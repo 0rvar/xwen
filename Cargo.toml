@@ -4,3 +4,78 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# This rev's candle-metal-kernels ships kernel_mul_mv_id_* / kernel_mul_mm_id_*
+# (the quantized indexed MoE matmuls) in quantized.metal with no Rust host
+# wiring — src/ops/ dispatches the mv_id ones directly (XWEN_MV_CLASSIC
+# fallback), so the pin also freezes those kernel signatures and the public
+# QStorage/MetalDevice surface we rely on. It also carries our upstreamed
+# MetalDevice::{register,unregister}_buffers residency APIs (candle PR #3771),
+# which gguf.rs's mmap no-copy weight views depend on.
+candle-core = { git = "https://github.com/huggingface/candle.git", rev = "21cca0b196f00784ba3e7b12832694f4e83b5c18", features = ["metal"] }
+candle-nn = { git = "https://github.com/huggingface/candle.git", rev = "21cca0b196f00784ba3e7b12832694f4e83b5c18", features = ["metal"] }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", rev = "21cca0b196f00784ba3e7b12832694f4e83b5c18", features = ["metal"] }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", rev = "21cca0b196f00784ba3e7b12832694f4e83b5c18" }
+
+# Raw Metal bindings for the mmap no-copy load path (gguf.rs MmapSource:
+# newBufferWithBytesNoCopy views over the GGUF mapping, MTLResidencySet).
+# These MUST stay `=`-pinned to the exact versions the pinned candle rev
+# resolves: cargo has to unify xwen's objc2 crates with candle-metal-kernels'
+# so the ProtocolObject/Retained types interoperate — a drifting version would
+# duplicate the crates and break that (the objc2 mismatch trap CLAUDE.md warns
+# about). objc2-metal features mirror candle-metal-kernels' Cargo.toml.
+objc2 = "=0.6.3"
+objc2-metal = { version = "=0.3.2", features = ["block2"] }
+objc2-foundation = "=0.3.2"
+
+# Official-checkpoint resolution (src/hub.rs): idempotent ensure of the GGUFs
+# in the standard Hugging Face hub cache — cache-first `get`, download only
+# when missing. Sync ureq API only (no tokio feature); nothing on an inference
+# path ever touches it.
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+# Constrained decoding (serve response_format / output_config.format):
+# JSON schema -> token-level grammar masks (src/constrain.rs). llguidance's
+# default features drop `lark` (unused frontend) and `rayon` (only feeds its C
+# batch API). toktrie_hf_tokenizers pins tokenizers 0.21 internally — a second
+# compiled copy that never crosses into ours; we feed it the raw embedded
+# tokenizer.json bytes instead of a Tokenizer value, so the 0.21/0.22 split is
+# invisible at the API boundary.
+llguidance = { version = "1.7.6", default-features = false, features = ["referencing", "ahash"] }
+toktrie = "1.7.6"
+toktrie_hf_tokenizers = "1.7.6"
+crossterm = "0.29"
+unicode-width = "0.2"
+memmap2 = "0.9"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+# preserve_order: JSON objects keep the key order they were parsed/built in.
+# The chat template dumps tool schemas and call arguments verbatim, so byte-exact
+# rendering requires the client's key order to survive a round trip.
+serde_json = { version = "1", features = ["preserve_order"] }
+half = "2.5"
+rand = "0.9"
+
+# `xwen serve`: the HTTP layer. tokio drives the axum router and the SSE
+# streams; crossbeam carries jobs from the async handlers to the single
+# blocking inference thread (the model is strictly one-at-a-time). toml parses
+# the serve config file.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-stream = "0.1"
+crossbeam-channel = "0.5"
+toml = "1"
+
+# `xwen serve --tui`: the dashboard sink. Default features off keeps the
+# backend set to the crossterm we already depend on — the versions unify, so the
+# TUI adds no second terminal library — and drops the widgets that pull a date
+# crate we have no use for.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "layout-cache"] }
+
+[profile.release]
+debug = true
+
+[profile.dev]
+opt-level = 1

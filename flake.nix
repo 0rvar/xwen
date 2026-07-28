@@ -1,17 +1,17 @@
 {
-  description = "Devshell for the maxuna engine (M5 Max / Metal only)";
+  description = "Devshell for the xwen engine (M5 Max / Metal only)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
   outputs =
     { self, nixpkgs }:
     let
-      # Single-system on purpose: maxuna targets this machine only.
+      # Single-system on purpose: xwen targets this machine only.
       pkgs = import nixpkgs { system = "aarch64-darwin"; };
     in
     {
       # mkShellNoCC, not mkShell: the darwin stdenv exports SDKROOT pointing at
-      # nixpkgs' Apple SDK, and a cargo build under that SDKROOT links maxuna
+      # nixpkgs' Apple SDK, and a cargo build under that SDKROOT links xwen
       # against it. The Metal runtime compiler derives its default MSL version
       # from the SDK the binary was LINKED against, so an old nix SDK silently
       # breaks the Metal-4 tensor kernels (f16_t/mm_id) at runtime. Builds must

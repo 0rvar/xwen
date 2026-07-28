@@ -1,0 +1,423 @@
+# Decisions
+
+This file is the WHY, by topic: every deliberate choice, default, policy, and refuted
+direction, with its evidence. Refuted directions are recorded as decisions too — "we
+measured it and we will not do X" is load-bearing. Each entry ends with a parenthesized
+date pointing at the `docs/log.md` entry that tells the whole story; decisions.md gets
+amended in place, the log entry preserves what was believed at the time.
+
+Inherited rule from laguna, kept because it bit that project three separate times: an
+observed identity must never be promoted to a claimed one. When this file says
+"bit-identical", it says why.
+
+## Scope
+
+**xwen is a fork of ../laguna (crate `maxuna`) adapted to Qwen 3.6, serving exactly two
+checkpoints: Qwen3.6-27B (dense) and Qwen3.6-35B-A3B (MoE).** Same design target as the
+parent: maximum tok/s on this one machine (M5 Max, Metal), batch 1, GGUF weights, no
+portability hedging. The 35B-A3B is the bring-up model — 20.4 GB Q4_K_M, 3B active,
+fastest iteration loop; the 27B dense follows as a variant (its FFN is a strict subset
+of the MoE machinery) (2026-07-28).
+
+**The dependency set is laguna's, verbatim, and is not relitigated.** The candle git pin
+(rev 21cca0b) ships the quantized indexed MoE matmuls and the residency-set APIs the
+mmap loader needs; the objc2 crates stay `=`-pinned to what that rev resolves or cargo
+duplicates them and the ObjC types stop interoperating (2026-07-28).
+
+**Text-only.** Qwen 3.6 is multimodal upstream, but the GGUF conversions are text-only
+(no vision tensors in the qwen35/qwen35moe arch lists; mmproj is a separate CLIP file we
+do not load). The chat template's vision content items are rejected, not rendered
+(2026-07-28).
+
+## Defaults and CLI surface
+
+**Default checkpoints are ggml-org's Q4_K_M files.** `ggml-org/Qwen3.6-27B-GGUF` and
+`ggml-org/Qwen3.6-35B-A3B-GGUF` are HF's own llama.cpp org — the closest thing to
+official GGUFs (Qwen published safetensors/FP8 only). Q4_K_M over Q8_0 because decode is
+bandwidth-bound and the Q4_K_M mix (attention/ssm/shared-expert Q8_0, expert stacks
+Q4_K, lm_head Q6_K) keeps the quality-critical planes at 8-bit anyway. Single files, no
+sharding (2026-07-28).
+
+**Sampling defaults follow generation_config.json: temp 1.0, top_p 0.95, top_k 20.**
+Stop tokens are the generation_config list `[248046 <|im_end|>, 248044 <|endoftext|>]` —
+config.json's single `eos_token_id: 248044` is wrong for chat and runs straight past
+turn boundaries (2026-07-28).
+
+## Ground truth and parity methodology
+
+**Upstream llama.cpp master replaces the poolside fork as parity ground truth.** The
+reference implementation is `src/models/qwen35.cpp`, `src/models/qwen35moe.cpp`, and the
+shared `src/models/delta-net-base.cpp` (llama.cpp was refactored; per-arch graphs no
+longer live in llama-model.cpp), running the identical ggml-org GGUF. The three-tier
+gate methodology (strict oracle cosine / fork-equivalence / greedy replay + perplexity
+bound) carries over from laguna; floors must be recalibrated for the Qwen checkpoint
+quant mix and are not laguna's numbers (2026-07-28).
+
+**The oracle is PINNED to a commit, not tracked.** `reference/llama.cpp` must be a
+checkout at the exact sha recorded in docs/parity.md. A different oracle build can move
+the achieved cosines, which would silently invalidate the floors calibrated against it,
+so moving the pin is a deliberate act paired with a re-calibration — never a `git
+pull`. The harness itself is indifferent to HOW the checkout is materialized; what it
+requires is that the sha be recorded and deliberate.
+
+**The oracle checkout is a git SUBMODULE** (shallow, declared in .gitmodules), with
+only `reference/llama.cpp/build` ignored. Resolved by the owner the same night it
+arose: the P7 session had materialized it as a plain gitignored clone while a
+submodule gitlink was staged concurrently; the owner picked the submodule, whose
+gitlink makes the oracle sha reviewable in the diff — moving the pin is a staged
+change the owner approves, which is exactly the "deliberate act" the paragraph above
+requires (2026-07-28).
+
+**Floors are calibrated across BOTH checkpoints and all fixtures, then set under the
+WORST observed value.** The gate constants are global (one `COS_MIN_MM` for whatever
+file is gated), so a floor derived from one checkpoint or one prompt would be a
+coin-flip on the others. The measured spread is in docs/parity.md "Floors": the
+strict floor sits ~1e-4 under the worst classic-path value and the mm floor ~5.4e-4
+under its worst, roughly 1.7x the observed prompt-to-prompt spread. Per-checkpoint
+applicability remains enforced by the procedure, not by code — the ledger item for
+binding a floor to a checkpoint hash is still open (2026-07-28).
+
+**Tap-name translation lives in the harness, not in the engine.** Our tap names and
+llama.cpp's `cb()` node names disagree on three of nine taps, and the mixer output has
+two different llama.cpp names depending on layer kind. `scripts/parity.ts` owns the
+mapping (`refTapNames`) rather than renaming engine taps, so the parity harness can
+follow upstream's naming churn without touching model code — and so a mapping mistake
+is a harness bug, not a silent change to what the engine records (2026-07-28).
+
+**HF transformers is the secondary reference, with two conversion deltas that make
+diffing against it hazardous:** GGUF norm weights are pre-baked `w+1` (HF Qwen3.5 norms
+are Gemma-style zero-centered `(1+w)`) for every norm EXCEPT the DeltaNet `ssm_norm`,
+and GGUF V-head ordering is tiled (llama.cpp permutes V-side weights at conversion to
+suit `ggml_repeat`) where HF safetensors are grouped (`repeat_interleave`). We read
+GGUF, so we use the pre-baked/tiled forms directly and never "fix" them (2026-07-28).
+
+## Model math: the forms that could have gone the other way
+
+Every entry here is a place where two defensible readings existed, the code had to pick
+one, and picking wrong would have produced a model that runs, emits fluent text, and is
+quietly incorrect. Each is pinned by a unit test, because "we checked once" does not
+survive a refactor.
+
+**silu runs over the WHOLE fused DeltaNet stream, before the q/k/v split — so q and k
+are silu'd before their L2 normalization, not just v.** The natural misreading of the
+recurrence is that silu is the value-path activation. It is not: `qwen35.cpp:397`
+applies `ggml_silu` to the entire `[conv_dim, T]` conv output and the q/k/v views are
+taken from the result afterwards (`:400-423`), matching HF's
+`causal_conv1d_fn(..., activation="silu")`. Getting this wrong changes every q and k
+that enters the delta rule and is invisible in any shape check (2026-07-28).
+
+**The q/k L2 normalization uses ggml's clamp form `x / max(‖x‖, eps)`, NOT HF's
+`x · rsqrt(Σx² + eps)`.** `ggml_compute_forward_l2_norm_f32` computes
+`scale = 1.0f/fmaxf(sqrtf(sum), eps)` (`ggml/src/ggml-cpu/ops.cpp:4204`, read directly
+from the vendored tree, not taken on report); HF/FLA computes the rsqrt form
+(`modular_qwen3_next.py:222-224`). The two agree to rounding for any vector whose norm
+clears eps, which a silu'd conv output always does — so this cannot move parity today.
+It is still decided rather than left to chance: llama.cpp is the parity ground truth, a
+strict tier may one day ask for bitwise agreement, and an "it cannot matter" difference
+is exactly the kind that turns out to matter later. eps is `rms_norm_eps` read from the
+checkpoint, not a hardcoded 1e-6 — llama.cpp passes `hparams.f_norm_rms_eps`, and only
+the shipped checkpoints make those the same number (2026-07-28).
+
+**The `1/√128` scale is applied to the readout only.** llama.cpp scales q once, before
+the recurrence (`delta-net-base.cpp:319-321`), and q enters the recurrent form at
+exactly one place — the `o = q·S` readout (`:365-366`). Scaling q up front and scaling
+the output are therefore algebraically identical, and the chunked path applies the same
+scale at the same point so the two forms agree. There is no second scale anywhere: not
+on k, not folded into beta (2026-07-28).
+
+**q and k are broadcast from K-heads up to V-heads by TILING — output head `j` reads
+K-head `j % n_k_heads` — never by interleaving.** This was the single highest-risk
+assumption in the DeltaNet port, because the usual way to write this broadcast in ggml
+(reshape to `[d, 1, n_k, T]`, then repeat) yields interleave semantics, and both forms
+type-check, run, and produce plausible output. `qwen35.cpp:442-443` repeats directly on
+the natural `[head_k_dim, num_k_heads, T, S]` layout, and
+`ggml_compute_forward_repeat_f32` (`ggml/src/ggml-cpu/ops.cpp:1723-1739`) writes
+destination head `i1*ne01 + k1` from source head `k1` — tiled. This is deliberate, not
+incidental: the converter pre-permutes every V-side weight from HF's grouped order into
+tiled order precisely so ggml's repeat can replace an expensive interleaved one
+(`conversion/qwen.py:355-378`). Reading GGUF, tiling is correct; reading HF safetensors
+directly it would be `j / ratio`, and we do not read those (2026-07-28).
+
+**The DeltaNet output norm is `rms_norm → × ssm_norm.weight → × silu(z)`, with the gate
+LAST.** `build_norm_gated` (`qwen35.cpp:246-255`) normalizes, applies the weight, and
+only then multiplies by `silu(z)`; current HF agrees and carries the literal comment
+`# Norm before gate` (`modular_qwen3_next.py:76`). Older FLA `FusedRMSNormGated`
+variants gate first, which is why this needs recording: a reader who reaches for the
+wrong upstream finds a form that disagrees with both llama.cpp and current
+transformers. Folding the gate in before the norm would change the statistic the norm
+divides by, so it is not a reordering that washes out (2026-07-28).
+
+## Weights and loading
+
+**GGUF is the only weight format**, loaded by laguna's mmap/no-copy path
+(`newBufferWithBytesNoCopy` over the page cache, batch-registered residency, classic
+full-copy fallback under `XWEN_LOAD_CLASSIC`). Nothing in that loader is
+architecture-specific; only the tensor-name table changes (2026-07-28).
+
+**Loader name traps, recorded here because each one silently produces a working-looking
+model:** there is no `ffn_norm` — `blk.N.post_attention_norm.weight` is the PRE-MLP norm
+(HF semantics), not a Gemma-style post-norm. There is no `ssm_in` — the DeltaNet QKV
+projection ships as `blk.N.attn_qkv.weight` and the z-gate as `blk.N.attn_gate.weight`.
+`blk.N.ssm_a` (no `.weight` suffix) already holds `-exp(A_log)`. `blk.N.ssm_dt.bias`
+uses a `.bias` suffix. Full-attention `attn_q` is double-width with per-head interleaved
+`[q_h, gate_h]` layout (2026-07-28).
+
+**beta and alpha ship as two separate tensors; there is no fused `ssm_ba` on these
+architectures.** The loader briefly carried a fallback that split a
+`[2·v_heads, hidden]` `ssm_ba` on the theory that either conversion might exist. The
+shipped headers settle it: both files have `blk.N.ssm_beta.weight` and
+`blk.N.ssm_alpha.weight`, `[hidden, v_heads]` Q8_0 each, mapped one-to-one from HF's
+`in_proj_b` / `in_proj_a`. `LLM_TENSOR_SSM_BETA_ALPHA` → `blk.%d.ssm_ba` does exist in
+llama.cpp's arch table, but is referenced only by the `qwen3next` arch, which maps HF's
+fused `in_proj_ba`. The fallback was removed rather than kept as insurance: a branch
+that can never fire is a claim about the world that nothing will ever check
+(2026-07-28).
+
+**Persistent state is partition-dependent in its low bits, and that is accepted, not
+denied.** The dual-storage attention planes (f16 GEMM above `Q8_DECODE_MAX_SEQ`=8,
+raw-q8 GEMV at or below it) are deliberately not bit-identical per weight element, and
+the same `Proj` feeds cache-mutating paths — KV writes, the DeltaNet conv window and
+recurrence. So the same tokens partitioned differently into forward calls (prefix-cache
+snapshot stops, verify batches of 9+ vs one-token decode) produce state differing in
+low bits. A second-model review caught model.rs's rollback docstring promising bitwise
+identity with a differently-partitioned counterfactual — an observed identity promoted
+to a claimed one, the exact failure mode this file's preamble warns about. The
+docstring now states the real guarantee: restores are bit-exact replays of recorded
+bytes; cross-partition agreement is numeric and parity-gated; `XWEN_ATTN_DEQUANT` pins
+one canonical representation when bitwise partition-independence matters. The
+alternative — one representation always — roughly doubles the attention-projection
+bytes streamed per decoded token (halving those bytes is why dual storage exists;
+laguna measured the win when it shipped it), a real cost not paid for a low-bit
+property nothing currently depends on (2026-07-28).
+
+## Kernel policy
+
+**Laguna's kernel policy is inherited wholesale:** vendored `.metal` sources runtime-
+compiled via include_str!, ggml-geometry dispatch, `fp contract(off)` +
+`fp reassociate(off)`, a `XWEN_*_CLASSIC` kill-switch and provenance string per kernel,
+and the rule that nothing upstream of the MoE router is reimplemented unless
+bit-identical — laguna measured per-op-correct-to-1.6e-7 kernels moving final logits by
+1.3e-3 through router near-tie flips. Qwen3.6-35B-A3B has 256 experts and a softmax
+router; the same chaos-amplifier reasoning applies unchanged (2026-07-28).
+
+**DeltaNet gets a frozen reference first, kernels second.** A composed-candle-ops
+implementation of the recurrence (recurrent form, fp32 state) is the correctness oracle,
+mirroring laguna's `ReferenceExperts`; vendored Metal kernels (chunked prefill scan,
+fused decode step) land only after the reference passes parity, and the reference is
+never optimized (2026-07-28).
+
+**The recurrent state is fp32, non-negotiable.** `mamba_ssm_dtype: "float32"` upstream;
+llama.cpp hardcodes F32 for both conv and delta states. State per layer per sequence:
+`(d_conv−1)·conv_dim` floats conv + `128·128·H_v` floats delta (2 MiB on the 35B)
+(2026-07-28).
+
+## Refuted perf directions — do not reopen without new evidence
+
+Laguna's refuted list (death-by-dispatch, encoder takeover, all-f16 activation chains,
+mixed-operand matmul2d as a tensor speedup, sub-32-seq mm_id) transfers as *prior
+evidence, not law* — same machine, same candle, same kernel geometry, different model.
+Anything re-opened here needs a measurement, and its entry moves into this section with
+the number that killed or revived it. Nothing xwen-specific is refuted yet (2026-07-28).
+
+## Speculative decoding
+
+**dflash.rs stays in the fork — a removal decision was made and reversed within the
+bootstrap session.** The drafter was believed to be Laguna-specific; then the GGUF
+survey found ggml-org ships official DFlash sidecar drafters for BOTH Qwen 3.6 models
+(arch string `dflash`, block_size 16, mask_token_id, sliding-window pattern; 27B: 5
+layers, taps [2,17,32,47,62]; 35B: 6 layers, taps [2,7,12,17,23,28,33,38]). The
+subsystem is directly adaptable; adaptation (tap wiring, decoder_arch check, mask token)
+is tracked in TODO.md. llama.cpp additionally implements recurrent-state rollback
+specifically for qwen35/qwen35moe, confirming spec decode is viable on the hybrid
+(2026-07-28).
+
+**A DeltaNet layer's spec-decode rollback is a recorded per-token trail, not a
+truncation — and it costs about a gigabyte while a verify walk is in flight.** A
+full-attention layer rolls back for free: it writes each position to its own slot, so
+discarding a rejected tail is a length assignment. A recurrent layer has no such
+structure — every step overwrites the state — so no image of a single moment
+reconstructs an intermediate one. `LayerCache::checkpoint` therefore ARMS the layer and
+the verify forward records the state after each token as it goes; `rollback(commit)`
+reads the entry for the last accepted token. This mirrors llama.cpp, which keeps K
+most-recent-first snapshot slots for exactly this reason. The recurrent reference
+produces a fresh state tensor per step, so recording the trail costs handles rather
+than copies — but the states are real allocations: at block_size 16 that is roughly
+16 × 2 MiB × 30 layers ≈ 1 GB on the 35B and 16 × 3 MiB × 48 layers ≈ 2.3 GB on the
+27B, held only for the duration of a verify walk. Accepted for now because correctness
+came first and P9 has not measured the spec-decode win yet; a chunked scan that can
+replay a short prefix cheaply would let the trail be dropped entirely (2026-07-28).
+
+**MTP sidecars are a second drafter option, deferred.** The MTP GGUFs reuse the parent
+arch as one extra full-attention block (`blk.64`/`blk.40` + `nextn.*` tensors) with a
+plain KV cache. Evaluate only after DFlash adaptation lands or fails (2026-07-28).
+
+**Drafting is OPT-IN until the Qwen adaptation lands, reversing laguna's opt-out
+default.** Laguna shipped `DEFAULT_DRAFT_ENABLED = true`: no flag meant the official
+drafter. On xwen that made every zero-flag invocation abort. `xwen serve` resolved the
+drafter to the symbolic `official`, downloaded the sidecar, and failed in
+`validate_model` before the listener bound; `xwen generate` failed the same way after
+loading the target. The error is `missing GGUF key dflash.decoder_arch` — the shipped
+sidecars carry no `decoder_arch` key at all, so the failure precedes the
+`decoder_arch == "laguna"` check that adaptation was expected to repoint, and two more
+blockers sit behind it (`enc.aux_norm` and `blk.N.attn_gate` are absent from the
+shipped tensor tables). The load-time checks stay strict — asking for a drafter that
+cannot load should fail loudly — but nothing asks by default. Naming one still opts in
+three ways: `--draft <gguf>`, `--draft official`, or `draft.path` in the config, the
+last of which now enables on its own rather than needing `enabled = true` beside it.
+Flips back to `true` when TODO.md P9 lands (2026-07-28).
+
+**Cache sizing figures are derived per checkpoint on `hub::Model`, not carried as
+constants.** `serve/config.rs` had inherited laguna's geometry verbatim:
+`FULL_KV_BYTES_PER_TOKEN = 12 full layers × 8 KV heads × 128 head_dim × 2 × 2` = 48
+KiB/token, and a 72 MiB snapshot described as "deep copies of the 36 SWA rings". Every
+factor is wrong for Qwen and the model has no SWA layer at all. The real figures:
+20 KiB/token on the 35B-A3B (10 full layers × 2 KV heads × 256 head_dim × K+V × f16)
+and 64 KiB on the 27B (16 × 4 × 256 × 2 × 2); a snapshot is DeltaNet recurrent state —
+f32 conv window plus f32 delta state over the linear layers — at a fixed 62.8 MiB
+(35B-A3B) or 149.6 MiB (27B) whatever position it covers. The consumption sites are all
+display (the `--init` template) plus the `MAX_CHAIN_BYTES` justification, so
+`Model::kv_bytes_per_token()` and `Model::snapshot_bytes()` derive them from a per-model
+geometry table with a test pinning the arithmetic; anything holding a real `XwenConfig`
+should measure from that instead. One consequence surfaced: a 27B conversation filling
+the trained context while retaining dozens of snapshots can exceed the 24 GiB
+`MAX_CHAIN_BYTES` and be refused, which is the cap working as designed — a refused chain
+costs a re-prefill, an allocation failure at twice the chain size takes the process down
+(2026-07-28).
+
+## Serving
+
+**The serve/ tree (Anthropic + OpenAI + native dialects, TUI, queue, prefix cache, disk
+tier) is inherited as-is**; it is architecture-agnostic. The KV export/import and disk
+tier must additionally carry the recurrent state for the 3-of-4 linear layers — KV cache
+alone no longer reconstructs a prefix. Native endpoint moved `/maxuna/v1/*` →
+`/xwen/v1/*` (2026-07-28).
+
+## The prefix cache and the disk tier
+
+Inherited from laguna; correctness now depends on snapshotting (KV cache for the 10–16
+full-attention layers) + (conv + delta state for the linear layers) as one unit. Sizing
+is favorable: the 35B keeps KV for only 10 layers with 2 KV heads — the hybrid's state
+is far smaller per token than a uniform transformer's (2026-07-28).
+
+**`CONTAINER_VERSION` stays at 2 for the DeltaNet snapshot variant — deliberately, not
+by oversight.** The version discriminates FRAMING (header fields, directory layout,
+record tags) and nothing else, because two mechanisms already cover the payload and
+leave a bump nothing to catch. The checkpoint binding (hash plus file length, checked in
+`read_header`) means an image can only be read back beside the exact file that wrote it,
+so a laguna-era image cannot reach a Qwen build at all. Within a checkpoint,
+`kv_cache`'s per-layer kind tags (`LAYER_FULL`/`LAYER_SWA`/`LAYER_LINEAR`) give each
+kind its own field layout and dtype, and `check_restorable` rejects a layer whose kind
+or shape disagrees with the live cache. The recurrent-state snapshot is therefore a new
+per-layer tag inside unchanged framing. Bump the version only when the framing itself
+changes; the invariant is recorded at the constant so the next reader does not have to
+re-derive it (2026-07-28).
+
+## Tokenization, chat, tool calls
+
+**The Qwen tokenizer.json (12,807,982 bytes, byte-identical between the two model
+repos, sha256 5f9e4d49…) is vendored at reference/tokenizer.json and embedded via
+include_bytes!, following laguna's embedded-tokenizer decision.** Qwen2 byte-level BPE,
+NFC normalizer, no BOS ever prepended (`add_bos_token: false`, no post-processor). The
+split regex differs from Qwen3 by `\p{M}` handling — do not reuse a Qwen3 regex
+(2026-07-28).
+
+**chat.rs is a hand-written Rust port of the official chat_template.jinja (7764 bytes,
+byte-identical across both repos), keeping laguna's content/structure separation** so
+pasted text discussing control tokens can never become control tokens. The subtle rules,
+verified by rendering the real template: string tool-arguments render RAW (non-strings
+JSON-encode); OpenAI-style JSON-string `arguments` must be parsed into a map first
+(template raises on strings); thinking blocks are kept only for turns strictly after the
+last user turn that is not wholly a `<tool_response>` wrapper (or all, under
+`preserve_thinking`); generation prompt opens an unclosed `<think>\n` (thinking on) or
+emits a closed empty block (thinking off); consecutive tool results collapse into one
+user turn. Rendered test vectors from the bootstrap research are the fixture set
+(2026-07-28).
+
+**One deliberate divergence from template byte-parity: a tool result as the FIRST
+message is refused** (`ChatError::ToolResultOpensConversation`). The reference template
+hits undefined `loop.previtem` there and emits a turn that closes without ever opening
+(`<|im_end|>` with no `<|im_start|>user`); byte-parity would mean handing the model a
+malformed boundary. Refusal ordering otherwise follows the template exactly:
+NoMessages → NoUserQuery → SystemNotFirst (2026-07-28).
+
+**Bodies are stripped with Python's str.strip() whitespace set (29 codepoints,
+including U+001C–U+001F), not Rust's `trim`.** Jinja's `|trim` is str.strip(), and the
+difference decides real behavior: whether a body reads as a bare `<tool_response>`
+wrapper (which moves last_query_index and therefore which turns keep their reasoning)
+and whether an assistant turn counts as empty when its first tool call picks its
+separator. Verified against an exhaustive Unicode sweep (2026-07-28).
+
+**Constrained decoding's control-token safety is a compile-time property enforced by a
+test, not a runtime force-mask.** toktrie marks every `<…>`-shaped added token special
+regardless of the tokenizer's special flag, so no grammar byte can ever match a control
+marker; a per-draw 250-id mask sweep would duplicate that guarantee on the hot path and
+need an EOG carve-out. The guarantee rests on toktrie's bracket HEURISTIC, not on
+special:true — a future marker spelled without angle brackets would be
+grammar-reachable, which is why `no_control_token_is_ever_offered` sweeps the full
+control range at every step and asserts the mask stayed wide. The constrain trie is
+sized to the model's logit width 248320 (padded tail unreachable by construction), and
+`new()` refuses a checkpoint with a different width — this sizing fixed a latent bug
+where every constrained serve request died on a short mask (2026-07-28).
+
+**tokenizer.rs is the single owner of every token id in the crate**, including the
+hardcoded second stop id 248044 that no GGUF key advertises; config.rs imports it. Two
+vocab sizes are exposed deliberately: `vocab_size()` = 248070 encodable id space,
+`PADDED_VOCAB` = 248320 logit width — callers pick by which side of the sampler they
+are on (2026-07-28). The serve engine's tool-call span parser is now the same rule
+rather than an exception — see the entry below for what the exception cost.
+
+**The serve engine parses Qwen's real call format, and a span it cannot read degrades to
+text.** The inherited parser was laguna's twice over. Its span markers were literal ids
+`25`/`26`, which in Qwen's vocabulary are `:` and `;` (the real `<tool_call>` pair is
+248058/248059), so every colon in ordinary prose opened a phantom span and every
+semicolon closed one — truncating replies into a discarded span or reporting a
+fabricated call, while genuine `<tool_call>` tokens passed through as text. Its interior
+grammar was laguna's `<arg_key>`/`<arg_value>`, strings absent from Qwen's vocabulary
+and never emitted by chat.rs. The parser now sources both ids from `LagunaTokenizer` and
+reads the format chat.rs renders: `<function=NAME>` then per-argument
+`<parameter=KEY>\nVALUE\n</parameter>` then `</function>`, one function per span, with
+the newlines around a value treated as framing rather than content. Two rules follow
+from the template rather than from taste. The `</tool_call>` token is structural
+wherever it lands, mid-value included — chat.rs writes a literal `</tool_call>` inside
+an argument as ordinary content, so it never encodes to the added token, and reading the
+token as content would let one malformed value swallow the rest of the reply. And a span
+that never names a callable tool degrades: its raw text, markers included, goes to the
+client as answer text with a logged warning, instead of being silently dropped as the
+old parser dropped it. Never discard, never fabricate. The class of bug is closed by
+construction in the tests: they drive the emitter over ids from the real embedded
+tokenizer, round-tripping conversations that chat.rs rendered, and one hostile case
+feeds prose full of `:`, `;` and `<function=` text and asserts zero calls with
+byte-identical output (2026-07-28).
+
+**`--ban-string` protects the stop ids the decode loop actually uses.** `scan_banned`
+guarded the compile-time `LagunaTokenizer::EOG` while the loop stops on
+`Sampler::eog_ids()`, which `XwenConfig` derives from the checkpoint's metadata. The two
+agree on both shipped files, so nothing was broken — but they are independent sources,
+and a checkpoint declaring a different `eos_token_id` would leave its real stop token
+bannable, letting `--ban-string` remove the only token that can end a reply. The
+protected set is now passed in from the sampler, so the guarantee holds by construction
+rather than by the two sources happening to match (2026-07-28).
+
+## Thinking budget and sampling controls
+
+Laguna's `GenEvent` thinking/answer split carries over; Qwen 3.6 seeds generation inside
+an open `<think>` block, so the generation loop starts in thinking state whenever the
+template opened one, and `</think>` (token 248069) is the split marker. `<think>` /
+`</think>` are single tokens but `special: false` in the tokenizer — encoding user text
+never produces them via the special-token path; the loop must treat them by token id
+(2026-07-28).
+
+## Measurement discipline
+
+Inherited unchanged from laguna: state the power mode with every number, never report
+first-forward prefill as steady-state, bench via the scripts with warmup, and one
+~20–70 GB process at a time (2026-07-28).
+
+## Process
+
+Inherited unchanged: multi-reviewer review with external model families on evidence
+(reviewers recorded as wrong with disproofs, not just as right); a reviewer reads the
+path you wrote, a live check walks the path you forgot; let the existing suite arbitrate
+a proposed fix; docs drift is tracked work. Every shipped arc updates log.md (dated
+entry) + README if the surface changed + this file if a decision was made, changed, or
+refuted — a TODO.md update alone is not sufficient (2026-07-28).

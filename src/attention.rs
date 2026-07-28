@@ -1,0 +1,877 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+use candle_core::{DType, Device, Module, Tensor};
+
+use crate::config::XwenConfig;
+use crate::gguf::{AttnQ8, QLinear, Weights};
+use crate::kv_cache::{LayerCache, MaskKind};
+use crate::rope::Rope;
+
+/// Token count up to and including which a q8_0-stored attention projection runs
+/// the vendored q8_0 decode gemv (`ops::matmul_q8`); above it the dense f16
+/// plane's `matmul_f16` runs the tiled gemm. Set to the f16 path's own mv/mm
+/// break-even so the q8 gemv covers the ENTIRE gemv range (the f16 plane would
+/// otherwise run its own gemv over double the bytes for seq 1..=8) and the f16
+/// gemm takes over exactly where tiling wins — decode and short verify spans take
+/// the q8 gemv, prefill takes the f16 tensor gemm.
+const Q8_DECODE_MAX_SEQ: usize = 8;
+
+/// The prefill attention mask, built once per forward and shared across every
+/// full-attention layer. It is a pure function of (kind, pos, seq_len) — and on
+/// this architecture every attention layer is plain causal at the same head
+/// count, so one build serves the whole stack. `raw` is the additive
+/// `[seq, k_seq]` f32 mask the
+/// manual/CPU fallback broadcast-adds; `sdpa` is that mask reshaped to
+/// `[1, n_head, seq, k_seq]`, cast f16 and made contiguous for the Metal sdpa
+/// kernel. Both are byte-identical to what the pre-hoist per-layer path built.
+pub struct PrefillMask {
+    raw: Tensor,
+    sdpa: Tensor,
+}
+
+impl PrefillMask {
+    /// Build the raw + sdpa-materialized masks for `n_head` query heads of
+    /// `kind`, for a `seq`-token chunk at absolute position `pos`. `None` for a
+    /// single decode token (seq==1), matching the pre-hoist path (which built no
+    /// mask there).
+    pub fn build(
+        kind: MaskKind,
+        n_head: usize,
+        seq: usize,
+        pos: usize,
+        device: &Device,
+    ) -> Result<Option<Self>> {
+        let raw = match crate::kv_cache::attn_mask_for(kind, seq, pos, device)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let (s, kk) = raw.dims2()?;
+        let sdpa = raw
+            .reshape((1, 1, s, kk))?
+            .broadcast_as((1, n_head, s, kk))?
+            .to_dtype(DType::F16)?
+            .contiguous()?;
+        Ok(Some(Self { raw, sdpa }))
+    }
+}
+
+/// How the attention projection weights are held, decided at load (model.rs,
+/// `XWEN_ATTN_F32`). Activations are f32 either way — the `F16` mode streams
+/// dense f16 weight planes (GGUF-stored f16 on an f16-attention checkpoint, or
+/// dequantized from a q8_0-stored one, whose decode gemv reads the raw q8_0
+/// bytes instead) through the vendored mixed-dtype kernels (ops::matmul_f16),
+/// so the stored weights are the only non-f32 values in the projection math
+/// (the fork's exact precision structure).
+#[derive(Clone, Copy)]
+pub enum AttnWeights {
+    /// Dense f16 weight planes — GGUF-stored f16, or dequantized from q8_0
+    /// storage plus a raw-q8_0 decode alias (shipped default; Metal only).
+    F16,
+    /// Weights dequantized to dense f32 behind `QMatMul` (fully legacy).
+    DequantF32,
+}
+
+/// One attention projection. `DenseF16` holds the weight as a dense f16 tensor
+/// consumed by the vendored ggml-geometry f16-weight kernels: the f32
+/// activation is never cast and the output is written f32 — f16 weight
+/// streaming (the bandwidth win) with zero non-weight rounding. `Quant` keeps
+/// the GGUF tensor behind candle's `QMatMul` (an F16-stored weight is
+/// dequantized to dense f32 at load; a quantized-stored one runs candle's
+/// quantized matmul).
+pub(crate) enum Proj {
+    Quant(QLinear),
+    /// `[out_dim, in_dim]` f16.
+    DenseF16(Tensor),
+    /// A q8_0-stored attention weight (the current official checkpoint — the
+    /// production default; introduced for the since-deleted unsloth UD file): the
+    /// dequantized f16 dense plane consumed by the prefill/mm path (byte-identical
+    /// to `DenseF16`) PLUS the raw q8_0 bytes consumed by the decode gemv
+    /// (`ops::matmul_q8`) at seq <= 8. The stored q8_0 weights are the only
+    /// quantized values in the decode chain (no activation/output rounding), at
+    /// ~half the decode bandwidth of streaming the f16 plane.
+    DenseF16Q8 {
+        f16: Tensor,
+        q8: AttnQ8,
+    },
+}
+
+impl Proj {
+    /// Load `<prefix>.<name>.weight` in the storage mode `weights` selects. The
+    /// DeltaNet layers' projections ship under attention tensor names and take
+    /// the same route, so this is shared with `linear_attn.rs`.
+    pub(crate) fn load(w: &Weights, name: &str, weights: AttnWeights) -> Result<Self> {
+        Ok(match weights {
+            // q8_0-stored weights (the shipped Q4_K_M mix keeps attention and ssm
+            // planes at 8 bits) build the dual-storage Proj; an f16-stored weight
+            // returns no q8 alias and stays on the plain f16 plane.
+            AttnWeights::F16 => match w.attn_proj(name)? {
+                (f16, Some(q8)) => Proj::DenseF16Q8 { f16, q8 },
+                (f16, None) => Proj::DenseF16(f16),
+            },
+            AttnWeights::DequantF32 => Proj::Quant(w.qlinear(name)?),
+        })
+    }
+
+    /// f32 in, f32 out on every variant; the stored quantized/f16 weights are the
+    /// only non-f32 values the matmul ever sees.
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Proj::Quant(q) => Ok(q.forward(x)?),
+            Proj::DenseF16(w) => crate::ops::matmul_f16(w, x),
+            Proj::DenseF16Q8 { f16, q8 } => {
+                let seq = x.dim(0)?;
+                if seq <= Q8_DECODE_MAX_SEQ && !crate::ops::attn_dequant() {
+                    crate::ops::matmul_q8(&q8.buffer, q8.base_off, q8.out_dim, q8.in_dim, x)
+                } else {
+                    // Prefill (and XWEN_ATTN_DEQUANT): the dense f16 plane, the
+                    // path an f16-attention checkpoint always takes.
+                    crate::ops::matmul_f16(f16, x)
+                }
+            }
+        }
+    }
+}
+
+/// One Qwen 3.6 full-attention block (layer indices where `(il + 1) % 4 == 0`;
+/// every other layer is gated DeltaNet, in `linear_attn.rs`).
+///
+/// `attn_q` is DOUBLE width and per-head interleaved — head h occupies
+/// `[q_h(head_dim) | gate_h(head_dim)]` — so q and the output gate come out of
+/// one projection and are separated by a strided view. Both q and k take an
+/// RMSNorm over the head dim before rope; rope is partial NEoX over the first
+/// `n_rot` dims only; sdpa runs at scale `1/sqrt(head_dim)`; and `sigmoid(gate)`
+/// multiplies the attention output ELEMENTWISE (the gate is head_dim wide, not
+/// one scalar per head) before `attn_output`. Masking is plain causal
+/// everywhere — there is no sliding window in this architecture.
+///
+/// Activations are f32 end-to-end; with `AttnWeights::F16` each projection runs
+/// the vendored mixed-dtype kernels (f16 weights x f32 activations, f32
+/// accumulate/output), so the dense f16 weight planes stream at f16 width with
+/// no other rounding (a q8_0-stored checkpoint's decode gemv streams the raw
+/// q8_0 bytes instead). f16 otherwise appears only where both weight modes share
+/// it: the KV cache and the sdpa kernel.
+pub struct AttnBlock {
+    /// `attn_q`: q and the output gate, interleaved per head.
+    qg_proj: Proj,
+    k_proj: Proj,
+    v_proj: Proj,
+    o_proj: Proj,
+    /// QK-norm weights, f32 (candle's rms_norm requires weight dtype == x dtype).
+    q_norm: candle_nn::RmsNorm,
+    k_norm: candle_nn::RmsNorm,
+    rope: Arc<Rope>,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+}
+
+impl AttnBlock {
+    /// `w` is positioned at the block prefix (e.g. `blk.7`).
+    pub fn new(
+        w: &Weights,
+        cfg: &XwenConfig,
+        il: usize,
+        rope: Arc<Rope>,
+        weights: AttnWeights,
+    ) -> Result<Self> {
+        let proj = |name: &str| -> Result<Proj> { Proj::load(w, name, weights) };
+        let norm = |name: &str| -> Result<candle_nn::RmsNorm> {
+            Ok(candle_nn::RmsNorm::new(w.dense_f32(name)?, cfg.rms_eps))
+        };
+        Ok(Self {
+            qg_proj: proj("attn_q")?,
+            k_proj: proj("attn_k")?,
+            v_proj: proj("attn_v")?,
+            o_proj: proj("attn_output")?,
+            q_norm: norm("attn_q_norm")?,
+            k_norm: norm("attn_k_norm")?,
+            rope,
+            n_head: cfg.n_head(il),
+            n_kv_head: cfg.n_kv_head,
+            head_dim: cfg.head_dim,
+        })
+    }
+
+    /// Whether this block's projections hold the q8_0 decode alias (a
+    /// q8_0-quantized checkpoint under `AttnWeights::F16`). Uniform across the
+    /// block's projections, so `q_proj` is representative. Surfaced so the model
+    /// can record the attention decode path in dump provenance.
+    pub fn uses_q8_decode(&self) -> bool {
+        matches!(self.qg_proj, Proj::DenseF16Q8 { .. })
+    }
+
+    /// Build this block's prefill mask for `cache` at (seq, pos), or None for a
+    /// single decode token. Production prefill hoists this out of the layer loop
+    /// — one build per kind, shared across every layer of that kind — while
+    /// single-block callers (tests, benches) build it per call.
+    pub fn prefill_mask(
+        &self,
+        cache: &LayerCache,
+        seq: usize,
+        pos: usize,
+    ) -> Result<Option<PrefillMask>> {
+        PrefillMask::build(cache.mask_kind(), self.n_head, seq, pos, &cache.device())
+    }
+
+    /// x_normed: [seq, hidden] f32 (already attn_norm'ed by the caller).
+    /// `mask` is the pre-built, hoisted mask for this layer's kind (None for a
+    /// single decode token). Returns [seq, hidden] f32.
+    pub fn forward(
+        &self,
+        x_normed: &Tensor,
+        cache: &mut LayerCache,
+        pos: usize,
+        mask: Option<&PrefillMask>,
+    ) -> Result<Tensor> {
+        let (seq, _hidden) = x_normed.dims2()?;
+
+        // One projection, two outputs: `attn_q` is [n_head, 2, head_dim] per
+        // token with q first and the gate second WITHIN each head, so the split
+        // is a stride away — not a halving of the whole row.
+        let qg = self
+            .qg_proj
+            .forward(x_normed)?
+            .reshape((seq, self.n_head, 2, self.head_dim))?;
+        let q = qg
+            .narrow(2, 0, 1)?
+            .contiguous()?
+            .reshape((seq, self.n_head, self.head_dim))?;
+        let gate = qg
+            .narrow(2, 1, 1)?
+            .contiguous()?
+            .reshape((seq, self.n_head, self.head_dim))?;
+        let k = self
+            .k_proj
+            .forward(x_normed)?
+            .reshape((seq, self.n_kv_head, self.head_dim))?;
+        let v = self
+            .v_proj
+            .forward(x_normed)?
+            .reshape((seq, self.n_kv_head, self.head_dim))?;
+
+        // QK-norm: RMSNorm over head_dim before rope, in [seq, head, dim]
+        // layout where head_dim is contiguous last.
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
+        // Fused attention-glue kernels (Metal): each is bit-identical to the
+        // candle chain it replaces (ops::attn_glue bitwise tests), so this is a
+        // pure dispatch/traffic optimization. XWEN_ATTN_GLUE_CLASSIC reverts
+        // every glue site (here, sdpa_attention, and Rope::rotate) to the
+        // candle chains; non-Metal devices always run them.
+        let fused_glue =
+            matches!(x_normed.device(), Device::Metal(_)) && !crate::ops::attn_glue_classic();
+
+        // To [head, seq, head_dim] for rope + attention. At seq==1 (decode) the
+        // [1, head, dim] and [head, 1, dim] layouts share byte order, so a reshape
+        // (metadata only) is bit-identical to transpose+contiguous and drops three
+        // copy dispatches per layer on the hot decode path. seq>1 (prefill) is a
+        // real permutation: one fused permute-copy pass each for q/k (which must
+        // stay f32 for rope), and for v a single permute+f16-cast pass that also
+        // absorbs the cache-append cast (v is not roped).
+        let (q, k, v) = if seq == 1 {
+            (
+                q.reshape((self.n_head, 1, self.head_dim))?,
+                k.reshape((self.n_kv_head, 1, self.head_dim))?,
+                v.reshape((self.n_kv_head, 1, self.head_dim))?,
+            )
+        } else if fused_glue {
+            (
+                crate::ops::permute_01(&q)?,
+                crate::ops::permute_01(&k)?,
+                crate::ops::permute_01_f16(&v)?, // [n_kv, seq, hd] f16, cache-ready
+            )
+        } else {
+            (
+                q.transpose(0, 1)?.contiguous()?,
+                k.transpose(0, 1)?.contiguous()?,
+                v.transpose(0, 1)?.contiguous()?,
+            )
+        };
+
+        // On the fused-glue path rope stores its OUTPUT dtype directly (the
+        // kernel computes in f32 and rounds only the final store — bit-
+        // identical to f32 rope + cast_f16), folding the standalone post-rope
+        // casts away: k is stored f16 always (it flows straight to the f16
+        // cache), and q is stored f16 exactly where its consumer is the f16
+        // decode sdpa. q stays f32 for prefill (the flash kernel REQUIRES f32
+        // q, and the flash-classic route keeps its op sequence unchanged: rope
+        // f32 + the in-sdpa cast) and under the XWEN_SDPA_F32 experiment
+        // (whose sdpa consumes f32 q).
+        let (q, k) = if fused_glue {
+            let q_dt = if seq == 1 && !crate::ops::sdpa_f32() {
+                DType::F16
+            } else {
+                DType::F32
+            };
+            self.rope.apply_dt(&q, &k, pos, q_dt, DType::F16)?
+        } else {
+            self.rope.apply(&q, &k, pos)?
+        };
+
+        // Cache in f16; sdpa runs in f16. The additive mask is pre-built and
+        // hoisted by the caller (one per kind per forward; None at decode).
+        // The fused paths delivered k (rope f16 store) and prefill v (cast
+        // folded into its permute above) already f16.
+        let k16 = if k.dtype() == DType::F16 {
+            k
+        } else {
+            k.to_dtype(DType::F16)?
+        };
+        let v16 = if v.dtype() == DType::F16 {
+            v
+        } else if fused_glue {
+            crate::ops::cast_f16(&v)?
+        } else {
+            v.to_dtype(DType::F16)?
+        };
+        let (k_all, v_all) = cache.append(&k16, &v16)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+
+        // Attention proper. The vendored flash kernel is NOT a route here: it is
+        // compiled at head dim 128 (flash.metal's `BD == 128`) and this
+        // architecture is 256, so prefill goes through candle's sdpa with the
+        // materialized mask that `model.rs` builds. Two routes remain:
+        //  - Metal: candle's sdpa (including XWEN_SDPA_F32), consuming the
+        //    materialized f16 mask. On the fused-glue decode route the entry
+        //    casts are folded away (q arrives f16 from rope) — bit-identical by
+        //    construction.
+        //  - non-Metal: the explicit f32 fallback (CPU tests, reference oracle),
+        //    consuming the raw `[seq, k_seq]` additive mask.
+        let attn = if matches!(x_normed.device(), Device::Metal(_)) {
+            self.sdpa_attention(&q, &k_all, &v_all, mask.map(|m| &m.sdpa), scale)?
+        } else {
+            self.manual_attention(&q, &k_all, &v_all, mask.map(|m| &m.raw), scale, seq)?
+        }; // [n_head, seq, head_dim] f32 — except the fused-glue decode route,
+        // which hands over the raw f16 sdpa output (see sdpa_attention).
+
+        // The output gate is head_dim wide, so it multiplies elementwise rather
+        // than broadcasting one scalar per head. It comes from the SAME
+        // projection as q (interleaved per head) and applies after attention,
+        // before o_proj.
+        let gate = if seq == 1 {
+            gate.reshape((self.n_head, 1, self.head_dim))?
+        } else if fused_glue {
+            crate::ops::permute_01(&gate)?
+        } else {
+            gate.transpose(0, 1)?.contiguous()?
+        };
+        let attn = (attn.to_dtype(DType::F32)? * candle_nn::ops::sigmoid(&gate)?)?;
+
+        // Back to [seq, n_head*head_dim] then o_proj. Same seq==1 shortcut: the
+        // [head, 1, dim] -> [1, head*dim] regroup is byte-identical to
+        // transpose+contiguous+reshape, so decode skips the copy.
+        let out = if seq == 1 {
+            attn.reshape((seq, self.n_head * self.head_dim))?
+        } else if fused_glue {
+            crate::ops::permute_01(&attn)?.reshape((seq, self.n_head * self.head_dim))?
+        } else {
+            attn.transpose(0, 1)?
+                .contiguous()?
+                .reshape((seq, self.n_head * self.head_dim))?
+        };
+        self.o_proj.forward(&out)
+    }
+
+    /// Metal MLX fused attention. q [n_head, seq, hd] — f32, or already f16 on
+    /// the fused-glue decode path (rope stored it f16; same bits as the cast
+    /// this method would otherwise run). k/v [n_kv_head, K, hd] f16. GQA
+    /// (n_head multiple of n_kv_head) is handled by the kernel; k/v are not
+    /// pre-tiled. The kernel runs in f16: q is cast below where still f32, and
+    /// `mask` arrives pre-materialized (f16, `[1, n_head, seq, k]`, contiguous)
+    /// from the hoisted `PrefillMask`. Returns [n_head, seq, hd] — f32, except
+    /// on the fused-glue decode path (seq == 1), where the raw f16 sdpa output
+    /// is returned and the caller widens it (exact — widening never rounds).
+    fn sdpa_attention(
+        &self,
+        q: &Tensor,
+        k_all: &Tensor,
+        v_all: &Tensor,
+        mask: Option<&Tensor>,
+        scale: f32,
+    ) -> Result<Tensor> {
+        // Experiment hook (`XWEN_SDPA_F32`): run the whole sdpa in f32. The
+        // default path below is untouched when the env is absent.
+        if crate::ops::sdpa_f32() {
+            return self.sdpa_attention_f32(q, k_all, v_all, mask, scale);
+        }
+        // Metal-only path, so the glue switch alone picks the cast kernels. q
+        // arrives contiguous (rope output / decode reshape), so the fused cast
+        // needs no trailing contiguous; both casts are bit-identical to
+        // to_dtype (RTNE narrowing, exact widening).
+        let fused_glue = !crate::ops::attn_glue_classic();
+        let seq = q.dim(1)?;
+        let q = if q.dtype() == DType::F16 {
+            q.unsqueeze(0)? // fused decode: rope stored q f16, metadata only
+        } else if fused_glue {
+            crate::ops::cast_f16(q)?.unsqueeze(0)? // [1, n_head, seq, hd]
+        } else {
+            q.to_dtype(DType::F16)?.unsqueeze(0)?.contiguous()?
+        };
+        // k/v stay as the cache's narrowed views: rows within a head are
+        // contiguous and only the head dimension carries the max_ctx gap, which
+        // sdpa handles via the per-head k/v stride it is passed. Materializing a
+        // packed copy here would grow with context for no benefit.
+        let k = k_all.unsqueeze(0)?; // [1, n_kv_head, K, hd], head-strided
+        let v = v_all.unsqueeze(0)?;
+
+        let out = candle_nn::ops::sdpa(&q, &k, &v, mask, false, scale, 1.0)?;
+        let out = out.squeeze(0)?;
+        Ok(if fused_glue && seq == 1 {
+            out // f16, consumed directly by the f16-input gate kernel
+        } else if fused_glue {
+            crate::ops::cast_f32(&out)?
+        } else {
+            out.to_dtype(DType::F32)?
+        })
+    }
+
+    /// f32 sdpa experiment path (`XWEN_SDPA_F32`, non-default): the same
+    /// candle Metal sdpa kernel family as the default path, dispatched in f32
+    /// — q stays f32 (no f16 cast), the cached f16 k/v are widened to f32
+    /// (exact: widening never rounds), and the pre-materialized f16 mask is
+    /// widened too (also exact — it holds only 0 and -inf). The pinned candle
+    /// rev supports SdpaDType::F32 for both the full (seq > 1,
+    /// `steel_attention_float32_*`) and vector (seq == 1,
+    /// `sdpa_vector_float_*`) kernels at head_dim 128 with GQA; f32 is only
+    /// rejected at head_dim 512. Output matches the default path's shape and
+    /// dtype ([n_head, seq, hd] f32) so the downstream flow is unchanged.
+    fn sdpa_attention_f32(
+        &self,
+        q: &Tensor,
+        k_all: &Tensor,
+        v_all: &Tensor,
+        mask: Option<&Tensor>,
+        scale: f32,
+    ) -> Result<Tensor> {
+        // q arrives contiguous (rope output / decode reshape). Widening the
+        // cache's head-strided k/v views also packs them contiguous.
+        let q = q.unsqueeze(0)?; // [1, n_head, seq, hd] f32
+        let k = k_all.to_dtype(DType::F32)?.unsqueeze(0)?;
+        let v = v_all.to_dtype(DType::F32)?.unsqueeze(0)?;
+        // candle requires the mask dtype to match q's.
+        let mask32 = mask.map(|m| m.to_dtype(DType::F32)).transpose()?;
+        let out = candle_nn::ops::sdpa(&q, &k, &v, mask32.as_ref(), false, scale, 1.0)?;
+        Ok(out.squeeze(0)?)
+    }
+
+    /// Explicit softmax(q·kᵀ·scale + mask)·v in q's dtype (f32), GQA via a
+    /// broadcast over the query group dim. q [n_head, seq, hd] f32, k/v
+    /// [n_kv_head, K, hd] f16. Non-Metal fallback (CPU tests, Reference oracle).
+    fn manual_attention(
+        &self,
+        q: &Tensor,
+        k_all: &Tensor,
+        v_all: &Tensor,
+        mask: Option<&Tensor>,
+        scale: f32,
+        seq: usize,
+    ) -> Result<Tensor> {
+        let g = self.n_head / self.n_kv_head;
+        let k_seq = k_all.dim(1)?;
+        let k = k_all.to_dtype(q.dtype())?;
+        let v = v_all.to_dtype(q.dtype())?;
+
+        let q4 = q.reshape((self.n_kv_head, g, seq, self.head_dim))?;
+        let k4 = k.reshape((self.n_kv_head, 1, k_seq, self.head_dim))?;
+        let v4 = v.reshape((self.n_kv_head, 1, k_seq, self.head_dim))?;
+
+        let scores = q4
+            .broadcast_matmul(&k4.transpose(2, 3)?)?
+            .affine(scale as f64, 0.0)?;
+        let scores = match mask {
+            // The additive mask is built f32, matching the scores' dtype.
+            Some(m) => {
+                scores.broadcast_add(&m.to_dtype(scores.dtype())?.reshape((1, 1, seq, k_seq))?)?
+            }
+            None => scores,
+        };
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let out = probs.broadcast_matmul(&v4)?; // [n_kv_head, g, seq, hd]
+        Ok(out.reshape((self.n_head, seq, self.head_dim))?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Arch, LayerKind, RopeKind};
+    use candle_core::Device;
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Deterministic pseudo-random f32s in roughly [-0.5, 0.5] (LCG, no deps).
+    fn seeded(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as f32 / u32::MAX as f32) - 0.5
+            })
+            .collect()
+    }
+
+    fn dense(rows: usize, cols: usize, seed: u64, dev: &Device) -> Tensor {
+        Tensor::from_vec(seeded(rows * cols, seed), (rows, cols), dev).unwrap()
+    }
+
+    struct RawWeights {
+        /// [n_head * 2 * hd, hidden] — q and gate interleaved per head.
+        wqg: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor,
+        qn: Tensor,
+        kn: Tensor,
+    }
+
+    fn raw_weights(
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+        hidden: usize,
+        dev: &Device,
+    ) -> RawWeights {
+        let near_one = |dim: usize, seed: u64| {
+            Tensor::from_vec(
+                seeded(dim, seed)
+                    .iter()
+                    .map(|x| 1.0 + 0.1 * x)
+                    .collect::<Vec<f32>>(),
+                dim,
+                dev,
+            )
+            .unwrap()
+        };
+        RawWeights {
+            wqg: dense(n_head * 2 * hd, hidden, 1, dev),
+            wk: dense(n_kv * hd, hidden, 2, dev),
+            wv: dense(n_kv * hd, hidden, 3, dev),
+            wo: dense(hidden, n_head * hd, 5, dev),
+            qn: near_one(hd, 6),
+            kn: near_one(hd, 7),
+        }
+    }
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Write the weights to a throwaway GGUF (F32 quant) and load an AttnBlock,
+    /// exercising the real gguf.rs loading seam rather than a test-only shortcut.
+    fn build_block(
+        w: &RawWeights,
+        cfg: &XwenConfig,
+        il: usize,
+        rope: Arc<Rope>,
+        dev: &Device,
+        weights: AttnWeights,
+    ) -> AttnBlock {
+        let q = |t: &Tensor| {
+            QTensor::quantize(&t.to_device(&Device::Cpu).unwrap(), GgmlDType::F32).unwrap()
+        };
+        let (wqg, wk, wv, wo, qn, kn) =
+            (q(&w.wqg), q(&w.wk), q(&w.wv), q(&w.wo), q(&w.qn), q(&w.kn));
+        let tensors: Vec<(&str, &QTensor)> = vec![
+            ("blk.0.attn_q.weight", &wqg),
+            ("blk.0.attn_k.weight", &wk),
+            ("blk.0.attn_v.weight", &wv),
+            ("blk.0.attn_output.weight", &wo),
+            ("blk.0.attn_q_norm.weight", &qn),
+            ("blk.0.attn_k_norm.weight", &kn),
+        ];
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("xwen_attn_test_{}_{id}.gguf", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            candle_core::quantized::gguf_file::write(&mut f, &[], &tensors).unwrap();
+        }
+        let src = crate::gguf::open(&path, dev).unwrap();
+        let loaded = Weights::from_gguf(src).pp("blk.0");
+        let block = AttnBlock::new(&loaded, cfg, il, rope, weights).unwrap();
+        let _ = std::fs::remove_file(&path);
+        block
+    }
+
+    fn test_cfg(n_head: usize, n_kv: usize, hd: usize, hidden: usize, n_rot: usize) -> XwenConfig {
+        XwenConfig {
+            arch: Arch::Moe,
+            n_layer: 4,
+            hidden,
+            vocab: 32,
+            n_head: vec![n_head; 4],
+            n_kv_head: n_kv,
+            head_dim: hd,
+            // Every layer full-attention: this module's tests never build a
+            // DeltaNet cache.
+            layer_kind: vec![LayerKind::Full; 4],
+            linear_k_heads: 1,
+            linear_v_heads: 1,
+            linear_head_dim: 2,
+            conv_kernel: 4,
+            dense_ff: 0,
+            n_expert: 0,
+            n_expert_used: 0,
+            expert_ff: 0,
+            shared_expert_ff: 0,
+            rms_eps: 1e-6,
+            n_ctx_train: 4096,
+            rope: RopeKind::Plain {
+                freq_base: 1e7,
+                n_rot,
+            },
+            eog_tokens: vec![2],
+        }
+    }
+
+    /// A from-scratch f32 attention over the full token sequence: the strided
+    /// q/gate split, QK-norm, partial rope, the f16 KV round-trip and the
+    /// elementwise sigmoid gate, written out independently of the block.
+    /// Returns [total, hidden].
+    fn naive_forward(
+        w: &RawWeights,
+        rope: &Rope,
+        x: &Tensor,
+        n_head: usize,
+        n_kv: usize,
+        hd: usize,
+    ) -> Tensor {
+        let dev = x.device();
+        let (total, _hidden) = x.dims2().unwrap();
+        let eps = 1e-6f64;
+
+        let lin = |x: &Tensor, wt: &Tensor| x.matmul(&wt.t().unwrap()).unwrap();
+        let rms = |t: &Tensor, weight: &Tensor| {
+            let ms = (t.sqr().unwrap().sum_keepdim(2).unwrap() / hd as f64).unwrap();
+            t.broadcast_div(&(ms + eps).unwrap().sqrt().unwrap())
+                .unwrap()
+                .broadcast_mul(&weight.reshape((1, 1, hd)).unwrap())
+                .unwrap()
+        };
+
+        // The double-width projection, split per head: [.., h, 0, :] is q and
+        // [.., h, 1, :] is the gate.
+        let qg = lin(x, &w.wqg).reshape((total, n_head, 2, hd)).unwrap();
+        let q = qg
+            .narrow(2, 0, 1)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .reshape((total, n_head, hd))
+            .unwrap();
+        let gate = qg
+            .narrow(2, 1, 1)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .reshape((total, n_head, hd))
+            .unwrap();
+        let k = lin(x, &w.wk).reshape((total, n_kv, hd)).unwrap();
+        let v = lin(x, &w.wv).reshape((total, n_kv, hd)).unwrap();
+
+        let q = rms(&q.transpose(0, 1).unwrap().contiguous().unwrap(), &w.qn);
+        let k = rms(&k.transpose(0, 1).unwrap().contiguous().unwrap(), &w.kn);
+        let v = v.transpose(0, 1).unwrap().contiguous().unwrap();
+        let (q, k) = rope.apply(&q, &k, 0).unwrap();
+        // Round-trip k/v through f16 exactly as the cache does.
+        let k = k
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let v = v
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+
+        let g = n_head / n_kv;
+        let scale = 1.0f64 / (hd as f64).sqrt();
+        let q4 = q.reshape((n_kv, g, total, hd)).unwrap();
+        let k4 = k.reshape((n_kv, 1, total, hd)).unwrap();
+        let v4 = v.reshape((n_kv, 1, total, hd)).unwrap();
+        let scores = q4
+            .broadcast_matmul(&k4.transpose(2, 3).unwrap())
+            .unwrap()
+            .affine(scale, 0.0)
+            .unwrap();
+
+        let mut mask = vec![0f32; total * total];
+        for qi in 0..total {
+            for kj in 0..total {
+                if kj > qi {
+                    mask[qi * total + kj] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let mask = Tensor::from_vec(mask, (1, 1, total, total), dev).unwrap();
+        let scores = scores.broadcast_add(&mask).unwrap();
+        let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+        let out = probs
+            .broadcast_matmul(&v4)
+            .unwrap()
+            .reshape((n_head, total, hd))
+            .unwrap();
+
+        // Elementwise sigmoid gate over the full head width, then o_proj.
+        let gate = gate.transpose(0, 1).unwrap().contiguous().unwrap();
+        let gated = (out * candle_nn::ops::sigmoid(&gate).unwrap()).unwrap();
+        let flat = gated
+            .transpose(0, 1)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .reshape((total, n_head * hd))
+            .unwrap();
+        lin(&flat, &w.wo)
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+        let b: Vec<f32> = b.flatten_all().unwrap().to_vec1().unwrap();
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    }
+
+    /// The block's prefill-then-decode walk equals a single naive pass over the
+    /// whole sequence: the strided split, the QK-norm, the partial rope, the
+    /// cache and the gate all have to line up for this to hold.
+    #[test]
+    fn forward_matches_naive_prefill_and_decode() {
+        let dev = Device::Cpu;
+        let (n_head, n_kv, hd, hidden) = (4usize, 2usize, 8usize, 12usize);
+        let cfg = test_cfg(n_head, n_kv, hd, hidden, 4);
+        let rope = Arc::new(Rope::new(cfg.rope(), 32, &dev).unwrap());
+        let w = raw_weights(n_head, n_kv, hd, hidden, &dev);
+        let block = build_block(&w, &cfg, 0, rope.clone(), &dev, AttnWeights::DequantF32);
+
+        let total = 6usize;
+        let x = dense(total, hidden, 42, &dev);
+        let want = naive_forward(&w, &rope, &x, n_head, n_kv, hd);
+
+        // Prefill the first 4 tokens, then decode the last 2 one at a time.
+        let mut cache = LayerCache::new(&cfg, 0, 32, &dev).unwrap();
+        let prefill = x.narrow(0, 0, 4).unwrap().contiguous().unwrap();
+        let mask = block.prefill_mask(&cache, 4, 0).unwrap();
+        let mut got = vec![
+            block
+                .forward(&prefill, &mut cache, 0, mask.as_ref())
+                .unwrap(),
+        ];
+        for t in 4..total {
+            let row = x.narrow(0, t, 1).unwrap().contiguous().unwrap();
+            got.push(block.forward(&row, &mut cache, t, None).unwrap());
+        }
+        let got = Tensor::cat(&got, 0).unwrap();
+
+        assert!(
+            max_abs_diff(&got, &want) < 2e-3,
+            "block diverged from the naive reference by {}",
+            max_abs_diff(&got, &want)
+        );
+    }
+
+    /// q and the gate are interleaved WITHIN each head, not stacked as two
+    /// halves of the row. A block whose weight puts a known constant in one
+    /// head's gate slot and zero in every other must gate exactly that head.
+    #[test]
+    fn gate_is_read_from_the_interleaved_half_of_each_head() {
+        let dev = Device::Cpu;
+        let (n_head, n_kv, hd, hidden) = (3usize, 1usize, 4usize, 5usize);
+        let cfg = test_cfg(n_head, n_kv, hd, hidden, 2);
+        let rope = Arc::new(Rope::new(cfg.rope(), 8, &dev).unwrap());
+        let mut w = raw_weights(n_head, n_kv, hd, hidden, &dev);
+
+        // Rebuild attn_q so that every q slot is zero and only head 1's gate
+        // slot is non-zero. Rows are ordered [h0.q, h0.gate, h1.q, h1.gate, ...],
+        // each `hd` rows wide.
+        let mut wqg = vec![0f32; n_head * 2 * hd * hidden];
+        let gate_row0 = (1 * 2 + 1) * hd; // head 1, gate half
+        for r in 0..hd {
+            wqg[(gate_row0 + r) * hidden] = 8.0; // large -> sigmoid ~ 1
+        }
+        w.wqg = Tensor::from_vec(wqg, (n_head * 2 * hd, hidden), &dev).unwrap();
+        // The output projection reads head 1's slice straight through so the
+        // gating is visible in the result.
+        let mut wo = vec![0f32; hidden * n_head * hd];
+        for r in 0..hd {
+            wo[r * (n_head * hd) + hd + r] = 1.0; // hidden row r <- head 1, dim r
+        }
+        w.wo = Tensor::from_vec(wo, (hidden, n_head * hd), &dev).unwrap();
+
+        let block = build_block(&w, &cfg, 0, rope.clone(), &dev, AttnWeights::DequantF32);
+        let mut cache = LayerCache::new(&cfg, 0, 8, &dev).unwrap();
+
+        // One token whose first input component is 1, so head 1's gate logit is
+        // 8 and every other head's is 0.
+        let mut row = vec![0f32; hidden];
+        row[0] = 1.0;
+        let x = Tensor::from_vec(row, (1, hidden), &dev).unwrap();
+        let out = block.forward(&x, &mut cache, 0, None).unwrap();
+
+        let want = naive_forward(&w, &rope, &x, n_head, n_kv, hd);
+        assert!(
+            max_abs_diff(&out, &want) < 1e-4,
+            "interleaved gate split disagrees with the reference"
+        );
+        // And the gate really is near-saturated rather than near-0.5: a
+        // half-and-half split of the row would have read a zero weight here.
+        let got: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        let attn_only: Vec<f32> = {
+            let v = naive_forward(&w, &rope, &x, n_head, n_kv, hd);
+            v.flatten_all().unwrap().to_vec1().unwrap()
+        };
+        assert_eq!(got.len(), attn_only.len());
+        assert!(
+            got.iter().any(|v| v.abs() > 1e-6),
+            "gated output collapsed to zero, so nothing was tested"
+        );
+    }
+
+    /// Metal and the CPU fallback compute the same attention. The Metal sdpa
+    /// route is the only one production takes (the vendored flash kernel is
+    /// compiled at head dim 128 and cannot serve this architecture's 256).
+    #[test]
+    fn metal_sdpa_matches_cpu_reference() {
+        let Ok(metal) = crate::gguf::metal_device() else {
+            return;
+        };
+        let cpu = Device::Cpu;
+        let (n_head, n_kv, hd, hidden) = (4usize, 2usize, 128usize, 16usize);
+        let cfg = test_cfg(n_head, n_kv, hd, hidden, 64);
+        let w_cpu = raw_weights(n_head, n_kv, hd, hidden, &cpu);
+
+        let rope_cpu = Arc::new(Rope::new(cfg.rope(), 32, &cpu).unwrap());
+        let rope_metal = Arc::new(Rope::new(cfg.rope(), 32, &metal).unwrap());
+        let b_cpu = build_block(&w_cpu, &cfg, 0, rope_cpu, &cpu, AttnWeights::DequantF32);
+        let b_metal = build_block(&w_cpu, &cfg, 0, rope_metal, &metal, AttnWeights::DequantF32);
+
+        let x_cpu = dense(5, hidden, 77, &cpu);
+        let x_metal = x_cpu.to_device(&metal).unwrap();
+
+        let mut c_cpu = LayerCache::new(&cfg, 0, 32, &cpu).unwrap();
+        let mut c_metal = LayerCache::new(&cfg, 0, 32, &metal).unwrap();
+        let m_cpu = b_cpu.prefill_mask(&c_cpu, 5, 0).unwrap();
+        let m_metal = b_metal.prefill_mask(&c_metal, 5, 0).unwrap();
+
+        let out_cpu = b_cpu
+            .forward(&x_cpu, &mut c_cpu, 0, m_cpu.as_ref())
+            .unwrap();
+        let out_metal = b_metal
+            .forward(&x_metal, &mut c_metal, 0, m_metal.as_ref())
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+
+        assert!(
+            max_abs_diff(&out_cpu, &out_metal) < 5e-3,
+            "Metal sdpa diverged from the CPU reference by {}",
+            max_abs_diff(&out_cpu, &out_metal)
+        );
+    }
+}

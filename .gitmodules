@@ -1,0 +1,4 @@
+[submodule "reference/llama.cpp"]
+	path = reference/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+	shallow = true

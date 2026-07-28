@@ -2,7 +2,9 @@
 .direnv
 .DS_Store
 /models
-reference/llama.cpp-laguna-branch/build
+# The parity oracle is a git submodule pinned via the gitlink (see .gitmodules);
+# only its build output is ignored. scripts/build-llamacpp.sh builds it.
+reference/llama.cpp/build
 .claude/*.lock
 
 
