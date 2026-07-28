@@ -1313,7 +1313,7 @@ impl Generator {
             Some(path) => LagunaTokenizer::from_file(path)?,
             None => LagunaTokenizer::embedded()?,
         };
-        let sampler = Sampler::new(sampling, cfg.eog_tokens.clone());
+        let sampler = Sampler::new(sampling, cfg.eog_tokens.clone(), tok.vocab_size());
         let model = XwenModel::load(gguf, runner, max_ctx)?;
         Ok(Self::new(model, tok, sampler))
     }
@@ -1321,7 +1321,11 @@ impl Generator {
     /// Rebuild the sampler from `opts`, keeping the loaded EOG set. Lets a
     /// long-lived generator serve requests with per-request sampling.
     pub fn set_sampler(&mut self, opts: SamplerOptions) {
-        self.sampler = Sampler::new(opts, self.sampler.eog_ids().to_vec());
+        self.sampler = Sampler::new(
+            opts,
+            self.sampler.eog_ids().to_vec(),
+            self.sampler.encodable(),
+        );
     }
 
     /// Set the forced-reasoning floor (see the `min_think` field). Applies to

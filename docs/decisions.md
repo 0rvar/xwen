@@ -206,6 +206,39 @@ mirroring laguna's `ReferenceExperts`; vendored Metal kernels (chunked prefill s
 fused decode step) land only after the reference passes parity, and the reference is
 never optimized (2026-07-28).
 
+**The fused DeltaNet scan is bounded, not bit-identical — so it is pinned OFF in the
+strict tier.** Every other vendored kernel reproduces its candle chain's rounding
+boundaries exactly, which is why their `*_CLASSIC` pins are pure provenance discipline.
+The scan cannot: the reference contracts k and q against the state with a candle gemm
+and normalizes q/k with a candle reduce, while the kernel partitions both across
+threads (the whole point — the state stays in registers across all T timesteps).
+Reassociating an f32 sum is not something a kernel can undo. So `XWEN_DELTA_CLASSIC=1`
+is pinned on both sides of the strict tier, and the fused path is graded by the
+bounded mm/decode/ppl tiers instead, with a `delta` provenance field (schema v6) proving
+which side ran what. Measured agreement vs the reference at both shipped geometries:
+relative L2 under 1e-5 on both the per-token output and the state left behind, at
+sequence lengths from 1 to 512 (2026-07-28).
+
+**A multi-token chunk under an armed rollback checkpoint stays on the reference scan.**
+The one-dispatch scan can only report the state after the LAST token, and an armed
+DeltaNet layer needs the state after every token (`LayerCache::Linear`'s trail — the
+equivalent of llama.cpp's K snapshot slots). Rather than teach the kernel to spill T
+intermediate states, `LinearAttnBlock::forward` sends `seq > 1 && trail_armed` to
+`forward_classic`. Single tokens still take the fused path even when armed, because
+their only state IS the state after the last token — so spec decode's per-token verify
+steps keep the win and only a batched verify forward pays. Revisit if the verify walk
+ever becomes chunk-shaped and hot (2026-07-28).
+
+**The three glue kernels ARE bit-identical, and that was worth the block-scope
+pragmas.** `delta.metal` carries `fp contract(off)` / `reassociate(off)` at BLOCK scope
+on the conv, beta/decay and gated-norm kernels while deliberately leaving the scan
+free to contract into fma — its two inner loops are the entire prefill cost. File-scope
+pragmas (the sibling glue files' convention) would have doubled the scan's inner
+instruction count; a second library would have cost another runtime compile. The conv
+kernel is bitwise against the reference's cat + per-tap broadcast chain + silu, and the
+beta/decay kernel bitwise against candle's `usigmoid` and the stable softplus chain
+(2026-07-28).
+
 **The recurrent state is fp32, non-negotiable.** `mamba_ssm_dtype: "float32"` upstream;
 llama.cpp hardcodes F32 for both conv and delta states. State per layer per sequence:
 `(d_conv−1)·conv_dim` floats conv + `128·128·H_v` floats delta (2 MiB on the 35B)
@@ -407,11 +440,113 @@ template opened one, and `</think>` (token 248069) is the split marker. `<think>
 never produces them via the special-token path; the loop must treat them by token id
 (2026-07-28).
 
+The sampler is in-crate rather than candle's `LogitsProcessor`, because at vocab 248320
+the processor's shape costs ~0.6 ms of CPU per token: a temperature pass, a full CPU
+softmax, a `to_vec1`, and a `select_nth_unstable_by` over 248320 indices behind an
+indirect comparator. The replacement keeps the distribution and changes the execution:
+the full-vocabulary softmax runs on the device holding the logits (one Metal kernel,
+not 248320 CPU `expf` calls) and the candidate set comes from a single-pass streaming
+top-k. 0.819 → 0.406 ms/token measured at real width by `sampler_decode_bench`
+(2026-07-28).
+
+**Top-p is measured against absolute mass, following candle, NOT llama.cpp.** candle's
+`TopKThenTopP` softmaxes over the whole vocabulary first, then truncates to k, then
+applies the top-p cut to the survivors *without renormalizing them* — so `top_p` is a
+threshold on full-vocabulary probability mass, and the cut is skipped outright when the
+top-k set holds less than `top_p` of the total. llama.cpp (`llama_sampler_top_p` after
+`llama_sampler_top_k`) and HF (`TopPLogitsWarper` after `TopKLogitsWarper`) both
+renormalize over the k survivors first, which trims the tail in cases where this one
+does not. The retarget preserved candle's order deliberately: the change under
+discussion was a performance change, and switching sampling conventions inside it would
+have been an unreviewable behavior change riding along. It is also why the fast path
+still needs a full-vocabulary softmax instead of a k-wide one — the cut needs the total
+mass. Whether to move to the llama.cpp convention is open and belongs to whoever owns
+sampling semantics, not to a perf pass (2026-07-28).
+
+Consequence recorded so it is not mistaken for a regression: seeded stochastic runs
+produce different (equally valid) token streams than pre-2026-07-28 builds. candle's
+candidate list came out of `select_nth_unstable_by` in unspecified order and this one is
+sorted descending; a weighted draw maps its single uniform through the cumulative
+weights, so the same seed lands on a different token. Greedy decoding is bit-identical
+(argmax over the CPU copy, ties to the lowest id, no RNG touched), which is why the
+parity gate — greedy end to end — is unaffected (2026-07-28).
+
+**A NaN in the logit row fails the draw; ties at the top-k boundary go to the lowest
+id.** Two contracts the in-crate sampler states rather than inherits. NaN loses every
+ordered comparison, so both a scan that skips it (what the rewrite first did) and one
+that lets it win (candle's argmax pins index 0) turn a corrupt forward into a plausible
+token; the sampler errors on it instead, on every path including greedy, which is what
+the parity gate runs. `-inf` is a separate thing — it is how the controls exclude an id
+— and stays skippable. The tie contract is the one place the sampler is deliberately
+*stronger* than candle rather than equal to it: `select_nth_unstable_by` leaves which of
+several equal entries survives unspecified, while the streaming top-k's strict `>`
+against the floor keeps the lowest ids, so the candidate set is a function of the
+probabilities and not of the traversal that built it. Equivalence with candle is
+therefore claimed as distribution equality for untied inputs plus deterministic low-id
+selection at exact boundary ties, and only up to the floating-point rounding of whichever
+backend ran the softmax — the denominator cancels out of the weighted draw and reaches
+the outcome through exactly one place, the absolute-mass top-p comparison (2026-07-29).
+
+**Ids past the tokenizer's vocabulary are not drawable.** The output layer is padded
+(248320 rows against 248070 encodable ids) and the rows in between decode to nothing, so
+the sampler carries the encodable bound, checks it against every logit row it is handed,
+and narrows the row to it before the softmax. Narrowing rather than masking is what keeps
+the padding out of the denominator too, which is what lets the device fast path and the
+CPU `SampleControl` path softmax the same values. The bound is passed in from the
+tokenizer at construction, never written as a literal: the two vocabulary sizes are a
+per-checkpoint fact and `PADDED_VOCAB` vs `vocab_size()` is the distinction that decides
+which callers belong on which side (2026-07-29).
+
 ## Measurement discipline
 
 Inherited unchanged from laguna: state the power mode with every number, never report
 first-forward prefill as steady-state, bench via the scripts with warmup, and one
 ~20–70 GB process at a time (2026-07-28).
+
+**A/B perf comparisons must INTERLEAVE the two arms, and a sequential matrix is not a
+valid A/B.** Measured 2026-07-28 while benching the fused DeltaNet kernels: a
+back-to-back matrix of eight `xwen generate` runs drifts **20–35% slower** end to end,
+uniformly across both arms and both checkpoints, over roughly ten minutes of continuous
+GPU load. `pmset -g therm` records nothing while it happens, so there is no flag to
+check — the only tell is that the control arm moves too. Two consequences, both learned
+the expensive way. Run every arm of a comparison adjacently (F, C, F, C, …) and report
+the median of each, so both arms sample the same thermal envelope; the ratio survives
+drift even when the absolutes do not. And treat any absolute tok/s figure as a
+warm-machine number unless it came off an idle machine — the first pass of that matrix
+reported the 27B at 13.9 tok/s decode and a cooled, interleaved re-run put the same
+build at 19.0.
+
+**This does NOT touch the parity gate, and it is worth saying so explicitly.** Every
+tier grades logits, agreement counts or mean NLL — all arithmetic, all thermally
+invariant. A throttled run produces bit-identical dumps, just later. The only
+thermally sensitive figures in docs/parity.md are the wall-clock runtimes ("42 s
+warm"), which are scheduling guidance and not gate criteria. So the interleaving
+protocol is a bench-work rule; the gate needs no equivalent (2026-07-28).
+
+**`pgrep -f` is not a usable "is a model running?" guard — test what the process is
+EXECUTING, not what its command line mentions.** The pattern string appears in the argv
+of whatever runs the check, so `pgrep -f "logits-dump"` matches its own wrapper and
+aborts over a model process that does not exist. This bit both
+`scripts/parity-gate.ts`'s preflight and an ad-hoc bench guard within the same hour.
+Note the failure mode is not "the wrapper is a shell" — a bun/python/make wrapper, or a
+`git diff -- src/bin/logits-dump.rs`, matches just as well — so excluding `sh -c` is a
+heuristic, not a fix. Two structural fixes, both sound: match the process NAME exactly
+(`pgrep -x logits-dump`), or keep `-f` and filter on `argv[0]`, which is what
+parity-gate ships (`isModelProcess`, unit-tested offline against captured lines — a
+property `-x` cannot offer since it is opaque to the caller). `-x` does work —
+`pgrep -x bun` matches 3 live processes where `pgrep -f bun` matches 15, which is
+exactly the argv-only false-positive class being eliminated.
+
+Three traps cost both agents time while establishing that, all worth knowing before
+probing process state in an agent sandbox: background processes do not survive
+(`nice(5) failed: operation not permitted`), so a positive-case test needs a process
+started some other way; `ps -p <pid>` returns nothing even for pids `pgrep` can see, so
+"is it alive?" comes back empty and reads as "it isn't"; and `pgrep zsh` returns 0 in
+EVERY form (`-f`, `-l`, `-x`, bare), so probing `-x` against a shell looks like `-x` is
+broken when the target is simply invisible. Pick a probe target you can independently
+confirm is running and visible — `bun` works here. A guard whose failure mode is a
+concurrent 20 GB load deserves both halves tested against real processes, permissive
+and restrictive, not just its matcher unit-tested (2026-07-28).
 
 ## Process
 

@@ -266,18 +266,25 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// honest label, unlike `combine`'s distinct "reference" index_add path), else
 /// "fused" (the shipped vendored `ops::silu_mul` kernel) or "classic" (under
 /// `XWEN_ACT_CLASSIC`) for the fused runner.
+/// `delta` records the gated-DeltaNet layer path: "fused" (the vendored
+/// conv/beta-decay/scan/gated-norm kernels, the Metal default) or "classic"
+/// (the frozen reference scan, under `XWEN_DELTA_CLASSIC`). The same value for
+/// every runner, since the DeltaNet layers sit outside the MoE runner split —
+/// but unlike its env-derived siblings this one is OBSERVED, from the layer
+/// counters (`observed_delta_path`), because `forward` also falls back on
+/// grounds the environment cannot show.
 /// `schema_version` stamps which field set this dump carries
 /// (`xwen::parity_schema`): the gate resolves a field missing from an older
 /// dump to its grandfather value instead of hard-failing, so adding a field
 /// no longer invalidates cached/committed references. Additive: readers that
 /// ignore these still parse older/newer dumps.
-fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Value {
+fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value> {
     let attn_dtype = match model.attn_dtype() {
         DType::F32 => "f32",
         DType::F16 => "f16",
         other => unreachable!("attention computes in f16 or f32, not {other:?}"),
     };
-    json!({
+    Ok(json!({
         "schema_version": xwen::parity_schema::PROVENANCE_SCHEMA_VERSION,
         "moe_impl": moe_impl,
         "seq_len": seq_len,
@@ -335,7 +342,56 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Value {
         } else {
             "fused"
         },
-    })
+        // Gated-DeltaNet layer path: "fused" (the vendored conv / beta-decay /
+        // scan / gated-norm kernels, the Metal default) or "classic" (the frozen
+        // reference scan, under XWEN_DELTA_CLASSIC). Env-derived for every
+        // runner — the DeltaNet layers are outside the MoE runner split, so both
+        // runners take the same path. This pin carries more weight than its
+        // siblings: the fused scan is the only vendored family that is not
+        // bit-identical to the chain it replaces, so parity-gate.ts pins
+        // "classic" for reference and strict dumps and the bounded tiers grade
+        // "fused" against it.
+        "delta": observed_delta_path()?,
+    }))
+}
+
+/// The gated-DeltaNet path this process actually ran, from the per-layer
+/// counters rather than from `XWEN_DELTA_CLASSIC`.
+///
+/// `LinearAttnBlock::forward` takes the reference scan on more than the
+/// kill-switch: a non-production head dim, a non-Metal device, or a multi-token
+/// chunk under an armed rollback trail all fall back too. An env-derived field
+/// could therefore stamp "fused" on a dump that never dispatched a delta
+/// kernel, and the bounded tiers — the only ones that grade the fused scan —
+/// would compare the reference against itself and pass on nothing. So the dump
+/// records what ran, and refuses to be written at all when that contradicts the
+/// environment or splits across both paths (one dump carries one label; a mixed
+/// run has no honest one).
+fn observed_delta_path() -> Result<&'static str> {
+    let (fused, classic) = xwen::linear_attn::delta_path_counts();
+    let expected = if xwen::ops::delta_classic() {
+        "classic"
+    } else {
+        "fused"
+    };
+    let observed = match (fused, classic) {
+        (0, 0) => anyhow::bail!(
+            "no gated-DeltaNet layer forward ran, so provenance `delta` would claim \
+             {expected:?} for a path this dump never exercised"
+        ),
+        (_, 0) => "fused",
+        (0, _) => "classic",
+        _ => anyhow::bail!(
+            "gated-DeltaNet layers split across both paths ({fused} fused, {classic} classic); \
+             a dump records ONE `delta` provenance and neither label would be true"
+        ),
+    };
+    anyhow::ensure!(
+        observed == expected,
+        "the environment implies delta={expected:?} but {fused} fused / {classic} classic \
+         DeltaNet layer forwards ran (observed {observed:?})"
+    );
+    Ok(observed)
 }
 
 fn main() -> Result<()> {
@@ -483,7 +539,7 @@ fn run_ppl(
         "model": cli.model.display().to_string(),
         "corpus": corpus.display().to_string(),
         "moe_impl": cli.moe_impl,
-        "provenance": provenance(&model, &cli.moe_impl, seq_len),
+        "provenance": provenance(&model, &cli.moe_impl, seq_len)?,
         "tokens": tokens,
         "n_tokens": n_tokens,
         "token_hash": token_hash(&tokens),
@@ -559,7 +615,7 @@ fn run_single(cli: &Cli, mut model: XwenModel, device: &Device, vocab: usize) ->
         "model": cli.model.display().to_string(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
-        "provenance": provenance(&model, &cli.moe_impl, tokens.len()),
+        "provenance": provenance(&model, &cli.moe_impl, tokens.len())?,
         "tokens": tokens,
         "n_tokens": tokens.len(),
         "vocab": vocab,
@@ -638,7 +694,7 @@ fn run_greedy(
         "model": cli.model.display().to_string(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
-        "provenance": provenance(&model, &cli.moe_impl, tokens.len()),
+        "provenance": provenance(&model, &cli.moe_impl, tokens.len())?,
         "tokens": tokens,
         "n_tokens": tokens.len(),
         "vocab": vocab,
@@ -723,7 +779,7 @@ fn run_replay(
         "model": cli.model.display().to_string(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
-        "provenance": provenance(&model, &cli.moe_impl, prompt.len()),
+        "provenance": provenance(&model, &cli.moe_impl, prompt.len())?,
         "tokens": prompt,
         "n_tokens": prompt.len(),
         "vocab": vocab,

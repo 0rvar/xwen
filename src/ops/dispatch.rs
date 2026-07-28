@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, MetalDevice, MetalStorage, Shape, Storage, Tensor};
-use candle_metal_kernels::metal::{Buffer, ComputeCommandEncoder};
+use candle_metal_kernels::metal::{Buffer, ComputeCommandEncoder, ComputePipeline};
 use candle_metal_kernels::source::Source;
 use candle_metal_kernels::utils::EncoderProvider;
 
@@ -2185,6 +2185,481 @@ pub(crate) fn run_rope(
         (heads, seq, head_dim),
         candle_core::op::BackpropOp::none(),
         false,
+    ))
+}
+
+/// Matches the Metal `delta_conv_args` struct (src/ops/delta.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DeltaConvArgs {
+    seq: i32,
+    conv_dim: i32,
+    taps: i32,
+    tail: i32,
+}
+
+/// Matches the Metal `delta_ba_args` struct (src/ops/delta.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DeltaBaArgs {
+    seq: i32,
+    v_heads: i32,
+}
+
+/// Matches the Metal `delta_gnorm_args` struct (src/ops/delta.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DeltaGnormArgs {
+    v_heads: i32,
+    head_dim: i32,
+    eps: f32,
+}
+
+/// Matches the Metal `delta_scan_args` struct (src/ops/delta.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DeltaScanArgs {
+    seq: i32,
+    k_heads: i32,
+    v_heads: i32,
+    conv_dim: i32,
+    scale: f32,
+    eps: f32,
+}
+
+/// The DeltaNet head dim the scan kernel is specialized to. Both checkpoints
+/// run gated DeltaNet at 128 (27B: 16 K-heads / 48 V-heads, 35B-A3B: 16 / 32),
+/// so this is the production geometry, not a restriction that ever binds; a
+/// block at any other head dim keeps the reference scan.
+pub(crate) const DELTA_HEAD_DIM: usize = 128;
+
+/// Threadgroups the scan kernel launches per V-head (`DELTA_HEAD_DIM /
+/// DELTA_TG_COLS` in delta.metal — the value-dim columns split four ways).
+/// Kept in step with the kernel's own `#define` by
+/// `scan_geometry_matches_metal` (src/ops/delta.rs): the grid below is sized
+/// from this copy, so a drift would write outside a head's state slice.
+pub(crate) const DELTA_COL_BLOCKS: usize = 4;
+
+/// The simdgroup width the delta kernels are written against.
+/// `kernel_delta_scan` reduces q/k through `red[2][DELTA_D / 32]` indexed by
+/// simdgroup index, and `kernel_delta_gnorm` folds its sum of squares through a
+/// 32-entry partial row, so a device that executed simdgroups at any other
+/// width would reduce over the wrong lane set (and, in the scan, index past the
+/// reduction row). Every Apple GPU is 32-wide; the assumption is checked at
+/// pipeline setup so it fails at load rather than silently at dispatch.
+const DELTA_SIMD_WIDTH: usize = 32;
+
+/// Refuse a delta pipeline whose simdgroups are not `DELTA_SIMD_WIDTH` wide.
+fn check_delta_simd_width(pipeline: &ComputePipeline, what: &str) -> Result<()> {
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::MTLComputePipelineState;
+
+    let raw: &ProtocolObject<dyn MTLComputePipelineState> = pipeline.as_ref();
+    let width = raw.threadExecutionWidth();
+    if width != DELTA_SIMD_WIDTH {
+        bail!(
+            "{what} is written for {DELTA_SIMD_WIDTH}-wide simdgroups, this device executes \
+             them {width} wide"
+        );
+    }
+    Ok(())
+}
+
+/// Guard on an operand that must be a contiguous f32 tensor of a known shape.
+fn check_f32(t: &Tensor, want: &[usize], what: &str) -> Result<()> {
+    if t.dtype() != DType::F32 {
+        bail!("{what} must be f32, got {:?}", t.dtype());
+    }
+    if t.dims() != want {
+        bail!("{what} shape {:?} must be {want:?}", t.dims());
+    }
+    if !t.is_contiguous() {
+        bail!("{what} must be contiguous");
+    }
+    Ok(())
+}
+
+/// Byte offset of a contiguous f32 tensor's first element inside its buffer.
+fn f32_off(layout: &candle_core::Layout) -> usize {
+    layout.start_offset() * DType::F32.size_in_bytes()
+}
+
+/// Fused causal depthwise conv + silu + next conv window against
+/// `kernel_delta_conv` (delta.metal). `state` is the carried window
+/// `[taps - 1, conv_dim]`, `qkv` this chunk's fused projection rows
+/// `[seq, conv_dim]`, `w` the taps `[taps, conv_dim]` (oldest tap first); all
+/// f32 contiguous. Returns the silu'd conv output `[seq, conv_dim]` and the
+/// window the next call starts from `[taps - 1, conv_dim]`, replacing the
+/// reference's cat + per-tap broadcast chain + silu + slice_set materialization
+/// with ONE pass. Bit-identical to that chain (see delta.metal / the delta.rs
+/// test).
+pub(crate) fn run_delta_conv(state: &Tensor, qkv: &Tensor, w: &Tensor) -> Result<(Tensor, Tensor)> {
+    let cdev = qkv.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("delta_conv requires qkv on a Metal device");
+    };
+
+    let (seq, conv_dim) = qkv
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("qkv must be rank-2 [seq, conv_dim]: {e}"))?;
+    let (taps, w_dim) = w
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("w must be rank-2 [taps, conv_dim]: {e}"))?;
+    if w_dim != conv_dim {
+        bail!("conv taps span {w_dim} channels, expected conv_dim {conv_dim}");
+    }
+    if taps == 0 {
+        bail!("conv needs at least one tap");
+    }
+    let tail = taps - 1;
+    check_f32(qkv, &[seq, conv_dim], "qkv")?;
+    check_f32(w, &[taps, conv_dim], "w")?;
+    check_f32(state, &[tail, conv_dim], "conv state")?;
+    if seq == 0 {
+        bail!("delta_conv needs at least one token");
+    }
+    for (name, t) in [("state", state), ("w", w)] {
+        if !qkv.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as qkv");
+        }
+    }
+    let n = checked_elems(&[seq, conv_dim], "delta_conv")?;
+    glue_index_fits_i32(checked_elems(&[seq + tail, conv_dim], "delta_conv stream")?)?;
+
+    let pipeline = pipelines::delta_pipeline(mdev.device(), "kernel_delta_conv")?;
+    let dst = mdev.new_buffer(n, DType::F32, "delta_conv")?;
+    let nstate_len = tail * conv_dim;
+    let nstate = mdev.new_buffer(nstate_len.max(1), DType::F32, "delta_conv_state")?;
+
+    let (state_guard, state_layout) = state.storage_and_layout();
+    let Storage::Metal(state_storage) = &*state_guard else {
+        bail!("conv state is not on a Metal device");
+    };
+    let (qkv_guard, qkv_layout) = qkv.storage_and_layout();
+    let Storage::Metal(qkv_storage) = &*qkv_guard else {
+        bail!("qkv is not on a Metal device");
+    };
+    let (w_guard, w_layout) = w.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("w is not on a Metal device");
+    };
+
+    let args = DeltaConvArgs {
+        seq: seq as i32,
+        conv_dim: conv_dim as i32,
+        taps: taps as i32,
+        tail: tail as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(state_storage.buffer()), f32_off(state_layout));
+        encoder.set_input_buffer(2, Some(qkv_storage.buffer()), f32_off(qkv_layout));
+        encoder.set_input_buffer(3, Some(w_storage.buffer()), f32_off(w_layout));
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        encoder.set_output_buffer(5, Some(&nstate), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(state_guard);
+    drop(qkv_guard);
+    drop(w_guard);
+
+    Ok((
+        output_tensor(dst, mdev, n, (seq, conv_dim)),
+        output_tensor(nstate, mdev, nstate_len, (tail, conv_dim)),
+    ))
+}
+
+/// Fused beta / log-decay head against `kernel_delta_ba` (delta.metal). `ba` is
+/// the fused `[seq, 2 * v_heads]` beta|alpha projection output, `ssm_a` the
+/// pre-baked `-exp(A_log)` `[v_heads]`, `dt_bias` the dt offset `[v_heads]`.
+/// Returns `beta = sigmoid(b_raw)` and the LOG decay
+/// `g = ssm_a * softplus(a_raw + dt_bias)`, both `[seq, v_heads]` — the scan
+/// kernel exponentiates g, so the reference's separate exp pass is folded away.
+/// Bit-identical to the candle chain given the same `ba` (see the delta.rs test).
+pub(crate) fn run_delta_ba(
+    ba: &Tensor,
+    ssm_a: &Tensor,
+    dt_bias: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = ba.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("delta_ba requires ba on a Metal device");
+    };
+
+    let (seq, two_vh) = ba
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("ba must be rank-2 [seq, 2 * v_heads]: {e}"))?;
+    if two_vh % 2 != 0 {
+        bail!("ba has {two_vh} columns, expected an even 2 * v_heads");
+    }
+    let v_heads = two_vh / 2;
+    check_f32(ba, &[seq, two_vh], "ba")?;
+    check_f32(ssm_a, &[v_heads], "ssm_a")?;
+    check_f32(dt_bias, &[v_heads], "dt_bias")?;
+    if seq == 0 || v_heads == 0 {
+        bail!("delta_ba needs at least one token and one V-head");
+    }
+    for (name, t) in [("ssm_a", ssm_a), ("dt_bias", dt_bias)] {
+        if !ba.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as ba");
+        }
+    }
+    let n = checked_elems(&[seq, v_heads], "delta_ba")?;
+    glue_index_fits_i32(checked_elems(&[seq, two_vh], "delta_ba input")?)?;
+
+    let pipeline = pipelines::delta_pipeline(mdev.device(), "kernel_delta_ba")?;
+    let beta = mdev.new_buffer(n, DType::F32, "delta_beta")?;
+    let g = mdev.new_buffer(n, DType::F32, "delta_g")?;
+
+    let (ba_guard, ba_layout) = ba.storage_and_layout();
+    let Storage::Metal(ba_storage) = &*ba_guard else {
+        bail!("ba is not on a Metal device");
+    };
+    let (a_guard, a_layout) = ssm_a.storage_and_layout();
+    let Storage::Metal(a_storage) = &*a_guard else {
+        bail!("ssm_a is not on a Metal device");
+    };
+    let (dt_guard, dt_layout) = dt_bias.storage_and_layout();
+    let Storage::Metal(dt_storage) = &*dt_guard else {
+        bail!("dt_bias is not on a Metal device");
+    };
+
+    let args = DeltaBaArgs {
+        seq: seq as i32,
+        v_heads: v_heads as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(ba_storage.buffer()), f32_off(ba_layout));
+        encoder.set_input_buffer(2, Some(a_storage.buffer()), f32_off(a_layout));
+        encoder.set_input_buffer(3, Some(dt_storage.buffer()), f32_off(dt_layout));
+        encoder.set_output_buffer(4, Some(&beta), 0);
+        encoder.set_output_buffer(5, Some(&g), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(ba_guard);
+    drop(a_guard);
+    drop(dt_guard);
+
+    Ok((
+        output_tensor(beta, mdev, n, (seq, v_heads)),
+        output_tensor(g, mdev, n, (seq, v_heads)),
+    ))
+}
+
+/// Fused gated output RMSNorm against `kernel_delta_gnorm` (delta.metal):
+/// `rms_norm(o, eps) * ssm_norm_weight * silu(z)` per head, in one pass. `o` is
+/// `[seq, v_heads, head_dim]` f32, `z` the gate projection output in the same
+/// element order, `w` the `[head_dim]` weight. The gate is applied AFTER the
+/// weight and outside the norm, so it does not enter the statistic.
+pub(crate) fn run_delta_gnorm(o: &Tensor, z: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
+    let cdev = o.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("delta_gnorm requires o on a Metal device");
+    };
+
+    let (seq, v_heads, head_dim) = o
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("o must be rank-3 [seq, v_heads, head_dim]: {e}"))?;
+    check_f32(o, &[seq, v_heads, head_dim], "o")?;
+    check_f32(z, &[seq, v_heads, head_dim], "z")?;
+    check_f32(w, &[head_dim], "ssm_norm weight")?;
+    // The sum of squares folds through simd_sum over whole simdgroups, so the
+    // head dim must tile them exactly.
+    if head_dim == 0 || head_dim % 32 != 0 {
+        bail!("delta_gnorm head_dim ({head_dim}) must be a nonzero multiple of 32");
+    }
+    // The grid is one threadgroup per (token, head).
+    if seq == 0 || v_heads == 0 {
+        bail!("delta_gnorm needs at least one token and one head");
+    }
+    for (name, t) in [("z", z), ("ssm_norm weight", w)] {
+        if !o.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as o");
+        }
+    }
+    let n = checked_elems(&[seq, v_heads, head_dim], "delta_gnorm")?;
+    glue_index_fits_i32(n)?;
+
+    let pipeline = pipelines::delta_pipeline(mdev.device(), "kernel_delta_gnorm")?;
+    if pipeline.max_total_threads_per_threadgroup() < head_dim {
+        bail!(
+            "delta_gnorm needs {head_dim} threads per threadgroup, the pipeline allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    check_delta_simd_width(&pipeline, "kernel_delta_gnorm")?;
+    let dst = mdev.new_buffer(n, DType::F32, "delta_gnorm")?;
+
+    let (o_guard, o_layout) = o.storage_and_layout();
+    let Storage::Metal(o_storage) = &*o_guard else {
+        bail!("o is not on a Metal device");
+    };
+    let (z_guard, z_layout) = z.storage_and_layout();
+    let Storage::Metal(z_storage) = &*z_guard else {
+        bail!("z is not on a Metal device");
+    };
+    let (w_guard, w_layout) = w.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("ssm_norm weight is not on a Metal device");
+    };
+
+    let args = DeltaGnormArgs {
+        v_heads: v_heads as i32,
+        head_dim: head_dim as i32,
+        eps,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(o_storage.buffer()), f32_off(o_layout));
+        encoder.set_input_buffer(2, Some(z_storage.buffer()), f32_off(z_layout));
+        encoder.set_input_buffer(3, Some(w_storage.buffer()), f32_off(w_layout));
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        encoder.dispatch_thread_groups(mtl_size!(seq * v_heads, 1, 1), mtl_size!(head_dim, 1, 1));
+    }
+    drop(o_guard);
+    drop(z_guard);
+    drop(w_guard);
+
+    Ok(output_tensor(dst, mdev, n, (seq, v_heads, head_dim)))
+}
+
+/// The delta-rule recurrence against `kernel_delta_scan` (delta.metal): ONE
+/// dispatch advances the whole `[v_heads, head_dim, head_dim]` f32 state across
+/// all `seq` timesteps, reading q/k straight out of the conv output with the
+/// tiled K-head mapping and the L2 clamp-norm folded in. `conv` is
+/// `[seq, conv_dim]` (q | k | v fused, silu'd), `beta` and `g` are
+/// `[seq, v_heads]` (g the LOG decay), `s` the incoming state. Returns the
+/// per-token output `[seq, v_heads, head_dim]` and the state after the last
+/// token, leaving `s` untouched so a caller holding it for a rollback trail
+/// still sees the value it passed in.
+pub(crate) fn run_delta_scan(
+    conv: &Tensor,
+    beta: &Tensor,
+    g: &Tensor,
+    s: &Tensor,
+    k_heads: usize,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = conv.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("delta_scan requires conv on a Metal device");
+    };
+
+    let (seq, conv_dim) = conv
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("conv must be rank-2 [seq, conv_dim]: {e}"))?;
+    let (v_heads, d_k, d_v) = s
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("state must be rank-3 [v_heads, d_k, d_v]: {e}"))?;
+    if d_k != DELTA_HEAD_DIM || d_v != DELTA_HEAD_DIM {
+        bail!(
+            "delta_scan is specialized to head dim {DELTA_HEAD_DIM}, got state [{v_heads}, {d_k}, {d_v}]"
+        );
+    }
+    if k_heads == 0 || v_heads == 0 || v_heads % k_heads != 0 {
+        bail!("v_heads ({v_heads}) must be a nonzero multiple of k_heads ({k_heads})");
+    }
+    let want_conv_dim = (2 * k_heads + v_heads) * DELTA_HEAD_DIM;
+    if conv_dim != want_conv_dim {
+        bail!(
+            "conv width {conv_dim} does not match (2 * {k_heads} + {v_heads}) * {DELTA_HEAD_DIM} = {want_conv_dim}"
+        );
+    }
+    if seq == 0 {
+        bail!("delta_scan needs at least one token");
+    }
+    check_f32(conv, &[seq, conv_dim], "conv")?;
+    check_f32(beta, &[seq, v_heads], "beta")?;
+    check_f32(g, &[seq, v_heads], "g")?;
+    check_f32(s, &[v_heads, d_k, d_v], "delta state")?;
+    for (name, t) in [("beta", beta), ("g", g), ("delta state", s)] {
+        if !conv.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as conv");
+        }
+    }
+    let out_len = checked_elems(&[seq, v_heads, DELTA_HEAD_DIM], "delta_scan out")?;
+    let state_len = checked_elems(&[v_heads, d_k, d_v], "delta_scan state")?;
+    glue_index_fits_i32(checked_elems(&[seq, conv_dim], "delta_scan conv")?)?;
+    glue_index_fits_i32(out_len)?;
+
+    let pipeline = pipelines::delta_pipeline(mdev.device(), "kernel_delta_scan")?;
+    if pipeline.max_total_threads_per_threadgroup() < DELTA_HEAD_DIM {
+        bail!(
+            "delta_scan needs {DELTA_HEAD_DIM} threads per threadgroup, the pipeline allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    check_delta_simd_width(&pipeline, "kernel_delta_scan")?;
+    let out = mdev.new_buffer(out_len, DType::F32, "delta_scan_out")?;
+    let s_out = mdev.new_buffer(state_len, DType::F32, "delta_scan_state")?;
+
+    let (conv_guard, conv_layout) = conv.storage_and_layout();
+    let Storage::Metal(conv_storage) = &*conv_guard else {
+        bail!("conv is not on a Metal device");
+    };
+    let (beta_guard, beta_layout) = beta.storage_and_layout();
+    let Storage::Metal(beta_storage) = &*beta_guard else {
+        bail!("beta is not on a Metal device");
+    };
+    let (g_guard, g_layout) = g.storage_and_layout();
+    let Storage::Metal(g_storage) = &*g_guard else {
+        bail!("g is not on a Metal device");
+    };
+    let (s_guard, s_layout) = s.storage_and_layout();
+    let Storage::Metal(s_storage) = &*s_guard else {
+        bail!("delta state is not on a Metal device");
+    };
+
+    let args = DeltaScanArgs {
+        seq: seq as i32,
+        k_heads: k_heads as i32,
+        v_heads: v_heads as i32,
+        conv_dim: conv_dim as i32,
+        scale: 1.0 / (DELTA_HEAD_DIM as f32).sqrt(),
+        eps,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(conv_storage.buffer()), f32_off(conv_layout));
+        encoder.set_input_buffer(2, Some(beta_storage.buffer()), f32_off(beta_layout));
+        encoder.set_input_buffer(3, Some(g_storage.buffer()), f32_off(g_layout));
+        encoder.set_input_buffer(4, Some(s_storage.buffer()), f32_off(s_layout));
+        encoder.set_output_buffer(5, Some(&out), 0);
+        encoder.set_output_buffer(6, Some(&s_out), 0);
+        encoder.dispatch_thread_groups(
+            mtl_size!(v_heads * DELTA_COL_BLOCKS, 1, 1),
+            mtl_size!(DELTA_HEAD_DIM, 1, 1),
+        );
+    }
+    drop(conv_guard);
+    drop(beta_guard);
+    drop(g_guard);
+    drop(s_guard);
+
+    Ok((
+        output_tensor(out, mdev, out_len, (seq, v_heads, DELTA_HEAD_DIM)),
+        output_tensor(s_out, mdev, state_len, (v_heads, d_k, d_v)),
     ))
 }
 

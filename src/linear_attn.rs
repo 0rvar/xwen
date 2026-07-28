@@ -4,9 +4,12 @@
 //! `ReferenceExperts` is for the MoE FFN: composed candle ops, the recurrent
 //! (token-at-a-time) form only, fp32 state, written to be read against
 //! llama.cpp's `delta-net-base.cpp` rather than to be fast. Prefill costs one
-//! sequential scan step per token. Do not optimize it; the chunked scan and the
-//! fused decode step are separate vendored kernels (TODO P8) that are graded
-//! against this.
+//! sequential scan step per token. Do not optimize it: it is what the vendored
+//! kernels (`ops::delta_*`, reached through `forward_fused`) are graded against,
+//! and what `XWEN_DELTA_CLASSIC` falls back to.
+//!
+//! `forward` picks between the two. Everything below `forward_classic` is the
+//! oracle; `forward_fused` is the shipped path.
 //!
 //! Per token, with `x` the pre-attention normed residual:
 //!
@@ -26,6 +29,8 @@
 //! conv window (the last `kernel-1` columns of the PRE-conv fused stream) and
 //! `S`, both f32, both held by the layer's `LayerCache`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{Context, Result, ensure};
 use candle_core::Tensor;
 use candle_nn::ops::{sigmoid, silu};
@@ -34,6 +39,25 @@ use crate::attention::{AttnWeights, Proj};
 use crate::config::XwenConfig;
 use crate::gguf::Weights;
 use crate::kv_cache::{LayerCache, materialize};
+
+/// DeltaNet layer forwards this process has run down each path.
+///
+/// `forward` decides per call — on the head dim, the device, the
+/// `XWEN_DELTA_CLASSIC` switch, and whether a multi-token chunk meets an armed
+/// rollback trail — so the switch alone does not say which path a run took.
+/// Anything recording provenance reads these instead of the environment, which
+/// is what keeps a bounded parity tier from grading the reference scan against
+/// itself. Counting only; the increment carries no ordering obligation.
+static FUSED_FORWARDS: AtomicU64 = AtomicU64::new(0);
+static CLASSIC_FORWARDS: AtomicU64 = AtomicU64::new(0);
+
+/// `(fused, classic)` DeltaNet layer forwards since process start.
+pub fn delta_path_counts() -> (u64, u64) {
+    (
+        FUSED_FORWARDS.load(Ordering::Relaxed),
+        CLASSIC_FORWARDS.load(Ordering::Relaxed),
+    )
+}
 
 /// `x / max(||x||_2, eps)` over the last axis of a `[seq, heads, dim]` tensor —
 /// the q/k L2 normalization in `ggml_l2_norm`'s form, where eps is a FLOOR ON
@@ -50,7 +74,7 @@ use crate::kv_cache::{LayerCache, materialize};
 /// llama.cpp is the parity ground truth, and a form that merely "cannot matter"
 /// is the kind of thing that turns out to matter once a strict tier asks for
 /// bitwise agreement.
-fn l2_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
+pub(crate) fn l2_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
     let norm = x
         .sqr()?
         .sum_keepdim(2)?
@@ -73,6 +97,10 @@ pub struct LinearAttnBlock {
     /// `[hidden, v_heads]` f32, pre-transposed for the per-forward matmul.
     beta_wt: Tensor,
     alpha_wt: Tensor,
+    /// `[hidden, 2 * v_heads]` f32 — `beta_wt` and `alpha_wt` side by side, so
+    /// the fused path runs ONE gemv where the reference runs two. Column block
+    /// 0 is beta, block 1 is alpha; `ops::delta_ba` reads that layout.
+    ba_wt: Tensor,
     /// `ssm_a`, `[v_heads]` f32 — already `-exp(A_log)`; used as-is.
     ssm_a: Tensor,
     /// `ssm_dt.bias`, `[v_heads]` f32 — the dt offset, not a projection bias.
@@ -127,14 +155,18 @@ impl LinearAttnBlock {
             alpha_w.dim(0)?
         );
 
+        let (beta_wt, alpha_wt) = (beta_w.t()?.contiguous()?, alpha_w.t()?.contiguous()?);
+        let ba_wt = Tensor::cat(&[&beta_wt, &alpha_wt], 1)?.contiguous()?;
+
         let proj = |name: &str| -> Result<Proj> { Proj::load(w, name, weights) };
         Ok(Self {
             qkv: proj("attn_qkv")?,
             z_proj: proj("attn_gate")?,
             out_proj: proj("ssm_out")?,
             conv_w,
-            beta_wt: beta_w.t()?.contiguous()?,
-            alpha_wt: alpha_w.t()?.contiguous()?,
+            beta_wt,
+            alpha_wt,
+            ba_wt,
             ssm_a: w.dense_f32_any("ssm_a")?.flatten_all()?,
             dt_bias: w.dense_f32_any("ssm_dt")?.flatten_all()?,
             norm_w: w.dense_f32("ssm_norm")?.flatten_all()?,
@@ -149,7 +181,65 @@ impl LinearAttnBlock {
     /// `x_normed`: `[seq, hidden]` f32, already through the layer's `attn_norm`.
     /// Advances `cache`'s recurrent state by `seq` tokens. Returns
     /// `[seq, hidden]` f32.
+    ///
+    /// Runs the fused Metal kernels when they apply and the frozen reference
+    /// scan otherwise. The fused path needs a Metal device, the production head
+    /// dim the scan kernel is specialized to, and — because it advances the
+    /// state in one dispatch and can therefore only report the state after the
+    /// LAST token — either a single token or an unarmed rollback trail. A
+    /// multi-token chunk under a live checkpoint takes the reference scan,
+    /// which records one state per token; that is the spec-decode verify walk's
+    /// contract and it is cheap there (the walk steps a block at a time, and
+    /// its per-token decode steps still take the fused path).
     pub fn forward(&self, x_normed: &Tensor, cache: &mut LayerCache) -> Result<Tensor> {
+        let seq = x_normed.dim(0)?;
+        let fused = self.head_dim == crate::ops::DELTA_HEAD_DIM
+            && !crate::ops::delta_classic()
+            && x_normed.device().is_metal()
+            && (seq == 1 || !cache.linear_trail_armed());
+        if fused {
+            self.forward_fused(x_normed, cache)
+        } else {
+            self.forward_classic(x_normed, cache)
+        }
+    }
+
+    /// The fused path: eight dispatches per layer at any sequence length —
+    /// three projections, the conv+silu+state kernel, the beta/decay head, the
+    /// whole recurrent scan, the gated output norm, and the output projection.
+    fn forward_fused(&self, x_normed: &Tensor, cache: &mut LayerCache) -> Result<Tensor> {
+        FUSED_FORWARDS.fetch_add(1, Ordering::Relaxed);
+        let seq = x_normed.dim(0)?;
+        let v_dim = self.v_heads * self.head_dim;
+
+        let qkv = self.qkv.forward(x_normed)?; // [seq, conv_dim]
+        let (conv_state, s) = cache.linear_state()?;
+        let (conv, next_conv_state) = crate::ops::delta_conv(&conv_state, &qkv, &self.conv_w)?;
+
+        // beta and the decay come from the layer INPUT, not the conv output.
+        let ba = x_normed.matmul(&self.ba_wt)?; // [seq, 2 * v_heads]
+        let (beta, g) = crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)?;
+
+        let z = self.z_proj.forward(x_normed)?; // [seq, v_dim]
+
+        let (o, next_s) =
+            crate::ops::delta_scan(&conv, &beta, &g, &s, self.k_heads, self.rms_eps as f32)?;
+        cache.advance_linear(seq, vec![(next_conv_state, next_s)])?;
+
+        let o = crate::ops::delta_gnorm(
+            &o,
+            &z.reshape((seq, self.v_heads, self.head_dim))?,
+            &self.norm_w,
+            self.rms_eps as f32,
+        )?;
+        self.out_proj.forward(&o.reshape((seq, v_dim))?)
+    }
+
+    /// The FROZEN reference scan (see the module header). Never optimize it: it
+    /// is the oracle the fused kernels are graded against, and the
+    /// `XWEN_DELTA_CLASSIC` fallback.
+    fn forward_classic(&self, x_normed: &Tensor, cache: &mut LayerCache) -> Result<Tensor> {
+        CLASSIC_FORWARDS.fetch_add(1, Ordering::Relaxed);
         let (seq, _hidden) = x_normed.dims2()?;
         let (hd, kh, vh) = (self.head_dim, self.k_heads, self.v_heads);
         let (k_dim, v_dim) = (kh * hd, vh * hd);
@@ -245,7 +335,7 @@ impl LinearAttnBlock {
 /// Broadcast `[seq, k_heads, dim]` up to `[seq, v_heads, dim]` by TILING: output
 /// head j reads input head `j % k_heads`. This is ggml's plain repeat, and the
 /// order the GGUF's permuted V-side weights expect.
-fn tile_heads(x: &Tensor, v_heads: usize) -> Result<Tensor> {
+pub(crate) fn tile_heads(x: &Tensor, v_heads: usize) -> Result<Tensor> {
     let k_heads = x.dim(1)?;
     if k_heads == v_heads {
         return Ok(x.contiguous()?);
@@ -331,6 +421,13 @@ mod tests {
     }
 
     fn build(raw: &Raw, cfg: &XwenConfig) -> LinearAttnBlock {
+        build_on(raw, cfg, &dev())
+    }
+
+    /// `build`, with the block's weights landing on `device`. The raw tensors
+    /// are written to a throwaway GGUF from the CPU either way; only the load
+    /// device differs, so a Metal block and a CPU block hold the same bits.
+    fn build_on(raw: &Raw, cfg: &XwenConfig, device: &Device) -> LinearAttnBlock {
         let q = |t: &Tensor| QTensor::quantize(t, GgmlDType::F32).unwrap();
         let (qkv, gate, out, conv, beta, alpha, a, dt, norm) = (
             q(&raw.qkv),
@@ -361,7 +458,7 @@ mod tests {
             let mut f = std::fs::File::create(&path).unwrap();
             candle_core::quantized::gguf_file::write(&mut f, &[], &tensors).unwrap();
         }
-        let src = crate::gguf::open(&path, &dev()).unwrap();
+        let src = crate::gguf::open(&path, device).unwrap();
         let w = Weights::from_gguf(src).pp("blk.0");
         let block = LinearAttnBlock::new(&w, cfg, AttnWeights::DequantF32).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -403,7 +500,11 @@ mod tests {
     }
 
     fn cache_for(cfg: &XwenConfig) -> LayerCache {
-        LayerCache::new(cfg, 0, 16, &dev()).unwrap()
+        cache_on(cfg, &dev(), 16)
+    }
+
+    fn cache_on(cfg: &XwenConfig, device: &Device, max_ctx: usize) -> LayerCache {
+        LayerCache::new(cfg, 0, max_ctx, device).unwrap()
     }
 
     fn to_vec2(t: &Tensor) -> Vec<Vec<f32>> {
@@ -655,6 +756,190 @@ mod tests {
                 vec![2.0, 3.0]
             ]
         );
+    }
+
+    /// Deterministic pseudo-random f32s in [-0.5, 0.5] (xorshift-free LCG, no
+    /// deps) — the generator the streaming test already uses, lifted so the
+    /// Metal tests can share it.
+    fn seeded_vec(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((s >> 33) as f32 / u32::MAX as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// A block whose weights are all pseudo-random at head dim 128 — the dim the
+    /// fused kernels are specialized to — so both paths run the real recurrence
+    /// rather than a degenerate one.
+    fn random_block(cfg: &XwenConfig, hidden: usize, seed: u64) -> Raw {
+        let conv_dim = cfg.conv_dim();
+        let v_dim = cfg.linear_v_dim();
+        let vh = cfg.linear_v_heads;
+        Raw {
+            qkv: t2(seeded_vec(conv_dim * hidden, seed), conv_dim, hidden),
+            gate: t2(seeded_vec(v_dim * hidden, seed + 1), v_dim, hidden),
+            out: t2(seeded_vec(hidden * v_dim, seed + 2), hidden, v_dim),
+            conv: Tensor::from_vec(
+                seeded_vec(conv_dim * cfg.conv_kernel, seed + 3),
+                (conv_dim, cfg.conv_kernel),
+                &dev(),
+            )
+            .unwrap(),
+            beta: t2(seeded_vec(vh * hidden, seed + 4), vh, hidden),
+            alpha: t2(seeded_vec(vh * hidden, seed + 5), vh, hidden),
+            // Real decay: negative a, so exp(g) is strictly inside (0, 1).
+            a: t1(seeded_vec(vh, seed + 6).iter().map(|v| v - 1.0).collect()),
+            dt_bias: t1(seeded_vec(vh, seed + 7)),
+            norm: t1(seeded_vec(hd_of(cfg), seed + 8)
+                .iter()
+                .map(|v| 1.0 + v)
+                .collect()),
+        }
+    }
+
+    fn hd_of(cfg: &XwenConfig) -> usize {
+        cfg.linear_head_dim
+    }
+
+    fn flat(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    fn assert_all_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length mismatch");
+        for (i, (a, b)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (a - b).abs() <= tol * (1.0 + b.abs()),
+                "{what}: element {i} fused {a} vs reference {b}"
+            );
+        }
+    }
+
+    /// The fused Metal path must reproduce the frozen reference scan end to end
+    /// — the layer output AND the recurrent state it leaves in the cache — at
+    /// the head dim the kernels are specialized to. Two head ratios: V-heads
+    /// twice the K-heads (so the tiled broadcast is exercised) and the shipped
+    /// 16-to-32 ratio. Decode, a short chunk and a prefill chunk each go
+    /// through, because the scan kernel's state handling differs between one
+    /// timestep and many.
+    ///
+    /// This is the test that grades the kernels as a package: a wrong fused
+    /// beta|alpha column order, a mis-shaped gate reshape or a cache advance
+    /// that stored the wrong state all show up here and nowhere in the per-op
+    /// tests.
+    #[test]
+    fn fused_path_matches_the_reference_scan() {
+        let Ok(metal) = crate::gguf::metal_device() else {
+            return;
+        };
+        for &(kh, vh, hidden) in &[(2usize, 4usize, 256usize), (16, 32, 256)] {
+            let cfg = cfg_for(kh, vh, 128, hidden);
+            let raw = random_block(&cfg, hidden, 0x100 + kh as u64 * 7 + vh as u64);
+            let block = build_on(&raw, &cfg, &metal);
+
+            for &seq in &[1usize, 5, 64] {
+                let x = Tensor::from_vec(
+                    seeded_vec(seq * hidden, 0x900 + seq as u64),
+                    (seq, hidden),
+                    &metal,
+                )
+                .unwrap();
+
+                let mut fused_cache = cache_on(&cfg, &metal, 128);
+                let fused = block.forward(&x, &mut fused_cache).unwrap();
+                let (fused_conv, fused_delta) = fused_cache.linear_state().unwrap();
+
+                let mut ref_cache = cache_on(&cfg, &metal, 128);
+                let reference = block.forward_classic(&x, &mut ref_cache).unwrap();
+                let (ref_conv, ref_delta) = ref_cache.linear_state().unwrap();
+
+                let label = format!("k={kh} v={vh} seq={seq}");
+                assert_all_close(
+                    &flat(&fused),
+                    &flat(&reference),
+                    2e-4,
+                    &format!("{label} out"),
+                );
+                assert_all_close(
+                    &flat(&fused_conv),
+                    &flat(&ref_conv),
+                    1e-6,
+                    &format!("{label} conv window"),
+                );
+                assert_all_close(
+                    &flat(&fused_delta),
+                    &flat(&ref_delta),
+                    2e-5,
+                    &format!("{label} delta state"),
+                );
+            }
+        }
+    }
+
+    /// Decoding one token at a time through the fused path must land where one
+    /// batched fused prefill lands — the property that makes decode-after-
+    /// prefill correct, now that the conv window and the delta state cross the
+    /// call boundary through kernel-written buffers rather than candle slices.
+    #[test]
+    fn fused_streaming_matches_one_fused_batch() {
+        let Ok(metal) = crate::gguf::metal_device() else {
+            return;
+        };
+        let (kh, vh, hidden, seq) = (16usize, 32usize, 256usize, 7usize);
+        let cfg = cfg_for(kh, vh, 128, hidden);
+        let block = build_on(&random_block(&cfg, hidden, 0x300), &cfg, &metal);
+        let x = Tensor::from_vec(seeded_vec(seq * hidden, 0x301), (seq, hidden), &metal).unwrap();
+
+        let mut batch_cache = cache_on(&cfg, &metal, 32);
+        let batched = flat(&block.forward(&x, &mut batch_cache).unwrap());
+
+        let mut step_cache = cache_on(&cfg, &metal, 32);
+        let mut streamed = Vec::new();
+        for t in 0..seq {
+            let row = x.narrow(0, t, 1).unwrap().contiguous().unwrap();
+            streamed.extend(flat(&block.forward(&row, &mut step_cache).unwrap()));
+        }
+        assert_eq!(step_cache.len(), seq, "the cache advanced once per token");
+        assert_all_close(&streamed, &batched, 2e-4, "streamed vs batched");
+    }
+
+    /// A live rollback checkpoint needs the state after EVERY token of the
+    /// verify span, which the one-dispatch scan cannot report — so a multi-token
+    /// chunk under an armed layer takes the reference scan instead, and the
+    /// trail comes out one entry per token. A single token still takes the
+    /// fused path: its only state IS the state after the last token.
+    #[test]
+    fn an_armed_checkpoint_keeps_multi_token_chunks_on_the_reference_scan() {
+        let Ok(metal) = crate::gguf::metal_device() else {
+            return;
+        };
+        let (kh, vh, hidden) = (16usize, 32usize, 256usize);
+        let cfg = cfg_for(kh, vh, 128, hidden);
+        let block = build_on(&random_block(&cfg, hidden, 0x400), &cfg, &metal);
+
+        let mut cache = cache_on(&cfg, &metal, 32);
+        cache.checkpoint(6).unwrap();
+        assert!(cache.linear_trail_armed(), "the checkpoint arms the layer");
+
+        // A four-token chunk: the armed layer must come out with four recorded
+        // states, which only the per-token reference scan produces.
+        let x = Tensor::from_vec(seeded_vec(4 * hidden, 0x401), (4, hidden), &metal).unwrap();
+        block.forward(&x, &mut cache).unwrap();
+        assert_eq!(cache.len(), 4);
+
+        // Two more single tokens take the fused path and still record one state
+        // each, so the trail stays one-per-token across the mix.
+        for t in 0..2usize {
+            let row = Tensor::from_vec(seeded_vec(hidden, 0x402 + t as u64), (1, hidden), &metal)
+                .unwrap();
+            block.forward(&row, &mut cache).unwrap();
+        }
+        assert_eq!(cache.len(), 6, "the armed span filled exactly");
     }
 
     /// The L2 normalization floors the NORM at eps rather than adding eps under

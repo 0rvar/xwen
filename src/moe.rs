@@ -652,21 +652,24 @@ mod tests {
 
         use crate::sampler::{Sampler, SamplerOptions};
 
-        const HIDDEN: usize = 3072;
-        /// GGUF `laguna.expert_feed_forward_length` (and
-        /// `expert_shared_feed_forward_length` — both 1024 in the Q4_K_M file).
-        const EXPERT_FF: usize = 1024;
-        const SHARED_FF: usize = 1024;
+        const HIDDEN: usize = 2048;
+        /// GGUF `qwen35moe.expert_feed_forward_length` (and
+        /// `expert_shared_feed_forward_length` — both 512 in the Q4_K_M file).
+        const EXPERT_FF: usize = 512;
+        const SHARED_FF: usize = 512;
         const N_EXPERT: usize = 256;
-        const TOP_K: usize = 10;
-        const VOCAB: usize = 100352;
-        /// Layers 1..47 of the real model are MoE; results are scaled to this.
-        const MOE_LAYERS: usize = 47;
-        /// Memory constraint: 47 distinct synthetic layers would be ~50GB of
-        /// expert stacks, so build 4 distinct layers (~5.5GB) and loop them 12
-        /// times per iter — 48 layer-evals, scaled by 47/48 when printed.
+        const TOP_K: usize = 8;
+        const VOCAB: usize = 248320;
+        /// Every layer of the 35B-A3B is MoE; results are scaled to this.
+        const MOE_LAYERS: usize = 40;
+        /// Memory constraint: 40 distinct synthetic layers would be ~18GB of
+        /// expert stacks, so build 4 distinct layers (~1.8GB) and loop them 10
+        /// times per iter — exactly 40 layer-evals.
         const N_DISTINCT: usize = 4;
-        const PASSES: usize = 12;
+        const PASSES: usize = 10;
+        /// Row-block height for the tiled synthetic `[VOCAB, HIDDEN]` tables;
+        /// must divide VOCAB (248320 = 485 x 512).
+        const VOCAB_TILE: usize = 512;
 
         fn metal() -> Device {
             Device::new_metal(0).expect("decode benches require the Metal device")
@@ -799,30 +802,30 @@ mod tests {
         }
 
         /// The f16 token-embedding table `[VOCAB, HIDDEN]` production keeps on
-        /// Metal, as 98 tiled row-blocks (lookup timing is value-independent).
+        /// Metal, as tiled row-blocks (lookup timing is value-independent).
         fn build_embed(dev: &Device) -> Tensor {
-            let block = det_tensor(&[1024, HIDDEN], 0x111, 1.0)
+            let block = det_tensor(&[VOCAB_TILE, HIDDEN], 0x111, 1.0)
                 .to_device(dev)
                 .unwrap()
                 .to_dtype(DType::F16)
                 .unwrap();
-            let tiles: Vec<Tensor> = vec![block; VOCAB / 1024];
+            let tiles: Vec<Tensor> = vec![block; VOCAB / VOCAB_TILE];
             let embed = Tensor::cat(&tiles.iter().collect::<Vec<_>>(), 0).unwrap();
             assert_eq!(embed.dims(), &[VOCAB, HIDDEN]);
             embed
         }
 
-        /// A synthetic q6_K lm_head `[VOCAB, HIDDEN]` from 98 tiled quantized
+        /// A synthetic q6_K lm_head `[VOCAB, HIDDEN]` from tiled quantized
         /// row-blocks (mv timing is value-independent). Same zero-copy
         /// construction as `gguf::qlinear_with_buffer`: the buffer is retained
         /// before the storage moves into the QTensor, and the QTensor must be
         /// kept alive so the shared allocation stays resident.
         fn build_lm_head(dev: &Device) -> (Arc<candle_metal_kernels::metal::Buffer>, Arc<QTensor>) {
-            let one = det_tensor(&[1024, HIDDEN], 0x333, 0.5);
+            let one = det_tensor(&[VOCAB_TILE, HIDDEN], 0x333, 0.5);
             let qt = QTensor::quantize(&one, GgmlDType::Q6K).unwrap();
             let bytes = qt.data().unwrap();
-            let mut all = Vec::with_capacity(bytes.len() * (VOCAB / 1024));
-            for _ in 0..VOCAB / 1024 {
+            let mut all = Vec::with_capacity(bytes.len() * (VOCAB / VOCAB_TILE));
+            for _ in 0..VOCAB / VOCAB_TILE {
                 all.extend_from_slice(&bytes);
             }
             let storage = QStorage::from_data(Cow::Owned(all), dev, GgmlDType::Q6K).unwrap();
@@ -919,19 +922,19 @@ mod tests {
                 read_scalar(&x)
             });
 
-            let scale47 = |ms: f64| ms * MOE_LAYERS as f64 / evals as f64;
+            let scaled = |ms: f64| ms * MOE_LAYERS as f64 / evals as f64;
             eprintln!("{MOE_LAYERS}-layer-equivalent per token:");
-            eprintln!("  full MoE FFN half:   {:.3} ms", scale47(full));
-            eprintln!("  routing:             {:.3} ms", scale47(routing));
-            eprintln!("  shared expert:       {:.3} ms", scale47(shared));
-            eprintln!("  ffn_norm + residual: {:.3} ms", scale47(normres));
+            eprintln!("  full MoE FFN half:   {:.3} ms", scaled(full));
+            eprintln!("  routing:             {:.3} ms", scaled(routing));
+            eprintln!("  shared expert:       {:.3} ms", scaled(shared));
+            eprintln!("  ffn_norm + residual: {:.3} ms", scaled(normres));
             eprintln!(
                 "  derived mv_id gather + silu*mul + weighted combine: {:.3} ms",
-                scale47(full - routing - shared - normres)
+                scaled(full - routing - shared - normres)
             );
             eprintln!(
                 "caveat: {N_DISTINCT} distinct layers looped {PASSES}x — repeated expert-stack \
-                 reads may be SLC-cached more than 47 distinct layers would be; treat \
+                 reads may be SLC-cached more than {MOE_LAYERS} distinct layers would be; treat \
                  expert-read numbers as a lower bound"
             );
         }
@@ -946,7 +949,7 @@ mod tests {
         fn sampler_decode_bench() {
             let dev = metal();
             eprintln!(
-                "building synthetic f16 embedding [{VOCAB}, {HIDDEN}] (~0.6GB; 98 tiled \
+                "building synthetic f16 embedding [{VOCAB}, {HIDDEN}] (~1.0GB; tiled \
                  row-blocks — lookup timing is value-independent) + logits pool..."
             );
             let embed = build_embed(&dev);
@@ -959,7 +962,23 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
-            let mut sampler = Sampler::new(SamplerOptions::default(), vec![]);
+            // Drawing over the full synthetic row measures the widest the
+            // sampler ever works; the real encodable bound is a couple of
+            // hundred ids narrower, which is below this bench's resolution.
+            let mut sampler = Sampler::new(SamplerOptions::default(), vec![], VOCAB);
+
+            // Attribution floor: the GPU->CPU copy of the [VOCAB] f32 row every
+            // sampling strategy has to pay, with no sampling on top.
+            let mut r = 0usize;
+            let readback = bench("logits readback only (GPU->CPU f32 copy)", || {
+                let v = pool[r % POOL]
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                r += 1;
+                v[0]
+            });
 
             let mut i = 0usize;
             let sample_only = bench("sampler only (logits readback + CPU top-k sample)", || {
@@ -967,6 +986,10 @@ mod tests {
                 i += 1;
                 t as f32
             });
+            eprintln!(
+                "derived CPU sampling work (sampler minus readback): {:.3} ms",
+                sample_only - readback
+            );
             let mut j = 0usize;
             let full = bench(
                 "sampler + token upload + f16 embed gather + f32 upcast",
@@ -1002,7 +1025,7 @@ mod tests {
         fn token_tail_bench() {
             let dev = metal();
             eprintln!(
-                "building synthetic q6_K lm_head [{VOCAB}, {HIDDEN}] (~0.3GB; 98 tiled \
+                "building synthetic q6_K lm_head [{VOCAB}, {HIDDEN}] (~0.4GB; tiled \
                  quantized row-blocks — mv timing is value-independent)..."
             );
             let (buffer, qtensor) = build_lm_head(&dev);

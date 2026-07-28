@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 5;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 6;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -53,6 +53,14 @@ pub struct ProvenanceField {
 /// are always freshly generated at the current version and never rely on the
 /// grandfather; only the cached (committed) reference dumps do, and those are all
 /// f32-bypass, so grandfathering to it keeps them valid.
+/// Version 6: delta (the gated-DeltaNet layer path: "fused" for the vendored
+/// conv/beta/scan/norm kernels, "classic" for the frozen reference scan under
+/// XWEN_DELTA_CLASSIC). Grandfather "classic": every pre-v6 binary had only the
+/// reference scan, which is also the value the oracle carries, so the cached
+/// reference dumps stay valid. This field matters more than its siblings — the
+/// fused delta scan is the one vendored family that is NOT bit-identical to the
+/// chain it replaces, so a reference dump that quietly ran it would make the
+/// bounded tiers grade the fused path against itself.
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_impl",
@@ -118,6 +126,11 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
         name: "attn_decode",
         introduced: 5,
         grandfather: Some("f32-bypass"),
+    },
+    ProvenanceField {
+        name: "delta",
+        introduced: 6,
+        grandfather: Some("classic"),
     },
 ];
 

@@ -221,7 +221,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k.startsWith("XWEN_MM_ID")) continue;
+    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k.startsWith("XWEN_MM_ID")) continue;
     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
     // those explicitly per run; an inherited one would skew every tier.
     if (k.startsWith("XWEN_PARITY_")) continue;
@@ -247,11 +247,16 @@ function baseEnv(): Record<string, string> {
  * classic pins. `XWEN_ATTN_MM_CLASSIC=1` is pinned too,
  * defensively: under `XWEN_ATTN_F32` the f16 mm branch never runs (provenance
  * stays "f32-bypass"), but the pin keeps the oracle off the tensor gemm even if
- * the attention pin ever changes. Candidate dumps use baseEnv() and run
- * whatever path their tier is gating.
+ * the attention pin ever changes. The gated-DeltaNet layers are pinned to the
+ * frozen reference scan (`XWEN_DELTA_CLASSIC=1`) — and this pin is LOAD-BEARING
+ * rather than defensive: unlike the other fused kernels the delta scan is
+ * bounded-close, not bit-identical (it partitions the k/q contractions across
+ * threads where the reference runs a gemm), so it belongs on the candidate side
+ * of the bounded tiers and must be absent from the oracle. Candidate dumps use
+ * baseEnv() and run whatever path their tier is gating.
  */
 function referenceEnv(): Record<string, string> {
-  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1" };
+  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1" };
 }
 
 /** Experiment flags (--sdpa-f32 / --attn-mm-classic / --flash-classic), set once in main. */
@@ -317,12 +322,45 @@ async function tailLog(logPath: string, lines = 30): Promise<string> {
 
 // --------------------------------------------------------------- preflight
 
+/** Basename of `argv[0]` for a `pgrep -fl` line ("<pid> <argv0> <args...>"). */
+function execName(pgrepLine: string): string {
+  const argv0 = pgrepLine.trim().split(/\s+/)[1] ?? "";
+  return argv0.split("/").pop() ?? "";
+}
+
+/** Is this `pgrep -fl` line a process EXECUTING one of our model binaries? */
+export function isModelProcess(pgrepLine: string): boolean {
+  return /^(logits-dump|xwen|llama-(cli|server|bench|eval-callback)|parity-[0-9a-f]+)$/.test(
+    execName(pgrepLine),
+  );
+}
+
 /**
  * Abort if any ~70GB model process is already running (concurrent loads OOM the
- * GPU). `pgrep -fl` matches the whole command line, so a stale logits-dump or
- * llama-* is caught by the "xwen|llama" in its model-path argument. Our own
- * runner (and its bun/logits-dump children we are about to await) are excluded
- * by pid and by the script name.
+ * GPU).
+ *
+ * The test is on **argv[0]** — the executable the process is actually running —
+ * NOT on whether the command line mentions one of our binaries somewhere. That
+ * distinction is the whole guard: `pgrep -f` matches the full argv, so a wrapper
+ * shell that merely QUOTES a command (`until …; do sleep 20; done;
+ * ./target/release/logits-dump …`, a `zsh -c` one-liner, a `git diff --
+ * src/bin/logits-dump.rs`) matched the old pattern and aborted runs over a model
+ * process that did not exist. Both agents on this repo hit that within an hour of
+ * each other. A wrapper's argv[0] is `/bin/zsh`, so argv[0] rejects it
+ * structurally rather than by guessing at shell syntax.
+ *
+ * `pgrep -x` (match the process NAME exactly) gets the same structural property and
+ * is cleaner in principle. It does work here — measured on this machine,
+ * `pgrep -x bun` returns 3 and `pgrep -f bun` returns 15, so `-x` both matches live
+ * processes and drops the twelve that merely mention "bun" in their argv. argv[0] is
+ * preferred anyway for one reason: it is a pure function of a line of `pgrep -fl`
+ * output, so `isModelProcess` is unit-testable offline against captured lines from
+ * real incidents, which a `-x` invocation is not. Testability beats elegance for a
+ * guard whose failure mode is a concurrent 20 GB load.
+ *
+ * (If you re-test `-x` yourself, pick a target you can independently confirm is
+ * visible: `pgrep zsh` returns 0 in every form in the agent sandbox, which reads as
+ * "-x is broken" and is really "that process is invisible to pgrep here".)
  */
 async function preflight(what: string): Promise<void> {
   const proc = Bun.spawn({ cmd: ["pgrep", "-fl", "xwen|llama"], stdout: "pipe", stderr: "ignore" });
@@ -335,19 +373,7 @@ async function preflight(what: string): Promise<void> {
     .filter((l) => {
       const pid = Number.parseInt(l.split(/\s+/)[0], 10);
       if (pid === process.pid) return false;
-      // A shell whose ARGV merely quotes one of these commands (an agent's
-      // `until …; do sleep; done; ./target/release/logits-dump …` wrapper, a
-      // `zsh -c` one-liner) is not a model process — it is text about one. Only
-      // treat a line as an offender when the matched command is what the process
-      // is actually executing, i.e. argv[1] is the binary, not a `-c` script.
-      if (/^\s*\d+\s+\S*\/?(?:z|ba|)sh\b.*\s-c\b/.test(l)) return false;
-      // `pgrep -f "xwen|llama"` also matches innocent shells/editors/watchers
-      // whose command line merely mentions the repo path, a parity log,
-      // or a source file (`git diff -- src/bin/logits-dump.rs` is not a model
-      // process). The hazard is another ~70GB LOAD, so require a real
-      // model-process signature: one of our built binaries, a llama.cpp binary
-      // (`llama-*` as a path segment), or a process holding a `.gguf` open.
-      return /target\/release\/(logits-dump|xwen|deps\/parity)|(^|[/\s])llama-(cli|server|bench|eval-callback)|\.gguf/.test(l);
+      return isModelProcess(l);
     });
   if (offenders.length) {
     console.error(`\nparity-gate: refusing to start ${what} — a model process is already running:`);
@@ -387,7 +413,11 @@ async function fixtureTokens(id: string): Promise<string> {
  *  candle sdpa prefill),
  *  AND act=="classic" (the Reference oracle's ReferenceExperts always runs the
  *  candle silu*mul chain — grandfathered for dumps predating schema v4, whose
- *  binaries all ran that chain). A
+ *  binaries all ran that chain),
+ *  AND delta=="classic" (referenceEnv() pins XWEN_DELTA_CLASSIC=1 — the fused
+ *  delta scan is bounded-close rather than bit-identical, so an oracle that ran
+ *  it would grade the fused path against itself; grandfathered for dumps
+ *  predating schema v6, whose binaries had only the reference scan). A
  *  dump missing any field predates it and the Rust gate hard-fails on it, so
  *  regenerate here instead of failing after an expensive candidate run. `kind`
  *  (when given) must also match. Any parse/shape problem returns false
@@ -409,6 +439,7 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
     const sdpa = p.sdpa ?? (version < 2 ? "f16" : undefined);
     const flash = p.flash ?? (version < 3 ? "classic" : undefined);
     const act = p.act ?? (version < 4 ? "classic" : undefined);
+    const delta = p.delta ?? (version < 6 ? "classic" : undefined);
     return (
       p.moe_impl === "reference" &&
       p.attn_dtype === "f32" &&
@@ -417,7 +448,8 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
       p.attn_glue === "classic" &&
       sdpa === "f16" &&
       flash === "classic" &&
-      act === "classic"
+      act === "classic" &&
+      delta === "classic"
     );
   } catch {
     return false;
@@ -586,12 +618,17 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   // to the candle sdpa chain (the path the 0.999 anchor was blessed with), and
   // XWEN_ACT_CLASSIC=1 pins the routed-expert SwiGLU activation to the candle
   // silu*mul chain (bit-identical to the fused kernel, so it only matches the
-  // oracle's blessed path). mm runs the default mm_id prefill
+  // oracle's blessed path). XWEN_DELTA_CLASSIC=1 pins the gated-DeltaNet layers
+  // to the frozen reference scan: the fused delta kernels are the one vendored
+  // family that is NOT bit-identical (the scan partitions its contractions),
+  // so leaving them on would turn the bitwise strict tier into a bounded one.
+  // The fused delta path is graded by the mm / decode / ppl tiers instead,
+  // which is where it runs by default. mm runs the default mm_id prefill
   // (code-short's 58 tokens are >= MM_ID_MIN_SEQ) with the default f16 attention.
   // Only the mm candidate picks up the experiment flags (candidateEnv); strict
   // stays pinned to the exact env its 0.999 anchor was blessed with.
   const env = tier === "strict"
-    ? { ...baseEnv(), XWEN_NO_MM_ID: "1", XWEN_MV_CLASSIC: "1", XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1" }
+    ? { ...baseEnv(), XWEN_NO_MM_ID: "1", XWEN_MV_CLASSIC: "1", XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1" }
     : candidateEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);
@@ -808,7 +845,14 @@ async function main() {
   process.exit(failed === 0 ? 0 : 1);
 }
 
-main().catch((e) => {
-  console.error("parity-gate: unexpected error:", e);
-  process.exit(1);
-});
+// Guarded: without this, `import { isModelProcess } from "./parity-gate.ts"` runs
+// the ENTIRE gate as a side effect of the import — ~40 s of model time on a warm
+// cache, and a cold one would launch 20 GB loads nobody asked for. Found the hard
+// way while unit-testing the preflight matcher. Anything importable from this
+// module must stay behind this guard.
+if (import.meta.main) {
+  main().catch((e) => {
+    console.error("parity-gate: unexpected error:", e);
+    process.exit(1);
+  });
+}

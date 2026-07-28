@@ -1,6 +1,7 @@
 pub mod attn_glue;
 pub mod bf16;
 pub mod combine;
+pub mod delta;
 mod dispatch;
 pub mod f16;
 pub mod flash;
@@ -13,6 +14,7 @@ pub mod silu_mul;
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
 pub use bf16::matmul_bf16;
 pub use combine::combine;
+pub use delta::{DELTA_HEAD_DIM, delta_ba, delta_conv, delta_gnorm, delta_scan};
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
 pub use flash::flash_attn;
@@ -145,6 +147,27 @@ pub fn attn_glue_classic() -> bool {
 pub fn flash_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_FLASH_CLASSIC").is_some())
+}
+
+/// `XWEN_DELTA_CLASSIC=1` reverts the gated-DeltaNet layers from the vendored
+/// fused kernels (`ops::delta_*` — conv+silu+state, beta/decay head, recurrent
+/// scan, gated output norm, plus the load-time fused beta|alpha projection)
+/// back to `LinearAttnBlock::forward_classic`, the frozen reference scan: the
+/// composed-candle recurrent form, one step per token.
+///
+/// Unlike the combine/act/glue switches this one is NOT a bit-identity anchor.
+/// The scan kernel partitions the k- and q-contractions across threads where
+/// the reference runs a candle gemm, and folds the q/k L2 norm through
+/// simd_sum, so its result is bounded-close rather than bitwise — which is why
+/// the parity gate pins this switch on BOTH sides of the strict tier and lets
+/// the mm / decode / ppl tiers carry the real signal (docs/parity.md).
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`combine_classic`, `flash_classic`): any value enables it — only leaving it
+/// unset keeps the fused path.
+pub fn delta_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_DELTA_CLASSIC").is_some())
 }
 
 /// `XWEN_SDPA_F32` runs the sdpa attention kernel in f32 instead of the

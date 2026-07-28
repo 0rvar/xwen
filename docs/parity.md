@@ -217,9 +217,33 @@ failure.
 
 The preflight exits 3 and names the offending process — including your own
 `xwen generate` in another terminal, which is the common case. It deliberately does
-NOT kill anything. A wrapper shell whose argv merely quotes one of these commands is
-not treated as an offender (`sh -c` lines are filtered out), so waiting on the gate
-from a script does not trip its own check.
+NOT kill anything.
+
+**The preflight tests `argv[0]`, not the command line.** `pgrep -f` matches the whole
+argv, so any wrapper that merely QUOTES one of these commands — an `until …; do sleep;
+done; ./target/release/logits-dump …` waiter, a `zsh -c` one-liner, even
+`git diff -- src/bin/logits-dump.rs` — used to abort a run over a model process that
+did not exist. Both agents working this repo hit it within an hour of each other, so
+it is a footgun rather than a curiosity. A wrapper's `argv[0]` is `/bin/zsh`, so
+matching on the executable actually being run rejects it structurally instead of
+guessing at shell syntax. `isModelProcess` is exported and unit-tested offline against
+captured `pgrep -fl` lines, both the real processes it must catch and the wrappers it
+must ignore. (`pgrep -x` gets the same structural property and does work here —
+measured, `pgrep -x bun` returns 3 against `pgrep -f bun`'s 15. argv[0] is preferred
+only because it is a pure function of a `pgrep -fl` line, so the matcher is testable
+offline against captured incidents, which a `pgrep` invocation is not.)
+
+**`main()` is behind `import.meta.main`.** Without it, importing anything from
+`parity-gate.ts` runs the entire gate as an import side effect — ~40 s of model time
+warm, and cold it would launch 20 GB loads nobody asked for. Found by doing exactly
+that while unit-testing the matcher.
+
+**Which cargo commands are safe while a gate is running:** `cargo test --lib` /
+`--no-run --lib` do NOT relink the binaries and are safe. `cargo test --test <name>`,
+`--tests`, and bare `cargo test` DO pull in the bin targets and relink
+`target/release/{xwen,logits-dump}` under a running gate, splitting its dumps across
+two builds. Verified by mtime on both sides. Treat the shared `target/` dir as part of
+whoever holds the GPU, not just the GPU itself.
 
 The manual per-step commands below are what the script automates; they remain the
 reference and the fallback.
@@ -282,9 +306,13 @@ Env combinations that define each side (what `parity-gate.ts` sets for you):
 
 | side | env |
 |---|---|
-| Reference (all tiers) | `XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1`, `--moe-impl reference` |
-| strict candidate | the same six, PLUS `XWEN_NO_MM_ID=1 XWEN_MV_CLASSIC=1`, `--moe-impl fused` |
+| Reference (all tiers) | `XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1`, `--moe-impl reference` |
+| strict candidate | the same seven, PLUS `XWEN_NO_MM_ID=1 XWEN_MV_CLASSIC=1`, `--moe-impl fused` |
 | mm / decode / ppl candidate | none (the shipped defaults), `--moe-impl fused` |
+
+`XWEN_DELTA_CLASSIC=1` is the load-bearing one in that list — the gate checks it as
+provenance on both sides of the strict tier (see "Provenance pins"), so a manual dump
+that omits it fails the tier rather than merely shifting numbers.
 
 **3c. Decode gate — greedy agreement under forced replay:**
 
@@ -293,8 +321,12 @@ DIR=/tmp/decode-code-short; mkdir -p "$DIR"
 TOKENS="$(bun -e 'const j=await Bun.file("tests/fixtures/parity-prompts.json").json();
   console.log(j.prompts.find(p=>p.id==="code-short").tokens.join(","))')"
 
+# the reference side runs under the oracle env of the 3b table, in full:
+XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 \
+XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1 \
 ./target/release/logits-dump --model "$M" --moe-impl reference \
-  --tokens "$TOKENS" --greedy 64 --output "$DIR/reference-greedy.json"      # oracle env
+  --tokens "$TOKENS" --greedy 64 --output "$DIR/reference-greedy.json"
+# the candidate runs the shipped defaults — no env
 ./target/release/logits-dump --model "$M" --moe-impl fused \
   --replay "$DIR/reference-greedy.json" --output "$DIR/candidate-greedy.json"
 
@@ -373,13 +405,28 @@ candidate logit and on a candidate/reference L2-norm ratio outside
 **Provenance pins.** The tier is caller-selected with no cross-check against how the
 dump was produced, so every dump carries a `provenance` object and the gate pins each
 field per side and tier: `moe_impl`, `attn_dtype`, `attn_mm`, `attn_glue`, `sdpa`,
-`flash`, `act`, `combine`, `attn_decode`, plus `seq_len`/`mm_min_seq`/`no_mm_id` for
+`flash`, `act`, `combine`, `attn_decode`, `delta`, plus
+`seq_len`/`mm_min_seq`/`no_mm_id` for
 "was the mm_id path actually active". A field missing at or after its introduction
 version is a stale binary and hard-fails; `src/parity_schema.rs` is the single source
 of truth for the version and the grandfather table. What the Qwen checkpoints report
 on the shipped path: `attn_dtype f16`, `attn_mm tensor`, `attn_decode q8`,
 `combine fused`, `attn_glue fused`, `sdpa f16`, `flash fused`, `act fused`,
-`mm_variant tensor`.
+`delta fused`, `mm_variant tensor`.
+
+**`delta` is the one path pin that is load-bearing rather than blessed-anchor
+discipline.** The other `*_CLASSIC` kernels are bit-identical to the candle chains
+they replace, so pinning them on the reference side only anchors provenance. The
+fused gated-DeltaNet scan is not: it partitions the k- and q-contractions across
+threads and folds the q/k L2 norm through `simd_sum` where the reference runs a
+candle gemm and a candle reduce, so it is bounded-close, not bitwise. Two
+consequences. (1) `XWEN_DELTA_CLASSIC=1` is pinned on BOTH sides of the **strict**
+tier — with the fused scan on, strict is not a bitwise tier at all. (2) The oracle
+must never run it, or the bounded tiers would compare the kernels to themselves; the
+`delta` field is what proves it did not. Introduced at schema version 6 with
+grandfather `classic`, so every cached pre-v6 reference dump stays valid without
+regeneration (no binary of that era had a fused path). The fused kernels are graded
+by **mm**, **decode** and **ppl**, where they run by default.
 
 **`flash: "fused"` is currently a provenance label, not a fact, on these
 checkpoints.** The field is env-derived, and `flash.metal` is compiled at head dim
@@ -405,6 +452,25 @@ and run-to-run variation without accepting a real regression; the perplexity bou
 `max(3 x |measured delta|, 0.002)` nats.
 
 ### Calibration record — 2026-07-28, oracle `e9fa0781`, ggml-org Q4_K_M
+
+**Measured with the REFERENCE DeltaNet scan on both sides**, before the fused delta
+kernels existed (`src/ops/delta.metal` postdates the last dump in this table by half
+an hour). Every dump below is `delta: "classic"` in the schema-v6 sense — they predate
+the field, so they carry no `delta` key and grandfather to exactly that value.
+
+This matters for reading the table now that the fused scan is the mm/decode/ppl
+default. The **strict** anchors stay directly comparable, because
+`XWEN_DELTA_CLASSIC=1` is pinned on both sides of that tier (see "Provenance pins") —
+so a strict number that moves means something OTHER than the delta kernel changed. The
+**mm / decode / ppl** rows are the pre-fused BASELINE: the fused scan is bounded-close
+rather than bitwise, so it will drift against these, and the drift is the measurement.
+Note the 35B mm headroom is only 5.4e-4 (achieved 0.999540 against a 0.999 floor), so
+that cell is where a fused-scan regression surfaces first.
+
+Re-deriving these floors from a run of the change under test would be circular — the
+floor is what the new kernel has to clear. If a fused-path tier cannot clear one, the
+options are to fix the kernel or to re-run this whole cross-checkpoint sweep and record
+the widening WITH its evidence here; not to relax the constant in `tests/parity.rs`.
 
 Raw last-position cosine of each candidate against the f32 Reference oracle, all
 three fixtures, both checkpoints:
@@ -454,15 +520,43 @@ Two notes on the inherited `_Q8` widened bands, which fire on every Qwen candida
 headroom than the data needs. Neither was re-derived here — see the TODO.md ledger
 item.
 
-**Perplexity tier, 4218-token corpus (4217 scored), both sides `nonfinite == 0`:**
+**Perplexity tier, 4218-token corpus (4217 scored), all runs `nonfinite == 0`.** The
+candidate's DeltaNet path is called out because it moved the number:
 
-| checkpoint | Reference mean NLL | Fused mean NLL | delta |
-|---|---|---|---|
-| 35B-A3B | 1.693659 | 1.694170 | 0.000511 |
-| 27B | 1.747872 | 1.748093 | 0.000221 |
+| checkpoint | candidate delta path | reference NLL | candidate NLL | signed delta |
+|---|---|---|---|---|
+| 35B-A3B | classic (reference scan) | 1.693659 | 1.694170 | +0.000511 |
+| 35B-A3B | fused | 1.693659 | 1.694450 | +0.000791 |
+| 27B | classic (reference scan) | 1.747872 | 1.748093 | +0.000221 |
+| 27B | fused | 1.747872 | 1.748201 | +0.000330 |
 
-`max(3 x 0.000511, 0.002)` = 0.002, so the 0.002 floor of the recipe binds rather than
-the measured delta. `PPL_NLL_DELTA_MAX = 0.002`.
+**The sign is the finding, not the magnitude.** The candidate is worse — higher NLL —
+in all four measurements, across two architectures and two different candidate
+implementations. This is a systematic bias, not symmetric rounding noise, and it is
+what a scale-sensitive instrument is supposed to expose. Switching the delta path from
+the reference scan to the fused kernels widened the gap by **+55% on the 35B and +49%
+on the 27B** — proportionally the same on both models, which is what makes it credible
+as a real fidelity cost of the fused scan rather than run-to-run variation. Everything
+else about the two candidates was identical, so the attribution is clean.
+
+**`PPL_NLL_DELTA_MAX` stays at 0.002, anchored to the REFERENCE-SCAN baseline.** The
+recipe `max(3 x |measured|, 0.002)` was applied once, to the classic-scan measurement
+(`max(3 x 0.000511, 0.002)` = 0.002, the floor binding). Re-applying it to the fused
+measurement would give `3 x 0.000791` = 0.00237 and widen the bound — but that fits the
+bound to the change under test, and a bound re-fitted to each new implementation
+ratchets outward forever and catches nothing. The recipe is a one-time floor-SETTING
+heuristic against the oracle, not an invariant to maintain against the candidate.
+
+So the constant deliberately no longer reproduces from `3 x measured`, and that is the
+correct state: it is now a TIGHTER bound than the recipe would give, which makes it
+more sensitive, and the fused path still clears it with 2.5x headroom. Widening it
+later requires evidence that the increase is benign — which perplexity alone cannot
+show, so corroborate with greedy agreement and the cosine tiers before touching it.
+
+**Trip-wire for future kernel work:** the fused scan sits at 0.000791 on the 35B. A
+further ~2.5x rise fails the gate. Read that as the instrument working; the cosine
+tiers are much less sensitive here (the 35B mm cosine actually *improved* with the
+fused scan, 0.999540 → 0.999631), so perplexity is the number to watch.
 
 Runtime, for planning a gate run. The expensive half is the Reference oracle, and it
 is cached: a COLD four-tier run (every reference generated) is 10-15 min per

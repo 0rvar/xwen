@@ -113,12 +113,47 @@ a numbered parent.
    standard 0.5. So tighten the l2 band; leave the near-tie window at 1.0 and record
    0.5567 as its anchor. Both need more than three fixtures' worth of evidence first.
 
-8. **DeltaNet Metal kernels.** (a) fused recurrent decode step (one dispatch per layer
+8. **DeltaNet Metal kernels — (a) DONE 2026-07-28, (b) still open.** Original scope:
+   (a) fused recurrent decode step (one dispatch per layer
    per token; state stays resident, fp32); (b) chunked prefill scan, chunk 64,
    llama.cpp's chunked form as the spec (cumsum → tri decay mask → solve_tri →
    per-chunk state update) — needs tri-solve which candle lacks; vendored kernel.
    Kill-switches XWEN_DELTA_CLASSIC / XWEN_DELTA_CHUNK_CLASSIC falling back to the P3
    reference. Gate: bitwise-or-bounded vs reference per parity.md tiering.
+   - **(a) SHIPPED, and it covered prefill too.** `src/ops/delta.metal` +
+     `src/ops/delta.rs`: four kernels — conv+silu+next-window, the fused beta/decay
+     head over a load-time-concatenated `[hidden, 2*v_heads]` beta|alpha projection,
+     the gated output RMSNorm, and one scan kernel that runs the WHOLE recurrence for
+     T timesteps in a single dispatch with the head's state slice resident in
+     registers across the scan. A DeltaNet layer is 8 dispatches at any sequence
+     length (was ~65 per decoded token, ~8·T per prefill chunk). 35B-A3B, low-power
+     off (`lowpowermode 0`; no `highpowermode` key is exposed on this machine, so the
+     High Power tier is neither confirmed nor available — these are not laguna's
+     "full power" anchors), warm, interleaved A/B, median of 3: decode 57.8 → 91.2 at a
+     596-token prompt and 56.6 → 88.0 at 1929; prefill 305 → 2183 (7.15x) and
+     300 → 2274 (7.57x). Kill-switch `XWEN_DELTA_CLASSIC=1`. See log 2026-07-28 and
+     decisions.md "Model math".
+   - **(b) The chunked scan (chunk 64, tri-solve) remains open**, and its case is now
+     weaker than it looked: the single-dispatch sequential scan already put prefill at
+     ~2000 tok/s, so the chunked form is competing against that rather than against
+     the 300 tok/s reference. Its real remaining argument is the rollback trail (see
+     the P2-P4 deferred item): a chunked scan that can replay a prefix cheaply would
+     let the per-token trail be dropped entirely. Measure before building.
+   - `XWEN_DELTA_CHUNK_CLASSIC` was never created — there is no chunked path to
+     switch off yet. It belongs with (b).
+   - **The fused scan is bounded, not bit-identical**, so `XWEN_DELTA_CLASSIC=1` is
+     now pinned on BOTH sides of the strict parity tier and a `delta` provenance
+     field (parity_schema v6, grandfather "classic") proves which path each dump ran.
+     Cached pre-v6 reference dumps stay valid. docs/parity.md "Provenance pins".
+   - **Greedy output is not preserved at longer prompts, by construction.** At 596
+     prompt tokens fused and classic produce byte-identical greedy output; at 1929
+     they share 69 words and then fork at a near-tie. That is the expected
+     consequence of reassociated f32 sums and is what the decode tier's near-tie rule
+     exists to grade — it is not a kill-switch bug.
+   - The fused path requires head dim 128 (both checkpoints) and a Metal device;
+     anything else silently keeps the reference scan. A `seq > 1` chunk under an
+     armed rollback checkpoint also stays on the reference scan (single tokens do
+     not) — see decisions.md.
 
 9. **DFlash adaptation to the Qwen sidecars.** Repoint drafter arch check (arch
    `dflash`, decoder arch qwen35/qwen35moe), tap indices from `target_layers`
@@ -154,6 +189,24 @@ a numbered parent.
     generate/chat smoke run, decode/prefill perf numbers for the 27B (nothing
     measured yet; 64 layers dense will be much slower per token than the A3B), and
     the deferred conv threadgroup-sizing check when P8 lands.
+    - ANNOTATED 2026-07-28 (P8a): the 27B perf gap is now filled. Low-power off
+      (`lowpowermode 0`; the High Power tier is not exposed on this machine), warm,
+      batch 1, interleaved A/B, median of 3: decode 19.0 tok/s at a 596-token
+      prompt and 17.9 at 1929; prefill 290.4 and 209.3 tok/s. It is ~4.7x slower per
+      decoded token than the 35B-A3B, as expected from 64 dense layers at hidden
+      5120. The fused DeltaNet kernels bought it 1.25-1.33x decode and 2.7-3.8x
+      prefill; its per-token budget is dominated by the dense SwiGLU, not by dispatch
+      count, so the next 27B lever is the FFN, not more glue fusion. Still open: the
+      interactive smoke run.
+    - CAVEAT on those 27B numbers: its per-rep spread is materially wider than the
+      35B's (the 596-token fused decode walked 21.7/19.0/17.9 across three reps as
+      the machine heated, against a 35B classic arm that repeated to within 0.8%).
+      Treat the 27B figures as ±10% and re-measure off an idle machine before using
+      them as a baseline for anything. See decisions.md "Measurement discipline".
+    - The conv threadgroup-sizing worry (below, "the 27B linear-attn conv runs over
+      10240 channels") turned out not to bind: the fused conv kernel is a flat
+      one-thread-per-element launch through the shared `dispatch_linear` helper, so
+      channel count only sets the grid size. Closed by construction, not measurement.
 
 12. **MTP exploration — DEFERRED by decision.** Sidecar reuses parent arch, one extra
     full-attn block + nextn.* tensors, plain KV cache, eh_proj over
@@ -191,6 +244,66 @@ a numbered parent.
   against the spec-decode win when P9 lands; a chunked scan (P8) that can replay
   a prefix cheaply would let the trail be dropped entirely.
 
+## Deferred from the sampler-tail pass (2026-07-28)
+
+- [ ] **Top-k selection still crosses the bus at full vocabulary width.** The draw
+  now costs 0.406 ms/token, of which 0.199 ms is the GPU→CPU copy of the 993 KB
+  probability row and ~0.11 ms is the CPU streaming top-k. A Metal top-k (or a
+  block-wise partial reduction that ships candidates, not the whole row) would
+  leave only ~20 values to read back, and most of the 0.199 ms is command-buffer
+  sync rather than copy, so the win is a fraction of it — measure before
+  building. Pairs with P8; the sampler now has a bench that would show it
+  (`cargo test --release sampler_decode_bench -- --ignored --nocapture`).
+- [ ] **xwen's top-p convention follows candle, not llama.cpp.** The cut is
+  measured against full-vocabulary probability mass and is skipped entirely when
+  the top-k set holds less than `top_p` of the total; llama.cpp and HF both
+  renormalize over the k survivors first and therefore trim in cases where xwen
+  does not. Preserved deliberately through the perf rewrite (decisions.md
+  "Thinking budget and sampling controls"), but it is a real divergence from the
+  project's declared ground truth for everything else, and `--top-p` does not
+  mean what a llama.cpp user would expect. Decide it as a semantics question:
+  switching is a few lines and removes the need for the full-vocabulary softmax
+  on the fast path (the k-wide softmax would drop the readback to whatever the
+  selection needs), so it is also worth ~0.1 ms. Needs a decision, not a patch.
+  Second reason to want the switch (2026-07-29): comparing absolute mass is what
+  makes the truncation sensitive to which backend ran the softmax. The fast path
+  softmaxes on the device and the `SampleControl` path on the CPU, and an input
+  sitting within an ulp of the threshold can therefore truncate differently on
+  the two. Renormalizing over the k survivors never compares absolute mass, so
+  the whole boundary question dissolves rather than being documented around.
+- [ ] **The `SampleControl` path still softmaxes on the CPU.** Adjusted draws
+  (bans, bias, pull, force, grammar masks) read back raw logits, apply the
+  controls, and pay the ~0.35 ms full-vocabulary `expf` pass the unadjusted path
+  now avoids. It is the rare path — the default decode loop's control is a no-op
+  whenever there is no blacklist, no grammar and no thinking floor — but forced
+  reasoning (`--min-think`) and constrained decoding sit on it for entire
+  generations. Fixable by applying the controls in probability space with a
+  sparse renormalization (`p *= exp(delta/T)`, `p_pulled = p^(1-α)·p_max^α`,
+  banned → 0, adjusting the total by the delta rather than resumming), which is
+  exact for everything except `force` on a token whose probability underflowed —
+  and `force` can short-circuit. Unmeasured against real control-heavy runs.
+- [ ] **The WP-G1 expert-gather comment block in moe.rs still quotes laguna's
+  numbers.** `moe.rs` above `tiled_stack_dt` reasons from "~2.4 GB over 47
+  layers" and "~13.7 ms/token (LPM)" — measurements of laguna's geometry, left
+  in place because replacing them means inventing numbers nobody has taken at
+  Qwen width. Re-run `moe_decode_ffn_bench` (its constants are correct now) and
+  rewrite the block from what it reports.
+
+## Deferred from the DeltaNet-kernel hardening pass (2026-07-29)
+
+- [ ] **The `mtl_size!` rationale in dispatch.rs is factually wrong.**
+  `src/ops/dispatch.rs:21-24` justifies the macro with "xwen does not depend on
+  objc2-metal directly, and a function cannot return the unnameable type" — but
+  `Cargo.toml:26-28` pins the objc2 crates as direct dependencies, `src/gguf.rs:141`
+  already named `objc2_metal::MTLDevice`, and `check_delta_simd_width` now names
+  `objc2_metal::MTLComputePipelineState` in that same file. `objc2_metal::MTLSize` is
+  therefore nameable and the macro may be unnecessary. Left alone rather than
+  rewritten: correcting the stated reason means either inventing a rationale nobody
+  has verified or reworking the grid helpers, and neither belongs in a pass whose
+  contract was that no computed value moves. Decide whether the macro earns its keep
+  (candle's `get_block_dims` round-trip vs a plain struct literal) and rewrite or
+  delete the comment to match.
+
 ## Deferred from the fork bootstrap (2026-07-28)
 
 - [x] **Decide what to do with laguna's parity fixtures and tests/parity.rs — DONE
@@ -216,9 +329,34 @@ a numbered parent.
   trie ≤ logits with the tail force-masked. Also check the ban-string path against
   [PADnnnnnn] ids (type 5, unreachable but present). tokenizer.rs now exposes both
   sizes distinctly (chat-tok phase).
-- [ ] **The 27B linear-attn conv runs over 10240 channels at hidden 5120** — check
-  dispatch.rs threadgroup sizing assumptions when P8 lands (laguna never ran a
-  depthwise conv).
+- [x] **The 27B linear-attn conv runs over 10240 channels at hidden 5120 — CLOSED
+  2026-07-28 (P8a), no sizing problem.** The fused `kernel_delta_conv` is a flat
+  one-thread-per-output-element launch through the same `dispatch_linear` helper the
+  other glue kernels use (up to 256 threads per group, bounds-checked tail), so the
+  channel count only sets the grid extent. Both conv widths (10240 on the 27B, 8192
+  on the 35B) are covered bitwise by `conv_matches_reference_bitwise`.
+
+- [ ] **The 35B's perplexity delta grew with the fused DeltaNet scan and the floor's
+  margin shrank.** `PPL_NLL_DELTA_MAX = 0.002` was derived as
+  `max(3 x measured, 0.002)` from a measured 0.000511; the fused scan moved that to
+  **0.000791** (27B: 0.000221 → 0.000330). The gate still passes with ~2.5x headroom,
+  but 3 x 0.000791 = 0.00237 now EXCEEDS the constant, so the recipe that produced it
+  no longer reproduces it. **RESOLVED 2026-07-28 (parity owner): keep 0.002, do NOT
+  re-derive from the fused measurement.** The recipe is a one-time floor-SETTING
+  heuristic anchored to the reference-scan baseline, not an invariant to maintain
+  against whatever the candidate currently measures — re-fitting it to the change
+  under test ratchets the bound outward forever and catches nothing. The constant
+  deliberately no longer reproduces from `3 x measured`, and that is the correct
+  state: it is a tighter, more sensitive bound than the recipe would now give, and
+  the fused path clears it with 2.5x headroom. Widening it later needs evidence the
+  rise is benign, corroborated by greedy agreement and cosine — perplexity alone
+  cannot show that. Rationale and the trip-wire are in docs/parity.md "Perplexity
+  gate". Still open as a WATCH item: the fused scan sits at 0.000791 on the 35B, so a
+  further ~2.5x rise fails the gate, and the sign is systematic (candidate worse in
+  all four measurements across both architectures — the fused scan widened the gap
+  ~+50% on each). This is the single most sensitive number the gate reports about the
+  fused scan; the cosine tiers barely moved (35B mm actually improved, 0.999540 →
+  0.999631).
 - [x] **flake.nix description still says "maxuna engine"** — DONE 2026-07-28, the
   fork agent renamed all three occurrences (description + two rationale comments).
 - [ ] **Partition-parity drift never measured.** The q8/f16 dual-storage split makes

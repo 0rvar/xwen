@@ -90,6 +90,14 @@ const ROPE_SOURCE: &str = include_str!("rope.metal");
 /// masking). Own library (no Metal-4 dependency), compiled fast-math like
 /// candle's metallib with no contract pragmas — see flash.metal's header.
 const FLASH_SOURCE: &str = include_str!("flash.metal");
+/// Vendored fused gated-DeltaNet kernels (conv+silu+state, beta/decay head,
+/// recurrent scan, gated output norm). Own library (no Metal-4 dependency).
+/// The conv and beta/decay kernels pin FP contraction/reassociation off at
+/// BLOCK scope so their rounding stays bit-identical to the candle chains they
+/// replace; the gated norm and the scan are bounded instead — each partitions a
+/// reduction across threads — and the scan stays free to contract (see
+/// delta.metal).
+const DELTA_SOURCE: &str = include_str!("delta.metal");
 
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
@@ -249,4 +257,9 @@ pub(crate) fn rope_pipeline(device: &Device, name: &str) -> Result<ComputePipeli
 /// Pipeline for a `flash.metal` kernel (vendored flash-attention prefill).
 pub(crate) fn flash_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, FLASH_SOURCE, "flash", name)
+}
+
+/// Pipeline for a `delta.metal` kernel (vendored fused gated-DeltaNet ops).
+pub(crate) fn delta_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, DELTA_SOURCE, "delta", name)
 }
