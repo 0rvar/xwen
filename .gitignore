@@ -1,0 +1,13 @@
+/target
+.direnv
+.DS_Store
+/models
+reference/llama.cpp-laguna-branch/build
+.claude/*.lock
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target

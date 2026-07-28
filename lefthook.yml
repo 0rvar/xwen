@@ -1,0 +1,11 @@
+pre-commit:
+  commands:
+    rustfmt:
+      glob: "*.rs"
+      # rustfmt (not `cargo fmt`) so only staged files are formatted.
+      # --edition must match Cargo.toml.
+      run: rustfmt --edition 2024 {staged_files}
+      stage_fixed: true
+      skip:
+        - merge
+        - rebase
