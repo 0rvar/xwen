@@ -45,6 +45,29 @@ pub fn mul_mv_id(stack: &ExpertStack, x: &Tensor, ids: &Tensor) -> Result<Tensor
     dispatch::run(stack, x, ids, mode, crate::ops::MmVariant::ClassicHp)
 }
 
+/// Whether `mul_mv_id_dual` covers this gate/up pair (both q4_K, same geometry,
+/// both resident on Metal). Callers keep the split path for anything else.
+pub fn mul_mv_id_dual_supported(gate: &ExpertStack, up: &ExpertStack) -> bool {
+    dispatch::mv_id_dual_supported(gate, up)
+}
+
+/// Gate and up expert matvecs plus their SwiGLU activation in ONE dispatch —
+/// `silu(gate·x) * (up·x)` — replacing two `mul_mv_id` launches and the
+/// `ops::silu_mul` pass between them, and never materializing the two
+/// intermediate projections. Same operand contract as `mul_mv_id` (x
+/// `[t, x_per_row, k]` f32, ids `[t, top_k]` u32); returns `[t, top_k, n_out]`
+/// f32. Bit-identical to that three-dispatch chain (mv_id.rs
+/// `dual_matches_split_bitwise` proves it), so it is safe on every parity tier;
+/// the caller's kill-switch is the split chain (`XWEN_MOE_GLUE_CLASSIC`).
+pub fn mul_mv_id_dual(
+    gate: &ExpertStack,
+    up: &ExpertStack,
+    x: &Tensor,
+    ids: &Tensor,
+) -> Result<Tensor> {
+    dispatch::run_mv_id_dual(gate, up, x, ids)
+}
+
 /// Plain quantized mat-vec against the vendored ggml-geometry kernel — the
 /// lm_head bypass at seq==1. `weight` is the rank-2 `[n_out, k]` quantized
 /// tensor's raw device buffer (the caller retains it at load, same zero-copy
@@ -118,6 +141,81 @@ mod tests {
                 "{name} shared-row rel_l2 {rel} too high (max_abs {max})"
             );
         }
+    }
+
+    /// The dual-weight gate|up kernel must reproduce the three-dispatch chain it
+    /// replaces — `mul_mv_id(gate)`, `mul_mv_id(up)`, `ops::silu_mul` —
+    /// BIT-FOR-BIT. It runs the same per-projection accumulation body, so the
+    /// only way this fails is a wiring error (the two stacks swapped, a wrong
+    /// row offset) or a fast-math transform escaping the pinned epilogue: all
+    /// three are exactly what bit-identity is here to catch, so never loosen this
+    /// to a tolerance.
+    ///
+    /// The grid covers the production decode shape (one token, top-8, expert_ff
+    /// 512 over hidden 2048), several tokens, and a ragged `n_out` that is not a
+    /// multiple of the kernel's `N_R0 * N_SG` row block.
+    #[test]
+    fn dual_matches_split_bitwise() {
+        let device = metal_device().unwrap();
+        let dt = GgmlDType::Q4K;
+
+        for &(n_expert, n_out, k, t, top_k) in &[
+            (256usize, 512usize, 2048usize, 1usize, 8usize),
+            (16, 512, 2048, 5, 8),
+            (8, 14, 256, 3, 4), // ragged n_out: 14 % (2*2) != 0
+        ] {
+            let (gate, _) = build_stack(&device, dt, n_expert, n_out, k, 0x5001).unwrap();
+            let (up, _) = build_stack(&device, dt, n_expert, n_out, k, 0x5002).unwrap();
+            assert!(mul_mv_id_dual_supported(&gate, &up));
+            // The kernel is opt-in at the block level (it measured slower than
+            // the split chain), so exercise it directly here — it is still a
+            // shipped kernel and its bit-identity is still a contract.
+
+            let x = Tensor::from_vec(pseudo_random(t * k, 0x5003, -1.5, 1.5), (t, 1, k), &device)
+                .unwrap();
+            let ids = Tensor::from_vec(random_ids(t, top_k, n_expert, 0x5004), (t, top_k), &device)
+                .unwrap();
+
+            let fused = mul_mv_id_dual(&gate, &up, &x, &ids).unwrap();
+            assert_eq!(fused.dims(), &[t, top_k, n_out]);
+
+            let g = mul_mv_id(&gate, &x, &ids).unwrap();
+            let u = mul_mv_id(&up, &x, &ids).unwrap();
+            let want = crate::ops::silu_mul(&g, &u).unwrap();
+
+            let fb: Vec<f32> = fused.flatten_all().unwrap().to_vec1().unwrap();
+            let wb: Vec<f32> = want.flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(fb.len(), wb.len());
+            for (i, (a, b)) in fb.iter().zip(wb.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "dual gather n_out={n_out} t={t} top_k={top_k}: element {i} differs \
+                     (fused {a:?}, split {b:?})"
+                );
+            }
+        }
+    }
+
+    /// The dual kernel is q4_K-only and needs matching geometry; anything else
+    /// keeps the split path rather than reaching a kernel that cannot serve it.
+    #[test]
+    fn dual_declines_unsupported_pairs() {
+        let device = metal_device().unwrap();
+        let (q4, _) = build_stack(&device, GgmlDType::Q4K, 4, 8, 256, 0x6001).unwrap();
+        let (q6, _) = build_stack(&device, GgmlDType::Q6K, 4, 8, 256, 0x6002).unwrap();
+        let (wide, _) = build_stack(&device, GgmlDType::Q4K, 4, 16, 256, 0x6003).unwrap();
+        assert!(!mul_mv_id_dual_supported(&q4, &q6), "mixed dtypes");
+        assert!(
+            !mul_mv_id_dual_supported(&q6, &q6),
+            "q6_K has no dual kernel"
+        );
+        assert!(!mul_mv_id_dual_supported(&q4, &wide), "n_out disagreement");
+
+        let x =
+            Tensor::zeros((1usize, 1usize, 256usize), candle_core::DType::F32, &device).unwrap();
+        let ids = Tensor::from_vec(vec![0u32, 1], (1usize, 2usize), &device).unwrap();
+        assert!(mul_mv_id_dual(&q4, &q6, &x, &ids).is_err());
     }
 
     #[test]

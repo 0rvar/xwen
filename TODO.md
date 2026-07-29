@@ -139,6 +139,13 @@ a numbered parent.
      the 300 tok/s reference. Its real remaining argument is the rollback trail (see
      the P2-P4 deferred item): a chunked scan that can replay a prefix cheaply would
      let the per-token trail be dropped entirely. Measure before building.
+     ANNOTATION 2026-07-29: measured, and the picture splits by model. On the 35B the
+     weak-case reading holds (prefill near llama.cpp parity at steady state). On the
+     27B the sequential scan — fused or not — is the measured cause of a 1.8-2.1x
+     prefill loss to llama.cpp (269 vs 486 @925, 236 vs 502 @4k, and xwen DEGRADES
+     with length while llama.cpp improves): 48 layers at inner 6144 amplify what 30
+     layers at 4096 hide. The chunked form's bounty is therefore ~2x on 27B prefill,
+     not a marginal 35B win. See log.md 2026-07-29 head-to-head.
    - `XWEN_DELTA_CHUNK_CLASSIC` was never created — there is no chunked path to
      switch off yet. It belongs with (b).
    - **The fused scan is bounded, not bit-identical**, so `XWEN_DELTA_CLASSIC=1` is
@@ -213,7 +220,47 @@ a numbered parent.
     [norm(emb);norm(h)]. Evaluate as drafter only after P9 lands or fails (see
     decisions.md "Speculative decoding").
 
-13. **YaRN long-context.** Native 262144; Qwen documents 1M via YaRN but ships no
+13. **MoE block glue fusion — SHIPPED 2026-07-29.** An MoE layer went from 24
+    dispatches per decoded token to 14 (960 → 560 across the 40 layers), and 35B-A3B
+    decode from 92.6 to 102.8 tok/s (+11.0%, `lowpowermode 0`, warm, interleaved,
+    median of 5, arms non-overlapping). Three fusions, all bit-identical to the candle
+    chains they replace, behind `XWEN_MOE_GLUE_CLASSIC=1`: `kernel_moe_router`
+    (softmax → bitonic arg-sort → gather → sum → clamp → renormalize, 7 dispatches → 1),
+    `kernel_moe_epilogue` (weighted combine + shared-expert sigmoid gate + its multiply
+    + the routed+shared add, 4 → 1), and the shared expert's `silu(g)*u` moved onto the
+    existing `ops::silu_mul` (2 → 1). Both parity gates pass with numbers identical to
+    the pre-change run, so the schema is untouched. See log 2026-07-29 and decisions.md
+    "Kernel policy".
+    - **The two router matmuls stay candle dispatches** — MLX's `gemv_t` accumulation
+      order is not reproducible from a differently-shaped hand-written gemv, and it
+      depends on the output width, so concatenating the shexp gate row onto the router
+      weight would have changed that gate's bits. Costs one dispatch of the ten saved.
+    - **The residual add was NOT fused in, on purpose.** The briefed design folded
+      `model.rs`'s `x + ffn_out` into the epilogue for a twelfth dispatch. That would
+      delete the `ffn_out` tap, which docs/parity.md lists with published per-layer
+      floors on both checkpoints — or force the gate onto the classic path, where it
+      would never exercise the fused epilogue at all. Worth ~40 dispatches per token
+      (one per layer) if someone later teaches the epilogue to write both `ffn_out` and
+      `l_out` when taps are on; not worth a provenance hole.
+    - **The dual-weight gate|up gather is built, bitwise, and switched OFF** — it
+      measured slower (99.5 vs 102.8 tok/s). `XWEN_MOE_DUAL=1` opts in. See
+      decisions.md "Refuted perf directions" for the mechanism; the short version is
+      that merging two bandwidth-bound dispatches halves the threadgroup count and the
+      memory-level parallelism with it.
+    - **Still open on the MoE decode path:** the remaining 14 dispatches are 8 matmuls
+      plus `ffn_norm`, the two router gemvs, the routed `silu_mul`, the fused router
+      and the fused epilogue. The next real lever is the shared expert — its three
+      q8_0 `QMatMul` projections plus its gate gemv are 4 of the 14, and nothing has
+      priced whether they are worth a dedicated fused SwiGLU the way the routed
+      experts got one.
+    - **Prefill is untouched and was not attacked.** Above `MM_ID_MIN_SEQ` the epilogue
+      declines (the f16-tile projection carries an L2 rescale it has no term for) and
+      only the router kernel and the shared-expert activation fuse; measured +0.6% at
+      925 tokens and +0.2% at 4k, i.e. nothing. Fusing the prefill combine would mean
+      an epilogue variant carrying the rescale — cheap to write, but prefill is
+      compute-bound at ~2100-2500 tok/s and there is no evidence it would show.
+
+14. **YaRN long-context.** Native 262144; Qwen documents 1M via YaRN but ships no
     scaling keys in config or GGUF. laguna's YaRN rope code is retained; wire an
     opt-in flag only on demand. Note rope table memory at 262k is trivial (64 dims).
 
@@ -254,7 +301,15 @@ a numbered parent.
   sync rather than copy, so the win is a fraction of it — measure before
   building. Pairs with P8; the sampler now has a bench that would show it
   (`cargo test --release sampler_decode_bench -- --ignored --nocapture`).
-- [ ] **xwen's top-p convention follows candle, not llama.cpp.** The cut is
+- [x] **xwen's top-p convention follows candle, not llama.cpp.** RESOLVED
+  2026-07-29: switched to the llama.cpp/HF convention. `truncate_top_p` now
+  renormalizes the top-k survivors and keeps the shortest prefix whose cumulative
+  mass reaches `top_p`, crossing token included (`cum_sum >= top_p`, llama.cpp's
+  comparison); `top_p >= 1.0` is a no-op as it is there. `min_keep` is not
+  carried — llama.cpp's default is 0. Sampled outputs changed, accepted. See
+  decisions.md "Top-p renormalizes over the top-k survivors". The perf half of
+  this item did NOT ship and is restated as its own entry below.
+  Original context, verbatim: The cut is
   measured against full-vocabulary probability mass and is skipped entirely when
   the top-k set holds less than `top_p` of the total; llama.cpp and HF both
   renormalize over the k survivors first and therefore trim in cases where xwen
@@ -271,6 +326,14 @@ a numbered parent.
   sitting within an ulp of the threshold can therefore truncate differently on
   the two. Renormalizing over the k survivors never compares absolute mass, so
   the whole boundary question dissolves rather than being documented around.
+- [ ] **The fast path still softmaxes the full vocabulary it no longer needs.**
+  Split out of the top-p convention item when that resolved (2026-07-29). The cut
+  now renormalizes over the k survivors, which is arithmetically a k-wide softmax,
+  so nothing downstream of the selection depends on the full-vocabulary
+  denominator any more — the ~0.1 ms it was worth is unclaimed only because the
+  selection itself still runs CPU-side over the whole row. Pairs with the Metal
+  top-k item above: land that and the device softmax collapses to the candidates
+  along with the readback.
 - [ ] **The `SampleControl` path still softmaxes on the CPU.** Adjusted draws
   (bans, bias, pull, force, grammar masks) read back raw logits, apply the
   controls, and pay the ~0.35 ms full-vocabulary `expf` pass the unadjusted path
@@ -282,12 +345,29 @@ a numbered parent.
   banned → 0, adjusting the total by the delta rather than resumming), which is
   exact for everything except `force` on a token whose probability underflowed —
   and `force` can short-circuit. Unmeasured against real control-heavy runs.
-- [ ] **The WP-G1 expert-gather comment block in moe.rs still quotes laguna's
-  numbers.** `moe.rs` above `tiled_stack_dt` reasons from "~2.4 GB over 47
+- [ ] **Temperature is applied before the top-k/top-p cut; llama.cpp's default
+  chain cuts first.** Found 2026-07-29 while transcribing `top_p`: llama.cpp's
+  default sampler chain is top_k → typ_p → top_p → min_p → temp → dist
+  (common/sampling.cpp), so its truncation sees raw-logit probabilities, while
+  xwen (like HF's default warper order) scales by temperature first, so the cut
+  sees the sharpened/flattened distribution. At the model's default temp 1.0 the
+  two are identical; the divergence only bites when `--temp` is overridden.
+  Convention question like the top-p one was — llama.cpp and HF disagree with
+  each other here, so there is no single ground truth to defer to. Needs a
+  decision, not a patch.
+- [x] **The WP-G1 expert-gather comment block in moe.rs still quotes laguna's
+  numbers.** `moe.rs` above `tiled_stack_dt` reasoned from "~2.4 GB over 47
   layers" and "~13.7 ms/token (LPM)" — measurements of laguna's geometry, left
   in place because replacing them means inventing numbers nobody has taken at
   Qwen width. Re-run `moe_decode_ffn_bench` (its constants are correct now) and
   rewrite the block from what it reports.
+  - RESOLVED 2026-07-29 (MoE-glue arc). The block now states the byte floor,
+    which is arithmetic and needs no bench: at 35B-A3B geometry (hidden 2048,
+    expert_ff 512, top_k 8) the three q4_K projections gather ~14 MB per layer
+    and ~570 MB per token across the 40 MoE layers. The laguna timing claims are
+    gone rather than replaced — the ~365 GB/s lm_head anchor they were compared
+    against is kept as the reference point, so the benches still say what a
+    reading means without asserting a measurement nobody has taken here.
 
 ## Deferred from the DeltaNet-kernel hardening pass (2026-07-29)
 

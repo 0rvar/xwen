@@ -306,13 +306,21 @@ Env combinations that define each side (what `parity-gate.ts` sets for you):
 
 | side | env |
 |---|---|
-| Reference (all tiers) | `XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1`, `--moe-impl reference` |
-| strict candidate | the same seven, PLUS `XWEN_NO_MM_ID=1 XWEN_MV_CLASSIC=1`, `--moe-impl fused` |
+| Reference (all tiers) | `XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1 XWEN_MOE_GLUE_CLASSIC=1`, `--moe-impl reference` |
+| strict candidate | the first seven, PLUS `XWEN_NO_MM_ID=1 XWEN_MV_CLASSIC=1`, `--moe-impl fused` |
 | mm / decode / ppl candidate | none (the shipped defaults), `--moe-impl fused` |
 
 `XWEN_DELTA_CLASSIC=1` is the load-bearing one in that list — the gate checks it as
 provenance on both sides of the strict tier (see "Provenance pins"), so a manual dump
 that omits it fails the tier rather than merely shifting numbers.
+
+`XWEN_MOE_GLUE_CLASSIC=1` is the opposite case and is deliberately NOT on the strict
+candidate: the fused MoE router and block epilogue are bit-identical to the candle
+chains, so the strict tier grades the FUSED glue against a reference that ran the
+unfused one, and that is the point. Regenerating the reference under this pin and
+re-running the gate returns `cos=1.000000 top5=5/5` with every other tier's number
+unchanged, which is the full-model confirmation of the ops-level bitwise tests. A
+reference cached before the pin existed is still valid for the same reason (2026-07-29).
 
 **3c. Decode gate — greedy agreement under forced replay:**
 
@@ -323,7 +331,7 @@ TOKENS="$(bun -e 'const j=await Bun.file("tests/fixtures/parity-prompts.json").j
 
 # the reference side runs under the oracle env of the 3b table, in full:
 XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 \
-XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1 \
+XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1 XWEN_MOE_GLUE_CLASSIC=1 \
 ./target/release/logits-dump --model "$M" --moe-impl reference \
   --tokens "$TOKENS" --greedy 64 --output "$DIR/reference-greedy.json"
 # the candidate runs the shipped defaults — no env

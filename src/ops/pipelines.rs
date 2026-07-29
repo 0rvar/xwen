@@ -75,6 +75,12 @@ const COMBINE_SOURCE: &str = include_str!("combine.metal");
 /// disabled so its per-op rounding stays bit-identical to the candle silu + mul
 /// chain it replaces (see silu_mul.metal).
 const SILU_MUL_SOURCE: &str = include_str!("silu_mul.metal");
+/// Vendored fused MoE glue kernels (the routing decision and the block tail).
+/// Own library (no Metal-4 dependency). Its FP pragmas are at BLOCK scope, not
+/// file scope: the epilogue pins contraction/reassociation off to keep candle's
+/// rounding boundaries, while the router must compile under the same fast-math
+/// latitude candle's own softmax/sort kernels do (see moe_glue.metal).
+const MOE_GLUE_SOURCE: &str = include_str!("moe_glue.metal");
 /// Vendored fused attention-glue kernels (softplus gate + permute/cast copies).
 /// Own library (no Metal-4 dependency); compiled with FP contraction disabled so
 /// its per-op rounding stays bit-identical to the candle elementwise/copy chains
@@ -242,6 +248,11 @@ pub(crate) fn combine_pipeline(device: &Device, name: &str) -> Result<ComputePip
 /// Pipeline for a `silu_mul.metal` kernel (vendored fused MoE SwiGLU activation).
 pub(crate) fn silu_mul_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, SILU_MUL_SOURCE, "silu_mul", name)
+}
+
+/// Pipeline for a `moe_glue.metal` kernel (fused MoE router / block epilogue).
+pub(crate) fn moe_glue_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, MOE_GLUE_SOURCE, "moe_glue", name)
 }
 
 /// Pipeline for an `attn_glue.metal` kernel (fused softplus gate / permute-cast).

@@ -239,6 +239,43 @@ kernel is bitwise against the reference's cat + per-tap broadcast chain + silu, 
 beta/decay kernel bitwise against candle's `usigmoid` and the stable softplus chain
 (2026-07-28).
 
+**One kill-switch covers the whole MoE block glue, because all of it is bit-identical.**
+`XWEN_MOE_GLUE_CLASSIC=1` reverts the fused router, the fused block epilogue and the
+shared expert's fused activation together, the way `XWEN_ATTN_GLUE_CLASSIC` covers the
+attention glue family. Splitting them would imply the pieces have independent
+correctness stories; they do not — each reproduces its candle chain's rounding
+boundaries exactly, so the switch is a safety handle and a provenance anchor, not a
+tier. The routed experts keep their older, narrower switches (`XWEN_ACT_CLASSIC`,
+`XWEN_COMBINE_CLASSIC`), which still apply on the classic branch. Because nothing here
+can move a dump, the parity schema is untouched: no `moe_glue` provenance field, no pin,
+no grandfather clause (2026-07-29).
+
+**The MoE router matmul stays candle's; the fusion starts at the logits.** The obvious
+version of the router fusion swallows the gemv too, and it was rejected on evidence
+rather than effort. candle lowers a `[1, hidden] × [hidden, n_expert]` f32 matmul to
+MLX's `gemv_t_float32_bm1_bn2_sm8_sn4_tm4_tn4`, whose K-partition is strided across
+lanes and whose cross-lane combine is a specific shuffle-down tree; reproducing it means
+lifting the kernel verbatim AND relying on the compiler contracting `result += vc * inter`
+into an fma identically, which the source text does not pin. Decisive on top of that:
+its accumulation order depends on the OUTPUT WIDTH, so the tempting trick — concatenating
+the shared-expert gate row onto the router weight at load time, the way `ba_wt` folds
+beta and alpha in the DeltaNet block — would have changed that gate's bits, because a
+`[hidden, 1]` matmul hits a different MLX kernel family entirely than a `[hidden, 257]`
+one. So both matmuls stay candle dispatches and the kernel takes over at the softmax.
+The cost is one dispatch out of ten; the alternative was a bounded router, and a bounded
+router is exactly the thing the chaos-amplifier rule above forbids (2026-07-29).
+
+**Reproducing candle's arg-sort tie order is not optional, and it is not the stable
+one.** candle's Metal `arg_sort_last_dim` is llama.cpp's bitonic network, whose
+comparators are strict and never consult the index — so equal probabilities do NOT come
+out in ascending expert order, and the CPU backend (a stable `sort_by`) disagrees with
+the Metal one. Any top-k selection shortcut would therefore diverge on ties, and a tie
+flip is not a rounding difference: it swaps a whole expert's contribution into the
+output. The fused router runs the network verbatim, ties and all
+(`router_ties_match_candle_bitwise`). Worth knowing before anyone "simplifies" it: the
+all-equal case comes out as the identity permutation, which makes the non-stability easy
+to miss in a casual test (2026-07-29).
+
 **The recurrent state is fp32, non-negotiable.** `mamba_ssm_dtype: "float32"` upstream;
 llama.cpp hardcodes F32 for both conv and delta states. State per layer per sequence:
 `(d_conv−1)·conv_dim` floats conv + `128·128·H_v` floats delta (2 MiB on the 35B)
@@ -250,7 +287,30 @@ Laguna's refuted list (death-by-dispatch, encoder takeover, all-f16 activation c
 mixed-operand matmul2d as a tensor speedup, sub-32-seq mm_id) transfers as *prior
 evidence, not law* — same machine, same candle, same kernel geometry, different model.
 Anything re-opened here needs a measurement, and its entry moves into this section with
-the number that killed or revived it. Nothing xwen-specific is refuted yet (2026-07-28).
+the number that killed or revived it (2026-07-28).
+
+**The dual-weight expert gather — fusing gate, up and their SwiGLU into one dispatch —
+is REFUTED on this device.** `kernel_mul_mv_id_q4_K_f32_dual` (mv.metal) does exactly
+that, and is bitwise against the three dispatches it replaces: it calls the same
+`mul_mv_q4_K_sums` body once per projection, factored out of the verbatim ggml
+`mul_mv_q4_K_impl`, so neither accumulation order moves, and the epilogue is
+`silu_mul.metal`'s expression with its roundings pinned. It still measured slower —
+99.5 tok/s decode against 102.8 for the split chain, 35B-A3B, interleaved, median of 5,
+five reps apart with no overlap between the arms.
+
+The mechanism is worth recording because it generalizes. It is NOT register pressure:
+the single and dual pipelines both report `max_total_threads_per_threadgroup` of 1024.
+It is the grid. Two independent `mul_mv_id` dispatches expose twice the threadgroups,
+and the routed-expert gather is bandwidth-bound, so that parallelism is what keeps
+memory requests outstanding. The dual kernel keeps ONE dispatch's grid while walking both
+weight planes serially per thread, halving the memory-level parallelism to save two
+launches. Dispatch count is the right thing to attack in the MoE glue — 24 to 14 bought
+11% — but it stops being the right thing to attack the moment the dispatches being
+merged were already saturating bandwidth in parallel.
+
+Kept behind an opt-in `XWEN_MOE_DUAL=1` rather than deleted: it is a measured, gated,
+bitwise-proven artifact, and the conclusion is device-specific. Re-price it before
+reusing it, do not assume it (2026-07-29).
 
 ## Speculative decoding
 
@@ -449,19 +509,35 @@ not 248320 CPU `expf` calls) and the candidate set comes from a single-pass stre
 top-k. 0.819 → 0.406 ms/token measured at real width by `sampler_decode_bench`
 (2026-07-28).
 
-**Top-p is measured against absolute mass, following candle, NOT llama.cpp.** candle's
-`TopKThenTopP` softmaxes over the whole vocabulary first, then truncates to k, then
-applies the top-p cut to the survivors *without renormalizing them* — so `top_p` is a
-threshold on full-vocabulary probability mass, and the cut is skipped outright when the
-top-k set holds less than `top_p` of the total. llama.cpp (`llama_sampler_top_p` after
-`llama_sampler_top_k`) and HF (`TopPLogitsWarper` after `TopKLogitsWarper`) both
-renormalize over the k survivors first, which trims the tail in cases where this one
-does not. The retarget preserved candle's order deliberately: the change under
-discussion was a performance change, and switching sampling conventions inside it would
-have been an unreviewable behavior change riding along. It is also why the fast path
-still needs a full-vocabulary softmax instead of a k-wide one — the cut needs the total
-mass. Whether to move to the llama.cpp convention is open and belongs to whoever owns
-sampling semantics, not to a perf pass (2026-07-28).
+**Top-p renormalizes over the top-k survivors before the cut, following llama.cpp and
+HF, NOT candle.** `truncate_top_p` is `llama_sampler_top_p_apply`: `top_p >= 1.0` is a
+no-op, otherwise the survivors are rescaled to sum to one and the shortest prefix whose
+cumulative mass *reaches* `top_p` is kept — the comparison is `cum_sum >= top_p` and the
+token that crosses the threshold is included, so the kept mass is at least `top_p` and
+never just short of it. llama.cpp's other knob, `min_keep`, is not carried: its default
+is 0 (disabled), and the loop's own guarantee — the first iterate can only cut at index
+1 or later — is the only floor that default produces. HF's `TopPLogitsWarper` after
+`TopKLogitsWarper` is the same rule (2026-07-29).
+
+The convention this replaced, kept on the record because the divergence explains the
+shape of the surrounding code: candle's `TopKThenTopP` softmaxes over the whole
+vocabulary, truncates to k, and applies the cut to the survivors *without* renormalizing
+them, so `top_p` was a threshold on full-vocabulary mass and the cut was skipped outright
+whenever the top-k set held less than `top_p` of the total. The 2026-07-28 perf retarget
+preserved that deliberately — it was a performance change, and switching sampling
+conventions inside it would have been an unreviewable behavior change riding along — and
+ledgered the question instead. Resolved here as a semantics question: llama.cpp is the
+project's declared ground truth everywhere else, and `--top-p` now means what a llama.cpp
+user expects. Sampled outputs change: a seeded stochastic run draws a different (equally
+valid) token stream than a pre-2026-07-29 build, and the change is one-directional —
+renormalizing only ever cuts the same or more. Greedy decoding is untouched, so the
+parity gate is unaffected. Two things follow from the switch. The fast path no longer
+*needs* a full-vocabulary softmax — renormalizing over the k survivors is exactly a
+k-wide softmax, so a Metal top-k could ship ~20 values instead of the 993 KB row (still
+a TODO, not done here). And the truncation stopped being sensitive to which backend ran
+the softmax: the shared denominator now divides back out of the cut as well as the draw,
+so the device fast path and the CPU `SampleControl` path truncate identically instead of
+being able to disagree by an ulp at the threshold (2026-07-29).
 
 Consequence recorded so it is not mistaken for a regression: seeded stochastic runs
 produce different (equally valid) token streams than pre-2026-07-28 builds. candle's
@@ -469,7 +545,9 @@ candidate list came out of `select_nth_unstable_by` in unspecified order and thi
 sorted descending; a weighted draw maps its single uniform through the cumulative
 weights, so the same seed lands on a different token. Greedy decoding is bit-identical
 (argmax over the CPU copy, ties to the lowest id, no RNG touched), which is why the
-parity gate — greedy end to end — is unaffected (2026-07-28).
+parity gate — greedy end to end — is unaffected (2026-07-28). The top-p convention
+switch moved the seeded streams a second time, and for a second reason: the candidate
+set itself is now narrower wherever the cut bites (2026-07-29).
 
 **A NaN in the logit row fails the draw; ties at the top-k boundary go to the lowest
 id.** Two contracts the in-crate sampler states rather than inherits. NaN loses every
@@ -483,9 +561,11 @@ several equal entries survives unspecified, while the streaming top-k's strict `
 against the floor keeps the lowest ids, so the candidate set is a function of the
 probabilities and not of the traversal that built it. Equivalence with candle is
 therefore claimed as distribution equality for untied inputs plus deterministic low-id
-selection at exact boundary ties, and only up to the floating-point rounding of whichever
-backend ran the softmax — the denominator cancels out of the weighted draw and reaches
-the outcome through exactly one place, the absolute-mass top-p comparison (2026-07-29).
+selection at exact boundary ties, and — since the top-p conventions diverge — only where
+no top-p cut applies. The softmax denominator no longer reaches the outcome at all: it
+cancels out of the weighted draw and, once the survivors are renormalized, out of the
+cut too, so the two backends agree bit-for-bit on which candidates survive. llama.cpp is
+the oracle for the truncation itself (2026-07-29).
 
 **Ids past the tokenizer's vocabulary are not drawable.** The output layer is padded
 (248320 rows against 248070 encodable ids) and the rows in between decode to nothing, so

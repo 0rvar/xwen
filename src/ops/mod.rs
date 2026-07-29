@@ -6,6 +6,7 @@ mod dispatch;
 pub mod f16;
 pub mod flash;
 pub mod mm_id;
+pub mod moe_glue;
 pub mod mv_id;
 mod pipelines;
 pub mod q8;
@@ -19,6 +20,7 @@ pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
 pub use flash::flash_attn;
 pub use mm_id::mul_mm_id;
+pub use moe_glue::{moe_epilogue, moe_router, moe_router_supported};
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
 pub use q8::matmul_q8;
 pub use silu_mul::silu_mul;
@@ -113,6 +115,42 @@ pub(crate) fn candle_fast_math_disabled() -> bool {
 pub fn act_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_ACT_CLASSIC").is_some())
+}
+
+/// `XWEN_MOE_GLUE_CLASSIC=1` reverts the MoE block glue — the fused routing
+/// decision (`ops::moe_router`), the fused block epilogue (`ops::moe_epilogue`)
+/// and the shared expert's fused SwiGLU activation (`ops::silu_mul`) — back to
+/// the candle chains they replace. ONE switch covers all three: each fused
+/// kernel is bit-identical to its candle chain by construction, so this is a
+/// safety kill-switch and provenance anchor, not a correctness tier. The routed
+/// experts' own activation and combine keep their older, narrower switches
+/// (`XWEN_ACT_CLASSIC`, `XWEN_COMBINE_CLASSIC`), which still apply on the
+/// classic branch.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`combine_classic`, `attn_glue_classic`): any value enables it — only leaving
+/// it unset keeps the fused path.
+pub fn moe_glue_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_MOE_GLUE_CLASSIC").is_some())
+}
+
+/// `XWEN_MOE_DUAL=1` opts the routed experts' gate|up gather INTO the
+/// dual-weight kernel (`ops::mul_mv_id_dual`), which computes both projections
+/// and their SwiGLU activation in one dispatch instead of three. It is
+/// bit-identical to the split chain, so this is a perf switch, not a
+/// correctness tier — and it is OFF by default because it measured SLOWER:
+/// interleaved A/B on the 35B-A3B put decode at 102.8 tok/s with the split
+/// chain against 99.5 tok/s with the dual kernel, 5 reps of 5 apart (see
+/// docs/decisions.md "The dual-weight expert gather"). Kept because it is a
+/// measured, gated artifact worth re-pricing on a different device or after the
+/// gather's occupancy changes — not because anything runs it today.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches: any value
+/// enables it — only leaving it unset keeps the split chain.
+pub fn moe_dual() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_MOE_DUAL").is_some())
 }
 
 /// `XWEN_ATTN_GLUE_CLASSIC=1` reverts the attention glue — the fused softplus

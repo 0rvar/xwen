@@ -11,13 +11,25 @@ use crate::ops::{ExpertRunner, mm_id, mv_id};
 
 /// F16's smallest positive normal, the denominator floor llama.cpp clamps the
 /// routing-weight sum to before normalizing (`ffn_moe_weights_sum_clamped`).
-const WEIGHTS_SUM_FLOOR: f64 = 6.103_515_625e-5;
+pub(crate) const WEIGHTS_SUM_FLOOR: f64 = 6.103_515_625e-5;
 
 /// Runs the selected experts' SwiGLU FFNs.
 /// x: [seq, hidden] f32; ids: [seq, top_k] u32 on-device; weights: [seq, top_k] f32.
 /// Returns [seq, hidden] f32 (already weight-combined).
 pub trait ExpertFfn: Send {
     fn forward(&self, x: &Tensor, ids: &Tensor, weights: &Tensor) -> Result<Tensor>;
+
+    /// The per-slot down-projection output `[seq, top_k, hidden]` BEFORE the
+    /// routing-weight combine, for callers that fold the combine into a larger
+    /// fused pass. `None` means this runner cannot hand one over for these
+    /// operands and the caller must use `forward` — either because it never
+    /// materializes an uncombined result (the reference oracle scatters each
+    /// expert's rows as it goes) or because the projection carries a rescale the
+    /// plain combine does not undo. Implementations returning `None` must do so
+    /// before spending any work.
+    fn project(&self, _x: &Tensor, _ids: &Tensor) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
 }
 
 /// One MoE FFN block — every layer of `qwen35moe`. Routing math: a SOFTMAX over
@@ -32,6 +44,7 @@ pub struct MoeBlock {
     router_t: Tensor,
     experts: Box<dyn ExpertFfn>,
     shared: SharedExpert,
+    n_expert: usize,
     n_expert_used: usize,
 }
 
@@ -39,6 +52,7 @@ impl MoeBlock {
     /// `w` positioned at the block prefix. `runner` picks Fused vs Reference experts.
     pub fn new(w: &Weights, cfg: &XwenConfig, runner: ExpertRunner) -> Result<Self> {
         let router_t = w.dense_f32("ffn_gate_inp")?.t()?.contiguous()?;
+        let n_expert = router_t.dim(1)?;
         let experts: Box<dyn ExpertFfn> = match runner {
             ExpertRunner::Reference => Box::new(ReferenceExperts::new(w)?),
             ExpertRunner::Fused => Box::new(FusedExperts::new(w)?),
@@ -48,18 +62,51 @@ impl MoeBlock {
             router_t,
             experts,
             shared,
+            n_expert,
             n_expert_used: cfg.n_expert_used,
         })
+    }
+
+    /// Whether this block runs the fused glue kernels (`ops::moe_router`,
+    /// `ops::moe_epilogue`, and the shared expert's `ops::silu_mul`) rather than
+    /// the candle chains. Needs a Metal device, the kill-switch unset, and a
+    /// routing geometry the router kernel's threadgroup arrays cover — the
+    /// bounds are the kernel's, so a checkpoint outside them falls back rather
+    /// than failing.
+    fn glue_fused(&self, x: &Tensor) -> bool {
+        !crate::ops::moe_glue_classic()
+            && x.device().is_metal()
+            && crate::ops::moe_router_supported(self.n_expert, self.n_expert_used)
     }
 
     /// Returns (ids [seq, top_k] u32 on-device, weights [seq, top_k] f32).
     pub fn route(&self, x_normed: &Tensor) -> Result<(Tensor, Tensor)> {
         let logits = route_logits(&self.router_t, x_normed)?;
+        if self.glue_fused(x_normed) {
+            // One kernel for softmax + arg-sort + gather + sum + clamp + divide,
+            // bit-identical to the candle chain below (ops::moe_glue).
+            return crate::ops::moe_router(&logits, self.n_expert_used, WEIGHTS_SUM_FLOOR as f32);
+        }
         route_from_logits(&logits, self.n_expert_used)
     }
 
     pub fn forward(&self, x_normed: &Tensor) -> Result<Tensor> {
         let (ids, weights) = self.route(x_normed)?;
+
+        // Fused tail: the routed weighted combine, the shared expert's sigmoid
+        // gate, its multiply and the routed+shared add in one pass over the
+        // uncombined down projection. Only when the expert runner can hand that
+        // projection over — the reference oracle never materializes one, and the
+        // f16-tile prefill variants carry an L2 rescale this epilogue does not
+        // undo — otherwise the classic chain below runs unchanged.
+        if self.glue_fused(x_normed)
+            && let Some(down) = self.experts.project(x_normed, &ids)?
+        {
+            let shexp = self.shared.swiglu_out(x_normed)?;
+            let gate = self.shared.gate_logits(x_normed)?;
+            return crate::ops::moe_epilogue(&down, &weights, &shexp, &gate);
+        }
+
         let routed = self.experts.forward(x_normed, &ids, &weights)?;
         let shared = self.shared.forward(x_normed)?;
         Ok((routed + shared)?)
@@ -195,8 +242,28 @@ impl FusedExperts {
     }
 }
 
-impl ExpertFfn for FusedExperts {
-    fn forward(&self, x: &Tensor, ids: &Tensor, weights: &Tensor) -> Result<Tensor> {
+impl FusedExperts {
+    /// Whether these operands take the two-pass token-grouped prefill matmul
+    /// rather than the per-token matvec, and whether that choice stages the
+    /// down-projection activation as f16 (so the L2 rescale guard is required).
+    /// Split out of the projection so a caller can learn the answer without
+    /// spending any work.
+    fn use_mm(&self, seq: usize, top_k: usize) -> bool {
+        let variant = crate::ops::mm_id_variant();
+        let mm_supported = mm_id::supported(self.gate.dtype, top_k, variant)
+            && mm_id::supported(self.up.dtype, top_k, variant)
+            && mm_id::supported(self.down.dtype, top_k, variant);
+        seq >= crate::ops::mm_id_min_seq() && !crate::ops::no_mm_id() && mm_supported
+    }
+
+    fn needs_rescale(&self, seq: usize, top_k: usize) -> bool {
+        self.use_mm(seq, top_k) && crate::ops::mm_id_variant().casts_activation_f16()
+    }
+
+    /// The routed experts' down projection, `[seq, top_k, hidden]`, before any
+    /// weighted combine — plus the per-column L2 rescale factor a combine must
+    /// undo when the prefill kernels staged the activation as f16.
+    fn project_inner(&self, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
         let (seq, hidden) = x.dims2()?;
         let top_k = ids.dim(1)?;
         let x = x.to_dtype(DType::F32)?;
@@ -211,11 +278,7 @@ impl ExpertFfn for FusedExperts {
         // tiled f32 accumulation drifts a little further from the per-row f32
         // reference oracle than mv_id does (fork-equivalent tiled behavior; see
         // docs/parity.md §3b), so mv_id is the reference for the strict gate.
-        let variant = crate::ops::mm_id_variant();
-        let mm_supported = mm_id::supported(self.gate.dtype, top_k, variant)
-            && mm_id::supported(self.up.dtype, top_k, variant)
-            && mm_id::supported(self.down.dtype, top_k, variant);
-        let use_mm = seq >= crate::ops::mm_id_min_seq() && !crate::ops::no_mm_id() && mm_supported;
+        let use_mm = self.use_mm(seq, top_k);
 
         // One map0 pass (per-expert token-slot map) shared by gate/up/down: the
         // three projections route by the SAME ids, so their maps are byte-identical.
@@ -235,6 +298,26 @@ impl ExpertFfn for FusedExperts {
 
         // gate/up share one activation per token: x_per_row = 1.
         let x_g = x.reshape((seq, 1, hidden))?;
+
+        // OPT-IN (XWEN_MOE_DUAL): one dual-weight gather computes both
+        // projections and their SwiGLU activation, replacing three dispatches
+        // with one and never writing the two intermediates. Bit-identical to the
+        // split chain below, but MEASURED SLOWER on this device — the gather is
+        // bandwidth-bound and the extra live accumulators cost more occupancy
+        // than the two saved dispatches buy back (docs/decisions.md "The
+        // dual-weight expert gather"). Only reachable on the matvec path (the
+        // prefill mm_id kernels have no dual form) for a q4_K gate/up pair.
+        let dual = crate::ops::moe_dual()
+            && !use_mm
+            && !crate::ops::moe_glue_classic()
+            && !crate::ops::act_classic()
+            && !crate::ops::mv_classic()
+            && mv_id::mul_mv_id_dual_supported(&self.gate, &self.up);
+        if dual {
+            let act = mv_id::mul_mv_id_dual(&self.gate, &self.up, &x_g, ids)?;
+            return Ok((matmul(&self.down, &act, ids)?, None));
+        }
+
         let gate = matmul(&self.gate, &x_g, ids)?; // [seq, top_k, expert_ff]
         let up = matmul(&self.up, &x_g, ids)?; // [seq, top_k, expert_ff]
 
@@ -246,7 +329,7 @@ impl ExpertFfn for FusedExperts {
         //   - prefill / mm_id-hp (classic f32 tiles): stages src1 as float — no cast;
         //   - prefill / mm_id tensor default + classic-f16: stage src1 as half —
         //     f16 cast, so the rescale is required.
-        let needs_rescale = use_mm && crate::ops::mm_id_variant().casts_activation_f16();
+        let needs_rescale = self.needs_rescale(seq, top_k);
 
         // silu(gate)*up fused into one vendored pass (`ops::silu_mul`), which is
         // BIT-IDENTICAL to candle's `silu(gate) * up` chain by construction — the
@@ -263,13 +346,9 @@ impl ExpertFfn for FusedExperts {
             crate::ops::silu_mul(&gate, &up)?
         }; // [seq, top_k, expert_ff]
 
-        // Routing weights, f32 [seq, top_k]; the fused combine takes this shape,
-        // the classic candle chain reshapes to [seq, top_k, 1] for broadcasting.
-        let w = weights.to_dtype(DType::F32)?;
-
         if needs_rescale {
             // Per-column L2 rescale keeps the f16-tile down cast in range; the
-            // factor divides back out afterwards (a per-column identity). 32768
+            // factor divides back out in the combine (a per-column identity). 32768
             // (f16's safe headroom) is only meaningful on this f16-tile branch.
             let f16_safe = 32768.0_f64;
             let col_l2 = act
@@ -279,25 +358,50 @@ impl ExpertFfn for FusedExperts {
                 .clamp(1e-8_f32, 1e30_f32)?; // [seq, top_k, 1]
             let act_s = (&act * f16_safe)?.broadcast_div(&col_l2)?;
             let down = matmul(&self.down, &act_s, ids)?; // [seq, top_k, hidden]
-            // Undo the L2 scale, apply routing weights, sum over top_k. The fused
-            // kernel does all three in one pass over `down`, bit-identically to the
-            // candle chain; XWEN_COMBINE_CLASSIC keeps the candle chain.
-            if crate::ops::combine_classic() {
-                let down = (down.broadcast_mul(&col_l2)? * (1.0 / f16_safe))?;
-                let w = w.reshape((seq, top_k, 1))?;
-                return Ok(down.broadcast_mul(&w)?.sum(1)?);
-            }
-            return crate::ops::combine(&down, Some(&col_l2), &w);
+            return Ok((down, Some(col_l2)));
         }
 
         // Default: f32 down projection (mv_id or mm_id-hp) — no f16 cast, so the
         // activation feeds the down matmul directly, no rescale needed.
-        let down = matmul(&self.down, &act, ids)?; // [seq, top_k, hidden]
+        Ok((matmul(&self.down, &act, ids)?, None))
+    }
+}
+
+impl ExpertFfn for FusedExperts {
+    fn forward(&self, x: &Tensor, ids: &Tensor, weights: &Tensor) -> Result<Tensor> {
+        let (seq, top_k) = (x.dim(0)?, ids.dim(1)?);
+        let (down, col_l2) = self.project_inner(x, ids)?;
+
+        // Routing weights, f32 [seq, top_k]; the fused combine takes this shape,
+        // the classic candle chain reshapes to [seq, top_k, 1] for broadcasting.
+        let w = weights.to_dtype(DType::F32)?;
+
+        // Apply the routing weights and sum over top_k, undoing the L2 scale on
+        // the rescale branch. The fused kernel does all of it in one pass over
+        // `down`, bit-identically to the candle chain; XWEN_COMBINE_CLASSIC keeps
+        // the candle chain.
         if crate::ops::combine_classic() {
+            let f16_safe = 32768.0_f64;
+            let down = match &col_l2 {
+                Some(l2) => (down.broadcast_mul(l2)? * (1.0 / f16_safe))?,
+                None => down,
+            };
             let w = w.reshape((seq, top_k, 1))?;
             return Ok(down.broadcast_mul(&w)?.sum(1)?);
         }
-        crate::ops::combine(&down, None, &w)
+        crate::ops::combine(&down, col_l2.as_ref(), &w)
+    }
+
+    /// The uncombined down projection, for the fused block epilogue. Declines
+    /// (before doing any work) on the rescale branch: that projection carries an
+    /// L2 scale only the rescale combine undoes, and the epilogue's reduction
+    /// has no term for it.
+    fn project(&self, x: &Tensor, ids: &Tensor) -> Result<Option<Tensor>> {
+        if self.needs_rescale(x.dim(0)?, ids.dim(1)?) {
+            return Ok(None);
+        }
+        let (down, _) = self.project_inner(x, ids)?;
+        Ok(Some(down))
     }
 }
 
@@ -329,9 +433,34 @@ impl SharedExpert {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = swiglu(&self.gate, &self.up, &self.down, x)?;
-        let gate = sigmoid(&x.to_dtype(DType::F32)?.matmul(&self.router_t)?)?; // [seq, 1]
+        let out = self.swiglu_out(x)?;
+        let gate = sigmoid(&self.gate_logits(x)?)?; // [seq, 1]
         Ok(out.broadcast_mul(&gate)?)
+    }
+
+    /// The SwiGLU output BEFORE the scalar gate — what the fused block epilogue
+    /// scales by the gate itself.
+    ///
+    /// The `silu(gate) * up` step runs as one vendored pass (`ops::silu_mul`),
+    /// bit-identical to candle's two dispatches. The dense checkpoint's MLP
+    /// keeps the candle chain: it is not part of an MoE block, and its
+    /// dispatch count is not what bounds decode.
+    pub fn swiglu_out(&self, x: &Tensor) -> Result<Tensor> {
+        let g = self.gate.forward(x)?;
+        let u = self.up.forward(x)?;
+        let h = if !crate::ops::moe_glue_classic() && x.device().is_metal() {
+            crate::ops::silu_mul(&g, &u)?
+        } else {
+            (silu(&g)? * u)?
+        };
+        Ok(self.down.forward(&h)?)
+    }
+
+    /// The RAW pre-sigmoid shared-expert gate logit, `[seq, 1]` f32. The sigmoid
+    /// itself lives with whoever applies the gate — the fused epilogue folds it
+    /// into its own pass.
+    pub fn gate_logits(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(x.to_dtype(DType::F32)?.matmul(&self.router_t)?)
     }
 }
 
@@ -624,6 +753,128 @@ mod tests {
         assert!(scale_v.iter().all(|r| r.len() == 1));
     }
 
+    /// The whole fused MoE block — the routing kernel, the fused shared-expert
+    /// activation and the fused epilogue — must reproduce the candle
+    /// composition it replaces BIT-FOR-BIT at decode shape. The ops-level tests
+    /// pin each kernel against its own chain; this one pins the WIRING: an
+    /// operand handed to the wrong kernel argument, a gate logit that picked up
+    /// a stray sigmoid, or a shared-expert term added in the wrong order would
+    /// all survive the per-kernel tests and die here.
+    ///
+    /// The reference side is spelled out rather than taken from
+    /// `MoeBlock::forward`'s classic branch, because that branch itself runs
+    /// bit-identical fused kernels (`ops::combine`, `ops::silu_mul`) unless
+    /// their own switches are set — comparing against it would compare two
+    /// fused paths. Here every reference step is a candle op.
+    #[test]
+    fn fused_block_matches_candle_bitwise() {
+        use candle_core::quantized::QStorage;
+        use std::borrow::Cow;
+
+        let device = crate::gguf::metal_device().unwrap();
+        // q4_K quantizes in 256-element blocks, so every contracted dimension
+        // is a multiple of 256.
+        let (hidden, expert_ff, n_expert, top_k, seq) =
+            (256usize, 256usize, 32usize, 4usize, 1usize);
+
+        let stack = |n_out: usize, k: usize, seed: u64| -> ExpertStack {
+            let one = det_tensor(&[n_out, k], seed, 0.5);
+            let qt = QTensor::quantize(&one, GgmlDType::Q4K).unwrap();
+            let bytes = qt.data().unwrap();
+            let mut all = Vec::with_capacity(bytes.len() * n_expert);
+            for e in 0..n_expert {
+                // Perturb each expert's first byte so the experts are not
+                // interchangeable and a mis-indexed gather cannot pass.
+                let mut copy = bytes.to_vec();
+                copy[0] = copy[0].wrapping_add(e as u8);
+                all.extend_from_slice(&copy);
+            }
+            let storage = QStorage::from_data(Cow::Owned(all), &device, GgmlDType::Q4K).unwrap();
+            let buffer = match &storage {
+                QStorage::Metal(qms) => Some(Arc::new(qms.buffer().clone())),
+                _ => panic!("expert stacks require Metal storage"),
+            };
+            let qtensor = Arc::new(QTensor::new(storage, (n_expert, n_out, k)).unwrap());
+            ExpertStack {
+                qtensor: Some(qtensor),
+                buffer,
+                base_off: 0,
+                mmap: None,
+                dtype: GgmlDType::Q4K,
+                n_expert,
+                n_out,
+                k,
+            }
+        };
+        let ql = |t: &Tensor| {
+            let qt = QTensor::quantize_onto(t, GgmlDType::Q4K, &device).unwrap();
+            QLinear::from_qtensor(Arc::new(qt)).unwrap()
+        };
+
+        let shared = SharedExpert {
+            gate: ql(&det_tensor(&[expert_ff, hidden], 0x20, 0.5)),
+            up: ql(&det_tensor(&[expert_ff, hidden], 0x21, 0.5)),
+            down: ql(&det_tensor(&[hidden, expert_ff], 0x22, 0.5)),
+            router_t: det_tensor(&[hidden, 1], 0x23, 0.4)
+                .to_device(&device)
+                .unwrap(),
+        };
+        let block = MoeBlock {
+            router_t: det_tensor(&[n_expert, hidden], 0x10, 0.4)
+                .to_device(&device)
+                .unwrap()
+                .t()
+                .unwrap()
+                .contiguous()
+                .unwrap(),
+            experts: Box::new(FusedExperts {
+                gate: stack(expert_ff, hidden, 0x01),
+                up: stack(expert_ff, hidden, 0x02),
+                down: stack(hidden, expert_ff, 0x03),
+            }),
+            shared,
+            n_expert,
+            n_expert_used: top_k,
+        };
+        assert!(
+            crate::ops::moe_router_supported(n_expert, top_k),
+            "this geometry must reach the fused router, or the test proves nothing"
+        );
+
+        let x = det_tensor(&[seq, hidden], 0x42, 1.7)
+            .to_device(&device)
+            .unwrap();
+        let got = block.forward(&x).unwrap();
+
+        // Reference: the candle routing chain, the candle broadcast/sum combine,
+        // the candle silu+mul shared expert, then routed + shared.
+        let logits = route_logits(&block.router_t, &x).unwrap();
+        let (ids, weights) = route_from_logits(&logits, top_k).unwrap();
+        let down = block.experts.project(&x, &ids).unwrap().unwrap();
+        let routed = down
+            .broadcast_mul(&weights.reshape((seq, top_k, 1)).unwrap())
+            .unwrap()
+            .sum(1)
+            .unwrap();
+        let g = block.shared.gate.forward(&x).unwrap();
+        let u = block.shared.up.forward(&x).unwrap();
+        let h = (silu(&g).unwrap() * u).unwrap();
+        let sh = block.shared.down.forward(&h).unwrap();
+        let gate = sigmoid(&x.matmul(&block.shared.router_t).unwrap()).unwrap();
+        let want = (routed + sh.broadcast_mul(&gate).unwrap()).unwrap();
+
+        let gv: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+        let wv: Vec<f32> = want.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(gv.len(), wv.len());
+        for (i, (a, b)) in gv.iter().zip(wv.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "fused MoE block element {i} differs (fused {a:?}, candle {b:?})"
+            );
+        }
+    }
+
     /// The dense checkpoint's FFN is a plain ungated SwiGLU.
     #[test]
     fn dense_mlp_swiglu() {
@@ -796,6 +1047,7 @@ mod tests {
                 router_t,
                 experts: Box::new(experts),
                 shared,
+                n_expert: N_EXPERT,
                 n_expert_used: TOP_K,
             };
             (norm(HIDDEN, s + 30, dev), block)
@@ -1071,14 +1323,14 @@ mod tests {
 
         // --- decode expert-gather attribution benches (WP-G1) --------------
         //
-        // The decode MoE budget's biggest line item is the routed expert
-        // gather: three `mul_mv_id` launches per layer (gate/up/down) over
-        // ~50 MiB of q4_K weights each token-layer (~2.4 GB over 47 layers).
-        // `moe_decode_ffn_bench` derives "mv_id gather + silu*mul + combine" at
-        // ~13.7 ms/token (LPM), ~180 GB/s effective against ~2.4 GB — half the
-        // ~365 GB/s the q6_K lm_head matvec sustains at the same seq==1. These
-        // benches localize the missing half: is it kernel-internal streaming at
-        // expert geometry, inter-dispatch boundaries, or a wrong byte floor?
+        // The decode MoE budget's byte floor is the routed expert gather: three
+        // `mul_mv_id` launches per layer (gate/up/down) over the top_k selected
+        // experts' q4_K planes. At 35B-A3B geometry (hidden 2048, expert_ff 512,
+        // top_k 8) that is ~14 MB of weight per layer and ~570 MB per token
+        // across the 40 MoE layers. Comparing each launch's effective GB/s
+        // against the ~365 GB/s the q6_K lm_head matvec sustains at the same
+        // seq==1 says WHERE a shortfall lives: kernel-internal streaming at
+        // expert geometry, inter-dispatch boundaries, or a wrong byte floor.
         // Synthetic weights at production geometry; never load a model file.
 
         /// Effective bandwidth: `bytes` moved in `ms` milliseconds, as GB/s

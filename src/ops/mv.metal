@@ -178,17 +178,29 @@ static inline void helper_mv_reduce_and_write(
 // ---- q4_K impl (verbatim from ggml-metal.metal kernel_mul_mv_q4_K_f32_impl,
 // with the function-constant broadcast dims resolved to 1) --------------------
 
+// q4_K's (N_R0, N_SG) as `#define`s rather than per-impl constexpr, because the
+// dual-weight gather kernel below needs the same pair to size its two register
+// accumulators and recompute `first_row`. dispatch.rs `MvVendoredGeom` mirrors
+// them for the host grid; the mv_id.rs geometry test holds the two in step.
+#define MV_Q4_K_NR0 2
+#define MV_Q4_K_NSG 2
+
+// The q4_K accumulation, stopping short of the cross-lane reduce and the store:
+// fills `sumf[NR0]` with this lane's partial for each row the calling simdgroup
+// owns. Factored out of `mul_mv_q4_K_impl` (which is otherwise the verbatim ggml
+// body) so the dual-weight kernel can run it once per projection without
+// perturbing either one's accumulation order.
 template<typename args_t>
-static inline void mul_mv_q4_K_impl(
+static inline void mul_mv_q4_K_sums(
         args_t args,
         device const char * src0,
         device const char * src1,
-        device       char * dst,
+        thread float * sumf,
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
-    constexpr short NR0 = 2;  // N_R0_Q4_K
-    constexpr short NSG = 2;  // N_SG_Q4_K
+    constexpr short NR0 = MV_Q4_K_NR0;
+    constexpr short NSG = MV_Q4_K_NSG;
 
     constexpr uint16_t kmask1 = 0x3f3f;
     constexpr uint16_t kmask2 = 0x0f0f;
@@ -203,7 +215,6 @@ static inline void mul_mv_q4_K_impl(
 
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
-    const int im = tgpig.z;
 
     const int first_row = (r0 * NSG + sgitg) * NR0;
 
@@ -216,8 +227,6 @@ static inline void mul_mv_q4_K_impl(
 
     float yl[16];
     float yh[16];
-
-    float sumf[NR0]={0.f};
 
     device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
@@ -273,6 +282,26 @@ static inline void mul_mv_q4_K_impl(
 
         y4 += 4 * QK_K;
     }
+}
+
+template<typename args_t>
+static inline void mul_mv_q4_K_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NR0 = MV_Q4_K_NR0;
+    constexpr short NSG = MV_Q4_K_NSG;
+
+    float sumf[NR0] = {0.f};
+    mul_mv_q4_K_sums(args, src0, src1, sumf, tgpig, tiisg, sgitg);
+
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
 
     device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
 
@@ -728,4 +757,73 @@ kernel void kernel_mul_mv_id_q8_0_f32_v(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     MUL_MV_ID_BODY_SHMEM(mul_mv_q8_0_impl)
+}
+
+// ---- Dual-weight indexed gather (gate|up + SwiGLU, one dispatch) ------------
+
+// candle's `usilu` times `up`, the expression `kernel_moe_silu_mul`
+// (silu_mul.metal) computes — kept in its own function so the fp pragmas that
+// pin its two roundings apply ONLY here. The accumulation above must keep this
+// library's default (contracting) codegen, or it would stop matching the
+// single-projection kernels bit-for-bit.
+static inline float mv_silu_mul(float g, float u) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const float s = g / (1 + exp(-g));
+    return s * u;
+}
+
+// OPT-IN (XWEN_MOE_DUAL), and OFF by default because it measured SLOWER than the
+// three dispatches it replaces: 99.5 vs 102.8 tok/s decode on the 35B-A3B,
+// interleaved, 5 reps apart with no overlap. The two pipelines report the same
+// max_total_threads_per_threadgroup (1024), so it is not register pressure; the
+// grid is. Two independent `_v` dispatches expose twice the threadgroups, and
+// this bandwidth-bound gather turns that parallelism into outstanding memory
+// requests — folding them into one grid that walks both weight planes serially
+// per thread costs more than the two saved launches buy. Kept as a measured,
+// gated artifact worth re-pricing elsewhere (docs/decisions.md).
+//
+// Gate and up in ONE dispatch, with the SwiGLU activation as the epilogue:
+// dst[t, slot, row] = silu(gate_row . x) * (up_row . x). The two stacks share
+// the ids, the activation and the geometry — only the weight base differs — so
+// this replaces three dispatches (two `kernel_mul_mv_id_q4_K_f32_v` plus
+// `kernel_moe_silu_mul`) and never materializes the two intermediate
+// projections.
+//
+// BIT-IDENTICAL to that trio by construction: each projection runs
+// `mul_mv_q4_K_sums` — the same body, the same lane partition, the same
+// accumulation order the single kernel uses — and `simd_sum` folds it the same
+// way, so `g` and `u` carry exactly the bits the separate dispatches would have
+// stored; the epilogue is silu_mul.metal's expression with its roundings pinned.
+kernel void kernel_mul_mv_id_q4_K_f32_dual(
+        constant mv_id_args & args    [[buffer(0)]],
+        device const char *  src0s    [[buffer(1)]],
+        device const char *  src1     [[buffer(2)]],
+        device       char *  dst      [[buffer(3)]],
+        device const char *  ids      [[buffer(4)]],
+        device const char *  src0s_u  [[buffer(5)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    MUL_MV_ID_DECODE
+    device const char * src0_up = src0s_u + i02*args.nb02;
+
+    float sumf_g[MV_Q4_K_NR0] = {0.f};
+    float sumf_u[MV_Q4_K_NR0] = {0.f};
+    mul_mv_q4_K_sums(args0, src0_cur, src1_cur, sumf_g, tgpig, tiisg, sgitg);
+    mul_mv_q4_K_sums(args0, src0_up,  src1_cur, sumf_u, tgpig, tiisg, sgitg);
+
+    const int first_row = (tgpig.x * MV_Q4_K_NSG + sgitg) * MV_Q4_K_NR0;
+    device float * dst_f32 = (device float *) dst_cur
+        + (int64_t)tgpig.z*args0.ne0*args0.ne1 + (int64_t)tgpig.y*args0.ne0;
+
+    // Same store-only ragged-tail guard as the single-projection impl.
+    for (int row = 0; row < MV_Q4_K_NR0 && first_row + row < args0.ne0; ++row) {
+        const float g = simd_sum(sumf_g[row]);
+        const float u = simd_sum(sumf_u[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = mv_silu_mul(g, u);
+        }
+    }
 }

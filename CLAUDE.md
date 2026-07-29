@@ -164,16 +164,21 @@ kernel-vs-reference invariants and is the fast pre-check.
 
 ## Perf state
 
-First 35B-A3B numbers (2026-07-28, power mode unmeasured, short prompt): decode
-58.6-59.0 tok/s plain (--no-draft), warm prefill 167.6 tok/s at 23 tokens, load
-2.8-3.0s, 19.2 GB resident at max_ctx 8192. Cold first run adds ~9s of Metal
-pipeline compilation. Unmeasured: long-prompt prefill (the sequential DeltaNet
-reference scan's cost grows with length — P8), the 27B entirely, and any number
-under a stated power mode. Laguna anchors on this machine (different model, same
-kernels, full power): decode 21.7 tok/s on a 118B-A8B Q4_K_M, prefill ~320-345
-tok/s at 925-4k. The 35B-A3B decode landing at ~2.7x laguna's on ~2.7x fewer
-active params is the bandwidth story behaving; the DeltaNet layers (not the
-experts) are the novel cost center and the P8 kernels are the lever.
+As of 2026-07-29 (Automatic power mode, interleaved protocol, --no-draft; full
+history in log.md): 35B-A3B decode 103.1 tok/s, prefill ~2550@925 / ~2320@4k;
+27B decode 19.6, prefill ~270@925 / ~236@4k (prefill DEGRADES with length — the
+sequential DeltaNet reference scan, P8b owns it). Load 2.8-3.0s, 19.2 GB
+resident at max_ctx 8192; cold first run adds ~9s of Metal pipeline compilation.
+Head-to-head vs llama.cpp e9fa078 -fa 1, same GGUFs, same machine (log.md
+2026-07-29): xwen wins decode on both models (1.05x / 1.02x), 35B prefill near
+parity at steady state, 27B prefill 1.8-2.1x BEHIND — llama.cpp prefills the
+DeltaNet layers chunked (chunk=64), xwen still runs the sequential scan, and
+the 27B has 48 such layers at inner 6144 vs the 35B's 30 at 4096. Bandwidth
+framing: 27B decode is at ~57% of the 614 GB/s peak (near the wall, ceiling
+~23-30 tok/s); 35B decode at ~32% (still launch-bound, ceiling ~225-290);
+prefill is compute-bound on both (~15-16 achieved TFLOP/s each). llama.cpp's
+prefill thermal-boosts harder than xwen's (-17% vs -5% settling) — never read
+a first-reps prefill ratio as steady state.
 
 ## DFlash (PLANNED — sidecars exist, adaptation not started)
 

@@ -191,8 +191,9 @@ impl Sampler {
             Strategy::TopKThenTopP { k, p, temperature } => (k, p, temperature),
         };
 
-        // Probabilities over the WHOLE encodable vocabulary, which is what the
-        // top-p cut below measures against — see `truncate_top_p`.
+        // Probabilities over the whole encodable vocabulary. The top-p cut
+        // renormalizes over the top-k survivors, so only their ratios reach the
+        // outcome and the shared denominator cancels — see `truncate_top_p`.
         let probs = if ctl.is_noop() {
             // Multiplying by exactly 1.0 is the identity in f32, so the default
             // temperature skips the scaling pass outright.
@@ -294,32 +295,27 @@ fn softmax_in_place(values: &mut [f32], temperature: f64) {
 /// weight is a candidate the top-p cut removed.
 ///
 /// Order of operations: vocabulary-wide softmax, then top-k, then top-p over
-/// the surviving probabilities AS THEY STAND — the top-k weights are not
-/// renormalized before the cut, so `top_p` is a threshold on absolute
-/// probability mass, not on mass relative to the top-k set. The distinction is
-/// load-bearing: when the top-k set holds less than `top_p` of the total mass,
-/// the cut is skipped outright and all `k` candidates stay in, where a
-/// renormalizing sampler would still trim the tail.
+/// the survivors renormalized to sum to one — `top_p` is a threshold on mass
+/// relative to the top-k set, which is llama.cpp's convention and HF's. The
+/// surviving weights come back renormalized for the same reason llama.cpp's
+/// `cur_p->p` is: they are what the cut was measured against. The draw
+/// normalizes anyway, so the scale reaches nothing but the threshold.
 fn candidate_set(probs: &[f32], k: usize, top_p: f32) -> Result<Vec<(f32, u32)>> {
-    if k >= probs.len() {
+    let mut candidates = if k >= probs.len() {
         // Nothing for top-k to remove: the whole vocabulary is the candidate
-        // set, and the top-p cut then applies to it unconditionally.
+        // set the top-p cut then applies to.
         ensure!(
             !probs.iter().any(|p| p.is_nan()),
             "the probability row holds a NaN: the forward pass produced a corrupt row"
         );
         let mut all: Vec<(f32, u32)> = probs.iter().copied().zip(0u32..).collect();
         all.sort_by(|a, b| b.0.total_cmp(&a.0));
-        truncate_top_p(&mut all, top_p);
-        Ok(all)
+        all
     } else {
-        let mut top = top_k_desc(probs, k)?;
-        let sum_p: f32 = top.iter().map(|c| c.0).sum();
-        if top_p > 0.0 && top_p < sum_p {
-            truncate_top_p(&mut top, top_p);
-        }
-        Ok(top)
-    }
+        top_k_desc(probs, k)?
+    };
+    truncate_top_p(&mut candidates, top_p);
+    Ok(candidates)
 }
 
 /// The `k` largest entries of `probs` as `(probability, id)`, sorted
@@ -368,17 +364,48 @@ fn top_k_desc(probs: &[f32], k: usize) -> Result<Vec<(f32, u32)>> {
     Ok(best)
 }
 
-/// Zero every candidate past the point where the running probability mass
-/// reaches `top_p`. `candidates` must be sorted descending; the leader always
-/// survives, since the running total starts below any positive `top_p`.
+/// Renormalize `candidates` to sum to one, then zero everything past the
+/// shortest prefix whose cumulative mass reaches `top_p`. `candidates` must be
+/// sorted descending.
+///
+/// This is `llama_sampler_top_p_apply`: `p >= 1.0` is a no-op sampler,
+/// otherwise the probabilities are recomputed over the surviving set (llama.cpp
+/// re-softmaxes the candidates' logits; renormalizing their probabilities is
+/// the same quotient) and the walk keeps the token that *crosses* the
+/// threshold, comparing `cum_sum >= top_p` — so the kept mass is at least
+/// `top_p`, never just short of it. At least one candidate always survives:
+/// the first iterate can only set the cut at index 1 or later.
+///
+/// llama.cpp's `min_keep` floor is not carried: its default is 0 (disabled),
+/// and the loop's at-least-one guarantee is the only floor that default
+/// produces.
 fn truncate_top_p(candidates: &mut [(f32, u32)], top_p: f32) {
-    let mut cumsum = 0f32;
+    // Matching llama.cpp's early return matters at exactly 1.0: renormalized
+    // weights sum to one only to within rounding, so a cumulative walk could
+    // otherwise drop the last candidate over an ulp.
+    if top_p >= 1.0 {
+        return;
+    }
+    // A softmax always leaves its maximum positive, so this only guards the
+    // degenerate rows that would fail the draw regardless.
+    let sum: f32 = candidates.iter().map(|c| c.0).sum();
+    if sum <= 0.0 {
+        return;
+    }
     for c in candidates.iter_mut() {
+        c.0 /= sum;
+    }
+    let mut cumsum = 0f32;
+    let mut keep = candidates.len();
+    for (i, c) in candidates.iter().enumerate() {
+        cumsum += c.0;
         if cumsum >= top_p {
-            c.0 = 0.0;
-        } else {
-            cumsum += c.0;
+            keep = i + 1;
+            break;
         }
+    }
+    for c in &mut candidates[keep..] {
+        c.0 = 0.0;
     }
 }
 
@@ -795,10 +822,18 @@ mod tests {
         assert!(!s.is_eog(23));
     }
 
-    // --- equivalence with candle's TopKThenTopP -------------------------------
+    // --- the truncation conventions and what each oracle is good for ---------
     //
-    // This sampler replaced candle's `LogitsProcessor`, which is still linked
-    // and serves as the oracle below. The claim the tests pin, precisely:
+    // Top-p follows llama.cpp: renormalize over the top-k survivors, then keep
+    // the shortest prefix whose cumulative mass reaches `top_p`. The oracle for
+    // that is `llamacpp_filtered` below.
+    //
+    // candle's `LogitsProcessor` — which this sampler replaced, and which is
+    // still linked — measures the same cut against UNrenormalized mass, so the
+    // two conventions genuinely disagree wherever the cut can bite. candle
+    // therefore stays an oracle only for the parts that never depended on the
+    // convention: top-k selection, and the whole pipeline whenever `top_p` is
+    // 1.0 and no cut applies. What that residual agreement claims, precisely:
     //
     // * For inputs with no exact tie at the top-k boundary, the two select the
     //   same candidate set and draw from the same distribution over it.
@@ -811,19 +846,14 @@ mod tests {
     // * The agreement is up to floating-point rounding of whichever backend ran
     //   the softmax, not bit-for-bit. The production fast path softmaxes on the
     //   device holding the logits; candle softmaxes on the CPU. The denominator
-    //   is a scale factor shared by every candidate, so it cancels out of the
-    //   weighted draw and reaches the outcome through exactly one place: the
-    //   top-p comparison, which measures absolute mass. An input sitting on the
-    //   threshold to within an ulp can therefore truncate differently on the
-    //   two backends. (Renormalizing top-p over the k survivors — the open
-    //   ledger item — would remove even that, since it never compares absolute
-    //   mass.)
+    //   is a scale factor shared by every candidate, and renormalizing over the
+    //   survivors divides it back out, so it cancels from the cut as well as
+    //   from the draw: the two backends truncate identically.
     // * Candidate ORDER differs and always did: candle's list comes out of the
     //   `select_nth_unstable_by` in unspecified order, this one is sorted by
     //   descending probability, and a weighted draw maps its single uniform
     //   through the cumulative weights. Seeded draws therefore differ
-    //   token-for-token from the pre-replacement build while coming from the
-    //   same distribution.
+    //   token-for-token from the pre-replacement build.
 
     /// Deterministic pseudo-random logits, spread over `scale`.
     fn det_logits(n: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -888,6 +918,49 @@ mod tests {
         out
     }
 
+    /// A literal transcription of llama.cpp's `llama_sampler_top_k_impl`
+    /// followed by `llama_sampler_top_p_apply`: full softmax at `temperature`,
+    /// descending sort, cut to `k`, then — unless `top_p` is 1.0 or more, where
+    /// llama.cpp's sampler is a no-op — renormalize the survivors and keep the
+    /// shortest prefix whose cumulative mass reaches `top_p`, the crossing
+    /// token included. Returns the surviving `(id, weight)` sorted by id.
+    ///
+    /// `min_keep` is llama.cpp's other knob and is left at its default of 0,
+    /// which disables it; the prefix always holds at least one token anyway.
+    fn llamacpp_filtered(
+        logits: &[f32],
+        k: usize,
+        top_p: f32,
+        temperature: f64,
+    ) -> Vec<(u32, f32)> {
+        let mut probs = logits.to_vec();
+        softmax_in_place(&mut probs, temperature);
+        let mut ranked: Vec<(u32, f32)> = (0u32..).zip(probs.iter().copied()).collect();
+        // A stable sort on the probability alone leaves equal entries in id
+        // order, which is the low-id tie-break both sides resolve toward.
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ranked.truncate(k.min(ranked.len()));
+
+        if top_p < 1.0 {
+            let sum: f32 = ranked.iter().map(|c| c.1).sum();
+            for c in ranked.iter_mut() {
+                c.1 /= sum;
+            }
+            let mut cumsum = 0f32;
+            let mut keep = ranked.len();
+            for (i, c) in ranked.iter().enumerate() {
+                cumsum += c.1;
+                if cumsum >= top_p {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            ranked.truncate(keep);
+        }
+        ranked.sort_by_key(|c| c.0);
+        ranked
+    }
+
     /// This sampler's candidate set in the same `(id, weight)` form, dropping
     /// the candidates top-p zeroed so the two sides describe the same support.
     fn ours_filtered(logits: &[f32], k: usize, top_p: f32, temperature: f64) -> Vec<(u32, f32)> {
@@ -902,31 +975,62 @@ mod tests {
         out
     }
 
-    // The candidate set matches candle's — the same ids survive top-k and
-    // top-p, carrying the same probabilities — across flat, moderately peaked
-    // and sharply peaked logits, which is what puts the top-p cut on both sides
-    // of its "is the top-k mass already under top_p" branch.
+    // The candidate set matches llama.cpp's — the same ids survive top-k and
+    // top-p, carrying the same renormalized probabilities — across flat,
+    // moderately peaked and sharply peaked logits, at cuts that bite hard, cuts
+    // that barely bite, and `top_p` 1.0 where llama.cpp's sampler is a no-op.
     //
     // Weights agree to a relative tolerance rather than bit-for-bit: the two
     // softmax denominators are the same sum in a different association order
     // (candle's f32 reduction is a NEON lane tree, this one is sequential, and
-    // the Metal kernel the production path uses is a third order). The
-    // denominator is a scale factor shared by every candidate, so it cancels
-    // out of the weighted draw entirely and reaches the outcome only through
-    // the top-p threshold comparison.
+    // the Metal kernel the production path uses is a third order).
     #[test]
-    fn candidate_set_matches_candle_filtering() {
+    fn candidate_set_matches_llamacpp_filtering() {
         for (n, scale) in [(64usize, 1.0f32), (64, 4.0), (2048, 3.0), (2048, 12.0)] {
             for seed in [1u64, 77, 4242] {
-                for (k, p, temp) in [(20usize, 0.95f32, 1.0f64), (8, 0.5, 0.7), (40, 1.0, 1.3)] {
+                for (k, p, temp) in [
+                    (20usize, 0.95f32, 1.0f64),
+                    (8, 0.5, 0.7),
+                    (40, 1.0, 1.3),
+                    (20, 0.2, 1.0),
+                ] {
                     let l = det_logits(n, seed, scale);
                     let case =
                         format!("n {n} scale {scale} seed {seed} k {k} top_p {p} temp {temp}");
-                    let want: Vec<(u32, f32)> = candle_filtered(&l, k, p, temp)
+                    let want = llamacpp_filtered(&l, k, p, temp);
+                    let got: Vec<(u32, f32)> = ours_filtered(&l, k, p, temp)
                         .into_iter()
                         .filter(|&(_, w)| w > 0.0)
                         .collect();
-                    let got: Vec<(u32, f32)> = ours_filtered(&l, k, p, temp)
+                    let ids = |v: &[(u32, f32)]| v.iter().map(|c| c.0).collect::<Vec<_>>();
+                    assert_eq!(ids(&want), ids(&got), "{case}");
+                    for (&(id, a), &(_, b)) in want.iter().zip(&got) {
+                        assert!(
+                            (a - b).abs() <= 1e-5 * a.abs(),
+                            "{case}: token {id} weighted {b} against llama.cpp's {a}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Where no top-p cut applies — `top_p` 1.0, so both samplers are doing pure
+    // top-k — the candidate set still matches candle's exactly, ids and
+    // weights. This is the part of the pipeline the convention switch left
+    // alone, and candle remains a real oracle for it.
+    #[test]
+    fn candidate_set_matches_candle_when_no_top_p_cut_applies() {
+        for (n, scale) in [(64usize, 1.0f32), (64, 4.0), (2048, 3.0), (2048, 12.0)] {
+            for seed in [1u64, 77, 4242] {
+                for (k, temp) in [(20usize, 1.0f64), (8, 0.7), (40, 1.3)] {
+                    let l = det_logits(n, seed, scale);
+                    let case = format!("n {n} scale {scale} seed {seed} k {k} temp {temp}");
+                    let want: Vec<(u32, f32)> = candle_filtered(&l, k, 1.0, temp)
+                        .into_iter()
+                        .filter(|&(_, w)| w > 0.0)
+                        .collect();
+                    let got: Vec<(u32, f32)> = ours_filtered(&l, k, 1.0, temp)
                         .into_iter()
                         .filter(|&(_, w)| w > 0.0)
                         .collect();
@@ -943,58 +1047,151 @@ mod tests {
         }
     }
 
-    // The top-p cut is measured against FULL-vocabulary probability mass, not
-    // against mass renormalized over the top-k survivors. When the top-k set
-    // holds less than top_p of the total, there is nothing to cut and all k
-    // candidates keep their weight — a renormalizing sampler would instead trim
-    // the set down to top_p of its own mass. Pinned because the two conventions
-    // disagree and this one is what the pre-replacement build shipped.
+    // The top-p cut measures mass RENORMALIZED over the top-k survivors, which
+    // is llama.cpp's convention and HF's: the survivors are rescaled to sum to
+    // one and the shortest prefix reaching `top_p` is kept, the token that
+    // crosses the threshold included.
+    //
+    // Both cases below are hand-computed on exact probabilities, and both are
+    // ones where renormalizing and measuring absolute mass give different
+    // answers — which is the point of pinning the convention at all.
     #[test]
-    fn top_p_measures_absolute_mass_not_renormalized_mass() {
-        // 2048 near-uniform logits: the top 20 hold far less than 95% of the
-        // mass, so the cut cannot trigger.
-        let l = det_logits(2048, 9, 0.5);
-        let mut probs = l.clone();
-        softmax_in_place(&mut probs, 1.0);
-        let cand = candidate_set(&probs, 20, 0.95).unwrap();
-        let mass: f32 = cand.iter().map(|c| c.0).sum();
-        assert!(
-            mass < 0.95,
-            "test needs a diffuse distribution, got mass {mass}"
-        );
-        assert!(
-            cand.iter().all(|c| c.0 > 0.0),
-            "no candidate may be cut when the top-k mass is already below top_p"
-        );
-
-        // A sharply peaked vector puts the same top-20 above 95%, and now the
-        // cut does bite.
-        let mut peaked = det_logits(2048, 9, 0.5);
-        for (i, v) in peaked.iter_mut().enumerate().take(3) {
-            *v = 20.0 - i as f32;
+    fn top_p_measures_mass_renormalized_over_the_candidate_set() {
+        /// Logits whose softmax is exactly `weights` normalized.
+        fn from_weights(weights: &[f32]) -> Vec<f32> {
+            weights.iter().map(|w| w.ln()).collect()
         }
-        let mut probs = peaked.clone();
+        let surviving = |probs: &[f32], k: usize, p: f32| -> Vec<u32> {
+            let mut ids: Vec<u32> = candidate_set(probs, k, p)
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.0 > 0.0)
+                .map(|c| c.1)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+
+        // Probabilities .40 .30 .20 .05 .03 .02; top-3 holds .90 of the total.
+        // Renormalized the three are .4444 / .3333 / .2222, so the cumulative
+        // sum passes 0.75 at the second one and the third is cut. Measuring
+        // absolute mass instead, the running total reaches only .70 before the
+        // third candidate and it survives.
+        let mut probs = from_weights(&[40.0, 30.0, 20.0, 5.0, 3.0, 2.0]);
         softmax_in_place(&mut probs, 1.0);
-        let cand = candidate_set(&probs, 20, 0.95).unwrap();
-        assert!(
-            cand.iter().any(|c| c.0 == 0.0),
-            "the cut must remove the tail once the top-k mass exceeds top_p"
-        );
+        assert_eq!(surviving(&probs, 3, 0.75), vec![0, 1]);
+
+        // The same distinction where the absolute convention cannot cut at all:
+        // the top-3 of this row hold .76 of the total, short of top_p .90, so
+        // an absolute-mass cut is skipped outright and all three survive.
+        // Renormalized they are .5263 / .3947 / .0789, the running sum passes
+        // .90 at the second, and the third is cut.
+        let mut weights = vec![3.0f32; 11];
+        weights[0] = 40.0;
+        weights[1] = 30.0;
+        weights[2] = 6.0;
+        let mut probs = from_weights(&weights);
+        softmax_in_place(&mut probs, 1.0);
+        let top3: f32 = probs[..3].iter().sum();
+        assert!((top3 - 0.76).abs() < 1e-5, "top-3 mass {top3}");
+        assert_eq!(surviving(&probs, 3, 0.90), vec![0, 1]);
+
+        // `top_p` 1.0 keeps everything the top-k selected: llama.cpp's top-p
+        // sampler is a no-op at or above 1.0, and a cumulative walk over
+        // weights that sum to one only to within rounding could otherwise drop
+        // the last candidate.
+        assert_eq!(surviving(&probs, 3, 1.0), vec![0, 1, 2]);
     }
 
-    // The drawn tokens follow candle's distribution: over many draws the two
-    // samplers agree on which tokens are reachable and on how often each comes
-    // up. Frequencies, not sequences — the candidate ordering differs, so the
-    // seeded token streams legitimately do not match.
+    // `top_p` 0.0 is a live value — the serve layers pass a client's `top_p`
+    // through verbatim — and the cumulative walk crosses a zero threshold at
+    // the first candidate, so exactly the top-probability token survives, as
+    // it does in llama.cpp.
     #[test]
-    fn draw_frequencies_match_candle() {
+    fn top_p_of_zero_keeps_only_the_top_candidate() {
+        let logits = det_logits(64, 90210, 3.0);
+        let want = llamacpp_filtered(&logits, 20, 0.0, 1.0);
+        assert_eq!(want.len(), 1);
+
+        let mut probs = logits.clone();
+        softmax_in_place(&mut probs, 1.0);
+        let got: Vec<(u32, f32)> = candidate_set(&probs, 20, 0.0)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.0 > 0.0)
+            .map(|c| (c.1, c.0))
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, want[0].0);
+        assert!((got[0].1 - want[0].1).abs() < 1e-6);
+    }
+
+    // The drawn tokens follow llama.cpp's distribution end to end: every token
+    // the renormalized cut kept comes up at its own weight, and every token it
+    // cut never comes up at all.
+    #[test]
+    fn draw_frequencies_follow_llamacpp_semantics() {
+        const N: usize = 64;
+        const DRAWS: usize = 40_000;
+        const SEED: u64 = 5150;
+        const K: usize = 20;
+        const P: f64 = 0.95;
+        const TEMP: f64 = 1.0;
+        let l = det_logits(N, 31337, 3.0);
+        let tensor = Tensor::new(l.as_slice(), &Device::Cpu).unwrap();
+
+        let want = llamacpp_filtered(&l, K, P as f32, TEMP);
+        let mass: f32 = want.iter().map(|c| c.1).sum();
+        assert!(
+            want.len() < K,
+            "test needs a cut that bites, {} of {K} survived",
+            want.len()
+        );
+
+        let mut ours = Sampler::new(
+            SamplerOptions {
+                temperature: TEMP,
+                top_k: K,
+                top_p: P,
+                seed: SEED,
+            },
+            vec![],
+            N,
+        );
+        let mut hist = vec![0usize; N];
+        for _ in 0..DRAWS {
+            hist[ours.sample(&tensor).unwrap() as usize] += 1;
+        }
+
+        for id in 0..N as u32 {
+            let drawn = hist[id as usize] as f64 / DRAWS as f64;
+            match want.iter().find(|c| c.0 == id) {
+                Some(&(_, w)) => {
+                    let expect = (w / mass) as f64;
+                    assert!(
+                        (drawn - expect).abs() < 0.01,
+                        "token {id} drawn at {drawn}, llama.cpp weights it {expect}"
+                    );
+                }
+                None => assert_eq!(drawn, 0.0, "token {id} was cut but was drawn at {drawn}"),
+            }
+        }
+    }
+
+    // With no top-p cut in play the drawn tokens still follow candle's
+    // distribution: over many draws the two samplers agree on which tokens are
+    // reachable and on how often each comes up. Frequencies, not sequences —
+    // the candidate ordering differs, so the seeded token streams legitimately
+    // do not match.
+    #[test]
+    fn draw_frequencies_match_candle_when_no_top_p_cut_applies() {
         use candle_transformers::generation::{LogitsProcessor, Sampling};
 
         const N: usize = 64;
         const DRAWS: usize = 40_000;
         const SEED: u64 = 5150;
         const K: usize = 20;
-        const P: f64 = 0.95;
+        const P: f64 = 1.0;
         const TEMP: f64 = 1.0;
         let l = det_logits(N, 31337, 3.0);
         let tensor = Tensor::new(l.as_slice(), &Device::Cpu).unwrap();
@@ -1045,7 +1242,8 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Shape {
         /// Near-uniform. The top-k set holds a small share of the total mass,
-        /// so the top-p cut is skipped and every candidate keeps its weight.
+        /// which is where the renormalizing cut and an absolute-mass one differ
+        /// most: this one still trims, an absolute-mass one could not.
         Flat,
         /// A handful of ids hold nearly all the mass, so the top-p cut bites
         /// early and most of the top-k set is zeroed.
@@ -1098,17 +1296,19 @@ mod tests {
             .collect()
     }
 
-    // The same sweep run against the REAL `LogitsProcessor` rather than a
-    // transcription of it, so a misreading of candle's source cannot pass:
-    // vocabulary widths from a toy row up to the checkpoint's own logit width,
-    // every k from "collapses to greedy" through "wider than the row", and
-    // top_p from a cut that bites hard to one that cannot bite at all.
+    // The same sweep run against the llama.cpp truncation oracle and against
+    // the REAL `LogitsProcessor` rather than a transcription of it, so a
+    // misreading of either source cannot pass: vocabulary widths from a toy row
+    // up to the checkpoint's own logit width, every k from "collapses to
+    // greedy" through "wider than the row", and top_p from a cut that bites
+    // hard to one that cannot bite at all.
     //
-    // What each shape is allowed to claim differs, and the difference is the
-    // point. Untied logits pin containment in this sampler's candidate set —
-    // candle must never draw an id this one excluded — plus matching draw
-    // frequencies wherever the row is small enough to sample properly. Tied
-    // logits pin only eligibility, because which of the tied entries candle
+    // What each oracle is allowed to claim differs, and the difference is the
+    // point. llama.cpp pins the candidate set exactly, at every shape and every
+    // p. candle pins the same thing only at top_p 1.0, where no cut applies —
+    // below that it measures the cut against unrenormalized mass and keeps
+    // candidates this sampler drops. Tied logits pin only eligibility against
+    // candle, because which of the tied entries its `select_nth_unstable_by`
     // keeps is unspecified; the deterministic answer this sampler gives is
     // pinned separately in `top_k_boundary_ties_keep_the_lowest_ids`.
     #[test]
@@ -1147,6 +1347,16 @@ mod tests {
                             .collect();
                         let eligible = tie_inclusive_top_k(&probs, k);
 
+                        // The candidate set is llama.cpp's, exactly, whatever
+                        // the shape and whatever the cut.
+                        let mut ours_by_id = ours_set.clone();
+                        ours_by_id.sort_unstable();
+                        let llamacpp_set: Vec<u32> = llamacpp_filtered(&l, k, p as f32, TEMP)
+                            .into_iter()
+                            .map(|c| c.0)
+                            .collect();
+                        assert_eq!(ours_by_id, llamacpp_set, "{case}");
+
                         let mut ours = Sampler::new(
                             SamplerOptions {
                                 temperature: TEMP,
@@ -1183,6 +1393,10 @@ mod tests {
                         }
                         match shape {
                             Shape::Ties => {
+                                // The top-p cut only ever removes candidates,
+                                // so whatever candle's unspecified tie
+                                // resolution kept, it still reaches the k-th
+                                // largest probability — at every p.
                                 for &id in theirs_hist.keys() {
                                     assert!(
                                         eligible.contains(&id),
@@ -1191,7 +1405,10 @@ mod tests {
                                     );
                                 }
                             }
-                            Shape::Flat | Shape::Peaked => {
+                            // Below top_p 1.0 the two conventions part company
+                            // and candle keeps candidates this sampler cuts,
+                            // so candle is an oracle only where no cut applies.
+                            Shape::Flat | Shape::Peaked if p >= 1.0 => {
                                 for &id in theirs_hist.keys() {
                                     assert!(
                                         ours_set.contains(&id),
@@ -1216,6 +1433,7 @@ mod tests {
                                     }
                                 }
                             }
+                            Shape::Flat | Shape::Peaked => {}
                         }
                     }
                 }

@@ -256,7 +256,11 @@ function baseEnv(): Record<string, string> {
  * baseEnv() and run whatever path their tier is gating.
  */
 function referenceEnv(): Record<string, string> {
-  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1" };
+  // XWEN_MOE_GLUE_CLASSIC joins the list on hygiene, not necessity: the fused
+  // MoE router and block epilogue are bit-identical to the candle chains they
+  // replace, so a reference generated with or without it is byte-for-byte the
+  // same dump. Cached references predating this pin therefore stay valid.
+  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_MOE_GLUE_CLASSIC: "1" };
 }
 
 /** Experiment flags (--sdpa-f32 / --attn-mm-classic / --flash-classic), set once in main. */

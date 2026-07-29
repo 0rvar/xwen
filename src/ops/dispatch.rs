@@ -980,6 +980,161 @@ fn run_inner(
     Ok(output_tensor(dst, mdev, out_count, (t, top_k, stack.n_out)))
 }
 
+/// Whether the dual-weight gate|up gather kernel covers these two stacks: both
+/// q4_K (the only dtype `kernel_mul_mv_id_q4_K_f32_dual` is written for — the
+/// official Q4_K_M's routed experts), same geometry, both resident on Metal.
+pub(crate) fn mv_id_dual_supported(gate: &ExpertStack, up: &ExpertStack) -> bool {
+    gate.dtype == GgmlDType::Q4K
+        && up.dtype == GgmlDType::Q4K
+        && gate.n_expert == up.n_expert
+        && gate.n_out == up.n_out
+        && gate.k == up.k
+        && gate.buffer.is_some()
+        && up.buffer.is_some()
+}
+
+/// Gate and up expert matvecs plus their SwiGLU activation in ONE dispatch
+/// (`kernel_mul_mv_id_q4_K_f32_dual`, mv.metal), replacing two
+/// `kernel_mul_mv_id_q4_K_f32_v` launches and the `kernel_moe_silu_mul` pass
+/// between them. `x` is `[t, x_per_row, k]` f32, `ids` `[t, top_k]` u32; returns
+/// `[t, top_k, n_out]` f32 — the ACTIVATION, not the two projections.
+/// Bit-identical to that trio (mv_id.rs `dual_matches_split_bitwise` proves it).
+/// Callers must check `mv_id_dual_supported` first.
+pub(crate) fn run_mv_id_dual(
+    gate: &ExpertStack,
+    up: &ExpertStack,
+    x: &Tensor,
+    ids: &Tensor,
+) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("mul_mv_id_dual requires x on a Metal device");
+    };
+    if !mv_id_dual_supported(gate, up) {
+        bail!(
+            "no dual-weight gather kernel for gate {:?}[{},{},{}] / up {:?}[{},{},{}]",
+            gate.dtype,
+            gate.n_expert,
+            gate.n_out,
+            gate.k,
+            up.dtype,
+            up.n_expert,
+            up.n_out,
+            up.k
+        );
+    }
+
+    let (t, x_per_row, kx) = x
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("x must be rank-3 [t, x_per_row, k]: {e}"))?;
+    let (t_ids, top_k) = ids
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("ids must be rank-2 [t, top_k]: {e}"))?;
+    if x.dtype() != DType::F32 {
+        bail!("x must be f32, got {:?}", x.dtype());
+    }
+    if ids.dtype() != DType::U32 {
+        bail!("ids must be u32, got {:?}", ids.dtype());
+    }
+    if !x.is_contiguous() {
+        bail!("x must be contiguous");
+    }
+    if !ids.is_contiguous() {
+        bail!("ids must be contiguous");
+    }
+    if kx != gate.k {
+        bail!("x k ({kx}) does not match expert stack k ({})", gate.k);
+    }
+    if t_ids != t {
+        bail!("ids t ({t_ids}) does not match x t ({t})");
+    }
+    if x_per_row != 1 && x_per_row != top_k {
+        bail!("x_per_row ({x_per_row}) must be 1 (shared row) or top_k ({top_k}) (per-slot row)");
+    }
+
+    let dt = GgmlDType::Q4K;
+    let block_size = dt.block_size();
+    if !gate.k.is_multiple_of(block_size) {
+        bail!(
+            "expert stack k ({}) is not a multiple of {dt:?} block size {block_size}",
+            gate.k
+        );
+    }
+    let bytes_per_row = gate.k / block_size * dt.type_size();
+    let per_expert = gate.n_out * bytes_per_row;
+    let geom = mv_vendored_geom(dt)?;
+
+    let (Some(gate_buf), Some(up_buf)) = (gate.buffer.as_deref(), up.buffer.as_deref()) else {
+        bail!("expert stacks have no device buffer; the fused MoE requires Metal");
+    };
+
+    let out_count = t * top_k * gate.n_out;
+    let dst = mdev.new_buffer(out_count, DType::F32, "mul_mv_id_dual")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+    let (ids_guard, ids_layout) = ids.storage_and_layout();
+    let Storage::Metal(ids_storage) = &*ids_guard else {
+        bail!("ids is not on a Metal device");
+    };
+
+    let args = MvIdArgs {
+        nei0: top_k as i32,
+        nei1: t as i32,
+        nbi1: (top_k * DType::U32.size_in_bytes()) as u64,
+        ne00: gate.k as i32,
+        ne01: gate.n_out as i32,
+        ne02: gate.n_expert as i32,
+        nb00: 0,
+        nb01: bytes_per_row as u64,
+        nb02: per_expert as u64,
+        ne10: gate.k as i32,
+        ne11: x_per_row as i32,
+        ne12: t as i32,
+        ne13: 1,
+        nb10: DType::F32.size_in_bytes() as u64,
+        nb11: (gate.k * DType::F32.size_in_bytes()) as u64,
+        nb12: (x_per_row * gate.k * DType::F32.size_in_bytes()) as u64,
+        ne0: gate.n_out as i32,
+        ne1: top_k as i32,
+        nb1: (gate.n_out * DType::F32.size_in_bytes()) as u64,
+        nr0: geom.nr0 as i32,
+    };
+
+    let pipeline = pipelines::mv_pipeline(mdev.device(), "kernel_mul_mv_id_q4_K_f32_dual")?;
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(gate_buf), gate.base_off);
+        encoder.set_input_buffer(
+            2,
+            Some(x_storage.buffer()),
+            x_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        encoder.set_input_buffer(
+            4,
+            Some(ids_storage.buffer()),
+            ids_layout.start_offset() * DType::U32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(5, Some(up_buf), up.base_off);
+
+        let grid = mtl_size!(geom.row_blocks(gate.n_out), 1, top_k * t);
+        let threads = mtl_size!(32, geom.nsg, 1);
+        encoder.dispatch_thread_groups(grid, threads);
+    }
+    drop(x_guard);
+    drop(ids_guard);
+
+    Ok(output_tensor(dst, mdev, out_count, (t, top_k, gate.n_out)))
+}
+
 /// Allocate the shared map0 scratch for one MoE block and encode the single map0
 /// pass from `ids`. The returned buffer holds `tpe` (n_expert i32 @ 0) then the
 /// `ids-map` (n_expert*t i32 @ n_expert*4); all three projections read it via
@@ -1799,6 +1954,261 @@ pub(crate) fn run_silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     drop(up_guard);
 
     Ok(output_tensor(dst, mdev, n, shape))
+}
+
+/// Matches the Metal `moe_router_args` struct (src/ops/moe_glue.metal).
+/// `#[repr(C)]` pins the layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeRouterArgs {
+    n_expert: i32,
+    n_expert_pad: i32,
+    top_k: i32,
+    softmax_width: i32,
+    sum_width: i32,
+    sum_floor: f32,
+}
+
+/// Matches the Metal `moe_epilogue_args` struct (src/ops/moe_glue.metal).
+/// `#[repr(C)]` pins the layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeEpilogueArgs {
+    top_k: i32,
+    n_out: i32,
+}
+
+/// Threadgroup-array bounds baked into `moe_glue.metal`'s router kernel. The
+/// dispatch refuses any geometry that would overrun one of them; the
+/// `moe_glue.rs` geometry test parses the `#define`s and holds these equal.
+pub(crate) const MOE_ROUTER_MAX_EXPERTS: usize = 512;
+pub(crate) const MOE_ROUTER_MAX_SOFTMAX: usize = 256;
+pub(crate) const MOE_ROUTER_MAX_TOP_K: usize = 32;
+
+/// candle's threadgroup width for a `work_per_threadgroup`-element reduction:
+/// `min(pipeline_max, next_pow2(work/2))` (call_reduce_contiguous /
+/// call_last_softmax, which share the formula). The router kernel reproduces
+/// both the softmax and the top-k sum with it, so the lane partitions — and thus
+/// the reduction orders — match candle's bit-for-bit.
+///
+/// The `pipeline_max` term is candle's OWN pipeline limit, which is not
+/// reachable from here; every width this is used for is far below any plausible
+/// limit (n_expert 256 gives 128, top_k 8 gives 4), and the bitwise tests would
+/// fail loudly if a device ever clamped candle lower.
+fn candle_reduction_width(work: usize) -> usize {
+    (work / 2).next_power_of_two()
+}
+
+/// Fused MoE routing decision against `kernel_moe_router` (moe_glue.metal):
+/// softmax over the full expert set, descending bitonic arg-sort, top-k gather,
+/// floor-clamped sum, renormalize — one threadgroup per token, replacing seven
+/// candle dispatches. `logits` is `[seq, n_expert]` f32 contiguous (the router
+/// matmul output, which stays a candle dispatch). Returns
+/// `(ids [seq, top_k] u32, weights [seq, top_k] f32)`. Bit-identical to the
+/// candle chain it replaces (moe_glue.rs `router_matches_candle_bitwise` proves
+/// it); the caller's kill-switch is that chain (`XWEN_MOE_GLUE_CLASSIC`).
+pub(crate) fn run_moe_router(
+    logits: &Tensor,
+    top_k: usize,
+    sum_floor: f32,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = logits.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("moe_router requires logits on a Metal device");
+    };
+
+    let (seq, n_expert) = logits
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("logits must be rank-2 [seq, n_expert]: {e}"))?;
+    if logits.dtype() != DType::F32 {
+        bail!("logits must be f32, got {:?}", logits.dtype());
+    }
+    if !logits.is_contiguous() {
+        bail!("logits must be contiguous");
+    }
+    if seq == 0 || n_expert == 0 {
+        bail!("moe_router needs at least one token and one expert");
+    }
+    if top_k == 0 || top_k > n_expert {
+        bail!("moe_router top_k={top_k} must be in 1..={n_expert}");
+    }
+    if top_k > MOE_ROUTER_MAX_TOP_K {
+        bail!(
+            "moe_router top_k={top_k} exceeds the kernel's {MOE_ROUTER_MAX_TOP_K}-wide selection \
+             buffer (its sum folds one simdgroup)"
+        );
+    }
+    let n_expert_pad = n_expert.next_power_of_two();
+    if n_expert_pad > MOE_ROUTER_MAX_EXPERTS {
+        bail!(
+            "moe_router n_expert={n_expert} pads to {n_expert_pad}, over the kernel's \
+             {MOE_ROUTER_MAX_EXPERTS}-wide threadgroup arrays"
+        );
+    }
+    let softmax_width = candle_reduction_width(n_expert);
+    if softmax_width > MOE_ROUTER_MAX_SOFTMAX {
+        bail!(
+            "moe_router softmax width {softmax_width} for n_expert={n_expert} exceeds the \
+             kernel's {MOE_ROUTER_MAX_SOFTMAX}-pair reduction array"
+        );
+    }
+    glue_index_fits_i32(checked_elems(&[seq, n_expert], "moe_router")?)?;
+
+    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), "kernel_moe_router")?;
+    // The bitonic network needs exactly one thread per padded column, and the
+    // softmax phase reuses the low `softmax_width` of them (next_pow2(n) is
+    // always >= next_pow2(n/2), so the network is the wider of the two).
+    if n_expert_pad > pipeline.max_total_threads_per_threadgroup() {
+        bail!(
+            "moe_router needs {n_expert_pad} threads per threadgroup, over this device's \
+             pipeline limit {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+
+    let n_sel = checked_elems(&[seq, top_k], "moe_router selection")?;
+    let ids = mdev.new_buffer(n_sel, DType::U32, "moe_router_ids")?;
+    let weights = mdev.new_buffer(n_sel, DType::F32, "moe_router_weights")?;
+
+    let (logits_guard, logits_layout) = logits.storage_and_layout();
+    let Storage::Metal(logits_storage) = &*logits_guard else {
+        bail!("logits is not on a Metal device");
+    };
+
+    let args = MoeRouterArgs {
+        n_expert: n_expert as i32,
+        n_expert_pad: n_expert_pad as i32,
+        top_k: top_k as i32,
+        softmax_width: softmax_width as i32,
+        sum_width: candle_reduction_width(top_k) as i32,
+        sum_floor,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(logits_storage.buffer()), f32_off(logits_layout));
+        encoder.set_output_buffer(2, Some(&ids), 0);
+        encoder.set_output_buffer(3, Some(&weights), 0);
+        encoder.dispatch_thread_groups(mtl_size!(seq, 1, 1), mtl_size!(n_expert_pad, 1, 1));
+    }
+    drop(logits_guard);
+
+    let ids = Tensor::from_storage(
+        Storage::Metal(MetalStorage::new(ids, mdev.clone(), n_sel, DType::U32)),
+        (seq, top_k),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+    Ok((ids, output_tensor(weights, mdev, n_sel, (seq, top_k))))
+}
+
+/// Fused MoE block epilogue against `kernel_moe_epilogue` (moe_glue.metal):
+/// `dst[s,c] = Σ_k down[s,k,c] * w[s,k] + shexp[s,c] * sigmoid(gate[s])`, one
+/// pass over `down`, replacing the weighted combine, the shared-expert gate
+/// sigmoid, its broadcast multiply and the routed+shared add. `down` is
+/// `[seq, top_k, n_out]` f32 contiguous, `w` `[seq, top_k]` f32, `shexp`
+/// `[seq, n_out]` f32, `gate` `[seq, 1]` f32 (the RAW pre-sigmoid gate logit).
+/// Bit-identical to the candle chain it replaces (moe_glue.rs
+/// `epilogue_matches_candle_bitwise` proves it); the caller's kill-switch is
+/// that chain (`XWEN_MOE_GLUE_CLASSIC`).
+pub(crate) fn run_moe_epilogue(
+    down: &Tensor,
+    weights: &Tensor,
+    shexp: &Tensor,
+    gate: &Tensor,
+) -> Result<Tensor> {
+    let cdev = down.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("moe_epilogue requires down on a Metal device");
+    };
+
+    let (seq, top_k, n_out) = down
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("down must be rank-3 [seq, top_k, n_out]: {e}"))?;
+    check_f32(down, &[seq, top_k, n_out], "down")?;
+    check_f32(weights, &[seq, top_k], "weights")?;
+    check_f32(shexp, &[seq, n_out], "shexp")?;
+    check_f32(gate, &[seq, 1], "gate")?;
+    for (name, t) in [("weights", weights), ("shexp", shexp), ("gate", gate)] {
+        if !down.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as down");
+        }
+    }
+    if seq == 0 || top_k == 0 || n_out == 0 {
+        bail!("moe_epilogue needs a non-empty down projection");
+    }
+
+    // Same single-simdgroup reduction contract as the combine kernels: candle's
+    // width for this top_k must fold inside one 32-lane simdgroup, or lanes 32..
+    // would be silently dropped. An error, not a fallback.
+    let width_hint = combine_reduction_width(top_k);
+    if width_hint > 32 {
+        bail!(
+            "moe_epilogue top_k={top_k} needs threadgroup width {width_hint} > 32; the \
+             single-simdgroup simd_sum reduction would silently drop lanes 32.."
+        );
+    }
+    if !combine_index_fits_i32(seq, top_k, n_out) {
+        bail!(
+            "moe_epilogue index math overflows i32: seq={seq} top_k={top_k} n_out={n_out} \
+             (seq*top_k*n_out = {} exceeds i32::MAX)",
+            (seq as i64) * (top_k as i64) * (n_out as i64)
+        );
+    }
+
+    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), "kernel_moe_epilogue")?;
+    let out_length = seq * n_out;
+    let dst = mdev.new_buffer(out_length, DType::F32, "moe_epilogue")?;
+
+    let (down_guard, down_layout) = down.storage_and_layout();
+    let Storage::Metal(down_storage) = &*down_guard else {
+        bail!("down is not on a Metal device");
+    };
+    let (w_guard, w_layout) = weights.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("weights is not on a Metal device");
+    };
+    let (sh_guard, sh_layout) = shexp.storage_and_layout();
+    let Storage::Metal(sh_storage) = &*sh_guard else {
+        bail!("shexp is not on a Metal device");
+    };
+    let (g_guard, g_layout) = gate.storage_and_layout();
+    let Storage::Metal(g_storage) = &*g_guard else {
+        bail!("gate is not on a Metal device");
+    };
+
+    let args = MoeEpilogueArgs {
+        top_k: top_k as i32,
+        n_out: n_out as i32,
+    };
+    let width = std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        combine_reduction_width(top_k),
+    );
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(down_storage.buffer()), f32_off(down_layout));
+        encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
+        encoder.set_input_buffer(3, Some(sh_storage.buffer()), f32_off(sh_layout));
+        encoder.set_input_buffer(4, Some(g_storage.buffer()), f32_off(g_layout));
+        encoder.set_output_buffer(5, Some(&dst), 0);
+        encoder.dispatch_thread_groups(mtl_size!(out_length, 1, 1), mtl_size!(width, 1, 1));
+    }
+    drop(down_guard);
+    drop(w_guard);
+    drop(sh_guard);
+    drop(g_guard);
+
+    Ok(output_tensor(dst, mdev, out_length, (seq, n_out)))
 }
 
 /// Matches the Metal `attn_gate_args` struct (src/ops/attn_glue.metal).
