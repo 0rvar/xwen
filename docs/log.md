@@ -4,7 +4,34 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-07-29 (latest) — First llama.cpp head-to-head: xwen wins decode on both models, loses 27B prefill 2x to the sequential DeltaNet scan
+## 2026-07-29 (latest) — Two-family review of the MoE-glue + top-p diff: kernels clean twice over, one real hole in the gate script
+
+**Context.** Standard post-arc review of what became commit `bec5fa2`, one Claude
+reviewer and one outside-model pass (Codex CLI, gpt-5.6-sol, xhigh effort) over the full
+diff. Both independently cleared the fused kernels line by line — barriers, the bitonic
+network's pad ordering, the epilogue's fp pragmas, wrapper validation. The findings that
+survived were all at the edges.
+
+**Fixed.** (1) `parity-gate.ts`'s `baseEnv()` stripped every presence-based kernel
+switch EXCEPT the two new ones, so a stray `XWEN_MOE_GLUE_CLASSIC` in the shell (even
+`=0`) would have silently classic-ed both sides and passed the gate without dispatching
+either new kernel. Both are stripped now, and the 35B gate was re-run under an
+explicitly clean env: ALL PASS, every number identical (strict 1.000000, mm 0.999631,
+decode 63/63/62 with 0 mismatches, ppl Δnll 0.000791) — which also retroactively
+validates the pre-fix run. (2) `top_p == 0.0` — reachable through the serve layers —
+had no test; it now pins the keep-one behavior against the llama.cpp oracle.
+
+**Documented, not changed.** The top-p cut is one ulp off llama.cpp at exact f32
+boundaries (they re-softmax survivor logits, we divide full-softmax survivors by their
+sum — algebraically equal, reproduced counterexample in decisions.md), and the
+`llamacpp_filtered` oracle is structurally blind to that class. **Ledgered.** `top_k=0`
+semantics (greedy here, disabled there), the unpinned
+`MTLMathFloatingPointFunctions` compile axis under the epilogue's bare `exp` (the
+bitwise suites are the tripwire), and `mul_mv_id_dual`'s trusting wrapper. Codex's one
+discounted finding — the ragged q4_K tail overread — is the documented, deliberate
+ggml-matching inheritance, predating this arc.
+
+## 2026-07-29 — First llama.cpp head-to-head: xwen wins decode on both models, loses 27B prefill 2x to the sequential DeltaNet scan
 
 **Context.** Three perf arcs (sampler tail, fused DeltaNet, fused MoE glue) had moved
 xwen's own numbers, but nobody had ever measured llama.cpp on this machine. Same GGUF

@@ -539,6 +539,17 @@ the softmax: the shared denominator now divides back out of the cut as well as t
 so the device fast path and the CPU `SampleControl` path truncate identically instead of
 being able to disagree by an ulp at the threshold (2026-07-29).
 
+One residual ULP-level divergence from llama.cpp is known and accepted (2026-07-29,
+found by outside-model review with a reproduced counterexample): llama.cpp truncates the
+raw logits to k and re-softmaxes the survivors, while xwen divides the full-vocabulary
+softmax's survivors by their sum. The quotients are algebraically identical but not
+bit-identical — at an exact f32 boundary the cumulative walk can land one ulp apart and
+keep one candidate more or fewer (verified: logits [-10.193466, -19.933178, -2.5489683],
+k=2, p=0.9995216131210327 keep 2 here and 1 there). Not worth restructuring the device
+fast path over, since it reads back probabilities, not logits; the `llamacpp_filtered`
+test oracle shares xwen's ordering and is therefore blind to exactly this class, which
+is why the bound is documented rather than tested.
+
 Consequence recorded so it is not mistaken for a regression: seeded stochastic runs
 produce different (equally valid) token streams than pre-2026-07-28 builds. candle's
 candidate list came out of `select_nth_unstable_by` in unspecified order and this one is

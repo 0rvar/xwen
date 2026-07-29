@@ -259,6 +259,24 @@ a numbered parent.
       925 tokens and +0.2% at 4k, i.e. nothing. Fusing the prefill combine would mean
       an epilogue variant carrying the rescale — cheap to write, but prefill is
       compute-bound at ~2100-2500 tok/s and there is no evidence it would show.
+    - **The bit-identity claims ride an unpinned compile axis** (outside-model review,
+      2026-07-29). candle rev 21cca0b compiles its kernels with BOTH
+      `MTLMathMode::Fast` and `MTLMathFloatingPointFunctions::Fast`
+      (candle-metal-kernels `kernel.rs:191-192`); `pipelines.rs` compiles the vendored
+      sources with default options, and the fp pragmas pin only the math-mode axis.
+      Kernels calling `fast::exp`/`fast::divide` explicitly (the router) are immune;
+      the epilogue's bare `exp(-g)` in its sigmoid is the one spot where a toolchain
+      that lowers the two axes differently could split bits. Empirically identical on
+      this machine today — the bitwise ops tests and the strict parity tier are the
+      tripwire, and any future failure there should suspect this first. The clean fix
+      is constructing `MTLCompileOptions` to mirror candle's exactly, but that changes
+      the compile of EVERY vendored kernel and needs a full bitwise-suite + parity
+      re-run as its own arc, not a drive-by.
+    - **`mul_mv_id_dual`'s wrapper trusts its ids buffer.** It validates rank, dtype,
+      contiguity and dims but not that each id is < n_expert (values live on the GPU;
+      checking means a readback) nor that ids/gate/up share x's device. Fine for the
+      router-produced ids of its only caller, loose for a `pub` API. Harden if the
+      dual path ever ships on by default.
 
 14. **YaRN long-context.** Native 262144; Qwen documents 1M via YaRN but ships no
     scaling keys in config or GGUF. laguna's YaRN rope code is retained; wire an
@@ -345,6 +363,13 @@ a numbered parent.
   banned → 0, adjusting the total by the delta rather than resumming), which is
   exact for everything except `force` on a token whose probability underflowed —
   and `force` can short-circuit. Unmeasured against real control-heavy runs.
+- [ ] **`top_k = 0` means greedy here, "top-k disabled" in llama.cpp.** The sampler
+  maps every `top_k <= 1` to argmax, where llama.cpp treats `k <= 0` as a no-op
+  filter (the whole vocabulary stays eligible). Pre-existing, harmless at the
+  default of 20, but the serve layers forward client-supplied values verbatim, so
+  a llama.cpp-reared client sending `top_k: 0` gets deterministic output instead
+  of unrestricted sampling. Surfaced by outside-model review 2026-07-29. A
+  semantics decision like the temperature-order item below, not a bug fix.
 - [ ] **Temperature is applied before the top-k/top-p cut; llama.cpp's default
   chain cuts first.** Found 2026-07-29 while transcribing `top_p`: llama.cpp's
   default sampler chain is top_k → typ_p → top_p → min_p → temp → dist
