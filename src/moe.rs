@@ -6,7 +6,7 @@ use candle_core::{DType, Tensor};
 use candle_nn::ops::{sigmoid, silu};
 
 use crate::config::XwenConfig;
-use crate::gguf::{ExpertStack, QLinear, Weights};
+use crate::gguf::{ExpertStack, QLinear, QuantPlane, Weights};
 use crate::ops::{ExpertRunner, mm_id, mv_id};
 
 /// F16's smallest positive normal, the denominator floor llama.cpp clamps the
@@ -464,24 +464,60 @@ impl SharedExpert {
     }
 }
 
-/// The dense checkpoint's SwiGLU MLP, on every layer.
+/// The dense checkpoint's SwiGLU MLP, on every layer. Carries the majority of
+/// the 27B's prefill FLOPs: 64 layers x 3 x 2 x T x 5120 x 17408.
+///
+/// Each projection is held twice over ONE device allocation — as a `QLinear` for
+/// decode and as a raw `QuantPlane` for the vendored dense cooperative-tensor
+/// prefill gemm (`gguf::Weights::qlinear_with_plane`). The planes are `None` off
+/// Metal, for a checkpoint whose FFN dtype has no vendored kernel, and under the
+/// `XWEN_DENSE_MM_CLASSIC` kill-switch; every such case runs `QLinear` at every
+/// seq, exactly as before this path existed.
 pub struct DenseMlp {
     gate: QLinear,
     up: QLinear,
     down: QLinear,
+    planes: Option<DensePlanes>,
+}
+
+/// The three FFN projections' quantized bytes, for the prefill gemm.
+struct DensePlanes {
+    gate: QuantPlane,
+    up: QuantPlane,
+    down: QuantPlane,
 }
 
 impl DenseMlp {
     pub fn new(w: &Weights) -> Result<Self> {
+        // The plane load shares its upload with the QLinear, so asking for both
+        // costs no extra device memory over asking for the QLinear alone — which
+        // is the only reason this is affordable at 14 GB of FFN weights.
+        let (gate, gate_p) = w.qlinear_with_plane("ffn_gate")?;
+        let (up, up_p) = w.qlinear_with_plane("ffn_up")?;
+        let (down, down_p) = w.qlinear_with_plane("ffn_down")?;
+        let planes = match (gate_p, up_p, down_p) {
+            (Some(gate), Some(up), Some(down)) if !crate::ops::dense_mm_classic() => {
+                Some(DensePlanes { gate, up, down })
+            }
+            _ => None,
+        };
         Ok(Self {
-            gate: w.qlinear("ffn_gate")?,
-            up: w.qlinear("ffn_up")?,
-            down: w.qlinear("ffn_down")?,
+            gate,
+            up,
+            down,
+            planes,
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        swiglu(&self.gate, &self.up, &self.down, x)
+        // Prefill takes the vendored gemm, which beats candle's kernel_mul_mm_q4_K
+        // by ~2.4x at these shapes; decode and short spans keep QLinear, whose
+        // gemv wins below the crossover (docs/decisions.md, "The dense-FFN
+        // prefill gemm").
+        match &self.planes {
+            Some(planes) if x.dim(0)? > crate::ops::dense_mm_min_seq() => swiglu_dense_q(planes, x),
+            _ => swiglu(&self.gate, &self.up, &self.down, x),
+        }
     }
 }
 
@@ -491,6 +527,24 @@ fn swiglu(gate: &QLinear, up: &QLinear, down: &QLinear, x: &Tensor) -> Result<Te
     let u = up.forward(x)?;
     let h = (&g * &u)?;
     Ok(down.forward(&h)?)
+}
+
+/// The same SwiGLU with the three matmuls on the vendored dense prefill gemm.
+/// The activation chain between them is untouched, so this differs from
+/// `swiglu` only in which kernel computes each projection.
+fn swiglu_dense_q(planes: &DensePlanes, x: &Tensor) -> Result<Tensor> {
+    // The kernel reads x as f32 from device memory with no staging, so a
+    // non-contiguous or offset view has to be materialized first. Prefill
+    // hidden states arrive contiguous; this is a guard, not a hot path.
+    let x = if x.is_contiguous() {
+        x.clone()
+    } else {
+        x.contiguous()?
+    };
+    let g = silu(&crate::ops::matmul_dense_q(&planes.gate, &x)?)?;
+    let u = crate::ops::matmul_dense_q(&planes.up, &x)?;
+    let h = (&g * &u)?;
+    crate::ops::matmul_dense_q(&planes.down, &h)
 }
 
 #[cfg(test)]
@@ -880,8 +934,177 @@ mod tests {
     fn dense_mlp_swiglu() {
         let (hidden, seq) = (16usize, 4usize);
         let (gate, up, down, x, expected) = swiglu_parts(48, hidden, seq);
-        let ffn = DenseMlp { gate, up, down };
+        // No planes: a CPU-device fixture, so the prefill gemm is unreachable
+        // and every seq takes the QLinear chain.
+        let ffn = DenseMlp {
+            gate,
+            up,
+            down,
+            planes: None,
+        };
         assert_rows_close(&ffn.forward(&x).unwrap(), &expected);
+    }
+
+    /// A `DenseMlp` on a Metal device holding BOTH views of the same quantized
+    /// weights — the `QLinear`s the classic path uses and the `QuantPlane`s the
+    /// prefill gemm uses — built over one upload per projection, exactly as
+    /// `Weights::qlinear_with_plane` does in production. `with_planes = false`
+    /// yields the block the `XWEN_DENSE_MM_CLASSIC` kill-switch (and any
+    /// non-Metal or unsupported-dtype load) produces.
+    fn dense_mlp_q4k(device: &Device, hidden: usize, ff: usize, with_planes: bool) -> DenseMlp {
+        use candle_core::quantized::QStorage;
+
+        let build = |rows: usize, cols: usize, seed: u64| -> (QLinear, QuantPlane) {
+            let dense = det_tensor(&[rows, cols], seed, 0.5);
+            let qcpu = QTensor::quantize(&dense, GgmlDType::Q4K).unwrap();
+            let storage =
+                QStorage::from_data(qcpu.data().unwrap(), device, GgmlDType::Q4K).unwrap();
+            let QStorage::Metal(qms) = &storage else {
+                panic!("expected Metal quantized storage")
+            };
+            let buffer = Arc::new(qms.buffer().clone());
+            let qtensor = Arc::new(QTensor::new(storage, (rows, cols)).unwrap());
+            (
+                QLinear::from_qtensor(qtensor).unwrap(),
+                QuantPlane {
+                    buffer,
+                    base_off: 0,
+                    dtype: GgmlDType::Q4K,
+                    out_dim: rows,
+                    in_dim: cols,
+                },
+            )
+        };
+
+        let (gate, gate_p) = build(ff, hidden, 0x501);
+        let (up, up_p) = build(ff, hidden, 0x502);
+        let (down, down_p) = build(hidden, ff, 0x503);
+        DenseMlp {
+            gate,
+            up,
+            down,
+            planes: with_planes.then(|| DensePlanes {
+                gate: gate_p,
+                up: up_p,
+                down: down_p,
+            }),
+        }
+    }
+
+    /// The whole dense FFN block on the vendored prefill gemm must reproduce the
+    /// `QLinear` chain it replaces, over the SAME quantized bytes, at a real
+    /// prefill chunk. Both sides stage the weight tile as half and accumulate in
+    /// f32; the vendored one additionally runs matmul2d's reduced-precision
+    /// tensor-core path, so it lands in the fork's ~2e-4 prefill precision class
+    /// (docs/parity.md §3b). Bound at 5e-4 — the same bound the attention tensor
+    /// gemm is held to against its classic twin, and the bound the kernel-level
+    /// test in ops::dense_mm uses. Errors compound across three chained matmuls
+    /// and a silu, which is exactly what this block-level check is for.
+    #[test]
+    fn dense_mlp_prefill_gemm_matches_qlinear() {
+        let device = crate::gguf::metal_device().unwrap();
+        // K must be a whole multiple of the 256-element Q4_K super-block, as
+        // every production FFN dim is; the shapes are scaled down from the 27B's
+        // 5120/17408 to keep the test fast.
+        let (hidden, ff, seq) = (512usize, 1536usize, 96usize);
+        let fused = dense_mlp_q4k(&device, hidden, ff, true);
+        let classic = dense_mlp_q4k(&device, hidden, ff, false);
+
+        let x = det_tensor(&[seq, hidden], 0x504, 1.0)
+            .to_device(&device)
+            .unwrap();
+        let flat = |t: Tensor| -> Vec<f32> { t.flatten_all().unwrap().to_vec1().unwrap() };
+        let rel_l2 = |a: &[f32], b: &[f32]| -> f32 {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            let den: f32 = b.iter().map(|y| y * y).sum();
+            (num / den.max(f32::MIN_POSITIVE)).sqrt()
+        };
+
+        // Stage by stage, so the block-level number is attributable rather than
+        // asserted blind: each projection lands in the fork's ~2e-4 prefill
+        // precision class, and the block's larger residual is that error
+        // compounding through the silu product and the second projection's
+        // K-wide dot, not a wiring difference.
+        let planes = fused.planes.as_ref().unwrap();
+        let g_new = flat(crate::ops::matmul_dense_q(&planes.gate, &x).unwrap());
+        let g_old = flat(classic.gate.forward(&x).unwrap());
+        let u_new = flat(crate::ops::matmul_dense_q(&planes.up, &x).unwrap());
+        let u_old = flat(classic.up.forward(&x).unwrap());
+        let rel_gate = rel_l2(&g_new, &g_old);
+        let rel_up = rel_l2(&u_new, &u_old);
+
+        let a = flat(fused.forward(&x).unwrap());
+        let b = flat(classic.forward(&x).unwrap());
+        let rel = rel_l2(&a, &b);
+        eprintln!(
+            "dense FFN, prefill gemm vs QLinear: gate {rel_gate:.3e}  up {rel_up:.3e}  \
+             block {rel:.3e}"
+        );
+
+        // Each projection alone: the kernel-level class (ops::dense_mm's TOL).
+        assert!(
+            rel_gate < 5e-4,
+            "gate projection rel_l2 {rel_gate} too high"
+        );
+        assert!(rel_up < 5e-4, "up projection rel_l2 {rel_up} too high");
+        // The block: two more error-amplifying steps past those projections (the
+        // silu product doubles the relative perturbation, the down projection
+        // then contracts it over ff with cancellation), so the bound is the
+        // per-projection class scaled by the chain rather than reused flat.
+        // Measured ~1.1e-3 at these shapes; bound at 3e-3 for the same ~3x
+        // headroom the per-matmul bounds carry over their measured values.
+        assert!(rel < 3e-3, "dense FFN block rel_l2 {rel} too high");
+    }
+
+    /// At or below `DENSE_MM_MIN_SEQ` the block must take the `QLinear` chain
+    /// even when planes are loaded: decode is explicitly untouched by this path,
+    /// and the threshold is exclusive. A short span therefore has to come out
+    /// BITWISE identical to the same block with no planes at all, while a span
+    /// one token past the threshold does not (it runs a different kernel).
+    #[test]
+    fn dense_mlp_below_threshold_takes_the_classic_path() {
+        let device = crate::gguf::metal_device().unwrap();
+        let (hidden, ff) = (512usize, 1536usize);
+        let fused = dense_mlp_q4k(&device, hidden, ff, true);
+        let classic = dense_mlp_q4k(&device, hidden, ff, false);
+
+        let min_seq = crate::ops::dense_mm_min_seq();
+        let bits = |mlp: &DenseMlp, x: &Tensor| -> Vec<u32> {
+            mlp.forward(x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+
+        for seq in [1usize, min_seq - 1, min_seq] {
+            let x = det_tensor(&[seq, hidden], 0x505, 1.0)
+                .to_device(&device)
+                .unwrap();
+            assert_eq!(
+                bits(&fused, &x),
+                bits(&classic, &x),
+                "seq {seq} does not exceed the threshold {min_seq} and must be \
+                 bit-identical to the plane-free block"
+            );
+        }
+
+        // One token past the threshold the vendored gemm runs, so the outputs
+        // are close but not bit-identical — the guard that the assertions above
+        // are actually observing the gate and not a no-op.
+        let x = det_tensor(&[min_seq + 1, hidden], 0x506, 1.0)
+            .to_device(&device)
+            .unwrap();
+        assert_ne!(
+            bits(&fused, &x),
+            bits(&classic, &x),
+            "seq {} must take the vendored prefill gemm",
+            min_seq + 1
+        );
     }
 
     /// Decode MoE-FFN and per-token-overhead perf benches (phase 0 of the
@@ -2075,6 +2298,151 @@ mod tests {
                 "time series (means of {chunk}-iter groups, ms): [{}]",
                 series.join(", ")
             );
+        }
+
+        /// Isolation timing for the 27B's dense SwiGLU FFN, which every one of
+        /// its 64 layers runs and which carries the majority of the model's
+        /// prefill FLOPs (3 x 2 x T x 5120 x 17408 per layer).
+        ///
+        /// The three matmuls go through `QLinear` -> candle's
+        /// `kernel_mul_mm_q4_K_f32`; unlike the attention and DeltaNet
+        /// projections, the FFN weights have no dequantized f16 plane, so the
+        /// `f16 plane` rows below price the counterfactual against the same
+        /// shapes on the vendored cooperative-tensor gemm. `silu*up` is the pair
+        /// of eager candle ops between them.
+        ///
+        /// Achieved TFLOP/s is printed next to every matmul: `2 * T * K * N`
+        /// over the plateau time. Compare against the ~26 TFLOP/s llama.cpp
+        /// sustains over a whole 27B prefill on this machine.
+        ///
+        /// `#[ignore]`d — run on a `pgrep`-verified free GPU with:
+        ///   cargo test --release -p xwen dense_ffn_prefill_timing -- --ignored --nocapture
+        #[test]
+        #[ignore = "perf bench"]
+        fn dense_ffn_prefill_timing() {
+            const HIDDEN: usize = 5120;
+            const FF: usize = 17408;
+            const LAYERS: usize = 64;
+
+            let device = metal();
+            let Device::Metal(mdev) = &device else {
+                unreachable!("metal() returned a non-Metal device")
+            };
+            let (warm, iters) = iter_counts();
+            let (warm, iters) = (warm.min(3), iters.min(10));
+
+            let sync_bench = |f: &mut dyn FnMut()| -> f64 {
+                for _ in 0..warm {
+                    f();
+                    mdev.wait_until_completed().unwrap();
+                }
+                let mut times = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    f();
+                    mdev.wait_until_completed().unwrap();
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                times[iters / 2..].iter().sum::<f64>() / (iters - iters / 2) as f64
+            };
+
+            let q4k = |rows: usize, cols: usize, seed: u64| {
+                let t = det_tensor(&[rows, cols], seed, 0.5);
+                QLinear::from_qtensor(Arc::new(
+                    QTensor::quantize_onto(&t, GgmlDType::Q4K, &device).unwrap(),
+                ))
+                .unwrap()
+            };
+            let plane = |rows: usize, cols: usize, seed: u64| {
+                det_tensor(&[rows, cols], seed, 0.5)
+                    .to_device(&device)
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap()
+            };
+
+            let (gate, up, down) = (
+                q4k(FF, HIDDEN, 0x401),
+                q4k(FF, HIDDEN, 0x402),
+                q4k(HIDDEN, FF, 0x403),
+            );
+            let (gate16, down16) = (plane(FF, HIDDEN, 0x401), plane(HIDDEN, FF, 0x403));
+
+            // 512 is the production chunk; the other two are the whole-prompt
+            // lengths the bench fixtures reach, kept to show the stage is linear
+            // in T (it has no position-dependent term).
+            for &t in &[512usize, 880, 3851] {
+                let x = det_tensor(&[t, HIDDEN], 0x404, 0.5)
+                    .to_device(&device)
+                    .unwrap();
+                let h = det_tensor(&[t, FF], 0x405, 0.5).to_device(&device).unwrap();
+                let tf =
+                    |ms: f64, k: usize, n: usize| 2.0 * t as f64 * k as f64 * n as f64 / (ms * 1e9);
+
+                let t_gate = sync_bench(&mut || {
+                    gate.forward(&x).unwrap();
+                });
+                let t_down = sync_bench(&mut || {
+                    down.forward(&h).unwrap();
+                });
+                let t_gate16 = sync_bench(&mut || {
+                    crate::ops::matmul_f16(&gate16, &x).unwrap();
+                });
+                let t_down16 = sync_bench(&mut || {
+                    crate::ops::matmul_f16(&down16, &h).unwrap();
+                });
+                let t_act = sync_bench(&mut || {
+                    let g = silu(&h).unwrap();
+                    (&g * &h).unwrap();
+                });
+                let t_block = sync_bench(&mut || {
+                    swiglu(&gate, &up, &down, &x).unwrap();
+                });
+                // A real forward issues all 64 layers' FFN dispatches without
+                // waiting in between, so the per-call commit-and-wait the
+                // measurements above each pay is overhead the model never sees.
+                // Batch BATCH blocks per sync and hold the outputs alive so the
+                // allocator pool cannot inject a false write-after-write barrier
+                // between them; this is the rate to multiply by the layer count.
+                const BATCH: usize = 8;
+                let t_amort = sync_bench(&mut || {
+                    let mut keep = Vec::with_capacity(BATCH);
+                    for _ in 0..BATCH {
+                        keep.push(swiglu(&gate, &up, &down, &x).unwrap());
+                    }
+                }) / BATCH as f64;
+
+                eprintln!("--- dense FFN, 27B shapes, T={t} ---");
+                eprintln!(
+                    "  q4k gate/up  [{t},{HIDDEN}]x[{HIDDEN},{FF}]  {t_gate:7.3} ms  {:6.2} TFLOP/s",
+                    tf(t_gate, HIDDEN, FF)
+                );
+                eprintln!(
+                    "  q4k down     [{t},{FF}]x[{FF},{HIDDEN}]  {t_down:7.3} ms  {:6.2} TFLOP/s",
+                    tf(t_down, FF, HIDDEN)
+                );
+                eprintln!(
+                    "  f16 plane gate                          {t_gate16:7.3} ms  {:6.2} TFLOP/s",
+                    tf(t_gate16, HIDDEN, FF)
+                );
+                eprintln!(
+                    "  f16 plane down                          {t_down16:7.3} ms  {:6.2} TFLOP/s",
+                    tf(t_down16, FF, HIDDEN)
+                );
+                eprintln!("  silu*up (eager)                         {t_act:7.3} ms");
+                eprintln!(
+                    "  whole swiglu                            {t_block:7.3} ms  {:6.2} TFLOP/s \
+                     => {:.1} ms for {LAYERS} layers",
+                    3.0 * 2.0 * t as f64 * HIDDEN as f64 * FF as f64 / (t_block * 1e9),
+                    t_block * LAYERS as f64
+                );
+                eprintln!(
+                    "  swiglu amortized                        {t_amort:7.3} ms  {:6.2} TFLOP/s \
+                     => {:.1} ms for {LAYERS} layers",
+                    3.0 * 2.0 * t as f64 * HIDDEN as f64 * FF as f64 / (t_amort * 1e9),
+                    t_amort * LAYERS as f64
+                );
+            }
         }
     }
 }

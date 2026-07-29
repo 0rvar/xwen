@@ -1,16 +1,23 @@
-//! DFlash drafter model (WP-D1) — the speculative-decoding drafter for the
-//! Laguna S 2.1 target. This is a self-contained module: the drafter is a pure
-//! function of its OWN weights and its OWN KV cache and never references
-//! `XwenModel`. Token embeddings and the lm_head live in the target and are
-//! applied by the driver, not here (the drafter returns pre-lm_head hidden
-//! states).
+//! DFlash drafter model — the speculative-decoding drafter for the Qwen 3.6
+//! targets. This is a self-contained module: the drafter is a pure function of
+//! its OWN weights and its OWN KV cache and never references `XwenModel`. Token
+//! embeddings and the lm_head live in the target and are applied by the driver,
+//! not here (the drafter returns pre-lm_head hidden states).
 //!
-//! Ground truth: `reference/llama.cpp-laguna-branch/src/models/dflash.cpp`
-//! (`decoder_laguna == true`, i.e. the Laguna drafter variant). The architecture
-//! is "dflash" with a "laguna" decoder: 6 dense layers, hidden 3072, 72 Q heads
-//! / 8 KV heads, head_dim 128, QK-norm before rope, a per-head softplus attention
-//! output gate, SwiGLU FFN, plain NEOX rope (theta 500k, all 128 dims, no YaRN),
-//! full causal attention on every layer (no SWA).
+//! Ground truth: `reference/llama.cpp/src/models/dflash.cpp` — the encoder graph
+//! at :109-123, the KV-injection graph at :238-300, the noise-block decoder at
+//! :325-384. The architecture is "dflash": 5 dense layers at hidden 5120 (the
+//! 27B sidecar) or 6 at hidden 2048 (the 35B-A3B sidecar), 32 Q / 8 KV heads,
+//! head_dim 128, QK-norm before rope, SwiGLU FFN, plain NEOX rope over all 128
+//! dims (theta from the GGUF, 1e7 on both sidecars, no YaRN), and NON-CAUSAL
+//! attention windowed to `dflash.attention.sliding_window` on every layer the
+//! `sliding_window_pattern` marks — the last layer is full on both sidecars.
+//! There is no attention output gate and no per-tap encoder norm.
+//!
+//! The drafter is a block-diffusion model: it denoises `[id_last, MASK × k]` in
+//! one forward, so its block attends to itself in both directions
+//! (`llama_set_causal_attn(ctx_dft, false)`, common/speculative.cpp:1004) and
+//! only the sliding window ever removes a key.
 //!
 //! Matmul weights: by DEFAULT the GGUF's BF16 planes are mmap-aliased no-copy
 //! (the target's `MmapSource` machinery — the `GgufFile`'s mapping is shared,
@@ -25,13 +32,12 @@
 //! via its finiteness check). Without a mapping (CPU device,
 //! `XWEN_LOAD_CLASSIC`) weights are materialized DENSE f16
 //! (BF16 -> f32 -> f16, `crate::ops::matmul_f16`) — the pre-alias behavior.
-//! Norm weights (attn/ffn/output norms, q/k-norm, aux_norm) stay f32 on every
+//! Norm weights (attn/ffn/output norms, q/k-norm) stay f32 on every
 //! path. `XWEN_DRAFT_F32` restores full-f32 weights with plain candle matmul
-//! (the path the scalar-reference tests pin). The drafter is tiny (~1.1B,
+//! (the path the scalar-reference tests pin). The drafter is tiny (1.7B / 386M,
 //! <= block_size query rows per forward).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, OnceLock};
@@ -51,20 +57,24 @@ use crate::kv_cache::{
 /// Default positions the drafter's KV cache is sized for, shared by `generate`,
 /// `chat` and serve. This doubles as the DRAFTING DEPTH LIMIT: past it decode
 /// continues plain (the round loops go plain once `n_past` runs off the
-/// drafter's cache). It is deliberately small, for two measured reasons
-/// (2026-07-27, full power, `--stats`): the drafter forward is O(depth) at
-/// ~25 us per context token per round (101 ms/round at 4k, 378 ms at 16k,
-/// 750 ms at 30k — vs a ~43 ms plain step), and its proposal quality collapses
-/// with depth anyway (19 drafted/121 rounds at 4k, 0/120 by 16k — nothing
-/// clears `draft_p_min`). Past ~8k even perfect acceptance is marginal;
-/// within it, the wall-clock auto-pause prunes the per-text losers. The f32
-/// planes also cost 48 KiB/token, so the cap keeps cache images small.
-/// Revisit if the drafter forward's depth scaling is ever fixed (TODO ledger).
+/// drafter's cache). The cap keeps the drafter's f32 cache planes and their
+/// exported images small: 40 KiB/token on the 27B sidecar (5 layers x K/V x
+/// 8 heads x 128 dims x f32) and 48 KiB/token on the 35B-A3B's 6 layers.
+///
+/// The value is inherited from laguna and has not been re-derived against the
+/// Qwen sidecars (TODO ledger). Laguna's argument was that the drafter forward
+/// is O(depth) and its proposal quality collapses with depth; the O(depth) half
+/// no longer holds here, because every layer but the last is windowed to
+/// 2048/4096 positions and `attention` narrows the cache to that window, so only
+/// one layer of five or six grows with the context.
 pub const DEFAULT_DRAFT_CTX: usize = 8192;
 
 /// Static architecture facts parsed from the `dflash.*` GGUF metadata. Errors
-/// unless the file is a Laguna-decoder DFlash drafter (arch "dflash",
-/// decoder_arch "laguna").
+/// unless the file is a DFlash drafter (`general.architecture == "dflash"`).
+/// The shipped sidecars carry no key naming their target architecture, so the
+/// pairing of a drafter to a target is the caller's business — `hub.rs` resolves
+/// both from one `Model`, and `spec_tap_layers` is range-checked against the
+/// target at attach time.
 #[derive(Debug, Clone)]
 pub struct DflashConfig {
     pub n_layer: usize,
@@ -75,6 +85,16 @@ pub struct DflashConfig {
     pub n_ff: usize,
     pub rms_eps: f64,
     pub rope_theta: f32,
+    /// Sliding-window width in positions (`dflash.attention.sliding_window`), or
+    /// `None` when the file declares no window. A windowed layer's query at
+    /// position `p` may attend to keys at `[p - window + 1, p]` on the past side
+    /// (llama-hparams.h `is_masked_swa`: masked iff `p1 - p0 >= n_swa`); the
+    /// future side is unbounded because the drafter is non-causal.
+    pub sliding_window: Option<usize>,
+    /// Per-layer window flags (`dflash.attention.sliding_window_pattern`), one
+    /// per layer, in layer order. All-`false` when the file declares no window.
+    /// Both sidecars window every layer but the last.
+    pub swa_layers: Vec<bool>,
     /// Noise-block width the drafter drafts per step (`dflash.block_size`).
     pub block_size: usize,
     /// Target-model layer indices whose residual taps feed the encoder, in the
@@ -100,11 +120,6 @@ impl DflashConfig {
             arch == "dflash",
             "expected a dflash GGUF, got architecture {arch:?}"
         );
-        let decoder = get("dflash.decoder_arch")?.to_string()?.as_str();
-        ensure!(
-            decoder == "laguna",
-            "expected decoder_arch \"laguna\", got {decoder:?}"
-        );
 
         let target_layers = get("dflash.target_layers")?
             .to_vec()
@@ -115,8 +130,60 @@ impl DflashConfig {
             .context("dflash.target_layers has non-integer entries")?;
         ensure!(!target_layers.is_empty(), "dflash.target_layers is empty");
 
+        let n_layer = value_usize(get("dflash.block_count")?)?;
+
+        // The window key is optional; once present it makes the pattern key
+        // mandatory and the pattern must cover every layer, exactly as
+        // dflash.cpp:23-30 reads them. A declared width of 0 is a file that
+        // means "no window" the long way round, and is normalized to None so
+        // nothing downstream has to special-case it.
+        let sliding_window = match content.metadata.get("dflash.attention.sliding_window") {
+            Some(v) => {
+                let w =
+                    value_usize(v).context("dflash.attention.sliding_window is not an integer")?;
+                (w > 0).then_some(w)
+            }
+            None => None,
+        };
+        let swa_layers = match sliding_window {
+            None => vec![false; n_layer],
+            Some(_) => {
+                // llama.cpp reads this through `get_key_or_arr`, which takes
+                // EITHER an array of exactly n_layer entries OR a single value
+                // repeated across every layer (llama-model-loader.cpp:444-482).
+                // Both shipped sidecars write the array form; the scalar form is
+                // what a converter emitting a uniformly-windowed drafter would
+                // produce, and rejecting it would refuse a file llama.cpp loads.
+                let key = get("dflash.attention.sliding_window_pattern")?;
+                match key.to_vec() {
+                    Ok(entries) => {
+                        let pattern = entries
+                            .iter()
+                            .map(value_bool)
+                            .collect::<Result<Vec<_>>>()
+                            .context(
+                                "dflash.attention.sliding_window_pattern has non-boolean entries",
+                            )?;
+                        ensure!(
+                            pattern.len() == n_layer,
+                            "dflash.attention.sliding_window_pattern covers {} layers, the model has {n_layer}",
+                            pattern.len()
+                        );
+                        pattern
+                    }
+                    Err(_) => {
+                        let all = value_bool(key).context(
+                            "dflash.attention.sliding_window_pattern is neither an array nor a \
+                             single boolean",
+                        )?;
+                        vec![all; n_layer]
+                    }
+                }
+            }
+        };
+
         Ok(Self {
-            n_layer: value_usize(get("dflash.block_count")?)?,
+            n_layer,
             n_embd: value_usize(get("dflash.embedding_length")?)?,
             n_head: value_usize(get("dflash.attention.head_count")?)?,
             n_head_kv: value_usize(get("dflash.attention.head_count_kv")?)?,
@@ -124,6 +191,8 @@ impl DflashConfig {
             n_ff: value_usize(get("dflash.feed_forward_length")?)?,
             rms_eps: get("dflash.attention.layer_norm_rms_epsilon")?.to_f32()? as f64,
             rope_theta: get("dflash.rope.freq_base")?.to_f32()?,
+            sliding_window,
+            swa_layers,
             block_size: value_usize(get("dflash.block_size")?)?,
             target_layers,
             mask_token_id: get("tokenizer.ggml.mask_token_id")?.to_u32()?,
@@ -131,9 +200,106 @@ impl DflashConfig {
         })
     }
 
+    /// The window layer `il` attends under, or `None` for full attention.
+    fn layer_window(&self, il: usize) -> Option<usize> {
+        match self.swa_layers.get(il) {
+            Some(true) => self.sliding_window,
+            _ => None,
+        }
+    }
+
     /// The encoder's concatenated feature width: `target_layers.len() * n_embd`.
     fn n_embd_inp(&self) -> usize {
         self.target_layers.len() * self.n_embd
+    }
+
+    /// Everything about this drafter that can be judged before a weight is read:
+    /// its own geometry has to be arithmetically buildable, and the parts of it
+    /// that reach across to the target have to match the target.
+    ///
+    /// This is the ONE place these checks live, and it has to stay that way.
+    /// Both entry points that attach a drafter — `Generator::attach_drafter` on
+    /// the CLI path and serve's startup preflight — call it, so a check added
+    /// for one is a check the other gets. Split across two call sites they drift,
+    /// and a drafter built for the other checkpoint reaches a running server.
+    ///
+    /// The cross-target checks are the whole of what a sidecar's metadata can be
+    /// held to: nothing in a DFlash file names the checkpoint it belongs to, so
+    /// pairing one with a target is only ever the caller's assertion. The
+    /// drafter's own depth, FFN width and head counts describe the drafter and
+    /// cannot be compared against anything — only their internal consistency is
+    /// checkable, which is what the first group does.
+    pub fn check_against_target(
+        &self,
+        target_hidden: usize,
+        target_n_layer: usize,
+        target_vocab: usize,
+    ) -> Result<()> {
+        // Internal consistency. `n_head_kv > 0` comes first and is the one that
+        // matters most: `DflashDrafter::build` guards the head ratio with an
+        // `ensure!`, but the `%` inside it is evaluated first and a zero divisor
+        // panics there before anything can report why.
+        ensure!(
+            self.n_head_kv > 0,
+            "the drafter declares 0 KV heads (dflash.attention.head_count_kv), which no \
+             attention geometry can be built from"
+        );
+        ensure!(
+            self.n_head > 0,
+            "the drafter declares 0 attention heads (dflash.attention.head_count)"
+        );
+        ensure!(
+            self.n_head.is_multiple_of(self.n_head_kv),
+            "the drafter declares {} attention heads over {} KV heads, which do not divide: \
+             grouped-query attention needs a whole number of query heads per KV head",
+            self.n_head,
+            self.n_head_kv
+        );
+        ensure!(
+            self.head_dim > 0 && self.head_dim.is_multiple_of(2),
+            "the drafter declares a head dim of {}, which rope cannot split into halves",
+            self.head_dim
+        );
+        ensure!(self.n_layer > 0, "the drafter declares 0 layers");
+        ensure!(
+            self.n_ff > 0,
+            "the drafter declares a feed-forward width of 0"
+        );
+        // A block of 1 is the anchor token alone: `block_size - 1` draft tokens
+        // is zero, so such a drafter could never propose anything.
+        ensure!(
+            self.block_size >= 2,
+            "the drafter declares a noise block of {} tokens, which leaves no room for a \
+             draft (the first block position is the anchor)",
+            self.block_size
+        );
+
+        // Cross-checks against the model being served.
+        ensure!(
+            self.n_embd == target_hidden,
+            "the drafter has a hidden size of {} but the target has {target_hidden}: \
+             this drafter was built for a different checkpoint",
+            self.n_embd
+        );
+        for il in self.spec_tap_layers()? {
+            ensure!(
+                il < target_n_layer,
+                "the drafter reads a residual tap from layer {il} of the target, which has \
+                 {target_n_layer} layers: this drafter was built for a deeper model"
+            );
+        }
+        // The mask token is fed straight into the target's embedding table every
+        // speculative round, so an out-of-range id is an indexing failure at the
+        // first round and an in-range wrong one degrades acceptance silently.
+        // Only the range is checkable here — the two shipped sidecars disagree
+        // on the id (248070 vs 248077), so there is no single right value.
+        ensure!(
+            (self.mask_token_id as usize) < target_vocab,
+            "the drafter's mask token id {} is outside the target's {target_vocab}-token \
+             vocabulary",
+            self.mask_token_id
+        );
+        Ok(())
     }
 
     /// The target-model `l_out` indices whose residuals feed the encoder, in
@@ -244,6 +410,17 @@ fn matmul_weight(t: Tensor, dtype: WeightDtype, name: &str) -> Result<Tensor> {
     }
 }
 
+/// Accept a GGUF bool or any integer width as a flag. The shipped sidecars
+/// store `sliding_window_pattern` as bool[], but llama.cpp's array reader
+/// accepts integer arrays for the same key (llama-model-loader.cpp:383-387), so
+/// a converter that writes 0/1 stays readable.
+fn value_bool(v: &Value) -> Result<bool> {
+    if let Ok(b) = v.to_bool() {
+        return Ok(b);
+    }
+    Ok(value_usize(v)? != 0)
+}
+
 /// Accept any GGUF integer width/signedness (target_layers is i32[]).
 fn value_usize(v: &Value) -> Result<usize> {
     if let Ok(u) = v.to_u64() {
@@ -257,7 +434,7 @@ fn value_usize(v: &Value) -> Result<usize> {
     Ok(i as usize)
 }
 
-/// One decoder layer's weights. Matmul weights (`wq/wk/wv/wo`, `gate`, the FFN
+/// One decoder layer's weights. Matmul weights (`wq/wk/wv/wo` and the FFN
 /// projections) are `[out, in]` (GGUF layout, `y = x @ wᵀ`) and dense f16 by
 /// default / f32 under `XWEN_DRAFT_F32`; norm weights are always f32. `linear`
 /// dispatches on each weight's dtype.
@@ -269,7 +446,6 @@ struct LayerWeights {
     wo: Tensor,      // [n_embd, n_head*head_dim]
     q_norm: RmsNorm, // [head_dim]
     k_norm: RmsNorm, // [head_dim]
-    gate: Tensor,    // [n_head, n_embd]
     ffn_norm: RmsNorm,
     ffn_gate: Tensor, // [n_ff, n_embd]
     ffn_up: Tensor,   // [n_ff, n_embd]
@@ -294,7 +470,6 @@ pub struct DflashDrafter {
     device: Device,
 
     // Encoder.
-    aux_norm: Tensor, // [n_aux, n_embd] f32
     enc_output_norm: RmsNorm,
     fc: Tensor, // [n_embd, n_aux*n_embd]
 
@@ -380,6 +555,15 @@ impl DflashDrafter {
             "head_dim {} must be even for rope",
             cfg.head_dim
         );
+        // Ordered before the ratio: `%` is evaluated before `ensure!` tests its
+        // condition, so a zero divisor panics with a remainder-by-zero instead
+        // of reporting the malformed metadata. `check_against_target` catches
+        // this earlier on both the CLI and serve paths, but `build` is `pub`
+        // enough to reach directly and must not panic on a bad file.
+        ensure!(
+            cfg.n_head_kv > 0,
+            "n_head_kv is 0, which no attention geometry can be built from"
+        );
         ensure!(
             cfg.n_head % cfg.n_head_kv == 0,
             "n_head {} must be a multiple of n_head_kv {}",
@@ -390,14 +574,6 @@ impl DflashDrafter {
         let eps = cfg.rms_eps;
         let norm = |t: Tensor| RmsNorm::new(t, eps);
 
-        let aux_norm = get("enc.aux_norm")?;
-        let n_aux = cfg.target_layers.len();
-        ensure!(
-            aux_norm.dims() == [n_aux, cfg.n_embd],
-            "enc.aux_norm shape {:?} != [{n_aux}, {}]",
-            aux_norm.dims(),
-            cfg.n_embd
-        );
         let enc_output_norm = norm(get("enc.output_norm")?);
         let fc = get("fc")?;
         ensure!(
@@ -421,7 +597,6 @@ impl DflashDrafter {
                 wo: matmul_weight(get(&p("attn_output"))?, dtype, "attn_output")?,
                 q_norm: norm(get(&p("attn_q_norm"))?),
                 k_norm: norm(get(&p("attn_k_norm"))?),
-                gate: matmul_weight(get(&p("attn_gate"))?, dtype, "attn_gate")?,
                 ffn_norm: norm(get(&p("ffn_norm"))?),
                 ffn_gate: matmul_weight(get(&p("ffn_gate"))?, dtype, "ffn_gate")?,
                 ffn_up: matmul_weight(get(&p("ffn_up"))?, dtype, "ffn_up")?,
@@ -444,7 +619,6 @@ impl DflashDrafter {
         Ok(Self {
             cfg,
             device: device.clone(),
-            aux_norm,
             enc_output_norm,
             fc,
             output_norm,
@@ -484,7 +658,7 @@ impl DflashDrafter {
     }
 
     /// Positions the drafter's own KV cache can hold. Sized independently of the
-    /// target's context (the drafter's f32 planes cost 48 KiB/token), so a driver
+    /// target's context (the drafter's f32 planes cost 40-48 KiB/token), so a driver
     /// has to stop injecting — and stop speculating — once the conversation runs
     /// past this.
     pub fn max_ctx(&self) -> usize {
@@ -560,11 +734,11 @@ impl DflashDrafter {
     /// space. `taps` are `n_aux` (= `target_layers.len()`) f32 tensors, each
     /// `[seq, n_embd]`, ordered as `target_layers`.
     ///
-    /// Per the Laguna drafter (dflash.cpp:128-143): view the concatenated taps as
-    /// `[seq, n_aux, n_embd]`, RMS-norm over the last dim (eps `rms_eps`, no
-    /// weight), multiply by the stacked per-aux weights `aux_norm [n_aux, n_embd]`,
-    /// flatten to `[seq, n_aux*n_embd]`, apply `fc`, then RMS-norm with
-    /// `enc.output_norm`. Returns fused `[seq, n_embd]` f32.
+    /// Three ops, per dflash.cpp:109-123: concatenate the taps tap-major within
+    /// each row to `[seq, n_aux*n_embd]`, apply `fc`, then RMS-norm with
+    /// `enc.output_norm`. The taps enter raw — the sidecars ship no per-tap norm
+    /// or scale, and the taps are the target's residual stream as it enters the
+    /// tapped block, unnormalized. Returns fused `[seq, n_embd]` f32.
     pub fn encode(&self, taps: &[Tensor]) -> Result<Tensor> {
         let n_aux = self.cfg.target_layers.len();
         ensure!(
@@ -590,20 +764,11 @@ impl DflashDrafter {
             );
         }
 
-        // [seq, n_aux, n_embd].
+        // [seq, n_aux * n_embd], tap-major within each row.
         let refs: Vec<&Tensor> = taps.iter().collect();
-        let x = Tensor::stack(&refs, 1)?
-            .to_dtype(DType::F32)?
-            .contiguous()?;
+        let flat = Tensor::cat(&refs, 1)?.to_dtype(DType::F32)?.contiguous()?;
+        debug_assert_eq!(flat.dims(), [seq, n_aux * n_embd]);
 
-        // ggml_rms_norm over the last dim (no weight), then multiply aux_norm.
-        let ms = x.sqr()?.mean_keepdim(2)?; // [seq, n_aux, 1]
-        let denom = (ms + self.cfg.rms_eps)?.sqrt()?;
-        let normed = x.broadcast_div(&denom)?;
-        let aux = self.aux_norm.reshape((1, n_aux, n_embd))?;
-        let scaled = normed.broadcast_mul(&aux)?;
-
-        let flat = scaled.reshape((seq, n_aux * n_embd))?.contiguous()?;
         let fused = linear(&flat, &self.fc)?; // [seq, n_embd]
         Ok(self.enc_output_norm.forward(&fused)?)
     }
@@ -611,8 +776,12 @@ impl DflashDrafter {
     /// KV-injection: project the fused context into every layer's K/V and append
     /// to the committed cache. `pos0` must equal the current committed length
     /// (positions are sequential). K is QK-normed then roped; V is neither.
-    /// (dflash.cpp:189-227, `decoder_laguna` branch: K/V come from the
-    /// `attn_norm`-normed fused input, matching the query path.)
+    ///
+    /// The fused input goes into `wk`/`wv` RAW, with no `attn_norm` — the
+    /// encoder's `enc.output_norm` is the only norm on this path
+    /// (dflash.cpp:252-253, where the injection graph projects `inp_g`
+    /// directly). The query path in `draft_forward` does apply `attn_norm`,
+    /// so the two paths deliberately disagree.
     pub fn inject(&mut self, fused: &Tensor, pos0: usize) -> Result<()> {
         ensure!(
             pos0 == self.committed,
@@ -636,10 +805,9 @@ impl DflashDrafter {
 
         for il in 0..self.layers.len() {
             let layer = &self.layers[il];
-            let kv_inp = layer.attn_norm.forward(&fused)?; // [seq, n_embd]
 
-            let k = linear(&kv_inp, &layer.wk)?.reshape((seq, n_kv, hd))?;
-            let v = linear(&kv_inp, &layer.wv)?.reshape((seq, n_kv, hd))?;
+            let k = linear(&fused, &layer.wk)?.reshape((seq, n_kv, hd))?;
+            let v = linear(&fused, &layer.wv)?.reshape((seq, n_kv, hd))?;
 
             let k = layer.k_norm.forward(&k)?; // QK-norm over head_dim, pre-rope
             let k = k.transpose(0, 1)?.contiguous()?; // [n_kv, seq, hd]
@@ -656,7 +824,8 @@ impl DflashDrafter {
     /// Noise-block draft forward. `noise_embd` is `[n_block, n_embd]` f32 —
     /// target-side token embeddings of `[id_last, MASK * (n_block-1)]` at
     /// positions `pos0..pos0+n_block` (pos0 must equal the committed length). Runs
-    /// the full causal decoder attending over `[committed cache | noise block]`.
+    /// the decoder attending over `[committed cache | noise block]`, non-causally
+    /// and windowed per layer (see `attention`).
     /// Each layer's noise K/V is written into the cache scratch region (rows
     /// `committed..committed+n_block`) and attention reads a narrowed cache view,
     /// so the committed prefix is never re-copied. `committed` is unchanged on
@@ -715,15 +884,17 @@ impl DflashDrafter {
             // reads before reading it, so the reuse never leaks stale K/V.
             self.caches[il].k.slice_set(&k, 1, committed)?;
             self.caches[il].v.slice_set(&v, 1, committed)?;
-            let k_all = self.caches[il].k.narrow(1, 0, committed + n_block)?;
-            let v_all = self.caches[il].v.narrow(1, 0, committed + n_block)?;
 
-            let attn = self.attention(&q, &k_all, &v_all, committed, n_block, scale)?; // [n_head, nb, hd]
-
-            // Softplus output gate, per-head, broadcast over head_dim.
-            let gate = softplus(&linear(&noise_norm, &layer.gate)?)?; // [nb, n_head]
-            let gate = gate.transpose(0, 1)?.reshape((n_head, n_block, 1))?;
-            let attn = attn.broadcast_mul(&gate)?;
+            let window = self.cfg.layer_window(il);
+            let attn = self.attention(
+                &self.caches[il].k,
+                &self.caches[il].v,
+                &q,
+                committed,
+                n_block,
+                scale,
+                window,
+            )?; // [n_head, nb, hd]
 
             let attn = attn
                 .transpose(0, 1)?
@@ -740,60 +911,101 @@ impl DflashDrafter {
         Ok(self.output_norm.forward(&inp)?)
     }
 
-    /// Causal GQA attention of `n_block` queries over `committed + n_block` keys.
-    /// `q [n_head, nb, hd]` contiguous; `k_all`/`v_all [n_kv, committed+nb, hd]`
-    /// may be non-contiguous narrowed cache views, so the GQA head axis is added
-    /// with `unsqueeze` (a metadata-only view) rather than `reshape` — the
-    /// following `broadcast_matmul` materializes its broadcast operand anyway
-    /// (candle contiguises the GQA expansion), and reads the strided view
-    /// directly, so no separate prefix copy is introduced. All f32. Committed
-    /// keys are always visible; the noise keys are causally masked within the
-    /// block (key i' visible to query i iff i' <= i).
+    /// Non-causal GQA attention of the `n_block` noise queries over the cache
+    /// rows `[0, committed + n_block)`, windowed to `window` positions on the
+    /// past side.
+    ///
+    /// The drafter denoises its whole block in one forward, so every query sees
+    /// every other block position in both directions — the only key a query
+    /// loses is one that fell out of its window. Query `i` sits at absolute
+    /// position `committed + i` and attends to absolute positions
+    /// `> committed + i - window` (llama-hparams.h:393-398, `p1 - p0 >= n_swa`
+    /// masks).
+    ///
+    /// Rather than mask a full-length score row, the cache is narrowed to the
+    /// UNION of the block's windows, `[lo, committed + n_block)`, where `lo` is
+    /// query 0's floor. A windowed layer therefore costs O(window) per round
+    /// instead of O(context), which is the whole point of the window; only the
+    /// at most `n_block - 1` columns between the queries' individual floors need
+    /// an additive mask, and when the context still fits inside the window there
+    /// is no mask at all.
+    ///
+    /// `q [n_head, nb, hd]` contiguous; `k_cache`/`v_cache` are the full
+    /// `[n_kv, max_ctx, hd]` planes. The GQA head axis is added with `unsqueeze`
+    /// (a metadata-only view) rather than `reshape` — the following
+    /// `broadcast_matmul` materializes its broadcast operand anyway (candle
+    /// contiguises the GQA expansion) and reads the strided view directly, so no
+    /// separate prefix copy is introduced. All f32.
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
         q: &Tensor,
-        k_all: &Tensor,
-        v_all: &Tensor,
         committed: usize,
         n_block: usize,
         scale: f32,
+        window: Option<usize>,
     ) -> Result<Tensor> {
         let (n_kv, hd, n_head) = (self.cfg.n_head_kv, self.cfg.head_dim, self.cfg.n_head);
         let g = n_head / n_kv;
         let k_seq = committed + n_block;
+        // Query 0's floor: it may attend back to `committed - window + 1`.
+        let lo = match window {
+            Some(w) => committed.saturating_sub(w - 1),
+            None => 0,
+        };
+        let span = k_seq - lo;
 
         let q4 = q.reshape((n_kv, g, n_block, hd))?;
-        let k4 = k_all.unsqueeze(1)?; // [n_kv, 1, k_seq, hd]
-        let v4 = v_all.unsqueeze(1)?; // [n_kv, 1, k_seq, hd]
+        let k4 = k_cache.narrow(1, lo, span)?.unsqueeze(1)?; // [n_kv, 1, span, hd]
+        let v4 = v_cache.narrow(1, lo, span)?.unsqueeze(1)?; // [n_kv, 1, span, hd]
 
         let scores = q4
             .broadcast_matmul(&k4.transpose(2, 3)?)?
             .affine(scale as f64, 0.0)?;
-        let mask = self.causal_mask(committed, n_block, k_seq)?; // [1, 1, nb, k_seq]
-        let scores = scores.broadcast_add(&mask)?;
+        let scores = match self.window_mask(committed, n_block, lo, span, window)? {
+            Some(mask) => scores.broadcast_add(&mask)?,
+            None => scores,
+        };
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = probs.broadcast_matmul(&v4)?; // [n_kv, g, nb, hd]
         Ok(out.reshape((n_head, n_block, hd))?)
     }
 
-    /// Additive mask `[1, 1, n_block, k_seq]` (0 attend / -inf block): committed
-    /// columns visible to every query, noise column c (>= committed) visible to
-    /// query i iff `c - committed <= i`.
-    fn causal_mask(&self, committed: usize, n_block: usize, k_seq: usize) -> Result<Tensor> {
-        let mut data = vec![0f32; n_block * k_seq];
+    /// Additive mask `[1, 1, n_block, span]` (0 attend / -inf block) over the
+    /// narrowed key view starting at absolute position `lo`: query `i` blocks
+    /// absolute key positions below `committed + i + 1 - window`. `None` when
+    /// nothing in the view is out of window for any query — which is every round
+    /// until the context outgrows the window, and every round on a full layer.
+    fn window_mask(
+        &self,
+        committed: usize,
+        n_block: usize,
+        lo: usize,
+        span: usize,
+        window: Option<usize>,
+    ) -> Result<Option<Tensor>> {
+        let Some(w) = window else {
+            return Ok(None);
+        };
+        // The deepest floor is the last query's; if even that is at or below the
+        // view's start, no key in the view is masked for any query.
+        if committed + n_block <= w {
+            return Ok(None);
+        }
+        let mut data = vec![0f32; n_block * span];
         for i in 0..n_block {
-            for c in 0..k_seq {
-                let blocked = c >= committed && (c - committed) > i;
-                if blocked {
-                    data[i * k_seq + c] = f32::NEG_INFINITY;
-                }
+            let floor = (committed + i + 1).saturating_sub(w); // first visible absolute position
+            for c in lo..floor.min(lo + span) {
+                data[i * span + (c - lo)] = f32::NEG_INFINITY;
             }
         }
-        Ok(Tensor::from_vec(
+        Ok(Some(Tensor::from_vec(
             data,
-            (1, 1, n_block, k_seq),
+            (1, 1, n_block, span),
             &self.device,
-        )?)
+        )?))
     }
 
     /// SwiGLU: `down(silu(gate(x)) * up(x))`, x `[nb, n_embd]` -> `[nb, n_embd]`.
@@ -875,8 +1087,9 @@ impl DrafterImage {
         })
     }
 
-    /// Host bytes this image occupies — 48 KiB per token on the shipped drafter
-    /// (6 layers x K/V x 8 heads x 128 dims x f32).
+    /// Host bytes this image occupies — 40 KiB per token on the 27B sidecar
+    /// (5 layers x K/V x 8 heads x 128 dims x f32), 48 KiB on the 35B-A3B's six
+    /// layers.
     pub fn byte_len(&self) -> usize {
         self.planes.iter().map(|(k, v)| k.len() + v.len()).sum()
     }
@@ -1067,14 +1280,6 @@ fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     }
 }
 
-/// Numerically stable softplus, ln(1 + exp(x)) = relu(x) + ln(1 + exp(-|x|)).
-fn softplus(x: &Tensor) -> Result<Tensor> {
-    let ax = x.abs()?;
-    let relu = x.broadcast_add(&ax)?.affine(0.5, 0.0)?;
-    let tail = ax.neg()?.exp()?.affine(1.0, 1.0)?.log()?;
-    Ok(relu.broadcast_add(&tail)?)
-}
-
 /// Plain NEOX rope cos/sin tables `[max_ctx, head_dim/2]` f32, mscale 1 (no
 /// YaRN): `inv_freq[j] = theta^(-2j/head_dim)`, angle `p * inv_freq[j]`.
 fn rope_tables(
@@ -1238,11 +1443,7 @@ fn read_tensor_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The hub-cached official drafter (`xwen fetch` or any default-model run puts it there).
-    fn drafter_path() -> Option<std::path::PathBuf> {
-        crate::hub::official_drafter()
-    }
+    use std::collections::HashMap;
 
     // --- synthetic weight plumbing -------------------------------------------
 
@@ -1259,6 +1460,8 @@ mod tests {
             .collect()
     }
 
+    /// A synthetic config with full attention on every layer. `with_window`
+    /// turns it into the sidecars' shape (every layer windowed but the last).
     fn tiny_cfg(
         n_layer: usize,
         n_head: usize,
@@ -1275,12 +1478,21 @@ mod tests {
             head_dim: hd,
             n_ff,
             rms_eps: 1e-6,
-            rope_theta: 500_000.0,
+            rope_theta: 10_000_000.0,
+            sliding_window: None,
+            swa_layers: vec![false; n_layer],
             block_size: 16,
             target_layers: vec![2, 11],
-            mask_token_id: 12,
+            mask_token_id: 248077,
             context_length: 1024,
         }
+    }
+
+    /// The shipped per-layer pattern — windowed everywhere but the final layer.
+    fn with_window(mut cfg: DflashConfig, window: usize) -> DflashConfig {
+        cfg.sliding_window = Some(window);
+        cfg.swa_layers = (0..cfg.n_layer).map(|il| il + 1 < cfg.n_layer).collect();
+        cfg
     }
 
     /// A synthetic weight map for `cfg`: every tensor filled with seeded pseudo-
@@ -1310,13 +1522,6 @@ mod tests {
             let v: Vec<f32> = seeded(dim, next()).iter().map(|x| 1.0 + 0.1 * x).collect();
             Tensor::from_vec(v, dim, dev).unwrap()
         };
-        m.insert("enc.aux_norm".to_string(), {
-            let v: Vec<f32> = seeded(n_aux * n_embd, next())
-                .iter()
-                .map(|x| 1.0 + 0.1 * x)
-                .collect();
-            Tensor::from_vec(v, (n_aux, n_embd), dev).unwrap()
-        });
         m.insert("enc.output_norm".to_string(), norm_w(n_embd));
         m.insert("output_norm".to_string(), norm_w(n_embd));
 
@@ -1329,7 +1534,6 @@ mod tests {
             m.insert(p("attn_output"), mat(n_embd, n_head * hd));
             m.insert(p("attn_q_norm"), norm_w(hd));
             m.insert(p("attn_k_norm"), norm_w(hd));
-            m.insert(p("attn_gate"), mat(n_head, n_embd));
             m.insert(p("ffn_norm"), norm_w(n_embd));
             m.insert(p("ffn_gate"), mat(n_ff, n_embd));
             m.insert(p("ffn_up"), mat(n_ff, n_embd));
@@ -1380,7 +1584,6 @@ mod tests {
         wo: Vec<f64>,
         q_norm: Vec<f64>,
         k_norm: Vec<f64>,
-        gate: Vec<f64>,
         ffn_norm: Vec<f64>,
         ffn_gate: Vec<f64>,
         ffn_up: Vec<f64>,
@@ -1421,11 +1624,6 @@ mod tests {
         out
     }
 
-    fn softplus_s(x: f64) -> f64 {
-        // ln(1+exp(x)), stable.
-        x.max(0.0) + (1.0 + (-x.abs()).exp()).ln()
-    }
-
     fn silu_s(x: f64) -> f64 {
         x / (1.0 + (-x).exp())
     }
@@ -1463,7 +1661,6 @@ mod tests {
                     wo: p("attn_output"),
                     q_norm: p("attn_q_norm"),
                     k_norm: p("attn_k_norm"),
-                    gate: p("attn_gate"),
                     ffn_norm: p("ffn_norm"),
                     ffn_gate: p("ffn_gate"),
                     ffn_up: p("ffn_up"),
@@ -1472,13 +1669,14 @@ mod tests {
             })
             .collect();
 
-        // Per-layer context K/V from the fused ctx (attn_norm -> wk/wv, K normed+roped).
+        // Per-layer context K/V from the fused ctx: the injection path projects
+        // the encoder output raw (no attn_norm) and QK-norms + ropes K only.
         // ctxk[il][kv] = Vec of [hd] per context token.
         let mut ctxk = vec![vec![Vec::<Vec<f64>>::new(); n_kv]; cfg.n_layer];
         let mut ctxv = vec![vec![Vec::<Vec<f64>>::new(); n_kv]; cfg.n_layer];
         for (il, layer) in layers.iter().enumerate() {
             for (t, tok) in ctx.iter().enumerate() {
-                let nn = rmsnorm(tok, &layer.attn_norm, eps);
+                let nn = tok.clone();
                 let kf = matvec(&layer.wk, &nn, n_kv * hd, n_embd);
                 let vf = matvec(&layer.wv, &nn, n_kv * hd, n_embd);
                 for kv in 0..n_kv {
@@ -1496,8 +1694,7 @@ mod tests {
             let mut qh = vec![vec![Vec::<f64>::new(); n_head]; n_block]; // [b][head] -> [hd]
             let mut nk = vec![vec![Vec::<f64>::new(); n_kv]; n_block];
             let mut nv = vec![vec![Vec::<f64>::new(); n_kv]; n_block];
-            let mut gates = vec![vec![0.0f64; n_head]; n_block];
-            let mut norms = Vec::with_capacity(n_block);
+            let window = cfg.layer_window(il);
             for b in 0..n_block {
                 let pos = committed + b;
                 let nn = rmsnorm(&hs[b], &layer.attn_norm, eps);
@@ -1513,52 +1710,56 @@ mod tests {
                     nk[b][kv] = rope_vec(&kn, pos, hd, theta);
                     nv[b][kv] = vf[kv * hd..(kv + 1) * hd].to_vec();
                 }
-                let gl = matvec(&layer.gate, &nn, n_head, n_embd);
-                for h in 0..n_head {
-                    gates[b][h] = softplus_s(gl[h]);
-                }
-                norms.push(nn);
             }
-            let _ = norms;
 
-            // Attention + gate + o_proj + residual + FFN, per block token.
+            // Attention + o_proj + residual + FFN, per block token.
             for b in 0..n_block {
+                let p1 = committed + b;
                 let mut attn_cat = vec![0.0f64; n_head * hd];
                 for h in 0..n_head {
                     let kv = h / g;
-                    // Keys: committed context (all), then noise 0..=b (causal).
-                    let mut scores = Vec::with_capacity(committed + b + 1);
-                    for t in 0..committed {
-                        let s: f64 = qh[b][h]
-                            .iter()
-                            .zip(&ctxk[il][kv][t])
-                            .map(|(a, c)| a * c)
-                            .sum();
-                        scores.push(s * scale);
-                    }
-                    for bp in 0..=b {
-                        let s: f64 = qh[b][h].iter().zip(&nk[bp][kv]).map(|(a, c)| a * c).sum();
-                        scores.push(s * scale);
-                    }
+                    // Every key position the window admits, in position order:
+                    // non-causal, so the whole noise block is visible to every
+                    // query and only the past side is cut.
+                    let visible: Vec<usize> = (0..committed + n_block)
+                        .filter(|&p0| match window {
+                            Some(w) => (p1 as i64 - p0 as i64) < (w as i64),
+                            None => true,
+                        })
+                        .collect();
+                    let key = |p0: usize| -> &Vec<f64> {
+                        if p0 < committed {
+                            &ctxk[il][kv][p0]
+                        } else {
+                            &nk[p0 - committed][kv]
+                        }
+                    };
+                    let val = |p0: usize| -> &Vec<f64> {
+                        if p0 < committed {
+                            &ctxv[il][kv][p0]
+                        } else {
+                            &nv[p0 - committed][kv]
+                        }
+                    };
+                    let scores: Vec<f64> = visible
+                        .iter()
+                        .map(|&p0| {
+                            let s: f64 = qh[b][h].iter().zip(key(p0)).map(|(a, c)| a * c).sum();
+                            s * scale
+                        })
+                        .collect();
                     // Softmax.
                     let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                     let exps: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
                     let sum: f64 = exps.iter().sum();
                     let mut ov = vec![0.0f64; hd];
                     for (idx, w) in exps.iter().map(|e| e / sum).enumerate() {
-                        let vv = if idx < committed {
-                            &ctxv[il][kv][idx]
-                        } else {
-                            &nv[idx - committed][kv]
-                        };
+                        let vv = val(visible[idx]);
                         for d in 0..hd {
                             ov[d] += w * vv[d];
                         }
                     }
-                    let gate = gates[b][h];
-                    for d in 0..hd {
-                        attn_cat[h * hd + d] = ov[d] * gate;
-                    }
+                    attn_cat[h * hd..(h + 1) * hd].copy_from_slice(&ov);
                 }
                 let cur = matvec(&layer.wo, &attn_cat, n_embd, n_head * hd);
                 let ffn_inp: Vec<f64> = cur.iter().zip(&hs[b]).map(|(a, b)| a + b).collect();
@@ -1582,70 +1783,371 @@ mod tests {
 
     // --- tests ----------------------------------------------------------------
 
-    /// Test 1: load the real drafter GGUF and check the parsed config plus the
-    /// on-disk tensor shapes/dtypes (BF16 matmuls, F32 norms). Reads the 2.2GB
-    /// file only — no target model process, safe to run.
+    /// The geometry one shipped sidecar must parse to. Both are checked by
+    /// `real_file_load_and_shapes`, which is the gate on the whole adaptation:
+    /// these numbers come from the GGUF headers of the ggml-org files.
+    struct SidecarSpec {
+        model: crate::hub::Model,
+        n_layer: usize,
+        n_embd: usize,
+        n_ff: usize,
+        target_layers: Vec<usize>,
+        tap_layers: Vec<usize>,
+        mask_token_id: u32,
+        sliding_window: usize,
+        /// The checkpoint this sidecar belongs to: layers and hidden size, for
+        /// `check_against_target`. Vocab is 248320 on both.
+        target_layers_count: usize,
+        target_hidden: usize,
+    }
+
+    fn sidecar_specs() -> Vec<SidecarSpec> {
+        vec![
+            SidecarSpec {
+                model: crate::hub::Model::Qwen27B,
+                n_layer: 5,
+                n_embd: 5120,
+                n_ff: 17408,
+                target_layers: vec![2, 17, 32, 47, 62],
+                tap_layers: vec![1, 16, 31, 46, 61],
+                mask_token_id: 248070,
+                sliding_window: 2048,
+                target_layers_count: 64,
+                target_hidden: 5120,
+            },
+            SidecarSpec {
+                model: crate::hub::Model::Qwen35BA3B,
+                n_layer: 6,
+                n_embd: 2048,
+                n_ff: 6144,
+                target_layers: vec![2, 7, 12, 17, 23, 28, 33, 38],
+                tap_layers: vec![1, 6, 11, 16, 22, 27, 32, 37],
+                mask_token_id: 248077,
+                sliding_window: 4096,
+                target_layers_count: 40,
+                target_hidden: 2048,
+            },
+        ]
+    }
+
+    /// A minimal in-memory `dflash` metadata map, with the window keys left to
+    /// the caller so each parsing case can vary them.
+    fn synth_metadata(n_layer: usize) -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        let mut put = |k: &str, v: Value| {
+            m.insert(k.to_string(), v);
+        };
+        put("general.architecture", Value::String("dflash".into()));
+        put("dflash.block_count", Value::U32(n_layer as u32));
+        put("dflash.embedding_length", Value::U32(2048));
+        put("dflash.feed_forward_length", Value::U32(6144));
+        put("dflash.attention.head_count", Value::U32(32));
+        put("dflash.attention.head_count_kv", Value::U32(8));
+        put("dflash.attention.key_length", Value::U32(128));
+        put("dflash.attention.layer_norm_rms_epsilon", Value::F32(1e-6));
+        put("dflash.rope.freq_base", Value::F32(1e7));
+        put("dflash.block_size", Value::U32(16));
+        put("dflash.context_length", Value::U32(262144));
+        put(
+            "dflash.target_layers",
+            Value::Array(vec![Value::I32(2), Value::I32(7)]),
+        );
+        put("tokenizer.ggml.mask_token_id", Value::U32(248077));
+        m
+    }
+
+    fn synth_content(metadata: HashMap<String, Value>) -> Content {
+        Content {
+            magic: candle_core::quantized::gguf_file::VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+        }
+    }
+
+    /// Window parsing: absent keys mean full attention everywhere, a declared
+    /// window makes the pattern mandatory, and a pattern that does not cover
+    /// every layer is refused rather than silently padded.
+    #[test]
+    fn the_sliding_window_pattern_is_read_per_layer_and_checked() {
+        // No window keys at all: every layer is full.
+        let cfg = DflashConfig::from_gguf(&synth_content(synth_metadata(4))).unwrap();
+        assert_eq!(cfg.sliding_window, None);
+        assert_eq!(cfg.swa_layers, vec![false; 4]);
+        assert_eq!(cfg.layer_window(0), None);
+
+        // Declaring a window without the pattern is a hard error.
+        let mut meta = synth_metadata(4);
+        meta.insert(
+            "dflash.attention.sliding_window".to_string(),
+            Value::U32(2048),
+        );
+        let err = DflashConfig::from_gguf(&synth_content(meta.clone())).unwrap_err();
+        assert!(err.to_string().contains("sliding_window_pattern"), "{err}");
+
+        // A pattern shorter than the layer count names the mismatch.
+        meta.insert(
+            "dflash.attention.sliding_window_pattern".to_string(),
+            Value::Array(vec![Value::Bool(true), Value::Bool(false)]),
+        );
+        let err = DflashConfig::from_gguf(&synth_content(meta.clone())).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains('2') && text.contains('4'), "{text}");
+
+        // The shipped shape: windowed everywhere but the last layer.
+        meta.insert(
+            "dflash.attention.sliding_window_pattern".to_string(),
+            Value::Array(vec![
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(false),
+            ]),
+        );
+        let cfg = DflashConfig::from_gguf(&synth_content(meta.clone())).unwrap();
+        assert_eq!(cfg.sliding_window, Some(2048));
+        assert_eq!(cfg.swa_layers, vec![true, true, true, false]);
+        assert_eq!(cfg.layer_window(2), Some(2048));
+        assert_eq!(cfg.layer_window(3), None);
+
+        // A SCALAR pattern repeats across every layer, the second form
+        // llama.cpp's `get_key_or_arr` takes (llama-model-loader.cpp:444-482).
+        // Neither shipped sidecar uses it, but a uniformly-windowed drafter is
+        // what a converter would emit it for, and llama.cpp would load that file.
+        meta.insert(
+            "dflash.attention.sliding_window_pattern".to_string(),
+            Value::Bool(true),
+        );
+        let cfg = DflashConfig::from_gguf(&synth_content(meta.clone())).unwrap();
+        assert_eq!(cfg.swa_layers, vec![true; 4]);
+
+        meta.insert(
+            "dflash.attention.sliding_window_pattern".to_string(),
+            Value::Bool(false),
+        );
+        let cfg = DflashConfig::from_gguf(&synth_content(meta.clone())).unwrap();
+        assert_eq!(cfg.swa_layers, vec![false; 4]);
+        // The width is still declared, but no layer uses it.
+        assert_eq!(cfg.sliding_window, Some(2048));
+        assert_eq!(cfg.layer_window(0), None);
+
+        // A declared width of 0 means "no window" whatever the pattern says, so
+        // nothing downstream has to special-case a zero-width window.
+        meta.insert("dflash.attention.sliding_window".to_string(), Value::U32(0));
+        let cfg = DflashConfig::from_gguf(&synth_content(meta)).unwrap();
+        assert_eq!(cfg.sliding_window, None);
+        assert_eq!(cfg.swa_layers, vec![false; 4]);
+    }
+
+    /// The geometry of the checkpoint `sidecar_35b_config` belongs to.
+    const T35_HIDDEN: usize = 2048;
+    const T35_LAYERS: usize = 40;
+    const T35_VOCAB: usize = 248320;
+
+    /// The 35B-A3B sidecar's metadata, for the checks to vary one field of.
+    fn sidecar_35b_config() -> DflashConfig {
+        DflashConfig {
+            n_layer: 6,
+            n_embd: T35_HIDDEN,
+            n_head: 32,
+            n_head_kv: 8,
+            head_dim: 128,
+            n_ff: 6144,
+            rms_eps: 1e-6,
+            rope_theta: 10_000_000.0,
+            sliding_window: Some(4096),
+            swa_layers: vec![true, true, true, true, true, false],
+            block_size: 16,
+            target_layers: vec![2, 7, 12, 17, 23, 28, 33, 38],
+            mask_token_id: 248077,
+            context_length: 262144,
+        }
+    }
+
+    /// Everything a drafter can be rejected for before a weight is read, in one
+    /// place — the shared check both the CLI's `attach_drafter` and serve's
+    /// startup preflight run.
+    #[test]
+    fn a_drafter_is_checked_against_the_target_it_will_serve() {
+        let check = |cfg: &DflashConfig, hidden, layers, vocab| {
+            cfg.check_against_target(hidden, layers, vocab)
+        };
+        let ok = |cfg: &DflashConfig| check(cfg, T35_HIDDEN, T35_LAYERS, T35_VOCAB);
+        assert!(ok(&sidecar_35b_config()).is_ok());
+
+        // --- internal consistency ------------------------------------------
+        // Zero KV heads is the one that would otherwise panic: `build` computes
+        // the head ratio with `%` before its `ensure!` can report anything.
+        let err = ok(&DflashConfig {
+            n_head_kv: 0,
+            ..sidecar_35b_config()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("head_count_kv"), "{err}");
+
+        let err = ok(&DflashConfig {
+            n_head: 0,
+            ..sidecar_35b_config()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("head_count"), "{err}");
+
+        // Heads that do not divide into the KV heads leave no whole number of
+        // query heads per KV head.
+        let err = ok(&DflashConfig {
+            n_head: 30,
+            ..sidecar_35b_config()
+        })
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("30") && text.contains('8'), "{text}");
+
+        // Rope splits the head dim in half, so an odd one has no pairing.
+        assert!(
+            ok(&DflashConfig {
+                head_dim: 127,
+                ..sidecar_35b_config()
+            })
+            .is_err()
+        );
+
+        // A noise block of one position is the anchor alone — it can never carry
+        // a draft token, so such a drafter would run at a permanent loss.
+        let err = ok(&DflashConfig {
+            block_size: 1,
+            ..sidecar_35b_config()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("anchor"), "{err}");
+        assert!(
+            ok(&DflashConfig {
+                block_size: 2,
+                ..sidecar_35b_config()
+            })
+            .is_ok()
+        );
+
+        // --- cross-checks against the target -------------------------------
+        // The pairing nothing else catches: this drafter's taps top out at 37,
+        // inside the 27B's 64 layers, so only the hidden size tells them apart.
+        assert_eq!(
+            sidecar_35b_config().spec_tap_layers().unwrap(),
+            vec![1, 6, 11, 16, 22, 27, 32, 37]
+        );
+        let err = check(&sidecar_35b_config(), 5120, 64, T35_VOCAB).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("2048") && text.contains("5120"), "{text}");
+
+        // A tap past the target's last layer, reported by the first offender.
+        // `set_spec_taps` asserts the same bound, i.e. panics, so this check is
+        // what keeps a configuration mistake from reaching it.
+        let err = check(&sidecar_35b_config(), T35_HIDDEN, 20, T35_VOCAB).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("22") && text.contains("20"), "{text}");
+        // A tap exactly at the layer count is one past the last index.
+        assert!(check(&sidecar_35b_config(), T35_HIDDEN, 38, T35_VOCAB).is_ok());
+        assert!(check(&sidecar_35b_config(), T35_HIDDEN, 37, T35_VOCAB).is_err());
+
+        // The mask token is embedded through the target's table every round, so
+        // an id past its vocabulary is an indexing failure at the first one.
+        let err = check(&sidecar_35b_config(), T35_HIDDEN, T35_LAYERS, 248_077).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("248077"), "{text}");
+        assert!(check(&sidecar_35b_config(), T35_HIDDEN, T35_LAYERS, 248_078).is_ok());
+    }
+
+    /// Test 1: load each real drafter GGUF and check the parsed config plus the
+    /// on-disk tensor shapes/dtypes (BF16 matmuls, F32 norms). Reads the sidecar
+    /// files only — no target model process, safe to run.
     #[test]
     fn real_file_load_and_shapes() {
-        let Some(path) = drafter_path() else {
-            eprintln!("skipping real_file_load_and_shapes: official drafter not in the HF cache");
-            return;
-        };
         let dev = Device::Cpu;
-        let gguf = crate::gguf::open(&path, &dev).unwrap();
+        for spec in sidecar_specs() {
+            let Some(path) = crate::hub::cached_drafter(spec.model) else {
+                eprintln!(
+                    "skipping real_file_load_and_shapes for {:?}: drafter not in the HF cache",
+                    spec.model
+                );
+                continue;
+            };
+            let gguf = crate::gguf::open(&path, &dev).unwrap();
 
-        let cfg = DflashConfig::from_gguf(&gguf.content).unwrap();
-        assert_eq!(cfg.n_layer, 6);
-        assert_eq!(cfg.n_embd, 3072);
-        assert_eq!(cfg.n_head, 72);
-        assert_eq!(cfg.n_head_kv, 8);
-        assert_eq!(cfg.head_dim, 128);
-        assert_eq!(cfg.n_ff, 12288);
-        assert_eq!(cfg.block_size, 16);
-        assert_eq!(cfg.target_layers, vec![2, 11, 20, 30, 39, 48]);
-        // Layer-input ids translate to post-FFN l_out capture indices (t - 1).
-        assert_eq!(cfg.spec_tap_layers().unwrap(), vec![1, 10, 19, 29, 38, 47]);
-        assert_eq!(cfg.mask_token_id, 12);
-        assert!((cfg.rms_eps - 1e-6).abs() < 1e-12);
-        assert_eq!(cfg.rope_theta, 500_000.0);
+            let cfg = DflashConfig::from_gguf(&gguf.content).unwrap();
+            assert_eq!(cfg.n_layer, spec.n_layer);
+            assert_eq!(cfg.n_embd, spec.n_embd);
+            assert_eq!(cfg.n_head, 32);
+            assert_eq!(cfg.n_head_kv, 8);
+            assert_eq!(cfg.head_dim, 128);
+            assert_eq!(cfg.n_ff, spec.n_ff);
+            assert_eq!(cfg.block_size, 16);
+            assert_eq!(cfg.context_length, 262144);
+            assert_eq!(cfg.target_layers, spec.target_layers);
+            // Layer-input ids translate to post-FFN l_out capture indices (t - 1).
+            assert_eq!(cfg.spec_tap_layers().unwrap(), spec.tap_layers);
+            assert_eq!(cfg.mask_token_id, spec.mask_token_id);
+            assert!((cfg.rms_eps - 1e-6).abs() < 1e-12);
+            assert_eq!(cfg.rope_theta, 10_000_000.0);
+            // Every layer is windowed but the last, which runs full attention.
+            assert_eq!(cfg.sliding_window, Some(spec.sliding_window));
+            let want_pattern: Vec<bool> =
+                (0..spec.n_layer).map(|il| il + 1 < spec.n_layer).collect();
+            assert_eq!(cfg.swa_layers, want_pattern);
+            assert_eq!(cfg.layer_window(0), Some(spec.sliding_window));
+            assert_eq!(cfg.layer_window(spec.n_layer - 1), None);
 
-        // On-disk tensor shapes and dtypes.
-        let info = |n: &str| {
-            gguf.content
-                .tensor_infos
-                .get(n)
-                .unwrap_or_else(|| panic!("missing {n}"))
-        };
-        let shape = |n: &str| info(n).shape.dims().to_vec();
-        let dtype = |n: &str| info(n).ggml_dtype;
+            // On-disk tensor shapes and dtypes.
+            let info = |n: &str| {
+                gguf.content
+                    .tensor_infos
+                    .get(n)
+                    .unwrap_or_else(|| panic!("missing {n}"))
+            };
+            let shape = |n: &str| info(n).shape.dims().to_vec();
+            let dtype = |n: &str| info(n).ggml_dtype;
+            let (n_embd, n_ff) = (spec.n_embd, spec.n_ff);
 
-        assert_eq!(shape("fc.weight"), vec![3072, 18432]);
-        assert_eq!(dtype("fc.weight"), GgmlDType::BF16);
-        assert_eq!(shape("enc.aux_norm.weight"), vec![6, 3072]);
-        assert_eq!(dtype("enc.aux_norm.weight"), GgmlDType::F32);
-        assert_eq!(dtype("enc.output_norm.weight"), GgmlDType::F32);
-        assert_eq!(dtype("output_norm.weight"), GgmlDType::F32);
-        for il in 0..cfg.n_layer {
-            let p = |n: &str| format!("blk.{il}.{n}.weight");
-            assert_eq!(shape(&p("attn_q")), vec![9216, 3072]);
-            assert_eq!(shape(&p("attn_k")), vec![1024, 3072]);
-            assert_eq!(shape(&p("attn_v")), vec![1024, 3072]);
-            assert_eq!(shape(&p("attn_output")), vec![3072, 9216]);
-            assert_eq!(shape(&p("attn_gate")), vec![72, 3072]);
-            assert_eq!(shape(&p("attn_q_norm")), vec![128]);
-            assert_eq!(shape(&p("attn_k_norm")), vec![128]);
-            assert_eq!(shape(&p("ffn_gate")), vec![12288, 3072]);
-            assert_eq!(shape(&p("ffn_up")), vec![12288, 3072]);
-            assert_eq!(shape(&p("ffn_down")), vec![3072, 12288]);
-            assert_eq!(dtype(&p("attn_q")), GgmlDType::BF16);
-            assert_eq!(dtype(&p("attn_q_norm")), GgmlDType::F32);
-            assert_eq!(dtype(&p("attn_norm")), GgmlDType::F32);
+            assert_eq!(
+                shape("fc.weight"),
+                vec![n_embd, spec.target_layers.len() * n_embd]
+            );
+            assert_eq!(dtype("fc.weight"), GgmlDType::BF16);
+            assert_eq!(dtype("enc.output_norm.weight"), GgmlDType::F32);
+            assert_eq!(dtype("output_norm.weight"), GgmlDType::F32);
+            // The encoder is fc + one norm: no per-tap norm ships.
+            assert!(
+                !gguf
+                    .content
+                    .tensor_infos
+                    .contains_key("enc.aux_norm.weight")
+            );
+            for il in 0..cfg.n_layer {
+                let p = |n: &str| format!("blk.{il}.{n}.weight");
+                assert_eq!(shape(&p("attn_q")), vec![4096, n_embd]);
+                assert_eq!(shape(&p("attn_k")), vec![1024, n_embd]);
+                assert_eq!(shape(&p("attn_v")), vec![1024, n_embd]);
+                assert_eq!(shape(&p("attn_output")), vec![n_embd, 4096]);
+                assert_eq!(shape(&p("attn_q_norm")), vec![128]);
+                assert_eq!(shape(&p("attn_k_norm")), vec![128]);
+                assert_eq!(shape(&p("ffn_gate")), vec![n_ff, n_embd]);
+                assert_eq!(shape(&p("ffn_up")), vec![n_ff, n_embd]);
+                assert_eq!(shape(&p("ffn_down")), vec![n_embd, n_ff]);
+                assert_eq!(dtype(&p("attn_q")), GgmlDType::BF16);
+                assert_eq!(dtype(&p("attn_q_norm")), GgmlDType::F32);
+                assert_eq!(dtype(&p("attn_norm")), GgmlDType::F32);
+                // No attention output gate on this arch.
+                assert!(!gguf.content.tensor_infos.contains_key(&p("attn_gate")));
+            }
+
+            // The shipped pairing passes the check both attach paths run, and
+            // the vocabulary is the padded 248320 of both checkpoints.
+            cfg.check_against_target(spec.target_hidden, spec.target_layers_count, 248_320)
+                .unwrap();
+
+            // Full load materializes every weight dense f32 and builds the caches.
+            let drafter = DflashDrafter::load(&gguf, &dev, 64).unwrap();
+            assert_eq!(drafter.config().n_layer, spec.n_layer);
+            assert_eq!(drafter.committed_len(), 0);
         }
-
-        // Full load materializes every weight dense f32 and builds the caches.
-        let drafter = DflashDrafter::load(&gguf, &dev, 64).unwrap();
-        assert_eq!(drafter.config().n_layer, 6);
-        assert_eq!(drafter.committed_len(), 0);
     }
 
     /// Test 2: the encoder matches a hand-rolled scalar re-implementation.
@@ -1665,8 +2167,7 @@ mod tests {
         let drafter = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F32);
         let got = to_vec(&drafter.encode(&taps).unwrap());
 
-        // Scalar reference.
-        let aux_norm = host(&m, "enc.aux_norm");
+        // Scalar reference: the taps enter raw, concatenated tap-major.
         let enc_out = host(&m, "enc.output_norm");
         let fc = host(&m, "fc");
         let taps_h: Vec<Vec<f64>> = taps
@@ -1676,14 +2177,10 @@ mod tests {
         let eps = cfg.rms_eps;
         let mut want = Vec::new();
         for s in 0..seq {
-            // Per-aux: rms-norm (no weight) over n_embd, then * aux_norm[aux].
             let mut concat = vec![0.0f64; n_aux * n_embd];
             for a in 0..n_aux {
-                let feat: Vec<f64> = (0..n_embd).map(|e| taps_h[a][s * n_embd + e]).collect();
-                let ms: f64 = feat.iter().map(|v| v * v).sum::<f64>() / n_embd as f64;
-                let sc = 1.0 / (ms + eps).sqrt();
                 for e in 0..n_embd {
-                    concat[a * n_embd + e] = feat[e] * sc * aux_norm[a * n_embd + e];
+                    concat[a * n_embd + e] = taps_h[a][s * n_embd + e];
                 }
             }
             let fused = matvec(&fc, &concat, n_embd, n_aux * n_embd);
@@ -1739,6 +2236,192 @@ mod tests {
 
         let rel = rel_l2(&got, &want);
         assert!(rel < 1e-4, "draft_forward rel_l2 {rel} too high");
+    }
+
+    /// The windowed layers drop keys older than `window` positions while the
+    /// final full layer keeps all of them, matching the scalar reference that
+    /// filters key positions by `p1 - p0 < window`. The context here is deeper
+    /// than the window, so the narrowed key view starts past position 0 and the
+    /// per-query mask has work to do — the two things a full-attention drafter
+    /// would get wrong.
+    #[test]
+    fn sliding_window_matches_scalar() {
+        let dev = Device::Cpu;
+        let (n_embd, hd) = (8usize, 4usize);
+        let cfg = with_window(tiny_cfg(2, 2, 1, hd, n_embd, 16), 5);
+        assert_eq!(cfg.layer_window(0), Some(5));
+        assert_eq!(cfg.layer_window(1), None);
+        let m = synth_weights(&cfg, &dev);
+        let mut drafter = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F32);
+
+        let committed = 12usize;
+        let n_block = 3usize;
+        let scale_in = 0.25f32;
+        let fused = Tensor::from_vec(seeded(committed * n_embd, 31), (committed, n_embd), &dev)
+            .unwrap()
+            .affine(scale_in as f64, 0.0)
+            .unwrap();
+        let noise = Tensor::from_vec(seeded(n_block * n_embd, 32), (n_block, n_embd), &dev)
+            .unwrap()
+            .affine(scale_in as f64, 0.0)
+            .unwrap();
+
+        drafter.inject(&fused, 0).unwrap();
+        let got = to_vec(&drafter.draft_forward(&noise, committed).unwrap());
+
+        let to_rows = |t: &Tensor, rows: usize| -> Vec<Vec<f64>> {
+            let flat = to_vec(t);
+            (0..rows)
+                .map(|r| (0..n_embd).map(|c| flat[r * n_embd + c] as f64).collect())
+                .collect()
+        };
+        let want_rows = naive_draft(
+            &cfg,
+            &m,
+            &to_rows(&fused, committed),
+            &to_rows(&noise, n_block),
+        );
+        let want: Vec<f32> = want_rows.iter().flatten().map(|x| *x as f32).collect();
+        let rel = rel_l2(&got, &want);
+        assert!(rel < 1e-4, "windowed draft_forward rel_l2 {rel} too high");
+
+        // And the window is not a no-op: the same weights with full attention
+        // everywhere produce a different block.
+        let full_cfg = tiny_cfg(2, 2, 1, hd, n_embd, 16);
+        let mut full = drafter_from_map(full_cfg, &m, &dev, 32, WeightDtype::F32);
+        full.inject(&fused, 0).unwrap();
+        let full_out = to_vec(&full.draft_forward(&noise, committed).unwrap());
+        assert!(
+            rel_l2(&full_out, &want) > 1e-3,
+            "full attention produced the windowed result — the window was ignored"
+        );
+    }
+
+    /// The windowed path ON METAL, against the same scalar reference — the
+    /// scalar test above runs on the CPU device and so never exercises what the
+    /// window actually does to the tensors: `narrow` at a NONZERO offset into the
+    /// cache planes, producing strided views that candle's Metal
+    /// `broadcast_matmul` has to read (and contiguise for the GQA broadcast)
+    /// rather than the offset-0 views every other path hands it.
+    ///
+    /// Three positions of the block relative to the window are covered, because
+    /// they take different branches of `attention`/`window_mask`: a context
+    /// shorter than the window (no narrow, no mask), one straddling it (offset 0
+    /// but a live per-query mask), and one well past it (nonzero offset AND a
+    /// mask). The f16 weight path is the shipped one, so it is what runs.
+    #[test]
+    fn windowed_attention_on_metal_matches_scalar() {
+        let Ok(dev) = crate::gguf::metal_device() else {
+            eprintln!("skipping windowed_attention_on_metal_matches_scalar: no Metal device");
+            return;
+        };
+        // Shapes satisfy the f16 kernels' k % 32 == 0 / n_out % 4 == 0.
+        let (n_embd, hd, n_head, n_kv, n_ff) = (64usize, 32usize, 4usize, 2usize, 128usize);
+        let window = 12usize;
+        let cfg = with_window(tiny_cfg(2, n_head, n_kv, hd, n_embd, n_ff), window);
+        let m = synth_weights(&cfg, &dev);
+        let n_block = 5usize;
+
+        for committed in [6usize, 10, 30] {
+            let mut drafter = drafter_from_map(cfg.clone(), &m, &dev, 64, WeightDtype::F16);
+            let fused = Tensor::from_vec(
+                seeded(committed * n_embd, 51 + committed as u64),
+                (committed, n_embd),
+                &dev,
+            )
+            .unwrap()
+            .affine(0.25, 0.0)
+            .unwrap();
+            let noise = Tensor::from_vec(seeded(n_block * n_embd, 52), (n_block, n_embd), &dev)
+                .unwrap()
+                .affine(0.25, 0.0)
+                .unwrap();
+
+            // The three regimes this loop is here to cover.
+            let lo = committed.saturating_sub(window - 1);
+            let masked = committed + n_block > window;
+            match committed {
+                6 => assert!(lo == 0 && !masked, "expected the wholly-inside-window case"),
+                10 => assert!(lo == 0 && masked, "expected the straddling case"),
+                _ => assert!(lo > 0 && masked, "expected the offset-view case"),
+            }
+
+            drafter.inject(&fused, 0).unwrap();
+            let got = to_vec(&drafter.draft_forward(&noise, committed).unwrap());
+            assert!(
+                got.iter().all(|v| v.is_finite()),
+                "committed {committed}: non-finite output"
+            );
+
+            let to_rows = |t: &Tensor, rows: usize| -> Vec<Vec<f64>> {
+                let flat = to_vec(t);
+                (0..rows)
+                    .map(|r| (0..n_embd).map(|c| flat[r * n_embd + c] as f64).collect())
+                    .collect()
+            };
+            let want_rows = naive_draft(
+                &cfg,
+                &m,
+                &to_rows(&fused, committed),
+                &to_rows(&noise, n_block),
+            );
+            let want: Vec<f32> = want_rows.iter().flatten().map(|x| *x as f32).collect();
+            // f16 weight rounding is the only departure from the full-precision
+            // reference, bounded at the same per-matmul precision class as the
+            // other f16 tests (docs/parity.md §3b).
+            let rel = rel_l2(&got, &want);
+            assert!(
+                rel < 5e-4,
+                "committed {committed}: windowed Metal rel_l2 {rel} too high"
+            );
+        }
+    }
+
+    /// The noise block is denoised in one non-causal forward, so a later block
+    /// position informs an earlier one. Perturbing only the LAST noise row must
+    /// therefore move the FIRST output row; under causal masking within the
+    /// block it could not.
+    #[test]
+    fn the_noise_block_attends_to_itself_in_both_directions() {
+        let dev = Device::Cpu;
+        let (n_embd, hd) = (8usize, 4usize);
+        let cfg = tiny_cfg(2, 2, 1, hd, n_embd, 16);
+        let m = synth_weights(&cfg, &dev);
+
+        let (committed, n_block) = (4usize, 3usize);
+        let fused = Tensor::from_vec(seeded(committed * n_embd, 41), (committed, n_embd), &dev)
+            .unwrap()
+            .affine(0.25, 0.0)
+            .unwrap();
+        let mut noise = seeded(n_block * n_embd, 42)
+            .iter()
+            .map(|x| x * 0.25)
+            .collect::<Vec<f32>>();
+
+        let run = |noise: &[f32]| {
+            let mut d = drafter_from_map(cfg.clone(), &m, &dev, 32, WeightDtype::F32);
+            let t = Tensor::from_vec(noise.to_vec(), (n_block, n_embd), &dev).unwrap();
+            d.inject(&fused, 0).unwrap();
+            to_vec(&d.draft_forward(&t, committed).unwrap())
+        };
+
+        let base = run(&noise);
+        for v in noise.iter_mut().skip((n_block - 1) * n_embd) {
+            *v += 0.5;
+        }
+        let perturbed = run(&noise);
+
+        let first_row_delta: f32 = base
+            .iter()
+            .zip(&perturbed)
+            .take(n_embd)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            first_row_delta > 1e-3,
+            "the first block row ignored a change to the last one ({first_row_delta}), so the \
+             block was masked causally"
+        );
     }
 
     /// Companion to Test 3 on the SHIPPED f16 weight path (Metal only): the same
@@ -1849,63 +2532,74 @@ mod tests {
         assert!(rel < 4e-3, "draft_forward bf16 rel_l2 {rel} too high");
     }
 
-    /// Loads the REAL drafter GGUF on Metal and checks the mmap-alias default:
+    /// Loads each REAL drafter GGUF on Metal and checks the mmap-alias default:
     /// every matmul plane comes out a BF16 alias (no materialization), the
     /// mapping Arc is retained, and an inject + draft_forward round produces
-    /// finite hidden states through the bf16 kernels at production shapes.
-    /// Skips cleanly without the file or a Metal device.
+    /// finite hidden states through the bf16 kernels at production shapes. The
+    /// injected context runs past each sidecar's own window, so the windowed
+    /// layers take the narrow-plus-mask path and a broken window shows up as a
+    /// NaN row rather than only in the synthetic tests. Skips cleanly without
+    /// the files or a Metal device.
     #[test]
     fn real_file_bf16_alias_load_and_forward() {
-        let Some(path) = drafter_path() else {
-            eprintln!(
-                "skipping real_file_bf16_alias_load_and_forward: official drafter not in the HF cache"
-            );
-            return;
-        };
         let Ok(dev) = crate::gguf::metal_device() else {
             eprintln!("skipping real_file_bf16_alias_load_and_forward: no Metal device");
             return;
         };
-        let gguf = crate::gguf::open(&path, &dev).unwrap();
-        let drafter_load = std::time::Instant::now();
-        let mut drafter = DflashDrafter::load(&gguf, &dev, 64).unwrap();
-        eprintln!(
-            "real drafter alias load: {:.3}s",
-            drafter_load.elapsed().as_secs_f64()
-        );
+        for spec in sidecar_specs() {
+            let Some(path) = crate::hub::cached_drafter(spec.model) else {
+                eprintln!(
+                    "skipping real_file_bf16_alias_load_and_forward for {:?}: drafter not in the \
+                     HF cache",
+                    spec.model
+                );
+                continue;
+            };
+            let gguf = crate::gguf::open(&path, &dev).unwrap();
+            let drafter_load = std::time::Instant::now();
+            // Past this sidecar's own window, so query 0's floor is above 0 and
+            // the later block queries need the per-query mask.
+            let ctx = spec.sliding_window + 52;
+            let mut drafter = DflashDrafter::load(&gguf, &dev, ctx + 16).unwrap();
+            eprintln!(
+                "{:?} drafter alias load: {:.3}s",
+                spec.model,
+                drafter_load.elapsed().as_secs_f64()
+            );
 
-        assert!(drafter._weights_mmap.is_some(), "expected the alias path");
-        assert_eq!(drafter.fc.dtype(), DType::BF16);
-        for l in &drafter.layers {
-            for w in [
-                &l.wq,
-                &l.wk,
-                &l.wv,
-                &l.wo,
-                &l.gate,
-                &l.ffn_gate,
-                &l.ffn_up,
-                &l.ffn_down,
-            ] {
-                assert_eq!(w.dtype(), DType::BF16);
+            assert!(drafter._weights_mmap.is_some(), "expected the alias path");
+            assert_eq!(drafter.fc.dtype(), DType::BF16);
+            for l in &drafter.layers {
+                for w in [
+                    &l.wq,
+                    &l.wk,
+                    &l.wv,
+                    &l.wo,
+                    &l.ffn_gate,
+                    &l.ffn_up,
+                    &l.ffn_down,
+                ] {
+                    assert_eq!(w.dtype(), DType::BF16);
+                }
             }
-        }
 
-        let n_embd = drafter.cfg.n_embd;
-        let fused = Tensor::from_vec(seeded(4 * n_embd, 21), (4, n_embd), &dev)
-            .unwrap()
-            .affine(0.02, 0.0)
-            .unwrap();
-        let noise = Tensor::from_vec(seeded(16 * n_embd, 22), (16, n_embd), &dev)
-            .unwrap()
-            .affine(0.02, 0.0)
-            .unwrap();
-        drafter.inject(&fused, 0).unwrap();
-        let out = to_vec(&drafter.draft_forward(&noise, 4).unwrap());
-        assert!(
-            out.iter().all(|v| v.is_finite()),
-            "draft_forward produced non-finite values on the alias path"
-        );
+            let n_embd = drafter.cfg.n_embd;
+            let fused = Tensor::from_vec(seeded(ctx * n_embd, 21), (ctx, n_embd), &dev)
+                .unwrap()
+                .affine(0.02, 0.0)
+                .unwrap();
+            let noise = Tensor::from_vec(seeded(16 * n_embd, 22), (16, n_embd), &dev)
+                .unwrap()
+                .affine(0.02, 0.0)
+                .unwrap();
+            drafter.inject(&fused, 0).unwrap();
+            let out = to_vec(&drafter.draft_forward(&noise, ctx).unwrap());
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "draft_forward produced non-finite values on the alias path for {:?}",
+                spec.model
+            );
+        }
     }
 
     /// Test 4: cache hygiene — inject/draft/truncate roundtrips leave the cache

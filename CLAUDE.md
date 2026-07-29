@@ -164,21 +164,40 @@ kernel-vs-reference invariants and is the fast pre-check.
 
 ## Perf state
 
-As of 2026-07-29 (Automatic power mode, interleaved protocol, --no-draft; full
-history in log.md): 35B-A3B decode 103.1 tok/s, prefill ~2550@925 / ~2320@4k;
-27B decode 19.6, prefill ~270@925 / ~236@4k (prefill DEGRADES with length — the
-sequential DeltaNet reference scan, P8b owns it). Load 2.8-3.0s, 19.2 GB
-resident at max_ctx 8192; cold first run adds ~9s of Metal pipeline compilation.
-Head-to-head vs llama.cpp e9fa078 -fa 1, same GGUFs, same machine (log.md
-2026-07-29): xwen wins decode on both models (1.05x / 1.02x), 35B prefill near
-parity at steady state, 27B prefill 1.8-2.1x BEHIND — llama.cpp prefills the
-DeltaNet layers chunked (chunk=64), xwen still runs the sequential scan, and
-the 27B has 48 such layers at inner 6144 vs the 35B's 30 at 4096. Bandwidth
-framing: 27B decode is at ~57% of the 614 GB/s peak (near the wall, ceiling
-~23-30 tok/s); 35B decode at ~32% (still launch-bound, ceiling ~225-290);
-prefill is compute-bound on both (~15-16 achieved TFLOP/s each). llama.cpp's
-prefill thermal-boosts harder than xwen's (-17% vs -5% settling) — never read
-a first-reps prefill ratio as steady state.
+As of 2026-07-29 (`lowpowermode 0` — NOT low-power mode; this machine emits no
+`powermode` key, so high-power mode is never positively confirmable and must not
+be claimed. Interleaved protocol, --no-draft; full history in log.md): 35B-A3B
+decode 103.1 tok/s, prefill ~1900-2550@4k; 27B decode 22-25, prefill 702@925 /
+445@4k. Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run adds ~9s
+of Metal pipeline compilation.
+
+**The 27B prefill gap is CLOSED (P8c, same day).** It was never the DeltaNet
+scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill
+wall) running candle's `kernel_mul_mm_q4_K_f32` at ~12-13 TFLOP/s where the
+Metal-4 cooperative-tensor gemm does 28-36. `src/ops/dense_mm.metal` (Q4_K
+source, in-kernel tile dequant, `seq > 32`) made 27B prefill 2.2-2.7x faster:
+270 → 702 @925, 236 → 445 @4k, against llama.cpp's 486 / 502. Prefill no longer
+degrades with length for FFN reasons, though a +350-560 µs/token residual
+outside all measured stages still does (TODO.md — and it is most of why 4k fell
+short of the profile's 496 upper bound while 925 met it). The kernel is
+knowingly less accurate than the `QMatMul` chain (~4.1e-4 vs ~1.9e-4 rel_l2 from
+the f32 oracle — matmul2d's reduced-precision path, the same trade the attention
+prefill gemm made); it is pinned off on both sides of the strict parity tier and
+graded by mm/decode/ppl.
+
+Benching rules this machine has already enforced the hard way. Peak memory
+bandwidth here has NEVER been measured — do not argue "far below peak" from the
+614 GB/s figure; compare bytes-moved against time between two arms instead (the
+Q4_K FFN gemm reads 3.6x fewer weight bytes than the f16 one and takes 2.4x
+longer, which settles bandwidth-vs-kernel without a peak). Use AMORTIZED rates
+(BATCH dispatches per sync, outputs held alive), never per-dispatch: a budget
+built from per-dispatch numbers sums to 127% of wall. Keep the duty cycle low —
+the same shape measured 23% slower in a 36 s run than in a 9 s one, with no
+thermal flag anywhere. llama.cpp's prefill thermal-boosts harder than xwen's
+(-17% vs -5% settling) — never read a first-reps prefill ratio as steady state.
+And on a machine shared with other agents, calibrate every prefill run against
+the classic arm's known baseline before believing absolutes: three separate
+contended runs read 3x low in BOTH arms while the ratio stayed put.
 
 ## DFlash (PLANNED — sidecars exist, adaptation not started)
 

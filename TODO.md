@@ -5,7 +5,16 @@ header (`DONE <date>`, `CLOSED-REFUTED <date>`, …) plus the measurement that c
 them and a pointer to the log.md entry with the full arc. Sub-items are lettered under
 a numbered parent.
 
-## Priority order (decided 2026-07-28, next session starts at P1)
+## Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29)
+
+Live items as of 2026-07-29, by value: **P9(a)** K-snapshot fused verify (the
+unlock for spec decode's real 27B win — measured 39 ms/verified-position on the
+reference-scan fallback today); the **P8c prefill residual** (+350-560 µs/token
+outside every measured stage, now the largest 27B-prefill unknown; diagnosis
+first, in-situ per-layer timing in `run_stack`); the **P8c attention glue**
+(lowest risk first step: route the main attention block through the existing
+bit-identical `attn_gate`/`permute_01`/`cast_*` kernels, then re-measure).
+P9(b) drafter inject fusion and P10 serve adaptation follow.
 
 1. **Mechanical fork — DONE 2026-07-28.** cp-based copy of ../laguna, maxuna→xwen
    rename, MAXUNA_*→XWEN_* env prefix, Qwen tokenizer/chat-template/configs vendored
@@ -146,6 +155,42 @@ a numbered parent.
      with length while llama.cpp improves): 48 layers at inner 6144 amplify what 30
      layers at 4096 hide. The chunked form's bounty is therefore ~2x on 27B prefill,
      not a marginal 35B win. See log.md 2026-07-29 head-to-head.
+     ANNOTATION 2026-07-29 (later the same day): **the ~2x bounty is WITHDRAWN — that
+     reading was wrong, and the measurement that would have caught it had never been
+     taken.** The fused scan is 3% of 27B prefill: 48 layers × 1.97 ms is 95 ms of a
+     2.96 s prefill at 880 tokens, 48 × 8.56 ms is 411 ms of 14.2 s at 3851. Making
+     the scan FREE moves 27B prefill from ~297 to ~307 tok/s against llama.cpp's 486,
+     so no scan form — chunked, re-decomposed, or absent — can be the 1.8-2.1x gap.
+     The gap is in the dense projections and needs its own item.
+     ANNOTATION 2026-07-29 (P8c): **that item was opened, root-caused and CLOSED the
+     same day — the gap was the dense FFN's gemm, and it is fixed.** The profiling
+     pass put 66-85% of 27B prefill wall time in the dense SwiGLU FFN (64 layers,
+     17408-wide, Q4_K) running through `QLinear` → candle `QMatMul` →
+     `kernel_mul_mm_q4_K_f32` at ~12-13 TFLOP/s, against 28-36 TFLOP/s for the same
+     shapes on the Metal-4 cooperative-tensor gemm. (A band because that budget row
+     is derived from an isolated rate ~7-8% pessimistic against a real forward.) The
+     gap is kernel efficiency, not bandwidth: the Q4_K arm moves 3.6x FEWER weight
+     bytes and takes 2.4x LONGER, and a bandwidth-bound arm moving fewer bytes would
+     be the faster one. `src/ops/dense_mm.metal`
+     is the dense cooperative-tensor gemm reading Q4_K directly with an in-kernel
+     tile dequant, gated at `seq > DENSE_MM_MIN_SEQ` (32). Kernel-level 2.4-3.0x at a
+     512-token chunk; end-to-end numbers, the rejected dequant-to-scratch
+     alternative, and the precision cost are in log.md 2026-07-29 and decisions.md
+     "The dense-FFN prefill gemm dequantizes in-kernel".
+     Separately, llama.cpp
+     on Metal never runs its chunked form at all (its fused `ggml_gated_delta_net` op
+     pre-empts the chunked graph, delta-net-base.cpp:437-446), and its sequential
+     Metal decomposition was transplanted here and measured SLOWER at both geometries
+     and both lengths. So **(b) stays ledgered but is refuted as a prefill lever**;
+     its remaining live rationale is chunk-boundary replay for the rollback trail, and
+     even that is superseded by the K-snapshot plan under P9. Do not reopen (b) for
+     prefill without a per-stage profile that contradicts the 3% figure — re-run
+     `delta_scan_timing` (src/ops/delta.rs, `#[ignore]`d) to price it. See log.md
+     2026-07-29 "The DeltaNet scan is 3% of 27B prefill" and decisions.md "The
+     DeltaNet scan decomposition".
+   - The refuted re-decomposition is kept runnable, not deleted:
+     `XWEN_DELTA_SCAN_V2=1` selects `kernel_delta_scan_v2` (llama.cpp's shape) plus
+     the `kernel_delta_l2norm` dispatch it needs, on the `XWEN_MOE_DUAL` precedent.
    - `XWEN_DELTA_CHUNK_CLASSIC` was never created — there is no chunked path to
      switch off yet. It belongs with (b).
    - **The fused scan is bounded, not bit-identical**, so `XWEN_DELTA_CLASSIC=1` is
@@ -162,27 +207,102 @@ a numbered parent.
      armed rollback checkpoint also stays on the reference scan (single tokens do
      not) — see decisions.md.
 
-9. **DFlash adaptation to the Qwen sidecars.** Repoint drafter arch check (arch
-   `dflash`, decoder arch qwen35/qwen35moe), tap indices from `target_layers`
+9. **DFlash adaptation to the Qwen sidecars — ADAPTED 2026-07-29, but speculation is
+   a 27B-only win and stays opt-in.** Both sidecars load, draft and verify correctly
+   at 85-95% acceptance; the two deliberately-red tests are green and the suite is
+   760/0. Measured (`lowpowermode 0`, warm, greedy, 128 tokens, interleaved, 3 reps):
+   27B **+4.8 to +6.8%** on a code prompt (26.4-26.7 vs 25.0-25.2 tok/s) and **+1.5 to
+   +7.4%** on a chat prompt, quoted as ranges across two independent runs because the
+   27B's between-run level shifts even though its within-run reps are tight; 35B-A3B
+   **-11.5%** and **-12.7%** (93.0/92.1 vs 105.1/105.5, repeating to within 1%).
+   `draft_p_min` retuned 0.5 → 0.3 (only value ahead of plain on both
+   prompt kinds in every run); `pause_margin` stays 1.0. See log.md 2026-07-29 and
+   decisions.md "Speculative decoding". Original scope: repoint drafter arch check
+   (arch `dflash`, decoder arch qwen35/qwen35moe), tap indices from `target_layers`
    metadata, mask_token_id, sliding-window pattern; verify the fc.weight geometry
    (5×hidden / 8×hidden concat). Needs P4's recurrent-state rollback. Re-tune
    auto-pause and draft-ctx horizon for this drafter's cost curve.
-   - ANNOTATED 2026-07-28: drafting is now OFF by default (`DEFAULT_DRAFT_ENABLED
-     = false`) because the inherited opt-out default aborted every zero-flag
-     `xwen generate` and `xwen serve` at startup. **Flip it back to `true` as part
-     of this item**, along with the CLI/config help text in `bin/xwen/main.rs`
-     (`DraftArgs`, `ServeArgs`) and `serve/config.rs` (`DraftToml`, the `[draft]`
-     `--init` template block), all of which currently say drafting is unavailable.
-   - The first failure is NOT the `decoder_arch == "laguna"` check: the shipped
-     sidecars carry no `dflash.decoder_arch` key at all, so `from_gguf` fails on the
-     missing key before reaching it. Two more blockers behind it — the shipped
-     tensor tables have no `enc.aux_norm` and no `blk.N.attn_gate`, both of which
-     `DflashDrafter::build` requires. `dflash::tests::real_file_load_and_shapes` and
-     `real_file_bf16_alias_load_and_forward` fail on exactly this and are the
-     suite's only red tests; they go green when this item lands.
-   - `DRAFT_KV_BYTES_PER_TOKEN` in `serve/config.rs` describes the 35B-A3B sidecar
-     only (6 layers; the 27B has 5). It feeds an `--init` comment and nothing that
-     allocates — make it per-model here, alongside `hub::Model::kv_bytes_per_token`.
+   - **(a) The K-snapshot fused verify is the precondition for speculation to pay,
+     not an optimization of it — the top open item under P9.** Under an armed
+     rollback trail a multi-token chunk takes the frozen reference scan
+     (linear_attn.rs:194-205), which walks tokens one at a time, so the 48-of-64
+     (27B) and 30-of-40 (35B) DeltaNet layers get NO batching win inside a verify
+     forward: measured 245 ms for a ~6-position 27B verify against a 43 ms plain
+     step, i.e. 39 ms per verified position. That is why the gains are single-digit
+     percent rather than the 1.39-2.29x reported elsewhere on Apple silicon. The
+     structural provision is already in place: both scan kernels
+     (`kernel_delta_scan`, `kernel_delta_scan_v2` in `src/ops/delta.metal`) hold each
+     thread's slice of the state in registers across the whole timestep loop, so
+     emitting the last K per-token states is one guarded store inside the loop plus a
+     wider output buffer — mirror llama.cpp's `n_rs_seq + 1` most-recent-first
+     snapshot planes (ggml-metal.metal, the `K > 1` branch of
+     `kernel_gated_delta_net_impl`). Landing it retires the `seq > 1 && trail_armed`
+     fallback, the ~1-2.3 GB verify-walk trail (decisions.md "Speculative decoding"),
+     and P8b(b)'s last live rationale.
+   - **(b) The drafter's per-token cache sync costs ~1.2 ms and is what sinks the
+     35B.** An arm that can never draft (`--draft-p-min 1.1`, 119/127 rounds paused)
+     still decodes at 92.6 tok/s against 105.1 plain — the whole 35B loss, incurred
+     before any drafting. Per committed token: `encode` (8-tap concat through a
+     [2048, 16384] `fc`) plus six layers of `wk`/`wv` + QK-norm + rope + two
+     `slice_set`s, ~14 small Metal dispatches. Dispatch-bound, not FLOP-bound — the
+     same disease `kernel_moe_router`/`kernel_moe_epilogue` cured for the MoE block.
+     Two independent levers: fuse the inject (one dispatch for all layers' K/V, or at
+     least batch the projections), and/or teach the pause controller to DETACH rather
+     than pause once it has enough evidence, since a paused drafter still pays this.
+     Fixing either could flip `--draft` to opt-out; see (d).
+   - **(c) `DEFAULT_DRAFT_CTX` (8192) was NOT re-derived and its inherited rationale
+     is now half wrong.** Laguna's argument was O(depth) drafter forwards plus
+     collapsing proposal quality with depth. The O(depth) half no longer holds: every
+     sidecar layer but the last is windowed (2048 on the 27B, 4096 on the 35B) and
+     `attention` narrows the cache to the window, so only one layer of five or six
+     grows with the context. The memory argument stands (40 KiB/token on the 27B,
+     48 on the 35B, imaged per cache slot). Re-derive by measuring drafter cost and
+     acceptance at 4k/8k/16k/32k on the Qwen sidecars before changing it.
+   - **(d) The `--draft` opt-out flip is DEFERRED with numbers.** The flip was
+     conditional on the controller holding a never-materially-slower property on both
+     checkpoints; it does not, because the 35B's 12% loss lands on rounds the
+     controller has already paused (see (b)). Re-evaluate after (a) and/or (b): the
+     bar is the 35B at or above plain, not merely closer to it.
+   - **(e) A ring-buffer drafter cache is deferred.** The per-layer cache stays a flat
+     `[n_kv, max_ctx, hd]` array; windowing lives in `attention`'s narrow-plus-mask.
+     A ring would cap the allocation at the window rather than at `draft_ctx`, but it
+     would also stop `DrafterImage` being a straight prefix copy of the committed
+     rows, which is what makes export/import and the disk tier simple. Only worth it
+     if `draft_ctx` grows a lot under (c).
+   - **`--draft` is not byte-identical to `--no-draft` in general, but the sampler
+     stream is in lockstep.** `bun scripts/spec-equivalence.ts` runs two modes.
+     Greedy: 11 of 12 comparisons match exactly, the twelfth forking on the 27B chat
+     prompt at a near-tie, because the batched verify forward reassociates its f32
+     sums differently from the single-token forward — same class as the
+     fused-delta-scan divergence under P8a, not a verify-walk bug. Sampled
+     (temperature 0.8, fixed seed, `p_min` 0, auto-pause off — the only mode that can
+     see the RNG, since argmax never draws from it): the 35B is identical on both
+     prompts over 360-435 drafted tokens and the 27B on the code prompt over 315, so
+     the spec loop draws exactly as many times as the plain loop. The 27B chat prompt
+     forks at line 12, deep enough to be the near-tie signature rather than a desync.
+     Both modes refuse to pass a run that drafted nothing. Deliberately not a
+     `cargo test` gate: near-tie forks are expected and would make it flaky.
+   - ANNOTATED 2026-07-28, RESOLVED 2026-07-29: drafting was turned OFF by default
+     (`DEFAULT_DRAFT_ENABLED = false`) because the inherited opt-out default aborted
+     every zero-flag `xwen generate` and `xwen serve` at startup, and this item was
+     to flip it back. It does NOT flip — see (d) for the blocking numbers. The
+     CLI/config help text in `bin/xwen/main.rs` (`DraftArgs`, `ServeArgs`) and
+     `serve/config.rs` (`DraftToml`, the `[draft]` `--init` template block) no longer
+     says drafting is unavailable; it now gives the measured reason for opt-in.
+   - CLOSED 2026-07-29: the three load blockers are gone. The shipped sidecars carry
+     no `dflash.decoder_arch` key (the requirement is deleted), no `enc.aux_norm`
+     (the per-tap norm-and-scale is deleted — the encoder is concat → `fc` →
+     `enc.output_norm`, dflash.cpp:109-123) and no `blk.N.attn_gate` (the softplus
+     output gate is deleted). `dflash::tests::real_file_load_and_shapes` and
+     `real_file_bf16_alias_load_and_forward` were the suite's only red tests and are
+     now green against both sidecars' real weights.
+   - DONE 2026-07-29: `DRAFT_KV_BYTES_PER_TOKEN` in `serve/config.rs` derives from
+     the new `hub::Model::draft_kv_bytes_per_token()` (40 KiB/token on the 27B's five
+     drafter layers, 48 on the 35B-A3B's six), alongside
+     `hub::Model::kv_bytes_per_token`.
+   - ANNOTATED 2026-07-29: the K-snapshot plan for the verify walk's recurrent-state
+     rollback is now (a) above, promoted from a nice-to-have to the item's top
+     blocker by the verify-cost measurement.
 
 10. **serve adaptation.** Tool-call parsing for the `<function=...>` XML-ish format in
     both API dialects (string args raw, non-string JSON), thinking-mode flags
@@ -219,6 +339,11 @@ a numbered parent.
     full-attn block + nextn.* tensors, plain KV cache, eh_proj over
     [norm(emb);norm(h)]. Evaluate as drafter only after P9 lands or fails (see
     decisions.md "Speculative decoding").
+    - ANNOTATED 2026-07-29: P9 landed, and the trigger is still not met. DFlash's
+      acceptance is 85-95% — a better drafter would not help. What limits xwen's
+      speculation is the verify forward's cost (P9a) and the drafter cache sync
+      (P9b), and an MTP drafter would pay both identically. Do not open this until
+      P9a lands and the win is measured with a fast verify.
 
 13. **MoE block glue fusion — SHIPPED 2026-07-29.** An MoE layer went from 24
     dispatches per decoded token to 14 (960 → 560 across the 40 layers), and 35B-A3B
@@ -408,6 +533,82 @@ a numbered parent.
   contract was that no computed value moves. Decide whether the macro earns its keep
   (candle's `get_block_dims` round-trip vs a plain struct literal) and rewrite or
   delete the comment to match.
+
+## Deferred from the dense-FFN prefill gemm pass (2026-07-29, P8c)
+
+All three come out of the per-stage prefill profile that root-caused the 27B gap.
+They are what that profile found and did NOT fix; the profile itself is transcribed
+in log.md 2026-07-29.
+
+- [ ] **The dense-FFN gemm diff shipped WITHOUT an independent review pass** — the
+  only arc of 2026-07-29 that did (an agent-spawning moratorium was in effect;
+  every other arc got a two-model-family review). Both parity gates pass and the
+  test suite is green, so this is process debt, not a known defect. When it runs,
+  the author's own pointers at the two places a subtle bug could hide: (1)
+  `src/ops/dense_mm.metal` is `src/ops/f16_t.metal` with exactly ONE intended
+  substitution (block-quant tile dequant replacing the half widen-copy in A-tile
+  staging) — any other divergence between the two files is a bug; (2) the dequant
+  sub-block indexing (`xb = base + k_pos/(16*nl)`, `il = (k_pos/16) % nl`) assumes
+  each dequant call returns the 16 contiguous elements at super-block offset
+  `[16*il, 16*il+16)` — pinned by a test against `QTensor::dequantize`, but an
+  off-by-one here is the classic quant-kernel failure and deserves adversarial
+  eyes.
+
+- [ ] **+350 to +560 µs/token of prefill cost lives OUTSIDE every measured stage, and it
+  grows with prompt length.** Per-token wall goes 3023 → 3599 µs between the 880- and
+  3851-token fixtures (+576, i.e. the 330.7 → 277.9 tok/s drop), and the four profiled
+  stages account for only **+13 µs/token** of that: the dense FFN and DeltaNet non-scan
+  per-token rates are flat, and the DeltaNet scan gets *faster* per token with length,
+  so it is anti-correlated. Mask + sdpa quadratic growth is real but only ~+69 µs/token
+  combined.
+  **State it as a range, not +576.** The FFN row of that budget is derived from an
+  isolated rate ~7-8% pessimistic against a real forward (the @880 budget sums to 106.8%
+  of wall, a physically impossible negative residual), so part of the swing is an
+  artifact of that bias. +350 to +560 µs/token is the defensible claim.
+  Ruled out by direct measurement at T=512/880/3851: dense FFN, DeltaNet non-scan,
+  DeltaNet scan, and the mask+sdpa quadratic terms. NOT ruled out and unattributable
+  without new instrumentation: the per-layer RMSNorms (2 × 64 layers = 128 eager
+  dispatches per chunk over `[512, 5120]` f32), residual adds, KV-cache appends and
+  page-touching as the 537 MB cache fills, embedding + lm_head, Metal buffer-pool
+  behaviour across 8 chunks × 64 layers, and command-buffer gaps. Next step is per-layer
+  timing inside `model.rs` `run_stack` — in situ, not a synthetic bench. Now the largest
+  single unknown in 27B prefill: with the FFN gemm fixed this is a much bigger share of
+  what remains, and it is most of why the 4k result (445 tok/s) fell short of the
+  profile's 496 upper-bound counterfactual while the 925 result met it.
+
+- [ ] **Attention glue: ~10 unfused eager passes per layer, inside a 57.13 ms/layer
+  attention block.** MEASURED (profiling pass, amortized, T=3851): the whole attention
+  layer is 57.13 ms, growing monotonically with position within the prefill (5.746 ms at
+  a 512-token chunk at position 0 → 9.176 at position 3072). The brief that opened the
+  arc put ~42.43 ms/layer of that in the glue — the permute/cast/gate copies around the
+  projections and sdpa, each a separate candle dispatch over a full
+  `[T, n_head, head_dim]` tensor — but that split appeared in the briefing rather than in
+  the raw profile, so **re-measure the sub-term before sizing any work against it**.
+  `ops::attn_gate` already exists and does exactly the fused-gate job, but it is wired
+  only into the DFlash path. Two steps, in order: route the main block through the
+  existing `attn_gate`/`permute_01`/`cast_*` kernels (bit-identical to the chains they
+  replace, so this is `XWEN_ATTN_GLUE_CLASSIC` territory and needs no new parity tier),
+  then measure what is left. Do not start by writing a new fused kernel — the existing
+  ones may cover most of it.
+
+- [ ] **The host-built materialized causal mask is not today's problem but becomes
+  first-order at 8k+.** `flash.metal` is genuinely unreachable at head dim 256
+  (`ops::flash_attn` hard-bails at `head_dim != FLASH_BD` (128), dispatch.rs:3324 and
+  3361, and has zero production callers), so prefill runs candle sdpa against a
+  host-built mask — a scalar `Vec<f32>` loop (kv_cache.rs:89-98) then uploaded, broadcast
+  to 24 heads and cast to f16, to carry what is one bit per position. **REFUTED as a
+  meaningful part of the 27B gap**, and the refutation turns on a detail worth not
+  re-deriving: the mask is **HOISTED** — built once per chunk in `model.rs` `run_stack`
+  and shared across all 16 full-attention layers, NOT rebuilt per layer. The profiling
+  pass's own first run multiplied by 16 and produced a ~682 ms scare; corrected, it is
+  51.22 ms, **0.37% of wall at 3851** and 0.15% at 880. Mask + sdpa together grow ~1.2
+  percentage points across the two lengths against a 16% observed throughput drop.
+  The 402 MB figure is DERIVED (Σ over chunks of `n_head × seq × k_seq × 2`), not
+  measured; with the 51.22 ms measured time it implies ~8 GB/s, slow in isolation and
+  irrelevant at 0.4% of wall. But both quadratic terms roughly quadruple from 4k to 8k,
+  so this becomes first-order at long context. The real fix is the existing ledger item —
+  make `flash.metal` reachable at head dim 256, removing the mask rather than making it
+  cheaper. Pairs with the head-dim-256 flash item under P8.
 
 ## Deferred from the fork bootstrap (2026-07-28)
 

@@ -4,7 +4,433 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-07-29 (latest) — Two-family review of the MoE-glue + top-p diff: kernels clean twice over, one real hole in the gate script
+## 2026-07-29 (latest) — The 27B prefill gap was the dense FFN's gemm, not the DeltaNet scan: a Q4_K cooperative-tensor kernel takes prefill from 263 to 702 tok/s @925
+
+**Context.** Two entries below, the DeltaNet arc refuted its own premise and handed off a
+question: the 27B's 1.8-2.1x prefill loss to llama.cpp is not in the DeltaNet layers, it
+is "in the dense projections", and the next arc "should start from a per-stage profile
+rather than from a reading of llama.cpp's kernels". A profiling pass did exactly that and
+found the answer in one stage. This arc fixed it.
+
+**The profile.** Transcribed from the profiling pass, which produced no docs of its own.
+Conditions: `pmset -g` reported `lowpowermode 0` — NOT low-power mode, but this machine
+emits no `powermode` key at all, so high-power mode was never positively confirmed and
+must not be claimed. `XWEN_BENCH=1` (warm, GPU-complete), GPU exclusivity verified before
+every run, fixtures at 880 and 3851 tokens. Rows are tagged MEASURED or DERIVED because
+two of the headline figures are derived and one carries a known bias.
+
+Wall (MEASURED, reproduced twice): **2.66-2.68 s @880 (330.7 tok/s)**, **13.86 s @3851
+(277.9 tok/s)**.
+
+| stage | @880 ms (% wall) | @3851 ms (% wall) | µs/tok @880 → @3851 | |
+|---|---|---|---|---|
+| Dense FFN (64 layers) | 2268 (85.3%) | 9926 (71.6%) | 2578 → 2578 | DERIVED |
+| DeltaNet non-scan (48) | 278 (10.4%) | 1216 (8.8%) | 316 → 316 | DERIVED |
+| Attention (16) | 155 (5.8%) | 914 (6.6%) | 176 → 237 | MEASURED |
+| DeltaNet scan (48) | 136 (5.1%) | 377 (2.7%) | 154 → 98 | MEASURED/DERIVED |
+| Prefill mask (hoisted) | 4.01 (0.2%) | 51.22 (0.37%) | 5 → 13 | MEASURED |
+| **sum** | **2841 (106.8%)** | **12484 (90.1%)** | 3229 → 3242 | |
+| unaccounted | −181 (−6.8%) | +1376 (+9.9%) | −206 → +357 | |
+
+**Read the −181 ms.** A negative residual is physically impossible: the stage sum exceeds
+the wall clock. The cause is that the FFN row is DERIVED from an isolated T=512 rate that
+is ~7-8% pessimistic against what the FFN achieves inside a real forward. So the honest
+claim is a **band: the dense FFN is 66-85% of prefill wall time**, and the two DERIVED
+rows carry that bias. Everything else is measured directly.
+
+**Two protocol traps the profiling pass documented, both easy to repeat.** (1) All rates
+above are AMORTIZED — BATCH=8 dispatches per sync, outputs held alive so the allocator
+pool cannot inject a false write-after-write barrier. Per-dispatch numbers charge a
+command-buffer round trip a real forward never pays, and are wildly different (attention
+102.12 vs 57.13 ms/layer, DeltaNet 8.903 vs 3.367, FFN 24.589 vs 20.620); building the
+budget from them sums to **127% of wall**, i.e. nonsense. (2) These benches throttle: the
+same T=3851 q4_K gate measured 53.773 ms in a 9.3 s run, 54.118 ms in a low-duty run, and
+66.639 ms (23% slower) in a 36 s run. Low-duty-cycle only; a profiling run long enough to
+heat the GPU inverts conclusions.
+
+**The mechanism, and it is not subtle.** The FFN runs `DenseMlp` → `QLinear::forward` →
+candle `QMatMul` → `kernel_mul_mm_q4_K_f32`; the same shapes through `ops::matmul_f16` →
+`kernel_mul_mm_f16_f32_t` are 2.4-3.0x faster:
+
+| [T, 5120] × [5120, 17408] | Q4_K (`QMatMul`) | f16 cooperative-tensor gemm |
+|---|---|---|
+| T = 512 | 7.893 ms (11.6 TFLOP/s) | 3.242 ms (28.2 TFLOP/s) |
+| T = 880 | 13.143 ms (11.9) | 4.412 ms (35.6) |
+| T = 3851 | 54.118 ms (12.7) | 19.979 ms (34.4) |
+
+(Profiling pass's figures. Re-measured independently for this entry with
+`dense_ffn_prefill_timing`: 8.170 / 2.988 at T=512, 12.390 / 4.188 at 880, 55.904 /
+19.932 at 3851 — same conclusion, within 8% on every cell.) The f16 rate is not a
+synthetic-shape artifact: the DeltaNet projections, which DO take the f16 plane in
+production, measure 27.7-30.4 TFLOP/s at T=880. The reason the FFN does not is that the
+dual-plane machinery (`Weights::attn_proj`, gguf.rs:657) has exactly one caller,
+`Proj::load` in attention.rs:108.
+
+**Why this is kernel efficiency and not a memory wall — stated without appeal to a peak
+bandwidth nobody measured.** At T=512 the Q4_K arm reads 50.14 MB of weights and the f16
+arm 178.32 MB. The Q4_K arm moves **3.6x fewer weight bytes and takes 2.4x longer**
+(10.9 vs 66.0 GB/s of weights+output). If either arm were bandwidth-bound, the one moving
+fewer bytes would be the faster one. It is not.
+
+Counterfactual (DERIVED, and an **upper bound** — it assumes a quantized gemm could reach
+the full f16-plane rate, which is not guaranteed): 694 tok/s @880 and 496 @3851 against
+llama.cpp's 486 / 502.
+
+The same profile refuted a standing suspect and left two others open. All three are now
+TODO.md ledger items rather than folklore. Their figures are the profiling pass's, carried
+over rather than re-measured here — with one exception, flagged where it appears: the
+attention-glue split came from the arc's briefing, not from the raw profile.
+
+**Refuted: the materialized causal mask.** `flash.metal` is genuinely unreachable at head
+dim 256 (`ops::flash_attn` hard-bails at `head_dim != 128`, dispatch.rs:3324/3361, zero
+production callers), so prefill runs candle sdpa against a host-built mask — but that
+mask is **hoisted**: built once per chunk in `model.rs` `run_stack` and shared across all
+16 full-attention layers, NOT rebuilt per layer. The profiling pass's own first run got
+this wrong and multiplied by 16, turning a 51 ms non-event into a ~682 ms scare; the
+corrected figure is **0.37% of wall at 3851** (51.22 ms) and 0.15% at 880. Mask + sdpa
+together grow ~1.2 percentage points between the two lengths against an observed 16%
+throughput drop — an order of magnitude short of what the hypothesis needs. The 402 MB is
+DERIVED (Σ over chunks of `n_head × seq × k_seq × 2`), not measured.
+
+**Open: a length-dependent residual outside every measured stage.** Per-token wall goes
+3023 → 3599 µs between the two fixtures (+576, the 330.7 → 277.9 drop), and the four big
+stages account for only **+13 µs/token** of it — the FFN and DeltaNet non-scan rates are
+flat, and the scan actually gets *faster* per token with length. But part of the residual
+swing is an artifact of the DERIVED FFN row's 7-8% bias, so the defensible statement is
+**+350 to +560 µs/token**, not a hard +576. Not attributable without per-layer
+instrumentation inside `run_stack`.
+
+**Open: attention glue.** Attention is 57.13 ms/layer amortized at T=3851 (up from 5.15
+at a single 512-token chunk at position 0, growing monotonically with position), and the
+brief that opened this arc put ~42.43 ms/layer of that in ~10 unfused eager passes —
+a figure that appeared in the briefing rather than in the raw profile, so treat it as
+indicative until re-measured. `ops::attn_gate` already exists but is wired only into the
+DFlash path.
+
+**Built: `src/ops/dense_mm.metal`.** A dense Metal-4 cooperative-tensor gemm that reads
+Q4_K directly and dequantizes each weight tile in registers. It is `f16_t.metal`'s kernel
+with exactly one substitution — the A-tile staging phase gains ggml's block-quant
+dequant instead of a half widen-copy — so the 64-row × 128-token tiles, the f32
+activation read straight from device as a cooperative tensor with no B staging, the
+reduced-precision matmul2d descriptor and the extent-clipped store all carry over
+unchanged. That is also how ggml writes it: templated over
+`(block_q, nl, dequantize_func)`. Instantiated for q8_0/q4_K/q5_K/q6_K; q4_K is the
+production one.
+
+**The alternative was priced, not hand-waved.** Dequantizing to a transient f16 scratch
+and feeding the existing gemm needs 178 MB written and 178 MB read back per projection
+per chunk against the 50 MB of Q4_K the kernel otherwise streams — ~8x the weight
+traffic, ~0.68 ms per projection at 600 GB/s against the gemm's own 3.2 ms, so about a
+fifth of the win handed straight back plus a 178 MB scratch buffer. Permanent f16 planes,
+the trick the attention projections use, are not even arithmetically available here:
+17.1e9 FFN parameters at 2 bytes is 34 GB. The planes that did ship cost nothing —
+`Weights::qlinear_with_plane` reuses `qlinear_with_buffer`'s one-upload construction, so
+the `QLinear` decode path and the prefill gemm index the same allocation.
+
+**Threshold from the tile geometry, not from tuning.** `DENSE_MM_MIN_SEQ = 32`,
+exclusive (`seq > 32`), following `F16_MM_MIN_SEQ` and ggml's `ne11_mm_min`. candle tiles
+tokens 32 wide and the vendored kernel 128, so up to 32 tokens both sit on the same
+launch-latency floor — 1.01-1.05x, a wash — and at 33 candle takes a second token tile
+while the vendored gemm does not. Isolation, plateau ms, interleaved arms:
+
+| tokens | 33 | 48 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| [17408, 5120] speedup | 1.48x | 1.30x | 1.94x | 2.19x | **2.41x** |
+| [5120, 17408] speedup | 1.20x | 1.19x | 1.65x | 2.71x | **3.02x** |
+
+Production prefill runs in 512-token chunks (`PREFILL_CHUNK`), so the kernel always sees
+the end of that curve.
+
+**End to end** (27B, `lowpowermode 0` — not LPM, high-power mode not separately
+confirmable on this machine — `XWEN_BENCH=1`, `--no-draft`, committed fixtures,
+interleaved arms F/C/F/C, 5 reps, medians with ranges; the classic arm doubles as the
+calibration — at 263 tok/s @925 it reproduces the documented ~270 baseline, which is how
+this run was distinguished from three earlier contended ones that read 3x low in **both**
+arms. Note the profiling pass's own baseline on a quieter machine was higher still,
+330.7 tok/s @880, so the classic column here is a valid control but not a machine-best
+number):
+
+| | fused | classic (`XWEN_DENSE_MM_CLASSIC=1`) | |
+|---|---|---|---|
+| prefill @925 | **702.2** [637-715] | 263.1 [230-307] | **2.67x** |
+| prefill @3851 | **444.9** [409-450] | 199.9 [194-205] | **2.23x** |
+| decode n=128 | 24.6 [20.6-24.7] | 22.1 [19.5-23.4] | no regression |
+
+Decode cannot change and did not: at seq 1 the threshold sends it down the `QLinear`
+chain, and `dense_mlp_below_threshold_takes_the_classic_path` asserts bit-identical
+output there against a block built with no planes at all. The 1.11x in that row is
+between-run drift, not an effect — the two ranges overlap almost completely. The 35B-A3B
+is untouched by construction (every layer is MoE; `DenseMlp` never constructs) and
+spot-checks at 1.01x prefill / 0.94x decode, both noise.
+
+So 27B prefill goes from 1.8-2.1x behind llama.cpp to ahead of it at 925 (702 vs 486)
+and near parity at 4k (445 vs 502). Against the counterfactual — which was an upper
+bound, assuming a quantized gemm could reach the full f16-plane rate — the short prompt
+landed on it (702 vs 694 predicted) and the long one came in under (445 vs 496). The
+shortfall at 4k is where the remaining work is: the length-dependent residual above is
+now a much larger share of what is left than it was of what it came out of.
+
+**The cost, stated plainly.** This kernel is **less accurate than the `QMatMul` chain it
+replaces**. Against a dequantize-then-f32 oracle at the 27B FFN shapes it lands ~4.1e-4
+rel_l2 where candle's kernel lands ~1.9e-4; the two differ from each other by ~3.7e-4.
+Both stage the weight tile as half and accumulate in f32 — the extra ~2e-4 is matmul2d's
+reduced-precision tensor-core path, which is where the throughput comes from. It is not a
+new precision class (the attention prefill gemm made the identical trade, and llama.cpp
+sets the same descriptor flag for its own dense FFN), but it is a real one, so the kernel
+is graded like the DeltaNet scan and not like the glue kernels:
+`XWEN_DENSE_MM_CLASSIC=1` is pinned on **both** sides of the strict tier, a `dense_mm`
+provenance field (parity_schema v7, grandfather `classic`) proves which side ran what,
+and the bounded mm/decode/ppl tiers carry the signal against frozen floors. Cached pre-v7
+references stay valid — no binary of that era had the gemm.
+
+**Both gates pass on frozen floors.** 27B: strict `cos=1.000000`, mm `cos=1.000000`,
+decode 64/64 with 0 mismatches on all three fixtures, ppl `Δnll=0.000243`. 35B-A3B
+(mandatory here because the provenance schema moved to v7, not because any 35B code
+path changed): strict `1.000000`, mm `0.999631`, decode 63/63/62 with 0 mismatches, ppl
+`Δnll=0.000791` — reproducing the DeltaNet entry's numbers exactly, which is the
+confirmation that the 35B is bit-for-bit untouched.
+
+**Shipped.** `src/ops/dense_mm.metal` + `src/ops/dense_mm.rs` (new library, compiled
+lazily so nothing else gains a Metal-4 dependency), `dispatch::run_matmul_dense_q_mm` and
+its dtype/geometry support matrix, `gguf::QuantPlane` + `Weights::qlinear_with_plane`,
+`DenseMlp`'s prefill entry, and the `XWEN_DENSE_MM_CLASSIC` / `XWEN_DENSE_MM_MIN_SEQ`
+switches wired into `parity-gate.ts`'s strip list, `referenceEnv()`, the strict candidate
+env and `isReferenceDump()`. New tests: kernel-vs-oracle and kernel-vs-`QMatMul` at the
+production FFN shapes, all four dtypes, the tile-edge cases (token counts across the
+128-wide tile, out-dims across the 64-wide one), the instantiation-matrix and
+geometry-vs-`#define` cross-checks, a `DenseMlp`-level fused-vs-classic comparison with
+per-projection attribution, and the threshold-gating test above. 696 lib tests and 66
+parity tests pass, 0 failures.
+
+## 2026-07-29 — DFlash adapted to the Qwen sidecars (P9): both drafters load and accept 85-95%, and speculation is a 27B-only win because the verify forward runs the per-token reference scan
+
+**Context.** The DFlash subsystem came over from laguna whole and inert: `dflash.rs`
+described a six-layer, hidden-3072, 72-head drafter with a per-head softplus attention
+gate and a per-tap encoder norm, gated behind a `dflash.decoder_arch == "laguna"` check.
+The ggml-org sidecars for Qwen 3.6 are a different model — 5 layers at hidden 5120 (27B)
+or 6 at 2048 (35B-A3B), 32 Q / 8 KV heads, no gate tensor, no `enc.aux_norm`, no
+`decoder_arch` key at all, and sliding-window attention on every layer but the last. Two
+tests (`real_file_load_and_shapes`, `real_file_bf16_alias_load_and_forward`) were the
+suite's only red ones and asserted the laguna geometry on purpose, as the arc's gate.
+
+**What the oracle actually says.** Three of the graph's differences were not in the
+briefed list and were found by reading `reference/llama.cpp/src/models/dflash.cpp`
+against the shipped headers:
+
+- **The noise block is non-causal.** `common/speculative.cpp:1004` calls
+  `llama_set_causal_attn(ctx_dft, false)`, and the causal branch of the KV mask builder
+  is guarded by `if (causal)` (llama-kv-cache.cpp:1793). The drafter is a block-diffusion
+  model: it denoises `[id_last, MASK × 15]` in one forward, so every block position sees
+  every other in both directions. The inherited code masked the block causally.
+- **The injection path applies no `attn_norm`.** dflash.cpp:252-253 projects the raw
+  encoder output into `wk`/`wv`; `enc.output_norm` is the only norm on that path. The
+  query path in `draft_forward` does apply `attn_norm`, so the two deliberately disagree.
+  The inherited code normed both, citing the laguna branch — which no longer exists.
+- **The encoder is three ops.** dflash.cpp:109-123: concatenate the taps tap-major,
+  `fc`, `enc.output_norm`. No per-tap RMS-norm, no per-tap scale.
+
+Everything else the mapping pass had established held up: taps are the residual
+*entering* the named target block, so the `t - 1` translation to our `l_out` capture
+points is unchanged; rope is plain NEoX over all 128 dims (no `rope.dimension_count` key
+→ `n_rot = n_embd_head_k`), theta 1e7 from the GGUF; QK-norm before rope; SwiGLU with a
+real `ffn_norm` tensor.
+
+**Sliding windows, implemented as a narrow rather than a mask.** llama.cpp masks
+`p1 - p0 >= n_swa`, i.e. a query at position `p` keeps `[p - window + 1, p]` on the past
+side and — being non-causal — everything on the future side. The obvious implementation
+is an additive mask over the full score row, but the block's windows are a contiguous
+union: query 0 has the deepest floor, and the 16 queries' floors span at most 15
+positions. `attention` therefore narrows the cache to `[lo, committed + n_block)` and
+masks only the ≤15 columns between the individual floors, falling back to no mask at all
+while the context still fits inside the window. A windowed layer costs O(window) per
+round instead of O(context), which retires half of the argument behind
+`DEFAULT_DRAFT_CTX` being small: only the final full-attention layer — one of five or six
+— still grows with depth.
+
+**Measurements** (`lowpowermode 0`, warm, greedy, 128 decoded tokens, interleaved arms
+within one process-per-run sweep, 3 reps, medians; scripts in the session scratchpad,
+`scripts/spec-equivalence.ts` committed):
+
+| | plain | `--draft` (p_min 0.3) | acceptance |
+|---|---|---|---|
+| 27B, code prompt | 25.0-25.2 tok/s | 26.4-26.7 (+4.8 to +6.8%) | 87.4% |
+| 27B, chat prompt | 20.6-21.5 tok/s | 20.9-23.1 (+1.5 to +7.4%) | 65.9-73.7% |
+| 35B-A3B, code prompt | 105.1 tok/s | 93.0 (-11.5%) | 81.3% |
+| 35B-A3B, chat prompt | 105.5 tok/s | 92.1 (-12.7%) | 82.8% |
+
+The 27B rows are ranges across two independent interleaved runs rather than one run's
+median, because that model's run-to-run spread is wide enough to matter (docs/decisions.md
+"Measurement discipline", and the 27B caveat under TODO P11): within a run the reps are
+tight — 26.9/26.7/26.7 against 24.8/25/25 on the code prompt — but the level shifts
+between runs. The sign is stable; the magnitude is ±2 points. The 35B rows repeated to
+within 1%.
+
+The drafter proposes well on both models — 85-95% acceptance at `p_min` 0.5-0.9, and a
+27B run at `p_min` 0.9 accepted 54 of 54. The 35B's loss is not a drafting failure.
+
+**The 35B loses ~12% before it drafts anything.** An arm with `--draft-p-min 1.1`, where
+no drafter token can ever clear the threshold and 119 of 127 rounds pause, still decodes
+at 92.6-92.7 tok/s against 105.1-105.5 plain — the same loss as the best drafting arm.
+The cost is the drafter's per-round cache sync: every committed token runs `encode` (an
+8-tap concat through a [2048, 16384] `fc`) plus six layers of `wk`/`wv` projections,
+QK-norm, rope and two `slice_set`s, about 14 small Metal dispatches for ~1.2 ms. That is
+12% of a 9.5 ms plain step and 2.8% of the 27B's 43 ms one, which is the whole difference
+between the two models' verdicts. It is dispatch-bound, not FLOP-bound — the same disease
+the MoE glue fusion cured — and it is mandatory while a drafter is attached, because a
+drafter whose cache falls out of step with the target's can never resume speculating.
+
+**The verify forward gets almost no batching win, which is the real ceiling.** Under an
+armed rollback trail a multi-token chunk falls back to the frozen reference scan
+(linear_attn.rs:194-205), and that scan walks tokens one at a time in candle ops. So the
+layers that are 48 of the 27B's 64 and 30 of the 35B's 40 cost the same per position in a
+16-token verify as in 16 single-token steps: measured 245 ms for a ~6-position verify on
+the 27B against a 43 ms plain step, i.e. 39 ms per verified position. Speculative decoding
+is a bet that verifying N tokens costs far less than decoding them one at a time; on this
+architecture that bet currently pays only in the attention and FFN layers. **The
+K-snapshot fused verify is therefore not an optimization of P9 but the precondition for
+it** — TODO.md P9 carries it with the structural note that both scan kernels already hold
+each thread's state slice in registers across the timestep loop, so emitting per-token
+snapshots is one guarded store plus a wider output buffer.
+
+**Tuning.** `draft_p_min` swept over {0.2, 0.3, 0.5, 0.7, 0.9} on the 27B: 0.3 is the only
+value that came out ahead of plain on both prompt kinds in every run (0.5 lost on the chat
+prompt twice), so the default moves 0.5 → 0.3 in `SpecParams`, the CLI and the serve
+config. Lower `p_min` drafts longer at lower acceptance, and that wins precisely because
+the verify cost is near-linear in its span — with no batching penalty to pay, a longer
+span amortizes the round's fixed cost. That reasoning is fitted to the reference-scan cost
+curve and should be re-run when the fused verify lands. `pause_margin` stays 1.0: the
+controller earns it on the 27B, where always-drafting (`--draft-pause-margin 0`) measured
+21.8 tok/s against the controller's 25.8 and plain's 23.3. It cannot help the 35B, whose
+loss is charged to rounds the controller has already paused.
+
+**`--draft` stays opt-in.** The flip to opt-out was conditional on the controller holding
+a never-materially-slower property on both models. It does not: no setting of `p_min` or
+`pause_margin` can recover a 12% loss that is incurred on paused rounds. The CLI, serve
+config and `--init` template text all lose their "not adapted yet, fails at load" wording
+and gain the measured reason instead.
+
+**Equivalence, in two modes.** `scripts/spec-equivalence.ts` diffs `--draft` against
+`--no-draft`. Greedy mode (temperature 0) checks the verify walk's token selection; it
+found 11 of 12 comparisons byte-identical, the twelfth forking on the 27B chat prompt at an
+adjective ("accessible" vs "educational"). That is the batched verify forward reassociating
+its f32 sums differently from the single-token forward and flipping a near-tie — the same
+class the decode parity tier's near-tie rule grades, and the same one already recorded for
+the fused delta scan under P8a.
+
+Greedy mode has a structural blind spot, though, raised by the second-family review: at
+temperature 0 the argmax path never draws from the seeded RNG, so no amount of greedy
+agreement can show that the spec loop advances the SAMPLER STREAM the same number of times
+the plain loop does — one extra or missing draw would reroute every subsequent token. A
+`sampled` mode now covers it: temperature 0.8 at a fixed seed with `--draft-p-min 0` and
+`--draft-pause-margin 0`, so every round drafts a full block and nothing pauses (auto-pause
+is what makes a temperature>0 run irreproducible from a seed, so it has to be off).
+Result: the 35B is byte-identical on both prompts with 360 and 435 drafted tokens over 384
+and 464 verified positions, and the 27B is identical on the code prompt with 315 drafted.
+**The sampler stream is in lockstep.** The 27B chat prompt forks in sampled mode too, at
+line 12 — deep enough that the stream was demonstrably in step for over a hundred tokens,
+which is the near-tie signature rather than the desync one (a desync reroutes the first
+sampled token, and the script says so when a sampled-mode fork lands on line 1).
+
+Both modes now also refuse to report OK on a run that drafted nothing: a comparison that
+paused into plain decoding exercises no verify and no rollback, so its agreement means
+nothing, and the script says NO COVERAGE instead. It rebuilds before comparing and checks
+the binary is not older than the newest source, so it cannot bless a stale build.
+
+**Deleted, added, changed.** Deleted: the `decoder_arch` requirement, the `enc.aux_norm`
+tensor and its per-tap norm-and-scale, the `attn_gate` tensor and its softplus output
+gate, the `softplus` helper, and the within-block causal mask. Added: `sliding_window` +
+`swa_layers` on `DflashConfig` with a `layer_window(il)` accessor, `value_bool`, the
+narrow-plus-mask windowed attention, `Model::draft_kv_bytes_per_token()` (40 KiB/token on
+the 27B's five layers, 48 on the 35B's six — `serve/config.rs`'s hardcoded 35B-only
+constant now derives from it), and `scripts/spec-equivalence.ts`. `attach_drafter` also
+gained the mismatched-pairing check the CLI path never needed while every drafter load
+failed: nothing in a sidecar's metadata names its target, so `--draft <path>` can pair the
+27B drafter with the 35B, which used to reach `set_spec_taps`'s `assert!` and panic. It is
+now an error naming both numbers, and the hidden-size mismatch is caught at attach rather
+than at the first forward. Review caught that serve had the same hole one level earlier:
+`check_draft_geometry` compared head counts but not hidden size, and the tap check alone
+does not separate the two sidecars in one direction — the 35B-A3B drafter's translated
+taps top out at 37, inside the 27B's 64 layers — so `xwen serve --model-size 27b --draft
+<35B drafter>` passed startup validation and failed the first job instead. The check is
+now threaded through `read_draft_config` from the target's `XwenConfig`, which is what
+`validate_model` exists to do. Tests: the two red ones
+rewritten against real sidecar geometry and parameterized over both models (the alias test
+now injects 2100 positions, past the 27B's 2048 window, so the narrow-plus-mask path runs
+on real weights), plus three new ones — a windowed forward graded against the scalar
+reference and against an unwindowed twin, a perturbation test proving the last block row
+informs the first, and a config test for the window keys. `ops/bf16.rs`'s `DRAFTER_SHAPES`
+covers both sidecars' twelve production matmul shapes. Suite: **760 passing, 0 failing**,
+the two deliberately-red tests among them.
+
+## 2026-07-29 — The DeltaNet scan is 3% of 27B prefill: llama.cpp's decomposition measured slower, and the premise behind P8b refuted
+
+**Context.** The head-to-head entry below named the sequential DeltaNet scan as the cause
+of the 27B's 1.8-2.1x prefill loss, and a mapping pass then established that llama.cpp's
+Metal path does NOT run the chunked form it advertises — its fused
+`ggml_gated_delta_net` op pre-empts the chunked graph (delta-net-base.cpp:437-446), so it
+runs the same sequential scan we do, under a far more parallel decomposition. That made
+re-decomposing our kernel the obvious lever and demoted P8b's chunked scan. This arc
+built the re-decomposition. It lost, and finding out why cost the premise as well.
+
+**Built.** `kernel_delta_scan_v2` is llama.cpp's shape adapted to our layouts: one
+SIMDGROUP owns one state value-column for the whole T loop, both key-dim contractions
+collapse to `simd_sum`, no barrier appears anywhere in the timestep loop, and the grid is
+1536 threadgroups at the 27B geometry against the shipped kernel's 192. It needs q and k
+pre-normalized, so `kernel_delta_l2norm` hoists the L2 clamp-norm out into its own
+dispatch. Both are bounded against the frozen reference scan exactly as the shipped
+kernel is, at the same tolerances — no parity schema change, floors untouched.
+
+**Measured, and it lost.** Isolation timing per DeltaNet layer (`delta_scan_timing`,
+plateau ms, each arm inclusive of its q/k norm), and interleaved end-to-end (median of 3
+rounds, arm order flipped each round, full power `lowpowermode 0` start and end,
+`XWEN_BENCH=1`, `--no-draft`, committed fixtures):
+
+| isolation, one layer | 27B @880 | 27B @4096 | 35B @880 | 35B @4096 |
+|---|---|---|---|---|
+| shipped | 1.97 | 8.56 | 1.57 | 6.31 |
+| llama.cpp shape | 2.73 | 14.81 | 1.88 | 8.93 |
+
+| end to end, tok/s | 27B shipped | 27B v2 | 35B shipped | 35B v2 |
+|---|---|---|---|---|
+| prefill @880 | 296.9 | 307.6 | 2504.9 | 2497.2 |
+| prefill @3851 | 262.1 | 257.7 | 2312.3 | 2398.6 |
+| decode n=256 @630 | 22.0 | 22.1 | 103.3 | 102.2 |
+
+The end-to-end arms are a tie in both directions — which is the actual finding, not a
+measurement failure. **The scan is 3% of 27B prefill.** 48 layers × 1.97 ms is 95 ms of a
+2.96 s prefill at 880 tokens; × 8.56 ms is 411 ms of 14.2 s at 3851. A free scan buys
+~297 → ~307 tok/s against llama.cpp's 486. The 1.7x isolation regression at 4096 shows up
+end-to-end as exactly the 1.7% it should, which is the cross-check that the share is
+right. The mechanism of the loss is q/k read amplification: our threadgroup stages one
+normalized q and k vector per threadgroup per timestep, llama.cpp's shape gives every
+simdgroup its own copy — 32x the L2 traffic — and at head dim 128 each lane owns 4 state
+entries, so two `simd_sum`s ride on 8 useful FMAs. Hoisting the norm alone loses too: the
+extra dispatch rewrites the whole q|k plane (0.52 / 1.80 ms) to save a reduction already
+amortized over a threadgroup.
+
+**Shipped: nothing.** The scan kernel is byte-identical to what it was before this arc,
+which both gates confirm by reproducing every number exactly (35B strict 1.000000, mm
+0.999631, decode 63/63/62 with 0 mismatches, ppl Δnll 0.000791; 27B strict and mm both
+1.000000, decode 64/64/64 with 0 mismatches, ppl Δnll 0.000330). `parity-gate.ts`'s
+`baseEnv()` strips `XWEN_DELTA_SCAN_V2` alongside the other presence-based switches —
+unlike its siblings it has no provenance field, so a stray shell value would have applied
+to both sides and passed the gate while grading the wrong kernel. The two new kernels stay
+behind `XWEN_DELTA_SCAN_V2=1` as a runnable refutation — the kernel they mirror is
+vendored in this repo and will invite the same proposal again — along with
+`ops::delta_l2norm`, its bounded test, and the `delta_scan_timing` bench that produced
+the table. 681 lib tests pass with the two dflash `real_file` tests staying deliberately
+red, 63 parity tests pass (3 ignored, the ones the gate feeds), and the delta and
+linear-attn suites pass under `XWEN_DELTA_SCAN_V2=1` as well as under the default.
+`scan_matches_reference` picked up seq 67 — prime, and a multiple of no tile or simd
+width the scan is built from.
+
+**What this hands off.** The 27B prefill gap is still ~1.8-2.1x and is now known NOT to
+be in the DeltaNet layers. It is in the dense projections; that is the next arc's
+question, and it should start from a per-stage profile rather than from a reading of
+llama.cpp's kernels. P8b's chunked scan keeps its rollback-replay rationale and loses its
+prefill bounty (see TODO.md and decisions.md, "The DeltaNet scan decomposition").
+
+## 2026-07-29 — Two-family review of the MoE-glue + top-p diff: kernels clean twice over, one real hole in the gate script
 
 **Context.** Standard post-arc review of what became commit `bec5fa2`, one Claude
 reviewer and one outside-model pass (Codex CLI, gpt-5.6-sol, xhigh effort) over the full

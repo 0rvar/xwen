@@ -365,6 +365,25 @@ impl QLinear {
     }
 }
 
+/// A rank-2 quantized weight `[out_dim, in_dim]` as raw device bytes, for the
+/// vendored dense cooperative-tensor prefill gemm (`ops::matmul_dense_q`). The
+/// buffer is the SAME allocation the companion `QLinear` matmuls against — both
+/// come from one `QStorage::from_data` upload (`qlinear_with_plane`), so a plane
+/// costs no extra device memory. That matters here more than anywhere else in
+/// the loader: the 27B's FFN weights are 14 of its 19 GB, and a materialized f16
+/// copy of them would not fit at all.
+pub struct QuantPlane {
+    /// The weight's quantized bytes as a raw device buffer.
+    pub buffer: Arc<Buffer>,
+    /// Byte offset of the weight's first block inside `buffer` — 0 for the
+    /// dedicated allocation `qlinear_with_plane` builds. Every dispatch
+    /// consuming `buffer` must add it.
+    pub base_off: usize,
+    pub dtype: GgmlDType,
+    pub out_dim: usize,
+    pub in_dim: usize,
+}
+
 /// Stacked per-expert weights kept in their quantized GGUF layout,
 /// `[n_expert, n_out, k]`, whose device buffer the `ops::{mv_id,mm_id}`
 /// kernels index directly by expert id.
@@ -579,6 +598,30 @@ impl Weights {
             out_dim,
         };
         Ok((qlinear, buffer, dtype))
+    }
+
+    /// A rank-2 weight `[out_dim, in_dim]` as a `QLinear` PLUS a `QuantPlane`
+    /// view of the same device allocation, so prefill can dispatch the vendored
+    /// dense cooperative-tensor gemm over the identical bytes `QLinear::forward`
+    /// reads at decode. Built on `qlinear_with_buffer` — one upload, two views,
+    /// no extra device memory.
+    ///
+    /// The plane is `None` off Metal (no buffer to hand out) and for any dtype
+    /// or `in_dim` the vendored kernel is not instantiated for; the caller then
+    /// stays on `QLinear::forward` everywhere.
+    pub fn qlinear_with_plane(&self, name: &str) -> Result<(QLinear, Option<QuantPlane>)> {
+        let (qlinear, buffer, dtype) = self.qlinear_with_buffer(name)?;
+        let (out_dim, in_dim) = (qlinear.out_dim, qlinear.in_dim);
+        let plane = buffer
+            .filter(|_| crate::ops::dense_mm_supported(dtype, in_dim))
+            .map(|buffer| QuantPlane {
+                buffer,
+                base_off: 0,
+                dtype,
+                out_dim,
+                in_dim,
+            });
+        Ok((qlinear, plane))
     }
 
     pub fn rms_norm(&self, name: &str, eps: f64) -> Result<RmsNorm> {

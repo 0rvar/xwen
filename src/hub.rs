@@ -42,6 +42,10 @@ struct Checkpoint {
     drafter: &'static str,
     model_size: &'static str,
     drafter_size: &'static str,
+    /// Decoder layers in the DFlash sidecar (`dflash.block_count`). The only
+    /// drafter dimension the two sidecars differ in — 32 Q / 8 KV heads at
+    /// head_dim 128 on both — so it alone decides what a drafter cache costs.
+    drafter_layers: usize,
     geometry: CacheGeometry,
 }
 
@@ -75,6 +79,7 @@ const QWEN_27B: Checkpoint = Checkpoint {
     drafter: "dflash-Qwen3.6-27B-BF16.gguf",
     model_size: "19.1 GB",
     drafter_size: "3.5 GB",
+    drafter_layers: 5,
     // 64 layers, full attention every fourth.
     geometry: CacheGeometry {
         full_attn_layers: 16,
@@ -94,6 +99,7 @@ const QWEN_35B_A3B: Checkpoint = Checkpoint {
     drafter: "dflash-Qwen3.6-35B-A3B-BF16.gguf",
     model_size: "20.4 GB",
     drafter_size: "0.8 GB",
+    drafter_layers: 6,
     // 40 layers, full attention every fourth.
     geometry: CacheGeometry {
         full_attn_layers: 10,
@@ -149,6 +155,15 @@ impl Model {
     pub const fn kv_bytes_per_token(self) -> usize {
         let g = &self.checkpoint().geometry;
         g.full_attn_layers * g.n_kv_head * g.head_dim * 2 * 2
+    }
+
+    /// Bytes of DFlash drafter KV cache one more token of context costs, when a
+    /// drafter is attached: every sidecar layer's K and V over 8 KV heads at
+    /// head_dim 128, f32 (the drafter's cache is stored exact — see
+    /// `DrafterImage`). 40 KiB/token on the 27B's five layers, 48 on the
+    /// 35B-A3B's six.
+    pub const fn draft_kv_bytes_per_token(self) -> usize {
+        self.checkpoint().drafter_layers * 2 * 8 * 128 * 4
     }
 
     /// Bytes one prefix-cache snapshot costs, whatever position it covers.
@@ -312,6 +327,30 @@ mod tests {
         // prose that quotes a worst case has to be read against.
         assert!(Model::Qwen27B.kv_bytes_per_token() > Model::Qwen35BA3B.kv_bytes_per_token());
         assert!(Model::Qwen27B.snapshot_bytes() > Model::Qwen35BA3B.snapshot_bytes());
+    }
+
+    /// The drafter cache figure, pinned for the same reason as the target's: it is
+    /// quoted in the `serve --init` template and in `--draft-ctx`'s help, where a
+    /// wrong number becomes an operator's wrong memory budget.
+    ///
+    /// The two DFlash sidecars differ only in layer count — both are 32 Q / 8 KV
+    /// heads at head_dim 128 — so that is the only factor that varies. K and V are
+    /// stored f32, not f16 like the target's: the drafter is tiny and the exactness
+    /// keeps its export/import round trip free of rounding.
+    #[test]
+    fn the_drafter_cache_figure_follows_each_sidecars_layer_count() {
+        // 5 drafter layers x (K and V) x 8 KV heads x 128 head_dim x 4 bytes.
+        assert_eq!(Model::Qwen27B.draft_kv_bytes_per_token(), 40 * 1024);
+        // 6 x 2 x 8 x 128 x 4.
+        assert_eq!(Model::Qwen35BA3B.draft_kv_bytes_per_token(), 48 * 1024);
+
+        // The drafter ordering is the OPPOSITE of the target's: the 27B has the
+        // bigger KV cache and the smaller drafter cache, so neither model is the
+        // worst case on both and a sizing estimate has to name which it means.
+        assert!(
+            Model::Qwen27B.draft_kv_bytes_per_token()
+                < Model::Qwen35BA3B.draft_kv_bytes_per_token()
+        );
     }
 
     fn scratch(label: &str) -> PathBuf {

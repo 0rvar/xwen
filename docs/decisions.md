@@ -276,6 +276,78 @@ output. The fused router runs the network verbatim, ties and all
 all-equal case comes out as the identity permutation, which makes the non-stability easy
 to miss in a casual test (2026-07-29).
 
+**The dense-FFN prefill gemm dequantizes in-kernel; it does not dequantize to a
+scratch plane.** The 27B's prefill was 1.8-2.1x behind llama.cpp, and the profiling pass
+found **66-85%** of its wall time in the dense SwiGLU FFN — 64 layers, 17408-wide, Q4_K —
+running through `QLinear` → candle's `QMatMul` → `kernel_mul_mm_q4_K_f32` at ~12-13
+TFLOP/s, where the same shapes hit 28-36 TFLOP/s on the Metal-4 cooperative-tensor f16
+gemm. (A band, not a point: the FFN row of that budget is derived from an isolated T=512
+rate that is ~7-8% pessimistic against a real forward, which is why the @880 budget sums
+to 106.8% of wall. See log.md 2026-07-29.)
+
+**The gap is kernel efficiency, not a memory wall, and the argument needs no peak-
+bandwidth number.** Do not write "both are far below the machine's peak" — nobody has
+measured this machine's peak. The airtight form: at T=512 the Q4_K arm reads 50.14 MB of
+weights against the f16 arm's 178.32 MB, so it moves **3.6x fewer weight bytes and takes
+2.4x longer** (10.9 vs 66.0 GB/s). If either arm were bandwidth-bound, the one moving
+fewer bytes would be the faster one. It is not (2026-07-29).
+
+Two ways to close it. (a) Dequantize each weight to a transient f16 scratch buffer per
+layer per chunk and feed the existing `f16_t.metal` gemm. (b) Port the dense
+cooperative-tensor kernel to read Q4_K directly and dequantize each tile in registers.
+**(b) shipped**, on arithmetic that is not close: a `[17408, 5120]` f16 plane is 178 MB
+written and 178 MB read back against the 50 MB of Q4_K the kernel would otherwise
+stream — about 8x the weight traffic, ~0.68 ms per projection at 600 GB/s against the
+gemm's own 3.2 ms, so roughly a fifth of the win handed back plus a 178 MB scratch
+allocation. The tile dequant reads each super-block once and never leaves registers.
+
+The port itself was small because the pieces already existed: `f16_t.metal` is the
+dense tensor gemm (64-row x 128-token tiles, the f32 activation read straight from
+device as a cooperative tensor, no B staging), and `mm_id.metal` has ggml's Q4_K tile
+dequant. `dense_mm.metal` is the first with the second substituted into its A-tile
+phase — which is also exactly how ggml writes it, templated over
+`(block_q, nl, dequantize_func)`. The 128-wide token tile is what keeps it from being
+dequant-bound the way the MoE gather is at 32: each dequantized element feeds 128 MACs
+(2026-07-29).
+
+**The dense-FFN gemm crosses over at exactly 33 tokens, and that is a tile boundary, not
+a tuned number.** `DENSE_MM_MIN_SEQ = 32`, exclusive (`seq > 32`), following
+`F16_MM_MIN_SEQ` and ggml's `ne11_mm_min` rather than `MM_ID_MIN_SEQ`'s inclusive
+convention. candle's kernel tiles tokens 32 wide and the vendored one 128, so up to 32
+tokens both sit on the same launch-latency floor — measured 1.01-1.05x, a wash — and at
+33 candle takes a second token tile while the vendored gemm does not: 1.20x there,
+1.6-1.9x at 128, and 2.4-3.0x at a 512-token chunk. Below the boundary there is no
+throughput reason to take the vendored kernel and a positive reason not to (next entry),
+so the threshold sits where the win starts rather than where it would be tidy
+(2026-07-29).
+
+**The dense-FFN gemm is LESS accurate than the `QMatMul` chain it replaces, and that is
+the trade being made.** Against a dequantize-then-f32 oracle at the 27B FFN shapes it
+lands ~4.1e-4 rel_l2 where candle's kernel lands ~1.9e-4; the two differ from each other
+by ~3.7e-4. Both stage the weight tile as half and accumulate in f32 — the extra ~2e-4
+is matmul2d's reduced-precision tensor-core path, which is where the throughput comes
+from (the `false` variant of that descriptor flag runs at classic speed). This is not a
+new precision class and not a new decision: the attention prefill gemm made the
+identical trade, docs/parity.md §3b already names the ~2e-4 band the fork's prefill
+precision class, and llama.cpp sets the same flag for its own dense FFN prefill. So the
+kernel is graded like the DeltaNet scan rather than like the glue kernels —
+`XWEN_DENSE_MM_CLASSIC=1` is pinned on BOTH sides of the strict tier, a `dense_mm`
+provenance field (schema v7, grandfather `classic`) proves which side ran what, and the
+bounded mm/decode/ppl tiers carry the signal against frozen floors. Worth stating
+plainly because the reflex is to treat a faster kernel as free: this one costs precision,
+the gate is what decides the cost is acceptable, and the kill-switch is what makes the
+question answerable later (2026-07-29).
+
+**The FFN prefill planes cost no device memory, which is the only reason they exist.**
+17.1e9 FFN parameters as f16 is 34 GB — the permanent-plane approach the attention
+projections use (`Weights::attn_proj`'s dual f16/q8_0 storage) is arithmetically
+impossible here. `Weights::qlinear_with_plane` instead reuses `qlinear_with_buffer`'s
+construction: read the quantized bytes once, upload once via `QStorage::from_data`,
+retain the buffer, then wrap that same storage in the `QTensor`. The `QLinear` decode
+path and the prefill gemm index one allocation. A checkpoint whose FFN dtype has no
+vendored kernel, or a non-Metal load, gets `None` and runs `QLinear` at every seq
+(2026-07-29).
+
 **The recurrent state is fp32, non-negotiable.** `mamba_ssm_dtype: "float32"` upstream;
 llama.cpp hardcodes F32 for both conv and delta states. State per layer per sequence:
 `(d_conv−1)·conv_dim` floats conv + `128·128·H_v` floats delta (2 MiB on the 35B)
@@ -312,6 +384,55 @@ Kept behind an opt-in `XWEN_MOE_DUAL=1` rather than deleted: it is a measured, g
 bitwise-proven artifact, and the conclusion is device-specific. Re-price it before
 reusing it, do not assume it (2026-07-29).
 
+**The DeltaNet scan decomposition: llama.cpp's Metal shape is REFUTED here, and the
+scan was never the 27B prefill gap in the first place.** Two claims, measured together,
+because the second is what makes the first not worth revisiting.
+
+llama.cpp's `kernel_gated_delta_net_impl` (ggml-metal.metal) gives ONE SIMDGROUP each
+state value-column end to end: both key-dim contractions become `simd_sum`, the timestep
+loop holds no barrier at all, and the grid is `(S_v/nsg) × H × n_seqs` — 1536
+threadgroups at the 27B geometry against our 192, eight times the parallelism. It is
+transplanted here as `kernel_delta_scan_v2` plus the hoisted `kernel_delta_l2norm` the
+shape requires, adapted to our transposed state layout and our end-of-scan `1/sqrt(128)`.
+It is SLOWER, at every geometry and every length. Isolation timing of one layer's whole
+recurrence (`delta_scan_timing`, plateau ms, both arms inclusive of their q/k norm):
+
+| geometry | seq 880 | seq 4096 |
+|---|---|---|
+| 27B (16 K / 48 V), shipped | 1.97 | 8.56 |
+| 27B, llama.cpp shape | 2.73 | 14.81 |
+| 35B-A3B (16 / 32), shipped | 1.57 | 6.31 |
+| 35B-A3B, llama.cpp shape | 1.88 | 8.93 |
+
+The mechanism is the same one the dual-weight gather taught, running the other way.
+Parallelism was not the binding constraint; q/k READ AMPLIFICATION is. Our kernel stages
+one normalized q and k vector into threadgroup memory per threadgroup per timestep, so
+that traffic scales with the 192 threadgroups. Giving every simdgroup its own column
+also gives every simdgroup its own copy of those reads — 6144 of them per timestep at
+the 27B geometry, 32x the L2 traffic — and at head dim 128 each lane owns only 4 state
+entries, so two `simd_sum` reductions sit on top of 8 useful FMAs per lane per timestep.
+The barriers and the redundant in-register norm that the shape removes are cheaper than
+that. Hoisting the norm out on its own is a loss too, for a related reason: the separate
+dispatch reads and rewrites the whole q|k plane (0.52 ms at seq 880, 1.80 ms at 4096,
+27B) to save a reduction that was already amortized over a threadgroup.
+
+The second claim is the one that closes the direction. **The scan is 3% of 27B prefill,
+so no decomposition of it can be the 1.8-2.1x llama.cpp prefill gap.** 48 DeltaNet
+layers × 1.97 ms is 95 ms of a 2.96 s prefill at 880 tokens, and × 8.56 ms is 411 ms of
+a 14.2 s prefill at 3851. Deleting the scan outright would move 27B prefill from ~297 to
+~307 tok/s against llama.cpp's 486. The end-to-end A/B corroborates the isolation
+numbers to within noise — the llama.cpp shape costs 48 × 6.25 ms ≈ 300 ms at 4096, which
+is 1.9% of the wall time, and the measured arms differ by 1.7%. On the 35B the scan is a
+larger slice (30 layers, 11-13% of prefill) but that model is already near llama.cpp
+parity. Whatever the 27B loses, it loses in the dense projections, not here (2026-07-29).
+
+`kernel_delta_scan_v2` and `kernel_delta_l2norm` are kept behind `XWEN_DELTA_SCAN_V2=1`
+rather than deleted, on the `XWEN_MOE_DUAL` precedent and for a sharper reason: the
+kernel they mirror is sitting in `reference/llama.cpp` inviting the same proposal, so the
+refutation is worth more as a runnable arm than as a paragraph. `delta_scan_timing`
+(src/ops/delta.rs, `#[ignore]`d) is the instrument — re-run it before believing any
+future claim about the scan's cost, including this one.
+
 ## Speculative decoding
 
 **dflash.rs stays in the fork — a removal decision was made and reversed within the
@@ -322,7 +443,8 @@ layers, taps [2,17,32,47,62]; 35B: 6 layers, taps [2,7,12,17,23,28,33,38]). The
 subsystem is directly adaptable; adaptation (tap wiring, decoder_arch check, mask token)
 is tracked in TODO.md. llama.cpp additionally implements recurrent-state rollback
 specifically for qwen35/qwen35moe, confirming spec decode is viable on the hybrid
-(2026-07-28).
+(2026-07-28). LANDED 2026-07-29: the adaptation shipped and both sidecars load, draft and
+verify correctly — see the entries below for what it cost and why it is still opt-in.
 
 **A DeltaNet layer's spec-decode rollback is a recorded per-token trail, not a
 truncation — and it costs about a gigabyte while a verify walk is in flight.** A
@@ -344,20 +466,94 @@ replay a short prefix cheaply would let the trail be dropped entirely (2026-07-2
 arch as one extra full-attention block (`blk.64`/`blk.40` + `nextn.*` tensors) with a
 plain KV cache. Evaluate only after DFlash adaptation lands or fails (2026-07-28).
 
-**Drafting is OPT-IN until the Qwen adaptation lands, reversing laguna's opt-out
-default.** Laguna shipped `DEFAULT_DRAFT_ENABLED = true`: no flag meant the official
-drafter. On xwen that made every zero-flag invocation abort. `xwen serve` resolved the
-drafter to the symbolic `official`, downloaded the sidecar, and failed in
-`validate_model` before the listener bound; `xwen generate` failed the same way after
-loading the target. The error is `missing GGUF key dflash.decoder_arch` — the shipped
-sidecars carry no `decoder_arch` key at all, so the failure precedes the
-`decoder_arch == "laguna"` check that adaptation was expected to repoint, and two more
-blockers sit behind it (`enc.aux_norm` and `blk.N.attn_gate` are absent from the
-shipped tensor tables). The load-time checks stay strict — asking for a drafter that
-cannot load should fail loudly — but nothing asks by default. Naming one still opts in
-three ways: `--draft <gguf>`, `--draft official`, or `draft.path` in the config, the
-last of which now enables on its own rather than needing `enabled = true` beside it.
-Flips back to `true` when TODO.md P9 lands (2026-07-28).
+**Drafting is OPT-IN, reversing laguna's opt-out default.** Laguna shipped
+`DEFAULT_DRAFT_ENABLED = true`: no flag meant the official drafter. On xwen that made
+every zero-flag invocation abort, because the shipped sidecars carry no
+`dflash.decoder_arch` key and two more blockers sat behind that one. The load-time checks
+stay strict — asking for a drafter that cannot load should fail loudly — but nothing asks
+by default. Naming one opts in three ways: `--draft <gguf>`, `--draft official`, or
+`draft.path` in the config, the last of which enables on its own rather than needing
+`enabled = true` beside it (2026-07-28).
+REVISED 2026-07-29 (P9): the load blockers are gone and both sidecars draft well, but
+**opt-in stays**, now for a measured reason rather than a broken one. The flip to opt-out
+was conditional on the auto-pause controller holding a never-materially-slower property on
+both checkpoints, and it cannot: on the 35B-A3B an attached drafter costs ~12% of decode
+on rounds where it drafts NOTHING (see the next entry), which is a cost the controller has
+no lever over. The 27B gains 1.5-7.4% depending on prompt and run. A default that helps
+one checkpoint by single digits and takes 12% off the other is not a default. Revisit when
+the fused verify and a cheaper inject land.
+
+**The drafter's per-token cache sync is what decides whether speculation pays, not its
+acceptance rate.** Both Qwen sidecars propose well — 85-95% acceptance, and 100% at
+`p_min` 0.9 — yet speculation is a 4.8-7.4% win on the 27B and an 11.5-12.7% loss on the
+35B-A3B. The discriminator is a fixed cost, not a probabilistic one: every committed token
+must run `encode` plus the drafter's per-layer K/V injection to keep its cache in step with
+the target's, about 14 small Metal dispatches for ~1.2 ms. Measured directly by an arm
+that can never draft (`--draft-p-min 1.1`, 119 of 127 rounds paused): 92.6 tok/s against
+105.1 plain on the 35B, indistinguishable from the best real drafting arm. That is 12% of
+a 9.5 ms plain step and 2.8% of the 27B's 43 ms one. The sync is mandatory while a drafter
+is attached — a drafter whose cache falls out of step can never resume speculating
+(`drafter_span_rows` returns 0) — so the only fixes are to make it cheaper (it is
+dispatch-bound, like the pre-fusion MoE glue) or to let the controller detach entirely
+rather than merely pause. Both are ledgered under TODO.md P9 (2026-07-29).
+
+**Speculative decoding's batching win does not currently exist in the DeltaNet layers, and
+that is the ceiling on P9.** Under an armed rollback trail a multi-token chunk takes the
+frozen reference scan (linear_attn.rs:194-205), which walks tokens one at a time in candle
+ops. So the 48-of-64 (27B) and 30-of-40 (35B) layers that are DeltaNet cost the same per
+position inside a verify forward as they would as separate decode steps: 245 ms for a
+~6-position 27B verify against a 43 ms plain step, i.e. 39 ms per verified position.
+Speculation only wins on the attention and FFN layers, which is why the measured gains are
+single-digit percentages rather than the 1.39-2.29x reported elsewhere on Apple silicon.
+Accepted for this arc deliberately: the alternative was building the K-snapshot fused
+verify inside the adaptation, and the adaptation had to be verified first. The consequence
+to carry forward is that **the K-snapshot work is the precondition for speculative
+decoding to pay here, not an optimization of it** (2026-07-29).
+
+**The drafter's sliding window is implemented as a cache narrow plus a ≤15-column mask,
+not as a full-width score mask.** The sidecars window every layer but the last (2048
+positions on the 27B, 4096 on the 35B) and llama.cpp masks `p1 - p0 >= n_swa`, keeping
+`[p - window + 1, p]` on the past side. The block's 16 queries have floors spanning at
+most 15 positions, so their windows' union is one contiguous range: `attention` narrows
+the cache to it and masks only the columns between the individual floors, or not at all
+while the context still fits inside the window. The alternative — one additive mask over
+the full `[16, context]` score row — is simpler but leaves every windowed layer costing
+O(context), which throws away the only thing the window is for. With the narrow, five of
+the 27B's six drafter layers cap at 2048 positions per round and only the final full layer
+grows with depth; that retires half the argument behind `DEFAULT_DRAFT_CTX` being 8192 and
+is why re-deriving that cap is now a ledger item rather than a settled number. A
+ring-buffer cache would go further and is ledgered; the flat position-indexed cache stays
+because it is what makes `DrafterImage` a straight prefix copy (2026-07-29).
+
+**A drafter is checked against its target in exactly one place, because two places
+drifted.** Nothing in a DFlash sidecar's metadata names the checkpoint it belongs to, so
+pairing one with a target is only ever the caller's assertion, and there were two callers
+asserting it differently: `Generator::attach_drafter` on the CLI path and serve's
+`check_draft_geometry` at startup. Serve's lacked the hidden-size comparison, and the tap
+bound does not separate the two shipped sidecars in one direction — the 35B-A3B drafter's
+translated taps top out at 37, inside the 27B's 64 layers — so `xwen serve --model-size
+27b --draft <35B drafter>` passed startup validation and failed the first job, which is
+precisely what startup validation exists to prevent. Both callers now go through
+`DflashConfig::check_against_target`, so a check added for one is a check the other gets.
+It covers what can be cross-checked (hidden size, tap bounds, mask id against the target's
+vocabulary) plus what can only be checked for internal consistency (head counts and their
+divisibility, an even head dim, a block size of at least 2 — a block of 1 is the anchor
+alone and could never carry a draft). The drafter's own depth, FFN width and head counts
+describe the drafter and have nothing to be compared against (2026-07-29).
+
+**Three drafter-graph forms came from the oracle, not from the inherited code, and all
+three contradicted it.** `reference/llama.cpp/src/models/dflash.cpp` is the executable
+reference and the laguna branch it was forked from no longer exists, so where the two
+disagree the oracle wins. (1) The noise block is NON-CAUSAL —
+`llama_set_causal_attn(ctx_dft, false)` at common/speculative.cpp:1004, with the causal
+branch of the mask builder guarded by `if (causal)` at llama-kv-cache.cpp:1793. This is a
+block-diffusion drafter: it denoises the whole block in one forward, so a later block
+position informs an earlier one, and `the_noise_block_attends_to_itself_in_both_directions`
+pins it. (2) The KV-injection path applies NO `attn_norm` (dflash.cpp:252-253 projects the
+raw encoder output), while the query path does — the two paths deliberately disagree, and
+`enc.output_norm` is the injection path's only norm. (3) The encoder is three ops,
+concat → `fc` → `enc.output_norm`, with no per-tap norm or scale; the `enc.aux_norm`
+tensor the inherited code required is absent from both shipped tensor tables (2026-07-29).
 
 **Cache sizing figures are derived per checkpoint on `hub::Model`, not carried as
 constants.** `serve/config.rs` had inherited laguna's geometry verbatim:

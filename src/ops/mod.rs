@@ -2,6 +2,7 @@ pub mod attn_glue;
 pub mod bf16;
 pub mod combine;
 pub mod delta;
+pub mod dense_mm;
 mod dispatch;
 pub mod f16;
 pub mod flash;
@@ -15,7 +16,8 @@ pub mod silu_mul;
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
 pub use bf16::matmul_bf16;
 pub use combine::combine;
-pub use delta::{DELTA_HEAD_DIM, delta_ba, delta_conv, delta_gnorm, delta_scan};
+pub use delta::{DELTA_HEAD_DIM, delta_ba, delta_conv, delta_gnorm, delta_l2norm, delta_scan};
+pub use dense_mm::{dense_mm_supported, matmul_dense_q};
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
 pub use flash::flash_attn;
@@ -49,6 +51,63 @@ pub fn mm_id_min_seq() -> usize {
             .and_then(|s| s.parse().ok())
             .unwrap_or(MM_ID_MIN_SEQ)
     })
+}
+
+/// Token count the dense checkpoint's SwiGLU FFN must EXCEED for prefill to
+/// switch from candle's `QMatMul` to the vendored dense cooperative-tensor gemm
+/// (`ops::matmul_dense_q`). Exclusive, like `F16_MM_MIN_SEQ` and ggml's own
+/// `ne11_mm_min`, not inclusive like `MM_ID_MIN_SEQ`.
+///
+/// Set from the measured crossover at the 27B's production FFN shapes, and it
+/// falls exactly on a tile boundary rather than a round number: candle's kernel
+/// tiles tokens 32 wide, the vendored one 128 wide, so up to 32 tokens both fit
+/// a single token tile and run at the same launch-latency floor (measured
+/// 1.01-1.05x, i.e. a wash), while at 33 candle takes a second tile and the
+/// vendored gemm does not — 1.20x there, rising to 2.4-3.0x at a 512-token
+/// chunk (docs/decisions.md, "The dense-FFN prefill gemm"). Below the boundary
+/// there is no throughput reason to take the vendored kernel, and a positive
+/// reason not to: it is the less accurate of the two. Decode is untouched.
+///
+/// Single source of truth: `DenseMlp` gates on it and `logits-dump` records the
+/// effective value in dump provenance.
+pub const DENSE_MM_MIN_SEQ: usize = 32;
+
+/// Effective dense-FFN prefill threshold: `XWEN_DENSE_MM_MIN_SEQ=<n>` overrides
+/// the default (probe/bench knob — e.g. forcing the vendored gemm onto short
+/// spans to re-measure the crossover). Value-parsed, read once and cached;
+/// unset or unparsable falls back to `DENSE_MM_MIN_SEQ`.
+pub fn dense_mm_min_seq() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_DENSE_MM_MIN_SEQ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DENSE_MM_MIN_SEQ)
+    })
+}
+
+/// `XWEN_DENSE_MM_CLASSIC=1` reverts the dense checkpoint's SwiGLU FFN prefill
+/// from the vendored Metal-4 cooperative-tensor gemm (`ops::matmul_dense_q`,
+/// dense_mm.metal) back to candle's `QMatMul` chain — the path every token took
+/// before, and the one decode still takes at every seq.
+///
+/// Like `XWEN_ATTN_MM_CLASSIC` and unlike the combine/act/glue switches, this is
+/// NOT a bit-identity anchor, and it is not even neutral: the vendored kernel
+/// runs matmul2d's reduced-precision tensor-core path, which is where its
+/// throughput comes from, so it sits ~4.1e-4 rel_l2 from the f32 oracle at the
+/// 27B FFN shapes where the `QMatMul` chain sits ~1.9e-4 (the two differ by
+/// ~3.7e-4). That is the fork's own prefill precision class — llama.cpp sets the
+/// same descriptor flag for its dense FFN prefill, and the attention prefill
+/// gemm already made the identical trade — which is why the parity gate pins
+/// this switch on BOTH sides of the strict tier and lets the mm / decode / ppl
+/// tiers carry the signal (docs/parity.md).
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`attn_mm_classic`, `flash_classic`): any value enables it — only leaving it
+/// unset keeps the vendored gemm.
+pub fn dense_mm_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_DENSE_MM_CLASSIC").is_some())
 }
 
 /// `XWEN_NO_MM_ID=1` forces the per-token mv_id path everywhere (prefill
@@ -206,6 +265,30 @@ pub fn flash_classic() -> bool {
 pub fn delta_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_DELTA_CLASSIC").is_some())
+}
+
+/// `XWEN_DELTA_SCAN_V2=1` runs the gated-DeltaNet recurrence through
+/// `kernel_delta_scan_v2` and the `ops::delta_l2norm` dispatch it needs, instead
+/// of the shipped single-dispatch `kernel_delta_scan`. That pair is llama.cpp's
+/// Metal decomposition of the same recurrence, adapted to our layouts: a
+/// SIMDGROUP owns each state value-column end to end, both key-dim contractions
+/// collapse to `simd_sum`, no barrier appears anywhere in the timestep loop, and
+/// the grid is eight times as many threadgroups.
+///
+/// NOT the default, on measurement: giving every simdgroup its own column also
+/// gives it its own copy of the per-timestep q and k reads, and that traffic
+/// costs more than the barriers and the redundant in-register norm it removes
+/// (27B geometry, seq 4096: 14.81 ms inclusive of its norm dispatch — ~1.80 ms
+/// of it — against the shipped kernel's 8.56 ms; see docs/decisions.md, "The
+/// DeltaNet scan decomposition").
+/// Kept as a measured artifact rather than deleted, like `XWEN_MOE_DUAL`,
+/// because llama.cpp's kernel invites the same proposal again.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches: any value
+/// enables it — only leaving it unset keeps the shipped kernel.
+pub fn delta_scan_v2() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_DELTA_SCAN_V2").is_some())
 }
 
 /// `XWEN_SDPA_F32` runs the sdpa attention kernel in f32 instead of the

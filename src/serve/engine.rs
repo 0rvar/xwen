@@ -170,7 +170,7 @@ pub fn validate_model(
         // first request is far too late to learn it: speculation would simply be
         // absent, or the load would fail behind a request that had nothing to do
         // with it.
-        read_draft_config(path, cfg.n_layer)
+        read_draft_config(path, &cfg)
             .with_context(|| format!("validating the drafter {}", path.display()))?;
     }
     Ok((Arc::new(load_tokenizer()?), max_ctx))
@@ -206,63 +206,19 @@ fn read_config(path: &Path) -> Result<XwenConfig> {
 }
 
 /// Metadata-only read of a DFlash drafter, on the CPU device for the same reason
-/// [`read_config`] uses it: header and tensor index only, no Metal allocation. The
-/// tap translation is resolved and checked against `target_n_layer` here — it is the
-/// part of the drafter's metadata that can be individually well-formed and still not
-/// describe a wiring the model being served can provide.
-fn read_draft_config(path: &Path, target_n_layer: usize) -> Result<DflashConfig> {
+/// [`read_config`] uses it: header and tensor index only, no Metal allocation.
+///
+/// The drafter is judged against `target` by the same
+/// [`DflashConfig::check_against_target`] the model load runs, hoisted to startup.
+/// A drafter that turns out not to describe a wiring this model can provide is a
+/// configuration mistake, and the lazy load is far too late to learn it: that load
+/// runs behind the panic boundary around a job, so the mistake would not kill the
+/// engine — it would fail a request, and every retry after it, forever.
+fn read_draft_config(path: &Path, target: &XwenConfig) -> Result<DflashConfig> {
     let gguf = gguf::open(path, &Device::Cpu)?;
     let cfg = DflashConfig::from_gguf(&gguf.content)?;
-    check_spec_taps(&cfg.spec_tap_layers()?, target_n_layer)?;
-    check_draft_geometry(&cfg)?;
+    cfg.check_against_target(target.hidden, target.n_layer, target.vocab)?;
     Ok(cfg)
-}
-
-/// The drafter's attention geometry has to be arithmetically usable before the load
-/// touches it.
-///
-/// `head_count_kv == 0` is the one that matters most: `DflashDrafter::build` guards the
-/// head ratio with an `ensure!`, but the `%` inside it is evaluated first and a zero
-/// divisor panics there. The lazy load runs behind the panic boundary around a job, so
-/// that panic would not kill the engine — but it would fail a request on every retry,
-/// forever, for a configuration mistake. The checks here reject a malformed drafter at
-/// startup, where the operator learns about it once instead.
-fn check_draft_geometry(cfg: &DflashConfig) -> Result<()> {
-    ensure!(
-        cfg.n_head_kv > 0,
-        "the drafter declares 0 KV heads (dflash.attention.head_count_kv), which no \
-         attention geometry can be built from"
-    );
-    ensure!(
-        cfg.n_head > 0,
-        "the drafter declares 0 attention heads (dflash.attention.head_count)"
-    );
-    ensure!(
-        cfg.n_head.is_multiple_of(cfg.n_head_kv),
-        "the drafter declares {} attention heads over {} KV heads, which do not divide: \
-         grouped-query attention needs a whole number of query heads per KV head",
-        cfg.n_head,
-        cfg.n_head_kv
-    );
-    Ok(())
-}
-
-/// Every residual tap the drafter reads has to name a layer the model being served
-/// actually has.
-///
-/// `XwenModel::set_spec_taps` asserts the same bound during the model load. The lazy
-/// load runs behind the panic boundary around a job, so a drafter built against a deeper
-/// model would not kill the engine — but every request would pay a failed load and get a
-/// 500 for what is a configuration mistake, which startup is the honest place to report.
-fn check_spec_taps(taps: &[usize], target_n_layer: usize) -> Result<()> {
-    for &il in taps {
-        ensure!(
-            il < target_n_layer,
-            "the drafter reads a residual tap from layer {il} of the model being served, \
-             which has {target_n_layer} layers: this drafter was built for a deeper model"
-        );
-    }
-    Ok(())
 }
 
 fn load_tokenizer() -> Result<LagunaTokenizer> {
@@ -5442,80 +5398,57 @@ mod tests {
         assert_eq!(summary[1].image_bytes, 3 * 10 + 3 * 100 + 3 * 1000);
     }
 
-    /// A drafter built against a deeper model is refused at startup, naming both depths.
-    /// The bound is asserted again inside `set_spec_taps`, which runs on the engine thread
-    /// outside the `catch_unwind` around a job — so letting one through would not fail a
-    /// request, it would kill the engine and leave every later request with nothing to
-    /// reach.
-    #[test]
-    fn a_drafter_tapping_past_the_targets_layers_is_refused() {
-        // The shipped pairing: target_layers [2, 11, 20, 30, 39, 48] against 48 layers,
-        // translated to l_out indices, with the sentinel landing on the last layer.
-        assert!(check_spec_taps(&[1, 10, 19, 29, 38, 47], 48).is_ok());
+    /// The 35B-A3B sidecar's metadata, and the geometry of the checkpoint it
+    /// belongs to.
+    const DRAFT_TARGET_HIDDEN: usize = 2048;
+    const DRAFT_TARGET_LAYERS: usize = 40;
+    const DRAFT_TARGET_VOCAB: usize = 248320;
 
-        // The same drafter against a shallower model: its upper taps are out of range, and
-        // the first of them is the one reported.
-        let err = check_spec_taps(&[1, 10, 19, 29, 38, 47], 24).unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("29") && text.contains("24"), "{text}");
-
-        // A tap exactly at the layer count is one past the last index.
-        assert!(check_spec_taps(&[24], 24).is_err());
-        assert!(check_spec_taps(&[23], 24).is_ok());
-        // Nothing to check is not a failure; the drafter's own metadata parse rejects an
-        // empty tap list before this sees it.
-        assert!(check_spec_taps(&[], 48).is_ok());
-    }
-
-    /// The shipped drafter's metadata, for the geometry checks to vary one field of.
     fn draft_config() -> DflashConfig {
         DflashConfig {
             n_layer: 6,
-            n_embd: 3072,
-            n_head: 72,
+            n_embd: DRAFT_TARGET_HIDDEN,
+            n_head: 32,
             n_head_kv: 8,
             head_dim: 128,
-            n_ff: 12288,
+            n_ff: 6144,
             rms_eps: 1e-6,
-            rope_theta: 500_000.0,
+            rope_theta: 10_000_000.0,
+            sliding_window: Some(4096),
+            swa_layers: vec![true, true, true, true, true, false],
             block_size: 16,
-            target_layers: vec![2, 11, 20, 30, 39, 48],
-            mask_token_id: 12,
+            target_layers: vec![2, 7, 12, 17, 23, 28, 33, 38],
+            mask_token_id: 248077,
             context_length: 262144,
         }
     }
 
-    /// Drafter metadata whose attention geometry cannot be built is refused at startup.
-    /// Zero KV heads is the one that would otherwise panic — the drafter's own guard
-    /// computes the head ratio before it can report anything, and that load runs outside
-    /// the panic boundary around a job.
+    /// Serve refuses a mismatched or malformed drafter at STARTUP rather than on the
+    /// first job. The cases themselves are covered exhaustively where the check lives
+    /// (`dflash::tests::a_drafter_is_checked_against_the_target_it_will_serve`); what
+    /// this pins is that serve's preflight runs it at all, against the config of the
+    /// model being served.
+    ///
+    /// It matters because the lazy load runs behind the `catch_unwind` around a job:
+    /// a drafter that slipped through would not kill the engine, it would fail a
+    /// request and every retry after it, forever, for a configuration mistake.
     #[test]
-    fn drafter_metadata_with_an_unusable_head_geometry_is_refused() {
-        assert!(check_draft_geometry(&draft_config()).is_ok());
+    fn serve_preflights_the_drafter_against_the_model_being_served() {
+        let ok = draft_config().check_against_target(
+            DRAFT_TARGET_HIDDEN,
+            DRAFT_TARGET_LAYERS,
+            DRAFT_TARGET_VOCAB,
+        );
+        assert!(ok.is_ok(), "{ok:?}");
 
-        let err = check_draft_geometry(&DflashConfig {
-            n_head_kv: 0,
-            ..draft_config()
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("head_count_kv"), "{err}");
-
-        let err = check_draft_geometry(&DflashConfig {
-            n_head: 0,
-            ..draft_config()
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("head_count"), "{err}");
-
-        // Heads that do not divide into the KV heads: no whole number of query heads per
-        // KV head, which the drafter's own guard would reject after the load began.
-        let err = check_draft_geometry(&DflashConfig {
-            n_head: 70,
-            ..draft_config()
-        })
-        .unwrap_err();
+        // The pairing serve used to admit: the 35B-A3B drafter against the 27B. Its
+        // taps top out at 37, inside the 27B's 64 layers, so nothing but the hidden
+        // size separates the two sidecars in this direction.
+        let err = draft_config()
+            .check_against_target(5120, 64, DRAFT_TARGET_VOCAB)
+            .unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("70") && text.contains('8'), "{text}");
+        assert!(text.contains("2048") && text.contains("5120"), "{text}");
     }
 
     /// The per-request speculation report: made once, and only when speculation was

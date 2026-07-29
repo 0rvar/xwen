@@ -306,13 +306,14 @@ Env combinations that define each side (what `parity-gate.ts` sets for you):
 
 | side | env |
 |---|---|
-| Reference (all tiers) | `XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1 XWEN_MOE_GLUE_CLASSIC=1`, `--moe-impl reference` |
-| strict candidate | the first seven, PLUS `XWEN_NO_MM_ID=1 XWEN_MV_CLASSIC=1`, `--moe-impl fused` |
+| Reference (all tiers) | `XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1 XWEN_DENSE_MM_CLASSIC=1 XWEN_MOE_GLUE_CLASSIC=1`, `--moe-impl reference` |
+| strict candidate | the first eight, PLUS `XWEN_NO_MM_ID=1 XWEN_MV_CLASSIC=1`, `--moe-impl fused` |
 | mm / decode / ppl candidate | none (the shipped defaults), `--moe-impl fused` |
 
-`XWEN_DELTA_CLASSIC=1` is the load-bearing one in that list — the gate checks it as
-provenance on both sides of the strict tier (see "Provenance pins"), so a manual dump
-that omits it fails the tier rather than merely shifting numbers.
+`XWEN_DELTA_CLASSIC=1` and `XWEN_DENSE_MM_CLASSIC=1` are the load-bearing ones in that
+list — the gate checks both as provenance on both sides of the strict tier (see
+"Provenance pins"), so a manual dump that omits either fails the tier rather than
+merely shifting numbers.
 
 `XWEN_MOE_GLUE_CLASSIC=1` is the opposite case and is deliberately NOT on the strict
 candidate: the fused MoE router and block epilogue are bit-identical to the candle
@@ -331,8 +332,8 @@ TOKENS="$(bun -e 'const j=await Bun.file("tests/fixtures/parity-prompts.json").j
 
 # the reference side runs under the oracle env of the 3b table, in full:
 XWEN_ATTN_F32=1 XWEN_ATTN_MM_CLASSIC=1 XWEN_COMBINE_CLASSIC=1 XWEN_ATTN_GLUE_CLASSIC=1 \
-XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1 XWEN_MOE_GLUE_CLASSIC=1 \
-./target/release/logits-dump --model "$M" --moe-impl reference \
+XWEN_FLASH_CLASSIC=1 XWEN_ACT_CLASSIC=1 XWEN_DELTA_CLASSIC=1 XWEN_DENSE_MM_CLASSIC=1 \
+XWEN_MOE_GLUE_CLASSIC=1 ./target/release/logits-dump --model "$M" --moe-impl reference \
   --tokens "$TOKENS" --greedy 64 --output "$DIR/reference-greedy.json"
 # the candidate runs the shipped defaults — no env
 ./target/release/logits-dump --model "$M" --moe-impl fused \
@@ -413,17 +414,17 @@ candidate logit and on a candidate/reference L2-norm ratio outside
 **Provenance pins.** The tier is caller-selected with no cross-check against how the
 dump was produced, so every dump carries a `provenance` object and the gate pins each
 field per side and tier: `moe_impl`, `attn_dtype`, `attn_mm`, `attn_glue`, `sdpa`,
-`flash`, `act`, `combine`, `attn_decode`, `delta`, plus
+`flash`, `act`, `combine`, `attn_decode`, `delta`, `dense_mm`, plus
 `seq_len`/`mm_min_seq`/`no_mm_id` for
 "was the mm_id path actually active". A field missing at or after its introduction
 version is a stale binary and hard-fails; `src/parity_schema.rs` is the single source
 of truth for the version and the grandfather table. What the Qwen checkpoints report
 on the shipped path: `attn_dtype f16`, `attn_mm tensor`, `attn_decode q8`,
 `combine fused`, `attn_glue fused`, `sdpa f16`, `flash fused`, `act fused`,
-`delta fused`, `mm_variant tensor`.
+`delta fused`, `dense_mm fused`, `mm_variant tensor`.
 
-**`delta` is the one path pin that is load-bearing rather than blessed-anchor
-discipline.** The other `*_CLASSIC` kernels are bit-identical to the candle chains
+**`delta` and `dense_mm` are the two path pins that are load-bearing rather than
+blessed-anchor discipline.** The other `*_CLASSIC` kernels are bit-identical to the candle chains
 they replace, so pinning them on the reference side only anchors provenance. The
 fused gated-DeltaNet scan is not: it partitions the k- and q-contractions across
 threads and folds the q/k L2 norm through `simd_sum` where the reference runs a
@@ -435,6 +436,22 @@ must never run it, or the bounded tiers would compare the kernels to themselves;
 grandfather `classic`, so every cached pre-v6 reference dump stays valid without
 regeneration (no binary of that era had a fused path). The fused kernels are graded
 by **mm**, **decode** and **ppl**, where they run by default.
+
+`dense_mm` is the same story with a different mechanism, and the arithmetic is worth
+stating because it is the one place where a shipped kernel is knowingly less accurate
+than what it replaced. The vendored dense-FFN prefill gemm (`src/ops/dense_mm.metal`,
+seq > 32 on the dense checkpoint) runs matmul2d's reduced-precision tensor-core path:
+against a dequantize-then-f32 oracle at the 27B FFN shapes it lands ~4.1e-4 rel_l2
+where candle's `kernel_mul_mm_q4_K_f32` lands ~1.9e-4, and the two differ from each
+other by ~3.7e-4. That is the same ~2e-4 band §3b already names for the attention
+prefill gemm, and llama.cpp sets the same descriptor flag for its own dense FFN — so
+it is fork-equivalent, not novel. It is still bounded rather than bitwise, so
+`XWEN_DENSE_MM_CLASSIC=1` is pinned on both sides of **strict** and the fused gemm is
+graded by **mm**, **decode** and **ppl** against frozen floors. Introduced at schema
+version 7 with grandfather `classic` (no pre-v7 binary had the gemm), so cached
+references stay valid. Note the field is env-derived and the 35B-A3B has no dense FFN
+layer at all — on that checkpoint `dense_mm` labels the configured path, not an
+executed one, exactly as `flash` does below.
 
 **`flash: "fused"` is currently a provenance label, not a fact, on these
 checkpoints.** The field is env-derived, and `flash.metal` is compiled at head dim

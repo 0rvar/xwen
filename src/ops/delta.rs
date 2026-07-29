@@ -1,10 +1,10 @@
 //! Host side of the fused gated-DeltaNet ops (conv+silu+state, beta/decay head,
-//! recurrent scan, gated output norm). Kernel-side rounding contracts live in
-//! delta.metal: the conv and beta/decay kernels are bit-identical to the candle
-//! chains they replace, while the gated norm and the scan are bounded — each
-//! partitions across threads a reduction the reference runs in one order
-//! (simd_sum over the head dim, and the scan's contractions where the reference
-//! runs a gemm).
+//! q/k L2 norm, recurrent scan, gated output norm). Kernel-side rounding
+//! contracts live in delta.metal: the conv and beta/decay kernels are
+//! bit-identical to the candle chains they replace, while the two norms and the
+//! scan are bounded — each partitions across threads a reduction the reference
+//! runs in one order (simd_sum over the head dim, and the scan's contractions
+//! where the reference runs a gemm).
 
 use anyhow::Result;
 use candle_core::Tensor;
@@ -47,11 +47,25 @@ pub fn delta_gnorm(o: &Tensor, z: &Tensor, w: &Tensor, eps: f32) -> Result<Tenso
     dispatch::run_delta_gnorm(o, z, w, eps)
 }
 
+/// The q/k L2 clamp-norm, `x / max(||x||, eps)`, over the leading
+/// `2 * k_heads * 128` columns of the conv output — the per-K-head q planes
+/// followed by the k planes. `conv` is `[seq, conv_dim]` f32 contiguous; returns
+/// `[seq, 2 * k_heads * 128]` in the same order. v is not normalized and stays
+/// in `conv`.
+///
+/// Off the shipped path: `delta_scan`'s default kernel normalizes q and k in its
+/// own load stage, and only the `XWEN_DELTA_SCAN_V2` artifact needs this
+/// hoisted. Kept and tested alongside it.
+pub fn delta_l2norm(conv: &Tensor, k_heads: usize, eps: f32) -> Result<Tensor> {
+    dispatch::run_delta_l2norm(conv, k_heads, eps)
+}
+
 /// The delta-rule recurrence in ONE dispatch, however long the chunk:
 /// `S *= exp(g); d = (v - k·S) * beta; S += k (x) d; o = q·S / sqrt(d_k)` per
 /// timestep. `conv` `[seq, conv_dim]` is the silu'd conv output (q | k | v
-/// fused) — q and k are read from it with the tiled K-head mapping and L2
-/// clamp-normalized (`x / max(||x||, eps)`) inside the kernel, so no
+/// fused) — q and k are L2 clamp-normalized in the kernel's load stage (or by a
+/// separate `delta_l2norm` dispatch under `XWEN_DELTA_SCAN_V2`) and read with
+/// the tiled K-head mapping, so no
 /// materialized tile-and-broadcast is needed. `beta`/`g` are `[seq, v_heads]`,
 /// `s` is the incoming `[v_heads, 128, 128]` f32 state. Returns the per-token
 /// output `[seq, v_heads, 128]` and the state after the last token; `s` itself
@@ -285,6 +299,55 @@ mod tests {
         }
     }
 
+    /// UNIT 3b: the hoisted q/k norm must reproduce `linear_attn::l2_norm` over
+    /// exactly the conv output's leading q and k planes, and must leave the v
+    /// columns alone. Only the 128-term sum of squares reassociates, so this is a
+    /// tight bound rather than bit-identity. Two input scales: ordinary
+    /// activations, whose norms clear the eps floor, and activations so small
+    /// that every norm is floored — a relative comparison at that scale is what
+    /// grades the clamp form (`x / max(||x||, eps)`) rather than the rsqrt form.
+    #[test]
+    fn l2norm_matches_reference() {
+        let device = metal_device().unwrap();
+        for (ki, &(k_heads, v_heads)) in GEOMETRIES.iter().enumerate() {
+            let conv_dim = (2 * k_heads + v_heads) * HD;
+            for &seq in &[1usize, 17, 512] {
+                for &scale in &[1.0f32, 1e-9] {
+                    let seed = 0x3800 + ki as u64 * 53 + seq as u64;
+                    let raw: Vec<f32> = pseudo_random(seq * conv_dim, seed, -2.0, 2.0)
+                        .into_iter()
+                        .map(|v| v * scale)
+                        .collect();
+                    let conv = on_device(raw, (seq, conv_dim), &device);
+
+                    let got = delta_l2norm(&conv, k_heads, EPS as f32).unwrap();
+
+                    let qk_dim = 2 * k_heads * HD;
+                    let want = l2_norm(
+                        &conv
+                            .narrow(1, 0, qk_dim)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((seq, 2 * k_heads, HD))
+                            .unwrap(),
+                        EPS,
+                    )
+                    .unwrap()
+                    .reshape((seq, qk_dim))
+                    .unwrap();
+
+                    assert_close(
+                        &got,
+                        &want,
+                        2e-6,
+                        &format!("l2norm k={k_heads} v={v_heads} seq={seq} scale={scale:e}"),
+                    );
+                }
+            }
+        }
+    }
+
     /// The reference scan of `LinearAttnBlock::forward_classic`, lifted verbatim
     /// onto raw tensors: split the conv output, L2-normalize q and k, tile them
     /// up to the V-head count, then walk the delta rule one token at a time.
@@ -365,7 +428,9 @@ mod tests {
         let device = metal_device().unwrap();
         for (ki, &(k_heads, v_heads)) in GEOMETRIES.iter().enumerate() {
             let conv_dim = (2 * k_heads + v_heads) * HD;
-            for &seq in &[1usize, 2, 33, 512] {
+            // 67 is deliberately awkward: prime, and not a multiple of any tile
+            // or simd width the scan is built out of.
+            for &seq in &[1usize, 2, 33, 67, 512] {
                 let seed = 0x4000 + ki as u64 * 313 + seq as u64;
                 let conv = on_device(
                     pseudo_random(seq * conv_dim, seed, -2.0, 2.0),
@@ -528,6 +593,11 @@ mod tests {
         );
         assert!(delta_gnorm(&z3((2, 3, HD)), &z3((2, 4, HD)), &w128, 1e-6).is_err());
 
+        // l2norm: the conv row must be wide enough to hold the q|k planes it is
+        // asked to normalize.
+        assert!(delta_l2norm(&z1((2, 2 * 16 * HD - 1)), 16, 1e-6).is_err());
+        assert!(delta_l2norm(&z1((2, 2 * 16 * HD)), 0, 1e-6).is_err());
+
         // scan: head dim, head-count divisibility, conv width.
         let s_ok = z3((32, HD, HD));
         let conv_ok = z1((2, (2 * 16 + 32) * HD));
@@ -543,6 +613,7 @@ mod tests {
         assert!(delta_conv(&z1((3, 64)), &z1((0, 64)), &w).is_err());
         assert!(delta_ba(&z1((0, 8)), &a, &a).is_err());
         assert!(delta_gnorm(&z3((0, 3, HD)), &z3((0, 3, HD)), &w128, 1e-6).is_err());
+        assert!(delta_l2norm(&z1((0, 2 * 16 * HD)), 16, 1e-6).is_err());
         assert!(delta_gnorm(&z3((2, 0, HD)), &z3((2, 0, HD)), &w128, 1e-6).is_err());
         assert!(
             delta_scan(
@@ -587,6 +658,9 @@ mod tests {
         let rows = define("DELTA_TG_ROWS");
         let slice = define("DELTA_S_SLICE");
         let col_blocks = define("DELTA_COL_BLOCKS");
+        let kpl = define("DELTA_V2_KPL");
+        let sgs = define("DELTA_V2_SGS");
+        let col_tgs = define("DELTA_V2_COL_TGS");
 
         assert_eq!(
             d, DELTA_HEAD_DIM,
@@ -596,14 +670,122 @@ mod tests {
             col_blocks,
             dispatch::DELTA_COL_BLOCKS,
             "delta.metal DELTA_COL_BLOCKS and dispatch.rs DELTA_COL_BLOCKS disagree; \
-             the scan grid is sized from the Rust copy"
+             the v1 scan grid is sized from the Rust copy"
         );
-        // The same relations the kernel's own static_asserts hold it to, so a
+        assert_eq!(
+            sgs,
+            dispatch::DELTA_V2_SGS,
+            "delta.metal DELTA_V2_SGS and dispatch.rs DELTA_V2_SGS disagree; \
+             the v2 threadgroup is sized from the Rust copy"
+        );
+        assert_eq!(
+            col_tgs,
+            dispatch::DELTA_V2_COL_TGS,
+            "delta.metal DELTA_V2_COL_TGS and dispatch.rs DELTA_V2_COL_TGS disagree; \
+             the v2 scan grid is sized from the Rust copy"
+        );
+        // The same relations the kernels' own static_asserts hold them to, so a
         // `#define` edit that broke them is caught here too and not only by the
         // Metal compiler on a device.
-        assert_eq!(rows * cols, d, "the threadgroup must be DELTA_D threads");
-        assert_eq!(slice, d / rows, "state rows per thread");
-        assert_eq!(col_blocks, d / cols, "threadgroups per head");
+        assert_eq!(rows * cols, d, "the v1 threadgroup must be DELTA_D threads");
+        assert_eq!(slice, d / rows, "v1 state rows per thread");
+        assert_eq!(col_blocks, d / cols, "v1 threadgroups per head");
+        assert_eq!(kpl * 32, d, "a v2 simdgroup's lanes must cover the key dim");
+        assert_eq!(col_tgs * sgs, d, "v2 threadgroups per head");
+    }
+
+    /// Isolation timing for the recurrent scan (plus its q/k norm) at both
+    /// production geometries and both prefill chunk lengths the bench harness
+    /// uses. Multiply a number here by the model's DeltaNet layer count (27B: 48,
+    /// 35B-A3B: 30) to get the scan's share of one prefill, which is what says
+    /// whether the scan is worth optimizing at all.
+    ///
+    /// The decomposition is chosen by the cached `XWEN_DELTA_SCAN_V2` switch, so
+    /// one process times one arm; run it twice to compare. `#[ignore]`d — run on
+    /// a `pgrep`-verified free GPU with:
+    ///   cargo test --release -p xwen delta_scan_timing -- --ignored --nocapture
+    /// `XWEN_BENCH_WARMUP` / `XWEN_BENCH_ITERS` override the loop counts.
+    #[test]
+    #[ignore = "perf bench"]
+    fn delta_scan_timing() {
+        use std::time::Instant;
+
+        let device = metal_device().unwrap();
+        let get = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let (warm, iters) = (get("XWEN_BENCH_WARMUP", 5), get("XWEN_BENCH_ITERS", 20));
+        let arm = if crate::ops::delta_scan_v2() {
+            "v2     "
+        } else {
+            "shipped"
+        };
+
+        for &(k_heads, v_heads) in GEOMETRIES.iter() {
+            let conv_dim = (2 * k_heads + v_heads) * HD;
+            for &seq in &[880usize, 4096] {
+                let seed = 0x9000 + seq as u64;
+                let conv = on_device(
+                    pseudo_random(seq * conv_dim, seed, -2.0, 2.0),
+                    (seq, conv_dim),
+                    &device,
+                );
+                let beta = on_device(
+                    pseudo_random(seq * v_heads, seed + 1, 0.01, 0.99),
+                    (seq, v_heads),
+                    &device,
+                );
+                let g = on_device(
+                    pseudo_random(seq * v_heads, seed + 2, -0.6, -0.001),
+                    (seq, v_heads),
+                    &device,
+                );
+                let s0 = on_device(
+                    pseudo_random(v_heads * HD * HD, seed + 3, -0.5, 0.5),
+                    (v_heads, HD, HD),
+                    &device,
+                );
+
+                // Each iteration ends by waiting on the device rather than by
+                // reading the output back: these ops produce tens of megabytes,
+                // and a readback would time the memcpy as much as the kernel.
+                let Device::Metal(mdev) = &device else {
+                    unreachable!("metal_device() returned a non-Metal device")
+                };
+                let bench = |label: &str, f: &mut dyn FnMut()| {
+                    for _ in 0..warm {
+                        f();
+                        mdev.wait_until_completed().unwrap();
+                    }
+                    let mut times = Vec::with_capacity(iters);
+                    for _ in 0..iters {
+                        let t = Instant::now();
+                        f();
+                        mdev.wait_until_completed().unwrap();
+                        times.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    let mean = times.iter().sum::<f64>() / times.len() as f64;
+                    let plateau: f64 =
+                        times[iters / 2..].iter().sum::<f64>() / (iters - iters / 2) as f64;
+                    eprintln!(
+                        "{label} {arm} k={k_heads} v={v_heads} seq={seq}: mean {mean:.3} ms | \
+                         plateau {plateau:.3} ms"
+                    );
+                };
+
+                bench("scan  ", &mut || {
+                    delta_scan(&conv, &beta, &g, &s0, k_heads, EPS as f32).unwrap();
+                });
+                // The norm alone, so the hoisted arms' extra dispatch can be
+                // priced against what removing it from the timestep loop saves.
+                bench("l2norm", &mut || {
+                    delta_l2norm(&conv, k_heads, EPS as f32).unwrap();
+                });
+            }
+        }
     }
 
     /// Every op resolves its operands via `start_offset * dtype_size`; the other

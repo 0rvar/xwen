@@ -4,22 +4,29 @@
 // seven matmuls, and one dispatch PER TIMESTEP PER LAYER during prefill. These
 // four kernels collapse the glue:
 //
-//   kernel_delta_conv   depthwise causal conv + silu + next conv window, reading
-//                       the carried window and the fresh qkv rows as two
-//                       buffers (no concatenation, no slice_set state write).
-//   kernel_delta_ba     beta = sigmoid(b_raw) and g = ssm_a * softplus(a_raw +
-//                       dt_bias) from ONE fused [hidden, 2*v_heads] projection.
-//   kernel_delta_scan   the whole delta-rule recurrence over T timesteps, with
-//                       the head's state slice resident in registers for the
-//                       entire scan: one dispatch per layer per chunk.
-//   kernel_delta_gnorm  the gated output RMSNorm (rms -> ssm_norm.weight ->
-//                       silu(z)).
+//   kernel_delta_conv    depthwise causal conv + silu + next conv window, reading
+//                        the carried window and the fresh qkv rows as two
+//                        buffers (no concatenation, no slice_set state write).
+//   kernel_delta_ba      beta = sigmoid(b_raw) and g = ssm_a * softplus(a_raw +
+//                        dt_bias) from ONE fused [hidden, 2*v_heads] projection.
+//   kernel_delta_scan    the whole delta-rule recurrence over T timesteps, with
+//                        the head's state slice resident in registers for the
+//                        entire scan: one dispatch per layer per chunk. It folds
+//                        the q/k L2 clamp-norm into its own load stage.
+//   kernel_delta_gnorm   the gated output RMSNorm (rms -> ssm_norm.weight ->
+//                        silu(z)).
 //
 // A layer therefore costs eight dispatches at any sequence length. The
 // kill-switch back to the reference scan is XWEN_DELTA_CLASSIC.
 //
-// ROUNDING. TWO of the four kernels are BIT-IDENTICAL to the candle chain they
-// replace, and pin FP contraction and reassociation off at block scope
+// Two further kernels are not on the shipped path and exist as MEASURED
+// ARTIFACTS of a refuted direction (docs/decisions.md, "The DeltaNet scan
+// decomposition"): kernel_delta_scan_v2, llama.cpp's Metal decomposition of the
+// same recurrence, and kernel_delta_l2norm, the hoisted q/k norm it needs.
+// XWEN_DELTA_SCAN_V2 selects the pair.
+//
+// ROUNDING. TWO of this file's kernels are BIT-IDENTICAL to the candle chain
+// they replace, and pin FP contraction and reassociation off at block scope
 // (`#pragma clang fp contract(off)` / `reassociate(off)`):
 //   - kernel_delta_conv reproduces the reference's tap chain exactly: the first
 //     tap is a bare product and each later tap is a separate f32 multiply
@@ -29,11 +36,14 @@
 //     stable softplus chain of linear_attn.rs (abs, add, affine-as-fma, exp,
 //     affine-as-fma, log, add) with the same rounding boundaries, then one
 //     multiply by ssm_a.
-// The other two are BOUNDED, not bitwise, because a reduction the reference
-// runs in one order is partitioned here:
+// The rest are BOUNDED, not bitwise, because a reduction the reference runs in
+// one order is partitioned here:
 //   - kernel_delta_gnorm's arithmetic matches the reference's ops one for one,
 //     but the 128-term sum-of-squares reduction reassociates (hardware simd_sum
 //     instead of candle's reduce partition). Its test grades at 2e-6.
+//   - kernel_delta_l2norm is the same story for the q/k norm: the ops match
+//     `linear_attn::l2_norm` one for one (sum of squares, sqrt, floor at eps,
+//     divide) and only the 128-term sum reassociates. Its test grades at 2e-6.
 //   - kernel_delta_scan partitions the k- and q-contractions across threads and
 //     folds them through threadgroup memory, where the reference runs a candle
 //     gemm. It deliberately does NOT carry the fp pragmas — its two inner loops
@@ -220,11 +230,71 @@ kernel void kernel_delta_gnorm(
     dst[idx] = ((x / den) * w[d]) * (zv / (1 + exp(-zv)));
 }
 
-// The scan kernel's fixed geometry. Both checkpoints run gated DeltaNet at head
-// dim 128 (27B: 16 K-heads / 48 V-heads; 35B-A3B: 16 / 32), so the kernel is
+// The scan kernels' fixed head dim. Both checkpoints run gated DeltaNet at 128
+// (27B: 16 K-heads / 48 V-heads; 35B-A3B: 16 / 32), so the kernels are
 // specialized to it and the host refuses any other head dim (falling back to
 // the reference scan).
-#define DELTA_D 128       // head dim, and the threads per threadgroup
+#define DELTA_D 128
+
+// Matches dispatch.rs DeltaL2NormArgs (#[repr(C)]).
+typedef struct {
+    int32_t k_heads;
+    int32_t conv_dim;
+    float eps; // rms_norm_eps, the L2 norm FLOOR
+} delta_l2norm_args;
+
+// The q/k L2 clamp-norm, `x / max(||x||, eps)` with eps a FLOOR ON THE NORM
+// rather than a term under the root (ggml_l2_norm's form).
+//
+// The conv output's leading `2 * k_heads * DELTA_D` columns are the q planes
+// followed by the k planes, one plane per K-HEAD; everything after them is v,
+// which is not normalized. This kernel walks exactly those leading columns and
+// writes them normalized to a `[seq, 2 * k_heads * DELTA_D]` buffer in the same
+// order, so the scan reads q and k from `qk` and v from `conv` and the tiled
+// K-head broadcast stays a read-side index rather than a materialized tensor.
+//
+// Normalizing here rather than inside the scan is what keeps this work
+// proportional to the K-HEADS: the scan's threadgroups outnumber the K-head
+// planes by the V-head ratio times the value-column split, and each of them
+// would otherwise recompute the same two norms on every timestep.
+//
+// One threadgroup per (token, plane), DELTA_D threads wide; the sum of squares
+// folds through simd_sum and one threadgroup-memory pass, exactly as
+// kernel_delta_gnorm's does.
+kernel void kernel_delta_l2norm(
+        constant delta_l2norm_args & args [[buffer(0)]],
+        device const float * conv         [[buffer(1)]],
+        device       float * dst          [[buffer(2)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint tid  [[thread_position_in_threadgroup]],
+        uint sgid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sgcount [[simdgroups_per_threadgroup]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    threadgroup float partial[DELTA_D / 32];
+
+    const int planes = 2 * args.k_heads;
+    const int t = (int) tgid / planes;
+    const int plane = (int) tgid % planes;
+    const int d = (int) tid;
+
+    const float x = conv[(size_t) t * args.conv_dim + (size_t) plane * DELTA_D + d];
+
+    const float lane_sum = simd_sum(x * x);
+    if (lane == 0) {
+        partial[sgid] = lane_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint u = 0; u < sgcount; ++u) {
+        total += partial[u];
+    }
+
+    dst[(size_t) tgid * DELTA_D + d] = x / max(sqrt(total), args.eps);
+}
+
+// The shipped scan's threadgroup geometry (see kernel_delta_scan below).
 #define DELTA_TG_COLS 32  // value-dim columns owned by one threadgroup
 #define DELTA_TG_ROWS 4   // key-dim slices the columns are split across
 #define DELTA_S_SLICE 32  // DELTA_D / DELTA_TG_ROWS, state rows per thread
@@ -278,6 +348,11 @@ typedef struct {
 // Lane order also makes both state passes coalesced: consecutive threads within
 // a simdgroup share `r` and take consecutive `j`, so each state row access is a
 // contiguous 32-float run.
+//
+// Staging q and k through threadgroup memory is also what keeps the q/k reads
+// proportional to the THREADGROUPS rather than to the individual state columns.
+// kernel_delta_scan_v2 below gives that up, and it is the measured reason this
+// decomposition is the one that ships.
 kernel void kernel_delta_scan(
         constant delta_scan_args & args [[buffer(0)]],
         device const float * conv       [[buffer(1)]],
@@ -383,5 +458,134 @@ kernel void kernel_delta_scan(
 #pragma unroll
     for (int a = 0; a < DELTA_S_SLICE; ++a) {
         s_out[s_base + (size_t) (i0 + a) * DELTA_D] = s[a];
+    }
+}
+
+// The v2 scan's geometry. A SIMDGROUP, not a threadgroup, is the unit of
+// ownership: one simdgroup owns one value column j of one head's state for the
+// whole scan, holding the column's DELTA_D key entries DELTA_V2_KPL to a lane.
+// Both key-dim contractions are then simd_sum reductions inside that
+// simdgroup — no threadgroup memory, and no barrier anywhere in the timestep
+// loop. DELTA_V2_SGS simdgroups share a threadgroup purely to reach a sensible
+// launch width; they never talk to each other.
+#define DELTA_V2_KPL 4      // DELTA_D / 32, key entries per lane
+#define DELTA_V2_SGS 4      // simdgroups (= value columns) per threadgroup
+#define DELTA_V2_COL_TGS 32 // DELTA_D / DELTA_V2_SGS, threadgroups per V-head
+
+// The three are not independent: a lane's DELTA_V2_KPL entries times the 32
+// lanes of a simdgroup must cover the key dim exactly, and the threadgroups of a
+// head must tile its value dim exactly. The host sizes the grid and the
+// threadgroup from its own copies (dispatch.rs DELTA_V2_SGS / DELTA_V2_COL_TGS,
+// cross-checked by a test), so a value drifting out of these relations would
+// leave part of the state unowned.
+static_assert(DELTA_V2_KPL * 32 == DELTA_D,
+              "a simdgroup's lanes must cover the key dim exactly");
+static_assert(DELTA_V2_COL_TGS * DELTA_V2_SGS == DELTA_D,
+              "a head's threadgroups must tile its value dim exactly");
+
+// Matches dispatch.rs DeltaScanV2Args (#[repr(C)]). No eps: this kernel reads q
+// and k already normalized, from kernel_delta_l2norm.
+typedef struct {
+    int32_t seq;
+    int32_t k_heads;
+    int32_t v_heads;
+    int32_t conv_dim;
+    float scale; // 1 / sqrt(head_dim)
+} delta_scan_v2_args;
+
+// The same recurrence and the same inputs as kernel_delta_scan (bar the already
+// normalized q and k), under a decomposition that hands each SIMDGROUP its own
+// state value-column instead of splitting one head across a whole threadgroup.
+// Selected by XWEN_DELTA_SCAN_V2; its doc comment in src/ops/mod.rs carries the
+// measured reason it is not the default.
+//
+// Decomposition: value-dim columns are fully independent of each other (sk, d,
+// the rank-1 update of column j and o[j] all touch only column j), so ONE
+// SIMDGROUP owns column j of head h end to end, and both key-dim contractions
+// collapse to simd_sum within it. Lane `l` holds state rows
+// [l*DELTA_V2_KPL, (l+1)*DELTA_V2_KPL) of that column in registers for the whole
+// scan: the state is read once and written once no matter how long the chunk is,
+// the timestep loop touches no threadgroup memory, and nothing in it waits on a
+// barrier. Each lane's q/k reads are DELTA_V2_KPL consecutive floats, and the
+// lanes of a simdgroup cover a plane contiguously.
+//
+// The state's value axis is the fastest-varying one, so a column is strided in
+// memory and the load and store below are not coalesced. That is a deliberate
+// trade: it costs two strided passes per dispatch and buys a timestep loop with
+// no cross-lane traffic at all.
+kernel void kernel_delta_scan_v2(
+        constant delta_scan_v2_args & args [[buffer(0)]],
+        device const float * qk    [[buffer(1)]],
+        device const float * conv  [[buffer(2)]],
+        device const float * beta  [[buffer(3)]],
+        device const float * g     [[buffer(4)]],
+        device const float * s_in  [[buffer(5)]],
+        device       float * out   [[buffer(6)]],
+        device       float * s_out [[buffer(7)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]]) {
+    const uint lane = tpitg.x;
+    const int h = (int) tgpig.y;
+    const int j = (int) (tgpig.x * DELTA_V2_SGS + tpitg.y);
+
+    const int k_dim = args.k_heads * DELTA_D;
+    const int qk_stride = 2 * k_dim;
+    const int kh = h % args.k_heads; // TILED, not interleaved
+    const int i0 = (int) lane * DELTA_V2_KPL;
+
+    // The state column this simdgroup owns, DELTA_V2_KPL rows of it per lane,
+    // resident for the whole scan.
+    const size_t s_base =
+        (size_t) h * DELTA_D * DELTA_D + (size_t) i0 * DELTA_D + (size_t) j;
+    float s[DELTA_V2_KPL];
+#pragma unroll
+    for (int a = 0; a < DELTA_V2_KPL; ++a) {
+        s[a] = s_in[s_base + (size_t) a * DELTA_D];
+    }
+
+    device const float * q_ptr = qk + (size_t) kh * DELTA_D + i0;
+    device const float * k_ptr = qk + (size_t) (k_dim + kh * DELTA_D + i0);
+    device const float * v_ptr = conv + (size_t) (2 * k_dim + h * DELTA_D + j);
+    device const float * b_ptr = beta + h;
+    device const float * g_ptr = g + h;
+    device       float * o_ptr = out + (size_t) h * DELTA_D + j;
+
+    for (int t = 0; t < args.seq; ++t) {
+        // Decay the state, then contract it with k over the key dim.
+        const float dec = exp(*g_ptr);
+        float sk = 0.0f;
+#pragma unroll
+        for (int a = 0; a < DELTA_V2_KPL; ++a) {
+            s[a] *= dec;
+            sk += s[a] * k_ptr[a];
+        }
+        sk = simd_sum(sk);
+
+        const float delta = (*v_ptr - sk) * (*b_ptr);
+
+        // Rank-1 update, then read the UPDATED state out with q.
+        float y = 0.0f;
+#pragma unroll
+        for (int a = 0; a < DELTA_V2_KPL; ++a) {
+            s[a] += k_ptr[a] * delta;
+            y += s[a] * q_ptr[a];
+        }
+        y = simd_sum(y);
+
+        if (lane == 0) {
+            *o_ptr = y * args.scale;
+        }
+
+        q_ptr += qk_stride;
+        k_ptr += qk_stride;
+        v_ptr += args.conv_dim;
+        b_ptr += args.v_heads;
+        g_ptr += args.v_heads;
+        o_ptr += (size_t) args.v_heads * DELTA_D;
+    }
+
+#pragma unroll
+    for (int a = 0; a < DELTA_V2_KPL; ++a) {
+        s_out[s_base + (size_t) a * DELTA_D] = s[a];
     }
 }

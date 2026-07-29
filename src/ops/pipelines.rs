@@ -65,6 +65,15 @@ const F16_T_SOURCE: &str = include_str!("f16_t.metal");
 /// mixed-operand `matmul2d` fails only this probe, never the default or the
 /// half-tile tensor library.
 const F16_T_MIXED_SOURCE: &str = include_str!("f16_t_mixed.metal");
+/// Vendored Metal-4 cooperative-tensor DENSE quantized-weight prefill gemm (the
+/// 27B's SwiGLU FFN projections) — `f16_t.metal`'s kernel with an in-kernel
+/// block-quant tile dequant in place of the half widen-copy. Its own lazily
+/// compiled library, mirroring every other Metal-4 split: `mm_id.metal` (whose
+/// dequant helpers it re-vendors) is MoE-prefill-critical, this one is
+/// dense-FFN-prefill-critical, and neither can break the other. Under the
+/// `XWEN_DENSE_MM_CLASSIC` kill-switch nothing asks for this library, so it
+/// never compiles.
+const DENSE_MM_SOURCE: &str = include_str!("dense_mm.metal");
 /// Vendored fused MoE weighted-combine kernels (the routed-expert combine tail).
 /// Own library (no Metal-4 dependency); compiled with FP contraction disabled so
 /// its per-op rounding stays bit-identical to the candle broadcast/affine/sum
@@ -238,6 +247,13 @@ pub(crate) fn f16_t_pipeline(device: &Device, name: &str) -> Result<ComputePipel
 /// probe). Own library, compiled lazily on first (test-only) dispatch.
 pub(crate) fn f16_t_mixed_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, F16_T_MIXED_SOURCE, "f16_t_mixed", name)
+}
+
+/// Pipeline for a `dense_mm.metal` kernel (Metal-4 cooperative-tensor dense
+/// quantized-weight prefill gemm). Its own library, compiled lazily on first
+/// dense-FFN prefill dispatch.
+pub(crate) fn dense_mm_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, DENSE_MM_SOURCE, "dense_mm", name)
 }
 
 /// Pipeline for a `combine.metal` kernel (vendored fused MoE weighted combine).

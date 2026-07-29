@@ -874,4 +874,268 @@ mod tests {
             max_abs_diff(&out_cpu, &out_metal)
         );
     }
+
+    /// Per-stage isolation timing for ONE 27B full-attention layer, walked over
+    /// the exact chunk sequence a real prefill issues (`PREFILL_CHUNK` = 512
+    /// tokens at a time), with the KV operands laid out the way the cache hands
+    /// them to sdpa: a `[1, n_kv, max_ctx, head_dim]` f16 allocation narrowed on
+    /// the token axis, so each head carries the full max_ctx stride.
+    ///
+    /// The projections are flat in position and the mask/sdpa pair is not — the
+    /// mask is a materialized `[1, n_head, seq, k_seq]` f16 tensor and sdpa's
+    /// work is `seq * k_seq`, so both grow as the prompt advances. Multiply a
+    /// per-chunk total by 16 (the 27B's full-attention layer count) and sum over
+    /// the chunk list to get attention's share of one prefill.
+    ///
+    /// `#[ignore]`d — run on a `pgrep`-verified free GPU with:
+    ///   cargo test --release -p xwen attn_prefill_stage_timing -- --ignored --nocapture
+    /// `XWEN_BENCH_WARMUP` / `XWEN_BENCH_ITERS` override the loop counts.
+    #[test]
+    #[ignore = "perf bench"]
+    fn attn_prefill_stage_timing() {
+        use std::time::Instant;
+
+        const HIDDEN: usize = 5120;
+        const N_HEAD: usize = 24;
+        const N_KV: usize = 4;
+        const HD: usize = 256;
+        const MAX_CTX: usize = 8192;
+        /// Production's prefill chunk (generate.rs `PREFILL_CHUNK`).
+        const CHUNK: usize = 512;
+
+        let device = crate::gguf::metal_device().unwrap();
+        let Device::Metal(mdev) = &device else {
+            unreachable!("metal_device() returned a non-Metal device")
+        };
+        let get = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let (warm, iters) = (get("XWEN_BENCH_WARMUP", 3), get("XWEN_BENCH_ITERS", 10));
+
+        // Waiting on the device rather than reading back: these stages produce
+        // hundreds of megabytes and a readback would time the memcpy.
+        let bench = |f: &mut dyn FnMut()| -> f64 {
+            for _ in 0..warm {
+                f();
+                mdev.wait_until_completed().unwrap();
+            }
+            let mut times = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t = Instant::now();
+                f();
+                mdev.wait_until_completed().unwrap();
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            times[iters / 2..].iter().sum::<f64>() / (iters - iters / 2) as f64
+        };
+
+        let f16w = |rows: usize, cols: usize, seed: u64| {
+            dense(rows, cols, seed, &device)
+                .to_dtype(DType::F16)
+                .unwrap()
+        };
+        let w_qg = f16w(N_HEAD * 2 * HD, HIDDEN, 11);
+        let w_k = f16w(N_KV * HD, HIDDEN, 12);
+        let w_v = f16w(N_KV * HD, HIDDEN, 13);
+        let w_o = f16w(HIDDEN, N_HEAD * HD, 14);
+        let qn = candle_nn::RmsNorm::new(
+            Tensor::from_vec(vec![1.0f32; HD], HD, &device).unwrap(),
+            1e-6,
+        );
+
+        // The cache's own allocation: one contiguous [n_kv, max_ctx, hd] f16
+        // block per tensor, which sdpa reads through a narrowed token axis.
+        let kv_alloc = |seed: u64| {
+            Tensor::from_vec(
+                seeded(N_KV * MAX_CTX * HD, seed),
+                (1, N_KV, MAX_CTX, HD),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+        };
+        let k_alloc = kv_alloc(21);
+        let v_alloc = kv_alloc(22);
+
+        let scale = 1.0f32 / (HD as f32).sqrt();
+
+        // The chunk sequences the two bench fixtures produce.
+        let chunks_for = |total: usize| -> Vec<(usize, usize)> {
+            let mut v = Vec::new();
+            let mut pos = 0;
+            while pos < total {
+                let seq = CHUNK.min(total - pos);
+                v.push((seq, pos));
+                pos += seq;
+            }
+            v
+        };
+
+        for &total in &[880usize, 3851] {
+            let mut sums = [0f64; 6];
+            let mut amort = 0f64;
+            eprintln!("--- 27B attention, prefill of {total} tokens, per chunk (ms) ---");
+            for (seq, pos) in chunks_for(total) {
+                let k_seq = pos + seq;
+                let x = dense(seq, HIDDEN, 0x51 + seq as u64, &device);
+                let k_view = k_alloc.narrow(2, 0, k_seq).unwrap();
+                let v_view = v_alloc.narrow(2, 0, k_seq).unwrap();
+                let q16 = dense(N_HEAD * seq, HD, 0x52, &device)
+                    .reshape((1, N_HEAD, seq, HD))
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap();
+                let mask = PrefillMask::build(MaskKind::Full, N_HEAD, seq, pos, &device)
+                    .unwrap()
+                    .unwrap();
+
+                let t_mask = bench(&mut || {
+                    PrefillMask::build(MaskKind::Full, N_HEAD, seq, pos, &device).unwrap();
+                });
+                let t_sdpa = bench(&mut || {
+                    candle_nn::ops::sdpa(
+                        &q16,
+                        &k_view,
+                        &v_view,
+                        Some(&mask.sdpa),
+                        false,
+                        scale,
+                        1.0,
+                    )
+                    .unwrap();
+                });
+                let t_qg = bench(&mut || {
+                    crate::ops::matmul_f16(&w_qg, &x).unwrap();
+                });
+                let t_kv = bench(&mut || {
+                    crate::ops::matmul_f16(&w_k, &x).unwrap();
+                    crate::ops::matmul_f16(&w_v, &x).unwrap();
+                });
+                let o_in = dense(seq, N_HEAD * HD, 0x53, &device);
+                let t_o = bench(&mut || {
+                    crate::ops::matmul_f16(&w_o, &o_in).unwrap();
+                });
+
+                // Everything between the projections and sdpa: the strided
+                // q/gate split, QK-norm, the three permute-copies, the q cast,
+                // the sdpa output widening, and the eager sigmoid gate.
+                let t_glue = bench(&mut || {
+                    let qg = crate::ops::matmul_f16(&w_qg, &x)
+                        .unwrap()
+                        .reshape((seq, N_HEAD, 2, HD))
+                        .unwrap();
+                    let q = qg
+                        .narrow(2, 0, 1)
+                        .unwrap()
+                        .contiguous()
+                        .unwrap()
+                        .reshape((seq, N_HEAD, HD))
+                        .unwrap();
+                    let gate = qg
+                        .narrow(2, 1, 1)
+                        .unwrap()
+                        .contiguous()
+                        .unwrap()
+                        .reshape((seq, N_HEAD, HD))
+                        .unwrap();
+                    let q = qn.forward(&q).unwrap();
+                    let q = crate::ops::permute_01(&q).unwrap();
+                    let q = crate::ops::cast_f16(&q).unwrap();
+                    let attn = crate::ops::cast_f32(&q).unwrap();
+                    let gate = crate::ops::permute_01(&gate).unwrap();
+                    (&attn * &candle_nn::ops::sigmoid(&gate).unwrap()).unwrap();
+                });
+                // The glue timing re-ran the qg projection to get a real input;
+                // charge only the remainder.
+                let t_glue = t_glue - t_qg;
+
+                // A real forward issues all 16 attention layers back to back, so
+                // the per-call commit-and-wait above is overhead the model never
+                // pays. Batch the whole per-layer sequence and sync once; this is
+                // the rate to multiply by the layer count.
+                const BATCH: usize = 8;
+                let t_amort = bench(&mut || {
+                    let mut keep = Vec::with_capacity(BATCH);
+                    for _ in 0..BATCH {
+                        let qg = crate::ops::matmul_f16(&w_qg, &x)
+                            .unwrap()
+                            .reshape((seq, N_HEAD, 2, HD))
+                            .unwrap();
+                        let q = qg
+                            .narrow(2, 0, 1)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((seq, N_HEAD, HD))
+                            .unwrap();
+                        let gate = qg
+                            .narrow(2, 1, 1)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((seq, N_HEAD, HD))
+                            .unwrap();
+                        crate::ops::matmul_f16(&w_k, &x).unwrap();
+                        crate::ops::matmul_f16(&w_v, &x).unwrap();
+                        let q = qn.forward(&q).unwrap();
+                        let q = crate::ops::permute_01(&q).unwrap();
+                        let q16 = crate::ops::cast_f16(&q).unwrap();
+                        let a = candle_nn::ops::sdpa(
+                            &q16.reshape((1, N_HEAD, seq, HD)).unwrap(),
+                            &k_view,
+                            &v_view,
+                            Some(&mask.sdpa),
+                            false,
+                            scale,
+                            1.0,
+                        )
+                        .unwrap();
+                        let a = crate::ops::cast_f32(&a.squeeze(0).unwrap()).unwrap();
+                        let gate = crate::ops::permute_01(&gate).unwrap();
+                        let a = (&a * &candle_nn::ops::sigmoid(&gate).unwrap()).unwrap();
+                        let a = crate::ops::permute_01(&a)
+                            .unwrap()
+                            .reshape((seq, N_HEAD * HD))
+                            .unwrap();
+                        keep.push(crate::ops::matmul_f16(&w_o, &a).unwrap());
+                    }
+                }) / BATCH as f64;
+                amort += t_amort;
+
+                let row = [t_qg, t_kv, t_o, t_mask, t_sdpa, t_glue];
+                for (s, r) in sums.iter_mut().zip(row) {
+                    *s += r;
+                }
+                eprintln!(
+                    "  seq={seq:<4} pos={pos:<5} qg {t_qg:6.3} | kv {t_kv:6.3} | o {t_o:6.3} \
+                     | mask {t_mask:6.3} | sdpa {t_sdpa:6.3} | glue {t_glue:6.3} \
+                     || whole-layer amortized {t_amort:6.3}"
+                );
+            }
+            // The mask is built once per chunk in model.rs `run_stack` and shared
+            // by every attention layer, so its column is a whole-prefill total
+            // already; the other five are per layer and scale by 16.
+            let per_layer: f64 = sums[0] + sums[1] + sums[2] + sums[4] + sums[5];
+            eprintln!(
+                "  TOTAL  qg {:.2} | kv {:.2} | o {:.2} | sdpa {:.2} | glue {:.2} \
+                 => {per_layer:.2} ms/layer x16 = {:.1} ms; mask {:.2} ms (hoisted, once per chunk)",
+                sums[0],
+                sums[1],
+                sums[2],
+                sums[4],
+                sums[5],
+                per_layer * 16.0,
+                sums[3],
+            );
+            eprintln!(
+                "  AMORTIZED whole layer {amort:.2} ms/layer x16 = {:.1} ms (+ mask {:.2} ms)",
+                amort * 16.0,
+                sums[3]
+            );
+        }
+    }
 }

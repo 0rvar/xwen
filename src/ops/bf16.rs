@@ -33,17 +33,24 @@ mod tests {
     use crate::ops::dispatch::testutil::{pseudo_random, rel_l2};
     use candle_core::{DType, Device, Tensor};
 
-    /// The drafter's production matmul shapes as (n_out, k): q (72h -> 9216),
-    /// k/v (8kv -> 1024), o_proj, the 72-row attn gate, the FFN trio, and the
-    /// encoder fc (k = n_aux * n_embd = 18432).
-    const DRAFTER_SHAPES: [(usize, usize); 7] = [
-        (9216, 3072),
-        (1024, 3072),
-        (72, 3072),
-        (3072, 9216),
-        (12288, 3072),
-        (3072, 12288),
-        (3072, 18432),
+    /// The two sidecars' production matmul shapes as (n_out, k): q (32 heads ->
+    /// 4096), k/v (8 KV heads -> 1024), o_proj, the FFN trio, and the encoder fc
+    /// (k = n_aux * n_embd, 5 x 5120 on the 27B and 8 x 2048 on the 35B-A3B).
+    const DRAFTER_SHAPES: [(usize, usize); 12] = [
+        // 27B sidecar: n_embd 5120, n_ff 17408, 5 taps.
+        (4096, 5120),
+        (1024, 5120),
+        (5120, 4096),
+        (17408, 5120),
+        (5120, 17408),
+        (5120, 25600),
+        // 35B-A3B sidecar: n_embd 2048, n_ff 6144, 8 taps.
+        (4096, 2048),
+        (1024, 2048),
+        (2048, 4096),
+        (6144, 2048),
+        (2048, 6144),
+        (2048, 16384),
     ];
 
     /// Weights whose values are exactly representable in BOTH bf16 and f16:
@@ -123,7 +130,8 @@ mod tests {
     #[test]
     fn bf16_bitwise_matches_f16_on_common_values() {
         let device = metal_device().unwrap();
-        for (n_out, k) in [(1024, 3072), (72, 3072), (3072, 9216), (3072, 18432)] {
+        // k/v (27B), q (35B), o_proj (35B), encoder fc (35B).
+        for (n_out, k) in [(1024, 5120), (4096, 2048), (2048, 4096), (2048, 16384)] {
             let (wb, wf) = common_weights(n_out, k, 0xC0FFEE + n_out as u64, &device);
             for (t, kernel) in [
                 (4usize, F16MmKernel::Classic), // gemv (kernel arg unused at t<=8)
@@ -160,11 +168,11 @@ mod tests {
         let device = metal_device().unwrap();
         let cpu = Device::Cpu;
         for (n_out, k, t) in [
-            (9216, 3072, 16),
-            (1024, 3072, 413),
-            (72, 3072, 413),
-            (3072, 12288, 512),
-            (3072, 18432, 512),
+            (4096, 5120, 16),   // 27B q, sub-tile token edge
+            (1024, 5120, 413),  // 27B k/v, token count off every tile boundary
+            (4096, 2048, 413),  // 35B q, same
+            (2048, 6144, 512),  // 35B ffn_down, full tiles
+            (2048, 16384, 512), // 35B encoder fc, full tiles over a wide k
         ] {
             let seed = 0xD00 + n_out as u64 + t as u64;
             let w = Tensor::from_vec(pseudo_random(n_out * k, seed, -0.5, 0.5), (n_out, k), &cpu)
@@ -199,7 +207,7 @@ mod tests {
     #[test]
     fn bf16_offset_view_matches() {
         let device = metal_device().unwrap();
-        let (n_out, k) = (1024usize, 3072usize);
+        let (n_out, k) = (1024usize, 5120usize); // the 27B sidecar's k/v projection
         let pad = 96usize;
         let vals = pseudo_random(pad + n_out * k, 0xE0, -0.5, 0.5);
         let flat_all = Tensor::from_vec(vals, pad + n_out * k, &device)

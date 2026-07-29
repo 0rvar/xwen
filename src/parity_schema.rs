@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 6;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 7;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -61,6 +61,16 @@ pub struct ProvenanceField {
 /// fused delta scan is the one vendored family that is NOT bit-identical to the
 /// chain it replaces, so a reference dump that quietly ran it would make the
 /// bounded tiers grade the fused path against itself.
+/// Version 7: dense_mm (the DENSE checkpoint's SwiGLU FFN prefill gemm: "fused"
+/// for the vendored cooperative-tensor kernel, "classic" for candle's QMatMul
+/// chain under XWEN_DENSE_MM_CLASSIC). Grandfather "classic": every pre-v7
+/// binary had only the QMatMul chain, which is also what the oracle runs. Like
+/// `delta`, this one is load-bearing rather than cosmetic — the vendored gemm is
+/// NOT bit-identical to the chain it replaces (matmul2d's reduced-precision
+/// path puts it ~4e-4 from the f32 oracle against QMatMul's ~1.9e-4), so a
+/// reference dump that quietly ran it would grade the fused path against itself.
+/// The field is env-derived, not observed: the 35B-A3B has no dense FFN layer at
+/// all, so an observed field would have nothing to report on that model.
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_impl",
@@ -130,6 +140,11 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "delta",
         introduced: 6,
+        grandfather: Some("classic"),
+    },
+    ProvenanceField {
+        name: "dense_mm",
+        introduced: 7,
         grandfather: Some("classic"),
     },
 ];
@@ -212,6 +227,12 @@ mod tests {
         assert_eq!(resolve_missing("attn_decode", 1), Some("f32-bypass"));
         assert_eq!(resolve_missing("attn_decode", 4), Some("f32-bypass"));
         assert_eq!(resolve_missing("attn_decode", 5), None);
+        // dense_mm introduced at v7: v1..v6 dumps missing it resolve to
+        // "classic" (their binaries had only the QMatMul FFN chain, which is
+        // also what the oracle runs); missing at v7 fails.
+        assert_eq!(resolve_missing("dense_mm", 1), Some("classic"));
+        assert_eq!(resolve_missing("dense_mm", 6), Some("classic"));
+        assert_eq!(resolve_missing("dense_mm", 7), None);
         // Baseline fields are required at every version.
         assert_eq!(resolve_missing("attn_dtype", 1), None);
         assert_eq!(resolve_missing("attn_dtype", 2), None);

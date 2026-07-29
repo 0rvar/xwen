@@ -972,4 +972,206 @@ mod tests {
             "expected division by the eps floor, got {out:?}"
         );
     }
+
+    /// Isolation timing for the 27B DeltaNet layer's NON-scan dispatches — the
+    /// three f16 projections, the eager beta/alpha matmul, and the conv, ba and
+    /// gnorm kernels. `delta_scan_timing` (src/ops/delta.rs) prices the scan
+    /// itself; together they account for all eight dispatches of
+    /// `forward_fused`, and the 27B runs 48 of these layers.
+    ///
+    /// The projections dominate the layer's FLOPs (qkv is [T,5120]x[5120,10240],
+    /// z is [T,5120]x[5120,6144], out is [T,6144]x[6144,5120]) and, unlike the
+    /// dense FFN, they DO get a dequantized f16 plane, so their achieved
+    /// TFLOP/s is the reference point for what this machine's gemm can do.
+    ///
+    /// `#[ignore]`d — run on a `pgrep`-verified free GPU with:
+    ///   cargo test --release -p xwen deltanet_prefill_stage_timing -- --ignored --nocapture
+    /// `XWEN_BENCH_WARMUP` / `XWEN_BENCH_ITERS` override the loop counts.
+    #[test]
+    #[ignore = "perf bench"]
+    fn deltanet_prefill_stage_timing() {
+        use std::time::Instant;
+
+        const HIDDEN: usize = 5120;
+        const K_HEADS: usize = 16;
+        const V_HEADS: usize = 48;
+        const HD: usize = 128;
+        const TAPS: usize = 4;
+        const LAYERS: usize = 48;
+        const CONV_DIM: usize = (2 * K_HEADS + V_HEADS) * HD; // 10240
+        const V_DIM: usize = V_HEADS * HD; // 6144
+
+        let device = crate::gguf::metal_device().unwrap();
+        let Device::Metal(mdev) = &device else {
+            unreachable!("metal_device() returned a non-Metal device")
+        };
+        let get = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let (warm, iters) = (get("XWEN_BENCH_WARMUP", 3), get("XWEN_BENCH_ITERS", 10));
+
+        let bench = |f: &mut dyn FnMut()| -> f64 {
+            for _ in 0..warm {
+                f();
+                mdev.wait_until_completed().unwrap();
+            }
+            let mut times = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t = Instant::now();
+                f();
+                mdev.wait_until_completed().unwrap();
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            times[iters / 2..].iter().sum::<f64>() / (iters - iters / 2) as f64
+        };
+
+        // Deterministic values in [lo, hi) from a plain LCG — timing is
+        // value-independent for every stage here, so the only requirement is
+        // that the buffers are real device allocations of the right shape.
+        let rnd = |n: usize, seed: u64, lo: f32, hi: f32, shape: (usize, usize)| {
+            let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let v: Vec<f32> = (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    lo + (hi - lo) * ((s >> 33) as f32 / u32::MAX as f32)
+                })
+                .collect();
+            Tensor::from_vec(v, shape, &device).unwrap()
+        };
+        let f16w = |rows: usize, cols: usize, seed: u64| {
+            rnd(rows * cols, seed, -0.5, 0.5, (rows, cols))
+                .to_dtype(candle_core::DType::F16)
+                .unwrap()
+        };
+
+        let w_qkv = f16w(CONV_DIM, HIDDEN, 0x601);
+        let w_z = f16w(V_DIM, HIDDEN, 0x602);
+        let w_out = f16w(HIDDEN, V_DIM, 0x603);
+        let ba_wt = rnd(
+            HIDDEN * 2 * V_HEADS,
+            0x604,
+            -0.1,
+            0.1,
+            (HIDDEN, 2 * V_HEADS),
+        );
+        let conv_w = rnd(TAPS * CONV_DIM, 0x605, -1.0, 1.0, (TAPS, CONV_DIM));
+        let conv_state = rnd(
+            (TAPS - 1) * CONV_DIM,
+            0x606,
+            -1.0,
+            1.0,
+            (TAPS - 1, CONV_DIM),
+        );
+        let ssm_a = rnd(V_HEADS, 0x607, -3.0, -0.1, (1, V_HEADS))
+            .flatten_all()
+            .unwrap();
+        let dt_bias = rnd(V_HEADS, 0x608, -2.0, 2.0, (1, V_HEADS))
+            .flatten_all()
+            .unwrap();
+        let norm_w = rnd(HD, 0x609, 0.5, 1.5, (1, HD)).flatten_all().unwrap();
+
+        for &t in &[512usize, 880, 3851] {
+            let x = rnd(t * HIDDEN, 0x60a, -1.0, 1.0, (t, HIDDEN));
+            let qkv = rnd(t * CONV_DIM, 0x60b, -2.0, 2.0, (t, CONV_DIM));
+            let ba = rnd(t * 2 * V_HEADS, 0x60c, -20.0, 20.0, (t, 2 * V_HEADS));
+            let o = rnd(t * V_DIM, 0x60d, -1.0, 1.0, (t, V_DIM))
+                .reshape((t, V_HEADS, HD))
+                .unwrap();
+            let z = rnd(t * V_DIM, 0x60e, -1.0, 1.0, (t, V_DIM))
+                .reshape((t, V_HEADS, HD))
+                .unwrap();
+            let ov = rnd(t * V_DIM, 0x60f, -1.0, 1.0, (t, V_DIM));
+            let tf =
+                |ms: f64, k: usize, n: usize| 2.0 * t as f64 * k as f64 * n as f64 / (ms * 1e9);
+
+            let t_qkv = bench(&mut || {
+                crate::ops::matmul_f16(&w_qkv, &x).unwrap();
+            });
+            let t_z = bench(&mut || {
+                crate::ops::matmul_f16(&w_z, &x).unwrap();
+            });
+            let t_out = bench(&mut || {
+                crate::ops::matmul_f16(&w_out, &ov).unwrap();
+            });
+            let t_ba_mm = bench(&mut || {
+                x.matmul(&ba_wt).unwrap();
+            });
+            let t_conv = bench(&mut || {
+                crate::ops::delta_conv(&conv_state, &qkv, &conv_w).unwrap();
+            });
+            let t_ba = bench(&mut || {
+                crate::ops::delta_ba(&ba, &ssm_a, &dt_bias).unwrap();
+            });
+            let t_gnorm = bench(&mut || {
+                crate::ops::delta_gnorm(&o, &z, &norm_w, 1e-6).unwrap();
+            });
+
+            // A real forward issues all 48 DeltaNet layers back to back, so the
+            // per-call commit-and-wait each measurement above pays is overhead
+            // the model never sees. Batch the whole non-scan sequence and sync
+            // once; this is the rate to multiply by the layer count.
+            const BATCH: usize = 8;
+            let t_amort = bench(&mut || {
+                let mut keep = Vec::with_capacity(BATCH);
+                for _ in 0..BATCH {
+                    let q = crate::ops::matmul_f16(&w_qkv, &x).unwrap();
+                    let (conv, _) = crate::ops::delta_conv(&conv_state, &q, &conv_w).unwrap();
+                    let raw = x.matmul(&ba_wt).unwrap();
+                    crate::ops::delta_ba(&raw, &ssm_a, &dt_bias).unwrap();
+                    let z = crate::ops::matmul_f16(&w_z, &x).unwrap();
+                    let gn = crate::ops::delta_gnorm(
+                        &conv
+                            .narrow(1, 2 * K_HEADS * HD, V_DIM)
+                            .unwrap()
+                            .contiguous()
+                            .unwrap()
+                            .reshape((t, V_HEADS, HD))
+                            .unwrap(),
+                        &z.reshape((t, V_HEADS, HD)).unwrap(),
+                        &norm_w,
+                        1e-6,
+                    )
+                    .unwrap();
+                    keep.push(
+                        crate::ops::matmul_f16(&w_out, &gn.reshape((t, V_DIM)).unwrap()).unwrap(),
+                    );
+                }
+            }) / BATCH as f64;
+
+            let non_scan = t_qkv + t_z + t_out + t_ba_mm + t_conv + t_ba + t_gnorm;
+            eprintln!("--- 27B DeltaNet non-scan, T={t} ---");
+            eprintln!(
+                "  qkv proj  {t_qkv:7.3} ms  {:6.2} TFLOP/s",
+                tf(t_qkv, HIDDEN, CONV_DIM)
+            );
+            eprintln!(
+                "  z proj    {t_z:7.3} ms  {:6.2} TFLOP/s",
+                tf(t_z, HIDDEN, V_DIM)
+            );
+            eprintln!(
+                "  out proj  {t_out:7.3} ms  {:6.2} TFLOP/s",
+                tf(t_out, V_DIM, HIDDEN)
+            );
+            eprintln!(
+                "  ba matmul {t_ba_mm:7.3} ms  {:6.2} TFLOP/s (candle eager)",
+                tf(t_ba_mm, HIDDEN, 2 * V_HEADS)
+            );
+            eprintln!("  conv      {t_conv:7.3} ms");
+            eprintln!("  ba head   {t_ba:7.3} ms");
+            eprintln!("  gnorm     {t_gnorm:7.3} ms");
+            eprintln!(
+                "  NON-SCAN  {non_scan:7.3} ms/layer => {:.1} ms for {LAYERS} layers",
+                non_scan * LAYERS as f64
+            );
+            eprintln!(
+                "  AMORTIZED {t_amort:7.3} ms/layer => {:.1} ms for {LAYERS} layers",
+                t_amort * LAYERS as f64
+            );
+        }
+    }
 }

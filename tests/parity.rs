@@ -257,6 +257,18 @@ struct Provenance {
     /// bit-identical, so a reference dump that ran it would grade the fused
     /// path against itself.
     delta: Option<String>,
+    /// Dense-checkpoint SwiGLU FFN prefill gemm: "fused" (the vendored
+    /// cooperative-tensor kernel, the Metal default) or "classic" (candle's
+    /// `QMatMul` chain, `XWEN_DENSE_MM_CLASSIC`, which the oracle and the strict
+    /// candidate both run). Introduced at schema version 7 with grandfather
+    /// "classic" — every earlier binary had only the `QMatMul` chain, so a
+    /// v1..v6 dump missing the field resolves to "classic"; missing at v7+ is
+    /// the stale-binary hard fail. Load-bearing for the same reason as `delta`:
+    /// the vendored gemm runs matmul2d's reduced-precision path and is
+    /// bounded-close rather than bit-identical, so a reference dump that ran it
+    /// would grade the fused path against itself. Env-derived, so it is pinned
+    /// on the 35B-A3B too even though that checkpoint has no dense FFN layer.
+    dense_mm: Option<String>,
 }
 
 impl Provenance {
@@ -421,6 +433,16 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
                 Some(d) => Some(
                     d.as_str()
                         .context("provenance `delta` is not a string")?
+                        .to_string(),
+                ),
+                None => None,
+            },
+            // Absent in schema-version-1..6 dumps (grandfathered to "classic"
+            // by the version-aware check); present-but-not-a-string is malformed.
+            dense_mm: match p.get("dense_mm") {
+                Some(d) => Some(
+                    d.as_str()
+                        .context("provenance `dense_mm` is not a string")?
                         .to_string(),
                 ),
                 None => None,
@@ -850,6 +872,19 @@ fn check_delta(p: &Provenance, side: &str, want: &str) -> Result<()> {
     check_field(p, side, "delta", p.delta.as_deref(), want)
 }
 
+/// `want` is "classic" for the Reference-oracle side and for strict-tier
+/// candidates (both produced under `XWEN_DENSE_MM_CLASSIC=1`, parity-gate.ts),
+/// and "fused" for the mm/decode/ppl candidates that grade the shipped vendored
+/// gemm. Load-bearing like `check_delta` and for the same reason: the vendored
+/// gemm's reduced-precision tensor path is bounded-close, not bit-identical, so
+/// a reference dump that ran it would leave both sides on the same approximate
+/// path and the bounded tiers would pass vacuously. Introduced at schema version
+/// 7: a v1..v6 dump missing the field is grandfathered to "classic" by
+/// `check_field`, which keeps the cached reference dumps valid.
+fn check_dense_mm(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "dense_mm", p.dense_mm.as_deref(), want)
+}
+
 /// Enforce the attention DECODE-projection path recorded in one side's provenance.
 /// The reference oracle and strict-tier candidates run under `XWEN_ATTN_F32=1`,
 /// so the whole block is the dequant-f32 QMatMul → "f32-bypass" (`want = Some`).
@@ -941,6 +976,11 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             // scan is bounded-close, not bit-identical, so a fused reference would
             // grade the fused path against itself.
             check_delta(p, "reference dump", "classic")?;
+            // Same reasoning for the dense checkpoint's FFN prefill gemm: the
+            // oracle is pinned to the QMatMul chain (XWEN_DENSE_MM_CLASSIC=1,
+            // parity-gate.ts referenceEnv()), because the vendored gemm is
+            // bounded-close and a fused reference would grade it against itself.
+            check_dense_mm(p, "reference dump", "classic")?;
             // The oracle's XWEN_ATTN_F32 makes the whole attention block the
             // dequant-f32 QMatMul, so its decode projections are "f32-bypass" too
             // (redundant with attn_mm, but pinned for symmetry / stale-dump defence).
@@ -1145,6 +1185,19 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     };
     if let Some(p) = &candidate.provenance {
         check_delta(p, "candidate dump", want_delta)?;
+    }
+
+    // EVERY tier also pins the CANDIDATE's dense-FFN prefill gemm, for the same
+    // reason as the DeltaNet path above: strict grades the QMatMul chain
+    // (candidate produced under XWEN_DENSE_MM_CLASSIC=1 → "classic", because the
+    // vendored gemm's reduced-precision tensor path would break a bitwise
+    // tier), mm/decode grade the shipped vendored gemm ("fused").
+    let want_dense_mm = match tier {
+        Tier::Strict => "classic",
+        Tier::Mm | Tier::Decode => "fused",
+    };
+    if let Some(p) = &candidate.provenance {
+        check_dense_mm(p, "candidate dump", want_dense_mm)?;
     }
 
     // EVERY tier also pins the CANDIDATE's attention decode-projection path:
@@ -1492,6 +1545,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_flash(p, "reference-greedy.json", "classic")?;
             check_act(p, "reference-greedy.json", "classic")?;
             check_delta(p, "reference-greedy.json", "classic")?;
+            check_dense_mm(p, "reference-greedy.json", "classic")?;
             check_attn_decode(p, "reference-greedy.json", Some("f32-bypass"))?;
         }
         Some(p) => bail!(
@@ -1518,6 +1572,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_flash(p, "candidate-greedy.json", &expected_flash())?;
             check_act(p, "candidate-greedy.json", "fused")?;
             check_delta(p, "candidate-greedy.json", "fused")?;
+            check_dense_mm(p, "candidate-greedy.json", "fused")?;
             // The decode gate grades the shipped decode gemv: "f16" (official) or
             // "q8" (UD) both pass; XWEN_PARITY_EXPECT_ATTN_DECODE pins one.
             check_attn_decode(
@@ -1855,6 +1910,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_flash(p, "reference-ppl.json", "classic")?;
             check_act(p, "reference-ppl.json", "classic")?;
             check_delta(p, "reference-ppl.json", "classic")?;
+            check_dense_mm(p, "reference-ppl.json", "classic")?;
             check_attn_decode(p, "reference-ppl.json", Some("f32-bypass"))?;
         }
         Some(p) => bail!(
@@ -1881,6 +1937,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_flash(p, "candidate-ppl.json", &expected_flash())?;
             check_act(p, "candidate-ppl.json", "fused")?;
             check_delta(p, "candidate-ppl.json", "fused")?;
+            check_dense_mm(p, "candidate-ppl.json", "fused")?;
             check_attn_decode(p, "candidate-ppl.json", expected_attn_decode().as_deref())?;
         }
         Some(p) => bail!(
@@ -2069,6 +2126,17 @@ fn prov(moe_impl: &str) -> Provenance {
         // are the frozen reference scan); fused candidates run the shipped fused
         // delta kernels. Strict-tier candidate tests override this to "classic".
         delta: Some(
+            if moe_impl == "reference" {
+                "classic"
+            } else {
+                "fused"
+            }
+            .to_string(),
+        ),
+        // Reference runs under XWEN_DENSE_MM_CLASSIC (the oracle's dense FFN is
+        // candle's QMatMul chain); fused candidates run the shipped vendored
+        // prefill gemm. Strict-tier candidate tests override this to "classic".
+        dense_mm: Some(
             if moe_impl == "reference" {
                 "classic"
             } else {
@@ -3205,14 +3273,20 @@ fn delta_missing_grandfathered_at_schema_version_5() {
     .expect("v5 references without delta must be grandfathered to classic and pass");
 }
 
+/// The dense-FFN prefill-gemm pin, per tier and on both sides. Keeps the bounded
+/// tiers honest for the same reason the DeltaNet pin above does: the vendored
+/// gemm's reduced-precision tensor path is bounded-close rather than
+/// bit-identical, so a reference that ran it would put both sides on the same
+/// approximate path and the mm/decode tiers would compare the kernels to
+/// themselves.
 #[test]
-fn compare_pins_candidate_attn_decode_per_tier() {
+fn compare_pins_candidate_dense_mm_per_tier() {
     let reference = tiny_dump(Some(prov("reference")));
 
-    // strict runs under XWEN_ATTN_F32, so the decode projections are the
-    // dequant-f32 QMatMul → "f32-bypass"; a candidate carrying the shipped f16
-    // decode gemv ran the wrong build. attn_decode is the LAST candidate pin, so
-    // this must clear every other strict pin (including act and delta) to reach it.
+    // strict runs under XWEN_DENSE_MM_CLASSIC (a reduced-precision gemm cannot
+    // sit under a bitwise tier), so a candidate carrying the fused gemm ran the
+    // wrong build. dense_mm is checked after delta, so clear every earlier
+    // strict pin — including delta itself.
     let mut p = prov("fused");
     p.attn_dtype = Some("f32".to_string());
     p.attn_mm = Some("f32-bypass".to_string());
@@ -3222,6 +3296,101 @@ fn compare_pins_candidate_attn_decode_per_tier() {
     p.flash = Some("classic".to_string());
     p.act = Some("classic".to_string());
     p.delta = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("dense_mm"), "unexpected error: {err}");
+
+    // mm/decode grade the shipped vendored gemm, so a candidate still on the
+    // QMatMul chain is rejected — it would gate nothing.
+    let mut p = prov("fused");
+    p.seq_len = p.mm_min_seq; // mm-active
+    p.dense_mm = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Mm)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("dense_mm"), "unexpected error: {err}");
+    let mut p = prov("fused");
+    p.dense_mm = Some("classic".to_string());
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("dense_mm"), "unexpected error: {err}");
+
+    // A reference that recorded the fused gemm is no longer an oracle.
+    let mut r = prov("reference");
+    r.dense_mm = Some("fused".to_string());
+    let err = compare(
+        &tiny_dump(Some(prov("fused"))),
+        &tiny_dump(Some(r)),
+        Tier::Decode,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("dense_mm"), "unexpected error: {err}");
+}
+
+#[test]
+fn dense_mm_missing_at_current_version_hard_fails() {
+    // A dump claiming the current schema version but missing dense_mm came from
+    // a stale/doctored binary: hard fail, both sides.
+    let reference = tiny_dump(Some(prov("reference")));
+    let mut p = prov("fused");
+    p.dense_mm = None;
+    let err = compare(&tiny_dump(Some(p)), &reference, Tier::Decode)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no dense_mm"), "unexpected error: {err}");
+
+    let mut r = prov("reference");
+    r.dense_mm = None;
+    let err = compare(
+        &tiny_dump(Some(prov("fused"))),
+        &tiny_dump(Some(r)),
+        Tier::Decode,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("no dense_mm"), "unexpected error: {err}");
+}
+
+#[test]
+fn dense_mm_missing_grandfathered_at_schema_version_6() {
+    // A v6 REFERENCE dump (written before the dense_mm field existed) resolves
+    // the missing field to the grandfather "classic" — the only FFN path a
+    // pre-v7 binary had, and exactly what the reference pin expects, so the
+    // cached references regenerated at v6 stay valid without another 40 minutes
+    // of GPU time.
+    let mut r = prov("reference");
+    r.schema_version = 6;
+    r.dense_mm = None;
+    compare(
+        &tiny_dump(Some(prov("fused"))),
+        &tiny_dump(Some(r)),
+        Tier::Decode,
+    )
+    .expect("v6 references without dense_mm must be grandfathered to classic and pass");
+}
+
+#[test]
+fn compare_pins_candidate_attn_decode_per_tier() {
+    let reference = tiny_dump(Some(prov("reference")));
+
+    // strict runs under XWEN_ATTN_F32, so the decode projections are the
+    // dequant-f32 QMatMul → "f32-bypass"; a candidate carrying the shipped f16
+    // decode gemv ran the wrong build. attn_decode is the LAST candidate pin, so
+    // this must clear every other strict pin (including act, delta and dense_mm)
+    // to reach it.
+    let mut p = prov("fused");
+    p.attn_dtype = Some("f32".to_string());
+    p.attn_mm = Some("f32-bypass".to_string());
+    p.no_mm_id = true;
+    p.combine = Some("classic".to_string());
+    p.attn_glue = Some("classic".to_string());
+    p.flash = Some("classic".to_string());
+    p.act = Some("classic".to_string());
+    p.delta = Some("classic".to_string());
+    p.dense_mm = Some("classic".to_string());
     // attn_decode defaults to "f16" — wrong for strict (expects "f32-bypass").
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict)
         .unwrap_err()
@@ -3389,6 +3558,9 @@ fn load_dump_defaults_missing_schema_version_to_v1() {
     assert_eq!(prov.act, None);
     check_act(&prov, "reference dump", "classic")
         .expect("missing act at v1 must grandfather to classic");
+    assert_eq!(prov.dense_mm, None);
+    check_dense_mm(&prov, "reference dump", "classic")
+        .expect("missing dense_mm at v1 must grandfather to classic");
 }
 
 #[test]
@@ -3455,6 +3627,7 @@ fn committed_ppl_reference_fixtures_stay_valid() {
         check_attn_glue(&p, &name, "classic").unwrap();
         check_sdpa(&p, &name, "f16").unwrap();
         check_flash(&p, &name, "classic").unwrap();
+        check_dense_mm(&p, &name, "classic").unwrap();
         checked += 1;
     }
     assert!(

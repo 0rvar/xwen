@@ -273,6 +273,11 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// but unlike its env-derived siblings this one is OBSERVED, from the layer
 /// counters (`observed_delta_path`), because `forward` also falls back on
 /// grounds the environment cannot show.
+/// `dense_mm` records the DENSE checkpoint's SwiGLU FFN prefill gemm: "fused"
+/// (the vendored cooperative-tensor kernel, the Metal default) or "classic"
+/// (candle's `QMatMul` chain, under `XWEN_DENSE_MM_CLASSIC`); env-derived for
+/// every runner, like `flash`. The 35B-A3B has no dense FFN, so on that model
+/// the field labels the configured path rather than an executed one.
 /// `schema_version` stamps which field set this dump carries
 /// (`xwen::parity_schema`): the gate resolves a field missing from an older
 /// dump to its grandfather value instead of hard-failing, so adding a field
@@ -352,6 +357,19 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
         // "classic" for reference and strict dumps and the bounded tiers grade
         // "fused" against it.
         "delta": observed_delta_path()?,
+        // Dense-checkpoint SwiGLU FFN prefill gemm: "fused" (the vendored
+        // cooperative-tensor kernel, the Metal default) or "classic" (candle's
+        // QMatMul chain, under XWEN_DENSE_MM_CLASSIC). Env-derived for every
+        // runner — the dense FFN is outside the MoE runner split. Deliberately
+        // NOT observed like `delta`: the 35B-A3B has no dense FFN layer, so an
+        // observed field would have nothing to report there and would hard-fail
+        // every MoE dump. On that model the label therefore describes the
+        // configured path rather than an executed one, exactly as `flash` does
+        // for a decode-only dump. Like `delta`, the fused gemm is not
+        // bit-identical to what it replaces, so parity-gate.ts pins "classic"
+        // for reference and strict dumps and the bounded tiers grade "fused"
+        // against it.
+        "dense_mm": if xwen::ops::dense_mm_classic() { "classic" } else { "fused" },
     }))
 }
 

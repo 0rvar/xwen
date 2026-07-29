@@ -212,16 +212,21 @@ function die(msg: string): never {
 // ------------------------------------------------------------------- shell
 
 /**
- * A clean environment for a model run: strips the mm_id kernel-selection toggles
- * (all PRESENCE-BASED — a stray XWEN_MM_ID_F16=0 in the shell would still flip
- * the kernel) so each dump runs the path this script intends, and the parity
- * env vars (the gate sets those explicitly). Per-run additions layer on top.
+ * A clean environment for a model run: strips every kernel-selection toggle (all
+ * PRESENCE-BASED — a stray XWEN_MM_ID_F16=0 in the shell would still flip the
+ * kernel) so each dump runs the path this script intends, and the parity env
+ * vars (the gate sets those explicitly). Per-run additions layer on top.
+ *
+ * A toggle missing from this list is not a loud failure: it would apply to BOTH
+ * sides and the gate would pass while grading a kernel nobody asked for. Add new
+ * switches here as they land — `XWEN_DELTA_SCAN_V2` is the one that has no
+ * provenance field of its own, so stripping it is the only guard.
  */
 function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k.startsWith("XWEN_MM_ID")) continue;
+    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k.startsWith("XWEN_MM_ID")) continue;
     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
     // those explicitly per run; an inherited one would skew every tier.
     if (k.startsWith("XWEN_PARITY_")) continue;
@@ -260,7 +265,14 @@ function referenceEnv(): Record<string, string> {
   // MoE router and block epilogue are bit-identical to the candle chains they
   // replace, so a reference generated with or without it is byte-for-byte the
   // same dump. Cached references predating this pin therefore stay valid.
-  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_MOE_GLUE_CLASSIC: "1" };
+  //
+  // XWEN_DENSE_MM_CLASSIC is the opposite — necessity, like XWEN_DELTA_CLASSIC.
+  // The vendored dense-FFN prefill gemm runs matmul2d's reduced-precision path
+  // and is bounded-close, not bit-identical, so an oracle that ran it would put
+  // both sides on the same approximate path. Cached references predating the
+  // pin are still valid because no binary of that era could run the gemm (the
+  // schema-v7 grandfather says exactly this).
+  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1", XWEN_MOE_GLUE_CLASSIC: "1" };
 }
 
 /** Experiment flags (--sdpa-f32 / --attn-mm-classic / --flash-classic), set once in main. */
@@ -444,6 +456,7 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
     const flash = p.flash ?? (version < 3 ? "classic" : undefined);
     const act = p.act ?? (version < 4 ? "classic" : undefined);
     const delta = p.delta ?? (version < 6 ? "classic" : undefined);
+    const denseMm = p.dense_mm ?? (version < 7 ? "classic" : undefined);
     return (
       p.moe_impl === "reference" &&
       p.attn_dtype === "f32" &&
@@ -453,7 +466,8 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
       sdpa === "f16" &&
       flash === "classic" &&
       act === "classic" &&
-      delta === "classic"
+      delta === "classic" &&
+      denseMm === "classic"
     );
   } catch {
     return false;
@@ -627,12 +641,15 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   // family that is NOT bit-identical (the scan partitions its contractions),
   // so leaving them on would turn the bitwise strict tier into a bounded one.
   // The fused delta path is graded by the mm / decode / ppl tiers instead,
-  // which is where it runs by default. mm runs the default mm_id prefill
+  // which is where it runs by default. XWEN_DENSE_MM_CLASSIC=1 pins the dense
+  // checkpoint's FFN prefill to candle's QMatMul chain for the same reason —
+  // the vendored gemm's reduced-precision tensor path is bounded-close, not
+  // bit-identical. mm runs the default mm_id prefill
   // (code-short's 58 tokens are >= MM_ID_MIN_SEQ) with the default f16 attention.
   // Only the mm candidate picks up the experiment flags (candidateEnv); strict
   // stays pinned to the exact env its 0.999 anchor was blessed with.
   const env = tier === "strict"
-    ? { ...baseEnv(), XWEN_NO_MM_ID: "1", XWEN_MV_CLASSIC: "1", XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1" }
+    ? { ...baseEnv(), XWEN_NO_MM_ID: "1", XWEN_MV_CLASSIC: "1", XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1" }
     : candidateEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);

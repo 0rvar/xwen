@@ -68,15 +68,15 @@ impl SamplingArgs {
     }
 }
 
-/// DFlash speculative-decode knobs. Speculation is opt-IN on xwen: the shipped
-/// Qwen drafters are not yet adapted (TODO.md P9), so decoding is plain unless
-/// `--draft <gguf>` or `--draft official` asks for one. `--no-draft` is still
-/// accepted and does nothing, so a laguna-era command line keeps working.
+/// DFlash speculative-decode knobs. Speculation is opt-IN on xwen: decoding is
+/// plain unless `--draft <gguf>` or `--draft official` asks for a drafter.
+/// `--no-draft` is still accepted and does nothing, so a laguna-era command
+/// line keeps working.
 #[derive(Parser)]
 struct DraftArgs {
     /// Speculate with a DFlash drafter GGUF; the literal `official` selects the
-    /// shipped one. Off by default — the Qwen drafters are not adapted yet, so
-    /// this currently fails at load (TODO.md P9).
+    /// shipped one. Off by default — measured a win on the 27B and a ~12% loss
+    /// on the 35B-A3B (see docs/decisions.md, "Speculative decoding").
     #[arg(long, value_name = "GGUF", conflicts_with = "no_draft")]
     draft: Option<PathBuf>,
     /// Decode without speculation. Accepted for compatibility; this is already
@@ -90,8 +90,8 @@ struct DraftArgs {
     #[arg(long, default_value_t = 0)]
     draft_min: usize,
     /// Stop drafting at the first token whose full-vocab softmax prob is below
-    /// this. Adaptive draft length; 0.5 measured best across prompt kinds.
-    #[arg(long, default_value_t = 0.5)]
+    /// this. Adaptive draft length; 0.3 measured best across prompt kinds.
+    #[arg(long, default_value_t = 0.3)]
     draft_p_min: f32,
     /// Auto-pause speculation when its wall-clock cost per committed token
     /// exceeds a plain decode step's cost times this factor (keeps `--draft`
@@ -342,7 +342,7 @@ struct ServeArgs {
     /// on the 27B — plus one snapshot's DeltaNet state per snapshot kept
     /// (62.8 / 149.6 MiB). The live one holds an image too, so budget
     /// N x (--ctx x per-token + snapshots x per-snapshot), plus
-    /// min(--draft-ctx, --ctx) x 48 KiB of drafter planes per slot while
+    /// min(--draft-ctx, --ctx) x 40-48 KiB of drafter planes per slot while
     /// speculation is on, plus one slot's images again while a swap is in
     /// flight. Lower this or --ctx if that does not fit. 1 keeps a single
     /// conversation warm.
@@ -371,9 +371,10 @@ struct ServeArgs {
     disk_min_tokens: Option<usize>,
     /// DFlash drafter GGUF to speculate with; the literal `official` selects
     /// the shipped one, fetched into the Hugging Face cache on first use.
-    /// Greedy output is identical to decoding without it. Off by default — the
-    /// Qwen drafters are not adapted yet, so this currently fails at load
-    /// (TODO.md P9).
+    /// Greedy output matches decoding without it except where a near-tie lands
+    /// differently. Off by default: measured a win on the 27B and a ~12% loss
+    /// on the 35B-A3B, whose plain step is too short to absorb the drafter's
+    /// per-token cache sync.
     #[arg(long, value_name = "GGUF", conflicts_with = "no_draft")]
     draft: Option<PathBuf>,
     /// Decode without speculation. Accepted for compatibility; this is already
@@ -394,9 +395,9 @@ struct ServeArgs {
     draft_pause_margin: Option<f32>,
     /// Positions the drafter's KV cache is sized for, and equally how far into a
     /// conversation speculation stays active — past it decode continues plain
-    /// (the drafter's per-round cost grows with context depth while its
-    /// proposal quality collapses, so deep drafting is a pure loss). The cache
-    /// is f32 at 48 KiB per token — about 0.4 GB at the default 8192, and that
+    /// (the drafter's proposal quality collapses with context depth, so deep
+    /// drafting is a pure loss). The cache is f32 at 40 KiB per token on the
+    /// 27B sidecar and 48 on the 35B-A3B — about 0.4 GB at the default 8192, and that
     /// again per warm conversation, since each cache slot images its own
     /// drafter planes (see --cache-slots).
     #[arg(long)]
@@ -585,8 +586,8 @@ fn build_generator(
     );
 
     // Speculation is opt-in: only an explicit `--draft` asks for a drafter, so
-    // a zero-flag run decodes plain instead of aborting on the unadapted Qwen
-    // sidecars (TODO.md P9). `--no-draft` is the default and stays accepted.
+    // a zero-flag run decodes plain — the right default while attaching a
+    // drafter is a measured loss on the 35B-A3B. `--no-draft` stays accepted.
     if let Some((draft, requested)) = draft
         .filter(|d| !d.no_draft)
         .and_then(|d| d.draft.as_ref().map(|path| (d, path)))
@@ -599,7 +600,7 @@ fn build_generator(
         // The drafter's cache is sized by --draft-ctx (capped at the target's
         // context), which is also the drafting depth limit — the same rule the
         // serve engine applies. Sizing it at the target's max_ctx would buy
-        // 48 KiB/token of f32 cache for depths where drafting never pays (and
+        // 40-48 KiB/token of f32 cache for depths where drafting never pays (and
         // OOMs outright at 262k alongside the 68 GB target).
         let drafter = DflashDrafter::load(&dgguf, &device, draft.draft_ctx.min(max_ctx))?;
         generator.attach_drafter(drafter, draft.params())?;

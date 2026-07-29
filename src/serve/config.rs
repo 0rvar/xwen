@@ -95,35 +95,33 @@ pub const DEFAULT_SCHEDULE_AGE_LIMIT_SECS: u64 = 20;
 /// Speculative-decode defaults, matching `xwen generate`'s `--draft-*` flags so
 /// a conversation speculates here exactly as it does on the command line.
 ///
-/// Speculation is opt-IN, unlike laguna's opt-out: the shipped Qwen DFlash
-/// sidecars are not adapted yet (TODO.md P9), so a drafter load fails outright
-/// and a default-on flag would abort every zero-flag `xwen serve` at startup.
-/// Naming a drafter — `--draft <gguf>`, `--draft official`, or `draft.path` in
-/// the config — still opts in, and still fails loudly if it cannot load. Flips
-/// back to `true` when P9 lands. See docs/decisions.md, "Speculative decoding".
+/// Speculation is opt-IN, unlike laguna's opt-out. The Qwen sidecars now load
+/// and draft well (85-95% acceptance), but attaching one is only a win on the
+/// 27B: on the 35B-A3B a drafter costs ~12% of decode even on rounds where it
+/// drafts nothing, because keeping its KV cache in step with the target's is a
+/// fixed ~1.2 ms per committed token against a 9.5 ms plain step. Naming a
+/// drafter — `--draft <gguf>`, `--draft official`, or `draft.path` in the
+/// config — opts in. Revisit when the fused verify and a cheaper inject land
+/// (TODO.md P9). See docs/decisions.md, "Speculative decoding".
 pub const DEFAULT_DRAFT_ENABLED: bool = false;
 pub const DEFAULT_DRAFT_MAX: usize = 15;
-pub const DEFAULT_DRAFT_P_MIN: f32 = 0.5;
+pub const DEFAULT_DRAFT_P_MIN: f32 = 0.3;
 pub const DEFAULT_DRAFT_PAUSE_MARGIN: f32 = 1.0;
 /// Positions the drafter's KV cache is sized for, which doubles as the horizon
 /// speculation stays active over — past it decode continues plain. Shared with
 /// the CLI (`--draft-ctx`); see the constant's doc for why it is small.
 pub use crate::dflash::DEFAULT_DRAFT_CTX;
 
-/// KV bytes per token of drafter cache: the shipped 35B-A3B sidecar's 6 layers
-/// x K and V x 8 KV heads x 128 head_dim, f32 (stored exact — narrowing drafter
-/// state would put rounding into a page-out round trip).
-///
-/// Provisional, like everything about the drafters: the sidecars are not adapted
-/// yet (TODO.md P9), and the 27B one has five layers rather than six. It informs
-/// a `--init` comment and nothing that allocates, so one figure for the bring-up
-/// model is enough until the adaptation lands and can measure both.
-const DRAFT_KV_BYTES_PER_TOKEN: usize = 6 * 2 * 8 * 128 * 4;
-
 /// Which checkpoint the `--init` template quotes its cache sizes for. The
 /// template is written before any model is chosen, so it has to name one; the
 /// bring-up model is the one most of these numbers will be read against.
 const TEMPLATE_MODEL: crate::hub::Model = crate::hub::Model::Qwen35BA3B;
+
+/// KV bytes per token of drafter cache for the model the template quotes. The
+/// figure is per-model — the 27B sidecar has five layers to the 35B-A3B's six —
+/// and lives on `hub::Model` beside the target's. It informs a `--init` comment
+/// and nothing that allocates.
+const DRAFT_KV_BYTES_PER_TOKEN: usize = TEMPLATE_MODEL.draft_kv_bytes_per_token();
 
 /// Config path used when `--config` is not given.
 pub const CONFIG_RELATIVE_PATH: &str = ".config/xwen/serve.toml";
@@ -1136,7 +1134,7 @@ pub fn init_template() -> String {
 # The model GGUF to serve. Unset (and no --model), the official checkpoint is
 # used, fetched into the Hugging Face cache on first use (`xwen fetch`
 # prefetches).
-# model = "/path/to/laguna-s-2.1-Q4_K_M.gguf"
+# model = "/path/to/Qwen3.6-35B-A3B-Q4_K_M.gguf"
 
 # Address to bind. Loopback keeps the server off the network; "0.0.0.0" accepts
 # connections from other machines, which is worth pairing with api_key below.
@@ -1322,9 +1320,11 @@ slots = {slots}
 [draft]
 # Speculative decoding with a DFlash drafter: the drafter proposes a block of
 # tokens, one batched target forward verifies them, and every token the target
-# would have sampled anyway is committed for free. Greedy output is identical to
-# decoding without it. Opt-in, and currently unavailable: the shipped Qwen
-# drafters are not adapted yet, so turning this on fails at load (TODO.md P9).
+# would have sampled anyway is committed for free. Greedy output matches decoding
+# without it except where a near-tie lands differently. Opt-in, and worth it only
+# on the 27B: on the 35B-A3B an attached drafter costs about 12% of decode even
+# on rounds where it drafts nothing, because keeping its cache in step with the
+# target's is a fixed per-token cost that a 9.5 ms plain step cannot absorb.
 # `enabled = true` uses the official drafter, fetched into the Hugging Face
 # cache on first use; `path` names a custom drafter GGUF and enables on its own.
 enabled = {draft_enabled}
@@ -1335,7 +1335,7 @@ max = {draft_max}
 
 # Stop drafting at the first token whose probability falls below this, so a round
 # drafts as far as the drafter is confident and no further. Adaptive length beats
-# any fixed block: 0.5 measured best across prompt kinds.
+# any fixed block: 0.3 measured best across prompt kinds.
 p_min = {draft_p_min}
 
 # Pause speculation when its measured wall-clock cost per committed token exceeds a
@@ -1439,8 +1439,7 @@ mod tests {
         assert_eq!(s.disk_max_gib, DEFAULT_DISK_MAX_GIB);
         assert_eq!(s.disk_min_tokens, DEFAULT_DISK_MIN_TOKENS);
         // Speculation is opt-in: nothing asked for a drafter, so a zero-flag
-        // server decodes plain instead of failing on the unadapted Qwen
-        // sidecars (TODO.md P9).
+        // server decodes plain.
         assert_eq!(s.draft, None);
         assert_eq!(s.draft_max, DEFAULT_DRAFT_MAX);
         assert_eq!(s.draft_p_min, DEFAULT_DRAFT_P_MIN);
@@ -1516,9 +1515,8 @@ mod tests {
     /// Speculation is opt-in: it takes an explicit request, and each of the
     /// three ways of making one works on its own.
     ///
-    /// The default is off because the shipped Qwen DFlash sidecars are not
-    /// adapted yet (TODO.md P9) and a drafter load aborts the server at
-    /// startup — so a zero-flag run must not ask for one.
+    /// The default is off because an attached drafter is a measured decode loss
+    /// on the 35B-A3B — so a zero-flag run must not ask for one.
     #[test]
     fn speculation_is_off_until_something_asks_for_it() {
         // Nothing named, nothing enabled: no drafter.

@@ -134,14 +134,22 @@ pub struct SpecParams {
 
 impl Default for SpecParams {
     fn default() -> Self {
-        // p_min 0.5 measured best on this machine (2026-07-23): adaptive draft
-        // length beats any fixed draft_max — code-gen 25.5 vs 18.4 tok/s base at
-        // temp 1.0 (80% acceptance); p_min 0 with full blocks was a net LOSS
-        // (9.1 tok/s, 13% acceptance — rejected tail verifies are pure waste).
+        // Adaptive draft length beats any fixed draft_max: a full fixed block
+        // spends the whole round verifying a tail that gets rejected. p_min 0.3
+        // measured best of {0.2, 0.3, 0.5, 0.7, 0.9} on the Qwen sidecars
+        // (2026-07-29, 27B, interleaved arms, greedy): it is the only setting
+        // that came out ahead of plain decode on BOTH a code prompt and a chat
+        // prompt in every run, where 0.5 lost on chat twice. Lower p_min drafts
+        // longer at lower acceptance, and that wins here because the verify
+        // forward's cost is close to linear in its span — the DeltaNet layers
+        // fall back to the per-token reference scan under an armed rollback
+        // trail, so a long span amortizes the round's fixed cost without the
+        // usual batching penalty. Revisit when the fused verify lands (TODO P9):
+        // it changes the cost curve this was fitted to.
         Self {
             draft_max: 15,
             draft_min: 0,
-            draft_p_min: 0.5,
+            draft_p_min: 0.3,
             pause_margin: 1.0,
         }
     }
@@ -1398,7 +1406,19 @@ impl Generator {
     /// `DflashConfig::spec_tap_layers` (the enforced `target_layers -> l_out`
     /// translation), kept in `target_layers` order — the order the drafter's
     /// encoder concatenates them.
+    ///
+    /// A drafter paired with the wrong target is rejected here, by the same
+    /// `DflashConfig::check_against_target` serve runs at startup — the checks
+    /// are shared so the two paths cannot drift apart. Without it the failure
+    /// modes are a tap past the target's last layer (which `set_spec_taps`
+    /// asserts, i.e. panics), a hidden size the encoder cannot consume (which
+    /// would not surface until the first forward), and a mask token outside the
+    /// target's vocabulary (which fails at the first speculative round).
     pub fn attach_drafter(&mut self, drafter: DflashDrafter, params: SpecParams) -> Result<()> {
+        let target = self.model.config();
+        drafter
+            .config()
+            .check_against_target(target.hidden, target.n_layer, target.vocab)?;
         let tap_layers = drafter.config().spec_tap_layers()?;
         self.model.set_spec_taps(Some(tap_layers));
         self.drafter = Some(drafter);
@@ -1688,8 +1708,10 @@ impl Generator {
     }
 
     /// Positions the drafter's own KV cache can hold — smaller than the target's
-    /// context by design, since its f32 planes cost 48 KiB/token. `None` when no
-    /// drafter is attached.
+    /// context by design, since its f32 planes cost 40 KiB/token on the 27B
+    /// sidecar and 48 on the 35B-A3B's extra layer
+    /// (`hub::Model::draft_kv_bytes_per_token`). `None` when no drafter is
+    /// attached.
     pub fn drafter_max_ctx(&self) -> Option<usize> {
         self.drafter.as_ref().map(|d| d.max_ctx())
     }
@@ -2799,7 +2821,8 @@ impl Generator {
 ///
 /// Taking a PREFIX rather than skipping a straddling span matters because the
 /// drafter's context is sized independently of the target's (its f32 planes cost
-/// 48 KiB/token) and a prefill chunk rarely lands on that boundary. Filling the
+/// 40-48 KiB/token depending on the sidecar) and a prefill chunk rarely lands on
+/// that boundary. Filling the
 /// drafter right up to its capacity is what keeps the widest set of later rewind
 /// points able to re-enable speculation — a rewind can only do so if it lands
 /// exactly on the committed length.
