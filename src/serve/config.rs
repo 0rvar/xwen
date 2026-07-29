@@ -95,15 +95,16 @@ pub const DEFAULT_SCHEDULE_AGE_LIMIT_SECS: u64 = 20;
 /// Speculative-decode defaults, matching `xwen generate`'s `--draft-*` flags so
 /// a conversation speculates here exactly as it does on the command line.
 ///
-/// Speculation is opt-IN, unlike laguna's opt-out. The Qwen sidecars now load
-/// and draft well (85-95% acceptance), but attaching one is only a win on the
-/// 27B: on the 35B-A3B a drafter costs ~12% of decode even on rounds where it
-/// drafts nothing, because keeping its KV cache in step with the target's is a
-/// fixed ~1.2 ms per committed token against a 9.5 ms plain step. Naming a
-/// drafter — `--draft <gguf>`, `--draft official`, or `draft.path` in the
-/// config — opts in. Revisit when the fused verify and a cheaper inject land
-/// (TODO.md P9). See docs/decisions.md, "Speculative decoding".
-pub const DEFAULT_DRAFT_ENABLED: bool = false;
+/// Speculation is opt-OUT. The K-snapshot fused verify (P9a) removed the
+/// per-token cache-sync cost that made a drafter a loss on the 35B-A3B, and
+/// with it drafting measured faster on both checkpoints (2026-07-29, greedy,
+/// 128 tokens, warm, interleaved): 27B +19.3 to +21.0% on code and +7.6 to
+/// +8.4% on chat, 35B-A3B +18.1 to +19.8% on code and +12.6 to +12.8% on chat.
+/// `--no-draft`, or `enabled = false` in the config, opts out. Note the cost of
+/// the default: a zero-flag run now fetches and loads the DFlash sidecar (3.5
+/// GB on the 27B, 0.8 GB on the 35B-A3B). See docs/decisions.md, "Speculative
+/// decoding".
+pub const DEFAULT_DRAFT_ENABLED: bool = true;
 pub const DEFAULT_DRAFT_MAX: usize = 15;
 pub const DEFAULT_DRAFT_P_MIN: f32 = 0.3;
 pub const DEFAULT_DRAFT_PAUSE_MARGIN: f32 = 1.0;
@@ -318,9 +319,10 @@ pub struct CacheToml {
     pub slots: Option<usize>,
 }
 
-/// Speculative decoding with a DFlash drafter. Opt-in: off unless `path` names
-/// a drafter or `enabled = true` asks for the official one. `enabled = false`
-/// decodes one token per target forward even when a `path` is set.
+/// Speculative decoding with a DFlash drafter. Opt-out: on unless
+/// `enabled = false`, which decodes one token per target forward even when a
+/// `path` is set. `path` names a custom drafter; without it the official
+/// sidecar for the checkpoint is used.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DraftToml {
@@ -544,7 +546,7 @@ pub fn resolve(
         "disk-cache"
     };
     // Speculation's switch has a direction too: --no-draft disables, while an
-    // explicit --draft (naming a drafter is itself an opt-in) enables over a
+    // explicit --draft (naming a drafter is a request for one) enables over a
     // config that turned speculation off.
     let draft_flag = if cli.draft_enabled == Some(false) {
         "no-draft"
@@ -800,9 +802,9 @@ pub fn resolve(
                 origin,
                 &mut warnings,
             );
-            // Opt-in speculation: naming a drafter is itself the opt-in, so a
-            // config that sets only `path` still drafts. With no drafter named
-            // and nothing asking for one there is nothing to enable.
+            // Opt-out speculation: the default enables on its own, and the
+            // `|| path.is_some()` keeps a config that sets only `path` drafting
+            // whichever way DEFAULT_DRAFT_ENABLED is set.
             let enabled = pick_flag(
                 draft_flag,
                 "draft.enabled",
@@ -1321,12 +1323,13 @@ slots = {slots}
 # Speculative decoding with a DFlash drafter: the drafter proposes a block of
 # tokens, one batched target forward verifies them, and every token the target
 # would have sampled anyway is committed for free. Greedy output matches decoding
-# without it except where a near-tie lands differently. Opt-in, and worth it only
-# on the 27B: on the 35B-A3B an attached drafter costs about 12% of decode even
-# on rounds where it drafts nothing, because keeping its cache in step with the
-# target's is a fixed per-token cost that a 9.5 ms plain step cannot absorb.
-# `enabled = true` uses the official drafter, fetched into the Hugging Face
-# cache on first use; `path` names a custom drafter GGUF and enables on its own.
+# without it except where a near-tie lands differently. On by default: measured
+# faster on both checkpoints on 2026-07-29 — 27B +19.3 to +21.0% on code and
+# +7.6 to +8.4% on chat, 35B-A3B +18.1 to +19.8% on code and +12.6 to +12.8% on
+# chat (greedy, 128 tokens, warm). It uses the official drafter for the
+# checkpoint, fetched into the Hugging Face cache on first use (3.5 GB on the
+# 27B, 0.8 GB on the 35B-A3B); `path` names a custom drafter GGUF instead.
+# `enabled = false` decodes plain.
 enabled = {draft_enabled}
 # path = "/path/to/custom-drafter.gguf"
 
@@ -1438,9 +1441,9 @@ mod tests {
         assert_eq!(s.cache_dir, default_cache_dir());
         assert_eq!(s.disk_max_gib, DEFAULT_DISK_MAX_GIB);
         assert_eq!(s.disk_min_tokens, DEFAULT_DISK_MIN_TOKENS);
-        // Speculation is opt-in: nothing asked for a drafter, so a zero-flag
-        // server decodes plain.
-        assert_eq!(s.draft, None);
+        // Speculation is opt-out: a zero-flag server speculates with the
+        // official sidecar, named symbolically for the caller to resolve.
+        assert_eq!(s.draft, Some(PathBuf::from("official")));
         assert_eq!(s.draft_max, DEFAULT_DRAFT_MAX);
         assert_eq!(s.draft_p_min, DEFAULT_DRAFT_P_MIN);
         assert_eq!(s.draft_pause_margin, DEFAULT_DRAFT_PAUSE_MARGIN);
@@ -1448,8 +1451,8 @@ mod tests {
     }
 
     /// The drafter settings follow the same CLI-over-file-over-default precedence as
-    /// everything else, and naming a path is itself the opt-in that turns
-    /// speculation on.
+    /// everything else, and naming a path is what selects a drafter other than the
+    /// official one.
     #[test]
     fn draft_settings_follow_the_usual_precedence() {
         let file: ServeToml = toml::from_str(
@@ -1501,7 +1504,7 @@ mod tests {
         );
 
         // The flag alone, with no config file to contradict, leaves the rest at their
-        // defaults — passing --draft is all it takes to speculate.
+        // defaults — --draft only swaps which drafter speculates.
         let cli = CliOverrides {
             draft: Some(PathBuf::from("/only-cli.gguf")),
             ..model_only()
@@ -1512,26 +1515,26 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
-    /// Speculation is opt-in: it takes an explicit request, and each of the
-    /// three ways of making one works on its own.
+    /// Speculation is opt-out: it needs no request at all, and every way of
+    /// making one anyway still selects the drafter it names.
     ///
-    /// The default is off because an attached drafter is a measured decode loss
-    /// on the 35B-A3B — so a zero-flag run must not ask for one.
+    /// The default is on because drafting measured faster on both checkpoints
+    /// once the fused verify landed — so a zero-flag run asks for a drafter.
     #[test]
-    fn speculation_is_off_until_something_asks_for_it() {
-        // Nothing named, nothing enabled: no drafter.
+    fn speculation_is_on_unless_something_declines_it() {
+        // Nothing named, nothing enabled: the official drafter, by default.
         let empty: ServeToml = toml::from_str("").unwrap();
         let (settings, warnings) = resolve(&empty, None, &model_only()).unwrap();
-        assert_eq!(settings.draft, None);
+        assert_eq!(settings.draft, Some(PathBuf::from("official")));
         assert!(warnings.is_empty());
 
-        // `enabled = true` alone means the official drafter.
+        // `enabled = true` restates the default and means the same drafter.
         let file: ServeToml = toml::from_str("[draft]\nenabled = true\n").unwrap();
         let (settings, _) = resolve(&file, None, &model_only()).unwrap();
         assert_eq!(settings.draft, Some(PathBuf::from("official")));
 
-        // A config path alone is an opt-in on its own — `enabled` need not be
-        // restated beside it.
+        // A config path picks a custom drafter, and enables on its own whichever
+        // way the default is set.
         let file: ServeToml = toml::from_str("[draft]\npath = \"/d.gguf\"\n").unwrap();
         let (settings, _) = resolve(&file, None, &model_only()).unwrap();
         assert_eq!(settings.draft, Some(PathBuf::from("/d.gguf")));
@@ -1548,9 +1551,8 @@ mod tests {
 
     /// `--no-draft` and `[draft] enabled = false` both resolve to no drafter,
     /// even over a config-named path, and the CLI switch wins over an explicit
-    /// `enabled = true` with a warning. Since opt-in made no-drafter the
-    /// default, these are now about overriding a request for one rather than
-    /// about declining the default.
+    /// `enabled = true` with a warning. These are the opt-out: with speculation
+    /// on by default they are the only way to decode plain.
     #[test]
     fn no_draft_disables_speculation() {
         let file: ServeToml = toml::from_str("[draft]\nenabled = false\n").unwrap();
@@ -1582,9 +1584,9 @@ mod tests {
             ]
         );
     }
-    /// Naming a drafter on the CLI is itself an opt-in: `--draft <path>` (which
-    /// the CLI layer turns into `draft_enabled: Some(true)`) beats a config
-    /// file's `enabled = false`, with a warning naming the flag that won.
+    /// Naming a drafter on the CLI is itself a request for one: `--draft <path>`
+    /// (which the CLI layer turns into `draft_enabled: Some(true)`) beats a
+    /// config file's `enabled = false`, with a warning naming the flag that won.
     #[test]
     fn an_explicit_cli_draft_beats_config_disabled() {
         let file: ServeToml = toml::from_str("[draft]\nenabled = false\n").unwrap();

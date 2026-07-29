@@ -169,7 +169,9 @@ As of 2026-07-29 (`lowpowermode 0` — NOT low-power mode; this machine emits no
 be claimed. Interleaved protocol, --no-draft; full history in log.md): 35B-A3B
 decode 103.1 tok/s, prefill ~1900-2550@4k; 27B decode 22-25, prefill 702@925 /
 445@4k. Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run adds ~9s
-of Metal pipeline compilation.
+of Metal pipeline compilation. With drafting (the default since P9a, same day):
+35B decode 118-127 tok/s (+13-20%), 27B 26-30 (+8-21%), code prompts at the top
+of each range; `--no-draft` reproduces the plain numbers above.
 
 **The 27B prefill gap is CLOSED (P8c, same day).** It was never the DeltaNet
 scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill
@@ -199,16 +201,18 @@ And on a machine shared with other agents, calibrate every prefill run against
 the classic arm's known baseline before believing absolutes: three separate
 contended runs read 3x low in BOTH arms while the ratio stayed put.
 
-## DFlash (PLANNED — sidecars exist, adaptation not started)
+## DFlash (SHIPPED and ON BY DEFAULT as of 2026-07-29)
 
-laguna's dflash.rs is kept: ggml-org ships DFlash drafters for both models (arch
-`dflash`; 27B: 5 layers, sliding_window 2048, taps [2,17,32,47,62], mask 248070; 35B:
-6 layers, sliding_window 4096, taps [2,7,12,17,23,28,33,38], mask 248077; both
-block_size 16, fc.weight over concatenated tapped layer outputs, own ffn_norm,
-q/k-norms [128]). Adaptation = repoint decoder_arch check, tap indices, mask token,
-and re-tune the pause controller. Recurrent-state rollback for the verify walk needs
-delta/conv snapshot slots (llama.cpp keeps K=n_rs_seq+1 most-recent-first snapshots —
-mirror that shape).
+Adapted (P9), then made a both-checkpoint win by the K-snapshot fused verify (P9a) and
+flipped to opt-out the same day — `--no-draft` opts out; a zero-flag run fetches and
+loads the sidecar (3.5 GB 27B / 0.8 GB 35B). Sidecar facts (arch `dflash`; 27B: 5
+layers, sliding_window 2048, taps [2,17,32,47,62], mask 248070; 35B: 6 layers,
+sliding_window 4096, taps [2,7,12,17,23,28,33,38], mask 248077; both block_size 16,
+fc.weight over concatenated tapped layer outputs, own ffn_norm, q/k-norms [128]).
+Acceptance 85-95%. Verify-walk rollback uses the fused scan's K-snapshot planes
+(most-recent-first, llama.cpp's shape; decisions.md "Model math"). `p_min` 0.3 /
+`pause_margin` 1.0 are fitted to the RETIRED reference-scan cost curve — retune is
+ledgered (TODO.md "Deferred from the K-snapshot verify pass").
 
 ## serve (INHERITED, needs template adaptation)
 

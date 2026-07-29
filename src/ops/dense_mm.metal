@@ -1,7 +1,7 @@
 // Vendored Metal-4 cooperative-tensor DENSE quantized-weight x f32-activation
 // prefill gemm — the 27B's SwiGLU FFN projections (ffn_gate / ffn_up /
 // ffn_down, Q4_K in the shipped Q4_K_M file). The SHIPPED DEFAULT for
-// `DenseMlp`'s prefill (seq >= DENSE_MM_MIN_SEQ); XWEN_DENSE_MM_CLASSIC reverts
+// `DenseMlp`'s prefill (seq > DENSE_MM_MIN_SEQ); XWEN_DENSE_MM_CLASSIC reverts
 // to candle's `QMatMul` chain. Decode never reaches here.
 //
 // This file is `f16_t.metal`'s kernel with ONE substitution: the A-tile staging

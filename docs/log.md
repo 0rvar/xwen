@@ -4,7 +4,82 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-07-29 (latest) — The 27B prefill gap was the dense FFN's gemm, not the DeltaNet scan: a Q4_K cooperative-tensor kernel takes prefill from 263 to 702 tok/s @925
+## 2026-07-29 (latest) — K-snapshot fused verify lands: spec decode goes from single digits to +8-21%, the 35B flips from -12% to +13-20%, and --draft becomes opt-out
+
+**Context.** P9 shipped speculation as a 27B-only single-digit win with the 35B losing
+12%, and its own annotation named the cause: under an armed rollback trail a multi-token
+verify chunk fell back to the frozen reference scan, token by token — 39 ms per verified
+position on the 27B, so the 48-of-64 DeltaNet layers got no batching win at all inside a
+verify forward. TODO.md P9(a) called the K-snapshot fused verify "the precondition for
+speculation to pay, not an optimization of it". This arc built it.
+
+**What shipped.** The two fused scan kernels (`kernel_delta_scan`, `kernel_delta_scan_v2`
+in `src/ops/delta.metal`) now optionally spill per-token states: a new
+`ops::delta_scan_with_trail(.., state_planes)` widens the state output to
+`[planes, v_heads, 128, 128]`, most-recent-first (plane s = state after token
+`seq-1-s`), mirroring llama.cpp's `kernel_gated_delta_net` K>1 snapshot slots
+(ggml-metal.metal:2740-2749) so the CPU oracle stays diffable. Plane 0 is the unchanged
+after-loop store — at planes = 1 (every unarmed prefill and decode call) the kernel is
+byte-identical to before, proven by a bitwise test. The armed clause is gone from
+`linear_attn.rs`'s fused gate; an armed chunk runs the fused scan with planes = seq and
+builds the rollback trail from unmaterialized plane views (delta) plus the same
+host-side conv-stream slices the reference records. `XWEN_DELTA_CLASSIC=1` still routes
+everything, armed chunks included, to `forward_classic` (untouched, still the frozen
+oracle). `n_planes` rides the args struct, not a specialized pipeline. Details in
+decisions.md "Model math" (the superseded armed-chunk entry).
+
+**Verification.** 700 lib + 66 parity-harness tests green (4 net new; the test encoding
+the old fallback was rewritten to assert the new invariant, and the new trail test was
+mutation-tested — flipping the kernel's slot mapping fails it while every pre-existing
+scan test stays green, so it is not vacuous). Two-model-family adversarial review
+(Claude + Codex gpt-5.6-sol at xhigh): zero correctness findings; one doc-accuracy nit
+each, both fixed. Both parity gates re-ran and pass with numbers identical to the
+pre-change run (35B mm cos 0.999631, Δnll 0.000791; 27B all tiers) — the schema is
+untouched.
+
+**Measured** (`lowpowermode 0` — this machine exposes no `powermode` key, so high-power
+is never claimed; warm, one model process at a time, interleaved arms, greedy, 128 new
+tokens, `p_min` 0.3; two independent end-to-end runs, per-rep values in the raw logs).
+The verify A/B is same-day and same-harness: `XWEN_DELTA_CLASSIC=1` IS the pre-P9a
+verify path, and that arm reproduced the historical 245 ms @ span ~6 baseline.
+
+- 27B verify round (`n_past` 512): fit over spans 2-32, the marginal cost fell
+  **9.42 → 3.57 ms/position** (2.6x) over a fixed cost of ~171 → ~149 ms. At span 6:
+  244 → 187 ms/round. In-loop `--stats` corroborate (~248 ms/8.3-position round →
+  ~182 ms/7.3).
+- 27B end-to-end: code **+19.3 to +21.0%** (29.7-30.0 vs 24.8-24.9 tok/s median), chat
+  **+7.6 to +8.4%** — up from +4.8-6.8% / +1.5-7.4%. Acceptance 83.2% / 75.2% (down
+  ~4 points from pre-P9a: the batched verify reassociates sums and accepts a slightly
+  different token set; throughput improved regardless).
+- 35B-A3B end-to-end: code **+18.1 to +19.8%** (124.0-126.7 vs 105.0-105.8), chat
+  **+12.6 to +12.8%** — from **-11.5/-12.7%**. The mechanism is the pause controller,
+  not the drafter: 35B code went 54-of-66 rounds paused → **0-of-20 paused, 159
+  drafted**. The ledger's attribution of the 35B loss to the drafter cache sync (P9b)
+  was measured right but read wrong — the ~1.2 ms sync is only fatal when the
+  controller pauses and pays it for nothing; cheap verify made it stop pausing.
+- spec-equivalence: six of eight comparisons byte-identical; the two 27B-chat forks are
+  at the SAME points with the SAME words as the pre-P9a run (the known near-tie class).
+  No desync — the sampled stream stays in step for 100+ tokens before forking.
+
+**The `--draft` default flipped to opt-out** — P9(d)'s pre-registered bar ("the 35B at
+or above plain, not merely closer") is met with margin on both prompt kinds in both
+runs. Zero-flag `generate`/`serve` now load the dflash sidecar; `--no-draft` opts out.
+
+**New open items** (ledgered under P9/TODO): the verify round's ~149 ms fixed cost
+(~113 ms above a plain step, now ~60% of a typical round and the new ceiling — price
+checkpoint/rollback/readback before attacking); `p_min`/`pause_margin` retune against
+the new cost curve (0.3 was fitted to the reference-scan curve); an unexplained
+superlinear jump at span 48 in every verify arm (outside the production regime —
+block_size 16 caps real spans near 17 — refuted as the dense-mm threshold, cause
+unknown); `spec-verify-bench.rs` shipped broken (fixture id `long-swa` predates the P7
+rename to `long-mixed` — it had never run in this repo; fixed this arc). The flip's own
+review (Codex, clean on the diff) surfaced two default-on consequences, both ledgered:
+serve slots persisted without drafter planes now silently decode plain forever while
+reporting draft ON (the common hydration path against `--no-draft`-era slots, not the
+flag-change edge the code comment was written for), and a custom `--model` GGUF that
+fails the drafter preflight now hard-errors at startup where it previously ran plain.
+
+## 2026-07-29 — The 27B prefill gap was the dense FFN's gemm, not the DeltaNet scan: a Q4_K cooperative-tensor kernel takes prefill from 263 to 702 tok/s @925
 
 **Context.** Two entries below, the DeltaNet arc refuted its own premise and handed off a
 question: the 27B's 1.8-2.1x prefill loss to llama.cpp is not in the DeltaNet layers, it

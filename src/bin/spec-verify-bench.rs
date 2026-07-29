@@ -25,7 +25,8 @@ struct Args {
     #[arg(short, long)]
     model: PathBuf,
     /// Tokens prefilled before the verify sweep (cache depth during the bench;
-    /// > 512 exercises the wrapped SWA ring like a real mid-generation verify).
+    /// the deeper it is, the closer the verify is to a real mid-generation one —
+    /// both the KV cache it attends over and the DeltaNet state it carries).
     #[arg(long, default_value_t = 512)]
     n_past: usize,
     #[arg(long, default_value_t = 20)]
@@ -47,8 +48,8 @@ fn main() -> Result<()> {
         .as_array()
         .context("prompts array")?
         .iter()
-        .find(|p| p["id"] == "long-swa")
-        .context("long-swa fixture")?["tokens"]
+        .find(|p| p["id"] == "long-mixed")
+        .context("long-mixed fixture")?["tokens"]
         .as_array()
         .context("tokens array")?
         .iter()

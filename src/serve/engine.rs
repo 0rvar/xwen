@@ -2080,7 +2080,14 @@ fn page_in(
     // the checkpoint id binds the TARGET's geometry, so rows and rings that read back at
     // all necessarily fit, while the drafter is a separate GGUF chosen by a separate flag
     // — restart with a different `--draft`, or a smaller `--draft-ctx`, and planes stored
-    // by the last run describe a cache this one does not have. `import_cache` validates
+    // by the last run describe a cache this one does not have. With drafting on by
+    // default the plane-less case is also the COMMON hydration against slots written by
+    // a `--no-draft` run or a pre-drafting build, not just a flag-change edge. Either
+    // way the degradation is permanent for the conversation: the drafter's cache is fed
+    // by target-layer taps during target forwards, so a reset drafter at a nonzero
+    // restore point has no way to catch up (`drafter_span_rows` stays 0), and re-seeding
+    // would mean re-running the target prefill the snapshot exists to avoid — see the
+    // TODO.md ledger item. `import_cache` validates
     // before it writes anything, so the drafter is intact and a reset is the whole repair;
     // the conversation carries on with the target KV it just hydrated, decoding plain.
     let imported = match planes {

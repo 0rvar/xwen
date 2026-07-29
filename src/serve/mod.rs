@@ -1094,7 +1094,11 @@ pub(crate) mod testutil {
 
     /// Settings with the documented defaults, for the request-preparation
     /// tests: they exercise the "request said nothing, fall back to the server"
-    /// half of every mapping.
+    /// half of every mapping. One deliberate exception: `draft` is pinned to
+    /// `None` where production zero-flag resolves to `Some("official")` —
+    /// these tests never load a model, so a drafter path would be dead weight,
+    /// but it means nothing routed through this helper exercises
+    /// draft-enabled defaults.
     pub(crate) fn settings() -> ServeSettings {
         ServeSettings {
             model: PathBuf::from("/models/laguna-s-2.1-Q4_K_M.gguf"),

@@ -78,7 +78,32 @@ pub fn delta_scan(
     k_heads: usize,
     eps: f32,
 ) -> Result<(Tensor, Tensor)> {
-    dispatch::run_delta_scan(conv, beta, g, s, k_heads, eps)
+    let (o, states) = dispatch::run_delta_scan(conv, beta, g, s, k_heads, eps, 1)?;
+    Ok((o, states.squeeze(0)?))
+}
+
+/// `delta_scan`, plus the per-token state trail a speculative verify walk rolls
+/// back through. `state_planes` must be in `1..=seq`; the second returned tensor
+/// is `[state_planes, v_heads, 128, 128]` f32 MOST-RECENT-FIRST — plane p is the
+/// state after token `seq - 1 - p`, so plane 0 is the final state and
+/// `state_planes == 1` is exactly `delta_scan` (same kernel, same dispatch, same
+/// bits). A caller wanting the state after token t asks for `seq` planes and
+/// reads plane `seq - 1 - t`.
+///
+/// The ordering is llama.cpp's snapshot-slot convention, kept so the two are
+/// readable against each other. The trail is one buffer, not one per token: at
+/// the 27B's 48 V-heads a 16-token verify block is ~48 MiB per DeltaNet layer,
+/// live only for the walk.
+pub fn delta_scan_with_trail(
+    conv: &Tensor,
+    beta: &Tensor,
+    g: &Tensor,
+    s: &Tensor,
+    k_heads: usize,
+    eps: f32,
+    state_planes: usize,
+) -> Result<(Tensor, Tensor)> {
+    dispatch::run_delta_scan(conv, beta, g, s, k_heads, eps, state_planes)
 }
 
 #[cfg(test)]
@@ -360,6 +385,22 @@ mod tests {
         k_heads: usize,
         v_heads: usize,
     ) -> (Tensor, Tensor) {
+        let (o, states) = reference_scan_states(conv, beta, g, s0, k_heads, v_heads);
+        let last = states.last().unwrap().clone();
+        (o, last)
+    }
+
+    /// `reference_scan`, keeping the state after EVERY token in token order —
+    /// the trail a rollback reads, and what `delta_scan_with_trail`'s planes are
+    /// graded against.
+    fn reference_scan_states(
+        conv: &Tensor,
+        beta: &Tensor,
+        g: &Tensor,
+        s0: &Tensor,
+        k_heads: usize,
+        v_heads: usize,
+    ) -> (Tensor, Vec<Tensor>) {
         let seq = conv.dim(0).unwrap();
         let k_dim = k_heads * HD;
         let v_dim = v_heads * HD;
@@ -383,6 +424,7 @@ mod tests {
         let scale = 1.0 / (HD as f64).sqrt();
         let mut s = s0.clone();
         let mut outs = Vec::with_capacity(seq);
+        let mut states = Vec::with_capacity(seq);
         for t in 0..seq {
             let row = |t3: &Tensor| {
                 t3.narrow(0, t, 1)
@@ -412,8 +454,9 @@ mod tests {
                     .reshape((1, v_heads, HD))
                     .unwrap(),
             );
+            states.push(s.clone());
         }
-        (Tensor::cat(&outs, 0).unwrap(), s)
+        (Tensor::cat(&outs, 0).unwrap(), states)
     }
 
     /// UNIT 4: the fused scan must reproduce the reference recurrence — both
@@ -465,6 +508,144 @@ mod tests {
                 assert_close(&s, &want_s, 1e-5, &format!("{label} state"));
             }
         }
+    }
+
+    /// UNIT 4b: asked for one state plane per token, the scan must report the
+    /// state after EVERY token — the trail a speculative verify walk rolls back
+    /// through — under the same bound as its final state. The planes are
+    /// most-recent-first, so plane `seq - 1 - t` is the state after token t; a
+    /// kernel that wrote them in token order instead would pass at seq = 1 and
+    /// fail here from seq = 2 up.
+    #[test]
+    fn scan_trail_records_the_state_after_every_token() {
+        let device = metal_device().unwrap();
+        for (ki, &(k_heads, v_heads)) in GEOMETRIES.iter().enumerate() {
+            let conv_dim = (2 * k_heads + v_heads) * HD;
+            for &seq in &[2usize, 5, 16] {
+                let seed = 0x4400 + ki as u64 * 313 + seq as u64;
+                let conv = on_device(
+                    pseudo_random(seq * conv_dim, seed, -2.0, 2.0),
+                    (seq, conv_dim),
+                    &device,
+                );
+                let beta = on_device(
+                    pseudo_random(seq * v_heads, seed + 1, 0.01, 0.99),
+                    (seq, v_heads),
+                    &device,
+                );
+                let g = on_device(
+                    pseudo_random(seq * v_heads, seed + 2, -0.6, -0.001),
+                    (seq, v_heads),
+                    &device,
+                );
+                let s0 = on_device(
+                    pseudo_random(v_heads * HD * HD, seed + 3, -0.5, 0.5),
+                    (v_heads, HD, HD),
+                    &device,
+                );
+
+                let (o, trail) =
+                    delta_scan_with_trail(&conv, &beta, &g, &s0, k_heads, EPS as f32, seq).unwrap();
+                assert_eq!(trail.dims(), &[seq, v_heads, HD, HD]);
+                let (want_o, want_states) =
+                    reference_scan_states(&conv, &beta, &g, &s0, k_heads, v_heads);
+
+                let label = format!("trail k={k_heads} v={v_heads} seq={seq}");
+                assert_close(&o, &want_o, 1e-5, &format!("{label} out"));
+                for (t, want) in want_states.iter().enumerate() {
+                    let plane = trail.narrow(0, seq - 1 - t, 1).unwrap().squeeze(0).unwrap();
+                    assert_close(
+                        &plane,
+                        want,
+                        1e-5,
+                        &format!("{label} state after token {t}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The trail is the same kernel and the same dispatch as the plain scan, so
+    /// its most-recent plane is not merely close to `delta_scan`'s state — it is
+    /// the same bits. This is what lets the block take one path whether or not a
+    /// rollback checkpoint is armed.
+    #[test]
+    fn scan_trail_plane_zero_is_the_plain_scan_state() {
+        let device = metal_device().unwrap();
+        for (ki, &(k_heads, v_heads)) in GEOMETRIES.iter().enumerate() {
+            let conv_dim = (2 * k_heads + v_heads) * HD;
+            for &seq in &[1usize, 2, 16] {
+                let seed = 0x4500 + ki as u64 * 313 + seq as u64;
+                let conv = on_device(
+                    pseudo_random(seq * conv_dim, seed, -2.0, 2.0),
+                    (seq, conv_dim),
+                    &device,
+                );
+                let beta = on_device(
+                    pseudo_random(seq * v_heads, seed + 1, 0.01, 0.99),
+                    (seq, v_heads),
+                    &device,
+                );
+                let g = on_device(
+                    pseudo_random(seq * v_heads, seed + 2, -0.6, -0.001),
+                    (seq, v_heads),
+                    &device,
+                );
+                let s0 = on_device(
+                    pseudo_random(v_heads * HD * HD, seed + 3, -0.5, 0.5),
+                    (v_heads, HD, HD),
+                    &device,
+                );
+
+                let (plain_o, plain_s) =
+                    delta_scan(&conv, &beta, &g, &s0, k_heads, EPS as f32).unwrap();
+                let (o, trail) =
+                    delta_scan_with_trail(&conv, &beta, &g, &s0, k_heads, EPS as f32, seq).unwrap();
+
+                let label = format!("plane0 k={k_heads} v={v_heads} seq={seq}");
+                assert_bits_eq(&o, &plain_o, &format!("{label} out"));
+                assert_bits_eq(
+                    &trail.narrow(0, 0, 1).unwrap().squeeze(0).unwrap(),
+                    &plain_s,
+                    &format!("{label} state"),
+                );
+            }
+        }
+    }
+
+    /// A plane count outside `1..=seq` names a state no chunk of that length
+    /// has, so the wrapper refuses rather than dispatching a kernel that would
+    /// leave planes unwritten.
+    #[test]
+    fn scan_trail_rejects_a_plane_count_no_chunk_can_fill() {
+        let device = metal_device().unwrap();
+        let (k_heads, v_heads) = (16usize, 32usize);
+        let conv_dim = (2 * k_heads + v_heads) * HD;
+        let seq = 4usize;
+        let conv = on_device(
+            pseudo_random(seq * conv_dim, 0x5100, -2.0, 2.0),
+            (seq, conv_dim),
+            &device,
+        );
+        let beta = on_device(
+            pseudo_random(seq * v_heads, 0x5101, 0.01, 0.99),
+            (seq, v_heads),
+            &device,
+        );
+        let g = on_device(
+            pseudo_random(seq * v_heads, 0x5102, -0.6, -0.001),
+            (seq, v_heads),
+            &device,
+        );
+        let s0 = Tensor::zeros((v_heads, HD, HD), DType::F32, &device).unwrap();
+
+        for planes in [0usize, seq + 1] {
+            assert!(
+                delta_scan_with_trail(&conv, &beta, &g, &s0, k_heads, EPS as f32, planes).is_err(),
+                "{planes} planes over a {seq}-token chunk must be refused"
+            );
+        }
+        assert!(delta_scan_with_trail(&conv, &beta, &g, &s0, k_heads, EPS as f32, seq).is_ok());
     }
 
     /// The scan leaves the state it was handed untouched: the kernel writes a

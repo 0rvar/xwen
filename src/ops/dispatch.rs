@@ -2788,6 +2788,7 @@ struct DeltaScanArgs {
     k_heads: i32,
     v_heads: i32,
     conv_dim: i32,
+    n_planes: i32,
     scale: f32,
     eps: f32,
 }
@@ -2801,6 +2802,7 @@ struct DeltaScanV2Args {
     k_heads: i32,
     v_heads: i32,
     conv_dim: i32,
+    n_planes: i32,
     scale: f32,
 }
 
@@ -3208,6 +3210,7 @@ fn check_delta_scan_operands(
     g: &Tensor,
     s: &Tensor,
     k_heads: usize,
+    planes: usize,
 ) -> Result<(usize, usize, usize)> {
     let (seq, conv_dim) = conv
         .dims2()
@@ -3232,6 +3235,11 @@ fn check_delta_scan_operands(
     if seq == 0 {
         bail!("delta_scan needs at least one token");
     }
+    // Plane p of the state output is the state after token seq-1-p, so a chunk
+    // of `seq` tokens has exactly `seq` states to name.
+    if planes == 0 || planes > seq {
+        bail!("delta_scan needs 1 <= state planes <= seq, got {planes} planes for seq {seq}");
+    }
     check_f32(conv, &[seq, conv_dim], "conv")?;
     check_f32(beta, &[seq, v_heads], "beta")?;
     check_f32(g, &[seq, v_heads], "g")?;
@@ -3248,9 +3256,16 @@ fn check_delta_scan_operands(
 /// `[v_heads, head_dim, head_dim]` f32 state across all `seq` timesteps. `conv`
 /// is `[seq, conv_dim]` (q | k | v fused, silu'd), `beta` and `g` are
 /// `[seq, v_heads]` (g the LOG decay), `s` the incoming state. Returns the
-/// per-token output `[seq, v_heads, head_dim]` and the state after the last
-/// token, leaving `s` untouched so a caller holding it for a rollback trail
-/// still sees the value it passed in.
+/// per-token output `[seq, v_heads, head_dim]` and a
+/// `[planes, v_heads, head_dim, head_dim]` state output, leaving `s` untouched
+/// so a caller holding it for a rollback trail still sees the value it passed
+/// in.
+///
+/// The state planes are MOST-RECENT-FIRST: plane p is the state after token
+/// `seq - 1 - p`, so plane 0 is always the state after the last token and
+/// `planes == 1` is the plain scan. `planes == seq` is the rollback trail a
+/// speculative verify walk needs — llama.cpp's snapshot-slot ordering, kept so
+/// the two are readable against each other.
 ///
 /// The default is `kernel_delta_scan`, which normalizes q and k in its own load
 /// stage. `XWEN_DELTA_SCAN_V2` selects the measured artifact instead:
@@ -3264,11 +3279,12 @@ pub(crate) fn run_delta_scan(
     s: &Tensor,
     k_heads: usize,
     eps: f32,
+    planes: usize,
 ) -> Result<(Tensor, Tensor)> {
     if crate::ops::delta_scan_v2() {
-        run_delta_scan_v2(conv, beta, g, s, k_heads, eps)
+        run_delta_scan_v2(conv, beta, g, s, k_heads, eps, planes)
     } else {
-        run_delta_scan_default(conv, beta, g, s, k_heads, eps)
+        run_delta_scan_default(conv, beta, g, s, k_heads, eps, planes)
     }
 }
 
@@ -3282,16 +3298,17 @@ fn run_delta_scan_v2(
     s: &Tensor,
     k_heads: usize,
     eps: f32,
+    planes: usize,
 ) -> Result<(Tensor, Tensor)> {
     let cdev = conv.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("delta_scan requires conv on a Metal device");
     };
-    let (seq, conv_dim, v_heads) = check_delta_scan_operands(conv, beta, g, s, k_heads)?;
+    let (seq, conv_dim, v_heads) = check_delta_scan_operands(conv, beta, g, s, k_heads, planes)?;
 
     let out_len = checked_elems(&[seq, v_heads, DELTA_HEAD_DIM], "delta_scan out")?;
     let state_len = checked_elems(
-        &[v_heads, DELTA_HEAD_DIM, DELTA_HEAD_DIM],
+        &[planes, v_heads, DELTA_HEAD_DIM, DELTA_HEAD_DIM],
         "delta_scan state",
     )?;
     glue_index_fits_i32(checked_elems(&[seq, conv_dim], "delta_scan conv")?)?;
@@ -3337,6 +3354,7 @@ fn run_delta_scan_v2(
         k_heads: k_heads as i32,
         v_heads: v_heads as i32,
         conv_dim: conv_dim as i32,
+        n_planes: planes as i32,
         scale: 1.0 / (DELTA_HEAD_DIM as f32).sqrt(),
     };
     {
@@ -3370,7 +3388,7 @@ fn run_delta_scan_v2(
             s_out,
             mdev,
             state_len,
-            (v_heads, DELTA_HEAD_DIM, DELTA_HEAD_DIM),
+            (planes, v_heads, DELTA_HEAD_DIM, DELTA_HEAD_DIM),
         ),
     ))
 }
@@ -3385,16 +3403,17 @@ fn run_delta_scan_default(
     s: &Tensor,
     k_heads: usize,
     eps: f32,
+    planes: usize,
 ) -> Result<(Tensor, Tensor)> {
     let cdev = conv.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("delta_scan requires conv on a Metal device");
     };
-    let (seq, conv_dim, v_heads) = check_delta_scan_operands(conv, beta, g, s, k_heads)?;
+    let (seq, conv_dim, v_heads) = check_delta_scan_operands(conv, beta, g, s, k_heads, planes)?;
     let (d_k, d_v) = (DELTA_HEAD_DIM, DELTA_HEAD_DIM);
 
     let out_len = checked_elems(&[seq, v_heads, DELTA_HEAD_DIM], "delta_scan out")?;
-    let state_len = checked_elems(&[v_heads, d_k, d_v], "delta_scan state")?;
+    let state_len = checked_elems(&[planes, v_heads, d_k, d_v], "delta_scan state")?;
     glue_index_fits_i32(checked_elems(&[seq, conv_dim], "delta_scan conv")?)?;
     glue_index_fits_i32(out_len)?;
 
@@ -3431,6 +3450,7 @@ fn run_delta_scan_default(
         k_heads: k_heads as i32,
         v_heads: v_heads as i32,
         conv_dim: conv_dim as i32,
+        n_planes: planes as i32,
         scale: 1.0 / (DELTA_HEAD_DIM as f32).sqrt(),
         eps,
     };
@@ -3459,7 +3479,7 @@ fn run_delta_scan_default(
 
     Ok((
         output_tensor(out, mdev, out_len, (seq, v_heads, DELTA_HEAD_DIM)),
-        output_tensor(s_out, mdev, state_len, (v_heads, d_k, d_v)),
+        output_tensor(s_out, mdev, state_len, (planes, v_heads, d_k, d_v)),
     ))
 }
 

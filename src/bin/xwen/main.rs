@@ -68,19 +68,19 @@ impl SamplingArgs {
     }
 }
 
-/// DFlash speculative-decode knobs. Speculation is opt-IN on xwen: decoding is
-/// plain unless `--draft <gguf>` or `--draft official` asks for a drafter.
-/// `--no-draft` is still accepted and does nothing, so a laguna-era command
-/// line keeps working.
+/// DFlash speculative-decode knobs. Speculation is opt-OUT on xwen: decoding
+/// speculates with the checkpoint's official drafter unless `--no-draft` says
+/// otherwise, and `--draft <gguf>` swaps in a custom one.
 #[derive(Parser)]
 struct DraftArgs {
-    /// Speculate with a DFlash drafter GGUF; the literal `official` selects the
-    /// shipped one. Off by default — measured a win on the 27B and a ~12% loss
-    /// on the 35B-A3B (see docs/decisions.md, "Speculative decoding").
+    /// Speculate with a custom DFlash drafter GGUF instead of the checkpoint's
+    /// official one (which the literal `official`, and the default, select).
     #[arg(long, value_name = "GGUF", conflicts_with = "no_draft")]
     draft: Option<PathBuf>,
-    /// Decode without speculation. Accepted for compatibility; this is already
-    /// the default.
+    /// Decode without speculation. Drafting is on by default: measured faster on
+    /// both checkpoints on 2026-07-29 — 27B +19.3 to +21.0% on code and +7.6 to
+    /// +8.4% on chat, 35B-A3B +18.1 to +19.8% on code and +12.6 to +12.8% on
+    /// chat (see docs/decisions.md, "Speculative decoding").
     #[arg(long)]
     no_draft: bool,
     /// Max draft tokens proposed per verify round (clamped to block_size-1).
@@ -369,16 +369,18 @@ struct ServeArgs {
     /// saves grows with the token count.
     #[arg(long, value_name = "TOKENS")]
     disk_min_tokens: Option<usize>,
-    /// DFlash drafter GGUF to speculate with; the literal `official` selects
-    /// the shipped one, fetched into the Hugging Face cache on first use.
+    /// Custom DFlash drafter GGUF to speculate with, in place of the
+    /// checkpoint's official one (which the literal `official`, and the
+    /// default, select — fetched into the Hugging Face cache on first use).
     /// Greedy output matches decoding without it except where a near-tie lands
-    /// differently. Off by default: measured a win on the 27B and a ~12% loss
-    /// on the 35B-A3B, whose plain step is too short to absorb the drafter's
-    /// per-token cache sync.
+    /// differently.
     #[arg(long, value_name = "GGUF", conflicts_with = "no_draft")]
     draft: Option<PathBuf>,
-    /// Decode without speculation. Accepted for compatibility; this is already
-    /// the default.
+    /// Decode without speculation. Drafting is on by default: measured faster on
+    /// both checkpoints on 2026-07-29 — 27B +19.3 to +21.0% on code and +7.6 to
+    /// +8.4% on chat, 35B-A3B +18.1 to +19.8% on code and +12.6 to +12.8% on
+    /// chat. It costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the
+    /// 35B-A3B) plus drafter planes per cache slot (see --draft-ctx).
     #[arg(long)]
     no_draft: bool,
     /// Max draft tokens proposed per verify round.
@@ -432,9 +434,9 @@ impl ServeArgs {
             cache_snapshots: self.cache_snapshots,
             cache_slots: self.cache_slots,
             cache_dir: self.cache_dir.clone(),
-            // Naming a drafter is itself an opt-in, so an explicit --draft
-            // beats a config file that set `enabled = false` (clap rejects
-            // combining it with --no-draft).
+            // Naming a drafter is itself a request for one, so an explicit
+            // --draft beats a config file that set `enabled = false` (clap
+            // rejects combining it with --no-draft).
             draft_enabled: self
                 .no_draft
                 .then_some(false)
@@ -585,16 +587,19 @@ fn build_generator(
         load_start.elapsed().as_secs_f64()
     );
 
-    // Speculation is opt-in: only an explicit `--draft` asks for a drafter, so
-    // a zero-flag run decodes plain — the right default while attaching a
-    // drafter is a measured loss on the 35B-A3B. `--no-draft` stays accepted.
-    if let Some((draft, requested)) = draft
-        .filter(|d| !d.no_draft)
-        .and_then(|d| d.draft.as_ref().map(|path| (d, path)))
-    {
-        // resolve_draft keeps `--draft official` meaning the same thing here
-        // as in the serve config.
-        let path = resolve_draft(requested, size)?;
+    // Speculation is opt-out: a zero-flag run speculates with the official
+    // drafter, which a first run fetches into the Hugging Face cache (3.5 GB on
+    // the 27B, 0.8 GB on the 35B-A3B, with the same download notice the target
+    // gets). `--no-draft` decodes plain.
+    if let Some(draft) = draft.filter(|d| !d.no_draft) {
+        // resolve_draft keeps `--draft official` — and the default, which is
+        // that same symbolic path — meaning the same thing here as in the serve
+        // config.
+        let requested = draft
+            .draft
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("official"));
+        let path = resolve_draft(&requested, size)?;
         let draft_start = std::time::Instant::now();
         let dgguf = gguf::open(&path, &device)?;
         // The drafter's cache is sized by --draft-ctx (capped at the target's

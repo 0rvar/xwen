@@ -319,6 +319,7 @@ typedef struct {
     int32_t k_heads;
     int32_t v_heads;
     int32_t conv_dim;
+    int32_t n_planes; // state snapshot planes in s_out, most-recent-first
     float scale; // 1 / sqrt(head_dim)
     float eps;   // rms_norm_eps, the L2 norm FLOOR
 } delta_scan_args;
@@ -353,6 +354,12 @@ typedef struct {
 // proportional to the THREADGROUPS rather than to the individual state columns.
 // kernel_delta_scan_v2 below gives that up, and it is the measured reason this
 // decomposition is the one that ships.
+//
+// s_out holds args.n_planes state planes MOST-RECENT-FIRST: plane p is the state
+// after token seq-1-p, so plane 0 is always the final state and n_planes = 1 is
+// the plain scan. A rollback trail asks for n_planes = seq and reads plane
+// seq-1-t for token t. The ordering mirrors llama.cpp's snapshot slots
+// (ggml/src/ggml-metal/ggml-metal.metal, `target_slot = n_tokens - 1 - t`).
 kernel void kernel_delta_scan(
         constant delta_scan_args & args [[buffer(0)]],
         device const float * conv       [[buffer(1)]],
@@ -453,6 +460,19 @@ kernel void kernel_delta_scan(
         if (r == 0) {
             out[((size_t) t * args.v_heads + h) * DELTA_D + j] = o_col * args.scale;
         }
+
+        // Trail plane for this timestep. Plane 0 is the after-loop store below,
+        // so only the older planes are written here — at n_planes = 1 the loop
+        // costs one compare per timestep and nothing else.
+        const int target_slot = args.seq - 1 - t;
+        if (target_slot >= 1 && target_slot < args.n_planes) {
+            device float * s_plane =
+                s_out + (size_t) target_slot * (size_t) args.v_heads * DELTA_D * DELTA_D;
+#pragma unroll
+            for (int a = 0; a < DELTA_S_SLICE; ++a) {
+                s_plane[s_base + (size_t) (i0 + a) * DELTA_D] = s[a];
+            }
+        }
     }
 
 #pragma unroll
@@ -490,6 +510,7 @@ typedef struct {
     int32_t k_heads;
     int32_t v_heads;
     int32_t conv_dim;
+    int32_t n_planes; // state snapshot planes in s_out, most-recent-first
     float scale; // 1 / sqrt(head_dim)
 } delta_scan_v2_args;
 
@@ -574,6 +595,18 @@ kernel void kernel_delta_scan_v2(
 
         if (lane == 0) {
             *o_ptr = y * args.scale;
+        }
+
+        // Trail plane for this timestep, most-recent-first as in
+        // kernel_delta_scan; plane 0 is the after-loop store below.
+        const int target_slot = args.seq - 1 - t;
+        if (target_slot >= 1 && target_slot < args.n_planes) {
+            device float * s_plane =
+                s_out + (size_t) target_slot * (size_t) args.v_heads * DELTA_D * DELTA_D;
+#pragma unroll
+            for (int a = 0; a < DELTA_V2_KPL; ++a) {
+                s_plane[s_base + (size_t) a * DELTA_D] = s[a];
+            }
         }
 
         q_ptr += qk_stride;

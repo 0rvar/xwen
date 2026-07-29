@@ -16,7 +16,10 @@ pub mod silu_mul;
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
 pub use bf16::matmul_bf16;
 pub use combine::combine;
-pub use delta::{DELTA_HEAD_DIM, delta_ba, delta_conv, delta_gnorm, delta_l2norm, delta_scan};
+pub use delta::{
+    DELTA_HEAD_DIM, delta_ba, delta_conv, delta_gnorm, delta_l2norm, delta_scan,
+    delta_scan_with_trail,
+};
 pub use dense_mm::{dense_mm_supported, matmul_dense_q};
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;

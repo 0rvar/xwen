@@ -15,6 +15,10 @@ first, in-situ per-layer timing in `run_stack`); the **P8c attention glue**
 (lowest risk first step: route the main attention block through the existing
 bit-identical `attn_gate`/`permute_01`/`cast_*` kernels, then re-measure).
 P9(b) drafter inject fusion and P10 serve adaptation follow.
+UPDATE (later 2026-07-29): **P9(a) is DONE and `--draft` flipped to opt-out** —
+see the P9 annotations and log.md. Live items now, by value: the **P8c prefill
+residual**; the **P8c attention glue**; the **verify round's ~149 ms fixed
+cost** (new, "Deferred from the K-snapshot verify pass" below); P9(b); P10.
 
 1. **Mechanical fork — DONE 2026-07-28.** cp-based copy of ../laguna, maxuna→xwen
    rename, MAXUNA_*→XWEN_* env prefix, Qwen tokenizer/chat-template/configs vendored
@@ -223,7 +227,18 @@ P9(b) drafter inject fusion and P10 serve adaptation follow.
    (5×hidden / 8×hidden concat). Needs P4's recurrent-state rollback. Re-tune
    auto-pause and draft-ctx horizon for this drafter's cost curve.
    - **(a) The K-snapshot fused verify is the precondition for speculation to pay,
-     not an optimization of it — the top open item under P9.** Under an armed
+     not an optimization of it — the top open item under P9. DONE 2026-07-29** (same
+     day, see log.md "K-snapshot fused verify lands"): built exactly as sketched
+     below — `delta_scan_with_trail` widens the state output to most-recent-first
+     planes in both scan kernels, plane 0 stays the unchanged after-loop store
+     (planes = 1 bitwise-identical, tested), the armed clause is gone from the fused
+     gate, `XWEN_DELTA_CLASSIC` unchanged as kill switch. Two-model review clean,
+     both parity gates pass with pre-change numbers. Measured: verify marginal cost
+     9.42 → 3.57 ms/position (fixed ~171 → ~149 ms); end-to-end 27B +19.3-21.0%
+     code / +7.6-8.4% chat, 35B +18.1-19.8% / +12.6-12.8% (was -11.5/-12.7% — the
+     pause controller stopped pausing, see (d)). The retired fallback's successor
+     items live under "Deferred from the K-snapshot verify pass (2026-07-29)".
+     Original scope, kept: Under an armed
      rollback trail a multi-token chunk takes the frozen reference scan
      (linear_attn.rs:194-205), which walks tokens one at a time, so the 48-of-64
      (27B) and 30-of-40 (35B) DeltaNet layers get NO batching win inside a verify
@@ -263,6 +278,14 @@ P9(b) drafter inject fusion and P10 serve adaptation follow.
      checkpoints; it does not, because the 35B's 12% loss lands on rounds the
      controller has already paused (see (b)). Re-evaluate after (a) and/or (b): the
      bar is the 35B at or above plain, not merely closer to it.
+     RESOLVED 2026-07-29: **flipped — drafting is now the default** (`--no-draft`
+     opts out). (a) alone met the bar with margin: 35B +18.1-19.8% code /
+     +12.6-12.8% chat over plain, both prompt kinds, two independent runs. The (b)
+     attribution was measured right but read wrong — the ~1.2 ms/token cache sync
+     is only fatal on PAUSED rounds, and with verify cheap the controller stopped
+     pausing (35B code: 54-of-66 rounds paused → 0-of-20). (b) stays open as a
+     lever, no longer as the gate. Zero-flag `generate`/`serve` now load the
+     dflash sidecar; help/config text updated with the measured reason.
    - **(e) A ring-buffer drafter cache is deferred.** The per-layer cache stays a flat
      `[n_kv, max_ctx, hd]` array; windowing lives in `attention`'s narrow-plus-mask.
      A ring would cap the allocation at the window rather than at `draft_ctx`, but it
@@ -433,6 +456,14 @@ P9(b) drafter inject fusion and P10 serve adaptation follow.
   ~= 2.3 GB on the 27B, held only for the duration of a verify walk. Measure it
   against the spec-decode win when P9 lands; a chunked scan (P8) that can replay
   a prefix cheaply would let the trail be dropped entirely.
+  ANNOTATED 2026-07-29 (P9a): the footprint is unchanged in magnitude but changed
+  in shape — the trail's delta entries are now unmaterialized views into one
+  `[seq, v_heads, 128, 128]` snapshot buffer per layer per verify forward
+  (~48 MiB/layer at 16 planes on the 27B) instead of per-token materialized
+  copies; still walk-scoped, dropped at rollback. The chunked-scan replay
+  rationale is dead (P8b refuted + P9a landed). Spec decode's win is now
+  double-digit on both checkpoints, so the memory is earning its keep; measure
+  only if verify walks ever run concurrent per-seq in serve.
 
 ## Deferred from the sampler-tail pass (2026-07-28)
 
@@ -540,7 +571,7 @@ All three come out of the per-stage prefill profile that root-caused the 27B gap
 They are what that profile found and did NOT fix; the profile itself is transcribed
 in log.md 2026-07-29.
 
-- [ ] **The dense-FFN gemm diff shipped WITHOUT an independent review pass** — the
+- [x] **The dense-FFN gemm diff shipped WITHOUT an independent review pass** — the
   only arc of 2026-07-29 that did (an agent-spawning moratorium was in effect;
   every other arc got a two-model-family review). Both parity gates pass and the
   test suite is green, so this is process debt, not a known defect. When it runs,
@@ -553,6 +584,23 @@ in log.md 2026-07-29.
   `[16*il, 16*il+16)` — pinned by a test against `QTensor::dequantize`, but an
   off-by-one here is the classic quant-kernel failure and deserves adversarial
   eyes.
+  RESOLVED 2026-07-29: the two-model-family review ran (Claude + Codex
+  `gpt-5.6-sol` at xhigh, both adversarial, both read-only) and found ZERO
+  correctness bugs at any severity. Pointer (1) holds semantically, not
+  literally: the kernel body is line-identical to `f16_t.metal` outside A-tile
+  staging, but beyond the claimed substitution the file also adds the required
+  template-ization plus Q8_0/Q5_K/Q6_K dequantizers alongside Q4_K — a
+  support-matrix addition, not a divergence in executable behavior. Pointer (2)
+  verified two independent ways: Claude diffed the four block structs and
+  dequant functions verbatim against `reference/llama.cpp` (ggml-common.h,
+  ggml-metal.metal) and Codex re-derived the nibble/scale arithmetic from
+  scratch (il = 4g + r case analysis, get_scale_min_k4 6-bit packing, the
+  folded `d/16` high-nibble path); the empirical pin remains
+  `dense_q4k_matches_oracle_production_shapes`. Secondary probes (seq-gate
+  boundary 32/33, ragged tiles, buffer offsets, threadgroup sizing, barrier
+  placement, pipeline-cache keying) all clean. One doc nit found and fixed:
+  the `dense_mm.metal` header said `seq >= DENSE_MM_MIN_SEQ` where the gate is
+  strictly `>`.
 
 - [ ] **+350 to +560 µs/token of prefill cost lives OUTSIDE every measured stage, and it
   grows with prompt length.** Per-token wall goes 3023 → 3599 µs between the 880- and
@@ -609,6 +657,60 @@ in log.md 2026-07-29.
   so this becomes first-order at long context. The real fix is the existing ledger item —
   make `flash.metal` reachable at head dim 256, removing the mask rather than making it
   cheaper. Pairs with the head-dim-256 flash item under P8.
+
+## Deferred from the K-snapshot verify pass (2026-07-29, P9a)
+
+All three come out of the measurement pass that closed P9(a); raw per-rep data in the
+session logs referenced by log.md "K-snapshot fused verify lands".
+
+- [ ] **The verify round's ~149 ms fixed cost is the new spec-decode ceiling.** Fit
+  over spans 2-32 on the 27B (`n_past` 512): ~149 ms fixed + 3.57 ms/position,
+  against a ~40-43 ms plain step — the fixed part is ~113 ms above a plain forward
+  and ~60% of a typical round, and it is NOT the DeltaNet scan any more. Candidates,
+  none priced: checkpoint materialization (one conv+delta copy per layer on arm),
+  rollback restore, the trail's host-side conv slices (~1 cat + seq materializes per
+  DeltaNet layer), full-span logits computation + readback, command-buffer syncs.
+  Price the stages before attacking any of them — this item is a profile, not a fix.
+- [ ] **`p_min` 0.3 and `pause_margin` 1.0 were tuned against the reference-scan
+  cost curve and are now stale.** The curve they were fitted to (39 ms/position
+  marginal) no longer exists; with 3.6 ms/position marginal and a dominant fixed
+  cost, longer drafts amortize better and pausing is less often right (the 35B now
+  pauses 0-of-20 rounds on code with the OLD tuning — the win may grow with a
+  retune, and `DEFAULT_DRAFT_CTX` (c) interacts). Same protocol as the P9 tuning
+  sweep: both models, both prompt kinds, interleaved, two independent runs.
+- [ ] **Serve slots persisted without drafter planes silently decode plain forever
+  under default-on drafting** (Codex review of the flip, corroborated against the
+  code). `hydrate`'s `None => reset_drafter()` branch (serve/engine.rs, see the
+  comment there) was written for the flag-change edge; with drafting default-on it
+  is the COMMON path against slots written by `--no-draft` runs or pre-drafting
+  builds. A reset drafter at a nonzero restore point can never resync — its cache
+  is fed by target-layer taps during target forwards, `drafter_span_rows` returns
+  0 whenever `pos != committed` (unit test at generate.rs:3139 pins this), and
+  re-seeding would require re-running the target prefill the snapshot exists to
+  avoid. Output stays correct; speculation is lost and the server still reports
+  draft ON. Options when this is picked up (fits P10 serve adaptation): (a)
+  per-conversation draft status so the degradation is at least visible, (b) drop
+  the snapshot when drafting is enabled and planes are absent (trade prefill reuse
+  for speculation — wrong for long contexts), (c) accept and document. No option
+  is obviously right without measuring how often real serve traffic hydrates
+  plane-less slots.
+- [ ] **The draft-by-default flip makes a mismatched custom GGUF fail at startup.**
+  With drafting opt-out, `xwen serve --model <custom.gguf>` whose geometry fails the
+  drafter preflight (`DflashConfig::check_against_target`) now hard-errors where it
+  previously ran plain; `--no-draft` is the workaround. Recommended shape when it
+  bites someone: an IMPLICITLY-defaulted drafter that fails preflight should degrade
+  to plain decoding with a warning, while an EXPLICIT `--draft` keeps the hard error.
+  Not built now: the design target is the two blessed checkpoints, whose sidecars
+  always match, so the edge is custom-GGUF-only.
+- [ ] **Every verify arm goes superlinear at span 48.** Fused 264 → 548 ms between
+  spans 32 and 48; classic 472 → 846; reproduced across reps and arms. NOT the
+  dense-mm threshold (`XWEN_DENSE_MM_CLASSIC=1` arm shows the same jump). Outside
+  the production regime — drafter `block_size` 16 caps real verify spans near 17 —
+  so unchased, but unexplained. Also from the same pass, one anomalous
+  `XWEN_DENSE_MM_CLASSIC=1` sweep read ~17% high at every span including span 2
+  where that kernel cannot run, against four mutually-consistent fused sweeps and
+  an immediate re-run that matched them; single unreplicated outlier, recorded
+  here so a future contradiction has a trail.
 
 ## Deferred from the fork bootstrap (2026-07-28)
 

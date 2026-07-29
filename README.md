@@ -32,11 +32,14 @@ Default checkpoints: `ggml-org/Qwen3.6-27B-GGUF` and `ggml-org/Qwen3.6-35B-A3B-G
 
 ## Speculative decoding
 
-DFlash drafter sidecars ship alongside both checkpoints and are adapted (`--draft
-official`, or `--draft <gguf>` for a custom one). It is **opt-in**: measured a 1.5-7.4%
-decode gain on the 27B and an 11.5-12.7% loss on the 35B-A3B, whose plain step is too
-short to absorb the drafter's per-token cache sync. Acceptance is 85-95% on both. See
-docs/decisions.md "Speculative decoding" for why, and TODO.md P9 for what would change it.
+DFlash drafter sidecars ship alongside both checkpoints and are adapted. It is
+**opt-out** as of 2026-07-29: a zero-flag run speculates with the checkpoint's official
+sidecar, `--no-draft` decodes plain, and `--draft <gguf>` swaps in a custom drafter.
+Once the K-snapshot fused verify landed, drafting measured faster on both checkpoints —
+27B +19.3 to +21.0% on code and +7.6 to +8.4% on chat, 35B-A3B +18.1 to +19.8% on code
+and +12.6 to +12.8% on chat (greedy, 128 tokens, warm). Acceptance is 85-95% on both.
+The default costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the 35B-A3B). See
+docs/decisions.md "Speculative decoding".
 
 `--draft` should reproduce `--no-draft`; `bun scripts/spec-equivalence.ts` checks that on
 both models in two modes — greedy, and sampled at a fixed seed (the only one that can

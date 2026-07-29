@@ -377,8 +377,8 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
 /// counters rather than from `XWEN_DELTA_CLASSIC`.
 ///
 /// `LinearAttnBlock::forward` takes the reference scan on more than the
-/// kill-switch: a non-production head dim, a non-Metal device, or a multi-token
-/// chunk under an armed rollback trail all fall back too. An env-derived field
+/// kill-switch: a non-production head dim or a non-Metal device fall back too.
+/// An env-derived field
 /// could therefore stamp "fused" on a dump that never dispatched a delta
 /// kernel, and the bounded tiers — the only ones that grade the fused scan —
 /// would compare the reference against itself and pass on nothing. So the dump

@@ -42,9 +42,9 @@ use crate::kv_cache::{LayerCache, materialize};
 
 /// DeltaNet layer forwards this process has run down each path.
 ///
-/// `forward` decides per call — on the head dim, the device, the
-/// `XWEN_DELTA_CLASSIC` switch, and whether a multi-token chunk meets an armed
-/// rollback trail — so the switch alone does not say which path a run took.
+/// `forward` decides per call — on the head dim, the device and the
+/// `XWEN_DELTA_CLASSIC` switch — so the switch alone does not say which path a
+/// run took (a block at an unsupported head dim takes the reference either way).
 /// Anything recording provenance reads these instead of the environment, which
 /// is what keeps a bounded parity tier from grading the reference scan against
 /// itself. Counting only; the increment carries no ordering obligation.
@@ -183,20 +183,14 @@ impl LinearAttnBlock {
     /// `[seq, hidden]` f32.
     ///
     /// Runs the fused Metal kernels when they apply and the frozen reference
-    /// scan otherwise. The fused path needs a Metal device, the production head
-    /// dim the scan kernel is specialized to, and — because it advances the
-    /// state in one dispatch and can therefore only report the state after the
-    /// LAST token — either a single token or an unarmed rollback trail. A
-    /// multi-token chunk under a live checkpoint takes the reference scan,
-    /// which records one state per token; that is the spec-decode verify walk's
-    /// contract and it is cheap there (the walk steps a block at a time, and
-    /// its per-token decode steps still take the fused path).
+    /// scan otherwise. The fused path needs a Metal device and the production
+    /// head dim the scan kernel is specialized to; a live rollback trail does
+    /// not push it off, because the scan emits one state plane per token when
+    /// asked (`ops::delta_scan_with_trail`).
     pub fn forward(&self, x_normed: &Tensor, cache: &mut LayerCache) -> Result<Tensor> {
-        let seq = x_normed.dim(0)?;
         let fused = self.head_dim == crate::ops::DELTA_HEAD_DIM
             && !crate::ops::delta_classic()
-            && x_normed.device().is_metal()
-            && (seq == 1 || !cache.linear_trail_armed());
+            && x_normed.device().is_metal();
         if fused {
             self.forward_fused(x_normed, cache)
         } else {
@@ -207,10 +201,18 @@ impl LinearAttnBlock {
     /// The fused path: eight dispatches per layer at any sequence length —
     /// three projections, the conv+silu+state kernel, the beta/decay head, the
     /// whole recurrent scan, the gated output norm, and the output projection.
+    ///
+    /// A multi-token chunk under an armed rollback trail keeps those eight
+    /// scan-side dispatches (the scan writes one state plane per token instead
+    /// of one) but adds the trail's host-side copies: one `cat` for the
+    /// shifted stream plus one materialized conv window per token, so an armed
+    /// chunk of `seq` tokens costs roughly `8 + 1 + seq` dispatches. The conv
+    /// windows come from the same shifted stream the reference builds.
     fn forward_fused(&self, x_normed: &Tensor, cache: &mut LayerCache) -> Result<Tensor> {
         FUSED_FORWARDS.fetch_add(1, Ordering::Relaxed);
         let seq = x_normed.dim(0)?;
         let v_dim = self.v_heads * self.head_dim;
+        let tail = self.conv_kernel - 1;
 
         let qkv = self.qkv.forward(x_normed)?; // [seq, conv_dim]
         let (conv_state, s) = cache.linear_state()?;
@@ -222,9 +224,37 @@ impl LinearAttnBlock {
 
         let z = self.z_proj.forward(x_normed)?; // [seq, v_dim]
 
-        let (o, next_s) =
-            crate::ops::delta_scan(&conv, &beta, &g, &s, self.k_heads, self.rms_eps as f32)?;
-        cache.advance_linear(seq, vec![(next_conv_state, next_s)])?;
+        let eps = self.rms_eps as f32;
+        let o = if seq > 1 && cache.linear_trail_armed() {
+            let (o, trail) = crate::ops::delta_scan_with_trail(
+                &conv,
+                &beta,
+                &g,
+                &s,
+                self.k_heads,
+                eps,
+                seq, // one state plane per token of the verify span
+            )?;
+            // The conv window a rollback to token t restarts from is rows
+            // t+1..t+1+tail of the carried-window-plus-chunk stream, exactly as
+            // the reference records it. The delta entries are views into the
+            // trail buffer: nothing mutates it, and `rollback` materializes the
+            // one entry it keeps.
+            let stream = Tensor::cat(&[&conv_state, &qkv], 0)?; // [tail + seq, conv_dim]
+            let mut states = Vec::with_capacity(seq);
+            for t in 0..seq {
+                states.push((
+                    materialize(&stream.narrow(0, t + 1, tail)?)?,
+                    trail.narrow(0, seq - 1 - t, 1)?.squeeze(0)?,
+                ));
+            }
+            cache.advance_linear(seq, states)?;
+            o
+        } else {
+            let (o, next_s) = crate::ops::delta_scan(&conv, &beta, &g, &s, self.k_heads, eps)?;
+            cache.advance_linear(seq, vec![(next_conv_state, next_s)])?;
+            o
+        };
 
         let o = crate::ops::delta_gnorm(
             &o,
@@ -405,6 +435,16 @@ mod tests {
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+    /// `delta_path_counts` is process-global, so reading it around a single
+    /// forward only means something with every other forward in this module out
+    /// of the way. Every test that runs a DeltaNet layer takes this lock; a
+    /// panicking test hands it on rather than poisoning the rest.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn path_lock() -> std::sync::MutexGuard<'static, ()> {
+        PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The raw per-layer weights, written to a throwaway GGUF under the real
     /// tensor names so the loader's name table (no `ssm_in`, `ssm_a` bare,
     /// `ssm_dt.bias`) is exercised rather than bypassed.
@@ -530,6 +570,7 @@ mod tests {
     /// recurrence, the gated norm), and each appears explicitly in the reference.
     #[test]
     fn delta_rule_step_matches_hand_computation() {
+        let _guard = path_lock();
         let (hd, kh, vh) = (2usize, 1usize, 1usize);
         let hidden = 6; // conv_dim = (2*1 + 1) * 2 = 6, so qkv is the identity
         let cfg = cfg_for(kh, vh, hd, hidden);
@@ -624,6 +665,7 @@ mod tests {
     /// visible.
     #[test]
     fn gated_norm_applies_weight_before_the_gate() {
+        let _guard = path_lock();
         let (hd, kh, vh) = (2usize, 1usize, 1usize);
         let hidden = 6;
         let cfg = cfg_for(kh, vh, hd, hidden);
@@ -672,6 +714,7 @@ mod tests {
     /// the batched path and diverge here.
     #[test]
     fn streaming_one_token_at_a_time_matches_one_batch() {
+        let _guard = path_lock();
         let (hd, kh, vh) = (4usize, 2usize, 4usize);
         let hidden = 12;
         let cfg = cfg_for(kh, vh, hd, hidden);
@@ -837,6 +880,7 @@ mod tests {
         let Ok(metal) = crate::gguf::metal_device() else {
             return;
         };
+        let _guard = path_lock();
         for &(kh, vh, hidden) in &[(2usize, 4usize, 256usize), (16, 32, 256)] {
             let cfg = cfg_for(kh, vh, 128, hidden);
             let raw = random_block(&cfg, hidden, 0x100 + kh as u64 * 7 + vh as u64);
@@ -890,6 +934,7 @@ mod tests {
         let Ok(metal) = crate::gguf::metal_device() else {
             return;
         };
+        let _guard = path_lock();
         let (kh, vh, hidden, seq) = (16usize, 32usize, 256usize, 7usize);
         let cfg = cfg_for(kh, vh, 128, hidden);
         let block = build_on(&random_block(&cfg, hidden, 0x300), &cfg, &metal);
@@ -909,37 +954,100 @@ mod tests {
     }
 
     /// A live rollback checkpoint needs the state after EVERY token of the
-    /// verify span, which the one-dispatch scan cannot report — so a multi-token
-    /// chunk under an armed layer takes the reference scan instead, and the
-    /// trail comes out one entry per token. A single token still takes the
-    /// fused path: its only state IS the state after the last token.
+    /// verify span, and the fused scan reports all of them in one dispatch — so
+    /// an armed multi-token chunk takes the same fused path an unarmed one
+    /// takes, with the trail coming out one entry per token. `advance_linear`
+    /// refuses an armed advance carrying anything else, so a forward that
+    /// returns at all is the proof of the count; the rollback over the full span
+    /// at the end is the second.
+    ///
+    /// The kill switch still outranks the checkpoint: under `XWEN_DELTA_CLASSIC`
+    /// every DeltaNet forward is the frozen reference scan, armed chunks
+    /// included. That switch is read once per process, so this grades whichever
+    /// arm the test process was launched in.
     #[test]
-    fn an_armed_checkpoint_keeps_multi_token_chunks_on_the_reference_scan() {
+    fn an_armed_multi_token_chunk_stays_on_the_fused_scan() {
         let Ok(metal) = crate::gguf::metal_device() else {
             return;
         };
+        let _guard = path_lock();
         let (kh, vh, hidden) = (16usize, 32usize, 256usize);
         let cfg = cfg_for(kh, vh, 128, hidden);
         let block = build_on(&random_block(&cfg, hidden, 0x400), &cfg, &metal);
 
         let mut cache = cache_on(&cfg, &metal, 32);
-        cache.checkpoint(6).unwrap();
+        let ckpt = cache.checkpoint(6).unwrap();
         assert!(cache.linear_trail_armed(), "the checkpoint arms the layer");
 
-        // A four-token chunk: the armed layer must come out with four recorded
-        // states, which only the per-token reference scan produces.
         let x = Tensor::from_vec(seeded_vec(4 * hidden, 0x401), (4, hidden), &metal).unwrap();
+        let (fused_before, classic_before) = delta_path_counts();
         block.forward(&x, &mut cache).unwrap();
+        let (fused, classic) = delta_path_counts();
+        let switched = crate::ops::delta_classic();
+        assert_eq!(
+            (fused - fused_before, classic - classic_before),
+            if switched { (0, 1) } else { (1, 0) },
+            "armed four-token chunk took the wrong path (XWEN_DELTA_CLASSIC set: {switched})"
+        );
         assert_eq!(cache.len(), 4);
 
-        // Two more single tokens take the fused path and still record one state
-        // each, so the trail stays one-per-token across the mix.
+        // Two more single tokens, so the trail spans a mix of chunk lengths.
         for t in 0..2usize {
             let row = Tensor::from_vec(seeded_vec(hidden, 0x402 + t as u64), (1, hidden), &metal)
                 .unwrap();
             block.forward(&row, &mut cache).unwrap();
         }
         assert_eq!(cache.len(), 6, "the armed span filled exactly");
+
+        cache.rollback(&ckpt, 0, 6, 5).unwrap();
+        assert_eq!(cache.len(), 5, "the trail held an entry for every token");
+    }
+
+    /// Rolling back through a fused armed chunk must land exactly where rolling
+    /// back through the reference scan lands, at every accepted prefix: the conv
+    /// window bit-for-bit (both paths slice the same shifted stream) and the
+    /// delta state within the fused scan's bound. This is the invariant the
+    /// speculative verify walk rests on — the trail is only useful if the state
+    /// it restores is the state the accepted tokens actually produced.
+    #[test]
+    fn fused_armed_rollback_lands_where_the_reference_scan_lands() {
+        let Ok(metal) = crate::gguf::metal_device() else {
+            return;
+        };
+        let _guard = path_lock();
+        let (kh, vh, hidden, span) = (16usize, 32usize, 256usize, 4usize);
+        let cfg = cfg_for(kh, vh, 128, hidden);
+        let block = build_on(&random_block(&cfg, hidden, 0x500), &cfg, &metal);
+        // Two committed tokens before the span, so the verify chunk starts from
+        // a nonzero conv window and a nonzero delta state.
+        let prefix = Tensor::from_vec(seeded_vec(2 * hidden, 0x501), (2, hidden), &metal).unwrap();
+        let x = Tensor::from_vec(seeded_vec(span * hidden, 0x502), (span, hidden), &metal).unwrap();
+
+        for commit in 0..=span {
+            let run = |fused: bool| -> (Vec<f32>, Vec<f32>) {
+                let mut cache = cache_on(&cfg, &metal, 32);
+                block.forward(&prefix, &mut cache).unwrap();
+                let ckpt = cache.checkpoint(span).unwrap();
+                if fused {
+                    block.forward(&x, &mut cache).unwrap();
+                } else {
+                    block.forward_classic(&x, &mut cache).unwrap();
+                }
+                cache.rollback(&ckpt, 2, span, commit).unwrap();
+                assert_eq!(cache.len(), 2 + commit);
+                let (conv, delta) = cache.linear_state().unwrap();
+                (flat(&conv), flat(&delta))
+            };
+            let (fused_conv, fused_delta) = run(true);
+            let (ref_conv, ref_delta) = run(false);
+            assert_eq!(fused_conv, ref_conv, "commit {commit}: conv window");
+            assert_all_close(
+                &fused_delta,
+                &ref_delta,
+                2e-5,
+                &format!("commit {commit} delta state"),
+            );
+        }
     }
 
     /// The L2 normalization floors the NORM at eps rather than adding eps under

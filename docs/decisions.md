@@ -220,6 +220,19 @@ relative L2 under 1e-5 on both the per-token output and the state left behind, a
 sequence lengths from 1 to 512 (2026-07-28).
 
 **A multi-token chunk under an armed rollback checkpoint stays on the reference scan.**
+**SUPERSEDED 2026-07-29 (P9a)** — the revisit clause below fired: the verify walk was
+chunk-shaped and hot (39 ms/verified position, the number that capped spec decode's 27B
+win). The scan kernels now spill per-token states themselves: `delta_scan_with_trail`
+widens the state output to `[planes, v_heads, 128, 128]`, most-recent-first (plane s =
+state after token `seq-1-s`), mirroring llama.cpp's `kernel_gated_delta_net` K>1
+snapshot slots so the CPU oracle stays diffable. Plane 0 is still the unchanged
+after-loop store, so `planes = 1` — every unarmed prefill and decode call — is
+byte-identical to the old kernel; the in-loop guarded store only touches slots ≥ 1.
+The armed clause is gone from the fused gate; the trail's delta entries are
+unmaterialized views into the snapshot buffer, the conv entries the same host-side
+stream slices the reference records. `XWEN_DELTA_CLASSIC=1` still routes everything,
+armed chunks included, to `forward_classic`. Both parity gates re-passed with numbers
+identical to the pre-change run. Original entry, kept for the reasoning:
 The one-dispatch scan can only report the state after the LAST token, and an armed
 DeltaNet layer needs the state after every token (`LayerCache::Linear`'s trail — the
 equivalent of llama.cpp's K snapshot slots). Rather than teach the kernel to spill T
@@ -498,7 +511,18 @@ dispatch-bound, like the pre-fusion MoE glue) or to let the controller detach en
 rather than merely pause. Both are ledgered under TODO.md P9 (2026-07-29).
 
 **Speculative decoding's batching win does not currently exist in the DeltaNet layers, and
-that is the ceiling on P9.** Under an armed rollback trail a multi-token chunk takes the
+that is the ceiling on P9.** **SUPERSEDED 2026-07-29 (P9a, same day)** — the K-snapshot
+fused verify landed and the predicted unlock was measured. The batched verify's marginal
+cost fell from 9.42 to 3.57 ms/position on the 27B (fit over spans 2-32; at the span-6
+operating point, 41.0 → 31.2 ms/position with the fixed cost included), and the
+end-to-end wins moved from single digits to **27B +19.3-21.0% code / +7.6-8.4% chat, 35B
++18.1-19.8% code / +12.6-12.8% chat** — the 35B flipped from a 12% regression to a
+double-digit win because the pause controller stopped pausing (35B code: 54-of-66 rounds
+paused → 0-of-20) once verify got cheap, not because the ~1.2 ms drafter cache sync
+(P9b) got any cheaper. The new ceiling is the verify round's FIXED cost: ~149 ms on the
+27B (~113 ms above a plain step, ~60% of a typical round), no longer the DeltaNet scan —
+pricing it is the successor ledger item. Original entry, kept for the reasoning:
+Under an armed rollback trail a multi-token chunk takes the
 frozen reference scan (linear_attn.rs:194-205), which walks tokens one at a time in candle
 ops. So the 48-of-64 (27B) and 30-of-40 (35B) layers that are DeltaNet cost the same per
 position inside a verify forward as they would as separate decode steps: 245 ms for a
