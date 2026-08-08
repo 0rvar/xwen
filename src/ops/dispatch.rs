@@ -265,6 +265,21 @@ struct MmArgs {
     r3: i16,
 }
 
+/// The `mv_ext_args` struct of src/ops/mv_ext.metal — ggml's
+/// `ggml_metal_kargs_mul_mv_ext` minus the batch/broadcast fields, which are
+/// all 1 at batch 1. `#[repr(C)]` matches the Metal `constant` struct layout
+/// byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MvExtArgs {
+    ne00: i32,
+    ne01: i32,
+    nb01: u64,
+    ne11: i32,
+    nb11: u64,
+    ne0: i32,
+}
+
 /// `ggml_metal_kargs_mul_mv_id` (ggml-metal-impl.h). Written to buffer(0) of the
 /// vendored indexed mat-vec kernels (`kernel_mul_mv_id_<dtype>_f32_v`).
 #[repr(C)]
@@ -330,8 +345,10 @@ fn combine_index_fits_i32(seq: usize, top_k: usize, n_out: usize) -> bool {
 /// The fork's host-side mv/mm break-even for the float-family mul_mat path
 /// (ggml-metal-ops.cpp `ne11_mm_min`): the tiled matmul kernel is dispatched
 /// when the token count EXCEEDS this, the gemv otherwise. `run_matmul_f16`
-/// mirrors it. (ggml additionally has small-batch `mul_mv_ext` kernels for
-/// ne11 2..8; not vendored — see TODO.md — so those seqs ride the gemv.)
+/// mirrors it. ggml's small-batch `mul_mv_ext` kernels cover exactly the 2..8
+/// range that rides the gemv here; xwen vendors them for the QUANTIZED dtypes
+/// only (mv_ext.metal), so the f16 attention projections still re-read their
+/// weights per token in that window — ledgered in TODO.md.
 const F16_MM_MIN_SEQ: usize = 8;
 
 /// Fork host constants for `kernel_mul_mv_f16_f32_v` at our shapes: nr0 = 2
@@ -350,6 +367,25 @@ const MV_F16_NSG: usize = 4;
 pub(crate) const DENSE_MM_NR0: usize = 64;
 pub(crate) const DENSE_MM_NR1: usize = 128;
 pub(crate) const DENSE_MM_A_TILE_SMEM: usize = DENSE_MM_NR0 * 32 * 2;
+
+/// Geometry of the vendored small-batch mat-vec (mv_ext.metal), baked into the
+/// kernel and mirrored here for the grid: `NSG` simdgroups per threadgroup and
+/// `NXPSG` threads along each row, hence `NYPSG = 32/NXPSG` rows per simdgroup
+/// and `R0PTG = NYPSG*NSG` weight rows per threadgroup. These are the values
+/// ggml's host picks for our shapes (ggml-metal-ops.cpp:2160-2172: nsg is always
+/// 2, nxpsg is 8 whenever ne00 % 128 == 0).
+/// `mv_ext::tests::geometry_matches_metal` cross-checks them against the source.
+pub(crate) const MV_EXT_NSG: usize = 2;
+pub(crate) const MV_EXT_NXPSG: usize = 8;
+pub(crate) const MV_EXT_NYPSG: usize = 32 / MV_EXT_NXPSG;
+pub(crate) const MV_EXT_R0PTG: usize = MV_EXT_NYPSG * MV_EXT_NSG;
+
+/// K must be a whole multiple of this for the baked `nxpsg = 8` geometry: a
+/// thread walks `chpt*nxpsg` chunks per pass (4*8 float4 chunks = 128 elements
+/// for the 32-element block types, 1*8 float4x4 chunks = 128 for the K-quants),
+/// and the kernel has no tail path. It is also ggml's own condition for
+/// choosing this nxpsg.
+pub(crate) const MV_EXT_K_MULTIPLE: usize = 128;
 
 /// ggml's N_R0 / N_SG for the vendored q8_0 attention decode gemv
 /// (kernel_mul_mv_q8_0_f32_attn, q8.metal): N_R0_Q8_0 = 2 rows per threadgroup,
@@ -1720,6 +1756,177 @@ pub(crate) fn run_matmul_q8(
         // N_SG simdgroups of 32 splitting the K reduction.
         let grid = mtl_size!(n_out.div_ceil(MV_Q8_NR0), t, 1);
         encoder.dispatch_thread_groups(grid, mtl_size!(32, MV_Q8_NSG, 1));
+    }
+    drop(x_guard);
+
+    Ok(output_tensor(dst, mdev, out_count, (t, n_out)))
+}
+
+/// The r1ptg (src1 rows per threadgroup) ggml's host picks for a `t`-token
+/// batch, or `None` outside ITS window (2..=8). Not the routing decision —
+/// `ops::mv_ext_window` owns that and is what callers ask; this is the vendored
+/// table it consults inside ggml's range.
+///
+/// The mapping is ggml's own (ggml-metal-ops.cpp:2176-2190) — it divides the
+/// batch as evenly as the four widths allow (6 = 2x3 rather than 4+2, 8 = 2x4
+/// rather than 5+3), so no threadgroup runs mostly-masked rows.
+pub(crate) fn mv_ext_r1ptg(t: usize) -> Option<usize> {
+    let r = match t {
+        2 => 2,
+        3 | 6 => 3,
+        4 | 7 | 8 => 4,
+        5 => 5,
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// The vendored small-batch `kernel_mul_mv_ext_<dtype>_f32_r1_<r1ptg>`
+/// (src/ops/mv_ext.metal). Instantiated for the three dtypes the shipped files
+/// present to a small-batch matmul; a weight in any other dtype keeps whatever
+/// path it had. Keep in lockstep with the entry-point list in mv_ext.metal
+/// (`mv_ext::tests::instantiation_matrix_matches_metal` cross-checks it against
+/// the source).
+pub(crate) fn mv_ext_kernel_name(dt: GgmlDType, r1ptg: usize) -> Result<&'static str> {
+    let n = match (dt, r1ptg) {
+        (GgmlDType::Q4K, 2) => "kernel_mul_mv_ext_q4_K_f32_r1_2",
+        (GgmlDType::Q4K, 3) => "kernel_mul_mv_ext_q4_K_f32_r1_3",
+        (GgmlDType::Q4K, 4) => "kernel_mul_mv_ext_q4_K_f32_r1_4",
+        (GgmlDType::Q4K, 5) => "kernel_mul_mv_ext_q4_K_f32_r1_5",
+        (GgmlDType::Q6K, 2) => "kernel_mul_mv_ext_q6_K_f32_r1_2",
+        (GgmlDType::Q6K, 3) => "kernel_mul_mv_ext_q6_K_f32_r1_3",
+        (GgmlDType::Q6K, 4) => "kernel_mul_mv_ext_q6_K_f32_r1_4",
+        (GgmlDType::Q6K, 5) => "kernel_mul_mv_ext_q6_K_f32_r1_5",
+        (GgmlDType::Q8_0, 2) => "kernel_mul_mv_ext_q8_0_f32_r1_2",
+        (GgmlDType::Q8_0, 3) => "kernel_mul_mv_ext_q8_0_f32_r1_3",
+        (GgmlDType::Q8_0, 4) => "kernel_mul_mv_ext_q8_0_f32_r1_4",
+        (GgmlDType::Q8_0, 5) => "kernel_mul_mv_ext_q8_0_f32_r1_5",
+        (other, r) => bail!("no vendored mul_mv_ext kernel for dtype {other:?} at r1ptg {r}"),
+    };
+    Ok(n)
+}
+
+/// Whether a `[n_out, k]` quantized weight of this dtype can take the
+/// small-batch mat-vec: the kernel must be instantiated for the dtype, and `k`
+/// must be a whole multiple of BOTH the baked 128-element pass width and the
+/// dtype's super-block (the kernel has no K tail). Every production shape
+/// satisfies both; anything else keeps the path it had.
+pub(crate) fn mv_ext_supported(dt: GgmlDType, k: usize) -> bool {
+    mv_ext_kernel_name(dt, 2).is_ok()
+        && k.is_multiple_of(MV_EXT_K_MULTIPLE)
+        && k.is_multiple_of(dt.block_size())
+}
+
+/// Quantized-weight x f32-activation matmul against the vendored small-batch
+/// mat-vec (mv_ext.metal). `weight` is the rank-2 `[n_out, k]` quantized
+/// tensor's raw device buffer bound at `w_off`; `x` is `[t, k]` f32. Returns
+/// `[t, n_out]` f32.
+///
+/// `r1ptg` — the src1 rows a threadgroup covers — is the CALLER'S, not
+/// re-derived here: `ops::mv_ext_window` is the single authority on the plan, so
+/// a token count it admits can never be one this function rejects. Any `t` works
+/// for a valid `r1ptg`; the grid covers `ceil(t/r1ptg)` threadgroups and the
+/// kernel masks the ragged remainder.
+///
+/// Every operand stays f32: the weight chunk is dequantized to f32 registers,
+/// the activation is read as f32, and the accumulation is f32. What differs
+/// from the gemv and from candle's gemm is the summation ORDER of the K
+/// reduction (8 lanes per row here, each holding a different chunk interleave),
+/// so results are bounded-close to both rather than bit-identical to either —
+/// see the mv_ext.metal header.
+pub(crate) fn run_matmul_mv_ext(
+    weight: &Buffer,
+    w_off: usize,
+    dtype: GgmlDType,
+    n_out: usize,
+    k: usize,
+    x: &Tensor,
+    r1ptg: usize,
+) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("matmul_mv_ext requires x on a Metal device");
+    };
+    let (t, kx) = x
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("x must be rank-2 [t, k]: {e}"))?;
+    if x.dtype() != DType::F32 {
+        bail!("x must be f32, got {:?}", x.dtype());
+    }
+    if !x.is_contiguous() {
+        bail!("x must be contiguous");
+    }
+    if kx != k {
+        bail!("x k ({kx}) does not match weight k ({k})");
+    }
+    if t == 0 {
+        bail!("matmul_mv_ext needs at least one token");
+    }
+    // Rejects any r1ptg with no instantiated kernel, which is the only way this
+    // can be wrong now that the plan arrives from the caller.
+    let name = mv_ext_kernel_name(dtype, r1ptg)?;
+    if !mv_ext_supported(dtype, k) {
+        bail!(
+            "matmul_mv_ext requires k a multiple of {MV_EXT_K_MULTIPLE} and of the {dtype:?} \
+             block size {}, got {k}",
+            dtype.block_size()
+        );
+    }
+
+    let bytes_per_row = k / dtype.block_size() * dtype.type_size();
+    // The kernel reads the weight through `device const block_q *`, whose
+    // alignment is that of its widest member (the `half` scale, 2 bytes). Rows
+    // are whole blocks, so only the bound base offset could break it — GGUF's
+    // 32-byte tensor alignment satisfies this; a hand-sliced view lands here.
+    if !w_off.is_multiple_of(2) || !bytes_per_row.is_multiple_of(2) {
+        bail!(
+            "matmul_mv_ext requires a 2-byte-aligned weight view and row stride, \
+             got offset {w_off} and stride {bytes_per_row}"
+        );
+    }
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+    let x_buf = x_storage.buffer();
+    let x_off = x_layout.start_offset() * DType::F32.size_in_bytes();
+    // The activation is read as `float4` / `float4x4`, both of which Metal
+    // requires 16-byte aligned. Row starts are fine by construction (the row
+    // stride is a multiple of 128 floats), so only an offset view could break
+    // it; such a caller falls back rather than reading misaligned.
+    if !x_off.is_multiple_of(16) {
+        bail!("matmul_mv_ext requires a 16-byte-aligned x view, got offset {x_off}");
+    }
+
+    let out_count = t * n_out;
+    let dst = mdev.new_buffer(out_count, DType::F32, "matmul_mv_ext")?;
+
+    let args = MvExtArgs {
+        ne00: k as i32,
+        ne01: n_out as i32,
+        nb01: bytes_per_row as u64,
+        ne11: t as i32,
+        nb11: (k * DType::F32.size_in_bytes()) as u64,
+        ne0: n_out as i32,
+    };
+
+    let pipeline = pipelines::mv_ext_pipeline(mdev.device(), name)?;
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(weight), w_off);
+        encoder.set_input_buffer(2, Some(x_buf), x_off);
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        // No threadgroup memory: the reduction is a shuffle ladder inside each
+        // simdgroup. grid.x covers the weight rows R0PTG at a time, grid.y the
+        // token rows r1ptg at a time; threads are ggml's (SIMD width, nsg, 1).
+        let grid = mtl_size!(n_out.div_ceil(MV_EXT_R0PTG), t.div_ceil(r1ptg), 1);
+        encoder.dispatch_thread_groups(grid, mtl_size!(32, MV_EXT_NSG, 1));
     }
     drop(x_guard);
 

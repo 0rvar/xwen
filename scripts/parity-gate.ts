@@ -231,7 +231,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k === "XWEN_STACK_PROFILE" || k === "XWEN_CHUNK_SYNC" || k.startsWith("XWEN_MM_ID")) continue;
+    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MV_EXT_CLASSIC" || k.startsWith("XWEN_MV_EXT_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k === "XWEN_STACK_PROFILE" || k === "XWEN_CHUNK_SYNC" || k.startsWith("XWEN_MM_ID")) continue;
     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
     // those explicitly per run; an inherited one would skew every tier.
     if (k.startsWith("XWEN_PARITY_")) continue;
@@ -271,13 +271,22 @@ function referenceEnv(): Record<string, string> {
   // replace, so a reference generated with or without it is byte-for-byte the
   // same dump. Cached references predating this pin therefore stay valid.
   //
+  // XWEN_MV_EXT_CLASSIC is necessity too, for the same shape of reason as
+  // XWEN_DENSE_MM_CLASSIC: the vendored small-batch mat-vec reduces K in a
+  // different order, so an oracle that ran it would put both sides on the same
+  // non-QMatMul path. Note the direction differs — that kernel is the CLOSER of
+  // the two to exact (nothing is narrowed; candle's mul_mm stages its tile as
+  // half) — but the oracle's job is to be the one blessed path, not the most
+  // accurate one. Cached references predating the pin are still valid: no
+  // binary of that era had the kernels (the schema-v8 grandfather says so).
+  //
   // XWEN_DENSE_MM_CLASSIC is the opposite — necessity, like XWEN_DELTA_CLASSIC.
   // The vendored dense-FFN prefill gemm runs matmul2d's reduced-precision path
   // and is bounded-close, not bit-identical, so an oracle that ran it would put
   // both sides on the same approximate path. Cached references predating the
   // pin are still valid because no binary of that era could run the gemm (the
   // schema-v7 grandfather says exactly this).
-  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1", XWEN_MOE_GLUE_CLASSIC: "1" };
+  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1", XWEN_MV_EXT_CLASSIC: "1", XWEN_MOE_GLUE_CLASSIC: "1" };
 }
 
 /** Experiment flags (--sdpa-f32 / --attn-mm-classic / --flash-classic), set once in main. */
@@ -462,6 +471,7 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
     const act = p.act ?? (version < 4 ? "classic" : undefined);
     const delta = p.delta ?? (version < 6 ? "classic" : undefined);
     const denseMm = p.dense_mm ?? (version < 7 ? "classic" : undefined);
+    const mvExt = p.mv_ext ?? (version < 8 ? "classic" : undefined);
     return (
       p.moe_impl === "reference" &&
       p.attn_dtype === "f32" &&
@@ -472,7 +482,8 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
       flash === "classic" &&
       act === "classic" &&
       delta === "classic" &&
-      denseMm === "classic"
+      denseMm === "classic" &&
+      mvExt === "classic"
     );
   } catch {
     return false;
@@ -654,7 +665,7 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   // Only the mm candidate picks up the experiment flags (candidateEnv); strict
   // stays pinned to the exact env its 0.999 anchor was blessed with.
   const env = tier === "strict"
-    ? { ...baseEnv(), XWEN_NO_MM_ID: "1", XWEN_MV_CLASSIC: "1", XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1" }
+    ? { ...baseEnv(), XWEN_NO_MM_ID: "1", XWEN_MV_CLASSIC: "1", XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1", XWEN_MV_EXT_CLASSIC: "1" }
     : candidateEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);

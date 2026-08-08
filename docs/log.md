@@ -4,7 +4,168 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-08-08 (latest) — The 27B prefill residual is real and lives in the pipelining: per-stage syncs find only +103 of the +410-438 µs/token, and both cross-chunk accumulation and command-buffer batching are refuted as its mechanism
+## 2026-08-08 (latest) — `mul_mv_ext` ships: the verify forward at span 2 goes 153 → 61 ms, drafted decode gains +11.6-13.2% on the 27B, and the kernel is 20-400x MORE accurate than the mm it replaces
+
+**Context.** The entry below decomposed the verify round's ~149 ms fixed cost and put
+87.6% of it in the dense FFN's matmuls at small M — candle's `mul_mm` grid collapsing to
+`ne01/64` threadgroups at M ≤ 32, ~73 GB/s against ~280 on the seq==1 mat-vec path. It
+named the fix and priced it by byte arithmetic. This arc built and measured it.
+
+**What shipped.** `src/ops/mv_ext.metal` + `mv_ext.rs`: llama.cpp's
+`kernel_mul_mv_ext` multi-row quantized mat-vec, which dequantizes a weight block once
+and reuses it across 2-5 output rows. Q4_K / Q6_K / Q8_0 × r1ptg 2-5. It is routed at
+seq 2..=8 from a **single decision point, `QLinear::forward`**, which is what makes the
+blast radius small and legible: that one site covers the 27B dense FFN, the 35B shared
+expert, and `forward_all_logits`' lm_head. `XWEN_MV_EXT_CLASSIC` is the kill switch,
+`XWEN_MV_EXT_MAX_SEQ` a probe knob, and a `mv_ext` provenance field at schema v8
+(grandfather `classic`) records which path a dump ran.
+
+**The gate fixtures never enter the window, so the oracle tests are the correctness
+net.** Prefill chunks are 512 tokens and decode is 1, so no parity fixture produces a
+2..8 forward at all — the tiers cannot see this kernel. The `mv_ext.rs` oracle tests
+against `QTensor::dequantize` at production reduction lengths carry the correctness
+claim instead, and `XWEN_MV_EXT_CLASSIC=1` is pinned on both sides of the strict tier
+anyway (docs/parity.md "Provenance pins" explains why a kernel the gate cannot exercise
+still gets a pin).
+
+**Two-model review, four findings fixed.** Claude byte-diffed the vendored kernel
+against ggml and Codex re-derived the dequant arithmetic from scratch; both cleared it.
+The fixes were around the edges: `MAX_SEQ` not threaded into the plan, missing Q8_0
+ragged coverage, a vacuous offset test, and a wrong geometry claim in the file header.
+
+**The accuracy result runs the other way from `dense_mm`, and it is worth stating
+because the reflex is now to expect a precision cost.** This kernel is **20-400x MORE
+accurate than the `QMatMul` mm it replaces**: rel_l2 4e-7..8e-6 against ~1.8e-4. The
+reason is structural, not tuning — it is f32 end to end where candle's tiled mm stages
+weight tiles as half. The oracle tests assert the DIRECTION (`rel <= rel_classic` at
+1.0x) rather than an absolute band, so the property is pinned without freezing a number
+that a kernel change could legitimately move.
+
+**Both parity gates ALL PASS post-change, reporting pre-change tier numbers** — expected,
+since no gate fixture reaches the window, and the confirmation that the schema bump and
+the routing change did not disturb anything the gate does see.
+
+**Measured** (round 6; `lowpowermode 0`, both binaries at mtime 20:37, interleaved arms.
+Verify bench: 27B, `n_past` 512, 2 reps per arm, means. End-to-end: the P9a protocol —
+`spec-equivalence.ts`'s code and chat prompts verbatim, greedy, `-n 128`, `XWEN_BENCH=1`,
+drafting default-on, 3 reps, medians).
+
+Verify forward, default against `XWEN_MV_EXT_CLASSIC=1`:
+
+| span | default | classic | |
+|---|---|---|---|
+| 2 | **61.45 ms** | 153.44 | 0.40x (−92.0) |
+| 4 | **85.87** | 176.91 | 0.49x |
+| 6 | **125.89** | 197.97 | 0.64x |
+| 8 | **161.16** | 220.11 | 0.73x (−59.0) |
+| 12-32 | — | — | arms match within 1.2-4.2% (ext inactive) |
+
+One caveat that belongs next to the span-2 number: the default arm's per-rep spread was
+large and one-directional — rep 1 faster by 15-30%, the known pattern, the biggest
+instance of it seen so far. Bounding the win by the per-rep extremes gives **−87.5 to
+−96.4 ms at span 2**, so the sign and the magnitude both survive the spread; the point
+estimate is what is uncertain.
+
+**End-to-end drafted decode, the headline:**
+
+| | default | `XWEN_MV_EXT_CLASSIC=1` | |
+|---|---|---|---|
+| 27B code | **31.7 tok/s** | 28.4 | **+11.6%** |
+| 27B chat | **30.9** | 27.3 | **+13.2%** |
+| 35B code | **131.1** | 125.8 | +4.2% |
+| 35B chat | 119.5 | 119.5 | +0.0% |
+
+The 35B chat cell is a real dead heat, not a measurement failure: it is pause-dominated,
+25-26 of 44 rounds, so most of its tokens never enter a verify forward. And the 35B's
+small win is what the design predicts — only its shared expert and lm_head route through
+`QLinear`, and its verify forward gained just 3.2-4.3 ms at spans 2-8 with nothing
+beyond.
+
+**The controller's economics changed, which re-opens the retune.** The 27B default arm
+pauses far less than the classic arm — 16 vs 28 rounds on code, 14 vs 32 on chat — and
+drafts more. Cheaper verifies make speculation worth attempting more often, exactly as
+cheap verifies did after P9a. That is the **third** cost curve `p_min` 0.3 /
+`pause_margin` 1.0 have now been wrong about, and the ledger item that was blocked on
+this arc is unblocked by it.
+
+**Refuted: extending the window past 8.** `XWEN_MV_EXT_MAX_SEQ=32` makes spans 16 / 24 /
+32 **worse than classic by 1.11x / 1.42x / 1.69x**, with span 12 a wash at 0.98x. So
+ggml's `ne11_mm_min` 8 envelope is the right ceiling and the inherited default was not
+merely untested inheritance — it is now measured. Recorded under decisions.md "Refuted
+perf directions"; the ledger item that flagged the upper edge as unmeasured is closed by
+it.
+
+**A cross-round caveat, so a future reader does not diff the wrong pair.** The classic
+arm on this binary reads ~9-15% slower at mid-spans than round 3's binary did — fixed
+intercept 172.9 vs 161.0 ms. Different binaries and machine-state variance; only the
+WITHIN-round ratios above are trustworthy, never a cross-round absolute.
+
+**What the fixed cost still holds.** Fitting the spans-2-8 arm leaves ~89 ms of
+intercept. Two known non-coverages: the attention projections never touch `QLinear` on
+the default path (they are f16 or q8_0 planes), and the single-row lm_head goes through
+`forward` rather than `forward_all_logits`. Both are ledgered.
+
+## 2026-08-08 — Verify-round diagnosis: the ~149 ms fixed cost is the dense FFN's matmuls at small M, and none of the armed machinery it was blamed on
+
+**Diagnosis only.** The fix arc is in flight and will write the entry that ships it;
+this records what was measured, so the refutations do not have to be re-derived.
+
+**Context.** P9a left the verify round's ~149 ms fixed cost as the new spec-decode
+ceiling, with five unpriced candidates: checkpoint materialization, rollback restore,
+the trail's host-side conv slices, full-span logits + readback, and command-buffer
+syncs. The ledger item's instruction was "price the stages before attacking any of
+them". `spec-verify-bench` grew per-stage sync brackets and per-span stack-profile
+dumps to do that. Conditions throughout: 27B Q4_K_M, `n_past` 512, `lowpowermode 0`,
+medians over 20 reps.
+
+**All five candidates are refuted.** Checkpoint arm costs 5.7 ms fixed — the ~157 MB
+of per-round materializes are cheap. Rollback is 2.6 ms fixed + 0.43 ms/tok, and a
+keep-4 vs keep-0 branch comparison shows no difference at all. Full-span logits and
+readback are 0.12 ms + 0.099 ms/tok, with a last-row-materialize variant reading a flat
+~0.4 ms. Against ~149 ms, the entire armed apparatus is a rounding error.
+
+**The cost is inside the verify forward, and it is there unarmed.** Fitting spans 2-32
+puts the forward's own fixed cost at ~161 ms, and a span-2 UNARMED forward measures 152
+ms against a ~40-43 ms plain step. Speculation does not cause it: a 2-token forward is
+just ~3.7x a 1-token forward. Stage decomposition of that span-2 forward against a plain
+seq-1 step, both stack-profiled under an identical sync regime, puts **131.8 vs 33.9 ms
+in the dense FFN — +97.8 of the +111.7 ms total, 87.6% of it.** lm_head adds +4.4 (3.2x),
+mixer_delta +5.9, mixer_full_attn +2.7, and every other bucket is under a millisecond.
+
+**Mechanism: candle's `mul_mm` collapses at small M.** At seq 2..=32 every quantized
+matmul takes the tiled path, whose grid degenerates to `ne01/64` threadgroups — ~73 GB/s
+effective against ~280 GB/s on the seq==1 mat-vec path. Two refutation rounds confirm
+the shape of the problem rather than a mis-set threshold. Forcing the vendored dense
+gemm onto small spans (`XWEN_DENSE_MM_MIN_SEQ=1`) moved the fixed intercept only −3.3
+ms, because the cooperative-tensor gemm has the same small-M occupancy collapse — though
+its marginal did improve, 2.40 → 1.63 ms/tok. And `XWEN_MM_ID_MIN_SEQ=1` on the 35B was
+strictly worse at spans 2-8, by +4.1-4.4 ms. No kernel currently in the tree wants these
+shapes, so there is nothing to retune toward.
+
+**The fix in flight** is llama.cpp's `mul_mv_ext` multi-row mat-vec: dequantize once and
+reuse across 2-5 output rows (ggml-metal-ops.cpp:2120-2223, `ne11_mm_min` 8). Byte
+arithmetic says it wins at spans 2-8 and washes by ~16. `src/ops/dispatch.rs:330-334`
+already documented this exact gap and pointed at a TODO.md item that did not exist; the
+annotation on the fixed-cost item is now that item.
+
+**One consequence worth flagging before the fix lands:** it inverts the `p_min` retune
+item. "Longer drafts amortize better" was reasoned off a dominant fixed cost, and
+`mul_mv_ext` attacks precisely the short spans, so that tuning conclusion has to be
+re-derived rather than carried. Cross-referenced in the ledger, and the retune should
+wait.
+
+**Also from these sweeps: the span-48 superlinearity has a suspect.** It is
+arming-dependent — every checkpoint-on run overshoots its spans-2-32 extrapolation by
+1.54-1.65x while both no-checkpoint runs come in UNDER at 0.80-0.91x — and it does not
+move with the dense-mm or mm_id knobs. The profiled armed-minus-unarmed `mixer_delta`
+delta grows 6.8 → 160.6 → 304.5 ms at spans 2 / 32 / 48, tracking the K-snapshot plane
+buffer (~3.15 MB per plane per layer, ~100-150 MB/layer at spans 32-48). So it is trail
+memory pressure, not a kernel threshold. Still outside the production regime and still
+unchased. A separate observation from the same sweeps stays unexplained and is NOT
+arming-dependent: lm_head roughly doubles at span 48, 7.0 → 13.1 ms, in both armed and
+unarmed profiled runs.
+
+## 2026-08-08 — The 27B prefill residual is real and lives in the pipelining: per-stage syncs find only +103 of the +410-438 µs/token, and both cross-chunk accumulation and command-buffer batching are refuted as its mechanism
 
 **Context.** The dense-FFN gemm arc (P8c, 2026-07-29) closed the 27B prefill gap and
 handed off one number it could not attribute: +350 to +560 µs/token of prefill cost

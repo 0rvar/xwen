@@ -424,10 +424,16 @@ impl SharedExpert {
         // Stored as a bare `[hidden]` vector on both checkpoints; a `[1, hidden]`
         // conversion means the same thing.
         let hidden = router.elem_count();
+        // Loaded through the buffer-retaining path so each projection carries a
+        // plane and `QLinear::forward` can take the small-batch window (these
+        // are q8_0 on both shipped files). Same single upload either way — the
+        // plain loader reads the tensor from the file too — so this costs no
+        // device memory and no extra copy.
+        let planed = |name: &str| -> Result<QLinear> { Ok(w.qlinear_with_buffer(name)?.0) };
         Ok(Self {
-            gate: w.qlinear("ffn_gate_shexp")?,
-            up: w.qlinear("ffn_up_shexp")?,
-            down: w.qlinear("ffn_down_shexp")?,
+            gate: planed("ffn_gate_shexp")?,
+            up: planed("ffn_up_shexp")?,
+            down: planed("ffn_down_shexp")?,
             router_t: router.reshape((hidden, 1))?,
         })
     }
@@ -510,10 +516,22 @@ impl DenseMlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Prefill takes the vendored gemm, which beats candle's kernel_mul_mm_q4_K
-        // by ~2.4x at these shapes; decode and short spans keep QLinear, whose
-        // gemv wins below the crossover (docs/decisions.md, "The dense-FFN
-        // prefill gemm").
+        // Token-count precedence for a dense FFN projection, decided here and in
+        // `QLinear::forward`:
+        //   > dense_mm_min_seq  the vendored cooperative-tensor gemm, which beats
+        //                       candle's kernel_mul_mm_q4_K by ~2.4x at these
+        //                       shapes (docs/decisions.md, "The dense-FFN
+        //                       prefill gemm") — decided below.
+        //   2 ..= 8            the vendored small-batch mat-vec, one weight pass
+        //                       per 2..5 token rows — decided inside
+        //                       `QLinear::forward`, which each projection here
+        //                       goes through, because every QLinear built with a
+        //                       retained buffer can take it.
+        //   1                  QMatMul's own gemv, which wins at one row.
+        // The two windows cannot overlap (the small-batch ceiling is 8, the gemm
+        // floor is 32), and their kill-switches are independent: with
+        // XWEN_DENSE_MM_CLASSIC set `planes` is None and the small-batch window
+        // still routes, and with XWEN_MV_EXT_CLASSIC set the gemm still does.
         match &self.planes {
             Some(planes) if x.dim(0)? > crate::ops::dense_mm_min_seq() => swiglu_dense_q(planes, x),
             _ => swiglu(&self.gate, &self.up, &self.down, x),

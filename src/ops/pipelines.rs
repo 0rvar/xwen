@@ -28,6 +28,14 @@ const MM_ID_T_HP_INSTANTIATIONS: &str = include_str!("mm_id_t_hp.metal");
 /// Deliberately separate from `mm_id.metal` so it carries no Metal-4 tensor
 /// dependency.
 const MV_SOURCE: &str = include_str!("mv.metal");
+/// Vendored ggml small-batch mat-vec (`mul_mv_ext`) — the 2..8-token window
+/// between `mv.metal`'s gemv and a tiled gemm, one weight pass per 2..5 token
+/// rows. Its own library for the same isolation reason as every other split:
+/// `mv.metal` is decode-critical and must not be able to fail to compile
+/// because of a kernel only the small-batch window uses. Under the
+/// `XWEN_MV_EXT_CLASSIC` kill-switch nothing asks for this library, so it never
+/// compiles.
+const MV_EXT_SOURCE: &str = include_str!("mv_ext.metal");
 /// Vendored f16-weight x f32-activation matmul kernels (attention projections).
 /// Separate from both `mm_id.metal` (no Metal-4 tensor dependency) and
 /// `mv.metal` (attention-critical vs MoE-decode-critical: neither library can
@@ -211,6 +219,12 @@ pub(crate) fn mm_id_pipeline(device: &Device, name: &str) -> Result<ComputePipel
 /// Pipeline for a `mv.metal` kernel (vendored ggml-geometry mat-vec).
 pub(crate) fn mv_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, MV_SOURCE, "mv", name)
+}
+
+/// Pipeline for an `mv_ext.metal` kernel (vendored ggml small-batch mat-vec).
+/// Its own library, compiled lazily on the first small-batch dispatch.
+pub(crate) fn mv_ext_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, MV_EXT_SOURCE, "mv_ext", name)
 }
 
 /// Pipeline for an `f16.metal` kernel (vendored f16-weight attention matmul).

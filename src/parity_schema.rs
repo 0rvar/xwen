@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 7;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 8;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -71,6 +71,15 @@ pub struct ProvenanceField {
 /// reference dump that quietly ran it would grade the fused path against itself.
 /// The field is env-derived, not observed: the 35B-A3B has no dense FFN layer at
 /// all, so an observed field would have nothing to report on that model.
+/// Version 8: mv_ext (the SMALL-BATCH token window, 2..=8: "fused" for the
+/// vendored `mul_mv_ext` kernels, "classic" for the path each site had before,
+/// under XWEN_MV_EXT_CLASSIC). Grandfather "classic": no pre-v8 binary had the
+/// kernels at all, which is also what the oracle runs. Load-bearing like
+/// `delta` and `dense_mm` — it is not bit-identical to what it replaces (a
+/// different K-reduction order) — though it differs from both in DIRECTION: it
+/// is the more accurate of the two paths, sitting ~1e-6 from the f32 oracle
+/// where candle's half-staged `mul_mm` sits ~1.8e-4. Closer is still different,
+/// so the pin is the same. Env-derived, like `dense_mm`.
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_impl",
@@ -145,6 +154,11 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "dense_mm",
         introduced: 7,
+        grandfather: Some("classic"),
+    },
+    ProvenanceField {
+        name: "mv_ext",
+        introduced: 8,
         grandfather: Some("classic"),
     },
 ];
@@ -233,6 +247,12 @@ mod tests {
         assert_eq!(resolve_missing("dense_mm", 1), Some("classic"));
         assert_eq!(resolve_missing("dense_mm", 6), Some("classic"));
         assert_eq!(resolve_missing("dense_mm", 7), None);
+        // mv_ext introduced at v8: v1..v7 dumps missing it resolve to "classic"
+        // (no binary of that era had the small-batch kernels, which is also
+        // what the oracle runs); missing at v8 fails.
+        assert_eq!(resolve_missing("mv_ext", 1), Some("classic"));
+        assert_eq!(resolve_missing("mv_ext", 7), Some("classic"));
+        assert_eq!(resolve_missing("mv_ext", 8), None);
         // Baseline fields are required at every version.
         assert_eq!(resolve_missing("attn_dtype", 1), None);
         assert_eq!(resolve_missing("attn_dtype", 2), None);

@@ -324,6 +324,14 @@ pub struct QLinear {
     inner: QMatMul,
     pub in_dim: usize,
     pub out_dim: usize,
+    /// A raw-bytes view of the SAME allocation `inner` matmuls against, when the
+    /// loader had one to hand out (`qlinear_with_buffer`) and a vendored kernel
+    /// is instantiated for the dtype. Present only so `forward` can route the
+    /// small-batch token window to `ops::matmul_mv_ext`; `None` leaves every
+    /// token count on `QMatMul`, which is what the plain `qlinear` loader gives
+    /// (it never retains a buffer) and therefore what the XWEN_ATTN_F32 parity
+    /// path keeps.
+    plane: Option<QuantPlane>,
 }
 
 impl QLinear {
@@ -347,6 +355,19 @@ impl QLinear {
         } else {
             x
         };
+        // Small-batch window: one weight pass serves 2..8 token rows, where
+        // QMatMul would run candle's `mul_mm` at a fraction of the achievable
+        // bandwidth. Asked after the normalization above, so the kernel always
+        // sees a contiguous, offset-0 rank-2 activation. Any other rank or a
+        // token count outside the window falls through to QMatMul unchanged.
+        if let Some(plane) = &self.plane
+            && let Ok((t, _)) = x.dims2()
+            && let Some(r1ptg) = crate::ops::mv_ext_window(t)
+            && crate::ops::mv_ext_supported(plane.dtype, plane.in_dim)
+        {
+            return crate::ops::matmul_mv_ext(plane, &x, r1ptg)
+                .map_err(|e| candle_core::Error::Msg(format!("{e:?}")));
+        }
         self.inner.forward(&x)
     }
 
@@ -361,6 +382,7 @@ impl QLinear {
             inner: QMatMul::from_arc(qt)?,
             in_dim,
             out_dim,
+            plane: None,
         })
     }
 }
@@ -372,6 +394,7 @@ impl QLinear {
 /// costs no extra device memory. That matters here more than anywhere else in
 /// the loader: the 27B's FFN weights are 14 of its 19 GB, and a materialized f16
 /// copy of them would not fit at all.
+#[derive(Clone)]
 pub struct QuantPlane {
     /// The weight's quantized bytes as a raw device buffer.
     pub buffer: Arc<Buffer>,
@@ -541,6 +564,12 @@ impl Weights {
             inner: QMatMul::from_arc(qt)?,
             in_dim,
             out_dim,
+            // This loader never retains the device buffer, so there is nothing
+            // to hand a vendored kernel; `qlinear_with_buffer` is the one that
+            // can. Deliberate for the XWEN_ATTN_F32 attention projections, the
+            // only production user: that path IS the parity oracle and must
+            // keep the exact QMatMul chain the references were blessed with.
+            plane: None,
         })
     }
 
@@ -592,10 +621,27 @@ impl Weights {
             _ => None,
         };
         let qtensor = Arc::new(QTensor::new(storage, (out_dim, in_dim))?);
+        // The plane views the same allocation the QMatMul reads, so it costs no
+        // device memory. Built whenever a vendored kernel could want it; each
+        // consumer still checks its own support predicate before dispatching.
+        let plane = buffer
+            .clone()
+            .filter(|_| {
+                crate::ops::dense_mm_supported(dtype, in_dim)
+                    || crate::ops::mv_ext_supported(dtype, in_dim)
+            })
+            .map(|buffer| QuantPlane {
+                buffer,
+                base_off: 0,
+                dtype,
+                out_dim,
+                in_dim,
+            });
         let qlinear = QLinear {
             inner: QMatMul::from_arc(qtensor)?,
             in_dim,
             out_dim,
+            plane,
         };
         Ok((qlinear, buffer, dtype))
     }
@@ -610,17 +656,15 @@ impl Weights {
     /// or `in_dim` the vendored kernel is not instantiated for; the caller then
     /// stays on `QLinear::forward` everywhere.
     pub fn qlinear_with_plane(&self, name: &str) -> Result<(QLinear, Option<QuantPlane>)> {
-        let (qlinear, buffer, dtype) = self.qlinear_with_buffer(name)?;
-        let (out_dim, in_dim) = (qlinear.out_dim, qlinear.in_dim);
-        let plane = buffer
-            .filter(|_| crate::ops::dense_mm_supported(dtype, in_dim))
-            .map(|buffer| QuantPlane {
-                buffer,
-                base_off: 0,
-                dtype,
-                out_dim,
-                in_dim,
-            });
+        let (qlinear, _buffer, dtype) = self.qlinear_with_buffer(name)?;
+        let in_dim = qlinear.in_dim;
+        // The QLinear already holds a plane whenever any vendored kernel is
+        // instantiated for the weight; the one handed out here is the DENSE
+        // gemm's, so it keeps that kernel's narrower predicate.
+        let plane = qlinear
+            .plane
+            .clone()
+            .filter(|_| crate::ops::dense_mm_supported(dtype, in_dim));
         Ok((qlinear, plane))
     }
 

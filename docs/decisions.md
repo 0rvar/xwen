@@ -361,6 +361,45 @@ path and the prefill gemm index one allocation. A checkpoint whose FFN dtype has
 vendored kernel, or a non-Metal load, gets `None` and runs `QLinear` at every seq
 (2026-07-29).
 
+**The small-batch matmul window routes from ONE decision point, and it is
+`QLinear::forward`.** At seq 2..=8 no kernel in the tree wanted the shape: candle's
+`mul_mm` grid collapses to `ne01/64` threadgroups at small M (~73 GB/s against ~280 on
+the seq==1 mat-vec path), and the vendored cooperative-tensor gemm has the same
+occupancy collapse — forcing it down with `XWEN_DENSE_MM_MIN_SEQ=1` moved the verify
+forward's fixed intercept only −3.3 ms. `src/ops/mv_ext.metal` is llama.cpp's
+`kernel_mul_mv_ext`: dequantize a weight block once, reuse it across 2-5 output rows
+(Q4_K/Q6_K/Q8_0 × r1ptg 2-5). Routing it from the single `QLinear::forward` site rather
+than per-call-site is the deliberate part — that one point covers the 27B dense FFN, the
+35B shared expert and `forward_all_logits`' lm_head, so the window has one definition,
+one kill switch (`XWEN_MV_EXT_CLASSIC`) and one provenance field. Measured at 27B
+`n_past` 512: the verify forward goes 153.44 → 61.45 ms at span 2 (0.40x) and 220.11 →
+161.16 at span 8 (0.73x); drafted decode gains +11.6% / +13.2% on the 27B (2026-08-08).
+
+**Two deliberate divergences from ggml's own gating, both because our fallback is worse
+than theirs.** (1) ggml restricts its K-quants to ne11 4..=8; xwen admits them from 2,
+because at spans 2-3 our alternative is the 73 GB/s `mul_mm` rather than the tuned path
+ggml falls back to — the comparison that sets the gate is against what we actually have.
+(2) `nxpsg=8` is baked rather than tuned per shape. Both are recorded as divergences
+rather than oversights so a future reader diffing against ggml does not "fix" them
+(2026-08-08).
+
+**This kernel is MORE accurate than what it replaces — the opposite of the `dense_mm`
+trade — and the tests assert the direction, not a band.** rel_l2 4e-7..8e-6 against the
+`QMatMul` mm's ~1.8e-4, i.e. 20-400x better, because it is f32 end to end where candle's
+tiled mm stages weight tiles as half. The oracle tests assert `rel <= rel_classic` at
+1.0x rather than an absolute tolerance: the property worth pinning is "never worse than
+the path it replaced", and freezing a number would break on a legitimate kernel change.
+Worth stating next to the `dense_mm` entries above precisely because the reflex they
+install — a faster kernel costs precision — does not hold here (2026-08-08).
+
+**Provenance treatment mirrors `dense_mm`, even though the gate cannot exercise this
+kernel.** `mv_ext` at schema v8, grandfather `classic`, pinned classic on both sides of
+strict. No parity fixture ever produces a 2..8 forward (prefill chunks are 512, decode
+is 1), so the tiers are structurally blind to it and the `mv_ext.rs` oracle tests carry
+the correctness claim instead. The pin is still right: it costs nothing, it keeps the
+field meaningful if a future fixture ever does enter the window, and a dump that cannot
+say which path it ran is worth less than one that can (2026-08-08).
+
 **The recurrent state is fp32, non-negotiable.** `mamba_ssm_dtype: "float32"` upstream;
 llama.cpp hardcodes F32 for both conv and delta states. State per layer per sequence:
 `(d_conv−1)·conv_dim` floats conv + `128·128·H_v` floats delta (2 MiB on the 35B)
@@ -475,6 +514,19 @@ fence-wait pileup (every new encoder waits on every fence in the growing
 separating them needs a counter candle does not expose — a patched candle or a Metal
 capture. Do not re-propose either refuted lever without an instrument that can see
 inside a chunk (2026-08-08).
+
+**Extending the `mul_mv_ext` window past seq 8 is REFUTED — ggml's `ne11_mm_min` 8 is
+the right ceiling and is now measured rather than inherited.** The obvious follow-on to
+the small-batch win was to raise the ceiling: spans 9-32 are where the verify round's
+fixed cost actually lives, and the window's upper edge was ggml's tested envelope rather
+than anything anyone here had priced. `XWEN_MV_EXT_MAX_SEQ=32` prices it, and the
+multi-row mat-vec loses: spans 16 / 24 / 32 come in **worse than classic by 1.11x /
+1.42x / 1.69x**, with span 12 a wash at 0.98x. The degradation is monotonic in span,
+which is the signature of the mechanism — a mat-vec reusing one dequantized block across
+r1ptg rows stops paying once the token count is large enough for the tiled path's
+threadgroup grid to fill, and past that it is strictly the worse decomposition. The
+crossover is where ggml put it. Do not re-raise the ceiling without a kernel that
+changes this shape (2026-08-08).
 
 ## Speculative decoding
 

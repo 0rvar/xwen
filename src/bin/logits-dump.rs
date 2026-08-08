@@ -273,6 +273,9 @@ fn logits_to_host(t: &Tensor) -> Result<Vec<f32>> {
 /// but unlike its env-derived siblings this one is OBSERVED, from the layer
 /// counters (`observed_delta_path`), because `forward` also falls back on
 /// grounds the environment cannot show.
+/// `mv_ext` records the small-batch (2..=8 token) matmul window: "fused" (the
+/// vendored `mul_mv_ext` kernels, the Metal default) or "classic" (under
+/// `XWEN_MV_EXT_CLASSIC`); env-derived for every runner, like `dense_mm`.
 /// `dense_mm` records the DENSE checkpoint's SwiGLU FFN prefill gemm: "fused"
 /// (the vendored cooperative-tensor kernel, the Metal default) or "classic"
 /// (candle's `QMatMul` chain, under `XWEN_DENSE_MM_CLASSIC`); env-derived for
@@ -370,6 +373,16 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
         // for reference and strict dumps and the bounded tiers grade "fused"
         // against it.
         "dense_mm": if xwen::ops::dense_mm_classic() { "classic" } else { "fused" },
+        // Small-batch (2..=8 token) matmul window: "fused" (the vendored
+        // mul_mv_ext kernels, the Metal default) or "classic" (the path each
+        // routing site had before — candle's QMatMul, under
+        // XWEN_MV_EXT_CLASSIC). Env-derived for every runner, like `dense_mm`:
+        // the window is decided inside `QLinear::forward`, which sits under both
+        // MoE runners. Not bit-identical to what it replaces (a different
+        // K-reduction order), so parity-gate.ts pins "classic" for reference and
+        // strict dumps; unlike its siblings it is the CLOSER of the two paths to
+        // the f32 oracle, which changes nothing about the pin.
+        "mv_ext": if xwen::ops::mv_ext_classic() { "classic" } else { "fused" },
     }))
 }
 

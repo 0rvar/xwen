@@ -8,6 +8,7 @@ pub mod f16;
 pub mod flash;
 pub mod mm_id;
 pub mod moe_glue;
+pub mod mv_ext;
 pub mod mv_id;
 mod pipelines;
 pub mod q8;
@@ -26,6 +27,7 @@ pub use f16::matmul_f16;
 pub use flash::flash_attn;
 pub use mm_id::mul_mm_id;
 pub use moe_glue::{moe_epilogue, moe_router, moe_router_supported};
+pub use mv_ext::{matmul_mv_ext, mv_ext_supported};
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
 pub use q8::matmul_q8;
 pub use silu_mul::silu_mul;
@@ -147,6 +149,86 @@ pub fn stack_profile() -> bool {
 pub fn chunk_sync() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_CHUNK_SYNC").is_some())
+}
+
+/// Largest token count routed to the vendored small-batch mat-vec
+/// (`ops::matmul_mv_ext`). Inclusive, and it is ggml's own tested envelope: its
+/// host dispatches `mul_mv_ext` for ne11 in 2..=8 and the tiled gemm above that
+/// (ggml-metal-ops.cpp:2120-2223). Below 2 there is nothing to amortize — one
+/// token is the plain gemv's job.
+pub const MV_EXT_MAX_SEQ: usize = 8;
+
+/// Effective small-batch ceiling: `XWEN_MV_EXT_MAX_SEQ=<n>` overrides the
+/// default. A PROBE knob — the window's upper edge was inherited from ggml's
+/// tuning, not measured on this device, and the next question about this kernel
+/// is whether it also beats the gemm above 8. Value-parsed, read once and
+/// cached; unset or unparsable falls back to `MV_EXT_MAX_SEQ`.
+pub fn mv_ext_max_seq() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_MV_EXT_MAX_SEQ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MV_EXT_MAX_SEQ)
+    })
+}
+
+/// The small-batch plan for a `seq`-token matmul: `Some(r1ptg)` to route to
+/// `ops::matmul_mv_ext` with that many src1 rows per threadgroup, `None` to
+/// leave the call site on the path it had. Every routing site asks this and
+/// nothing else, so the kill-switch cannot be forgotten at one of them.
+///
+/// This is the SINGLE authority on the plan: the width it returns is handed to
+/// `matmul_mv_ext` verbatim and never re-derived downstream, so a token count
+/// admitted here can never be one the dispatcher rejects.
+///
+/// Inside ggml's 2..=8 window the width is ggml's own choice
+/// (`dispatch::mv_ext_r1ptg`). Above it — reachable only by raising
+/// `XWEN_MV_EXT_MAX_SEQ`, since the default ceiling is 8 — the width is 4, the
+/// widest ggml uses for a full batch and a divisor of the counts a probe would
+/// try; the kernel's ragged-token guard covers the remainder. That extension is
+/// xwen's, not ggml's, and exists to make the "does this beat the gemm higher
+/// up?" question measurable without a rebuild.
+pub fn mv_ext_window(seq: usize) -> Option<usize> {
+    if mv_ext_classic() || seq < 2 || seq > mv_ext_max_seq() {
+        return None;
+    }
+    Some(mv_ext_plan(seq))
+}
+
+/// The width alone, with neither the ceiling nor the kill-switch applied:
+/// ggml's table inside its window, xwen's r1ptg-4 extension above it. Split out
+/// of `mv_ext_window` so tests can drive the extension without depending on the
+/// process-wide cached env ceiling — and so the extension's default lives in
+/// exactly one place.
+pub(crate) fn mv_ext_plan(seq: usize) -> usize {
+    dispatch::mv_ext_r1ptg(seq).unwrap_or(4)
+}
+
+/// `XWEN_MV_EXT_CLASSIC=1` reverts every small-batch routing decision — the
+/// dense FFN below the dense-mm threshold, the q8_0 `QLinear` projections, and
+/// the lm_head — from the vendored `mul_mv_ext` kernels (`ops::matmul_mv_ext`,
+/// mv_ext.metal) back to the path each site had before: candle's `QMatMul`
+/// (which runs its `mul_mm` branch at these token counts), or the plain
+/// vendored gemv where that was already in use.
+///
+/// Like `XWEN_DENSE_MM_CLASSIC` and `XWEN_DELTA_CLASSIC`, and unlike the
+/// combine/act/glue switches, this is NOT a bit-identity anchor: the kernel
+/// changes the K reduction's summation order (eight partial sums per row
+/// instead of one lane-32 fold), so it is bounded-close rather than bitwise.
+/// Unlike those two it is bounded-close on the CLOSER side — nothing is
+/// narrowed, so it sits 4e-7..8e-6 from the f32 oracle where the `QMatMul`
+/// chain it replaces sits ~1.8e-4 (candle stages its dequantized tile as half).
+/// A non-bitwise change either way, which is why the parity gate pins this
+/// switch on BOTH sides of the strict tier and lets the mm / decode / ppl tiers
+/// carry the signal (docs/parity.md).
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`dense_mm_classic`, `flash_classic`): any value enables it — only leaving
+/// it unset keeps the vendored kernels.
+pub fn mv_ext_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_MV_EXT_CLASSIC").is_some())
 }
 
 /// `XWEN_NO_MM_ID=1` forces the per-token mv_id path everywhere (prefill

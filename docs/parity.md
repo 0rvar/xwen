@@ -414,14 +414,14 @@ candidate logit and on a candidate/reference L2-norm ratio outside
 **Provenance pins.** The tier is caller-selected with no cross-check against how the
 dump was produced, so every dump carries a `provenance` object and the gate pins each
 field per side and tier: `moe_impl`, `attn_dtype`, `attn_mm`, `attn_glue`, `sdpa`,
-`flash`, `act`, `combine`, `attn_decode`, `delta`, `dense_mm`, plus
+`flash`, `act`, `combine`, `attn_decode`, `delta`, `dense_mm`, `mv_ext`, plus
 `seq_len`/`mm_min_seq`/`no_mm_id` for
 "was the mm_id path actually active". A field missing at or after its introduction
 version is a stale binary and hard-fails; `src/parity_schema.rs` is the single source
 of truth for the version and the grandfather table. What the Qwen checkpoints report
 on the shipped path: `attn_dtype f16`, `attn_mm tensor`, `attn_decode q8`,
 `combine fused`, `attn_glue fused`, `sdpa f16`, `flash fused`, `act fused`,
-`delta fused`, `dense_mm fused`, `mm_variant tensor`.
+`delta fused`, `dense_mm fused`, `mv_ext fused`, `mm_variant tensor`.
 
 **`delta` and `dense_mm` are the two path pins that are load-bearing rather than
 blessed-anchor discipline.** The other `*_CLASSIC` kernels are bit-identical to the candle chains
@@ -452,6 +452,23 @@ version 7 with grandfather `classic` (no pre-v7 binary had the gemm), so cached
 references stay valid. Note the field is env-derived and the 35B-A3B has no dense FFN
 layer at all — on that checkpoint `dense_mm` labels the configured path, not an
 executed one, exactly as `flash` does below.
+
+**`mv_ext` is pinned even though no gate fixture can exercise it, and the reason is
+worth writing down.** The vendored multi-row mat-vec (`src/ops/mv_ext.metal`,
+`QLinear::forward` at seq 2..=8) never runs during a gate: prefill chunks are 512 tokens
+and decode is a single token, so no fixture produces a forward inside the window. The
+tiers are structurally blind to this kernel, and its correctness claim rests entirely on
+the `mv_ext.rs` oracle tests against `QTensor::dequantize` at production reduction
+lengths — not on anything in this document. It still gets the full treatment:
+`XWEN_MV_EXT_CLASSIC=1` pinned on both sides of **strict**, an `mv_ext` field at schema
+version 8 with grandfather `classic` (no pre-v8 binary had the kernel), so cached
+references stay valid. Three reasons the pin earns its place despite the blindness: it
+costs nothing, it becomes load-bearing the moment a fixture or a serve path does enter
+the window, and a dump that cannot say which path produced it is worth less than one
+that can. Note the accuracy direction is the opposite of `dense_mm`'s — this kernel is
+f32 end to end and lands 4e-7..8e-6 rel_l2 against the `QMatMul` mm's ~1.8e-4, 20-400x
+BETTER — so the pin is provenance discipline rather than a bounded-kernel guard, and the
+oracle tests assert `rel <= rel_classic` rather than an absolute band.
 
 **`flash: "fused"` is currently a provenance label, not a fact, on these
 checkpoints.** The field is env-derived, and `flash.metal` is compiled at head dim
