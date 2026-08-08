@@ -42,17 +42,29 @@ impl PrefillMask {
         pos: usize,
         device: &Device,
     ) -> Result<Option<Self>> {
-        let raw = match crate::kv_cache::attn_mask_for(kind, seq, pos, device)? {
-            Some(m) => m,
+        let host = match crate::kv_cache::attn_mask_data(kind, seq, pos) {
+            Some(h) => h,
             None => return Ok(None),
         };
+        Ok(Some(Self::from_host(host, n_head, device)?))
+    }
+
+    /// The device half of `build`: upload an already-filled host mask and
+    /// materialize the sdpa copy. Split from the CPU fill so a caller can time
+    /// the two separately; the tensors are identical either way.
+    pub fn from_host(
+        host: crate::kv_cache::MaskHost,
+        n_head: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let raw = crate::kv_cache::mask_tensor(host, device)?;
         let (s, kk) = raw.dims2()?;
         let sdpa = raw
             .reshape((1, 1, s, kk))?
             .broadcast_as((1, n_head, s, kk))?
             .to_dtype(DType::F16)?
             .contiguous()?;
-        Ok(Some(Self { raw, sdpa }))
+        Ok(Self { raw, sdpa })
     }
 }
 

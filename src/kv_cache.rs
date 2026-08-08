@@ -65,6 +65,14 @@ pub enum MaskKind {
     Swa { window: usize },
 }
 
+/// The host-side attention mask before it reaches the device: the additive
+/// `[rows, cols]` values in row-major order.
+pub struct MaskHost {
+    pub data: Vec<f32>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 /// Attention mask for `seq_len` new queries at absolute position `pos`, or None
 /// when a single decode token needs no mask.
 ///
@@ -79,8 +87,24 @@ pub fn attn_mask_for(
     pos: usize,
     device: &Device,
 ) -> Result<Option<Tensor>> {
-    if seq_len == 1 {
+    let Some(host) = attn_mask_data(kind, seq_len, pos) else {
         return Ok(None);
+    };
+    Ok(Some(mask_tensor(host, device)?))
+}
+
+/// Upload a host mask to `device`, unchanged.
+pub fn mask_tensor(host: MaskHost, device: &Device) -> Result<Tensor> {
+    let MaskHost { data, rows, cols } = host;
+    Ok(Tensor::from_vec(data, (rows, cols), device)?)
+}
+
+/// The CPU half of `attn_mask_for`: the mask values, with no device involved.
+/// Split out so a caller can time the fill and the upload separately; the values
+/// are exactly what `attn_mask_for` uploads.
+pub fn attn_mask_data(kind: MaskKind, seq_len: usize, pos: usize) -> Option<MaskHost> {
+    if seq_len == 1 {
+        return None;
     }
     let mask = match kind {
         MaskKind::Full => {
@@ -95,7 +119,11 @@ pub fn attn_mask_for(
                     }
                 }
             }
-            Tensor::from_vec(data, (seq_len, k_seq), device)?
+            MaskHost {
+                data,
+                rows: seq_len,
+                cols: k_seq,
+            }
         }
         MaskKind::Swa { window: w } => {
             // Columns are the m surviving past keys (abs pos-m..pos-1) then the
@@ -114,10 +142,14 @@ pub fn attn_mask_for(
                     }
                 }
             }
-            Tensor::from_vec(data, (seq_len, k_seq), device)?
+            MaskHost {
+                data,
+                rows: seq_len,
+                cols: k_seq,
+            }
         }
     };
-    Ok(Some(mask))
+    Some(mask)
 }
 
 impl LayerCache {

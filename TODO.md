@@ -19,6 +19,15 @@ UPDATE (later 2026-07-29): **P9(a) is DONE and `--draft` flipped to opt-out** �
 see the P9 annotations and log.md. Live items now, by value: the **P8c prefill
 residual**; the **P8c attention glue**; the **verify round's ~149 ms fixed
 cost** (new, "Deferred from the K-snapshot verify pass" below); P9(b); P10.
+UPDATE 2026-08-08: the **P8c prefill residual** was diagnosed, not fixed — it is
+real (+410-438 µs/token reproduced), it is not inside any stage (per-stage syncs
+find only +103 of it), and both cross-chunk accumulation and command-buffer
+batching are refuted as its mechanism; it is now blocked on an instrument that
+can count barriers and fence waits inside a chunk. The **P8c attention glue** is
+DOWNGRADED — its premise was inverted (the glue kernels are already wired in) and
+its ~42 ms/layer bounty never existed. Live items by value: the **verify round's
+~149 ms fixed cost**; P9(b); P10; the attention glue's surviving remnant (a fused
+sigmoid gate, ~2-3 dispatches) and the head-dim-256 flash instantiation.
 
 1. **Mechanical fork — DONE 2026-07-28.** cp-based copy of ../laguna, maxuna→xwen
    rename, MAXUNA_*→XWEN_* env prefix, Qwen tokenizer/chat-template/configs vendored
@@ -623,6 +632,51 @@ in log.md 2026-07-29.
   single unknown in 27B prefill: with the FFN gemm fixed this is a much bigger share of
   what remains, and it is most of why the 4k result (445 tok/s) fell short of the
   profile's 496 upper-bound counterfactual while the 925 result met it.
+  ANNOTATION 2026-08-08: **the diagnosis ran; the residual is real, it is NOT inside any
+  stage, and two candidate mechanisms are refuted.** The named next step was built —
+  `src/stack_profile.rs` / `XWEN_STACK_PROFILE`, in-situ per-stage timing by device
+  sync, plus a `XWEN_CHUNK_SYNC` probe flag (design and reading discipline in
+  decisions.md "Measurement discipline"; both flags stripped in `parity-gate.ts`'s
+  `baseEnv()`). Conditions throughout: `lowpowermode 0` (no `powermode` key on this
+  machine, high-power never claimable), warm, `XWEN_BENCH=1`, interleaved arms, medians
+  of 3, 27B Q4_K_M, prefill-925 (880 tok) and prefill-4k (3851 tok).
+  - **Reproduced.** Plain-arm length delta +410.3 µs/token (round 1) and +437.9
+    (round 2), squarely inside the ledgered band.
+  - **Under per-stage serialization the same delta is only +102.8 µs/token**:
+    mixer_full_attn +53.5 (which matches the ~+69 sdpa+mask quadratic already
+    estimated), ffn +42.2, residual_ffn +16.8, mask_upload +7.9, mixer_delta −9.1
+    (flat). So **~335 µs/token exists ONLY when stages pipeline** — it is not in any
+    stage's kernels, it is in how consecutive stages interact when the queue runs ahead.
+  - **Refuted, by direct A/B, as the mechanism:** (a) cross-chunk accumulation —
+    `XWEN_CHUNK_SYNC` prunes candle's buffer pool, clears its fence map and drops the
+    encoder's barrier history at every chunk boundary, and the length delta is
+    unchanged (+431.1 vs +437.9, a −6.8 difference; the flag itself costs +9.2 µs/token
+    at 925 and +2.4 at 4k, a per-chunk price); (b) command-buffer batching —
+    `CANDLE_METAL_COMPUTE_PER_BUFFER` at 10/200/1000 against the default 50, at 4k, all
+    within 0.9%. See decisions.md "Refuted perf directions".
+  - **Surviving hypotheses, both intra-chunk and both unconfirmed:** barrier storms from
+    buffer-pointer recycling (candle rev 21cca0b emits a full `MTLBarrierScope::Buffers`
+    barrier when a pool-recycled pointer is reused within an encoder session) and
+    fence-wait pileup (every new encoder waits on every fence in the growing
+    `prev_ce_outputs` map). Both re-develop inside a chunk regardless of boundary
+    cleanup, which is exactly what the `XWEN_CHUNK_SYNC` result requires of the real
+    mechanism. Supporting candle facts: the pool prunes ONLY inside
+    `wait_until_completed`/`flush_and_wait_current`; `Tensor::from_vec` bypasses the
+    pool entirely and allocates a fresh exact-size-keyed `MTLBuffer` plus a
+    residency-set commit per call (the per-chunk mask upload is on that path);
+    `find_available_buffer` scans O(total cached buffers).
+  - **Next step: an instrument that can see INSIDE a chunk.** A barrier/fence counter
+    needs either a candle patch or a Metal capture; `XWEN_STACK_PROFILE` cannot separate
+    the two survivors because syncing is what makes the cost disappear.
+  - **Second thread, tracked here rather than split out:** the **ffn stage's +42.2
+    µs/token of in-stage growth is unexplained**. The dense SwiGLU is length-INDEPENDENT
+    per token by construction, so a stage that grows with prompt length under
+    serialization is an anomaly on its own terms; the signature is allocator pressure,
+    not arithmetic.
+  - Today's plain baselines for the record: 755-767 tok/s @925, 574 @4k, against the
+    ledger's 702/445 of 2026-07-29. Machine-state variance, not a code change — nothing
+    in this arc touched a production path, the 27B's ±10% between-run caveat applies
+    (P11), and a compile load preceded round 1. See log.md 2026-08-08.
 
 - [ ] **Attention glue: ~10 unfused eager passes per layer, inside a 57.13 ms/layer
   attention block.** MEASURED (profiling pass, amortized, T=3851): the whole attention
@@ -638,6 +692,22 @@ in log.md 2026-07-29.
   replace, so this is `XWEN_ATTN_GLUE_CLASSIC` territory and needs no new parity tier),
   then measure what is left. Do not start by writing a new fused kernel — the existing
   ones may cover most of it.
+  ANNOTATION 2026-08-08: **DOWNGRADED — the premise is inverted, and the ~42 ms/layer of
+  glue never existed.** Read the code before sizing any of this. `permute_01`,
+  `permute_01_f16`, `cast_f16`, `cast_f32` and `rope_neox` have been wired into the MAIN
+  attention block since the fork (`attention.rs`'s `fused_glue` paths), so step one of
+  the plan above is already done and was never undone. `ops::attn_gate` has **zero
+  production call sites** and cannot serve Qwen as written: it computes a
+  scalar-per-(token, head) softplus gate where Qwen needs a head_dim-wide sigmoid
+  (attention.rs:360). DFlash uses no glue kernels at all — the "wired only into the
+  DFlash path" reading was wrong in both directions. And the number is gone too: the
+  ~42.43 ms/layer figure came from the briefing rather than the raw profile, and the
+  in-situ synced differential (see the residual item above) puts the whole attention
+  block's length-growth at +53.5 µs/token, which is ≈ the already-known sdpa quadratic
+  with nothing left over for glue. **What remains live:** a fused sigmoid-gate kernel at
+  the gate site, worth ~2-3 dispatches, and the head-dim-256 flash instantiation that
+  would remove the mask (the item below). Neither is sized against a measured bounty.
+  See log.md 2026-08-08.
 
 - [ ] **The host-built materialized causal mask is not today's problem but becomes
   first-order at 8k+.** `flash.metal` is genuinely unreachable at head dim 256

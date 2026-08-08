@@ -14,6 +14,7 @@ use crate::kv_cache::{CacheSnapshot, HostFullKv, HostSnapshot, KvCheckpoint};
 use crate::model::XwenModel;
 use crate::ops::ExpertRunner;
 use crate::sampler::{SampleControl, Sampler, SamplerOptions};
+use crate::stack_profile::Phase;
 use crate::tokenizer::LagunaTokenizer;
 
 /// Prompt tokens are fed to the model in chunks of this size. Keeps prefill
@@ -1587,9 +1588,14 @@ impl Generator {
             }
             device.synchronize()?;
             self.model.reset_cache()?;
+            // The warm-up's stages are the page-in and pipeline-compile costs
+            // this block exists to keep out of the measurement; they must not
+            // survive into the profile either.
+            self.model.reset_stack_profile();
         }
 
         // ---- Prefill: feed the prompt in chunks, advancing the absolute pos.
+        self.model.set_phase(Phase::Prefill);
         let prefill_start = Instant::now();
         let mut cancelled = false;
         let mut pos = 0usize;
@@ -1601,12 +1607,23 @@ impl Generator {
             }
             let input = Tensor::new(chunk, &device)?;
             logits = Some(self.model.forward(&input, pos)?);
+            // XWEN_CHUNK_SYNC: bound each chunk's work at the chunk boundary
+            // instead of letting chunks pipeline, so an A/B against the default
+            // prices whatever accumulates across them (ops::chunk_sync).
+            if crate::ops::chunk_sync() {
+                device.synchronize()?;
+            }
             pos += chunk.len();
         }
         // Force the queued prefill GPU work to complete before timing it (the
         // decode loop's per-token readback would otherwise absorb it).
         device.synchronize()?;
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
+        // Per-stage forward timing (XWEN_STACK_PROFILE), reported here so the
+        // prefill decomposition is readable before decode dilutes it, and again
+        // at the end of the generation with the decode phase filled in. No-op
+        // when profiling is off.
+        self.model.dump_stack_profile("after-prefill");
         let logits = match logits {
             Some(logits) if !cancelled => logits,
             // Cancelled during (or before) prefill: no logits to decode from.
@@ -1638,6 +1655,7 @@ impl Generator {
             should_stop,
         )?;
         let decoded = outcome.tokens_out;
+        self.model.dump_stack_profile("end-of-generation");
 
         Ok(GenStats {
             prefill_tokens: tokens.len(),
@@ -1681,6 +1699,7 @@ impl Generator {
             ..
         } = self;
         let device = model.device().clone();
+        model.set_phase(Phase::Prefill);
         let mut pos = start_pos;
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             let input = Tensor::new(chunk, &device)?;
@@ -1910,6 +1929,10 @@ impl Generator {
             .expect("checked before the logits were taken");
         think.reset();
         let device = model.device().clone();
+        // A verify forward feeds a whole span of tokens and is still decode, so
+        // the XWEN_STACK_PROFILE phase is declared rather than left to the shape
+        // of the batch.
+        model.set_phase(Phase::Decode);
         let params = spec_params.clone();
 
         // Draft-block width is bounded by the trained block size (id_last plus
@@ -2308,6 +2331,10 @@ impl Generator {
         should_stop: &mut dyn FnMut() -> bool,
     ) -> Result<DecodeOutcome> {
         let device = self.model.device().clone();
+        // Everything from here is decode, for the XWEN_STACK_PROFILE
+        // accumulators — set here rather than at the call sites so `generate` and
+        // the server's `decode_loop` are both covered.
+        self.model.set_phase(Phase::Decode);
         let decode_start = Instant::now();
         let ban_floor = self.ban_ids(true);
         let ban_plain = self.ban_ids(false);
@@ -2477,11 +2504,16 @@ impl Generator {
             device.synchronize()?;
             model.reset_cache()?;
             drafter.reset();
+            // The warm-up's stages are the page-in and pipeline-compile costs
+            // this block exists to keep out of the measurement; they must not
+            // survive into the profile either.
+            model.reset_stack_profile();
         }
 
         // ---- Prefill: feed the prompt in chunks. After each chunk, fuse the
         // target taps through the drafter's encoder and inject them into the
         // drafter's KV cache at the same absolute positions.
+        model.set_phase(Phase::Prefill);
         let prefill_start = Instant::now();
         let mut cancelled = false;
         let mut pos = 0usize;
@@ -2516,6 +2548,11 @@ impl Generator {
         // ---- Decode. `id_last` is the last sampled-but-not-yet-verified token,
         // living at absolute position `n_past`; the drafter's committed length
         // tracks `n_past` at every round boundary.
+        //
+        // A verify forward feeds a whole span of tokens and is still decode, so
+        // the XWEN_STACK_PROFILE phase is declared here rather than left to the
+        // shape of the batch.
+        model.set_phase(Phase::Decode);
         let decode_start = Instant::now();
         let mut stream = tokenizer.decode_stream();
         let mut stats = SpecStats::default();

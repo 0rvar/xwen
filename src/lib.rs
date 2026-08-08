@@ -16,6 +16,7 @@ pub mod parity_schema;
 pub mod rope;
 pub mod sampler;
 pub mod serve;
+pub mod stack_profile;
 pub mod tokenizer;
 
 pub use config::XwenConfig;

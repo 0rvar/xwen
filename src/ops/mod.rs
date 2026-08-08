@@ -113,6 +113,42 @@ pub fn dense_mm_classic() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_DENSE_MM_CLASSIC").is_some())
 }
 
+/// `XWEN_STACK_PROFILE` turns on the in-situ per-stage timing of the forward
+/// stack (`stack_profile`): every stage of `run_stack` plus the lm-head tail is
+/// bracketed by device syncs, each chunk's wall clock is measured the same way,
+/// and the difference between the two is reported as unaccounted time. It is
+/// DIAGNOSIS ONLY — no arithmetic changes — but the syncs serialize the whole
+/// pipeline, so a profiled run's absolute throughput means nothing.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`dense_mm_classic`, `combine_classic`): any value enables it. Unset — the
+/// normal case — costs one `Option` check at each instrumented site.
+pub fn stack_profile() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_STACK_PROFILE").is_some())
+}
+
+/// `XWEN_CHUNK_SYNC` makes the plain prefill loop wait for each chunk's forward
+/// to complete before enqueueing the next, instead of letting the chunks
+/// pipeline.
+///
+/// It is an A/B probe for prefill cost that accumulates ACROSS chunks rather
+/// than inside them. A sync is the only thing that clears candle-metal's fence
+/// map and encoder barrier history and prunes its buffer pool, so state that
+/// grows chunk over chunk — a pool that only ever adds entries because each
+/// chunk's mask upload asks for a fresh exact-size buffer, and the barrier
+/// storms that recycled pool pointers trigger — is present in a pipelined run
+/// and absent in a synced one. The difference between the two runs is that
+/// state's cost; neither run's arithmetic differs, and the sync itself is the
+/// only thing being added.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`stack_profile`, `dense_mm_classic`): any value enables it.
+pub fn chunk_sync() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_CHUNK_SYNC").is_some())
+}
+
 /// `XWEN_NO_MM_ID=1` forces the per-token mv_id path everywhere (prefill
 /// included), as a fallback / parity-debug switch. Read once and cached — it is
 /// consulted per MoE layer on the hot path.

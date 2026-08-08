@@ -15,6 +15,7 @@ use crate::linear_attn::LinearAttnBlock;
 use crate::moe::{DenseMlp, MoeBlock};
 use crate::ops::ExpertRunner;
 use crate::rope::Rope;
+use crate::stack_profile::Stage;
 
 /// Warn at load if the resident footprint (weights mmap-uploaded to the device
 /// plus the preallocated KV cache) exceeds this. The Q4_K_M checkpoint is ~70GB
@@ -103,6 +104,12 @@ pub struct XwenModel {
     /// The most recent forward's spec taps, in configured order, drained by
     /// `take_spec_taps`.
     spec_taps: Vec<Tensor>,
+    /// Per-stage forward timing, present only under `XWEN_STACK_PROFILE`
+    /// (`ops::stack_profile`). `None` — the normal case — costs one `Option`
+    /// check per instrumented site; `Some` brackets every stage with device
+    /// syncs, which serializes the pipeline and makes the run's throughput
+    /// meaningless. Diagnosis only: no arithmetic depends on it.
+    profile: Option<crate::stack_profile::StackProfiler>,
     /// Keeps the GGUF mapping (and its Metal view buffers' residency set) alive
     /// for the model's lifetime on the mmap alias load: the aliased attention
     /// f16 planes are plain `Tensor`s that cannot carry the mapping themselves,
@@ -245,6 +252,7 @@ impl XwenModel {
             taps: Vec::new(),
             spec_tap_layers: None,
             spec_taps: Vec::new(),
+            profile: crate::ops::stack_profile().then(crate::stack_profile::StackProfiler::new),
             _weights_mmap: gguf.mmap_source().cloned(),
             checkpoint: gguf.checkpoint_id(),
         })
@@ -310,9 +318,23 @@ impl XwenModel {
             self.max_ctx
         );
 
+        // Per-stage timing hooks (`XWEN_STACK_PROFILE`). Off — the normal case —
+        // each is one `Option` check; on, each brackets its stage with device
+        // syncs so the stage totals and the chunk's own wall clock are measured
+        // the same way and their difference is meaningful.
+        macro_rules! stage {
+            ($stage:expr, $e:expr) => {{
+                crate::stack_profile::stage_begin(&mut self.profile, &self.device)?;
+                let out = $e;
+                crate::stack_profile::stage_end(&mut self.profile, &self.device, $stage)?;
+                out
+            }};
+        }
+        crate::stack_profile::chunk_begin(&mut self.profile, &self.device, seq)?;
+
         // Embedding lookup, upcast to the f32 residual stream (shared with the
         // drafter via `embed_ids`).
-        let mut x = self.embed_tokens(tokens)?; // [seq, hidden] f32
+        let mut x = stage!(Stage::Embed, self.embed_tokens(tokens)?); // [seq, hidden] f32
 
         // Taps are collected into a local vec (no self-borrow tangle with the
         // per-layer cache mutation) and published by the caller when enabled.
@@ -343,7 +365,7 @@ impl XwenModel {
                 .find(|&il| self.cfg.is_full_attn(il))
                 .map(|il| self.cfg.n_head(il));
             match n_head {
-                Some(n) => PrefillMask::build(MaskKind::Full, n, seq, pos, &self.device)?,
+                Some(n) => self.build_prefill_mask(n, seq, pos)?,
                 None => None,
             }
         } else {
@@ -354,30 +376,35 @@ impl XwenModel {
             let layer = &self.layers[il];
             let cache = &mut self.caches[il];
 
-            let normed = layer.attn_norm.forward(&x)?;
+            let normed = stage!(Stage::AttnNorm, layer.attn_norm.forward(&x)?);
             tap!("attn_norm", il, normed);
 
             // x += mixer(attn_norm(x)) — post-o_proj for an attention layer,
             // post-ssm_out for a DeltaNet one. Both advance their layer's cache.
             let attn = match &layer.mixer {
-                Mixer::Full(block) => block.forward(&normed, cache, pos, full_mask.as_ref())?,
-                Mixer::Linear(block) => block.forward(&normed, cache)?,
+                Mixer::Full(block) => stage!(
+                    Stage::MixerFullAttn,
+                    block.forward(&normed, cache, pos, full_mask.as_ref())?
+                ),
+                Mixer::Linear(block) => {
+                    stage!(Stage::MixerDelta, block.forward(&normed, cache)?)
+                }
             };
             tap!("attn_o_proj", il, attn);
-            let ffn_inp = (&x + &attn)?;
+            let ffn_inp = stage!(Stage::ResidualAttn, (&x + &attn)?);
             tap!("ffn_inp", il, ffn_inp);
 
-            let ffn_normed = layer.ffn_norm.forward(&ffn_inp)?;
+            let ffn_normed = stage!(Stage::FfnNorm, layer.ffn_norm.forward(&ffn_inp)?);
             tap!("ffn_norm", il, ffn_normed);
 
             // x += ffn(ffn_norm(x)).
             let ffn_out = match &layer.ffn {
-                Ffn::Dense(mlp) => mlp.forward(&ffn_normed)?,
-                Ffn::Moe(moe) => moe.forward(&ffn_normed)?,
+                Ffn::Dense(mlp) => stage!(Stage::Ffn, mlp.forward(&ffn_normed)?),
+                Ffn::Moe(moe) => stage!(Stage::Ffn, moe.forward(&ffn_normed)?),
             };
             tap!("ffn_out", il, ffn_out);
 
-            x = (&ffn_inp + &ffn_out)?;
+            x = stage!(Stage::ResidualFfn, (&ffn_inp + &ffn_out)?);
             tap!("l_out", il, x);
 
             // Spec-decode capture: the same post-FFN-residual `l_out` value, held
@@ -395,8 +422,35 @@ impl XwenModel {
             taps.push(("h_nextn".to_string(), x.clone()));
         }
 
-        let normed = self.output_norm.forward(&x)?; // [seq, hidden]
+        let normed = stage!(Stage::FinalNorm, self.output_norm.forward(&x)?); // [seq, hidden]
         Ok((normed, taps, spec_captured))
+    }
+
+    /// Build the hoisted prefill mask, splitting the CPU fill from the upload so
+    /// the profiler can charge them to separate stages. The tensors are what
+    /// `PrefillMask::build` produces either way.
+    fn build_prefill_mask(
+        &mut self,
+        n_head: usize,
+        seq: usize,
+        pos: usize,
+    ) -> Result<Option<PrefillMask>> {
+        if self.profile.is_none() {
+            return PrefillMask::build(MaskKind::Full, n_head, seq, pos, &self.device);
+        }
+        let started = crate::stack_profile::host_begin(&mut self.profile);
+        let host = crate::kv_cache::attn_mask_data(MaskKind::Full, seq, pos);
+        crate::stack_profile::host_end(&mut self.profile, Stage::MaskFillHost, started);
+        let Some(host) = host else { return Ok(None) };
+
+        crate::stack_profile::stage_begin(&mut self.profile, &self.device)?;
+        let mask = PrefillMask::from_host(host, n_head, &self.device)?;
+        crate::stack_profile::stage_end(
+            &mut self.profile,
+            &self.device,
+            Stage::MaskUploadAndBroadcast,
+        )?;
+        Ok(Some(mask))
     }
 
     /// tokens: [seq] u32 at absolute position pos. Returns last-position
@@ -410,6 +464,7 @@ impl XwenModel {
         // position only — never run the vocab matmul over the whole prefill
         // chunk. `result_norm` matches the fork, which captures it after the
         // last-position gather, so it is last-position-only too.
+        crate::stack_profile::stage_begin(&mut self.profile, &self.device)?;
         let last = normed.narrow(0, seq - 1, 1)?.contiguous()?; // [1, hidden]
         // Decode bypass: at one query position, run the vendored ggml-geometry
         // plain mat-vec over the shared lm_head buffer (candle's baked quantized
@@ -433,6 +488,8 @@ impl XwenModel {
             _ => self.lm_head(&last)?, // [1, vocab] — shared raw projection
         };
         let logits = logits.flatten_all()?; // [vocab]
+        crate::stack_profile::stage_end(&mut self.profile, &self.device, Stage::LmHead)?;
+        crate::stack_profile::chunk_end(&mut self.profile, &self.device)?;
         if self.tap_enabled {
             taps.push(("result_norm".to_string(), last));
             taps.push(("result_output".to_string(), logits.clone()));
@@ -465,7 +522,43 @@ impl XwenModel {
         // whole-sequence `l_out` residuals, valid at every position, and the
         // speculative verify path depends on them.
         self.taps.clear();
-        self.lm_head(&normed) // [seq, vocab] — QMatMul path (seq > 1)
+        crate::stack_profile::stage_begin(&mut self.profile, &self.device)?;
+        let logits = self.lm_head(&normed)?; // [seq, vocab] — QMatMul path (seq > 1)
+        crate::stack_profile::stage_end(&mut self.profile, &self.device, Stage::LmHead)?;
+        crate::stack_profile::chunk_end(&mut self.profile, &self.device)?;
+        Ok(logits)
+    }
+
+    /// Report the per-stage forward timing collected under `XWEN_STACK_PROFILE`,
+    /// tagging every line with `label` (the call site — a generation reports once
+    /// after prefill and once at the end). No-op when profiling is off. The
+    /// accumulators are cumulative and per-phase, so a later dump repeats the
+    /// earlier one's phases unchanged and adds whatever has run since.
+    pub fn dump_stack_profile(&self, label: &str) {
+        if let Some(p) = &self.profile {
+            p.dump(label);
+        }
+    }
+
+    /// Declare which phase the forwards from here on belong to, for the
+    /// `XWEN_STACK_PROFILE` accumulators. No-op when profiling is off. Only the
+    /// generation loop knows this: neither the token count nor the entry point
+    /// distinguishes a one-token tail of a prompt from a decode step, or a
+    /// speculative verify span from a prefill chunk. Unset means prefill, which
+    /// is what a pure scoring pass wants.
+    pub fn set_phase(&mut self, phase: crate::stack_profile::Phase) {
+        if let Some(p) = self.profile.as_mut() {
+            p.set_phase(phase);
+        }
+    }
+
+    /// Drop everything the `XWEN_STACK_PROFILE` accumulators hold. No-op when
+    /// profiling is off. A throwaway warm-up pass calls this so the page-in and
+    /// pipeline-compile costs it exists to absorb stay out of the report.
+    pub fn reset_stack_profile(&mut self) {
+        if let Some(p) = self.profile.as_mut() {
+            p.reset();
+        }
     }
 
     /// Enable capture of named intermediate tensors (parity bisection).

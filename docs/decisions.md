@@ -446,6 +446,36 @@ refutation is worth more as a runnable arm than as a paragraph. `delta_scan_timi
 (src/ops/delta.rs, `#[ignore]`d) is the instrument — re-run it before believing any
 future claim about the scan's cost, including this one.
 
+**Chunk-boundary device syncs and command-buffer batching granularity are both REFUTED
+as levers on the 27B prefill residual.** The residual — +350 to +560 µs/token of
+length-dependent prefill cost outside every measured stage — was reproduced in situ at
++410.3 and +437.9 µs/token across two rounds, and per-stage serialization accounts for
+only +102.8 of it (mixer_full_attn +53.5, ffn +42.2, residual_ffn +16.8, mask_upload
++7.9, mixer_delta −9.1). So ~335 µs/token exists ONLY when stages pipeline, and the two
+obvious pipelining suspects were tested directly and both cleared.
+
+*Cross-chunk accumulation.* `XWEN_CHUNK_SYNC` waits for each 512-token chunk's forward
+to complete before enqueueing the next, which prunes candle's buffer pool, clears its
+fence map and drops the encoder's barrier history — everything a chunk boundary could
+reset. The length delta with it on is +431.1 µs/token against +437.9 without, a
+difference of −6.8. Whatever accumulates re-develops inside a single chunk. (The flag
+itself costs +9.2 µs/token at 925 and +2.4 at 4k — a per-chunk fixed price, not a
+length-dependent one.)
+
+*Command-buffer batching.* `CANDLE_METAL_COMPUTE_PER_BUFFER` swept over 10 / 200 / 1000
+against candle's default 50 at 4k: all four means within 0.9%. A 100x range of batching
+granularity moves nothing, so the cost is neither submission overhead nor a per-buffer
+fixed price.
+
+What is left standing is intra-chunk, and unconfirmed: barrier storms from
+buffer-pointer recycling (candle's encoder emits a full `MTLBarrierScope::Buffers`
+barrier when a pool-recycled pointer is reused within one encoder session) and
+fence-wait pileup (every new encoder waits on every fence in the growing
+`prev_ce_outputs` map). Both are consistent with the `XWEN_CHUNK_SYNC` result, and
+separating them needs a counter candle does not expose — a patched candle or a Metal
+capture. Do not re-propose either refuted lever without an instrument that can see
+inside a chunk (2026-08-08).
+
 ## Speculative decoding
 
 **dflash.rs stays in the fork — a removal decision was made and reversed within the
@@ -858,6 +888,46 @@ broken when the target is simply invisible. Pick a probe target you can independ
 confirm is running and visible — `bun` works here. A guard whose failure mode is a
 concurrent 20 GB load deserves both halves tested against real processes, permissive
 and restrictive, not just its matcher unit-tested (2026-07-28).
+
+**Per-stage forward timing is done IN SITU, by device sync, and only its
+length-DIFFERENTIALS may be read as measurements.** `src/stack_profile.rs`
+(`XWEN_STACK_PROFILE`) decomposes a chunk's wall clock into the stages `run_stack`
+actually runs, on the real weights in the real dispatch order, because a stage budget
+assembled from synthetic microbenchmarks cannot see what the wall clock holds that no
+stage claims — which is the entire question it was built for. Five design rules, each
+answering a way the instrument could lie:
+
+- Stages are bracketed by `Device::synchronize`, so a stage's total is completed GPU
+  work rather than enqueue time. Adjacent stages SHARE the sync between them, so the
+  brackets add one sync per stage and not two.
+- Host-side gaps go to their own `inter_stage_host` bucket. The sync closing one stage
+  opens the next, so an unbucketed gap would be silently charged to whichever kernel
+  follows it, and per-token cost living in the glue would be mis-attributed to the
+  stage after it.
+- `unaccounted == 0` is an ENFORCED bracket-integrity invariant, not a result. Every
+  interval inside a chunk's bracket belongs to some bucket by construction; a nonzero
+  value means the brackets are wrong. Anything real shows up as a bucket.
+- Phase (prefill vs decode) is DECLARED by the caller (`XwenModel::set_phase`), never
+  inferred from token count. Inference has two failure modes that both occur in
+  practice: a prompt whose length is ≡ 1 mod 512 ends prefill with a one-token chunk,
+  and a speculative verify forward feeds a whole span while being decode.
+- `XWEN_BENCH`'s warm-up pass is excluded by resetting the accumulators after it, so a
+  dump never averages a cold chunk with warm ones.
+
+**The reading discipline is the load-bearing part.** Per-stage syncs roughly DOUBLE the
+prefill wall — absolute synced numbers are ~2x plain and mean nothing on their own. What
+survives is the differential between two prompt lengths: the per-stage sync overhead is
+approximately constant per token, so it cancels out of a length delta. Any claim taken
+off this instrument must be a length-differential, never an absolute. It is built for
+plain `--no-draft` generation (the speculative and server paths accumulate correctly but
+print no dumps), and with the variable unset the cost at each instrumented site is one
+`Option` check. `XWEN_STACK_PROFILE` and `XWEN_CHUNK_SYNC` are both stripped in
+`parity-gate.ts`'s `baseEnv()` (2026-08-08).
+
+**A warm-up pass that reads faster than the timed pass following it is a thermal
+ordering artifact, not evidence.** The warm-up runs on the cooler chip. This looked like
+evidence about allocator-pool state during the residual diagnosis and was not; the
+profiler excludes warm-up from its dumps for exactly this reason (2026-08-08).
 
 ## Process
 
