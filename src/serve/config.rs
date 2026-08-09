@@ -104,9 +104,13 @@ pub const DEFAULT_SCHEDULE_AGE_LIMIT_SECS: u64 = 20;
 /// the default: a zero-flag run now fetches and loads the DFlash sidecar (3.5
 /// GB on the 27B, 0.8 GB on the 35B-A3B). See docs/decisions.md, "Speculative
 /// decoding".
+///
+/// `p_min` is the one drafter default that is not a constant here: it is fitted
+/// per checkpoint and lives on [`crate::hub::Model::draft_p_min_default`], which
+/// the merge reads through [`CliOverrides::model_size`]. `draft.p_min` in the
+/// config file, and `--draft-p-min`, override it exactly as before.
 pub const DEFAULT_DRAFT_ENABLED: bool = true;
 pub const DEFAULT_DRAFT_MAX: usize = 15;
-pub const DEFAULT_DRAFT_P_MIN: f32 = 0.3;
 pub const DEFAULT_DRAFT_PAUSE_MARGIN: f32 = 1.0;
 /// Positions the drafter's KV cache is sized for, which doubles as the horizon
 /// speculation stays active over — past it decode continues plain. Shared with
@@ -339,6 +343,12 @@ pub struct DraftToml {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CliOverrides {
     pub model: Option<PathBuf>,
+    /// `--model-size`: which official checkpoint is being served. Always
+    /// present (clap defaults it), and it selects the checkpoint even when
+    /// `--model` names a GGUF by path — the same rule that picks the official
+    /// drafter sidecar. The merge reads it for the per-checkpoint `draft.p_min`
+    /// default and nothing else.
+    pub model_size: crate::hub::Model,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub context_length: Option<usize>,
@@ -832,12 +842,15 @@ pub fn resolve(
             origin,
             &mut warnings,
         ),
+        // The only default here that depends on which checkpoint is served:
+        // the drafting floor is fitted per model. Precedence is unchanged —
+        // flag over config file over this.
         draft_p_min: pick(
             "draft-p-min",
             "draft.p_min",
             cli.draft_p_min,
             file.draft.p_min,
-            DEFAULT_DRAFT_P_MIN,
+            cli.model_size.draft_p_min_default(),
             origin,
             &mut warnings,
         ),
@@ -1098,7 +1111,9 @@ pub fn init_template() -> String {
     let snapshots_mib = snapshots * snapshot_mib;
     let slots = DEFAULT_CACHE_SLOTS;
     let draft_max = DEFAULT_DRAFT_MAX;
-    let draft_p_min = format!("{:?}", DEFAULT_DRAFT_P_MIN);
+    // Per-checkpoint, like the cache sizes above: quoted for the model the
+    // template names.
+    let draft_p_min = format!("{:?}", TEMPLATE_MODEL.draft_p_min_default());
     let draft_pause_margin = format!("{:?}", DEFAULT_DRAFT_PAUSE_MARGIN);
     let draft_enabled = DEFAULT_DRAFT_ENABLED;
     let draft_ctx = DEFAULT_DRAFT_CTX;
@@ -1338,7 +1353,9 @@ max = {draft_max}
 
 # Stop drafting at the first token whose probability falls below this, so a round
 # drafts as far as the drafter is confident and no further. Adaptive length beats
-# any fixed block: 0.3 measured best across prompt kinds.
+# any fixed block. The built-in default is per checkpoint — 0.5 on the 27B, 0.3 on
+# the 35B-A3B, fitted 2026-08-08 — and the value below is the one for the model
+# this template quotes; setting the key here pins it for whichever model is served.
 p_min = {draft_p_min}
 
 # Pause speculation when its measured wall-clock cost per committed token exceeds a
@@ -1445,9 +1462,41 @@ mod tests {
         // official sidecar, named symbolically for the caller to resolve.
         assert_eq!(s.draft, Some(PathBuf::from("official")));
         assert_eq!(s.draft_max, DEFAULT_DRAFT_MAX);
-        assert_eq!(s.draft_p_min, DEFAULT_DRAFT_P_MIN);
+        // Per checkpoint, and `model_only()` leaves --model-size at its default.
+        assert_eq!(
+            s.draft_p_min,
+            crate::hub::Model::default().draft_p_min_default()
+        );
         assert_eq!(s.draft_pause_margin, DEFAULT_DRAFT_PAUSE_MARGIN);
         assert_eq!(s.draft_ctx, DEFAULT_DRAFT_CTX);
+    }
+
+    /// The drafting floor is the one drafter default that follows the
+    /// checkpoint, so serving the 27B has to reach a different value than
+    /// serving the 35B-A3B without anyone passing a flag — while a config file
+    /// that names `p_min` still wins over both.
+    #[test]
+    fn draft_p_min_defaults_per_checkpoint() {
+        use crate::hub::Model;
+
+        let for_size = |size| CliOverrides {
+            model_size: size,
+            ..model_only()
+        };
+        let (dense, _) = resolve(&ServeToml::default(), None, &for_size(Model::Qwen27B)).unwrap();
+        let (moe, _) = resolve(&ServeToml::default(), None, &for_size(Model::Qwen35BA3B)).unwrap();
+        assert_eq!(dense.draft_p_min, 0.5);
+        assert_eq!(moe.draft_p_min, 0.3);
+
+        let file: ServeToml = toml::from_str("[draft]\np_min = 0.25\n").unwrap();
+        let (pinned, warnings) = resolve(
+            &file,
+            Some(Path::new("/etc/serve.toml")),
+            &for_size(Model::Qwen27B),
+        )
+        .unwrap();
+        assert_eq!(pinned.draft_p_min, 0.25);
+        assert!(warnings.is_empty());
     }
 
     /// The drafter settings follow the same CLI-over-file-over-default precedence as

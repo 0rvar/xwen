@@ -1133,7 +1133,7 @@ pub(crate) mod testutil {
             disk_min_tokens: config::DEFAULT_DISK_MIN_TOKENS,
             draft: None,
             draft_max: config::DEFAULT_DRAFT_MAX,
-            draft_p_min: config::DEFAULT_DRAFT_P_MIN,
+            draft_p_min: crate::hub::Model::default().draft_p_min_default(),
             draft_pause_margin: config::DEFAULT_DRAFT_PAUSE_MARGIN,
             draft_ctx: config::DEFAULT_DRAFT_CTX,
         }

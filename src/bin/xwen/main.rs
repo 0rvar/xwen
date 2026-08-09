@@ -90,9 +90,10 @@ struct DraftArgs {
     #[arg(long, default_value_t = 0)]
     draft_min: usize,
     /// Stop drafting at the first token whose full-vocab softmax prob is below
-    /// this. Adaptive draft length; 0.3 measured best across prompt kinds.
-    #[arg(long, default_value_t = 0.3)]
-    draft_p_min: f32,
+    /// this. Adaptive draft length; the default is per-model — 0.5 for 27b, 0.3
+    /// for 35b, fitted 2026-08-08.
+    #[arg(long)]
+    draft_p_min: Option<f32>,
     /// Auto-pause speculation when its wall-clock cost per committed token
     /// exceeds a plain decode step's cost times this factor (keeps `--draft`
     /// from losing to plain decode on low-acceptance text). With auto-pause on,
@@ -112,11 +113,14 @@ struct DraftArgs {
 }
 
 impl DraftArgs {
-    fn params(&self) -> SpecParams {
+    /// `size` supplies the drafting floor for a run that did not pass
+    /// `--draft-p-min`: it is fitted per checkpoint, so the flag's default
+    /// cannot live on the flag itself.
+    fn params(&self, size: Model) -> SpecParams {
         SpecParams {
             draft_max: self.draft_max,
             draft_min: self.draft_min,
-            draft_p_min: self.draft_p_min,
+            draft_p_min: self.draft_p_min.unwrap_or(size.draft_p_min_default()),
             pause_margin: self.draft_pause_margin,
         }
     }
@@ -410,6 +414,9 @@ impl ServeArgs {
     fn overrides(&self) -> CliOverrides {
         CliOverrides {
             model: self.model.clone(),
+            // Not an override of any config key: the merge needs it to resolve
+            // the per-checkpoint draft.p_min default.
+            model_size: self.select.model_size,
             host: self.host.clone(),
             port: self.port,
             context_length: self.ctx,
@@ -608,7 +615,7 @@ fn build_generator(
         // 40-48 KiB/token of f32 cache for depths where drafting never pays (and
         // OOMs outright at 262k alongside the 68 GB target).
         let drafter = DflashDrafter::load(&dgguf, &device, draft.draft_ctx.min(max_ctx))?;
-        generator.attach_drafter(drafter, draft.params())?;
+        generator.attach_drafter(drafter, draft.params(size))?;
         eprintln!(
             "xwen: drafter loaded in {:.1}s",
             draft_start.elapsed().as_secs_f64()

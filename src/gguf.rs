@@ -388,12 +388,14 @@ impl QLinear {
 }
 
 /// A rank-2 quantized weight `[out_dim, in_dim]` as raw device bytes, for the
-/// vendored dense cooperative-tensor prefill gemm (`ops::matmul_dense_q`). The
-/// buffer is the SAME allocation the companion `QLinear` matmuls against — both
-/// come from one `QStorage::from_data` upload (`qlinear_with_plane`), so a plane
-/// costs no extra device memory. That matters here more than anywhere else in
-/// the loader: the 27B's FFN weights are 14 of its 19 GB, and a materialized f16
-/// copy of them would not fit at all.
+/// vendored kernels that read the GGUF layout directly: the dense
+/// cooperative-tensor prefill gemm (`ops::matmul_dense_q`) and the small-batch
+/// mat-vec (`ops::matmul_mv_ext`). The buffer is the SAME allocation the weight
+/// already lives in — one `QStorage::from_data` upload shared with the companion
+/// `QLinear` (`qlinear_with_plane`), or the attention alias's own view
+/// (`attn_proj`) — so a plane costs no extra device memory. That matters here
+/// more than anywhere else in the loader: the 27B's FFN weights are 14 of its
+/// 19 GB, and a materialized f16 copy of them would not fit at all.
 #[derive(Clone)]
 pub struct QuantPlane {
     /// The weight's quantized bytes as a raw device buffer.
@@ -478,7 +480,8 @@ pub struct ExpertStack {
 const Q8_DECODE_NR0: usize = 2;
 
 /// The raw q8_0 bytes of one attention projection weight `[out_dim, in_dim]`,
-/// as a device buffer for the vendored decode gemv (`ops::matmul_q8`). Loaded
+/// as a device buffer for the vendored decode kernels — the single-token gemv
+/// (`ops::matmul_q8`) and the small-batch mat-vec (`ops::matmul_mv_ext`). Loaded
 /// ONLY for a q8_0-attention checkpoint (the current official file — so this is
 /// the production decode path; the unsloth UD-Q4_K_XL file that motivated it is
 /// deleted); the dense f16 plane that carries the prefill/mm path lives
@@ -486,18 +489,16 @@ const Q8_DECODE_NR0: usize = 2;
 /// mapping, with `base_off` the tensor's byte offset inside the view. Classic
 /// load: a dedicated private buffer (`base_off` 0).
 pub struct AttnQ8 {
-    /// The q8_0 bytes as a raw device buffer (aliased view or private copy).
-    pub buffer: Arc<Buffer>,
-    /// Byte offset of the weight's first block inside `buffer`: 0 on the classic
-    /// path, the sub-page remainder of the tensor's file offset on the mmap path
-    /// (< page size, 32-byte aligned per GGUF data alignment). The decode gemv
-    /// dispatch binds `buffer` at this offset.
-    pub base_off: usize,
-    /// Keeps the file mapping (and its residency set) alive while `buffer`
-    /// aliases it — `MmapSource`'s lifetime invariant. `None` on the classic path.
+    /// The q8_0 bytes as a rank-2 plane over a raw device buffer (aliased view
+    /// or private copy). Both decode kernels read it through this one
+    /// description — a `QuantPlane` here is a VIEW of the bytes the gemv already
+    /// used, not a second upload, so the small-batch route costs no device
+    /// memory.
+    pub plane: QuantPlane,
+    /// Keeps the file mapping (and its residency set) alive while the plane's
+    /// buffer aliases it — `MmapSource`'s lifetime invariant. `None` on the
+    /// classic path.
     pub mmap: Option<Arc<MmapSource>>,
-    pub out_dim: usize,
-    pub in_dim: usize,
 }
 
 /// VarBuilder-shaped accessor: `w.pp("blk.0").qlinear("attn_q")` reads `blk.0.attn_q.weight`.
@@ -725,7 +726,9 @@ impl Weights {
     /// One attention projection weight `[out_dim, in_dim]`: the dense f16 plane
     /// (`dense_f16` — the prefill/mm path) plus, ONLY when the GGUF stores the
     /// weight as Q8_0, the raw q8_0 bytes as an `AttnQ8` for the vendored decode
-    /// gemv (`ops::matmul_q8`). An F16-stored weight (an f16-attention
+    /// kernels — the single-token gemv (`ops::matmul_q8`) and the small-batch
+    /// mat-vec (`ops::matmul_mv_ext`), which read the same plane. An F16-stored
+    /// weight (an f16-attention
     /// checkpoint, like the retired original) returns `None` for the q8 handle
     /// and stays on the f16 path everywhere — no extra load work.
     ///
@@ -812,11 +815,14 @@ impl Weights {
         Ok((
             f16,
             Some(AttnQ8 {
-                buffer,
-                base_off,
+                plane: QuantPlane {
+                    buffer,
+                    base_off,
+                    dtype,
+                    out_dim,
+                    in_dim,
+                },
                 mmap,
-                out_dim,
-                in_dim,
             }),
         ))
     }

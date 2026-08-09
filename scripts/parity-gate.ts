@@ -360,6 +360,13 @@ function execName(pgrepLine: string): string {
 
 /** Is this `pgrep -fl` line a process EXECUTING one of our model binaries? */
 export function isModelProcess(pgrepLine: string): boolean {
+  // A real pgrep record is "<pid> <argv0> <args...>". An argv that EMBEDS
+  // newlines (agent harnesses spawn `zsh -c "cd <repo>\n<command>"`) prints as
+  // extra lines with no pid, and a fragment like "cd <repo-path-ending-in-xwen>"
+  // would otherwise parse its second token's basename as a model binary. Only
+  // lines that lead with a pid are records; fragments belong to a record whose
+  // own first line is still checked.
+  if (!/^\d+\s/.test(pgrepLine.trim())) return false;
   return /^(logits-dump|xwen|llama-(cli|server|bench|eval-callback)|parity-[0-9a-f]+)$/.test(
     execName(pgrepLine),
   );

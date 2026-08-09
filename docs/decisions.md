@@ -375,6 +375,34 @@ one kill switch (`XWEN_MV_EXT_CLASSIC`) and one provenance field. Measured at 27
 `n_past` 512: the verify forward goes 153.44 → 61.45 ms at span 2 (0.40x) and 220.11 →
 161.16 at span 8 (0.73x); drafted decode gains +11.6% / +13.2% on the 27B (2026-08-08).
 
+EXTENDED 2026-08-08 (later the same day): **there is now a SECOND routing site,
+`Proj::DenseF16Q8`, and it is a second site rather than a second window.** The q8_0
+attention and DeltaNet projections never touch `QLinear` on the default path — they are
+dual-storage planes read by `ops::matmul_q8` — so the one-decision-point property could
+not reach them and the choice was to add a site or leave 64 layers' worth of projections
+re-reading their weights once per token. The site takes the plan from `mv_ext_window`
+verbatim and checks `mv_ext_supported`, so `XWEN_MV_EXT_CLASSIC` reverts it identically;
+what it adds is a 16-byte activation-alignment guard, because the ext kernel reads the
+activation as `float4` where the gemv reads scalars at any offset. Two asymmetries are
+deliberate and documented at the call site: `XWEN_MV_EXT_MAX_SEQ` cannot widen this site
+past 8, since the enclosing `Q8_DECODE_MAX_SEQ` arm already routes seq > 8 to the dense
+f16 plane; and the alignment guard is a silent per-call fallback that the env-derived
+`mv_ext` provenance field structurally cannot report, which is acceptable only while
+every production activation here is offset-0 — a strided caller must be preceded by
+recording what actually ran, the way the `delta` field does. Sites deliberately left
+out: `ssm_beta`/`ssm_alpha` (dense f32 `[5120,96]`, nothing to stream), the MoE routed
+experts (the `mv_id` family, already refuted at these spans), the `seq == 1` lm_head
+bypass (a strict-tier bitwise anchor), and ggml's f16 ext variant (the q8_0 alias over
+the same weight streams half the bytes, so an f16 port would be strictly worse at every
+site that has both). Measured on the 27B verify forward at `n_past` 512, interleaved
+against a HEAD binary, 5 reps/arm pooled over two sessions, medians: span 8 **175.20 →
+154.19 ms (−12.0%)**, span 6 −6.0%, span 4 −5.0%, spans 12-48 unchanged. Span 2 reads
++2.3%, but the coverage arm ran second in every pair and the same protocol reads
+pairwise medians of +1.6 to +2.3% at spans 12/16/24 where the kernel cannot run — so
+that cell is a wash rather than a regression, and flooring the window at t>=3 is
+ledgered as needing an A/B designed to separate the effect from that ordering bias
+(2026-08-08).
+
 **Two deliberate divergences from ggml's own gating, both because our fallback is worse
 than theirs.** (1) ggml restricts its K-quants to ne11 4..=8; xwen admits them from 2,
 because at spans 2-3 our alternative is the 73 GB/s `mul_mm` rather than the tuned path
@@ -391,6 +419,17 @@ tiled mm stages weight tiles as half. The oracle tests assert `rel <= rel_classi
 the path it replaced", and freezing a number would break on a legitimate kernel change.
 Worth stating next to the `dense_mm` entries above precisely because the reflex they
 install — a faster kernel costs precision — does not hold here (2026-08-08).
+QUALIFIED 2026-08-08 (later the same day): **the direction claim is about the DISPLACED
+path, so it is per-site, and at the new `Proj::DenseF16Q8` site the two paths are
+LEVEL.** What that site displaces is the vendored q8_0 gemv, which narrows nothing
+either — it multiplies raw int8 quants by an f32 delta and accumulates in f32, exactly
+as this kernel does — so both sit at ~1e-6 and their ratio is pure reduction-order
+noise, measured within 1-2% of each other with the better one varying by shape. Hence a
+separate test constant: `GEMV_MULTIPLE` 2.0 rather than `CLASSIC_MULTIPLE` 1.0. The 2x
+band is wide enough not to grade noise and narrow enough that an f16 staging path
+creeping in (~1e-4, two orders out) still fails. "Never the further from exact" is
+therefore true at the `QLinear` sites and not a property of the kernel; the `mv_ext`
+provenance doc-comment in `tests/parity.rs` was corrected to say so.
 
 **Provenance treatment mirrors `dense_mm`, even though the gate cannot exercise this
 kernel.** `mv_ext` at schema v8, grandfather `classic`, pinned classic on both sides of
@@ -591,6 +630,43 @@ is attached — a drafter whose cache falls out of step can never resume specula
 (`drafter_span_rows` returns 0) — so the only fixes are to make it cheaper (it is
 dispatch-bound, like the pre-fusion MoE glue) or to let the controller detach entirely
 rather than merely pause. Both are ledgered under TODO.md P9 (2026-07-29).
+
+**`draft_p_min` is PER-CHECKPOINT — 0.5 on the 27B, 0.3 on the 35B-A3B — while
+`pause_margin` stays a single shared 1.0.** Both were fitted together on 2026-08-08 by
+two independent 120-run sweeps of `scripts/retune-draft.ts`, and they came out shaped
+differently, which is why one knob moved home and the other did not. The 27B's target
+forward is expensive, so it wants short, confident drafts: at 0.5 its chat prompt stops
+pausing entirely (13-18 paused rounds at 0.2/0.3 → 0), acceptance goes 57% → 78%, and
+mean-of-medians reads 37.3 / 37.2 tok/s against 33.0 / 33.5 at the shipped 0.3 — +46-52%
+over plain. The 35B-A3B's forward is cheap enough that drafting deeper at lower
+acceptance still pays, and 0.5 costs it ~2.5% (125.2-125.3 against 127.9-128.4 at 0.3).
+Both winners replicated across both runs. A single shared value would therefore have to
+pick which checkpoint to be wrong for, so the default moved to
+`Model::draft_p_min_default()` in `src/hub.rs` — one const arm per checkpoint, resolved
+by the CLI (`DraftArgs.draft_p_min` is now `Option<f32>`) and by serve's merge (via
+`CliOverrides.model_size`); `DEFAULT_DRAFT_P_MIN` is gone and `SpecParams::default()` is
+documented as a base every real caller overwrites. `pause_margin` did NOT earn the same
+treatment: 1.0 wins both 35B runs outright, and on the 27B at p_min 0.5 the margin is a
+wash — 1.0 and 1.2 within 0.1 tok/s in both runs, and the two runs' nominal winners
+disagree while spanning ~0.5 tok/s — because a controller that never pauses is
+insensitive to its pause threshold. Note this is the FIRST time `pause_margin` was
+actually swept; P9 validated 1.0 only against 0.0. Two tests pin the split
+(`hub::tests::the_drafting_floor_is_per_checkpoint`,
+`serve::config::tests::draft_p_min_defaults_per_checkpoint`), and the sweep script's
+`SHIPPED_P_MIN` table must be edited alongside `hub.rs` or the next sweep grades against
+a status quo that no longer ships (2026-08-08).
+
+**The pause machinery is not free even in a regime where it never pauses, and the two
+prompt kinds pay for it differently.** The `m=0` never-pause arm is a permanent
+diagnostic in stage 2 for this reason. On the 27B at p_min 0.5 it is simultaneously the
+fastest code cell in either sweep (medians 39.7 / 40.5 tok/s, ahead of the shipped 1.0's
+37.9 / 38.2) and the slowest drafted chat cell (34.3 / 35.2 against 37.1 / 37.4). The
+mechanism is the forced plain round every 32 that margin > 0 schedules to keep the
+controller's cost EMA fresh: removing those rounds changes the drafter's round alignment
+enough to move chat acceptance from 78% to 73.5%. So m=0 is not a candidate value — it
+trades a prompt kind against another rather than being uniformly better — but it stays
+in the grid because the asymmetry it exposes is the only direct read on what the pause
+apparatus costs when it is not pausing (2026-08-08).
 
 **Speculative decoding's batching win does not currently exist in the DeltaNet layers, and
 that is the ceiling on P9.** **SUPERSEDED 2026-07-29 (P9a, same day)** — the K-snapshot
@@ -940,6 +1016,16 @@ broken when the target is simply invisible. Pick a probe target you can independ
 confirm is running and visible — `bun` works here. A guard whose failure mode is a
 concurrent 20 GB load deserves both halves tested against real processes, permissive
 and restrictive, not just its matcher unit-tested (2026-07-28).
+EXTENDED 2026-08-08: **filtering on `argv[0]` is only correct if you first establish
+which lines ARE records.** `pgrep -fl` prints one record per line as `<pid> <argv0>
+<args…>`, but an argv that embeds newlines prints as extra lines carrying no pid — and
+agent harnesses produce exactly that, wrapping commands as `zsh -c "cd <repo>\n<cmd>"`.
+The continuation line `cd /Users/…/xwen` then has `xwen` as its second token, which
+`execName` reads as argv0, and the guard aborted both parity gates over a model process
+that did not exist. The fix is one predicate ahead of the matcher: a line is a record
+only if it leads with a pid, and fragments are dropped because the record they belong to
+is checked on its own first line anyway. Same lesson one level down from the original —
+the matcher was right and the tokenization under it was not.
 
 **Per-stage forward timing is done IN SITU, by device sync, and only its
 length-DIFFERENTIALS may be read as measurements.** `src/stack_profile.rs`
@@ -975,6 +1061,26 @@ plain `--no-draft` generation (the speculative and server paths accumulate corre
 print no dumps), and with the variable unset the cost at each instrumented site is one
 `Option` check. `XWEN_STACK_PROFILE` and `XWEN_CHUNK_SYNC` are both stripped in
 `parity-gate.ts`'s `baseEnv()` (2026-08-08).
+
+**Retuning the drafting controller is a scripted protocol now, `scripts/retune-draft.ts`,
+and its load-bearing rule is that NO cell is reused between stages.** The constants have
+now been wrong about three successive cost curves (P9's reference scan, P9a's
+fixed-cost-dominated verify, and the post-`mul_mv_ext` one), so the protocol is a script
+rather than a procedure someone re-derives from the last log entry. The shape: stage 1 sweeps `draft_p_min` at the shipped margin, stage
+2 sweeps `pause_margin` at stage 1's winner, both against a plain `--no-draft` baseline
+arm, rep-outermost interleave, greedy `-n 128` under `XWEN_BENCH=1`, 3 reps, medians.
+The qualification criterion is P9's and is preserved deliberately: an arm qualifies only
+if it is ahead of plain's median on BOTH prompt kinds in EVERY rep, the winner is the
+highest mean-of-medians among qualifiers, and a tie resolves toward the shipped value.
+The no-reuse rule is the part that is easy to get wrong: carrying stage 1's measurement
+of the shipped margin into stage 2 looks like a free saving and is the interleaving
+error one level up — it grades two arms from different thermal epochs. Every stage-2 arm
+is re-measured. Supporting requirements, each of which a review found missing: cell
+identities must not collide under rounding, the child env is clean with the HF cache
+root resolved once to an absolute path and `HF_TOKEN` never passed down or serialized,
+there is a contention guard and a per-run timeout, and the raw JSON dump is written 0600
+and atomically after every run so a sweep that dies mid-way still yields its data. The
+script prints recommendations and never edits a default (2026-08-08).
 
 **A warm-up pass that reads faster than the timed pass following it is a thermal
 ordering artifact, not evidence.** The warm-up runs on the cooler chip. This looked like

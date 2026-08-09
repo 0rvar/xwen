@@ -454,8 +454,9 @@ layer at all — on that checkpoint `dense_mm` labels the configured path, not a
 executed one, exactly as `flash` does below.
 
 **`mv_ext` is pinned even though no gate fixture can exercise it, and the reason is
-worth writing down.** The vendored multi-row mat-vec (`src/ops/mv_ext.metal`,
-`QLinear::forward` at seq 2..=8) never runs during a gate: prefill chunks are 512 tokens
+worth writing down.** The vendored multi-row mat-vec (`src/ops/mv_ext.metal`, routed at
+seq 2..=8 from `QLinear::forward` and, since 2026-08-08, from `Proj::DenseF16Q8` for the
+q8_0 attention and DeltaNet projections) never runs during a gate: prefill chunks are 512 tokens
 and decode is a single token, so no fixture produces a forward inside the window. The
 tiers are structurally blind to this kernel, and its correctness claim rests entirely on
 the `mv_ext.rs` oracle tests against `QTensor::dequantize` at production reduction
@@ -465,10 +466,14 @@ version 8 with grandfather `classic` (no pre-v8 binary had the kernel), so cache
 references stay valid. Three reasons the pin earns its place despite the blindness: it
 costs nothing, it becomes load-bearing the moment a fixture or a serve path does enter
 the window, and a dump that cannot say which path produced it is worth less than one
-that can. Note the accuracy direction is the opposite of `dense_mm`'s — this kernel is
-f32 end to end and lands 4e-7..8e-6 rel_l2 against the `QMatMul` mm's ~1.8e-4, 20-400x
-BETTER — so the pin is provenance discipline rather than a bounded-kernel guard, and the
-oracle tests assert `rel <= rel_classic` rather than an absolute band.
+that can. Note the accuracy direction depends on which path a site displaces, so it is
+not a property of the kernel. Against the `QMatMul` mm at the `QLinear` sites this kernel
+is the opposite of `dense_mm` — f32 end to end, 4e-7..8e-6 rel_l2 against ~1.8e-4, 20-400x
+BETTER, and the oracle tests assert `rel <= rel_classic` rather than an absolute band.
+Against the vendored q8_0 gemv at the `Proj` sites the two are LEVEL (both ~1e-6, within
+1-2% of each other, the better one varying by shape), which is why that comparison gets
+its own 2x band. Either way the pin is provenance discipline rather than a bounded-kernel
+guard.
 
 **`flash: "fused"` is currently a provenance label, not a fact, on these
 checkpoints.** The field is env-derived, and `flash.metal` is compiled at head dim

@@ -146,6 +146,30 @@ impl Model {
         self.checkpoint().drafter_size
     }
 
+    /// The drafting confidence floor (`--draft-p-min`) this checkpoint decodes
+    /// fastest at: a round stops proposing at the first drafter token whose
+    /// full-vocab probability falls below it, so a higher floor drafts shorter
+    /// at higher acceptance.
+    ///
+    /// The two checkpoints sit at different points on that trade, which is why
+    /// this is per-model rather than one shipped constant. Fitted 2026-08-08 by
+    /// two independent 120-run sweeps (`scripts/retune-draft.ts`) that picked
+    /// the same winner each time: 0.5 on the 27B — 37.2-37.3 tok/s
+    /// mean-of-medians against 33.0-33.5 at 0.3, where the shorter drafts run
+    /// 78-86% acceptance and the chat prompt stops auto-pausing altogether —
+    /// and 0.3 on the 35B-A3B, whose cheaper target forward still profits from
+    /// drafting deeper at lower acceptance. `pause_margin` was swept alongside
+    /// and stayed a shared 1.0.
+    ///
+    /// This is the default only: `--draft-p-min` and the serve config's
+    /// `draft.p_min` override it as before.
+    pub const fn draft_p_min_default(self) -> f32 {
+        match self {
+            Model::Qwen27B => 0.5,
+            Model::Qwen35BA3B => 0.3,
+        }
+    }
+
     /// Bytes of KV cache one more token of context costs.
     ///
     /// Only the full-attention layers grow with context; the DeltaNet layers
@@ -351,6 +375,15 @@ mod tests {
             Model::Qwen27B.draft_kv_bytes_per_token()
                 < Model::Qwen35BA3B.draft_kv_bytes_per_token()
         );
+    }
+
+    /// The fitted drafting floors, pinned so changing either one is a deliberate
+    /// act with a sweep behind it — these are the values `--draft-p-min` and the
+    /// serve config fall back to, and they came out of the 2026-08-08 retune.
+    #[test]
+    fn the_drafting_floor_is_per_checkpoint() {
+        assert_eq!(Model::Qwen27B.draft_p_min_default(), 0.5);
+        assert_eq!(Model::Qwen35BA3B.draft_p_min_default(), 0.3);
     }
 
     fn scratch(label: &str) -> PathBuf {

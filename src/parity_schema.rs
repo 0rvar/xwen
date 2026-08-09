@@ -76,10 +76,12 @@ pub struct ProvenanceField {
 /// under XWEN_MV_EXT_CLASSIC). Grandfather "classic": no pre-v8 binary had the
 /// kernels at all, which is also what the oracle runs. Load-bearing like
 /// `delta` and `dense_mm` — it is not bit-identical to what it replaces (a
-/// different K-reduction order) — though it differs from both in DIRECTION: it
-/// is the more accurate of the two paths, sitting ~1e-6 from the f32 oracle
-/// where candle's half-staged `mul_mm` sits ~1.8e-4. Closer is still different,
-/// so the pin is the same. Env-derived, like `dense_mm`.
+/// different K-reduction order) — though it differs from both in DIRECTION:
+/// nothing is narrowed, so it sits ~1e-6 from the f32 oracle, either better than
+/// the displaced path (candle's half-staged `mul_mm`, ~1.8e-4, at the `QLinear`
+/// sites) or level with it (the vendored q8_0 gemv, also ~1e-6, at the attention
+/// and DeltaNet projections). Neither is bit-identical, so the pin is the same.
+/// Env-derived, like `dense_mm`.
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_impl",

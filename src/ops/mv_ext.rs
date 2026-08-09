@@ -163,6 +163,19 @@ mod tests {
     /// parity with `QMatMul` would mean an f16 staging path had crept back in.
     const CLASSIC_MULTIPLE: f32 = 1.0;
 
+    /// The same accuracy-direction assert against the OTHER path this kernel
+    /// displaces: the vendored q8_0 gemv (`ops::matmul_q8`) at the attention
+    /// projections. That comparison cannot be made at 1.0 the way the `QMatMul`
+    /// one is: the gemv narrows nothing either — it multiplies the raw int8
+    /// quants by their f32 delta and accumulates in f32, exactly as this kernel
+    /// does — so the two sit in the same class and their ratio is pure
+    /// reduction-order noise. A 2x band is wide enough that which one rounds
+    /// better at a given shape does not matter, and narrow enough to catch a
+    /// real precision regression, which would show up as the
+    /// ~1e-4 of an f16 staging path (two orders out from the ~1e-6 both sit at).
+    /// Measured, the two are within 2% of each other at every shape below.
+    const GEMV_MULTIPLE: f32 = 2.0;
+
     /// Every dtype x every r1ptg width, at production reduction lengths, graded
     /// against the dequantize-then-f32 oracle and alongside `QMatMul` over the
     /// SAME quantized bytes. The pair is the load-bearing correctness link:
@@ -212,6 +225,67 @@ mod tests {
                         rel / rel_classic
                     );
                 }
+            }
+        }
+    }
+
+    /// The q8_0 attention and DeltaNet projections (`Proj::DenseF16Q8`) at their
+    /// production shapes, graded against the same f32 oracle as above AND against
+    /// `ops::matmul_q8` — the vendored gemv this window displaces at those sites,
+    /// which reads the identical q8_0 bytes once per token.
+    ///
+    /// Shapes are the real `[out_dim, in_dim]` pairs of both checkpoints, named
+    /// by the projections that carry them. The widest out dims (27B `attn_q`
+    /// 12288x5120 and `attn_qkv` 10240x5120, 35B `attn_q` 8192x2048) are left out
+    /// as duplicates of cost, not of coverage: out_dim only scales the grid's row
+    /// axis, which the ragged-row test already walks, while `in_dim` is what the
+    /// kernel's chunk walk depends on and every distinct one appears here.
+    #[test]
+    fn mv_ext_q8_matches_the_gemv_it_replaces_at_projection_shapes() {
+        let device = metal_device().unwrap();
+        // (out_dim, in_dim, the projections shipping that shape)
+        const PROJECTIONS: [(usize, usize, &str); 5] = [
+            (1024, 5120, "27B attn_k / attn_v"),
+            (5120, 6144, "27B attn_output / ssm_out"),
+            (512, 2048, "35B attn_k / attn_v"),
+            (8192, 2048, "35B attn_qkv"),
+            (2048, 4096, "35B attn_output / ssm_out"),
+        ];
+        // Bottom, middle and top of the shipped window (r1_2, r1_5, and r1_4
+        // over two threadgroups).
+        const TOKENS: [usize; 3] = [2, 5, 8];
+
+        for (n_out, k, what) in PROJECTIONS {
+            let (plane, qt) = build_plane(&device, GgmlDType::Q8_0, n_out, k, 0xF10 + n_out as u64);
+            for t in TOKENS {
+                let x = Tensor::from_vec(
+                    pseudo_random(t * k, 0x1010 + (n_out + t) as u64, -1.0, 1.0),
+                    (t, k),
+                    &device,
+                )
+                .unwrap();
+
+                let want = oracle(&qt, &x);
+                let got = flat(&matmul_mv_ext(&plane, &x, plan(t)).unwrap());
+                let gemv = flat(
+                    &crate::ops::matmul_q8(&plane.buffer, plane.base_off, n_out, k, &x).unwrap(),
+                );
+                let (rel, rel_gemv) = (rel_l2(&got, &want), rel_l2(&gemv, &want));
+                eprintln!(
+                    "mv_ext q8_0 [{n_out}x{k}] ({what}) t={t}: vs oracle {rel:.3e}  \
+                     gemv vs oracle {rel_gemv:.3e}"
+                );
+                assert!(
+                    rel < TOL,
+                    "mv_ext q8_0 vs oracle [{n_out}x{k}] t={t}: rel_l2 {rel} (max_abs {})",
+                    max_abs(&got, &want)
+                );
+                assert!(
+                    rel <= rel_gemv * GEMV_MULTIPLE,
+                    "mv_ext q8_0 is {:.1}x further from exact than the gemv it \
+                     replaces [{n_out}x{k}] t={t} ({rel} vs {rel_gemv})",
+                    rel / rel_gemv
+                );
             }
         }
     }

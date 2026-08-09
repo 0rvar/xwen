@@ -124,7 +124,8 @@ pub struct SpecParams {
     /// (`--draft-min`).
     pub draft_min: usize,
     /// Stop collecting drafts at the first drafter token whose full-vocab softmax
-    /// probability falls below this (`--draft-p-min`).
+    /// probability falls below this (`--draft-p-min`). The shipped default is
+    /// per-checkpoint — see [`crate::hub::Model::draft_p_min_default`].
     pub draft_p_min: f32,
     /// Auto-pause margin (`--draft-pause-margin`). Speculation pauses when its
     /// measured wall-clock cost per committed token exceeds a plain decode
@@ -133,24 +134,25 @@ pub struct SpecParams {
     pub pause_margin: f32,
 }
 
+/// A base for callers that fill the tuned knobs in themselves. Every path that
+/// actually speculates reaches the drafter through
+/// [`Generator::attach_drafter`], which replaces these wholesale with params
+/// built from the CLI flags or the serve config — and both of those resolve
+/// `draft_p_min` against the checkpoint
+/// ([`crate::hub::Model::draft_p_min_default`]), which this struct cannot see.
+/// What is left here is the 35B-A3B's floor, so a caller that overrides only
+/// some fields lands on a measured setting rather than an extreme one.
 impl Default for SpecParams {
     fn default() -> Self {
         // Adaptive draft length beats any fixed draft_max: a full fixed block
-        // spends the whole round verifying a tail that gets rejected. p_min 0.3
-        // measured best of {0.2, 0.3, 0.5, 0.7, 0.9} on the Qwen sidecars
-        // (2026-07-29, 27B, interleaved arms, greedy): it is the only setting
-        // that came out ahead of plain decode on BOTH a code prompt and a chat
-        // prompt in every run, where 0.5 lost on chat twice. Lower p_min drafts
-        // longer at lower acceptance, and that wins here because the verify
-        // forward's cost is close to linear in its span — the DeltaNet layers
-        // fall back to the per-token reference scan under an armed rollback
-        // trail, so a long span amortizes the round's fixed cost without the
-        // usual batching penalty. Revisit when the fused verify lands (TODO P9):
-        // it changes the cost curve this was fitted to.
+        // spends the whole round verifying a tail that gets rejected. Where the
+        // floor sits is a per-checkpoint call — the 27B pays much more per
+        // target forward and wants shorter, more confident drafts — so the
+        // values themselves live on `hub::Model`.
         Self {
             draft_max: 15,
             draft_min: 0,
-            draft_p_min: 0.3,
+            draft_p_min: crate::hub::Model::Qwen35BA3B.draft_p_min_default(),
             pause_margin: 1.0,
         }
     }

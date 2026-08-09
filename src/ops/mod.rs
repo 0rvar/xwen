@@ -206,11 +206,13 @@ pub(crate) fn mv_ext_plan(seq: usize) -> usize {
 }
 
 /// `XWEN_MV_EXT_CLASSIC=1` reverts every small-batch routing decision — the
-/// dense FFN below the dense-mm threshold, the q8_0 `QLinear` projections, and
-/// the lm_head — from the vendored `mul_mv_ext` kernels (`ops::matmul_mv_ext`,
-/// mv_ext.metal) back to the path each site had before: candle's `QMatMul`
-/// (which runs its `mul_mm` branch at these token counts), or the plain
-/// vendored gemv where that was already in use.
+/// dense FFN below the dense-mm threshold, the q8_0 `QLinear` projections, the
+/// lm_head, and the q8_0 attention/DeltaNet projections (`Proj::DenseF16Q8`,
+/// which covers attn_q/k/v/output, attn_qkv, attn_gate and ssm_out) — from the
+/// vendored `mul_mv_ext` kernels (`ops::matmul_mv_ext`, mv_ext.metal) back to
+/// the path each site had before: candle's `QMatMul` (which runs its `mul_mm`
+/// branch at these token counts), or the plain vendored gemv where that was
+/// already in use.
 ///
 /// Like `XWEN_DENSE_MM_CLASSIC` and `XWEN_DELTA_CLASSIC`, and unlike the
 /// combine/act/glue switches, this is NOT a bit-identity anchor: the kernel

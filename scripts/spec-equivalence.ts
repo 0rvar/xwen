@@ -40,6 +40,7 @@
 
 import { mkdirSync, writeFileSync, statSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { DRAFT_PROMPTS } from "./lib/draft-prompts";
 
 const repo = dirname(import.meta.dir);
 const args = process.argv.slice(2);
@@ -57,15 +58,10 @@ const temp = opt("temp", "0.8");
 const outDir = opt("out-dir", "/tmp/xwen-spec-equivalence");
 mkdirSync(outDir, { recursive: true });
 
-const prompts: Record<string, string> = {
-  code:
-    "Write a Rust function `fn merge_sorted(a: &[i32], b: &[i32]) -> Vec<i32>` that merges two " +
-    "sorted slices into one sorted Vec, then write unit tests for it covering the empty, " +
-    "disjoint, and interleaved cases. Show the complete code.",
-  chat:
-    "Explain to a curious teenager why the sky is blue during the day but red at sunset. " +
-    "Use an analogy they would find memorable, and mention what would be different on Mars.",
-};
+// Shared with scripts/retune-draft.ts: both harnesses have to exercise the same
+// two prompt kinds, and the tuning one compares against numbers recorded from
+// these exact strings.
+const prompts = DRAFT_PROMPTS;
 
 function guardNoModelProcess() {
   const proc = Bun.spawnSync([

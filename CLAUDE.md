@@ -164,16 +164,23 @@ kernel-vs-reference invariants and is the fast pre-check.
 
 ## Perf state
 
-As of 2026-07-29 (`lowpowermode 0` — NOT low-power mode; this machine emits no
+As of 2026-08-08 (`lowpowermode 0` — NOT low-power mode; this machine emits no
 `powermode` key, so high-power mode is never positively confirmable and must not
-be claimed. Interleaved protocol, --no-draft; full history in log.md): 35B-A3B
-decode 103.1 tok/s, prefill ~1900-2550@4k; 27B decode 22-25, prefill 702@925 /
-445@4k. Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run adds ~9s
-of Metal pipeline compilation. With drafting (the default since P9a, same day):
-35B decode 118-127 tok/s (+13-20%), 27B 26-30 (+8-21%), code prompts at the top
-of each range; `--no-draft` reproduces the plain numbers above.
+be claimed. Interleaved protocol; full history in log.md). Plain (--no-draft),
+measured inside the 2026-08-08 sweeps: 35B-A3B decode 104-107 tok/s, 27B 24.8-25.3.
+Prefill unchanged since 2026-07-29 and not re-measured: 35B ~1900-2550@4k; 27B
+702@925 / 445@4k. Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run
+adds ~9s of Metal pipeline compilation. With drafting (the default since P9a) at
+the per-model defaults fitted 2026-08-08: **27B 37.5-38.2 code / 36.8-37.4 chat**
+(+46-52% over plain), **35B 133.6-134.8 code / 122.3-123.7 chat** (+26-28% / +15-17%).
+Ranges span the four medians the shipped configuration was measured at (both stages
+of both sweeps).
+Those drafted figures are WITHIN-SWEEP against the plain arm of the same sweep;
+do not difference them against a drafted number from another session — the 27B's
+between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 reads
+36.5-37.6 in today's own 0.3 arm.
 
-**The 27B prefill gap is CLOSED (P8c, same day).** It was never the DeltaNet
+**The 27B prefill gap is CLOSED (P8c, 2026-07-29).** It was never the DeltaNet
 scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill
 wall) running candle's `kernel_mul_mm_q4_K_f32` at ~12-13 TFLOP/s where the
 Metal-4 cooperative-tensor gemm does 28-36. `src/ops/dense_mm.metal` (Q4_K
@@ -209,10 +216,18 @@ loads the sidecar (3.5 GB 27B / 0.8 GB 35B). Sidecar facts (arch `dflash`; 27B: 
 layers, sliding_window 2048, taps [2,17,32,47,62], mask 248070; 35B: 6 layers,
 sliding_window 4096, taps [2,7,12,17,23,28,33,38], mask 248077; both block_size 16,
 fc.weight over concatenated tapped layer outputs, own ffn_norm, q/k-norms [128]).
-Acceptance 85-95%. Verify-walk rollback uses the fused scan's K-snapshot planes
-(most-recent-first, llama.cpp's shape; decisions.md "Model math"). `p_min` 0.3 /
-`pause_margin` 1.0 are fitted to the RETIRED reference-scan cost curve — retune is
-ledgered (TODO.md "Deferred from the K-snapshot verify pass").
+Verify-walk rollback uses the fused scan's K-snapshot planes
+(most-recent-first, llama.cpp's shape; decisions.md "Model math").
+
+Controller constants, RETUNED 2026-08-08 (the retune ledger item is closed): `p_min` is
+PER-MODEL via `Model::draft_p_min_default()` in src/hub.rs — **0.5 on the 27B, 0.3 on
+the 35B-A3B** — and `pause_margin` stays a shared 1.0, now confirmed by its first real
+sweep rather than assumed. Acceptance at those defaults is 78-86% (27B) / 68-74% (35B);
+the older "85-95%" figure was measured at other `p_min` values and does not describe the
+shipped default. The standing retune tool is `bun scripts/retune-draft.ts` (two-stage,
+no cell reuse between stages, P9's qualification criterion, print-only) — if you change
+`hub.rs`'s arms you must also update the script's `SHIPPED_P_MIN` table, or the next
+sweep grades against a status quo that no longer ships.
 
 ## serve (INHERITED, needs template adaptation)
 

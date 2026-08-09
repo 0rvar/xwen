@@ -35,11 +35,20 @@ Default checkpoints: `ggml-org/Qwen3.6-27B-GGUF` and `ggml-org/Qwen3.6-35B-A3B-G
 DFlash drafter sidecars ship alongside both checkpoints and are adapted. It is
 **opt-out** as of 2026-07-29: a zero-flag run speculates with the checkpoint's official
 sidecar, `--no-draft` decodes plain, and `--draft <gguf>` swaps in a custom drafter.
-Once the K-snapshot fused verify landed, drafting measured faster on both checkpoints —
-27B +19.3 to +21.0% on code and +7.6 to +8.4% on chat, 35B-A3B +18.1 to +19.8% on code
-and +12.6 to +12.8% on chat (greedy, 128 tokens, warm). Acceptance is 85-95% on both.
-The default costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the 35B-A3B). See
-docs/decisions.md "Speculative decoding".
+At the defaults fitted 2026-08-08, drafting measured +46 to +52% on the 27B (both prompt
+kinds) and +26 to +28% on code / +15 to +17% on chat on the 35B-A3B, over plain decode
+on the same machine state (greedy, 128 tokens, warm, medians of 3 reps, two independent
+runs). Acceptance at those defaults is 78-86% on the 27B and 68-74% on the 35B-A3B; it
+trades against draft length, so raising `--draft-p-min` buys acceptance and loses tok/s.
+The default costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the 35B-A3B).
+
+**`--draft-p-min` has a per-checkpoint default: 0.5 on the 27B, 0.3 on the 35B-A3B**
+(`Model::draft_p_min_default`). The 27B's target forward is expensive, so it wants short
+confident drafts; the 35B-A3B's is cheap enough to profit from drafting deeper at lower
+acceptance, and 0.5 costs it ~2.5%. Passing the flag, or `draft.p_min` in a serve
+config, overrides it as before. `--draft-pause-margin` stays a single 1.0 for both.
+`bun scripts/retune-draft.ts` re-fits both knobs and prints recommendations; it never
+edits a default. See docs/decisions.md "Speculative decoding".
 
 `--draft` should reproduce `--no-draft`; `bun scripts/spec-equivalence.ts` checks that on
 both models in two modes — greedy, and sampled at a fixed seed (the only one that can

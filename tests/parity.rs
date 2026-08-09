@@ -270,17 +270,21 @@ struct Provenance {
     /// on the 35B-A3B too even though that checkpoint has no dense FFN layer.
     dense_mm: Option<String>,
     /// Small-batch (2..=8 token) matmul window: "fused" (the vendored
-    /// `mul_mv_ext` kernels, the Metal default) or "classic" (the QMatMul path
-    /// each routing site had before, `XWEN_MV_EXT_CLASSIC`, which the oracle and
+    /// `mul_mv_ext` kernels, the Metal default) or "classic" (the path each
+    /// routing site had before — candle's `QMatMul`, or the vendored q8_0 gemv
+    /// at the attention and DeltaNet projections — under
+    /// `XWEN_MV_EXT_CLASSIC`, which the oracle and
     /// the strict candidate both run). Introduced at schema version 8 with
     /// grandfather "classic" — no earlier binary had the kernels at all, so a
     /// v1..v7 dump missing the field resolves to "classic"; missing at v8+ is
     /// the stale-binary hard fail. Load-bearing like `dense_mm`: the kernel
     /// reduces K in a different order and so is bounded-close rather than
     /// bit-identical, and a reference dump that ran it would grade the fused
-    /// path against itself. It differs from its siblings only in direction —
-    /// nothing is narrowed, so it is the CLOSER of the two paths to exact —
-    /// which is irrelevant to the pin: the oracle has to be one fixed path.
+    /// path against itself. Accuracy direction varies by site — against
+    /// `QMatMul` (which stages through f16) the fused kernel is strictly
+    /// closer to exact; against the q8_0 gemv (which narrows nothing either)
+    /// the two are level, reduction-order noise apart — and either way it is
+    /// irrelevant to the pin: the oracle has to be one fixed path.
     mv_ext: Option<String>,
 }
 

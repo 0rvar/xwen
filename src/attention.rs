@@ -8,13 +8,15 @@ use crate::gguf::{AttnQ8, QLinear, Weights};
 use crate::kv_cache::{LayerCache, MaskKind};
 use crate::rope::Rope;
 
-/// Token count up to and including which a q8_0-stored attention projection runs
-/// the vendored q8_0 decode gemv (`ops::matmul_q8`); above it the dense f16
-/// plane's `matmul_f16` runs the tiled gemm. Set to the f16 path's own mv/mm
-/// break-even so the q8 gemv covers the ENTIRE gemv range (the f16 plane would
-/// otherwise run its own gemv over double the bytes for seq 1..=8) and the f16
-/// gemm takes over exactly where tiling wins — decode and short verify spans take
-/// the q8 gemv, prefill takes the f16 tensor gemm.
+/// Token count up to and including which a q8_0-stored attention projection
+/// reads its raw q8_0 bytes (the single-token gemv `ops::matmul_q8`, or the
+/// small-batch mat-vec `ops::matmul_mv_ext` over the same plane where
+/// `ops::mv_ext_window` admits the count); above it the dense f16 plane's
+/// `matmul_f16` runs the tiled gemm. Set to the f16 path's own mv/mm break-even
+/// so the q8 bytes cover the ENTIRE gemv range (the f16 plane would otherwise
+/// run its own gemv over double the bytes for seq 1..=8) and the f16 gemm takes
+/// over exactly where tiling wins — decode and short verify spans take the q8
+/// path, prefill takes the f16 tensor gemm.
 const Q8_DECODE_MAX_SEQ: usize = 8;
 
 /// The prefill attention mask, built once per forward and shared across every
@@ -98,10 +100,13 @@ pub(crate) enum Proj {
     /// A q8_0-stored attention weight (the current official checkpoint — the
     /// production default; introduced for the since-deleted unsloth UD file): the
     /// dequantized f16 dense plane consumed by the prefill/mm path (byte-identical
-    /// to `DenseF16`) PLUS the raw q8_0 bytes consumed by the decode gemv
-    /// (`ops::matmul_q8`) at seq <= 8. The stored q8_0 weights are the only
-    /// quantized values in the decode chain (no activation/output rounding), at
-    /// ~half the decode bandwidth of streaming the f16 plane.
+    /// to `DenseF16`) PLUS the raw q8_0 bytes consumed at seq <= 8 by the decode
+    /// gemv (`ops::matmul_q8`, one weight pass per token) and, over the same
+    /// plane, by the small-batch mat-vec (`ops::matmul_mv_ext`, one weight pass
+    /// for the whole batch) wherever `ops::mv_ext_window` admits the token count.
+    /// The stored q8_0 weights are the only quantized values in the decode chain
+    /// (no activation/output rounding), at ~half the decode bandwidth of
+    /// streaming the f16 plane.
     DenseF16Q8 {
         f16: Tensor,
         q8: AttnQ8,
@@ -134,7 +139,37 @@ impl Proj {
             Proj::DenseF16Q8 { f16, q8 } => {
                 let seq = x.dim(0)?;
                 if seq <= Q8_DECODE_MAX_SEQ && !crate::ops::attn_dequant() {
-                    crate::ops::matmul_q8(&q8.buffer, q8.base_off, q8.out_dim, q8.in_dim, x)
+                    let p = &q8.plane;
+                    // Small-batch window: one weight pass serves the whole token
+                    // batch over the SAME q8_0 bytes the single-token gemv reads,
+                    // where the gemv re-reads the entire weight once per token.
+                    // The plan comes from `mv_ext_window` and is threaded through
+                    // verbatim, so `XWEN_MV_EXT_CLASSIC` reverts this site exactly
+                    // as it reverts the `QLinear` ones. `XWEN_MV_EXT_MAX_SEQ` is
+                    // narrower here: the outer `Q8_DECODE_MAX_SEQ` arm has already
+                    // routed seq > 8 to the dense f16 plane, so raising the window
+                    // past 8 widens the `QLinear` sites but not this one — at this
+                    // site the knob's effective range is capped at 8.
+                    // The small-batch kernel reads the activation as
+                    // float4/float4x4, which Metal requires 16-byte aligned,
+                    // while the gemv reads scalars and takes any offset — so a
+                    // view the kernel could not read keeps the gemv. Every
+                    // activation reaching this window today is offset-0, and the
+                    // `mv_ext` provenance field is env-derived and cannot see a
+                    // per-call fallback: if a strided view ever starts landing
+                    // here, this guard would quietly stamp "fused" provenance on
+                    // gemv rounds — record what ran (as the `delta` field does)
+                    // before letting that happen.
+                    if let Some(r1ptg) = crate::ops::mv_ext_window(seq)
+                        && crate::ops::mv_ext_supported(p.dtype, p.in_dim)
+                        && x.layout()
+                            .start_offset()
+                            .is_multiple_of(16 / DType::F32.size_in_bytes())
+                    {
+                        crate::ops::matmul_mv_ext(p, x, r1ptg)
+                    } else {
+                        crate::ops::matmul_q8(&p.buffer, p.base_off, p.out_dim, p.in_dim, x)
+                    }
                 } else {
                     // Prefill (and XWEN_ATTN_DEQUANT): the dense f16 plane, the
                     // path an f16-attention checkpoint always takes.
@@ -885,6 +920,114 @@ mod tests {
             "Metal sdpa diverged from the CPU reference by {}",
             max_abs_diff(&out_cpu, &out_metal)
         );
+    }
+
+    /// A q8_0-stored projection sends each token count to the kernel that owns
+    /// it: the single-token gemv at seq 1, the vendored small-batch mat-vec
+    /// across the whole `ops::mv_ext_window`, and the dense f16 plane above
+    /// `Q8_DECODE_MAX_SEQ`. Asserted BITWISE against a direct call to the kernel
+    /// each range should reach, which is what makes it a routing test rather
+    /// than another accuracy one — the three paths differ in the last ulps, so
+    /// only the one that actually ran reproduces the output exactly.
+    ///
+    /// Loaded through `Weights::attn_proj` off a real GGUF, so the plane the
+    /// small-batch kernel is handed is the production one: on Metal that is a
+    /// page-floored mmap alias bound at a sub-page `base_off`, not an
+    /// offset-0 upload.
+    #[test]
+    fn q8_projection_routes_each_token_count_to_its_kernel() {
+        let Ok(dev) = crate::gguf::metal_device() else {
+            return;
+        };
+        // The window's env knobs are read once per process; a run with the
+        // kill-switch set has nothing to route and the accuracy tests still
+        // cover the kernel itself. `XWEN_LOAD_CLASSIC` skips too: the doc
+        // comment's sub-page-offset claim (asserted below) only holds for the
+        // mmap alias load this test exists to exercise.
+        if crate::ops::attn_dequant()
+            || crate::ops::mv_ext_window(2).is_none()
+            || crate::gguf::load_classic()
+        {
+            return;
+        }
+
+        // k = 512 satisfies the kernel's pass-width requirement (a multiple of
+        // 128) and is a whole number of q8_0 blocks, like every production
+        // in_dim; out_dim 64 covers eight full threadgroup row groups.
+        let (out_dim, in_dim) = (64usize, 512usize);
+        let w_cpu = dense(out_dim, in_dim, 0x5B, &Device::Cpu);
+        let qt = QTensor::quantize(&w_cpu, GgmlDType::Q8_0).unwrap();
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("xwen_proj_route_{}_{id}.gguf", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            candle_core::quantized::gguf_file::write(&mut f, &[], &[("blk.0.attn_k.weight", &qt)])
+                .unwrap();
+        }
+        let loaded = Weights::from_gguf(crate::gguf::open(&path, &dev).unwrap()).pp("blk.0");
+        let proj = Proj::load(&loaded, "attn_k", AttnWeights::F16).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let Proj::DenseF16Q8 { f16, q8 } = &proj else {
+            panic!("a q8_0-stored weight must load as the dual-storage projection")
+        };
+        let plane = &q8.plane;
+        // The production shape this test claims to exercise: a page-floored
+        // mmap alias whose tensor starts at a sub-page byte offset. An
+        // offset-0 upload here would mean the alias load silently fell back
+        // to a copy and the offset arithmetic under test never ran.
+        assert_ne!(
+            plane.base_off, 0,
+            "mmap-aliased plane must sit at a sub-page base_off"
+        );
+
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+
+        for t in 1..=Q8_DECODE_MAX_SEQ + 1 {
+            let x = dense(t, in_dim, 0x5C + t as u64, &dev);
+            let got = bits(&proj.forward(&x).unwrap());
+            let gemv = bits(
+                &crate::ops::matmul_q8(
+                    &plane.buffer,
+                    plane.base_off,
+                    plane.out_dim,
+                    plane.in_dim,
+                    &x,
+                )
+                .unwrap(),
+            );
+            let want = match crate::ops::mv_ext_window(t) {
+                _ if t > Q8_DECODE_MAX_SEQ => bits(&crate::ops::matmul_f16(f16, &x).unwrap()),
+                Some(r1ptg) => {
+                    let ext = bits(&crate::ops::matmul_mv_ext(plane, &x, r1ptg).unwrap());
+                    // The whole assertion rests on the two q8_0 paths being
+                    // distinguishable at this shape: they reduce K in different
+                    // orders, so they agree only to the last ulps. If they ever
+                    // matched bitwise, the check below would hold no matter
+                    // which one ran.
+                    assert_ne!(
+                        ext, gemv,
+                        "seq {t}: the small-batch kernel and the gemv agree bitwise, \
+                         so this test cannot tell which one ran"
+                    );
+                    ext
+                }
+                None => gemv,
+            };
+            assert_eq!(
+                got, want,
+                "seq {t} did not reach the kernel that owns its token count"
+            );
+        }
     }
 
     /// Per-stage isolation timing for ONE 27B full-attention layer, walked over
