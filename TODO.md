@@ -47,6 +47,13 @@ rather than another subtraction); the P8c prefill residual, still blocked on a
 barrier/fence instrument; the attention glue's surviving remnant and the head-dim-256
 flash instantiation. New small items from this pass: the span-2 Proj window floor
 option, and `DEFAULT_DRAFT_CTX`, which the retune deliberately did not sweep.
+UPDATE 2026-08-09: **`xwen batch` shipped** — a surface arc rather than a perf one, so
+the live perf order above is unchanged. It does move P10: the serve tree now owes a
+`/xwen/v1/batch` endpoint on top of its template adaptation, and the batch core was
+written transport-agnostic so that endpoint is a handler, not a port. Its own deferrals
+are in "Deferred from the batch + scored-classification arc (2026-08-09)" below; the one
+with parity implications is the missing Track-B case for snapshot-replay-vs-scratch,
+today an at-ship manual A/B.
 
 1. **Mechanical fork — DONE 2026-07-28.** cp-based copy of ../laguna, maxuna→xwen
    rename, MAXUNA_*→XWEN_* env prefix, Qwen tokenizer/chat-template/configs vendored
@@ -1124,6 +1131,83 @@ closed by it, and the docs it owed are written. The rest stand.
   supported checkpoint stores a weight in q5_K on a path this kernel serves — the
   retired unsloth UD file's experts were the only q5_K, and experts go through the
   mm_id/mv_id gather, not here. Add only if such a checkpoint returns.
+
+## Deferred from the batch + scored-classification arc (2026-08-09)
+
+`xwen batch` shipped with its prefix cache, `include_score` scored assembly and the
+nine-item demo (log.md 2026-08-09, decisions.md "Batch"). These are the pieces it
+deliberately did not carry.
+
+- [ ] **No `/xwen/v1/batch` HTTP endpoint.** The core (`batch::run_batch`) is
+  transport-agnostic — it takes a `Generator` and a request struct, and the CLI
+  subcommand is a thin stdin/stdout wrapper around it — so serving it is a handler plus
+  a dialect decision (native only, or an OpenAI-batch-shaped alias). Deferred behind P10:
+  the serve tree still needs its Qwen template adaptation (tool-call parsing, thinking
+  semantics, recurrent-state prefix snapshots), and adding an endpoint to a dialect layer
+  that has not been adapted yet means adapting it twice. Nothing about the core needs to
+  change when it lands.
+- [ ] **Prefix grouping is single-level, and there is no cross-batch pinned snapshot.**
+  One batch computes one LCP over all items; items that share more with each other than
+  with the batch as a whole get no credit for it, and a system prompt shared across
+  successive batch requests is re-prefilled every time. The literature says the first
+  costs little: BatchLLM measured single-level collapse at roughly 1% of achievable reuse
+  against a full prefix tree, and a tree brings eviction, invalidation and per-node
+  snapshot accounting with it. The pinned cross-batch snapshot is the cheaper of the two
+  and is the one to build first if it is built. Revisit only with a measured workload
+  where the single level demonstrably loses, not on principle.
+- [ ] **Results are not streamed.** `xwen batch` prints one JSON document when the last
+  item finishes; progress goes to stderr as unstructured lines. A long batch therefore
+  gives a caller nothing machine-readable until the end. NDJSON on stdout (one
+  `ItemResponse` per line, `BatchStats` last) is the obvious shape and would not change
+  the core, which already completes items in request order. Wants a flag rather than a
+  format change — the current single-document output is what makes `jq` over a batch
+  trivial.
+- [ ] **Per-token logprobs are not exposed in any dialect.** `include_score` reports
+  confidence over a field's ALLOWED OPTIONS, which is a different quantity from
+  OpenAI's `logprobs`/`top_logprobs` (raw log-softmax over the vocabulary at each emitted
+  position, top-k of it). The machinery for both now exists — `Generator::last_logprobs_for`
+  is the log-softmax over an encodable slice — but the two must not be conflated in the
+  surface: a client asking for `logprobs` wants token evidence, not label evidence.
+  Independent of the scored path; belongs with the serve adaptation.
+- [ ] **Snapshot-replay-vs-scratch has no Track-B parity case.** The equivalence was
+  exercised at ship time by hand (`XWEN_BATCH_NO_CACHE=1` as the A/B arm, same request
+  both ways) and the finding is recorded — values identical except one genuine near-tie,
+  scores differing in the third to fourth decimal, both explained by the `mv_id`/`mm_id`
+  partition split. That is a measurement, not a gate. The decode tier is the right home
+  for it (greedy replay with the near-tie rule, which is exactly the rule this divergence
+  class needs); it wants a fixture batch with a long shared prefix and enough items to
+  make one near-tie likely. Until then a regression in the restore path would be caught
+  only by someone running the demo.
+- [ ] **`escape` is opener-level and formatting-confounded for bare literals.** It is the
+  mass on tokens that open no option at the field's first choice-point token. For a
+  quoted enum the forced opening quote filters formatting out and the number is
+  meaningful; for a boolean, whose choice point sits after `:`, whitespace tokens a
+  pretty-printer would emit compete with `true`/`false` and the escape reads near 1 while
+  the answer is near-certain — observed at 0.998 escape beside a 0.9986 answer score. Two
+  candidate refinements: whitespace-normalize the opener set (cheap, narrow), or make the
+  escape sequence-level rather than opener-level (correct, but needs a bound on the
+  non-option continuation space). Do not act on the current number for bare literals; it
+  is documented on the field.
+- [ ] **v1's scored-schema limits are refusals, and each has a known lift.** The shape
+  guard accepts a flat all-required object of enum/boolean fields and refuses everything
+  else by name. Four separable extensions, in rough order of value: (1) values that merge
+  with their delimiter under BPE — the seam check refuses them today; scoring the merged
+  token as the option's last token is the principled fix, and it interacts with the
+  terminator-token rule, so derive them together; (2) JSON-escaped values, refused
+  because the escape sequence rather than the label would be what gets scored; (3)
+  free-form fields alongside scored ones, which means interleaving assembly with
+  grammar-masked decode inside one document; (4) free `thinking: true` combined with
+  `prefill`, currently not composable on a scored item. Each is a scope decision, not a
+  bug.
+- [ ] **DFlash draft-slot handling across snapshot/restore was never checked against
+  SGLang's pattern.** Batch replay syncs the drafter by truncation (`sync_drafter_to`),
+  which is correct here because every item shares every token below the snapshot
+  position — see decisions.md "Batch". The serving-SOTA research surfaced SGLang's
+  snapshot/promote handling of speculative draft slots across cache reuse, which solves a
+  strictly harder problem (concurrent sequences, divergent branches) and may name a case
+  the truncation argument does not cover. Read it against `sync_drafter_to` and
+  `DrafterImage` before the multi-level prefix tree or the serve endpoint lands, since
+  both break the shared-prefix premise truncation rests on.
 
 ## Deferred from the fork bootstrap (2026-07-28)
 

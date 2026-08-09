@@ -56,6 +56,86 @@ catch the spec loop drawing from the RNG a different number of times than plain 
 It prints the fork point when they differ; a near-tie landing differently is expected, a
 first-line fork in sampled mode is not. See the script's header.
 
+## Batch
+
+`xwen batch` answers N chat items that share a prompt prefix: one JSON request on
+stdin, one JSON response on stdout, progress lines on stderr. The shared prefix is
+prefilled once and the KV cache snapshotted there; every item restores that snapshot
+and prefills only its own tail, so nine questions about the same document cost one
+prefill of it rather than nine. The checkpoint comes from the payload, not a flag.
+
+```bash
+xwen batch < request.json > response.json
+```
+
+```json
+{
+  "model": "35b",
+  "defaults": { "max_tokens": 32 },
+  "items": [
+    {
+      "id": "sentiment",
+      "messages": [
+        { "role": "system", "content": "You classify support email." },
+        { "role": "user", "content": "<the email>\n\nOverall sentiment?" }
+      ],
+      "schema": {
+        "type": "object",
+        "properties": {
+          "label": { "enum": ["positive", "mixed", "negative"], "include_score": true }
+        },
+        "required": ["label"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
+```
+
+```json
+{
+  "model": "35b",
+  "items": [
+    {
+      "id": "sentiment",
+      "content": "{\"label\":\"mixed\"}",
+      "text": "{\"label\":\"mixed\"}",
+      "json": { "label": { "value": "mixed", "score": 0.5601 } },
+      "finish_reason": "stop",
+      "usage": { "prompt_tokens": 349, "cached_prefix_tokens": 317, "completion_tokens": 9 }
+    }
+  ],
+  "stats": {
+    "shared_prefix_tokens": 317,
+    "snapshot_ms": 148.3,
+    "items": 1,
+    "load_ms": 3470.0,
+    "total_ms": 1828.0
+  }
+}
+```
+
+An item takes `messages`, an optional JSON `schema` (constrained decode), `thinking`
+(`false` / `true` / a string to inject), an assistant `prefill`, `max_tokens` and
+`sampling`; `defaults` sets any of them batch-wide. Batch sampling is greedy and
+thinking is off unless a request says otherwise — both differ from the chat surface on
+purpose (docs/decisions.md "Batch"). Per-item failures land as `error` on that item and
+the rest of the batch still runs.
+
+**`include_score`.** Annotate an enum or boolean property with `include_score` and the
+item leaves the grammar path: xwen writes the JSON skeleton itself and picks each
+field's value by scoring every allowed option against the model, reporting
+`{"value": …, "score": …}` instead of a bare value (`"all"` adds the full `scores`
+table and the `escape` mass that fell outside the option set). v1 accepts a flat
+all-required object of enum/boolean fields and refuses anything else by name.
+
+`XWEN_BATCH_NO_CACHE=1` runs every item from a reset cache — the A/B lever for what the
+snapshot saves (35B demo: 1203 ms cached vs 1989 ms cold). The two arms decode the same
+answers but not always the same bytes; see docs/decisions.md "Batch".
+
+`bun scripts/classify-demo.ts` is the worked example: one support email classified along
+nine taxonomies as nine batch items, with ground truth embedded, run on both checkpoints.
+
 ## Verifying a change
 
 Any change to model math re-runs the parity gate. It compares our forward pass against

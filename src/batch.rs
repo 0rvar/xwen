@@ -1,0 +1,2740 @@
+//! Batch generation over one shared prompt prefix.
+//!
+//! A batch request holds N chat items that agree for most of their prompt — the
+//! same system message and the same document, differing only in the question at
+//! the end. Prefilling that prefix once per item is the whole cost of such a
+//! run, so the batch runner prefills it ONCE, snapshots the KV cache there, and
+//! replays the snapshot per item: restore, prefill the item's own tail, decode.
+//!
+//! The shared span is the literal longest common prefix of the items' TOKEN
+//! vectors, held one token short of the shortest item so every item still has a
+//! tail to prefill (a restore rewinds the cache to the snapshot's position, and
+//! writing below that position would invalidate the snapshot for every later
+//! item — `XwenModel::restore_cache_snapshot`). A prefix shorter than
+//! [`MIN_SHARED_PREFIX`] is not worth a snapshot, and then every item runs from a
+//! reset cache instead.
+//!
+//! Items run sequentially in request order. Failures are per item wherever they
+//! can be: a prompt that will not render, a schema the grammar compiler rejects,
+//! a decode that errors — each lands as an `error` on that item's response and
+//! the batch carries on, because the whole point is that one bad item must not
+//! cost the other N-1 their prefill.
+//!
+//! Two defaults deliberately differ from the chat surface. Sampling is GREEDY
+//! (temperature 0) unless a request overrides it, and thinking is OFF unless a
+//! request asks for it: batch items are structured-extraction jobs with tight
+//! token budgets, where a reasoning block the caller did not ask for consumes
+//! the entire budget before the answer starts.
+//!
+//! `XWEN_BATCH_NO_CACHE` (any value) disables the snapshot path, running every
+//! item from a reset cache. It exists so replay can be A/B'd against scratch on
+//! the same request.
+//!
+//! A schema may instead ask for its fields to be SCORED: annotate an enum or
+//! boolean property with `include_score` and that item stops free-decoding
+//! altogether. The runner writes the JSON itself — the structural skeleton is
+//! teacher-forced into the model's context and each field's value is chosen by
+//! scoring every allowed option's full token sequence against the model, rather
+//! than by drawing tokens under a grammar mask. The answer is the same shape
+//! either way; what the scored path adds is the model's confidence in it, and
+//! what it costs is one forward per option token instead of one per answer
+//! token. See [`ScoredPlan`] and the v1 shape guard in [`scored_fields`].
+//!
+//! The two arms decode the same tokens but are NOT bit-identical, and reading a
+//! difference as a snapshot bug would be wrong. Replay prefills an item's tail
+//! as its own short span, and a span below `ops::mm_id_min_seq` takes the MoE's
+//! per-token `mv_id` matmul where the cold arm's one long span takes `mm_id` —
+//! two kernels of the same math at different precision, which flips a near-tie
+//! now and then (measured 2026-08-09: one of four items chose `{"label"` over
+//! `{\n  "label"`, the same value either way). Forcing both arms onto one
+//! kernel with `XWEN_MM_ID_MIN_SEQ=1` makes them byte-identical, which is how
+//! that was settled. It is the same precision class the serve prefix cache has
+//! always had.
+
+use std::cell::Cell;
+use std::ops::Range;
+use std::time::Instant;
+
+use anyhow::{Result, anyhow, bail, ensure};
+use rand::SeedableRng;
+use rand::distr::Distribution;
+use rand::distr::weighted::WeightedIndex;
+use rand::rngs::StdRng;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+
+use crate::chat::{self, ChatOptions, Continuation, Message};
+use crate::constrain::{self, ConstraintFactory, GrammarState};
+use crate::generate::{GenEvent, Generator};
+use crate::hub::Model;
+use crate::kv_cache::CacheSnapshot;
+use crate::sampler::SamplerOptions;
+use crate::tokenizer::LagunaTokenizer;
+
+/// Shortest shared prefix worth a snapshot. Below this the snapshot/restore
+/// bookkeeping costs more than re-prefilling the tokens it would save.
+pub const MIN_SHARED_PREFIX: usize = 64;
+
+/// Token budget for an item that names none, and for a request whose defaults
+/// name none.
+pub const DEFAULT_MAX_TOKENS: usize = 512;
+
+/// Batch sampling before any request setting: greedy, so a batch is
+/// reproducible and two runs of the same request can be compared token for
+/// token. `top_k`/`top_p`/`seed` are inert at temperature 0 and carry the
+/// values a request would land on if it raised the temperature alone.
+pub const BATCH_SAMPLING: SamplerOptions = SamplerOptions {
+    temperature: 0.0,
+    top_k: 20,
+    top_p: 0.95,
+    seed: 42,
+};
+
+// ---------------------------------------------------------------- request ---
+
+/// One batch request, as it arrives on stdin.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRequest {
+    /// Which checkpoint to run (`27b` / `35b`). The model comes from the payload
+    /// rather than a flag: one request is one model's work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Per-item settings every item inherits unless it names its own.
+    #[serde(default)]
+    pub defaults: ItemDefaults,
+    pub items: Vec<BatchItem>,
+}
+
+/// The settings an item inherits. Every field is optional twice over: absent
+/// here means the module default, absent on the item means whatever this says.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingSpec>,
+}
+
+/// One item: a whole conversation, its output shape, and the knobs that differ
+/// from the batch defaults.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchItem {
+    /// Echoed on the response so a caller can match answers to questions
+    /// without relying on order. Not required to be unique.
+    pub id: String,
+    pub messages: Vec<BatchMessage>,
+    /// JSON schema the answer is constrained to. Absent decodes free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingSpec>,
+    /// Assistant text the answer continues from, rendered into the generation
+    /// header. It may not open with a newline (see [`Continuation::prefix`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingSpec>,
+}
+
+/// A conversation turn. `thinking` is an assistant turn's reasoning, replayed
+/// verbatim into the prompt.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+}
+
+/// Sampling overrides. An absent field keeps whatever the layer below settled
+/// on, so an item can raise the temperature without restating the rest.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+}
+
+/// How an item reasons: off, on, or on with the reasoning supplied by the
+/// caller — which is a string on the wire, so `false` / `true` / `"..."` are all
+/// legal values of the one field.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ThinkingSpec {
+    Enabled(bool),
+    /// Reasoning to place inside the turn's `<think>` block, which is then
+    /// closed so decoding starts in the answer.
+    Injected(String),
+}
+
+impl BatchRequest {
+    /// The checkpoint this request names, or the default one when it names
+    /// none.
+    pub fn model(&self) -> Result<Model> {
+        match &self.model {
+            Some(name) => name.parse().map_err(|e: String| anyhow!("batch: {e}")),
+            None => Ok(Model::default()),
+        }
+    }
+}
+
+// --------------------------------------------------------------- response ---
+
+/// The whole answer, printed as JSON on stdout.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BatchResponse {
+    pub model: String,
+    pub items: Vec<ItemResponse>,
+    pub stats: BatchStats,
+}
+
+/// One item's answer. Present in request order, including for items that
+/// failed — a failed item carries `error` and empty text, so the response is
+/// always parallel to the request.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ItemResponse {
+    pub id: String,
+    /// Everything the model emitted, reasoning included. The `</think>` marker
+    /// itself is not part of the stream (the decoder strips it), so this is the
+    /// reasoning text followed by the answer text.
+    pub content: String,
+    /// The answer alone: `content` minus any reasoning. A `prefill` is prompt
+    /// rather than output, so it is NOT part of this — only what the model
+    /// wrote after it.
+    pub text: String,
+    /// The constrained value, for an item that carried a schema; null for an
+    /// unconstrained one. This is the whole document, so an item that put the
+    /// opening of its value in `prefill` finds it here even though `text` holds
+    /// only the continuation.
+    ///
+    /// A scored item's value is assembled rather than parsed, and its annotated
+    /// fields report as objects: `{"value": …, "score": …}`, plus
+    /// `{"scores": {…}, "escape": …}` where the schema asked for `"all"`. Its
+    /// unannotated fields stay bare values.
+    pub json: Option<Value>,
+    pub finish_reason: FinishReason,
+    pub usage: Usage,
+    /// Why this item produced nothing. Absent on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    /// The model stopped on its own: an EOG token, or a constrained value that
+    /// completed.
+    Stop,
+    /// The item's `max_tokens` ran out first.
+    Length,
+    /// The item failed; see `error`.
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct Usage {
+    /// Tokens in the rendered prompt, shared prefix included.
+    pub prompt_tokens: usize,
+    /// How many of those came out of the snapshot rather than a prefill.
+    pub cached_prefix_tokens: usize,
+    pub completion_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+pub struct BatchStats {
+    /// Length of the shared prefix that was prefilled once, or 0 when every
+    /// item ran from a reset cache.
+    pub shared_prefix_tokens: usize,
+    /// Wall time of the shared prefill plus taking the snapshot.
+    pub snapshot_ms: f64,
+    pub items: usize,
+    /// Model + drafter load time, measured by the caller that loaded them.
+    pub load_ms: f64,
+    pub total_ms: f64,
+}
+
+// -------------------------------------------------------------- execution ---
+
+/// An item rendered, encoded and validated: everything needed to find the
+/// shared prefix, and everything [`run_item`] needs to run it.
+struct Prepared {
+    tokens: Vec<u32>,
+    /// Trailing tokens of `tokens` that render the response prefix. The grammar
+    /// has to consume them before the first draw, or it would open a second
+    /// document instead of continuing this one.
+    prefix_len: usize,
+    /// The response prefix as it was rendered, empty when the item supplied
+    /// none. Decoding continues it without re-emitting it, so it is the missing
+    /// head of any constrained value the item produces.
+    prefix_text: String,
+    starts_in_thinking: bool,
+    max_tokens: usize,
+    sampling: SamplerOptions,
+    /// The schema the grammar path compiles, `None` for an unconstrained item
+    /// AND for a scored one — a scored schema carries `include_score`, which
+    /// llguidance has never heard of, and the scored path constrains nothing
+    /// anyway.
+    schema: Option<Value>,
+    /// The assembly plan, for an item whose schema asked for scoring.
+    scored: Option<ScoredPlan>,
+}
+
+/// What one item's run produced.
+struct ItemOutcome {
+    content: String,
+    text: String,
+    finish_reason: FinishReason,
+    completion_tokens: usize,
+    /// The value a SCORED item assembled. The grammar path leaves this `None`
+    /// and its value is parsed back out of the decoded text instead.
+    json: Option<Value>,
+    /// Why this item has no usable answer even though the run itself did not
+    /// fail. The scored path's budget refusal is the one case: it reports as
+    /// `length`, like any other answer the token budget cut short.
+    error: Option<String>,
+}
+
+/// True when the snapshot path is disabled and every item is to run from a
+/// reset cache (`XWEN_BATCH_NO_CACHE`).
+fn cache_disabled() -> bool {
+    std::env::var_os("XWEN_BATCH_NO_CACHE").is_some()
+}
+
+/// Length of the longest prefix every sequence shares. Zero for an empty set —
+/// there is no sequence to take a prefix of.
+pub fn longest_common_prefix(seqs: &[&[u32]]) -> usize {
+    let Some((first, rest)) = seqs.split_first() else {
+        return 0;
+    };
+    let mut len = first.len();
+    for seq in rest {
+        len = len.min(seq.len());
+        len = first[..len]
+            .iter()
+            .zip(seq.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if len == 0 {
+            break;
+        }
+    }
+    len
+}
+
+/// The prefix worth prefilling once and snapshotting, or `None` to run every
+/// item from a reset cache.
+///
+/// Two rules shape it. It is held one token short of the shortest sequence, so
+/// every item has a tail to prefill: an item whose whole prompt is the shared
+/// prefix would have to re-prefill a token BELOW the snapshot position, which
+/// invalidates the snapshot for every item after it. And it has to clear
+/// [`MIN_SHARED_PREFIX`], below which the snapshot costs more than it saves. A
+/// lone item shares its prompt with nobody, so it never takes this path.
+pub fn shared_prefix_len(seqs: &[&[u32]]) -> Option<usize> {
+    if seqs.len() < 2 {
+        return None;
+    }
+    let shortest = seqs.iter().map(|s| s.len()).min().unwrap_or(0);
+    let len = longest_common_prefix(seqs).min(shortest.saturating_sub(1));
+    (len >= MIN_SHARED_PREFIX).then_some(len)
+}
+
+/// Run a whole batch on `generator`, which must already be loaded (and, if the run
+/// wants speculation, have its drafter attached). `load_ms` is what that load
+/// cost, for the stats block.
+pub fn run_batch(
+    generator: &mut Generator,
+    req: &BatchRequest,
+    load_ms: f64,
+) -> Result<BatchResponse> {
+    let started = Instant::now();
+    ensure!(!req.items.is_empty(), "batch: the request holds no items");
+    let model = req.model()?;
+    let max_ctx = generator.max_ctx();
+
+    // Every prompt is rendered and encoded before anything runs: the shared
+    // prefix is a fact about the whole set, and an item that cannot be prepared
+    // must not contribute a token vector to it.
+    let prepared: Vec<std::result::Result<Prepared, String>> = req
+        .items
+        .iter()
+        .map(|item| {
+            prepare_item(generator.tokenizer(), max_ctx, item, &req.defaults)
+                .map_err(|error| format!("{error:#}"))
+        })
+        .collect();
+
+    let live: Vec<&[u32]> = prepared
+        .iter()
+        .filter_map(|p| p.as_ref().ok().map(|p| p.tokens.as_slice()))
+        .collect();
+    let shared = if cache_disabled() {
+        None
+    } else {
+        shared_prefix_len(&live)
+    };
+
+    // The prefix is taken from the first live item, and by construction every
+    // other live item agrees with it token for token.
+    let mut snapshot_ms = 0.0;
+    let snapshot = match shared {
+        Some(len) => {
+            let prefix: Vec<u32> = live[0][..len].to_vec();
+            let prefill_started = Instant::now();
+            generator.reset_cache()?;
+            generator.reset_drafter();
+            generator.prefill_tokens(&prefix, 0)?;
+            let snapshot = generator.take_cache_snapshot()?;
+            snapshot_ms = elapsed_ms(prefill_started);
+            eprintln!("xwen: shared prefix {len} tokens prefilled in {snapshot_ms:.0}ms");
+            Some(snapshot)
+        }
+        None => None,
+    };
+    let shared_len = shared.unwrap_or(0);
+
+    // Built once for the whole batch: the token trie costs ~150 ms, while
+    // compiling one item's schema against it costs well under a millisecond.
+    // Only paid when some item actually asks for a schema.
+    let factory = if prepared
+        .iter()
+        .any(|p| p.as_ref().is_ok_and(|p| p.schema.is_some()))
+    {
+        Some(constrain::shared()?)
+    } else {
+        None
+    };
+
+    let mut items = Vec::with_capacity(req.items.len());
+    for (spec, prepared) in req.items.iter().zip(prepared.iter()) {
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                items.push(failed_item(&spec.id, error.clone()));
+                continue;
+            }
+        };
+        let cached = snapshot.as_ref().map(|snapshot| (snapshot, shared_len));
+        let item_started = Instant::now();
+        match run_item(generator, factory, prepared, cached) {
+            Ok(outcome) => {
+                eprintln!(
+                    "xwen: item {:?} {} tokens in {:.0}ms",
+                    spec.id,
+                    outcome.completion_tokens,
+                    elapsed_ms(item_started),
+                );
+                // A scored item brings its own value and its own refusal; only
+                // the grammar path has a document left to parse.
+                let (json, error) = match (&outcome.json, &outcome.error) {
+                    (json, Some(error)) => (json.clone(), Some(error.clone())),
+                    (Some(json), None) => (Some(json.clone()), None),
+                    (None, None) => match constrained_value(prepared, &outcome) {
+                        Some(Ok(value)) => (Some(value), None),
+                        Some(Err(error)) => (None, Some(error)),
+                        None => (None, None),
+                    },
+                };
+                items.push(ItemResponse {
+                    id: spec.id.clone(),
+                    content: outcome.content,
+                    text: outcome.text,
+                    json,
+                    finish_reason: outcome.finish_reason,
+                    usage: Usage {
+                        prompt_tokens: prepared.tokens.len(),
+                        cached_prefix_tokens: shared_len,
+                        completion_tokens: outcome.completion_tokens,
+                    },
+                    error,
+                });
+            }
+            Err(error) => items.push(failed_item(&spec.id, format!("{error:#}"))),
+        }
+    }
+
+    Ok(BatchResponse {
+        model: model.to_string(),
+        stats: BatchStats {
+            shared_prefix_tokens: shared_len,
+            snapshot_ms,
+            items: items.len(),
+            load_ms,
+            total_ms: elapsed_ms(started),
+        },
+        items,
+    })
+}
+
+/// The value a constrained item produced, or the reason it has none. `None`
+/// for an item that carried no schema.
+///
+/// The document is the rendered response prefix followed by what was decoded: a
+/// prefill is prompt, so the model never re-emits it, and parsing the decoded
+/// text alone would see a value with its head missing.
+fn constrained_value(item: &Prepared, outcome: &ItemOutcome) -> Option<Result<Value, String>> {
+    item.schema.as_ref()?;
+    // A constrained value is complete only when the grammar said so. A run that
+    // stopped at its cap stopped mid-document, and reporting the budget beats
+    // reporting a parse error about a truncated value.
+    if outcome.finish_reason != FinishReason::Stop {
+        return Some(Err(format!(
+            "the answer stopped at the {}-token budget before the value was complete",
+            item.max_tokens
+        )));
+    }
+    let document = format!("{}{}", item.prefix_text, outcome.text);
+    Some(
+        serde_json::from_str::<Value>(document.trim())
+            .map_err(|error| format!("the constrained answer did not parse as JSON: {error}")),
+    )
+}
+
+/// Run one prepared item to completion: rewind to the shared prefix (or to
+/// nothing), prefill the item's own tail, and decode under its sampler and
+/// grammar.
+///
+/// `cached` is the shared snapshot and the position it holds. A restore drops
+/// the held prefill logits, so the prefill below is what every decode reads
+/// from — there is no path here that decodes without prefilling first.
+fn run_item(
+    generator: &mut Generator,
+    factory: Option<&ConstraintFactory>,
+    item: &Prepared,
+    cached: Option<(&CacheSnapshot, usize)>,
+) -> Result<ItemOutcome> {
+    let resume = match cached {
+        Some((snapshot, at)) => {
+            generator.restore_cache_snapshot(snapshot)?;
+            // The drafter holds the previous item's tail; truncating it back to
+            // the shared position is what lets speculation resume immediately
+            // instead of waiting for a prefill from zero.
+            generator.sync_drafter_to(at)?;
+            at
+        }
+        None => {
+            generator.reset_cache()?;
+            generator.reset_drafter();
+            0
+        }
+    };
+    // `shared_prefix_len` holds the prefix short of the shortest item, so the
+    // tail is never empty.
+    generator.prefill_tokens(&item.tokens[resume..], resume)?;
+
+    generator.set_sampler(SamplerOptions {
+        temperature: item.sampling.temperature,
+        top_k: item.sampling.top_k,
+        top_p: item.sampling.top_p,
+        seed: item.sampling.seed,
+    });
+    if let Some(plan) = &item.scored {
+        // Nothing on the scored path free-decodes against a mask — the runner
+        // writes the structure itself — so the grammar is cleared rather than
+        // compiled. `None` is also what clears the previous item's.
+        generator.set_grammar(None);
+        return assemble_scored(generator, item, plan);
+    }
+    // Set unconditionally: `None` is what clears the previous item's grammar.
+    generator.set_grammar(item_grammar(factory, item)?);
+
+    let prompt_len = item.tokens.len();
+    let mut content = String::new();
+    let mut text = String::new();
+    let mut on_event = |event: GenEvent| {
+        content.push_str(event.text());
+        if let GenEvent::TextTok { text: chunk, .. } = &event {
+            text.push_str(chunk);
+        }
+    };
+    // The speculative loop draws the same tokens either way; this asks the
+    // narrower question of whether it could actually speculate from here, so a
+    // drafter that fell behind does not pay the round loop's overhead.
+    let outcome = if generator.spec_ready_at(prompt_len) {
+        generator.decode_loop_spec(
+            prompt_len,
+            item.starts_in_thinking,
+            item.max_tokens,
+            &mut on_event,
+            &mut || false,
+        )?
+    } else {
+        generator.decode_loop(
+            prompt_len,
+            item.starts_in_thinking,
+            item.max_tokens,
+            &mut on_event,
+            &mut || false,
+        )?
+    };
+
+    Ok(ItemOutcome {
+        content,
+        text,
+        finish_reason: if outcome.hit_eog {
+            FinishReason::Stop
+        } else {
+            FinishReason::Length
+        },
+        completion_tokens: outcome.tokens_out,
+        json: None,
+        error: None,
+    })
+}
+
+/// The grammar an item decodes under, `None` for an unconstrained one. A
+/// compiled `Grammar` is consumed by `into_state`, so this compiles per item
+/// rather than sharing one across the batch.
+fn item_grammar(
+    factory: Option<&ConstraintFactory>,
+    item: &Prepared,
+) -> Result<Option<GrammarState>> {
+    let Some(schema) = &item.schema else {
+        return Ok(None);
+    };
+    let factory =
+        factory.ok_or_else(|| anyhow!("batch: an item wants a schema but no factory was built"))?;
+    let mut state = factory.compile(schema)?.into_state(item.starts_in_thinking);
+    if item.prefix_len > 0 {
+        // A response prefix is already part of the answer document; feeding it
+        // in is what makes the first mask continue it. A prefix can only be
+        // rendered past a closed thinking span, so the state is live here.
+        state.consume_prefix(&item.tokens[item.tokens.len() - item.prefix_len..])?;
+    }
+    Ok(Some(state))
+}
+
+// ----------------------------------------------------------- scored items ---
+
+/// How much of a scored field's evidence the response reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScoreMode {
+    /// The property carries no `include_score`. Its value is still CHOSEN by
+    /// scoring — one item assembles one document — but it reports as a bare
+    /// value, exactly as the grammar path would have written it.
+    Bare,
+    /// `include_score: true`.
+    Value,
+    /// `include_score: "all"`: the whole option table, plus the mass that fell
+    /// outside it.
+    All,
+}
+
+/// One value a scored field may take.
+#[derive(Debug, Clone, PartialEq)]
+struct FieldOption {
+    /// What is written into the assembled document. For a string field this is
+    /// the JSON-escaped body WITHOUT its quotes: the quotes belong to the
+    /// skeleton, so that what gets scored is the tokens of the value itself.
+    text: String,
+    /// `text` encoded. Never empty — an option with no tokens would score as
+    /// certainty for free.
+    tokens: Vec<u32>,
+    /// What the response reports as the chosen value: a JSON string, or a real
+    /// JSON boolean.
+    value: Value,
+    /// This option's key in an `"all"` field's `scores` table. A boolean's
+    /// options are keyed by the STRINGS `"true"`/`"false"`, a JSON object
+    /// having no other kind of key.
+    key: String,
+}
+
+/// One property of a scored schema.
+#[derive(Debug, Clone, PartialEq)]
+struct ScoredField {
+    name: String,
+    options: Vec<FieldOption>,
+    /// Whether the value is written inside quotes — true for the string enums,
+    /// false for the booleans.
+    quoted: bool,
+    mode: ScoreMode,
+}
+
+/// A run of literal JSON between two values.
+#[derive(Debug, Clone, PartialEq)]
+struct Segment {
+    text: String,
+    tokens: Vec<u32>,
+    /// The client-content byte ranges of `text` — its field name. Kept so the
+    /// seam checks can re-encode this segment against its neighbours under the
+    /// same demotion rules it was first encoded with.
+    ranges: Vec<Range<usize>>,
+}
+
+/// A scored item's whole output plan: the fields in schema order, the skeleton
+/// that frames them, and what the two together cost.
+#[derive(Debug, Clone, PartialEq)]
+struct ScoredPlan {
+    fields: Vec<ScoredField>,
+    /// The literal JSON around the values, `fields.len() + 1` segments: the head
+    /// (`{"first":"`), one per gap (`","second":`) and the tail (`"}`).
+    segments: Vec<Segment>,
+    /// Tokens the assembly writes at worst — every segment plus the LONGEST
+    /// option of every field. The budget is checked against this before any
+    /// forward runs, so an item that cannot fit fails without costing a prefill.
+    ///
+    /// It bounds the scoring branches too, though they reach a token deeper than
+    /// the document does: a trial at field `i`'s choice point writes that whole
+    /// option, where the document goes on to write the segment after it. The
+    /// closing segment is counted here and never prefilled, which leaves the
+    /// deepest branch strictly inside this.
+    worst_case_tokens: usize,
+}
+
+/// The v1 shape `include_score` is defined against. A schema that carries the
+/// annotation without fitting it is an error rather than a schema quietly
+/// decoded the old way — the caller asked for scores and would otherwise get a
+/// plausible answer with none.
+const SCORED_SHAPE: &str = "a scored schema must be {\"type\": \"object\", \"properties\": {…}, \
+     \"required\": [every property], \"additionalProperties\": false}, every property being \
+     either {\"enum\": [strings]} or {\"type\": \"boolean\"}";
+
+/// The assembly plan an item's schema asks for, or `None` when the schema
+/// mentions no `include_score` and belongs on the grammar path untouched.
+fn scored_plan(tokenizer: &LagunaTokenizer, schema: &Value) -> Result<Option<ScoredPlan>> {
+    if !mentions_include_score(schema) {
+        return Ok(None);
+    }
+    let fields = scored_fields(tokenizer, schema)?;
+    let segments = skeleton(tokenizer, &fields)?;
+    check_seams(tokenizer, &fields, &segments)?;
+    let worst_case_tokens = segments.iter().map(|s| s.tokens.len()).sum::<usize>()
+        + fields
+            .iter()
+            .map(|f| {
+                f.options
+                    .iter()
+                    .map(|o| o.tokens.len())
+                    .max()
+                    .expect("a field always carries at least one option")
+            })
+            .sum::<usize>();
+    Ok(Some(ScoredPlan {
+        fields,
+        segments,
+        worst_case_tokens,
+    }))
+}
+
+/// Whether `include_score` appears anywhere in the schema. The search is over
+/// the whole document rather than the top level's properties, so an annotation
+/// buried in a nested definition still routes the schema here — where the shape
+/// guard refuses it by name instead of dropping it silently.
+fn mentions_include_score(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            map.contains_key("include_score") || map.values().any(mentions_include_score)
+        }
+        Value::Array(items) => items.iter().any(mentions_include_score),
+        _ => false,
+    }
+}
+
+/// Validate a scored schema against [`SCORED_SHAPE`] and read its fields out in
+/// schema order (`serde_json`'s `preserve_order` is what makes that order the
+/// caller's rather than alphabetical).
+fn scored_fields(tokenizer: &LagunaTokenizer, schema: &Value) -> Result<Vec<ScoredField>> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| anyhow!("{SCORED_SHAPE}; this schema is not a JSON object"))?;
+    for key in object.keys() {
+        // `title`/`description` carry no semantics; anything else could change
+        // what the schema means, and a scored item never sees a validator that
+        // would enforce it.
+        if !matches!(
+            key.as_str(),
+            "type" | "properties" | "required" | "additionalProperties" | "title" | "description"
+        ) {
+            bail!("{SCORED_SHAPE}; this schema also carries {key:?}");
+        }
+    }
+    ensure!(
+        object.get("type").and_then(Value::as_str) == Some("object"),
+        "{SCORED_SHAPE}; this schema's \"type\" is not \"object\""
+    );
+    ensure!(
+        object.get("additionalProperties") == Some(&Value::Bool(false)),
+        "{SCORED_SHAPE}; this schema's \"additionalProperties\" is not false"
+    );
+    let properties = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("{SCORED_SHAPE}; this schema has no \"properties\" object"))?;
+    ensure!(
+        !properties.is_empty(),
+        "{SCORED_SHAPE}; this schema declares no properties"
+    );
+    let required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("{SCORED_SHAPE}; this schema has no \"required\" array"))?;
+    let mut listed = required
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("{SCORED_SHAPE}; its \"required\" holds a non-string entry"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    listed.sort_unstable();
+    listed.dedup();
+    let mut declared: Vec<&str> = properties.keys().map(String::as_str).collect();
+    declared.sort_unstable();
+    ensure!(
+        listed == declared,
+        "{SCORED_SHAPE}; its \"required\" does not list exactly its properties"
+    );
+    properties
+        .iter()
+        .map(|(name, spec)| scored_field(tokenizer, name, spec))
+        .collect()
+}
+
+/// One property of a scored schema, validated and encoded.
+fn scored_field(tokenizer: &LagunaTokenizer, name: &str, spec: &Value) -> Result<ScoredField> {
+    let object = spec
+        .as_object()
+        .ok_or_else(|| anyhow!("property {name:?} is not a JSON object; {SCORED_SHAPE}"))?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "type" | "enum" | "include_score" | "title" | "description"
+        ) {
+            bail!("property {name:?} carries {key:?}; {SCORED_SHAPE}");
+        }
+    }
+    let mode = score_mode(name, object.get("include_score"))?;
+    let declared = match object.get("type") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("property {name:?} has a non-string \"type\""))?,
+        ),
+        None => None,
+    };
+    let (options, quoted) = match object.get("enum") {
+        Some(values) => {
+            ensure!(
+                matches!(declared, None | Some("string")),
+                "property {name:?} is an enum of type {:?}; only string enums are scored",
+                declared.unwrap_or_default(),
+            );
+            (enum_options(tokenizer, name, values)?, true)
+        }
+        None => {
+            ensure!(
+                declared == Some("boolean"),
+                "property {name:?} is neither an enum nor a boolean; {SCORED_SHAPE}"
+            );
+            (boolean_options(tokenizer, name)?, false)
+        }
+    };
+    Ok(ScoredField {
+        name: name.to_string(),
+        options,
+        quoted,
+        mode,
+    })
+}
+
+/// Read one property's `include_score`. An unrecognized value is an error: the
+/// annotation is the whole reason this item left the grammar path, so a typo in
+/// it must not read as "no scores, then".
+fn score_mode(name: &str, value: Option<&Value>) -> Result<ScoreMode> {
+    match value {
+        None | Some(Value::Bool(false)) => Ok(ScoreMode::Bare),
+        Some(Value::Bool(true)) => Ok(ScoreMode::Value),
+        Some(Value::String(mode)) if mode == "all" => Ok(ScoreMode::All),
+        Some(other) => {
+            bail!("property {name:?} has include_score {other}; it must be true, false or \"all\"")
+        }
+    }
+}
+
+/// The options of a string enum, in the order the schema lists them.
+fn enum_options(
+    tokenizer: &LagunaTokenizer,
+    name: &str,
+    values: &Value,
+) -> Result<Vec<FieldOption>> {
+    let values = values
+        .as_array()
+        .ok_or_else(|| anyhow!("property {name:?} has a non-array \"enum\""))?;
+    ensure!(
+        !values.is_empty(),
+        "property {name:?} has an empty \"enum\""
+    );
+    let mut options: Vec<FieldOption> = Vec::with_capacity(values.len());
+    for value in values {
+        let text = value
+            .as_str()
+            .ok_or_else(|| anyhow!("property {name:?} has a non-string enum value {value}"))?;
+        // An empty option encodes to nothing, and a zero-length sequence scores
+        // as logprob 0 — certainty, for free, against every real option.
+        ensure!(
+            !text.is_empty(),
+            "property {name:?} has an empty enum value, which has no tokens to score"
+        );
+        ensure!(
+            !options.iter().any(|o| o.key == text),
+            "property {name:?} lists the enum value {text:?} twice"
+        );
+        // A value needing JSON escapes is refused rather than escaped. The
+        // escape sequence would be what gets scored and what the closing quote
+        // is checked against, and a value containing a quote of its own would
+        // no longer be delimited by one — v1 takes the values it can write
+        // literally and says so about the rest.
+        ensure!(
+            json_body(text) == text,
+            "property {name:?} has the enum value {text:?}, which needs JSON escaping; \
+             unsupported"
+        );
+        options.push(FieldOption {
+            tokens: encode_client_text(tokenizer, text)?,
+            text: text.to_string(),
+            value: Value::String(text.to_string()),
+            key: text.to_string(),
+        });
+    }
+    Ok(options)
+}
+
+/// The two options of a boolean field, written bare (a JSON `true` carries no
+/// quotes) and keyed by their spellings.
+fn boolean_options(tokenizer: &LagunaTokenizer, name: &str) -> Result<Vec<FieldOption>> {
+    [true, false]
+        .into_iter()
+        .map(|flag| {
+            let text = if flag { "true" } else { "false" };
+            let tokens = encode_client_text(tokenizer, text)?;
+            ensure!(
+                !tokens.is_empty(),
+                "property {name:?} could not encode the boolean literal {text:?}"
+            );
+            Ok(FieldOption {
+                text: text.to_string(),
+                tokens,
+                value: Value::Bool(flag),
+                key: text.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The skeleton around the values: `fields.len() + 1` runs of literal JSON,
+/// compact (no whitespace anywhere), so the only thing left unwritten at any
+/// point is a value.
+///
+/// A string field's quotes live here rather than on its options. That is what
+/// makes an option's score the logprob of its BODY: the model is already past
+/// the opening quote when it is scored, so `"positive"` and `"positively awful"`
+/// are compared on the tokens that actually distinguish them.
+fn skeleton(tokenizer: &LagunaTokenizer, fields: &[ScoredField]) -> Result<Vec<Segment>> {
+    let mut segments = Vec::with_capacity(fields.len() + 1);
+    for index in 0..=fields.len() {
+        let mut text = String::new();
+        let mut ranges = Vec::new();
+        if index > 0 && fields[index - 1].quoted {
+            text.push('"');
+        }
+        text.push(match index {
+            0 => '{',
+            n if n == fields.len() => '}',
+            _ => ',',
+        });
+        if let Some(field) = fields.get(index) {
+            // The key is client-supplied, so its bytes are marked as content:
+            // a field named after a control marker must encode as plain text
+            // rather than mint the token.
+            let key = json_string(&field.name);
+            let start = text.len() + 1;
+            text.push_str(&key);
+            ranges.push(start..text.len() - 1);
+            text.push(':');
+            if field.quoted {
+                text.push('"');
+            }
+        }
+        let tokens = tokenizer.encode_prompt(&text, &ranges)?;
+        // Every segment carries at least one structural character, and the
+        // token that opens the segment AFTER a value is what terminates that
+        // value's scored sequence.
+        ensure!(
+            !tokens.is_empty(),
+            "the skeleton segment {text:?} encoded to zero tokens"
+        );
+        segments.push(Segment {
+            text,
+            tokens,
+            ranges,
+        });
+    }
+    Ok(segments)
+}
+
+/// Refuse a plan whose pieces do not tokenize the same apart as together.
+///
+/// The document is teacher-forced piece by piece — a skeleton segment, a value,
+/// the next segment — but every text the model has ever seen was tokenized as a
+/// whole. Where a value's last character would canonically MERGE with the
+/// delimiter behind it (`yes!` followed by the closing quote encodes `!"` as one
+/// token), the forced stream is a seam the model was never trained on, and both
+/// the option's score and the answer's tokens would be measured across it.
+///
+/// Checking seams rather than whole documents is what makes this computable: a
+/// document has one tokenization per combination of options, while a seam has
+/// one per option.
+fn check_seams(
+    tokenizer: &LagunaTokenizer,
+    fields: &[ScoredField],
+    segments: &[Segment],
+) -> Result<()> {
+    for (index, field) in fields.iter().enumerate() {
+        let (before, after) = (&segments[index], &segments[index + 1]);
+        for option in &field.options {
+            let value = (option.text.as_str(), [0..option.text.len()]);
+            let opening: Vec<u32> = before
+                .tokens
+                .iter()
+                .chain(&option.tokens)
+                .copied()
+                .collect();
+            ensure!(
+                encode_seam(
+                    tokenizer,
+                    (&before.text, &before.ranges),
+                    (value.0, &value.1)
+                )? == opening,
+                "property {:?} takes the value {:?}, which tokenizes non-canonically against the \
+                 {:?} before it; unsupported",
+                field.name,
+                option.key,
+                before.text,
+            );
+            let closing: Vec<u32> = option.tokens.iter().chain(&after.tokens).copied().collect();
+            ensure!(
+                encode_seam(tokenizer, (value.0, &value.1), (&after.text, &after.ranges))?
+                    == closing,
+                "property {:?} takes the value {:?}, which tokenizes non-canonically against the \
+                 {:?} after it; unsupported",
+                field.name,
+                option.key,
+                after.text,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The canonical tokenization of two adjacent pieces of the document, encoded as
+/// one string rather than as two — each piece keeping the content ranges it
+/// carries on its own, the right one rebased onto the joined text.
+fn encode_seam(
+    tokenizer: &LagunaTokenizer,
+    left: (&str, &[Range<usize>]),
+    right: (&str, &[Range<usize>]),
+) -> Result<Vec<u32>> {
+    let text = format!("{}{}", left.0, right.0);
+    let offset = left.0.len();
+    let ranges: Vec<Range<usize>> = left
+        .1
+        .iter()
+        .cloned()
+        .chain(right.1.iter().map(|r| r.start + offset..r.end + offset))
+        .collect();
+    tokenizer.encode_prompt(&text, &ranges)
+}
+
+/// `text` as a quoted, escaped JSON string.
+fn json_string(text: &str) -> String {
+    Value::String(text.to_string()).to_string()
+}
+
+/// `text` escaped as JSON but WITHOUT its quotes — the bytes that WOULD go
+/// between the skeleton's quotes. A value the assembler can write literally is
+/// its own body; anything else differs here, which is how such a value is
+/// spotted and refused.
+fn json_body(text: &str) -> String {
+    let quoted = json_string(text);
+    quoted[1..quoted.len() - 1].to_string()
+}
+
+/// Encode caller-supplied text as content: an added-token string inside it
+/// stays plain text rather than becoming the control token whose id it names.
+fn encode_client_text(tokenizer: &LagunaTokenizer, text: &str) -> Result<Vec<u32>> {
+    tokenizer.encode_prompt(text, &[0..text.len()])
+}
+
+/// One field's outcome: which option won, and the evidence behind it.
+#[derive(Debug, Clone, PartialEq)]
+struct Pick {
+    index: usize,
+    /// Per option, `softmax` over the options' full-sequence logprobs — value
+    /// and closing delimiter both (see [`score_field`]) — which is the
+    /// probability the response reports, renormalized over what the schema
+    /// allows. Always at temperature 1 and never truncated, whatever sampling
+    /// the item drew under.
+    probs: Vec<f64>,
+    /// Mass the choice point put on tokens that open NO option — everything the
+    /// model would rather have written than any allowed value.
+    ///
+    /// Measured on OPENERS, one row, while `probs` are measured over whole
+    /// sequences. The two answer different questions and do not add up: options
+    /// sharing a first token share its mass here (counted once), and an opener
+    /// this counts as inside may still lead somewhere no option goes.
+    ///
+    /// Read it as a distance from the schema, not as a confidence: "everything
+    /// else" includes how the model would have FORMATTED the answer, and the
+    /// skeleton is compact JSON. A boolean's choice point sits right after the
+    /// colon, where a model that pretty-prints puts almost all of its mass on a
+    /// space, so a near-1 escape there says nothing about the answer. The
+    /// reported probabilities are unaffected — every option is scored from this
+    /// same row, so whatever the model spent elsewhere divides out of them.
+    escape: f64,
+}
+
+/// Run one scored item: teacher-force the skeleton, score each field's options
+/// where a value belongs, and report the document the two produced.
+///
+/// The item's prompt is already prefilled by the caller, so the logits in hand
+/// describe the position the answer starts at.
+fn assemble_scored(
+    generator: &mut Generator,
+    item: &Prepared,
+    plan: &ScoredPlan,
+) -> Result<ItemOutcome> {
+    // Refused before any forward runs, and against the LONGEST option of each
+    // field: which option wins is not known until it has been scored, and an
+    // item that could only fit by picking short answers does not fit.
+    let reasoning_floor = usize::from(item.starts_in_thinking);
+    if plan.worst_case_tokens + reasoning_floor > item.max_tokens {
+        return Ok(budget_refusal(item, plan, reasoning_floor));
+    }
+
+    let prompt_len = item.tokens.len();
+    let mut reasoning = String::new();
+    let mut written = Vec::new();
+    if item.starts_in_thinking {
+        let run = decode_reasoning(
+            generator,
+            prompt_len,
+            item.max_tokens - plan.worst_case_tokens,
+        )?;
+        ensure!(
+            run.closed,
+            "the reasoning block did not close within the {} tokens left after the assembled \
+             answer's budget, so there is no answer position to score from",
+            item.max_tokens - plan.worst_case_tokens,
+        );
+        reasoning = run.text;
+        written = run.ids;
+    }
+
+    // Both decode loops may leave their last emitted token unforwarded, so the
+    // cache — never the count of events — says how much of the reasoning is
+    // context. Whatever it is short of gets written back with the first segment.
+    let held = generator.cache_len().saturating_sub(prompt_len);
+    ensure!(
+        held <= written.len(),
+        "the KV cache holds {held} tokens past the prompt but only {} were emitted",
+        written.len(),
+    );
+    let mut pending = written[held..].to_vec();
+
+    let mut rng = StdRng::seed_from_u64(item.sampling.seed);
+    let mut document = String::new();
+    let mut picks = Vec::with_capacity(plan.fields.len());
+    for (index, field) in plan.fields.iter().enumerate() {
+        pending.extend_from_slice(&plan.segments[index].tokens);
+        prefill_for_scoring(generator, &pending)?;
+        document.push_str(&plan.segments[index].text);
+
+        // Every candidate is scored through to the token that opens the segment
+        // after it, which is what makes the option set prefix-free.
+        let terminator = plan.segments[index + 1].tokens[0];
+        let pick = score_field(generator, field, terminator, &item.sampling, &mut rng)?;
+        let chosen = &field.options[pick.index];
+        document.push_str(&chosen.text);
+        pending = chosen.tokens.clone();
+        picks.push(pick);
+    }
+    // The closing segment is never prefilled: nothing is scored after it, and
+    // the cache this item leaves behind is rewound by the next one anyway. It is
+    // still part of the answer, so it is still part of the token count.
+    document.push_str(&plan.segments[plan.fields.len()].text);
+
+    let value: Map<String, Value> = plan
+        .fields
+        .iter()
+        .zip(&picks)
+        .map(|(field, pick)| (field.name.clone(), report(field, pick)))
+        .collect();
+    let assembled: usize = plan.segments.iter().map(|s| s.tokens.len()).sum::<usize>()
+        + plan
+            .fields
+            .iter()
+            .zip(&picks)
+            .map(|(field, pick)| field.options[pick.index].tokens.len())
+            .sum::<usize>();
+
+    Ok(ItemOutcome {
+        content: format!("{reasoning}{document}"),
+        text: document,
+        finish_reason: FinishReason::Stop,
+        completion_tokens: written.len() + assembled,
+        json: Some(Value::Object(value)),
+        error: None,
+    })
+}
+
+/// The response for an item whose assembled answer cannot fit its token budget.
+/// Reported as `length` rather than as an error: the budget is what refused it,
+/// which is the same thing that truncates a decoded answer.
+fn budget_refusal(item: &Prepared, plan: &ScoredPlan, reasoning_floor: usize) -> ItemOutcome {
+    let reasoning = if reasoning_floor > 0 {
+        ", and its reasoning block needs at least one token more"
+    } else {
+        ""
+    };
+    ItemOutcome {
+        content: String::new(),
+        text: String::new(),
+        finish_reason: FinishReason::Length,
+        completion_tokens: 0,
+        json: None,
+        error: Some(format!(
+            "the assembled answer needs up to {} tokens{reasoning}, past this item's \
+             {}-token budget",
+            plan.worst_case_tokens, item.max_tokens,
+        )),
+    }
+}
+
+/// What the reasoning phase of a scored item produced.
+struct Reasoning {
+    /// The reasoning as text, `</think>` stripped by the decoder as usual.
+    text: String,
+    /// Every id emitted, `</think>` included, in order.
+    ids: Vec<u32>,
+    closed: bool,
+}
+
+/// Decode a scored item's reasoning and stop the moment `</think>` commits.
+///
+/// Assembly needs the cache to hold the reasoning and nothing past it, and the
+/// cancel poll — which both decode loops read once per emitted token, right
+/// after the callback — is what hands the turn over on exactly that token. The
+/// two loops differ in whether the last emitted token was forwarded, so the
+/// caller reconciles against `cache_len()` rather than against the ids here.
+fn decode_reasoning(
+    generator: &mut Generator,
+    prompt_len: usize,
+    budget: usize,
+) -> Result<Reasoning> {
+    let closed = Cell::new(false);
+    let mut text = String::new();
+    let mut ids = Vec::new();
+    {
+        let mut on_event = |event: GenEvent| {
+            ids.push(event.id());
+            text.push_str(event.text());
+            if event.id() == LagunaTokenizer::THINK_CLOSE {
+                closed.set(true);
+            }
+        };
+        let mut stop = || closed.get();
+        if generator.spec_ready_at(prompt_len) {
+            generator.decode_loop_spec(prompt_len, true, budget, &mut on_event, &mut stop)?;
+        } else {
+            generator.decode_loop(prompt_len, true, budget, &mut on_event, &mut stop)?;
+        }
+    }
+    Ok(Reasoning {
+        text,
+        ids,
+        closed: closed.get(),
+    })
+}
+
+/// Prefill `tokens` so the logits left behind are the ones a DECODE step would
+/// have produced: everything but the last token as one span, the last token
+/// alone.
+///
+/// The lm head runs on a span's final position only, and at one position it
+/// takes the mat-vec bypass a longer span does not (`XwenModel::forward`). Every
+/// row a score is read from therefore comes off the same path — the skeleton's
+/// choice point and an option's continuations alike — instead of the choice
+/// point's precision depending on how long the segment before it happened to be.
+fn prefill_for_scoring(generator: &mut Generator, tokens: &[u32]) -> Result<()> {
+    ensure!(
+        !tokens.is_empty(),
+        "prefill_for_scoring: nothing to prefill"
+    );
+    let (head, last) = tokens.split_at(tokens.len() - 1);
+    let mut pos = generator.cache_len();
+    if !head.is_empty() {
+        generator.prefill_tokens(head, pos)?;
+        pos += head.len();
+    }
+    generator.prefill_tokens(last, pos)
+}
+
+/// Score every option a field allows at the current choice point, and pick one.
+///
+/// An option's score is the logprob of its token sequence PLUS `terminator`, the
+/// token that closes the value in the assembled document — the closing quote of
+/// a string field, the `,` or `}` after a boolean. Scoring the body alone would
+/// make the candidate set prefix-dependent: `low` is a strict prefix of
+/// `low_priority`, so the longer one's score is the shorter one's plus a
+/// negative, and greedy selection could never choose it however plainly the
+/// model preferred it. Ending every candidate at a common delimiter makes the
+/// set prefix-free, and turns the score into the probability of the event that
+/// actually distinguishes them: this value, then the end of it.
+///
+/// The terminator is SCORED but never committed — it belongs to the segment
+/// after the value, which the assembly writes in its own right.
+///
+/// The first token of every option is read from the one row the choice point
+/// already holds, so that row is read FIRST, before anything touches the cache:
+/// a restore drops it. Every option then costs one forward per body token, the
+/// last of which is what the terminator is scored against.
+fn score_field(
+    generator: &mut Generator,
+    field: &ScoredField,
+    terminator: u32,
+    sampling: &SamplerOptions,
+    rng: &mut StdRng,
+) -> Result<Pick> {
+    let openers: Vec<u32> = field
+        .options
+        .iter()
+        .map(|option| option.tokens[0])
+        .collect();
+    let mut scores = generator.last_logprobs_for(&openers)?;
+    let escape = escape_mass(&openers, &scores);
+
+    let choice_pos = generator.cache_len();
+    // Taken once for every option: a restore copies by reference, so re-taking
+    // it per option would pay for a whole cache copy each time.
+    let snapshot = generator.take_cache_snapshot()?;
+    for (option, score) in field.options.iter().zip(scores.iter_mut()) {
+        for (step, token) in option.tokens.iter().enumerate() {
+            generator.prefill_tokens(&[*token], choice_pos + step)?;
+            // The next token of the option, or — once the body is spent — the
+            // delimiter that ends it.
+            let next = option.tokens.get(step + 1).copied().unwrap_or(terminator);
+            *score += generator.last_logprobs_for(&[next])?[0];
+        }
+        generator.restore_cache_snapshot(&snapshot)?;
+        // A prefill feeds the drafter as well as the target, so a branch that
+        // rewinds one has to rewind the other with it.
+        generator.sync_drafter_to(choice_pos)?;
+    }
+
+    Ok(Pick {
+        // Reported untruncated and at temperature 1, whatever the draw below
+        // does: the score is what the model thinks, not how the item sampled.
+        probs: renormalize(&scores, 1.0),
+        index: select_option(&scores, sampling, rng)?,
+        escape,
+    })
+}
+
+/// Draw one option from the posterior under the item's sampling settings.
+///
+/// Runs `Sampler`'s pipeline over the option set the way the sampler runs it over
+/// the vocabulary — temperature, then top-k, then a nucleus cut measured on the
+/// renormalized survivors — so that a scored field and a decoded answer answer to
+/// the same knobs. A `top_k` of at most one collapses to greedy there
+/// (`Sampler::new`) and collapses to greedy here.
+fn select_option(scores: &[f64], sampling: &SamplerOptions, rng: &mut StdRng) -> Result<usize> {
+    if sampling.temperature <= 0.0 || sampling.top_k <= 1 {
+        return Ok(argmax_index(scores));
+    }
+    let probs = renormalize(scores, sampling.temperature);
+    // Descending by probability, ties going to the option the schema listed
+    // first — the direction `top_k_desc` breaks them in.
+    let mut ranked: Vec<(usize, f64)> = probs.iter().copied().enumerate().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(sampling.top_k);
+    truncate_nucleus(&mut ranked, sampling.top_p);
+    let weights: Vec<f64> = ranked.iter().map(|(_, prob)| *prob).collect();
+    let picked = WeightedIndex::new(&weights)
+        .map_err(|error| anyhow!("no option carries any mass after top-k/top-p: {error}"))?
+        .sample(rng);
+    Ok(ranked[picked].0)
+}
+
+/// Keep the shortest prefix of `ranked` whose mass — renormalized over the
+/// candidates themselves — reaches `top_p`, the token that crosses the threshold
+/// included. That is llama.cpp's convention and the one `truncate_top_p` applies
+/// to the vocabulary, early return at 1.0 included: renormalized weights sum to
+/// one only to within rounding, and a cumulative walk could otherwise drop the
+/// last candidate over an ulp.
+fn truncate_nucleus(ranked: &mut Vec<(usize, f64)>, top_p: f64) {
+    if top_p >= 1.0 {
+        return;
+    }
+    let total: f64 = ranked.iter().map(|(_, prob)| prob).sum();
+    if total <= 0.0 {
+        return;
+    }
+    let mut cumulative = 0.0;
+    let mut keep = ranked.len();
+    for (at, (_, prob)) in ranked.iter().enumerate() {
+        cumulative += prob / total;
+        if cumulative >= top_p {
+            keep = at + 1;
+            break;
+        }
+    }
+    ranked.truncate(keep);
+}
+
+/// The probability the choice point put on tokens that open NO option, read off
+/// the RAW (unrenormalized) distribution: `openers` are the options' first
+/// tokens and `logprobs` their log-probabilities under it.
+///
+/// Only DISTINCT openers count. Two options that begin with the same token —
+/// `"positive"` and `"positively"` share one — otherwise subtract that token's
+/// mass twice and drive the escape negative. Rounding can still leave the sum a
+/// hair past 1, and a reported probability is never outside [0, 1].
+fn escape_mass(openers: &[u32], logprobs: &[f64]) -> f64 {
+    let mut counted: Vec<u32> = Vec::with_capacity(openers.len());
+    let mut inside = 0.0;
+    for (token, logprob) in openers.iter().zip(logprobs) {
+        if !counted.contains(token) {
+            counted.push(*token);
+            inside += logprob.exp();
+        }
+    }
+    (1.0 - inside).clamp(0.0, 1.0)
+}
+
+/// `softmax` over option scores at `temperature`, max-subtracted so a long
+/// option's very negative logprob cannot underflow the whole row.
+fn renormalize(scores: &[f64], temperature: f64) -> Vec<f64> {
+    let scaled: Vec<f64> = scores.iter().map(|score| score / temperature).collect();
+    let max = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let exponentiated: Vec<f64> = scaled.iter().map(|score| (score - max).exp()).collect();
+    let total: f64 = exponentiated.iter().sum();
+    exponentiated.iter().map(|value| value / total).collect()
+}
+
+/// The highest-scoring option, ties going to the one the schema listed first.
+fn argmax_index(scores: &[f64]) -> usize {
+    let mut best = f64::NEG_INFINITY;
+    let mut index = 0;
+    for (at, &score) in scores.iter().enumerate() {
+        if score > best {
+            best = score;
+            index = at;
+        }
+    }
+    index
+}
+
+/// One field's entry in the response `json`.
+fn report(field: &ScoredField, pick: &Pick) -> Value {
+    let chosen = &field.options[pick.index];
+    match field.mode {
+        ScoreMode::Bare => chosen.value.clone(),
+        ScoreMode::Value => json!({ "value": chosen.value, "score": pick.probs[pick.index] }),
+        ScoreMode::All => {
+            let scores: Map<String, Value> = field
+                .options
+                .iter()
+                .zip(&pick.probs)
+                .map(|(option, prob)| (option.key.clone(), json!(prob)))
+                .collect();
+            json!({
+                "value": chosen.value,
+                "score": pick.probs[pick.index],
+                "scores": scores,
+                "escape": pick.escape,
+            })
+        }
+    }
+}
+
+/// Render, encode and validate one item.
+fn prepare_item(
+    tokenizer: &LagunaTokenizer,
+    max_ctx: usize,
+    item: &BatchItem,
+    defaults: &ItemDefaults,
+) -> Result<Prepared> {
+    let messages = item
+        .messages
+        .iter()
+        .map(chat_message)
+        .collect::<Result<Vec<_>>>()?;
+    let (opts, continuation) = resolve_render(item, defaults)?;
+    let (tokens, prefix_len, starts_in_thinking) =
+        encode_item(tokenizer, &messages, &opts, continuation.as_ref())?;
+    // The renderer writes the prefix verbatim, so what it was asked to render
+    // is what the answer continues from.
+    let prefix_text = continuation
+        .and_then(|c| c.prefix)
+        .unwrap_or_else(String::new);
+
+    let scored = match &item.schema {
+        Some(schema) => scored_plan(tokenizer, schema)?,
+        None => None,
+    };
+    // The runner writes a scored item's whole document, so there is nowhere for
+    // a caller's opening fragment to go: it would sit in front of a second
+    // complete object rather than becoming its head.
+    ensure!(
+        scored.is_none() || prefix_len == 0,
+        "scored output assembles the whole document, so the item cannot also supply a prefill"
+    );
+
+    let max_tokens = item
+        .max_tokens
+        .or(defaults.max_tokens)
+        .unwrap_or(DEFAULT_MAX_TOKENS);
+    ensure!(max_tokens > 0, "max_tokens must be at least 1");
+    // Phrased as a subtraction rather than as `tokens.len() + max_tokens`: a
+    // caller's `max_tokens` is arbitrary, and release builds wrap on overflow
+    // rather than panic — a huge budget would come out small and pass.
+    ensure!(
+        max_tokens <= max_ctx.saturating_sub(tokens.len()),
+        "the prompt ({} tokens) plus max_tokens ({max_tokens}) exceeds the context ({max_ctx}); \
+         shorten the item or lower its max_tokens",
+        tokens.len(),
+    );
+
+    Ok(Prepared {
+        tokens,
+        prefix_len,
+        prefix_text,
+        starts_in_thinking,
+        max_tokens,
+        sampling: resolve_sampling(defaults.sampling.as_ref(), item.sampling.as_ref()),
+        // A scored schema never reaches the grammar compiler: llguidance has
+        // never heard of `include_score`, and the scored path masks nothing.
+        schema: match scored {
+            Some(_) => None,
+            None => item.schema.clone(),
+        },
+        scored,
+    })
+}
+
+/// Turn a wire message into a renderer message.
+fn chat_message(message: &BatchMessage) -> Result<Message> {
+    let content = message.content.clone();
+    match message.role.as_str() {
+        "system" => Ok(Message::System(content)),
+        "user" => Ok(Message::User(content)),
+        "assistant" => Ok(Message::Assistant {
+            content,
+            reasoning: message.thinking.clone().filter(|text| !text.is_empty()),
+            tool_calls: Vec::new(),
+        }),
+        "tool" => Ok(Message::ToolResponse(content)),
+        other => bail!("unknown message role {other:?} (expected system, user, assistant or tool)"),
+    }
+}
+
+/// Resolve an item's thinking and prefill settings into the renderer's
+/// [`ChatOptions`] and [`Continuation`].
+///
+/// Three shapes, one per [`ThinkingSpec`] value. Off renders a closed empty
+/// `<think>` block and starts the model in the answer. On leaves the block open
+/// and the first decoded token is reasoning. Injected reasoning goes inside the
+/// block and closes it, which is also what lets a prefill follow.
+///
+/// The one refused combination is a prefill with thinking merely on: the prefix
+/// would be rendered inside the open thinking span and read back as reasoning
+/// (`chat.rs` refuses it too — this is where it gets a message naming the two
+/// fields).
+fn resolve_render(
+    item: &BatchItem,
+    defaults: &ItemDefaults,
+) -> Result<(ChatOptions, Option<Continuation>)> {
+    let thinking = item
+        .thinking
+        .clone()
+        .or_else(|| defaults.thinking.clone())
+        .unwrap_or(ThinkingSpec::Enabled(false));
+    let prefill = item.prefill.clone().filter(|text| !text.is_empty());
+
+    let (enable_thinking, injected) = match &thinking {
+        ThinkingSpec::Enabled(on) => (*on, None),
+        // An empty string is how a caller spells "not supplied" without
+        // dropping the key; it asks for thinking, not for injected reasoning.
+        ThinkingSpec::Injected(text) if text.is_empty() => (true, None),
+        ThinkingSpec::Injected(text) => (true, Some(text.clone())),
+    };
+    if enable_thinking && prefill.is_some() && injected.is_none() {
+        bail!(
+            "prefill needs the thinking span closed: set thinking to false, or to the reasoning \
+             the turn should carry"
+        );
+    }
+
+    let opts = ChatOptions {
+        enable_thinking,
+        preserve_thinking: false,
+        tools: Vec::new(),
+    };
+    let continuation = (injected.is_some() || prefill.is_some()).then(|| Continuation {
+        close_thinking: injected.is_some(),
+        thinking: injected,
+        prefix: prefill,
+    });
+    Ok((opts, continuation))
+}
+
+/// Layer a request's sampling overrides onto the batch default.
+fn resolve_sampling(
+    defaults: Option<&SamplingSpec>,
+    item: Option<&SamplingSpec>,
+) -> SamplerOptions {
+    let mut opts = BATCH_SAMPLING;
+    for spec in [defaults, item].into_iter().flatten() {
+        if let Some(temperature) = spec.temperature {
+            opts.temperature = temperature;
+        }
+        if let Some(top_p) = spec.top_p {
+            opts.top_p = top_p;
+        }
+        if let Some(top_k) = spec.top_k {
+            opts.top_k = top_k;
+        }
+        if let Some(seed) = spec.seed {
+            opts.seed = seed;
+        }
+    }
+    opts
+}
+
+/// Render a conversation and encode it, returning the ids, the token count of
+/// any rendered response prefix, and whether the prompt ends inside an open
+/// thinking span.
+///
+/// The context and the generation header tokenize independently — the header
+/// opens with the added token `<|im_start|>`, which BPE never merges into its
+/// neighbours — and so does the response prefix inside the header, which the
+/// added token `</think>` fences off. Encoding in spans is what counts the
+/// prefix rather than guessing it.
+///
+/// Every span is encoded with its client-content byte ranges, so an added-token
+/// string inside a message body — a document quoting `<|im_end|>` — stays plain
+/// text instead of becoming a control token the decode loop would stop on.
+fn encode_item(
+    tokenizer: &LagunaTokenizer,
+    messages: &[Message],
+    opts: &ChatOptions,
+    continuation: Option<&Continuation>,
+) -> Result<(Vec<u32>, usize, bool)> {
+    let chat::PromptParts {
+        context,
+        header,
+        content_ranges,
+        header_content_ranges,
+        header_prefix_start,
+        starts_in_thinking,
+        ..
+    } = chat::build_prompt_parts_with_spans_continued(messages, opts, continuation)?;
+
+    let mut tokens = tokenizer.encode_prompt(&context, &content_ranges)?;
+    let prefix_len = match header_prefix_start {
+        Some(split) => {
+            let (head, prefix) = split_content_ranges(&header_content_ranges, split);
+            tokens.extend(tokenizer.encode_prompt(&header[..split], &head)?);
+            let prefix = tokenizer.encode_prompt(&header[split..], &prefix)?;
+            let prefix_len = prefix.len();
+            tokens.extend(prefix);
+            prefix_len
+        }
+        None => {
+            tokens.extend(tokenizer.encode_prompt(&header, &header_content_ranges)?);
+            0
+        }
+    };
+    ensure!(!tokens.is_empty(), "the prompt encoded to zero tokens");
+    Ok((tokens, prefix_len, starts_in_thinking))
+}
+
+/// Divide client-content byte ranges at `at` into the ranges before it and the
+/// ranges after, the latter rebased onto that half. A range is clipped rather
+/// than assigned to a side, so one spanning the split would keep both halves
+/// marked as client content.
+fn split_content_ranges(
+    ranges: &[Range<usize>],
+    at: usize,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let head = ranges
+        .iter()
+        .map(|r| r.start.min(at)..r.end.min(at))
+        .filter(|r| !r.is_empty())
+        .collect();
+    let tail = ranges
+        .iter()
+        .map(|r| r.start.max(at) - at..r.end.max(at) - at)
+        .filter(|r| !r.is_empty())
+        .collect();
+    (head, tail)
+}
+
+fn failed_item(id: &str, error: String) -> ItemResponse {
+    ItemResponse {
+        id: id.to_string(),
+        content: String::new(),
+        text: String::new(),
+        json: None,
+        finish_reason: FinishReason::Error,
+        usage: Usage::default(),
+        error: Some(error),
+    }
+}
+
+fn elapsed_ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: &str) -> BatchItem {
+        BatchItem {
+            id: id.to_string(),
+            messages: vec![BatchMessage {
+                role: "user".into(),
+                content: "hello".into(),
+                thinking: None,
+            }],
+            schema: None,
+            thinking: None,
+            prefill: None,
+            max_tokens: None,
+            sampling: None,
+        }
+    }
+
+    // An empty set has no prefix to share, and a lone sequence shares its whole
+    // length with itself.
+    #[test]
+    fn lcp_of_nothing_and_of_one() {
+        assert_eq!(longest_common_prefix(&[]), 0);
+        assert_eq!(longest_common_prefix(&[&[1, 2, 3]]), 3);
+    }
+
+    #[test]
+    fn lcp_of_identical_sequences_is_their_length() {
+        let a: &[u32] = &[7, 8, 9, 10];
+        assert_eq!(longest_common_prefix(&[a, a, a]), 4);
+    }
+
+    // The shared span stops at the first disagreement, and one outlier pulls it
+    // down for the whole set.
+    #[test]
+    fn lcp_stops_at_the_first_divergence() {
+        let a: &[u32] = &[1, 2, 3, 4, 5];
+        let b: &[u32] = &[1, 2, 3, 9, 9];
+        let c: &[u32] = &[1, 2, 7, 4, 5];
+        assert_eq!(longest_common_prefix(&[a, b]), 3);
+        assert_eq!(longest_common_prefix(&[a, b, c]), 2);
+        assert_eq!(longest_common_prefix(&[a, &[9, 9]]), 0);
+    }
+
+    // A sequence that is a strict prefix of another caps the shared span at its
+    // own length.
+    #[test]
+    fn lcp_is_capped_by_the_shortest_sequence() {
+        let long: &[u32] = &[1, 2, 3, 4, 5];
+        let short: &[u32] = &[1, 2, 3];
+        assert_eq!(longest_common_prefix(&[long, short]), 3);
+        assert_eq!(longest_common_prefix(&[short, long]), 3);
+    }
+
+    // Below the floor the snapshot is not worth taking, and every item runs
+    // from a reset cache instead.
+    #[test]
+    fn a_short_shared_prefix_falls_back_to_cold_items() {
+        let a: Vec<u32> = (0..200).collect();
+        let mut b = a.clone();
+        b[MIN_SHARED_PREFIX - 2] = 9999;
+        assert_eq!(shared_prefix_len(&[&a, &b]), None);
+    }
+
+    #[test]
+    fn a_long_shared_prefix_is_snapshotted() {
+        let a: Vec<u32> = (0..200).collect();
+        let mut b = a.clone();
+        b[MIN_SHARED_PREFIX + 10] = 9999;
+        assert_eq!(shared_prefix_len(&[&a, &b]), Some(MIN_SHARED_PREFIX + 10));
+    }
+
+    // Identical items would share every token; the span is held one short so
+    // each still has a tail to prefill, which is what keeps the snapshot valid
+    // for the items after the first.
+    #[test]
+    fn the_shared_span_leaves_every_item_a_tail() {
+        let a: Vec<u32> = (0..200).collect();
+        assert_eq!(shared_prefix_len(&[&a, &a]), Some(199));
+        // And equally when one item's prompt is a strict prefix of another's.
+        let b: Vec<u32> = (0..120).collect();
+        assert_eq!(shared_prefix_len(&[&a, &b]), Some(119));
+    }
+
+    // A single item shares its prompt with nobody: snapshotting it would cost a
+    // restore and save nothing.
+    #[test]
+    fn a_lone_item_never_takes_the_snapshot_path() {
+        let a: Vec<u32> = (0..200).collect();
+        assert_eq!(shared_prefix_len(&[&a]), None);
+        assert_eq!(shared_prefix_len(&[]), None);
+    }
+
+    // Batch sampling is greedy until something says otherwise, and the two
+    // override layers apply in order without either restating the whole set.
+    #[test]
+    fn sampling_layers_default_then_item() {
+        let plain = resolve_sampling(None, None);
+        assert_eq!(plain.temperature, 0.0);
+
+        let defaults = SamplingSpec {
+            temperature: Some(0.7),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let layered = resolve_sampling(Some(&defaults), None);
+        assert_eq!(layered.temperature, 0.7);
+        assert_eq!(layered.seed, 7);
+        assert_eq!(layered.top_k, BATCH_SAMPLING.top_k);
+
+        let item = SamplingSpec {
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        let both = resolve_sampling(Some(&defaults), Some(&item));
+        assert_eq!(both.temperature, 0.0);
+        // Untouched by the item, so the default layer still shows through.
+        assert_eq!(both.seed, 7);
+    }
+
+    // Thinking is off unless a request asks for it, which is the divergence
+    // from the chat surface batch makes on purpose.
+    #[test]
+    fn thinking_defaults_off() {
+        let (opts, continuation) = resolve_render(&item("a"), &ItemDefaults::default()).unwrap();
+        assert!(!opts.enable_thinking);
+        assert!(continuation.is_none());
+    }
+
+    #[test]
+    fn thinking_true_leaves_the_span_open() {
+        let mut spec = item("a");
+        spec.thinking = Some(ThinkingSpec::Enabled(true));
+        let (opts, continuation) = resolve_render(&spec, &ItemDefaults::default()).unwrap();
+        assert!(opts.enable_thinking);
+        assert!(continuation.is_none());
+    }
+
+    // Injected reasoning goes inside the block and closes it, so decoding
+    // starts in the answer.
+    #[test]
+    fn injected_thinking_closes_the_span() {
+        let mut spec = item("a");
+        spec.thinking = Some(ThinkingSpec::Injected("the label is positive".into()));
+        let (opts, continuation) = resolve_render(&spec, &ItemDefaults::default()).unwrap();
+        assert!(opts.enable_thinking);
+        let continuation = continuation.expect("injected reasoning renders a continuation");
+        assert_eq!(
+            continuation.thinking.as_deref(),
+            Some("the label is positive")
+        );
+        assert!(continuation.close_thinking);
+        assert!(continuation.prefix.is_none());
+    }
+
+    #[test]
+    fn prefill_rides_the_continuation() {
+        let mut spec = item("a");
+        spec.prefill = Some("{\"label\":".into());
+        let (opts, continuation) = resolve_render(&spec, &ItemDefaults::default()).unwrap();
+        assert!(!opts.enable_thinking);
+        let continuation = continuation.expect("a prefill renders a continuation");
+        assert_eq!(continuation.prefix.as_deref(), Some("{\"label\":"));
+        assert!(!continuation.close_thinking);
+    }
+
+    // A prefill under an open thinking span would be read back as reasoning.
+    #[test]
+    fn prefill_with_thinking_merely_on_is_refused() {
+        let mut spec = item("a");
+        spec.thinking = Some(ThinkingSpec::Enabled(true));
+        spec.prefill = Some("{".into());
+        let error = resolve_render(&spec, &ItemDefaults::default())
+            .expect_err("a prefix inside the thinking span has no rendering");
+        assert!(
+            error.to_string().contains("thinking span closed"),
+            "{error}"
+        );
+    }
+
+    // An item's own setting wins over the batch default, in both directions.
+    #[test]
+    fn an_item_overrides_the_default_thinking() {
+        let defaults = ItemDefaults {
+            thinking: Some(ThinkingSpec::Enabled(true)),
+            ..Default::default()
+        };
+        let (opts, _) = resolve_render(&item("a"), &defaults).unwrap();
+        assert!(opts.enable_thinking);
+
+        let mut spec = item("a");
+        spec.thinking = Some(ThinkingSpec::Enabled(false));
+        let (opts, _) = resolve_render(&spec, &defaults).unwrap();
+        assert!(!opts.enable_thinking);
+    }
+
+    // The wire shapes survive a round trip, `thinking` in all three of its
+    // forms included — it is one field holding a bool or a string.
+    #[test]
+    fn a_request_round_trips() {
+        let text = r#"{
+            "model": "35b",
+            "defaults": { "max_tokens": 512, "sampling": { "temperature": 0 }, "thinking": false },
+            "items": [
+                { "id": "sentiment",
+                  "messages": [
+                    { "role": "system", "content": "You label text." },
+                    { "role": "user", "content": "great news" }
+                  ],
+                  "schema": { "type": "object" },
+                  "thinking": "the tone is upbeat",
+                  "prefill": "{",
+                  "max_tokens": 64,
+                  "sampling": { "top_k": 1 } },
+                { "id": "topic",
+                  "messages": [{ "role": "user", "content": "hi" }],
+                  "thinking": true }
+            ]
+        }"#;
+        let request: BatchRequest = serde_json::from_str(text).unwrap();
+        assert_eq!(request.model.as_deref(), Some("35b"));
+        assert_eq!(request.model().unwrap(), Model::Qwen35BA3B);
+        assert_eq!(request.items.len(), 2);
+        assert_eq!(
+            request.items[0].thinking,
+            Some(ThinkingSpec::Injected("the tone is upbeat".into()))
+        );
+        assert_eq!(request.items[1].thinking, Some(ThinkingSpec::Enabled(true)));
+        assert_eq!(
+            request.defaults.thinking,
+            Some(ThinkingSpec::Enabled(false))
+        );
+
+        let again: BatchRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(again.items[0].thinking, request.items[0].thinking);
+        assert_eq!(again.items[0].prefill, request.items[0].prefill);
+        assert_eq!(again.items[1].id, "topic");
+    }
+
+    // A typo'd field is a request error rather than a silently ignored setting.
+    #[test]
+    fn an_unknown_field_is_refused() {
+        let text = r#"{ "items": [], "temperature": 0 }"#;
+        assert!(serde_json::from_str::<BatchRequest>(text).is_err());
+    }
+
+    #[test]
+    fn a_response_round_trips() {
+        let response = BatchResponse {
+            model: "35b".into(),
+            items: vec![
+                ItemResponse {
+                    id: "sentiment".into(),
+                    content: "{\"label\":\"a\"}".into(),
+                    text: "{\"label\":\"a\"}".into(),
+                    json: Some(serde_json::json!({ "label": "a" })),
+                    finish_reason: FinishReason::Stop,
+                    usage: Usage {
+                        prompt_tokens: 210,
+                        cached_prefix_tokens: 190,
+                        completion_tokens: 9,
+                    },
+                    error: None,
+                },
+                failed_item("topic", "the prompt encoded to zero tokens".into()),
+            ],
+            stats: BatchStats {
+                shared_prefix_tokens: 190,
+                snapshot_ms: 41.5,
+                items: 2,
+                load_ms: 2900.0,
+                total_ms: 3400.0,
+            },
+        };
+        let text = serde_json::to_string(&response).unwrap();
+        let again: BatchResponse = serde_json::from_str(&text).unwrap();
+        assert_eq!(again.items[0].finish_reason, FinishReason::Stop);
+        assert_eq!(again.items[0].json, response.items[0].json);
+        assert_eq!(again.items[1].finish_reason, FinishReason::Error);
+        assert!(again.items[1].error.is_some());
+        assert_eq!(again.stats.shared_prefix_tokens, 190);
+        // A successful item carries no `error` key at all, rather than a null.
+        assert!(!text.contains("\"error\":null"));
+    }
+
+    #[test]
+    fn the_model_comes_from_the_payload() {
+        let mut request: BatchRequest = serde_json::from_str(r#"{ "items": [] }"#).unwrap();
+        assert_eq!(request.model().unwrap(), Model::default());
+        request.model = Some("27b".into());
+        assert_eq!(request.model().unwrap(), Model::Qwen27B);
+        request.model = Some("13b".into());
+        assert!(request.model().is_err());
+    }
+
+    fn prepared(schema: Option<Value>, prefix_text: &str) -> Prepared {
+        Prepared {
+            tokens: vec![1, 2, 3],
+            prefix_len: 0,
+            prefix_text: prefix_text.to_string(),
+            starts_in_thinking: false,
+            max_tokens: 32,
+            sampling: BATCH_SAMPLING,
+            schema,
+            scored: None,
+        }
+    }
+
+    fn outcome(text: &str, finish_reason: FinishReason) -> ItemOutcome {
+        ItemOutcome {
+            content: text.to_string(),
+            text: text.to_string(),
+            finish_reason,
+            completion_tokens: 4,
+            json: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn an_unconstrained_item_has_no_parsed_value() {
+        let item = prepared(None, "");
+        assert!(constrained_value(&item, &outcome("hello", FinishReason::Stop)).is_none());
+    }
+
+    #[test]
+    fn a_completed_value_parses() {
+        let item = prepared(Some(serde_json::json!({ "type": "object" })), "");
+        let value = constrained_value(&item, &outcome("{\"label\": \"a\"}", FinishReason::Stop))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, serde_json::json!({ "label": "a" }));
+    }
+
+    // A prefill is prompt, so the model continues it rather than re-emitting
+    // it: the parsed value is the prefix plus what was decoded.
+    #[test]
+    fn a_prefilled_value_parses_from_the_whole_document() {
+        let item = prepared(Some(serde_json::json!({ "type": "object" })), "{\"label\":");
+        let value = constrained_value(&item, &outcome(" \"a\"}", FinishReason::Stop))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, serde_json::json!({ "label": "a" }));
+    }
+
+    // Stopping at the budget leaves the document half-written, and the item
+    // reports the budget rather than a parse error about the truncation.
+    #[test]
+    fn a_truncated_value_reports_the_budget() {
+        let item = prepared(Some(serde_json::json!({ "type": "object" })), "");
+        let error = constrained_value(&item, &outcome("{\"label\":", FinishReason::Length))
+            .unwrap()
+            .expect_err("an incomplete value has nothing to parse");
+        assert!(error.contains("32-token budget"), "{error}");
+    }
+
+    // ---- scored items
+
+    /// A schema of the v1 shape, whose `label` property is annotated with
+    /// `include_score` set to whatever the caller passes (`Value::Null` leaves
+    /// the annotation off entirely).
+    fn scored_schema(include: Value) -> Value {
+        let mut label = serde_json::json!({ "enum": ["yes", "no"] });
+        if !include.is_null() {
+            label["include_score"] = include;
+        }
+        serde_json::json!({
+            "type": "object",
+            "properties": { "label": label },
+            "required": ["label"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn plan_of(schema: &Value) -> Result<Option<ScoredPlan>> {
+        scored_plan(&LagunaTokenizer::embedded().unwrap(), schema)
+    }
+
+    // A schema that never mentions the annotation is not this path's business:
+    // it keeps the grammar exactly as it was.
+    #[test]
+    fn an_unannotated_schema_stays_on_the_grammar_path() {
+        assert!(plan_of(&scored_schema(Value::Null)).unwrap().is_none());
+        assert!(
+            plan_of(&serde_json::json!({ "type": "object" }))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Both spellings of the annotation are accepted, and each says how much the
+    // response reports.
+    #[test]
+    fn the_annotation_says_how_much_is_reported() {
+        let plan = plan_of(&scored_schema(Value::Bool(true)))
+            .unwrap()
+            .expect("include_score routes the item to the scored path");
+        assert_eq!(plan.fields[0].mode, ScoreMode::Value);
+
+        let plan = plan_of(&scored_schema(Value::String("all".into())))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.fields[0].mode, ScoreMode::All);
+    }
+
+    // `include_score: false` is still an annotation: it routes the item here and
+    // reports a bare value, rather than reading as "no annotation".
+    #[test]
+    fn a_false_annotation_still_scores_and_reports_bare() {
+        let plan = plan_of(&scored_schema(Value::Bool(false)))
+            .unwrap()
+            .expect("the key is present, so the schema is a scored one");
+        assert_eq!(plan.fields[0].mode, ScoreMode::Bare);
+    }
+
+    // A misspelled annotation value is refused rather than read as "off": the
+    // caller asked for scores and would otherwise get an answer with none.
+    #[test]
+    fn an_unknown_annotation_value_is_refused() {
+        let error = plan_of(&scored_schema(Value::String("some".into())))
+            .expect_err("only true, false and \"all\" are defined");
+        assert!(error.to_string().contains("include_score"), "{error}");
+    }
+
+    // A sibling property without the annotation is scored all the same — one
+    // item assembles one document — and reports a bare value.
+    #[test]
+    fn an_unannotated_sibling_is_still_assembled() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "label": { "enum": ["yes", "no"], "include_score": true },
+                "topic": { "type": "string", "enum": ["a", "b"] },
+            },
+            "required": ["label", "topic"],
+            "additionalProperties": false,
+        });
+        let plan = plan_of(&schema).unwrap().unwrap();
+        assert_eq!(plan.fields.len(), 2);
+        assert_eq!(plan.fields[1].mode, ScoreMode::Bare);
+        // Schema order, not alphabetical order, is what the document is written
+        // in (`serde_json`'s preserve_order).
+        assert_eq!(plan.fields[0].name, "label");
+        assert_eq!(plan.fields[1].name, "topic");
+    }
+
+    // Every way the v1 shape can be missed is an error naming what is wrong, and
+    // for a property, which property.
+    #[test]
+    fn the_scope_guard_names_what_it_refused() {
+        let cases: Vec<(Value, &str)> = vec![
+            (
+                serde_json::json!({
+                    "type": "array",
+                    "properties": { "a": { "enum": ["x"], "include_score": true } },
+                    "required": ["a"],
+                    "additionalProperties": false,
+                }),
+                "\"type\"",
+            ),
+            (
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": { "enum": ["x"], "include_score": true } },
+                    "required": ["a"],
+                }),
+                "additionalProperties",
+            ),
+            (
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "a": { "enum": ["x"], "include_score": true },
+                        "b": { "enum": ["y"] },
+                    },
+                    "required": ["a"],
+                    "additionalProperties": false,
+                }),
+                "required",
+            ),
+            (
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": { "type": "integer", "include_score": true } },
+                    "required": ["a"],
+                    "additionalProperties": false,
+                }),
+                "\"a\"",
+            ),
+            (
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": { "enum": [1, 2], "include_score": true } },
+                    "required": ["a"],
+                    "additionalProperties": false,
+                }),
+                "\"a\"",
+            ),
+            (
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": { "enum": ["x"], "include_score": true } },
+                    "required": ["a"],
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                }),
+                "minProperties",
+            ),
+            (
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "a": { "enum": ["x"], "include_score": true, "maxLength": 3 },
+                    },
+                    "required": ["a"],
+                    "additionalProperties": false,
+                }),
+                "maxLength",
+            ),
+        ];
+        for (schema, expected) in cases {
+            let error = plan_of(&schema)
+                .expect_err("this shape has no scoring definition")
+                .to_string();
+            assert!(error.contains(expected), "{expected} missing from: {error}");
+        }
+    }
+
+    // An annotation buried where the shape guard cannot honour it is refused,
+    // not dropped on the way to the grammar compiler.
+    #[test]
+    fn a_nested_annotation_is_refused_rather_than_ignored() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "inner": {
+                    "type": "object",
+                    "properties": { "a": { "enum": ["x"], "include_score": true } },
+                },
+            },
+            "required": ["inner"],
+            "additionalProperties": false,
+        });
+        assert!(plan_of(&schema).is_err());
+    }
+
+    // An empty option has no tokens, so it would score as free certainty; a
+    // repeated one would take mass twice.
+    #[test]
+    fn degenerate_enum_values_are_refused() {
+        let mut schema = scored_schema(Value::Bool(true));
+        schema["properties"]["label"]["enum"] = serde_json::json!(["yes", ""]);
+        assert!(plan_of(&schema).unwrap_err().to_string().contains("empty"));
+
+        schema["properties"]["label"]["enum"] = serde_json::json!(["yes", "yes"]);
+        assert!(plan_of(&schema).unwrap_err().to_string().contains("twice"));
+    }
+
+    // The skeleton is compact JSON with the values cut out, and a string field's
+    // quotes belong to it — which is what makes an option's score the logprob of
+    // its body rather than of an opening quote it shares with every sibling.
+    #[test]
+    fn the_skeleton_quotes_strings_and_leaves_booleans_bare() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "label": { "enum": ["yes"], "include_score": true },
+                "urgent": { "type": "boolean" },
+            },
+            "required": ["label", "urgent"],
+            "additionalProperties": false,
+        });
+        let plan = plan_of(&schema).unwrap().unwrap();
+        let text: Vec<&str> = plan.segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, vec!["{\"label\":\"", "\",\"urgent\":", "}"]);
+        assert_eq!(plan.fields[0].options[0].text, "yes");
+        // A boolean's options are the bare literals, keyed by their spelling but
+        // reported as real JSON booleans.
+        let urgent = &plan.fields[1].options;
+        assert_eq!(urgent[0].text, "true");
+        assert_eq!(urgent[0].value, Value::Bool(true));
+        assert_eq!(urgent[0].key, "true");
+        assert_eq!(urgent[1].value, Value::Bool(false));
+
+        // Reassembling the skeleton around one option per field gives the
+        // compact document the model is teacher-forced through.
+        let document = format!(
+            "{}{}{}{}{}",
+            text[0], plan.fields[0].options[0].text, text[1], urgent[1].text, text[2],
+        );
+        assert_eq!(document, "{\"label\":\"yes\",\"urgent\":false}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&document).unwrap(),
+            serde_json::json!({ "label": "yes", "urgent": false }),
+        );
+    }
+
+    // A value that JSON cannot carry literally is refused rather than escaped:
+    // the escape sequence, not the value, would be what gets scored, and a value
+    // holding a quote of its own would no longer be delimited by one.
+    #[test]
+    fn an_option_needing_escapes_is_refused() {
+        for value in ["say \"hi\"", "back\\slash", "line\nbreak"] {
+            let mut schema = scored_schema(Value::Bool(true));
+            schema["properties"]["label"]["enum"] = serde_json::json!([value]);
+            let error = plan_of(&schema)
+                .expect_err("v1 writes its values literally")
+                .to_string();
+            assert!(error.contains("JSON escaping"), "{error}");
+        }
+    }
+
+    // The document is teacher-forced piece by piece, but the model has only seen
+    // text tokenized whole. A value whose last character merges with the
+    // delimiter behind it would be forced through a seam no training text
+    // contains, so the plan refuses it instead of scoring across it.
+    #[test]
+    fn a_value_that_merges_with_its_delimiter_is_refused() {
+        // `!` followed by the closing quote is one token in this vocabulary,
+        // while `!` and `"` alone are two.
+        for value in ["yes!", "done.", "why?", "trailing "] {
+            let mut schema = scored_schema(Value::Bool(true));
+            schema["properties"]["label"]["enum"] = serde_json::json!([value, "plain"]);
+            let error = plan_of(&schema)
+                .expect_err("this value does not tokenize canonically against its quote")
+                .to_string();
+            assert!(error.contains("non-canonically"), "{error}");
+            assert!(error.contains(value), "{error}");
+            assert!(error.contains("label"), "{error}");
+        }
+    }
+
+    // The seam check is a guard, not a wall: ordinary word-shaped values — the
+    // ones a classification schema is actually made of — pass it, in both the
+    // quoted and the bare position.
+    #[test]
+    fn ordinary_values_tokenize_canonically() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "sentiment": {
+                    "enum": ["positive", "negative", "neutral", "mixed"],
+                    "include_score": "all",
+                },
+                "urgent": { "type": "boolean" },
+                "route_to": { "enum": ["fulfilment", "product", "support"] },
+            },
+            "required": ["sentiment", "urgent", "route_to"],
+            "additionalProperties": false,
+        });
+        assert!(plan_of(&schema).unwrap().is_some());
+    }
+
+    /// The token sequence a field's option is SCORED over: its body plus the
+    /// token that opens the segment after it (see `score_field`).
+    fn scored_sequences(plan: &ScoredPlan, field: usize) -> Vec<Vec<u32>> {
+        let terminator = plan.segments[field + 1].tokens[0];
+        plan.fields[field]
+            .options
+            .iter()
+            .map(|option| {
+                let mut sequence = option.tokens.clone();
+                sequence.push(terminator);
+                sequence
+            })
+            .collect()
+    }
+
+    // An option whose body is a strict prefix of another's could never win under
+    // greedy scoring — the longer score is the shorter one plus a negative — so
+    // every candidate is scored through the delimiter that ends it, which makes
+    // the set prefix-free and the comparison a real one.
+    #[test]
+    fn a_prefix_pair_scores_as_a_prefix_free_set() {
+        let mut schema = scored_schema(Value::String("all".into()));
+        schema["properties"]["label"]["enum"] = serde_json::json!(["low", "low_priority"]);
+        let plan = plan_of(&schema).unwrap().unwrap();
+
+        // The bodies alone ARE a prefix pair: this is the case the terminator
+        // exists for, not a hypothetical one.
+        let bodies: Vec<Vec<u32>> = plan.fields[0]
+            .options
+            .iter()
+            .map(|o| o.tokens.clone())
+            .collect();
+        assert!(bodies[1].starts_with(&bodies[0]), "{bodies:?}");
+
+        let sequences = scored_sequences(&plan, 0);
+        for (i, a) in sequences.iter().enumerate() {
+            for (j, b) in sequences.iter().enumerate() {
+                if i != j {
+                    assert!(!b.starts_with(a), "{a:?} still opens {b:?}");
+                }
+            }
+        }
+    }
+
+    // The terminator is the token that opens the NEXT segment: a string field's
+    // closing quote, a boolean's separator. It is scored and never committed —
+    // the segment writes it in its own right.
+    #[test]
+    fn the_terminator_is_the_next_segments_opening_token() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "label": { "enum": ["yes"], "include_score": true },
+                "urgent": { "type": "boolean" },
+            },
+            "required": ["label", "urgent"],
+            "additionalProperties": false,
+        });
+        let plan = plan_of(&schema).unwrap().unwrap();
+        let tokenizer = LagunaTokenizer::embedded().unwrap();
+        // The string field closes on the quote that opens `","urgent":`.
+        assert!(plan.segments[1].text.starts_with('"'));
+        assert_eq!(
+            plan.segments[1].tokens[0],
+            tokenizer
+                .encode_prompt(&plan.segments[1].text, &[])
+                .unwrap()[0],
+        );
+        // The boolean closes on the `}` that is the whole final segment.
+        assert_eq!(plan.segments[2].text, "}");
+        assert_eq!(plan.segments[2].tokens.len(), 1);
+    }
+
+    /// Sampling with everything but the named knobs left at the batch default.
+    fn sampling(temperature: f64, top_k: usize, top_p: f64) -> SamplerOptions {
+        SamplerOptions {
+            temperature,
+            top_k,
+            top_p,
+            seed: 7,
+        }
+    }
+
+    // Scored selection answers to the same knobs ordinary generation does, so a
+    // top-k or a nucleus cut narrows the option set rather than being ignored.
+    #[test]
+    fn selection_honors_top_k_and_top_p() {
+        let scores = [-0.1, -1.0, -2.0, -8.0];
+        let mut rng = StdRng::seed_from_u64(1);
+
+        // Greedy on both of the sampler's greedy conditions.
+        for options in [sampling(0.0, 20, 0.95), sampling(1.5, 1, 0.95)] {
+            for _ in 0..8 {
+                assert_eq!(select_option(&scores, &options, &mut rng).unwrap(), 0);
+            }
+        }
+        // top_k = 2 can never reach the third option however hot the draw.
+        let narrow = sampling(4.0, 2, 1.0);
+        for _ in 0..200 {
+            assert!(select_option(&scores, &narrow, &mut rng).unwrap() < 2);
+        }
+        // A tight nucleus keeps only the leader, even at a flattening
+        // temperature that would otherwise spread the mass.
+        let tight = sampling(4.0, 20, 0.1);
+        for _ in 0..50 {
+            assert_eq!(select_option(&scores, &tight, &mut rng).unwrap(), 0);
+        }
+        // Wide open, the tail is reachable — so the cuts above are what
+        // excluded it, not the scores.
+        let open = sampling(4.0, 20, 1.0);
+        let reached = (0..400).any(|_| select_option(&scores, &open, &mut rng).unwrap() >= 2);
+        assert!(reached, "a wide draw should reach past the top two");
+    }
+
+    // The nucleus cut measures mass renormalized over the candidates, keeps the
+    // option that crosses the threshold, and returns early at 1.0 so rounding
+    // cannot drop the last one.
+    #[test]
+    fn the_nucleus_cut_keeps_the_crossing_option() {
+        let ranked = || vec![(0usize, 0.5), (1, 0.3), (2, 0.2)];
+        let mut all = ranked();
+        truncate_nucleus(&mut all, 1.0);
+        assert_eq!(all.len(), 3);
+
+        let mut half = ranked();
+        truncate_nucleus(&mut half, 0.5);
+        assert_eq!(half.len(), 1);
+
+        // 0.5 alone does not reach 0.6; the option that crosses it is kept.
+        let mut most = ranked();
+        truncate_nucleus(&mut most, 0.6);
+        assert_eq!(most.len(), 2);
+    }
+
+    // A budget past the context is refused however large it is. Release builds
+    // wrap on overflow rather than panic, so a `max_tokens` near the top of the
+    // range must not come out of the arithmetic looking small and legal.
+    #[test]
+    fn an_enormous_budget_is_refused_rather_than_wrapping() {
+        let tokenizer = LagunaTokenizer::embedded().unwrap();
+        let defaults = ItemDefaults::default();
+        for max_tokens in [usize::MAX, usize::MAX - 1, 8193] {
+            let mut spec = item("a");
+            spec.max_tokens = Some(max_tokens);
+            let error = prepare_item(&tokenizer, 8192, &spec, &defaults)
+                .err()
+                .expect("a budget past the context has nowhere to decode")
+                .to_string();
+            assert!(error.contains("exceeds the context"), "{error}");
+        }
+        // And one that fits still prepares.
+        let mut spec = item("a");
+        spec.max_tokens = Some(64);
+        assert!(prepare_item(&tokenizer, 8192, &spec, &defaults).is_ok());
+    }
+
+    // The worst case is what the budget is checked against: every segment plus
+    // the LONGEST option of every field, since which option wins is not known
+    // until it has been scored.
+    #[test]
+    fn the_plan_budgets_for_the_longest_option() {
+        let mut schema = scored_schema(Value::Bool(true));
+        schema["properties"]["label"]["enum"] =
+            serde_json::json!(["no", "a thoroughly unlikely multi-token label"]);
+        let plan = plan_of(&schema).unwrap().unwrap();
+        let segments: usize = plan.segments.iter().map(|s| s.tokens.len()).sum();
+        let longest = plan.fields[0]
+            .options
+            .iter()
+            .map(|o| o.tokens.len())
+            .max()
+            .unwrap();
+        assert_eq!(plan.worst_case_tokens, segments + longest);
+        assert!(longest > 1, "the long option should span several tokens");
+    }
+
+    /// Scores as a decode would leave them: one logprob per option.
+    fn pick_from(scores: &[f64], escape: f64) -> Pick {
+        Pick {
+            index: argmax_index(scores),
+            probs: renormalize(scores, 1.0),
+            escape,
+        }
+    }
+
+    // The reported probabilities are the options' sequence logprobs renormalized
+    // over the options alone: what the model would have spent on anything else
+    // is reported separately, as the escape, rather than shrinking them.
+    #[test]
+    fn probabilities_renormalize_over_the_options() {
+        let probs = renormalize(&[-1.0, -2.0, -5.0], 1.0);
+        let total: f64 = probs.iter().sum();
+        assert!((total - 1.0).abs() < 1e-12, "{total}");
+        assert!(probs[0] > probs[1] && probs[1] > probs[2]);
+        // Equal scores split the mass evenly however deep the row is.
+        let even = renormalize(&[-3.5, -3.5, -3.5, -3.5], 1.0);
+        assert!(even.iter().all(|p| (p - 0.25).abs() < 1e-12));
+        // Very negative scores renormalize by their differences, not by their
+        // magnitude — the max subtraction is what keeps them from underflowing.
+        let far = renormalize(&[-900.0, -901.0], 1.0);
+        assert!((far[0] / far[1] - std::f64::consts::E).abs() < 1e-9);
+    }
+
+    // Temperature reshapes the draw without touching what is reported: the
+    // response always carries the renormalized probabilities themselves.
+    #[test]
+    fn temperature_flattens_the_draw_only() {
+        let scores = [-1.0, -2.0];
+        let cold = renormalize(&scores, 0.25);
+        let warm = renormalize(&scores, 4.0);
+        assert!(cold[0] > renormalize(&scores, 1.0)[0]);
+        assert!(warm[0] < renormalize(&scores, 1.0)[0]);
+        assert!(warm[0] > warm[1], "the ordering never flips");
+    }
+
+    // Greedy selection takes the best score, ties going to the option the schema
+    // listed first.
+    #[test]
+    fn greedy_selection_breaks_ties_by_schema_order() {
+        assert_eq!(argmax_index(&[-2.0, -0.5, -3.0]), 1);
+        assert_eq!(argmax_index(&[-1.0, -1.0]), 0);
+    }
+
+    // The escape is the raw mass on tokens that open no option at all.
+    #[test]
+    fn escape_is_the_mass_outside_the_options() {
+        let half = 0.5f64.ln();
+        // Two options taking half the distribution each leave nothing outside.
+        assert!(escape_mass(&[10, 20], &[half, half]).abs() < 1e-12);
+        // A tenth each leaves four fifths of the mass elsewhere.
+        let tenth = 0.1f64.ln();
+        assert!((escape_mass(&[10, 20], &[tenth, tenth]) - 0.8).abs() < 1e-12);
+    }
+
+    // Options sharing a first token share its mass: counting it once per option
+    // would subtract it twice and report a negative escape.
+    #[test]
+    fn a_shared_first_token_counts_once() {
+        let two_thirds = (2.0f64 / 3.0).ln();
+        // Both options open on token 10, which holds two thirds of the mass.
+        let escape = escape_mass(&[10, 10], &[two_thirds, two_thirds]);
+        assert!((escape - 1.0 / 3.0).abs() < 1e-12, "{escape}");
+        // And the mass an option's opener holds is never more than all of it.
+        assert_eq!(escape_mass(&[10, 10], &[0.0, 0.0]), 0.0);
+    }
+
+    /// A one-field plan whose options are `yes`/`no`, annotated as `include`.
+    fn one_field(include: Value) -> ScoredPlan {
+        plan_of(&scored_schema(include)).unwrap().unwrap()
+    }
+
+    // An annotated field reports its value wrapped with the confidence behind
+    // it; an unannotated one reports the value alone.
+    #[test]
+    fn reporting_wraps_only_the_annotated_fields() {
+        let pick = pick_from(&[-0.1, -2.0], 0.05);
+        let score = pick.probs[0];
+
+        let bare = one_field(Value::Bool(false));
+        assert_eq!(report(&bare.fields[0], &pick), serde_json::json!("yes"));
+
+        let wrapped = one_field(Value::Bool(true));
+        assert_eq!(
+            report(&wrapped.fields[0], &pick),
+            serde_json::json!({ "value": "yes", "score": score }),
+        );
+    }
+
+    // `"all"` adds the whole option table and the escape, keyed by the enum
+    // values themselves.
+    #[test]
+    fn reporting_all_carries_the_option_table() {
+        let pick = pick_from(&[-0.1, -2.0], 0.05);
+        let value = report(&one_field(Value::String("all".into())).fields[0], &pick);
+        assert_eq!(value["value"], serde_json::json!("yes"));
+        assert_eq!(value["score"], serde_json::json!(pick.probs[0]));
+        assert_eq!(value["escape"], serde_json::json!(0.05));
+        assert_eq!(value["scores"]["yes"], serde_json::json!(pick.probs[0]));
+        assert_eq!(value["scores"]["no"], serde_json::json!(pick.probs[1]));
+        let table: f64 = value["scores"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v.as_f64().unwrap())
+            .sum();
+        assert!((table - 1.0).abs() < 1e-12, "{table}");
+    }
+
+    // A boolean's table is keyed by the STRINGS "true"/"false" — a JSON object
+    // has no other kind of key — while the chosen value stays a real boolean.
+    #[test]
+    fn a_boolean_field_reports_string_keys_and_a_real_boolean() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "urgent": { "type": "boolean", "include_score": "all" } },
+            "required": ["urgent"],
+            "additionalProperties": false,
+        });
+        let plan = plan_of(&schema).unwrap().unwrap();
+        let value = report(&plan.fields[0], &pick_from(&[-3.0, -0.05], 0.01));
+        assert_eq!(value["value"], Value::Bool(false));
+        assert!(value["scores"]["true"].is_number());
+        assert!(value["scores"]["false"].is_number());
+        assert!(
+            value["scores"]["false"].as_f64() > value["scores"]["true"].as_f64(),
+            "{value}"
+        );
+    }
+
+    // A budget that cannot hold the assembled answer refuses the item before any
+    // forward runs, and reports the budget that refused it.
+    #[test]
+    fn a_budget_too_small_for_the_skeleton_refuses_the_item() {
+        let plan = one_field(Value::Bool(true));
+        let mut item = prepared(None, "");
+        item.max_tokens = plan.worst_case_tokens - 1;
+        let outcome = budget_refusal(&item, &plan, 0);
+        assert_eq!(outcome.finish_reason, FinishReason::Length);
+        assert_eq!(outcome.completion_tokens, 0);
+        assert!(outcome.json.is_none());
+        let error = outcome.error.expect("a refusal always says why");
+        assert!(
+            error.contains(&format!("{}-token budget", item.max_tokens)),
+            "{error}"
+        );
+        assert!(
+            error.contains(&plan.worst_case_tokens.to_string()),
+            "{error}"
+        );
+    }
+
+    // A reasoning block needs a token of its own on top of the assembly, so the
+    // refusal says so rather than reporting a budget that would otherwise fit.
+    #[test]
+    fn a_reasoning_item_needs_room_beyond_the_assembly() {
+        let plan = one_field(Value::Bool(true));
+        let mut item = prepared(None, "");
+        item.max_tokens = plan.worst_case_tokens;
+        let error = budget_refusal(&item, &plan, 1)
+            .error
+            .expect("a refusal always says why");
+        assert!(error.contains("reasoning"), "{error}");
+    }
+
+    // Role names map onto the renderer's message kinds, and an unknown one is
+    // an item error rather than a silently dropped turn.
+    #[test]
+    fn roles_map_onto_renderer_messages() {
+        let message = |role: &str| BatchMessage {
+            role: role.into(),
+            content: "x".into(),
+            thinking: None,
+        };
+        assert!(matches!(
+            chat_message(&message("system")).unwrap(),
+            Message::System(_)
+        ));
+        assert!(matches!(
+            chat_message(&message("user")).unwrap(),
+            Message::User(_)
+        ));
+        assert!(matches!(
+            chat_message(&message("assistant")).unwrap(),
+            Message::Assistant { .. }
+        ));
+        assert!(matches!(
+            chat_message(&message("tool")).unwrap(),
+            Message::ToolResponse(_)
+        ));
+        assert!(chat_message(&message("developer")).is_err());
+    }
+}

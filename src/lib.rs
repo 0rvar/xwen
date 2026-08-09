@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod batch;
 pub mod chat;
 pub mod config;
 pub mod constrain;

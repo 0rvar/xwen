@@ -3,9 +3,10 @@ mod repl;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 
+use xwen::batch::{BatchRequest, BatchResponse};
 use xwen::chat::{ChatOptions, Message, build_prompt_with_spans};
 use xwen::config::XwenConfig;
 use xwen::dflash::DflashDrafter;
@@ -238,6 +239,40 @@ enum Cmd {
         ban_string: Vec<String>,
         #[command(flatten)]
         sampling: SamplingArgs,
+        #[command(flatten)]
+        draft: DraftArgs,
+    },
+    /// Answer a batch of chat items that share a prompt prefix: one JSON
+    /// request on stdin, one JSON response on stdout.
+    ///
+    /// The items' shared prefix is prefilled once and the KV cache snapshotted
+    /// there; every item then restores that snapshot and prefills only its own
+    /// tail, so a run of N questions about the same document costs one prefill
+    /// of it rather than N. Which checkpoint to run comes from the payload
+    /// (`"model": "27b"` / `"35b"`), not from a flag — one request is one
+    /// model's work. Sampling defaults to greedy and thinking to off, so a
+    /// batch is reproducible and a tight token budget goes to the answer.
+    ///
+    /// Progress lines go to stderr; stdout carries the JSON alone. Setting
+    /// XWEN_BATCH_NO_CACHE runs every item from a reset cache instead, which is
+    /// the A/B lever for what the snapshot actually saves. The two arms decode
+    /// the same answer but not always the same bytes: an item's short tail
+    /// prefill takes a different MoE matmul kernel than one long prefill does,
+    /// which flips the occasional near-tie (see the batch module's docs).
+    Batch {
+        /// Model GGUF (default: the checkpoint the payload names, ensured in
+        /// the Hugging Face cache — downloaded on first use, cached forever
+        /// after).
+        #[arg(short, long)]
+        model: Option<PathBuf>,
+        /// Custom tokenizer.json (default: the checkpoint tokenizer embedded
+        /// in the binary).
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        #[arg(long, default_value = "fused")]
+        moe_impl: String,
+        #[arg(long, default_value_t = 8192)]
+        max_ctx: usize,
         #[command(flatten)]
         draft: DraftArgs,
     },
@@ -562,6 +597,81 @@ fn ensure_drafter(size: Model) -> Result<PathBuf> {
     xwen::hub::ensure_drafter(size)
 }
 
+/// `xwen batch`: read one request from stdin, run it, write one JSON document
+/// to stdout.
+///
+/// Stdout is JSON on every exit, success or not — a caller reading the pipe
+/// parses one document either way — so a whole-request failure is caught here,
+/// printed as `{"error": ...}` and reported by the exit status rather than by
+/// anyhow's stderr message. Per-item failures never reach this: they ride the
+/// response as an `error` on their own item.
+fn run_batch(
+    model: Option<PathBuf>,
+    tokenizer: Option<PathBuf>,
+    moe_impl: &str,
+    max_ctx: usize,
+    draft: &DraftArgs,
+) -> Result<()> {
+    match batch_request(model, tokenizer, moe_impl, max_ctx, draft) {
+        Ok(response) => {
+            let mut stdout = std::io::stdout();
+            writeln!(stdout, "{}", serde_json::to_string_pretty(&response)?)?;
+            stdout.flush()?;
+            Ok(())
+        }
+        Err(error) => {
+            let document = serde_json::json!({ "error": format!("{error:#}") });
+            let mut stdout = std::io::stdout();
+            // Written and flushed before the exit: `process::exit` runs no
+            // destructors, so a buffered document would be lost.
+            writeln!(stdout, "{}", serde_json::to_string_pretty(&document)?)?;
+            stdout.flush()?;
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Everything `run_batch` does that can fail as a whole request: parse stdin,
+/// resolve the checkpoint the payload names, load it, run the batch.
+fn batch_request(
+    model: Option<PathBuf>,
+    tokenizer: Option<PathBuf>,
+    moe_impl: &str,
+    max_ctx: usize,
+    draft: &DraftArgs,
+) -> Result<BatchResponse> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let request: BatchRequest = serde_json::from_str(&input)
+        .context("the request on stdin is not a valid batch request")?;
+    // Checked here as well as in `run_batch`, because between the two sits a
+    // 20 GB load: a request with nothing to answer must be refused in
+    // milliseconds rather than after the checkpoint is resident.
+    ensure!(
+        !request.items.is_empty(),
+        "batch: the request holds no items"
+    );
+    // The payload names the checkpoint; `-m` still overrides the file, exactly
+    // as it does for the other commands.
+    let size = request.model()?;
+
+    let load_start = std::time::Instant::now();
+    let mut generator = build_generator(
+        &resolve_model(model, size)?,
+        size,
+        tokenizer.as_deref(),
+        moe_impl,
+        max_ctx,
+        // Batch sampling is per item and resolved inside the batch runner; this
+        // is only what the generator is constructed with.
+        xwen::batch::BATCH_SAMPLING,
+        Some(draft),
+    )?;
+    let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+
+    xwen::batch::run_batch(&mut generator, &request, load_ms)
+}
+
 fn expert_runner(name: &str) -> Result<ExpertRunner> {
     match name {
         "reference" | "ref" => Ok(ExpertRunner::Reference),
@@ -874,6 +984,13 @@ fn main() -> Result<()> {
             generator.set_banned_strings(&ban_string)?;
             repl::run(&mut generator, max_tokens, show_thinking)
         }
+        Some(Cmd::Batch {
+            model,
+            tokenizer,
+            moe_impl,
+            max_ctx,
+            draft,
+        }) => run_batch(model, tokenizer, &moe_impl, max_ctx, &draft),
         Some(Cmd::Serve(args)) => run_serve(args),
     }
 }

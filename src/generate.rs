@@ -1783,6 +1783,63 @@ impl Generator {
         Ok(())
     }
 
+    /// Log-softmax — over the encodable vocabulary — of the logits the last
+    /// `prefill_tokens` left held, one value per id in `ids`.
+    ///
+    /// This is what a caller that SCORES a token sequence rather than drawing
+    /// from it reads: prefill the sequence one token at a time and sum this at
+    /// each step, and the total is the sequence's logprob under the same
+    /// distribution the sampler would have drawn from.
+    ///
+    /// The row is cut to the tokenizer's encodable ids before the normalization,
+    /// exactly as `Sampler::sample_controlled` cuts it — the output layer's
+    /// padding rows take part in no draw, so they must not take part in the
+    /// denominator a score is measured against either. Normalization runs in f64
+    /// so a long option's summed logprob does not accumulate the error of ~248k
+    /// f32 additions.
+    ///
+    /// Errors when no prefill logits are held. That is the state a cache reset or
+    /// a snapshot restore leaves behind, and the row it dropped described a cache
+    /// tail that no longer exists — reading a stale one would score against the
+    /// wrong context.
+    pub fn last_logprobs_for(&self, ids: &[u32]) -> Result<Vec<f64>> {
+        let logits = self.last_logits.as_ref().ok_or_else(|| {
+            anyhow!("last_logprobs_for: no prefill logits; call prefill_tokens first")
+        })?;
+        let encodable = self.sampler.encodable();
+        let row = logits.flatten_all()?;
+        let width = row.dim(0)?;
+        ensure!(
+            width >= encodable,
+            "logit row is {width} wide but scoring normalizes over {encodable} encodable ids"
+        );
+        let values: Vec<f32> = row
+            .narrow(0, 0, encodable)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .to_vec1()?;
+        // A NaN is a corrupt forward, and it is loud here for the same reason it
+        // is loud in `argmax`: it would otherwise vanish into the maximum and
+        // poison only the denominator, reporting the corruption as a score.
+        ensure!(
+            !values.iter().any(|v| v.is_nan()),
+            "the logit row holds NaN; the forward that produced it is corrupt"
+        );
+        let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        ensure!(max.is_finite(), "the logit row holds no finite value");
+        let denom: f64 = values.iter().map(|&v| f64::from(v - max).exp()).sum();
+        let log_denom = f64::from(max) + denom.ln();
+        ids.iter()
+            .map(|&id| {
+                ensure!(
+                    (id as usize) < encodable,
+                    "token {id} is outside the {encodable} encodable ids"
+                );
+                Ok(f64::from(values[id as usize]) - log_denom)
+            })
+            .collect()
+    }
+
     /// True when a DFlash drafter is attached, whether or not it can currently
     /// speculate (see `spec_ready_at`).
     ///
