@@ -1087,6 +1087,30 @@ ordering artifact, not evidence.** The warm-up runs on the cooler chip. This loo
 evidence about allocator-pool state during the residual diagnosis and was not; the
 profiler excludes warm-up from its dumps for exactly this reason (2026-08-08).
 
+**`--stats` reports drafting against a plain baseline measured INSIDE the same run, and
+its plain bucket deliberately excludes wasted drafter time.** Every round is bucketed as
+plain (no draft block verified — paused, empty-draft, serial-thinking, or past the
+drafter's context; one token) or drafted (a block was verified; the round's full time,
+draft phase included; accepted plus bonus tokens), with full-accept as a subset of
+drafted marking the ceiling a longer block could reach. The load-bearing choice is what
+the plain bucket folds: `round_ms - draft_ms`, the same quantity the pause controller's
+plain comparator uses, so a round that ran the drafter and then committed plain
+contributes only its target forward. The bucket is therefore not "what those rounds
+cost" — it is what plain decode costs on this run's text, which makes `plain_rounds /
+plain_ms` an interleaved plain arm sampled in the same thermal envelope as the drafted
+rounds it is compared against. That is the whole reason to build it this way: the
+interleaving rule above says a cross-session ratio is not evidence, and the 27B's
+between-session level shift has already forced that warning into a log entry. A
+breakdown that carried in an external plain number would reproduce exactly the error the
+rule exists to prevent. `est. net ±Y.Y%` follows from the same partition — all committed
+tokens priced at the run's own plain rate, against `plain_ms + spec_ms + (draft_ms -
+spec_draft_ms)`, three terms that cover decode-loop model time once each. It is gated on
+`plain_rounds >= 8`, because a rate off a handful of rounds is noise, and it is an
+estimate rather than a measurement: it assumes the plain rate the run did exhibit is the
+rate a fully plain run would have exhibited, which a real `--no-draft` A/B still owns.
+The per-round averages it replaced divided by all rounds and inverted the reading of a
+mostly-paused run; `draft` now divides by the rounds that actually drafted (2026-08-09).
+
 ## Process
 
 Inherited unchanged: multi-reviewer review with external model families on evidence

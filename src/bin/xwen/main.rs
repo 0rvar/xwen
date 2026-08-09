@@ -736,6 +736,67 @@ fn main() -> Result<()> {
                     gstats.decode_secs,
                     gstats.decode_tps(),
                 );
+                if let Some(spec) = &gstats.spec {
+                    // Per-round-class tok/s: did drafting pay off within THIS
+                    // run? Buckets with zero rounds are skipped (a margin-0 run
+                    // can have no plain rounds; a paused run no drafted ones).
+                    if spec.plain_rounds > 0 && spec.plain_ms > 0.0 {
+                        eprintln!(
+                            "         plain:       {:>5} tok in {:.2}s ({:.1} tok/s over {} rounds)",
+                            spec.plain_rounds,
+                            spec.plain_ms / 1000.0,
+                            spec.plain_rounds as f64 / (spec.plain_ms / 1000.0),
+                            spec.plain_rounds,
+                        );
+                    }
+                    if spec.spec_rounds > 0 && spec.spec_ms > 0.0 {
+                        eprintln!(
+                            "         drafted:     {:>5} tok in {:.2}s ({:.1} tok/s over {} rounds, {:.1} tok/round)",
+                            spec.spec_tokens,
+                            spec.spec_ms / 1000.0,
+                            spec.spec_tokens as f64 / (spec.spec_ms / 1000.0),
+                            spec.spec_rounds,
+                            spec.spec_tokens as f64 / spec.spec_rounds as f64,
+                        );
+                    }
+                    if spec.full_accept_rounds > 0 && spec.full_accept_ms > 0.0 {
+                        eprintln!(
+                            "         full-accept: {:>5} tok in {:.2}s ({:.1} tok/s over {} rounds)",
+                            spec.full_accept_tokens,
+                            spec.full_accept_ms / 1000.0,
+                            spec.full_accept_tokens as f64 / (spec.full_accept_ms / 1000.0),
+                            spec.full_accept_rounds,
+                        );
+                    }
+                    // The comparison needs a stable plain baseline; a handful
+                    // of plain rounds is noise, not a rate.
+                    if spec.plain_rounds >= 8
+                        && spec.spec_rounds > 0
+                        && spec.plain_ms > 0.0
+                        && spec.spec_ms > 0.0
+                    {
+                        let plain_rate = spec.plain_rounds as f64 / (spec.plain_ms / 1000.0);
+                        let drafted_rate = spec.spec_tokens as f64 / (spec.spec_ms / 1000.0);
+                        // Estimated net effect over the whole run: what the
+                        // run's own plain rate would have cost for every
+                        // committed token, vs the model time actually spent —
+                        // plain forwards + full speculative rounds + drafter
+                        // time wasted on rounds that ended plain. Those three
+                        // partition decode-loop model time with no double
+                        // counting.
+                        let total_tokens = (spec.plain_rounds + spec.spec_tokens) as f64;
+                        let baseline_secs = total_tokens / plain_rate;
+                        let actual_secs = (spec.plain_ms
+                            + spec.spec_ms
+                            + (spec.draft_ms - spec.spec_draft_ms).max(0.0))
+                            / 1000.0;
+                        eprintln!(
+                            "         drafting:    {:.2}x vs plain on drafted rounds; est. net {:+.1}% overall",
+                            drafted_rate / plain_rate,
+                            (baseline_secs / actual_secs - 1.0) * 100.0,
+                        );
+                    }
+                }
                 if let Some(think) = &gstats.think {
                     let exit = match (think.closed, think.forced) {
                         (true, true) => "forced",
@@ -766,14 +827,18 @@ fn main() -> Result<()> {
                         spec.acceptance_rate() * 100.0,
                         spec.rejected(),
                     );
-                    // Per-round averages divide by rounds (>= 1 here since a spec
-                    // line only prints after decode ran); guard the zero case.
+                    // Verify averages over all rounds (>= 1 here since a spec
+                    // line only prints after decode ran); draft averages over
+                    // the rounds the drafter actually ran — draft_ms accrues
+                    // only on those, so dividing by all rounds would understate
+                    // the per-draft cost whenever auto-pause skipped drafting.
                     let rounds = spec.rounds.max(1) as f64;
+                    let draft_rounds = spec.draft_rounds.max(1) as f64;
                     eprintln!(
-                        "         {} verified positions; draft {:.1}s ({:.0}ms/round), verify {:.1}s ({:.0}ms/round)",
+                        "         {} verified positions; draft {:.1}s ({:.0}ms/draft), verify {:.1}s ({:.0}ms/round)",
                         spec.verify_positions,
                         spec.draft_ms / 1000.0,
-                        spec.draft_ms / rounds,
+                        spec.draft_ms / draft_rounds,
                         spec.verify_ms / 1000.0,
                         spec.verify_ms / rounds,
                     );

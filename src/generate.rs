@@ -188,6 +188,38 @@ pub struct SpecStats {
     /// Total wall ms spent in the commit phase (the target forward — batched
     /// verify or the plain single-token step — plus acceptance sampling).
     pub verify_ms: f64,
+    /// Rounds that committed via the plain single-token step (no draft block
+    /// was verified): paused rounds, empty-draft fallbacks, serial thinking
+    /// rounds, and rounds past the drafter's context. Each commits exactly one
+    /// token, so this is also the bucket's token count.
+    pub plain_rounds: usize,
+    /// Wall ms of the plain rounds' target forward + sample. Wasted drafter
+    /// time is excluded (`round_ms - draft_ms`, the same quantity the pause
+    /// controller's plain comparator folds), so `plain_rounds / plain_ms` is
+    /// this run's own plain-decode rate.
+    pub plain_ms: f64,
+    /// Rounds that verified a draft block.
+    pub spec_rounds: usize,
+    /// Full wall ms of the speculative rounds, draft phase included.
+    pub spec_ms: f64,
+    /// Draft-phase ms of the speculative rounds alone. `draft_ms -
+    /// spec_draft_ms` is the drafter time wasted on rounds that ended plain.
+    pub spec_draft_ms: f64,
+    /// Tokens committed by speculative rounds (accepted drafts plus each
+    /// round's bonus/correction token).
+    pub spec_tokens: usize,
+    /// The subset of speculative rounds whose every drafted token was
+    /// accepted — the drafter's best case, and the ceiling on what a longer
+    /// draft block could buy.
+    pub full_accept_rounds: usize,
+    /// Full wall ms of the full-accept rounds (a subset of `spec_ms`).
+    pub full_accept_ms: f64,
+    /// Tokens committed by the full-accept rounds (a subset of `spec_tokens`).
+    pub full_accept_tokens: usize,
+    /// Rounds where the drafter forward actually ran, whether or not the
+    /// p_min walk kept any of its proposals — the denominator for per-draft
+    /// cost (`draft_ms` accrues only on these rounds).
+    pub draft_rounds: usize,
 }
 
 impl SpecStats {
@@ -204,6 +236,40 @@ impl SpecStats {
     /// wall-time cost — these are never emitted.
     pub fn rejected(&self) -> usize {
         self.drafted - self.accepted
+    }
+
+    /// Fold one verify round into the per-class buckets the end-of-run
+    /// breakdown reports. `round_ms` is the round's model wall time, draft
+    /// phase included (and streaming excluded, where the loop measures it);
+    /// `draft_ms` is its draft-phase portion; `ran_spec` says whether a draft
+    /// block was verified; `full_accept` whether every drafted token was
+    /// accepted; `tokens` how many tokens the round committed.
+    fn bucket_round(
+        &mut self,
+        round_ms: f64,
+        draft_ms: f64,
+        ran_spec: bool,
+        full_accept: bool,
+        tokens: usize,
+    ) {
+        if ran_spec {
+            self.spec_rounds += 1;
+            self.spec_ms += round_ms;
+            self.spec_draft_ms += draft_ms;
+            self.spec_tokens += tokens;
+            if full_accept {
+                self.full_accept_rounds += 1;
+                self.full_accept_ms += round_ms;
+                self.full_accept_tokens += tokens;
+            }
+        } else {
+            // The plain bucket measures what plain decode costs on this run's
+            // text, so an empty-draft round's wasted drafter time stays out of
+            // it — the same `round_ms - draft_ms` the pause controller's plain
+            // comparator folds.
+            self.plain_rounds += 1;
+            self.plain_ms += (round_ms - draft_ms).max(0.0);
+        }
     }
 }
 
@@ -2064,7 +2130,9 @@ impl Generator {
                 .min(target_max_ctx.saturating_sub(n_past + 1))
                 .min(draft_ctx.saturating_sub(n_past + 1));
             let mut drafts: Vec<u32> = Vec::new();
-            if want_draft && n_draft > 0 {
+            let drafter_ran = want_draft && n_draft > 0;
+            if drafter_ran {
+                stats.draft_rounds += 1;
                 let mut noise_ids = Vec::with_capacity(n_draft + 1);
                 noise_ids.push(id_last);
                 noise_ids.extend(std::iter::repeat_n(mask_token_id, n_draft));
@@ -2090,8 +2158,15 @@ impl Generator {
             // just ended at the `draft_argmax_probs` readback (a CPU sync); the
             // commit phase below ends at its own sampler readback, so neither split
             // adds a device sync. A round that ran the drafter but kept no drafts
-            // still charges its draft time here.
-            let draft_ms = round_start.elapsed().as_secs_f64() * 1000.0;
+            // still charges its draft time here; a round that never ran it charges
+            // zero — the loop bookkeeping before this point stays on the commit
+            // side, and every draft_ms consumer (the stats ledger, the buckets,
+            // the pause controller's plain comparator) assumes exactly that.
+            let draft_ms = if drafter_ran {
+                round_start.elapsed().as_secs_f64() * 1000.0
+            } else {
+                0.0
+            };
 
             // The tokens this round commits, and — when it verified a draft block —
             // the rollback point and taps the commit below needs.
@@ -2288,6 +2363,13 @@ impl Generator {
             stats.draft_ms += draft_ms;
             stats.verify_ms += round_ms - draft_ms;
             stats.verify_positions += 1 + drafts.len();
+            stats.bucket_round(
+                round_ms,
+                draft_ms,
+                ran_spec,
+                ran_spec && matched == drafts.len(),
+                retained,
+            );
             if accounted {
                 pause.record(round_kind, round_ms, draft_ms, retained, ran_spec);
                 // Count every round that ran plain because of the pause: the
@@ -2651,7 +2733,9 @@ impl Generator {
                     .min(max_ctx.saturating_sub(n_past + 1))
                     .min(draft_ctx.saturating_sub(n_past + 1));
                 let mut drafts: Vec<u32> = Vec::new();
-                if want_draft && n_draft > 0 {
+                let drafter_ran = want_draft && n_draft > 0;
+                if drafter_ran {
+                    stats.draft_rounds += 1;
                     let mut noise_ids = Vec::with_capacity(n_draft + 1);
                     noise_ids.push(id_last);
                     noise_ids.extend(std::iter::repeat(mask_token_id).take(n_draft));
@@ -2686,11 +2770,22 @@ impl Generator {
                 // phase just ended at the `draft_argmax_probs` readback (a CPU
                 // sync); the commit phase below ends at its own sampler readback,
                 // so neither split adds a device sync. A round that ran the
-                // drafter but kept no drafts still charges its draft time here.
-                let draft_ms = round_start.elapsed().as_secs_f64() * 1000.0;
+                // drafter but kept no drafts still charges its draft time here;
+                // a round that never ran it charges zero — the loop bookkeeping
+                // before this point stays on the commit side, and every draft_ms
+                // consumer (the stats ledger, the buckets, the pause controller's
+                // plain comparator) assumes exactly that.
+                let draft_ms = if drafter_ran {
+                    round_start.elapsed().as_secs_f64() * 1000.0
+                } else {
+                    0.0
+                };
 
                 // Committed tokens for this round and the last sampled token.
                 let committed: Vec<u32>;
+                // Drafts this round's target samples agreed with (0 on a
+                // plain round).
+                let mut matched = 0usize;
                 if drafts.is_empty() {
                     // No usable draft: a plain single-token decode step. This is
                     // the same target forward + sampler draw plain decode runs, so
@@ -2778,6 +2873,7 @@ impl Generator {
                     stats.rounds += 1;
                     stats.drafted += drafts.len();
                     stats.accepted += m;
+                    matched = m;
                     committed = accepted;
                 }
 
@@ -2799,6 +2895,13 @@ impl Generator {
                 stats.draft_ms += draft_ms;
                 stats.verify_ms += round_ms - draft_ms;
                 stats.verify_positions += 1 + drafts.len();
+                stats.bucket_round(
+                    round_ms,
+                    draft_ms,
+                    ran_spec,
+                    ran_spec && matched == drafts.len(),
+                    committed.len(),
+                );
                 if accounted {
                     pause.record(round_kind, round_ms, draft_ms, committed.len(), ran_spec);
                     // Count every round that ran plain because of the pause: the
@@ -3152,6 +3255,35 @@ mod tests {
         assert_eq!(m, 1);
         assert_eq!(committed, vec![10]);
         assert_eq!(calls, 1);
+    }
+
+    // The per-class buckets partition round time: a speculative round folds its
+    // full cost (draft phase included), a plain round folds only its
+    // target-forward cost (wasted drafter time excluded, mirroring the pause
+    // controller's plain comparator), and full-accept rounds are a subset of
+    // the speculative bucket.
+    #[test]
+    fn bucket_round_partitions_time_and_tokens() {
+        let mut s = SpecStats::default();
+        // A speculative round: 3 drafted, all accepted, plus the bonus token.
+        s.bucket_round(20.0, 5.0, true, true, 4);
+        // A speculative round with a mid-block mismatch: not full-accept.
+        s.bucket_round(18.0, 4.0, true, false, 2);
+        // A plain round that never ran the drafter.
+        s.bucket_round(10.0, 0.0, false, false, 1);
+        // An empty-draft round: the drafter ran (3ms, wasted) but the round
+        // committed via the plain step; only the target-forward part is plain.
+        s.bucket_round(12.0, 3.0, false, false, 1);
+
+        assert_eq!(s.spec_rounds, 2);
+        assert_eq!(s.spec_tokens, 6);
+        assert_eq!(s.spec_ms, 38.0);
+        assert_eq!(s.spec_draft_ms, 9.0);
+        assert_eq!(s.full_accept_rounds, 1);
+        assert_eq!(s.full_accept_tokens, 4);
+        assert_eq!(s.full_accept_ms, 20.0);
+        assert_eq!(s.plain_rounds, 2);
+        assert_eq!(s.plain_ms, 19.0); // 10 + (12 - 3)
     }
 
     // ---- The speculative round loop's two pure decisions: which spans the

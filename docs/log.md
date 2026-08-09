@@ -4,7 +4,64 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-08-08 (latest) — the small-batch window reaches the attention and DeltaNet projections (verify span 8 −12.0%), and the first real controller sweep makes `draft_p_min` per-checkpoint: 0.5 on the 27B, +11-13% over the shipped 0.3
+## 2026-08-09 (latest) — `--stats` splits decode by round class: plain / drafted / full-accept, with an in-run plain baseline and an estimated net drafting effect
+
+**The old block was arithmetically correct and read backwards.** `draft` and `verify`
+both divided by ALL rounds, so a run whose controller paused 93% of its rounds printed
+`verify 12ms/round` next to a draft cost averaged over rounds the drafter never ran.
+That reads as "verification is slower than plain decode", when per committed token the
+verified rounds were the cheaper ones and the drafter had barely fired. Nothing in the
+block answered the question the block exists for: did drafting help THIS run, and by how
+much.
+
+**What ships.** `SpecStats::bucket_round` folds every round into one of two classes as
+the loop finishes it. **Plain**: no draft block was verified — paused rounds,
+empty-draft fallbacks, serial thinking rounds, rounds past the drafter's context — one
+committed token each. **Drafted**: a block was verified; the round's full wall time,
+draft phase included; tokens are accepted plus the bonus. **Full-accept** is a subset of
+drafted, the rounds where every drafted token survived, which is the ceiling a longer
+block could reach. Two counters come with it: `spec_draft_ms`, so `draft_ms -
+spec_draft_ms` is drafter time spent on rounds that ended plain, and `draft_rounds`, the
+rounds the drafter forward actually ran. One shared bucketer is called from both the CLI
+loop (`generate_spec`) and serve's (`decode_loop_spec`) — serve's printer is unchanged
+and feeds the bucketer its own emit-excluded `round_ms`.
+
+**The design decision worth naming: the plain bucket excludes wasted drafter time.** It
+folds `round_ms - draft_ms`, which is exactly the quantity the pause controller's plain
+comparator folds. It is deliberately not "what the round cost" — it is what a plain
+decode step costs on this run's text, so `plain_rounds / plain_ms` is an interleaved
+plain baseline measured inside the run being reported. That immunity to between-session
+drift is the point: the entry below has to warn against differencing a drafted 27B
+figure against a plain one from another session, because the 27B's level moves. This
+baseline never crosses a session boundary.
+
+**Derived lines.** `drafting: X.XXx vs plain on drafted rounds` is the drafted bucket's
+token rate over the plain rate. `est. net ±Y.Y%` prices every committed token at the
+run's own plain rate and compares that against the decode time actually spent — plain
+forwards, plus full drafted rounds, plus the wasted drafter ms — three terms that
+partition decode-loop model time with no double counting. Both need `plain_rounds >= 8`;
+a handful of plain rounds is noise, not a rate. Zero-round buckets print nothing (a
+margin-0 run has no plain rounds, a fully paused one no drafted ones). The misleading
+denominator is fixed in the same pass: `draft` now averages over `draft_rounds` and says
+`ms/draft`. `bucket_round_partitions_time_and_tokens` pins the partition offline.
+
+**What it looks like** (35B, thinking-heavy code prompt, smoke run, `lowpowermode 0`):
+
+```
+decode:  768 tokens in 7.82s (98.2 tok/s)
+         plain:         703 tok in 7.09s (99.2 tok/s over 703 rounds)
+         drafted:        64 tok in 0.72s (88.5 tok/s over 16 rounds, 4.0 tok/round)
+         full-accept:    31 tok in 0.25s (123.2 tok/s over 6 rounds)
+         drafting:    0.89x vs plain on drafted rounds; est. net -1.0% overall
+spec:    719 rounds (701 paused), 95 drafted, 48 accepted (50.5%), 47 rejected
+         814 verified positions; draft 0.2s (10ms/draft), verify 7.7s (11ms/round)
+```
+
+One run, not a benchmark — but it is the shape the instrument exists to make visible:
+701 of 719 rounds paused, and across the 16 that drafted the token rate came in below
+this run's own plain rate.
+
+## 2026-08-08 — the small-batch window reaches the attention and DeltaNet projections (verify span 8 −12.0%), and the first real controller sweep makes `draft_p_min` per-checkpoint: 0.5 on the 27B, +11-13% over the shipped 0.3
 
 **Two arcs, and the second is the one the first predicted.** The entry below shipped
 `mul_mv_ext` behind `QLinear::forward` and closed on two things: a list of sites the

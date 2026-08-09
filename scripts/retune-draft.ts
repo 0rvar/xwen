@@ -467,7 +467,9 @@ interface Stats {
   accepted: number | null;
   acceptPct: number | null;
   verifyMsPerRound: number | null;
-  draftMsPerRound: number | null;
+  /** Drafter cost per round that actually ran the drafter (the stats line's
+   * `ms/draft` figure — NOT averaged over all rounds like verifyMsPerRound). */
+  draftMsPerDraft: number | null;
 }
 
 /** Parse the `--stats` block (all of it on stderr; see src/bin/xwen/main.rs). */
@@ -489,7 +491,7 @@ function parseStats(err: string): Stats {
     accepted: num(/(\d+) accepted \(/),
     acceptPct: num(/accepted \(([\d.]+)%\)/),
     verifyMsPerRound: num(/verify [\d.]+s \((\d+)ms\/round\)/),
-    draftMsPerRound: num(/draft [\d.]+s \((\d+)ms\/round\)/),
+    draftMsPerDraft: num(/draft [\d.]+s \((\d+)ms\/draft\)/),
   };
 }
 
