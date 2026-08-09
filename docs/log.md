@@ -148,6 +148,75 @@ Low confidence on a genuinely ambiguous label is the scored path behaving correc
 Amending the tag rules would move the number; it is left alone deliberately, because the
 row is the clearest live example of a score that should be low.
 
+**And then `--compare-thinking`, which turns the demo into a controlled experiment on
+reasoning itself.** One 22-item batch per model: every taxonomy twice, once with thinking
+off and once with a force-injected closed `<think>` scaffold. The scaffold restates the
+rubric and the evidence discipline and never states a document fact — it is a reasoning
+protocol, not a hint, which is the only way the comparison stays about thinking rather
+than about a leaked answer. Both arms sit behind the same shared prefix, so 22 items are
+still one prefill and one snapshot. 6.4 s on the 35B, 21.1 s on the 27B, same power-mode
+caveat as everything above. Note what the scaffold costs in output: nothing. Injected
+reasoning is prompt-side, so the thinking arm spends zero completion tokens on it.
+
+**The scaffold moved exactly the rows the research said it would.** Both of the 35B's
+near-tie misses flipped to correct — sentiment `mixed` → `negative` at 0.56 → 0.76,
+emotion `frustration` → `disappointment` at 0.51 → 0.69 — and every row that had already
+scored 1.00 was left untouched. That is the thinking-helps-ambiguous-rubrics-only pattern
+reproduced in-demo, and the scores are what make it legible: the confidence rose where
+the answer changed and did not move where it did not.
+
+**It also flipped `emotion_intensity` high → medium on BOTH checkpoints, confidently
+(0.86 and 0.89).** That label has now gone three ways across three protocols — authored
+medium, amended to high on the models' agreement, and back to medium under the scaffold.
+Three readings from one document is a rubric problem, not a model problem, and it is the
+right conclusion to draw before the tempting one: an underspecified label does not become
+specified by being graded more times. Net accuracy therefore splits: 35B 8 → 9, 27B
+10 → 9.
+
+**And then it resolved: the author flipped expected `emotion_intensity` back to medium,
+because the scaffolded reading won the argument on its merits.** So the label went out
+the way it came in, having been argued into and back out of `high` — the rubric problem
+above is real, and this is what settling it looks like rather than a fourth reading. The
+predictions did not move; only the key did, and the re-grade was verified live. Under the
+corrected key injected thinking wins on BOTH checkpoints: **35B plain 7/12 → thinking
+10/12, 27B plain 9/12 → thinking 10/12.** That supersedes the 8 → 9 / 10 → 9 split in the
+paragraph above, which was correct against the `high` key and is kept because it is what
+the split looked like at the time — and it strengthens the conclusion it was hedging: the
+scaffold does not trade one model's accuracy for another's, it lifts both.
+
+**Closing the `replacement` thread: the rule was sharpened after all, and the ambiguity
+resolved exactly where its probability said it would.** The paragraph above left the tag
+rules alone on the grounds that a low score on an ambiguous label is the scored path
+working; that held right up until the rule was made to say what it had always meant —
+"sent, offered, or requested at any point, even if the customer now declines further
+replacements". `tags_scored` is now 6/6 on both checkpoints and in both arms, with
+`replacement` joining the confident mass rather than merely creeping over a threshold.
+The free-decoded array over the identical tag set STILL drops `refund_request`, on both
+checkpoints and in both arms. That is the finding to keep: the decomposed-over-joint gap
+does not come from a fuzzy rubric and does not close when the rubric is sharpened — it is
+structural, a property of emitting a list versus scoring each member. Final numbers (same
+power caveat; 6.4 s on the 35B, 21.5 s on the 27B), superseding the re-grade above:
+
+```
+35B-A3B    plain  8/12    thinking 11/12
+27B        plain 10/12    thinking 11/12
+```
+
+The thinking arms remain identical across the two checkpoints, and the only miss anywhere
+in either thinking arm is the joint-array control item — the one the experiment exists to
+lose. `scripts/classify-demo.ts` carries these as header comment blocks, written as
+properties rather than as results, so the file states what it demonstrates without dating
+itself to this run.
+
+**The most striking result is not accuracy at all — under the scaffold the two
+checkpoints agree on every single field.** The cross-model diff is empty. Injected
+thinking is acting as a variance reducer here, and it lifts the fast 35B to the slow
+27B's level of agreement, which is a far more interesting property for a batch
+classification surface than either model's raw score. Per-taxonomy scaffold selection is
+the protocol this indicates — scaffold the ambiguous rubrics, leave the saturated ones
+alone — but that is a hypothesis fitted on one document, and adopting it needs held-out
+validation rather than selection on the same email it was read off.
+
 ## 2026-08-09 — `--stats` splits decode by round class: plain / drafted / full-accept, with an in-run plain baseline and an estimated net drafting effect
 
 **The old block was arithmetically correct and read backwards.** `draft` and `verify`

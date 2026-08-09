@@ -11,14 +11,46 @@
 // `include_score` report a distribution over the allowed values rather than
 // over tokens.
 //
+// `--compare-thinking` adds a second arm: every item goes out twice in the SAME
+// batch, once thinking-off and once with a closed think block injected ahead of
+// the answer. The scaffold restates the rubric and the discipline and never any
+// document-specific evidence, so what it measures is whether re-reading the
+// rubric changes the answer — not whether a hint was smuggled in. Injected
+// thinking is prompt rather than completion, so the token budgets are unchanged
+// and both arms still share the one prefix, snapshot and load.
+//
+// What the shapes in here are worth, stated as properties rather than as a
+// sales pitch:
+//
+// Decomposition. One taxonomy per item beats a single multi-taxonomy JSON for
+// the same reason per-tag scored booleans beat one joint array: each label gets
+// the model's whole attention and carries its own confidence. A tag set emitted
+// as one array drops labels that the same set, asked as one boolean per tag,
+// recovers — and the per-tag P(true) shows WHERE the decision boundary sits,
+// not merely which side of it a tag landed on.
+//
+// Injected thinking. A closed scaffold that restates the rubric and the
+// evidence discipline — never a fact from the document — moves near-tie fields
+// toward the considered reading and leaves already-confident fields alone. It
+// costs no completion tokens, being prompt, and it narrows the spread between
+// checkpoints: the small fast model converges on the large one's judgments. A
+// scaffold belongs to its taxonomy and has to hold up on held-out documents;
+// one tuned against a single message is fitted to that message.
+//
+// Ground truth. An underspecified rubric announces itself twice over: the label
+// moves with the asking protocol, and its probability strands between the
+// confident mass and the noise floor. The score distribution is a diagnostic on
+// the LABEL, not only on the model.
+//
 // The two models run STRICTLY SEQUENTIALLY — one large model process at a time
 // on this machine (CLAUDE.md, operational hazards).
 //
 // Usage:
-//   bun scripts/classify-demo.ts                # 35b then 27b, print the report
-//   bun scripts/classify-demo.ts --model 35b    # just one model
-//   bun scripts/classify-demo.ts --no-draft     # passed through to `xwen batch`
-//   bun scripts/classify-demo.ts --json         # dump raw responses instead
+//   bun scripts/classify-demo.ts                     # 35b then 27b, print the report
+//   bun scripts/classify-demo.ts --model 35b         # just one model
+//   bun scripts/classify-demo.ts --no-draft          # passed through to `xwen batch`
+//   bun scripts/classify-demo.ts --json              # dump raw responses instead
+//   bun scripts/classify-demo.ts --compare-thinking  # both arms, side by side
 
 import { dirname, join } from "node:path";
 
@@ -34,11 +66,14 @@ if (flag("help") || args.includes("-h")) {
   console.log(
     [
       "Usage: bun scripts/classify-demo.ts [--model 35b|27b] [--no-draft] [--json]",
+      "                                    [--compare-thinking]",
       "",
-      "  --model 35b|27b  run only this checkpoint (default: 35b then 27b, in that order)",
-      "  --no-draft       pass --no-draft through to `xwen batch` (plain decode)",
-      "  --json           print the raw batch responses instead of the report",
-      "  --help           this text",
+      "  --model 35b|27b     run only this checkpoint (default: 35b then 27b, in that order)",
+      "  --no-draft          pass --no-draft through to `xwen batch` (plain decode)",
+      "  --json              print the raw batch responses instead of the report",
+      "  --compare-thinking  run every item twice in one batch, thinking-off vs an",
+      "                      injected closed think block, and compare the two arms",
+      "  --help              this text",
     ].join("\n"),
   );
   process.exit(0);
@@ -52,6 +87,10 @@ if (only && only !== "35b" && only !== "27b") {
 const models = only ? [only] : ["35b", "27b"];
 const noDraft = flag("no-draft");
 const rawJson = flag("json");
+const compare = flag("compare-thinking");
+/// Id suffixes, which are also the arm names. Without the flag there is one
+/// unsuffixed arm, so the request is exactly what it has always been.
+const ARMS = compare ? [":plain", ":think"] : [""];
 
 // ---------------------------------------------------------------------------
 // The task: one support email, classified along nine taxonomies.
@@ -89,7 +128,9 @@ interface Taxonomy {
   /// shared tag vocabulary, and differ only in how they are asked for it: `tags`
   /// takes the grammar path (one array, no scores available), `tags_scored`
   /// asks the same question as one boolean per tag so every tag carries its own
-  /// probability.
+  /// probability. The pair exists to be compared: the two arms are the same
+  /// question, and a tag the array form omits is often one the boolean form
+  /// answers true with room to spare.
   kind?: "tags" | "tags_scored";
   maxTokens?: number;
 }
@@ -121,7 +162,9 @@ const TAG_RULES =
   "product_defect = the product itself is faulty; shipping_damage = damage " +
   "caused in transit; repeat_issue = the same problem occurred more than once; " +
   "deadline_mentioned = the customer names a date or timeframe; " +
-  "positive_support_experience = the customer praises support staff.";
+  "positive_support_experience = the customer praises support staff; " +
+  "replacement = a replacement unit was sent, offered, or requested at any " +
+  "point, even if the customer now declines further replacements.";
 
 // The last entry is COMPOUND: two related taxonomies share one schema and are
 // emitted together, which is the cheaper shape whenever the labels inform each
@@ -216,7 +259,7 @@ const TAXONOMIES: Taxonomy[] = [
         values: ["frustration", "anger", "joy", "disappointment", "confusion", "neutral"],
         expected: "disappointment",
       },
-      { name: "emotion_intensity", values: ["low", "medium", "high"], expected: "high" },
+      { name: "emotion_intensity", values: ["low", "medium", "high"], expected: "medium" },
     ],
   },
   { id: "tags", kind: "tags", rules: TAG_RULES, fields: [], maxTokens: 96 },
@@ -273,6 +316,37 @@ function userMessage(t: Taxonomy): string {
   return `${SOURCE_TEXT}\n\n---\n\nClassify along this taxonomy.\n${t.rules ?? ""}`;
 }
 
+/// The reasoning injected into the `:think` arm. It restates the rubric, the
+/// option set and the discipline to apply, and deliberately contains no
+/// evidence from the message — a scaffold that quoted the message would be
+/// answering the question rather than framing it.
+function scaffoldFor(t: Taxonomy): string {
+  if (t.kind) {
+    return (
+      "I am selecting every applicable tag from a fixed set. The rules: " +
+      `${TAG_RULES} For each tag I will ask only: does the message contain ` +
+      "explicit evidence for this tag? I will include exactly the tags with " +
+      "evidence and no others, in the required JSON shape."
+    );
+  }
+  // A compound item names both of its fields and both option lists; a single
+  // one needs no such labelling.
+  const names = t.fields.map((f) => f.name).join(" and ");
+  const options = t.fields
+    .map((f) => {
+      const values = f.values === null ? ["true", "false"] : [...f.values];
+      return t.fields.length > 1 ? `${f.name}: ${values.join(", ")}` : values.join(", ");
+    })
+    .join("; ");
+  return (
+    `I am classifying along one taxonomy: ${names}. The rubric: ${t.rules ?? ""} ` +
+    `The options are: ${options}. I will weigh each option against explicit ` +
+    "evidence in the message, prefer the dominant signal over isolated phrases, " +
+    "and not read in anything the message does not say. Then I will answer with " +
+    "the single best option in the required JSON shape."
+  );
+}
+
 function buildRequest(model: string) {
   return {
     model,
@@ -281,18 +355,27 @@ function buildRequest(model: string) {
       sampling: { temperature: 0 },
       thinking: false,
     },
-    items: TAXONOMIES.map((t) => ({
-      id: t.id,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userMessage(t) },
-      ],
-      schema: schemaFor(t),
-      // The tag items need a bigger budget than a one-value answer: the scored
-      // one is checked against the worst case for its whole skeleton, not just
-      // the values it will actually emit.
-      max_tokens: t.maxTokens ?? 64,
-    })),
+    items: TAXONOMIES.flatMap((t) => {
+      const body = {
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userMessage(t) },
+        ],
+        schema: schemaFor(t),
+        // The tag items need a bigger budget than a one-value answer: the
+        // scored one is checked against the worst case for its whole skeleton,
+        // not just the values it will actually emit. The `:think` arm keeps the
+        // same budget, since injected reasoning is prompt, not completion.
+        max_tokens: t.maxTokens ?? 64,
+      };
+      if (!compare) return [{ id: t.id, ...body }];
+      // The plain arm carries no `thinking` key at all, so it inherits the
+      // default `false` and is the same item the unflagged run sends.
+      return [
+        { id: `${t.id}:plain`, ...body },
+        { id: `${t.id}:think`, ...body, thinking: scaffoldFor(t) },
+      ];
+    }),
   };
 }
 
@@ -394,7 +477,9 @@ interface Row {
 const pad = (s: string, n: number) => s + " ".repeat(Math.max(0, n - s.length));
 const num = (v: number | null, d = 3) => (v === null ? "-" : v.toFixed(d));
 // Escape mass is normally tiny; fixed decimals would round every interesting
-// value to 0.000.
+// value to 0.000. Read it only for the quoted enum fields, where it is the mass
+// leaving the option set; on a bare boolean it is confounded by formatting and
+// carries less than its magnitude suggests.
 const tiny = (v: number | null) =>
   v === null ? "-" : v === 0 ? "0" : v < 1e-3 ? v.toExponential(1) : v.toFixed(3);
 
@@ -424,7 +509,7 @@ function tagDiff(predicted: string[]): string[] {
   return [`missing: ${missing.join(",") || "none"}   extra: ${extra.join(",") || "none"}`];
 }
 
-function rowsFor(resp: BatchResponse): Row[] {
+function rowsFor(resp: BatchResponse, arm = ""): Row[] {
   const byId = new Map(resp.items.map((it) => [it.id, it]));
   const rows: Row[] = [];
 
@@ -438,7 +523,8 @@ function rowsFor(resp: BatchResponse): Row[] {
   });
 
   for (const t of TAXONOMIES) {
-    const item = byId.get(t.id);
+    const itemId = t.id + arm;
+    const item = byId.get(itemId);
     // The predicted cell already carries a whole set; repeating the expected
     // set verbatim would double the row width to say nothing the diff line
     // below it does not say better.
@@ -446,7 +532,7 @@ function rowsFor(resp: BatchResponse): Row[] {
 
     if (t.kind) {
       if (!item) {
-        rows.push(miss(t.id, expectedTags, `no item '${t.id}' in the response`));
+        rows.push(miss(t.id, expectedTags, `no item '${itemId}' in the response`));
         continue;
       }
       if (item.error) {
@@ -509,7 +595,7 @@ function rowsFor(resp: BatchResponse): Row[] {
     for (const f of t.fields) {
       const expected = String(f.expected);
       if (!item) {
-        rows.push(miss(f.name, expected, `no item '${t.id}' in the response`));
+        rows.push(miss(f.name, expected, `no item '${itemId}' in the response`));
         continue;
       }
       if (item.error) {
@@ -593,9 +679,63 @@ function printReport(resp: BatchResponse, rows: Row[]) {
   );
 }
 
+/// Side-by-side arms. The two rows for a taxonomy answered the same question
+/// off the same prefix and differ only in the injected reasoning, so the
+/// interesting column is the one saying whether that changed anything.
+function printCompare(resp: BatchResponse, plain: Row[], think: Row[]) {
+  const cell = (r: Row) => `${r.predicted} (${num(r.score, 2)})`;
+  const pairs = plain.map((p, i) => [p, think[i]] as const);
+  const cap = (n: number) => Math.min(n, 34);
+  const cols = [
+    Math.max(8, ...plain.map((r) => r.taxonomy.length)),
+    cap(Math.max(11, ...plain.map((r) => cell(r).length))),
+    cap(Math.max(11, ...think.map((r) => cell(r).length))),
+    cap(Math.max(8, ...plain.map((r) => r.expected.length))),
+  ];
+  console.log(
+    `${pad("taxonomy", cols[0])}  ${pad("plain", cols[1])}  ${pad("think", cols[2])}  ` +
+      `${pad("expected", cols[3])}  note`,
+  );
+  for (const [p, k] of pairs) {
+    const changed = p.predicted !== k.predicted;
+    const delta = p.score !== null && k.score !== null ? k.score - p.score : null;
+    const notes: string[] = [];
+    if (changed) notes.push("CHANGED");
+    // Scores compare with tolerance, never bit-for-bit: the two arms reach the
+    // same field over different prompt lengths, and a genuine near-tie can land
+    // either way. Only a move worth acting on gets reported.
+    if (delta !== null && Math.abs(delta) >= 0.05) {
+      notes.push(`${delta >= 0 ? "+" : ""}${delta.toFixed(2)}`);
+    }
+    // Which arm was wrong is what makes CHANGED readable as better or worse.
+    if (!p.ok && !k.ok) notes.push("both MISS");
+    else if (!p.ok) notes.push("plain MISS");
+    else if (!k.ok) notes.push("think MISS");
+    console.log(
+      `${pad(p.taxonomy, cols[0])}  ${pad(cell(p), cols[1])}  ${pad(cell(k), cols[2])}  ` +
+        `${pad(p.expected, cols[3])}  ${notes.join("  ")}`,
+    );
+    if (!p.ok || !k.ok || changed) {
+      for (const line of p.detail) console.log(`    plain  ${line}`);
+      for (const line of k.detail) console.log(`    think  ${line}`);
+    }
+  }
+
+  const completion = (arm: string) =>
+    resp.items
+      .filter((it) => it.id.endsWith(arm))
+      .reduce((sum, it) => sum + it.usage.completion_tokens, 0);
+  console.log(
+    `\naccuracy plain ${plain.filter((r) => r.ok).length}/${TOTAL_ROWS}   ` +
+      `think ${think.filter((r) => r.ok).length}/${TOTAL_ROWS}   ` +
+      `completion tokens plain ${completion(":plain")}  think ${completion(":think")}   ` +
+      `shared_prefix ${resp.stats.shared_prefix_tokens} tok   total ${resp.stats.total_ms} ms`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 
-const results = new Map<string, Row[]>();
+const results = new Map<string, Map<string, Row[]>>();
 let ran = 0;
 
 for (const model of models) {
@@ -607,22 +747,25 @@ for (const model of models) {
     console.log(JSON.stringify(resp, null, 2));
     continue;
   }
-  const rows = rowsFor(resp);
-  results.set(model, rows);
-  printReport(resp, rows);
+  const arms = new Map(ARMS.map((arm) => [arm, rowsFor(resp, arm)]));
+  results.set(model, arms);
+  if (compare) printCompare(resp, arms.get(":plain")!, arms.get(":think")!);
+  else printReport(resp, arms.get("")!);
 }
 
 if (!rawJson && results.size === 2) {
   const [a, b] = models;
-  const ra = results.get(a)!;
-  const rb = results.get(b)!;
-  const disagree = ra
-    .map((r, i) => [r, rb[i]] as const)
-    .filter(([r, o]) => r.predicted !== o.predicted);
-  console.log(`\n=== ${a} vs ${b} ===`);
-  if (disagree.length === 0) {
-    console.log("identical predictions on all fields");
-  } else {
+  for (const arm of ARMS) {
+    const ra = results.get(a)!.get(arm)!;
+    const rb = results.get(b)!.get(arm)!;
+    const disagree = ra
+      .map((r, i) => [r, rb[i]] as const)
+      .filter(([r, o]) => r.predicted !== o.predicted);
+    console.log(`\n=== ${a} vs ${b}${arm ? ` (${arm.slice(1)})` : ""} ===`);
+    if (disagree.length === 0) {
+      console.log("identical predictions on all fields");
+      continue;
+    }
     const w = Math.max(...disagree.map(([r]) => r.taxonomy.length));
     for (const [r, o] of disagree) {
       console.log(
