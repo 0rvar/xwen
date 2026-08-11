@@ -115,6 +115,19 @@ the 35B's value; hf-hub's raw-stderr download bar under `--tui`, the route's inh
 for schema-only items all joined the TODO ledger. Final count after fixes: 781 + 69
 passed, 0 failed.
 
+**First live exercise (same day).** `scripts/classify-demo.ts` was switched from
+spawning `xwen batch` to POSTing `/xwen/v1/batch` — against a server already running
+on the default port when one answers `/health` (a hazard guard as much as a
+convenience: spawning a second server beside a running one would resident two ~20 GB
+models), `--url` for anywhere else, else a server it spawns on a free port and tears
+down. Its first run went against a live `xwen serve` and exercised the whole arc in
+one process: the 35B lazy-loaded cold (6.1 s) for the first batch, the second batch
+named the 27B and the engine swapped (14.5 s — 27B weights plus its 3.5 GB drafter
+sidecar, cold), and both reports came back with the demo's documented accuracy shape
+(35B 8/12 with the known near-tie misses, 27B 10/12), shared prefix 317 tokens cached
+across all items on both. `--no-draft` now applies only to a server the script spawns;
+against a running server, that server's config decides and the script says so.
+
 ## 2026-08-09 — `xwen batch`: one prefill for N items, and scored fields that report the model's confidence instead of a sampled token
 
 **Where it came from.** Two research passes opened the arc — one on the

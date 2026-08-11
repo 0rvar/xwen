@@ -1,7 +1,10 @@
 #!/usr/bin/env bun
-// Demo of DECOMPOSED classification against `xwen batch`: instead of asking one
-// prompt for every label at once, each taxonomy gets its own item with its own
-// schema, and all of them go out as a single batch request.
+// Demo of DECOMPOSED classification against the batch API: instead of asking
+// one prompt for every label at once, each taxonomy gets its own item with its
+// own schema, and all of them go out as a single batch request to
+// POST /xwen/v1/batch — the same document `xwen batch` reads on stdin, over
+// HTTP. By default the script starts its own `xwen serve` on a free port and
+// stops it afterward; `--url` targets a server you already have running.
 //
 // The shape is what makes it cheap. Every item repeats the same system prompt
 // and the same source text and differs only in its trailing instruction, so the
@@ -42,13 +45,16 @@
 // confident mass and the noise floor. The score distribution is a diagnostic on
 // the LABEL, not only on the model.
 //
-// The two models run STRICTLY SEQUENTIALLY — one large model process at a time
-// on this machine (CLAUDE.md, operational hazards).
+// The two models run STRICTLY SEQUENTIALLY through one server — the engine
+// holds one resident model at a time (CLAUDE.md, operational hazards) and
+// swaps checkpoints between the two requests, which this demo exercises on
+// purpose: the 27b batch names the other model and the server does the rest.
 //
 // Usage:
 //   bun scripts/classify-demo.ts                     # 35b then 27b, print the report
 //   bun scripts/classify-demo.ts --model 35b         # just one model
-//   bun scripts/classify-demo.ts --no-draft          # passed through to `xwen batch`
+//   bun scripts/classify-demo.ts --url http://host:5241   # use a running server
+//   bun scripts/classify-demo.ts --no-draft          # spawn the local server plain
 //   bun scripts/classify-demo.ts --json              # dump raw responses instead
 //   bun scripts/classify-demo.ts --compare-thinking  # both arms, side by side
 
@@ -65,11 +71,14 @@ const opt = (n: string, d: string) => {
 if (flag("help") || args.includes("-h")) {
   console.log(
     [
-      "Usage: bun scripts/classify-demo.ts [--model 35b|27b] [--no-draft] [--json]",
-      "                                    [--compare-thinking]",
+      "Usage: bun scripts/classify-demo.ts [--model 35b|27b] [--url <base>] [--no-draft]",
+      "                                    [--json] [--compare-thinking]",
       "",
       "  --model 35b|27b     run only this checkpoint (default: 35b then 27b, in that order)",
-      "  --no-draft          pass --no-draft through to `xwen batch` (plain decode)",
+      "  --url <base>        POST to a running server (e.g. http://127.0.0.1:5241) instead",
+      "                      of spawning one; drafting follows THAT server's config",
+      "  --no-draft          spawn the local server with --no-draft (plain decode);",
+      "                      ignored with --url, where the server's config decides",
       "  --json              print the raw batch responses instead of the report",
       "  --compare-thinking  run every item twice in one batch, thinking-off vs an",
       "                      injected closed think block, and compare the two arms",
@@ -88,6 +97,13 @@ const models = only ? [only] : ["35b", "27b"];
 const noDraft = flag("no-draft");
 const rawJson = flag("json");
 const compare = flag("compare-thinking");
+/// Base URL of a server to use. Empty means "spawn our own".
+const externalUrl = opt("url", "").replace(/\/+$/, "");
+if (externalUrl && noDraft) {
+  console.error(
+    "warning: --no-draft is ignored with --url; drafting follows that server's config",
+  );
+}
 /// Id suffixes, which are also the arm names. Without the flag there is one
 /// unsuffixed arm, so the request is exactly what it has always been.
 const ARMS = compare ? [":plain", ":think"] : [""];
@@ -380,7 +396,9 @@ function buildRequest(model: string) {
 }
 
 // ---------------------------------------------------------------------------
-// `xwen batch`: JSON on stdin, JSON on stdout, stats and logs on stderr.
+// Transport: POST /xwen/v1/batch — the same document `xwen batch` reads on
+// stdin, over HTTP. Either against a server the caller runs (`--url`) or one
+// this script spawns for the occasion and tears down after.
 
 interface BatchItem {
   id: string;
@@ -407,29 +425,112 @@ interface BatchResponse {
   };
 }
 
-async function runBatch(model: string): Promise<BatchResponse | null> {
-  const bin = join(repo, "target/release/xwen");
-  const proc = Bun.spawn([bin, "batch", ...(noDraft ? ["--no-draft"] : [])], {
-    cwd: repo,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "inherit",
-  });
-  proc.stdin.write(JSON.stringify(buildRequest(model)));
-  proc.stdin.end();
-  const out = await new Response(proc.stdout).text();
-  const code = await proc.exited;
+const DEFAULT_PORT = 5241;
 
-  if (code !== 0) {
-    console.error(`\n${model}: xwen batch exited ${code}`);
-    if (out.trim()) console.error(out.trim());
+/// The server the batches go to. `proc` is present only when this script
+/// spawned the process, and is what shutdown() tears down.
+interface Server {
+  url: string;
+  proc?: ReturnType<typeof Bun.spawn>;
+}
+
+async function healthy(url: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(1000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/// Resolve the server: an explicit --url, else a server already running on the
+/// default port, else one spawned here. The reuse step is a hazard guard, not
+/// a convenience: this machine holds ONE large model at a time (CLAUDE.md),
+/// and spawning a second server beside a running one would resident two.
+async function connect(): Promise<Server> {
+  if (externalUrl) {
+    if (!(await healthy(externalUrl))) {
+      console.error(`no server answers at ${externalUrl}/health`);
+      process.exit(1);
+    }
+    return { url: externalUrl };
+  }
+  const local = `http://127.0.0.1:${DEFAULT_PORT}`;
+  if (await healthy(local)) {
+    console.error(`using the running server at ${local}`);
+    if (noDraft) {
+      console.error(
+        "warning: --no-draft is ignored against a running server; its config decides",
+      );
+    }
+    return { url: local };
+  }
+  // Nothing running: spawn our own on a free port, --no-tui so its stderr is
+  // plain log lines interleaving with this script's output.
+  const probe = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const port = probe.port;
+  probe.stop(true);
+  const bin = join(repo, "target/release/xwen");
+  const proc = Bun.spawn(
+    [
+      bin,
+      "serve",
+      "--no-tui",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      ...(noDraft ? ["--no-draft"] : []),
+    ],
+    { cwd: repo, stdout: "inherit", stderr: "inherit" },
+  );
+  const url = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (await healthy(url)) return { url, proc };
+    if (proc.exitCode !== null) break;
+    await Bun.sleep(200);
+  }
+  console.error("the spawned server never became healthy");
+  proc.kill();
+  process.exit(1);
+}
+
+/// SIGTERM is the server's graceful path (images the live conversation out,
+/// flushes the disk tier); only a server this script spawned is touched.
+async function shutdown(server: Server) {
+  if (!server.proc) return;
+  server.proc.kill();
+  await server.proc.exited;
+}
+
+async function runBatch(server: Server, model: string): Promise<BatchResponse | null> {
+  // No timeout: a cold batch spans a model load (possibly a checkpoint swap)
+  // plus the full decode, and the server's own watchdog bounds runaways.
+  const res = await fetch(`${server.url}/xwen/v1/batch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(buildRequest(model)),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    console.error(`\n${model}: POST /xwen/v1/batch -> ${res.status}`);
+    try {
+      const body = JSON.parse(text) as { error?: { message?: string } };
+      console.error(body.error?.message ?? text.slice(0, 2000));
+    } catch {
+      console.error(text.slice(0, 2000));
+    }
+    if (res.status === 404) {
+      console.error("(this server predates /xwen/v1/batch — rebuild and restart it)");
+    }
     return null;
   }
   try {
-    return JSON.parse(out) as BatchResponse;
+    return JSON.parse(text) as BatchResponse;
   } catch (e) {
     console.error(`\n${model}: response was not JSON (${String(e)})`);
-    if (out.trim()) console.error(out.slice(0, 2000));
+    if (text.trim()) console.error(text.slice(0, 2000));
     return null;
   }
 }
@@ -675,7 +776,7 @@ function printReport(resp: BatchResponse, rows: Row[]) {
   console.log(
     `\naccuracy ${hits}/${TOTAL_ROWS}   shared_prefix ${resp.stats.shared_prefix_tokens} tok   ` +
       `cached_prefix ${cachedText} tok/item   ` +
-      `load ${resp.stats.load_ms} ms   total ${resp.stats.total_ms} ms`,
+      `load ${resp.stats.load_ms.toFixed(0)} ms   total ${resp.stats.total_ms.toFixed(0)} ms`,
   );
 }
 
@@ -738,19 +839,24 @@ function printCompare(resp: BatchResponse, plain: Row[], think: Row[]) {
 const results = new Map<string, Map<string, Row[]>>();
 let ran = 0;
 
-for (const model of models) {
-  console.log(`\n=== ${model}${noDraft ? " (--no-draft)" : ""} ===`);
-  const resp = await runBatch(model);
-  if (!resp) continue;
-  ran++;
-  if (rawJson) {
-    console.log(JSON.stringify(resp, null, 2));
-    continue;
+const server = await connect();
+try {
+  for (const model of models) {
+    console.log(`\n=== ${model}${noDraft && server.proc ? " (--no-draft)" : ""} ===`);
+    const resp = await runBatch(server, model);
+    if (!resp) continue;
+    ran++;
+    if (rawJson) {
+      console.log(JSON.stringify(resp, null, 2));
+      continue;
+    }
+    const arms = new Map(ARMS.map((arm) => [arm, rowsFor(resp, arm)]));
+    results.set(model, arms);
+    if (compare) printCompare(resp, arms.get(":plain")!, arms.get(":think")!);
+    else printReport(resp, arms.get("")!);
   }
-  const arms = new Map(ARMS.map((arm) => [arm, rowsFor(resp, arm)]));
-  results.set(model, arms);
-  if (compare) printCompare(resp, arms.get(":plain")!, arms.get(":think")!);
-  else printReport(resp, arms.get("")!);
+} finally {
+  await shutdown(server);
 }
 
 if (!rawJson && results.size === 2) {

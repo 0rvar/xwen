@@ -136,7 +136,10 @@ snapshot saves (35B demo: 1203 ms cached vs 1989 ms cold). The two arms decode t
 answers but not always the same bytes; see docs/decisions.md "Batch".
 
 `bun scripts/classify-demo.ts` is the worked example: one support email classified along
-nine taxonomies as nine batch items, with ground truth embedded, run on both checkpoints.
+nine taxonomies as nine batch items, with ground truth embedded, run on both checkpoints
+through `POST /xwen/v1/batch` — against a server already running on the default port (or
+`--url`), else one the script spawns and tears down itself. Running both checkpoints
+through one server is a deliberate exercise of the checkpoint swap.
 
 ## Serve
 
