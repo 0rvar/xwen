@@ -276,6 +276,9 @@ struct Cached {
 struct Live {
     origin: RequestOrigin,
     prompt_tokens: usize,
+    /// Whether `prompt_tokens` is the queue's bytes-based overestimate (a
+    /// batch at pickup) rather than a real token count — shown as such.
+    estimated: bool,
     queue_wait: Duration,
     deadline: Option<Instant>,
     cache: Option<Cached>,
@@ -355,12 +358,14 @@ impl Dashboard {
             ServeLog::JobPicked {
                 origin,
                 prompt_tokens,
+                estimated,
                 queue_wait,
                 deadline,
             } => {
                 self.live = Some(Live {
                     origin,
                     prompt_tokens,
+                    estimated,
                     queue_wait,
                     deadline,
                     cache: None,
@@ -485,9 +490,12 @@ impl Dashboard {
         false
     }
 
-    /// Move the LOG selection, which is also what disengages follow: an operator
+    /// Move the LOG selection, which is also what toggles follow: an operator
     /// reading back through the log must not have the pane yanked out from under
-    /// them by the next event.
+    /// them by the next event, and one who scrolls back DOWN onto the newest
+    /// line has arrived at the live edge and wants it live again — without this,
+    /// a pane once scrolled stays pinned to that line forever unless they know
+    /// about End.
     fn scroll_by(&mut self, lines: isize) {
         if self.logs.is_empty() {
             return;
@@ -495,7 +503,7 @@ impl Dashboard {
         let last = self.logs.len() - 1;
         let current = self.log_state.selected().unwrap_or(last) as isize;
         let next = (current + lines).clamp(0, last as isize) as usize;
-        self.follow = false;
+        self.follow = next == last;
         self.log_state.select(Some(next));
     }
 }
@@ -591,13 +599,22 @@ fn span(secs: f64) -> Duration {
 
 /// How a finished request ended. An abandoned one is marked with a `*` and named
 /// by what actually cut it short, which is not always what the client was told:
-/// a deadline truncation reports `max_tokens` on the wire.
+/// a deadline truncation reports `max_tokens` on the wire. A batch reports its
+/// item arithmetic — it has no single stop reason, and per-item failures are
+/// its outcome in a way one word cannot be.
 fn outcome(record: &JobRecord) -> String {
     if record.error.is_some() {
         return "error".to_string();
     }
     if let Some(reason) = record.abandoned {
         return format!("{}*", reason.label().replace(' ', "-"));
+    }
+    if let Some(batch) = &record.batch {
+        return if batch.failed > 0 {
+            format!("{}/{} items", batch.items - batch.failed, batch.items)
+        } else {
+            format!("{} items", batch.items)
+        };
     }
     match &record.stop {
         Some(StopKind::EndTurn) => "end_turn".to_string(),
@@ -619,21 +636,55 @@ fn token_flow(record: &JobRecord) -> String {
     )
 }
 
-/// What the reply cost per token, or what speculation did for it when there is
-/// something to say.
-fn record_rate(record: &JobRecord) -> String {
+/// One phase's cell — its wall time and its own rate — or a dash for a phase
+/// that never ran. Prefill and decode each get one of these; blending them
+/// into a single figure was tried and read as neither.
+fn phase_cell(tokens: usize, secs: f64) -> String {
+    if secs <= 0.0 || tokens == 0 {
+        return "—".to_string();
+    }
+    format!("{} · {:.0} t/s", seconds(span(secs)), tokens as f64 / secs)
+}
+
+/// The prefill column: tokens actually forwarded and the time they took. For a
+/// batch that is engine work — shared prefix once, tails, scored trials — not
+/// the logical prompt size the flow column shows.
+fn prefill_cell(record: &JobRecord) -> String {
+    match &record.batch {
+        Some(batch) => phase_cell(batch.prefill_tokens, batch.prefill_secs),
+        None => phase_cell(record.prefill_tokens, record.prefill_secs),
+    }
+}
+
+/// The decode column: tokens actually sampled and the time they took. A scored
+/// batch's assembled answers are teacher-forced, so it decodes only reasoning —
+/// often nothing, and the dash is the honest cell.
+fn decode_cell(record: &JobRecord) -> String {
+    match &record.batch {
+        Some(batch) => phase_cell(batch.decode_tokens, batch.decode_secs),
+        None => phase_cell(record.output_tokens, record.decode_secs),
+    }
+}
+
+/// The catch-all last column: TTFT and speculation for a generation, the whole
+/// wall run for a batch (host-side work lives in neither phase column).
+fn detail_cell(record: &JobRecord) -> String {
+    let mut parts = Vec::new();
+    if let Some(batch) = &record.batch {
+        parts.push(format!("total {}", seconds(span(batch.secs))));
+    }
+    if let Some(ttft) = record.ttft_secs {
+        parts.push(format!("TTFT {}", seconds(span(ttft))));
+    }
     if let Some(spec) = &record.spec
         && spec.drafted > 0
     {
-        return format!("spec {:.0}%", spec.acceptance_rate() * 100.0);
+        parts.push(format!("spec {:.0}%", spec.acceptance_rate() * 100.0));
     }
-    if record.decode_secs > 0.0 && record.output_tokens > 0 {
-        return format!(
-            "{:.1} t/s",
-            record.output_tokens as f64 / record.decode_secs
-        );
+    if parts.is_empty() {
+        return "—".to_string();
     }
-    "—".to_string()
+    parts.join(" · ")
 }
 
 // ---------------------------------------------------------------------------
@@ -823,11 +874,19 @@ fn detail_line(live: &Live, now: Instant) -> Line<'static> {
         parts.push(read);
         parts.push(format!("slot {}", cache.slot));
     }
-    parts.push(format!("prompt {} tok", commas(live.prompt_tokens)));
+    if live.estimated {
+        // A batch's text is untokenized at pickup: this is the queue's loose
+        // bytes-based overestimate, not a prompt anyone will prefill.
+        parts.push(format!("prompt ~{} tok (est)", commas(live.prompt_tokens)));
+    } else {
+        parts.push(format!("prompt {} tok", commas(live.prompt_tokens)));
+    }
     parts.push(format!("queued {}", seconds(live.queue_wait)));
     if let Some(deadline) = live.deadline {
+        // The watchdog's kill ceiling — deliberately loose (it is derived from
+        // the same overestimate), and nothing like an ETA.
         parts.push(format!(
-            "deadline in {}",
+            "watchdog in {}",
             seconds(deadline.saturating_duration_since(now))
         ));
     }
@@ -943,12 +1002,9 @@ fn draw_history(frame: &mut Frame, app: &Dashboard, area: Rect) {
                 record.origin.dialect.label().to_string(),
                 token_flow(record),
                 outcome(record),
-                seconds(span(record.prefill_secs + record.decode_secs)),
-                record.ttft_secs.map_or_else(
-                    || "—".to_string(),
-                    |ttft| format!("TTFT {}", seconds(span(ttft))),
-                ),
-                record_rate(record),
+                prefill_cell(record),
+                decode_cell(record),
+                detail_cell(record),
             ])
         })
         .collect();
@@ -957,13 +1013,25 @@ fn draw_history(frame: &mut Frame, app: &Dashboard, area: Rect) {
         Constraint::Length(9),
         Constraint::Length(20),
         Constraint::Length(13),
-        Constraint::Length(8),
-        Constraint::Length(12),
+        Constraint::Length(17),
+        Constraint::Length(17),
         Constraint::Fill(1),
     ];
     frame.render_widget(
         Table::new(rows, widths)
             .column_spacing(1)
+            .header(
+                Row::new(vec![
+                    "time",
+                    "api",
+                    "cached+new→out",
+                    "outcome",
+                    "prefill",
+                    "decode",
+                    "detail",
+                ])
+                .style(Style::new().dim()),
+            )
             .block(Block::bordered().title(" HISTORY ")),
         area,
     );
@@ -1323,7 +1391,9 @@ fn rendered(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Stri
 mod tests {
     use super::*;
     use crate::generate::SpecStats;
-    use crate::serve::log::{DiskEvictReason, DiskSegmentRole, JobPhase, QueueEntry, SlotSummary};
+    use crate::serve::log::{
+        BatchSummary, DiskEvictReason, DiskSegmentRole, JobPhase, QueueEntry, SlotSummary,
+    };
     use crate::serve::types::{CancelReason, Dialect};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1367,6 +1437,7 @@ mod tests {
             decode_secs: 3.1,
             ttft_secs: Some(6.6),
             spec: None,
+            batch: None,
         }
     }
 
@@ -1395,6 +1466,7 @@ mod tests {
                 ServeLog::JobPicked {
                     origin: origin(1),
                     prompt_tokens: 34_112,
+                    estimated: false,
                     queue_wait: Duration::from_millis(400),
                     deadline: None,
                 },
@@ -1489,6 +1561,7 @@ mod tests {
                 ServeLog::JobPicked {
                     origin: origin(1),
                     prompt_tokens: 2048,
+                    estimated: false,
                     queue_wait: Duration::ZERO,
                     deadline: None,
                 },
@@ -1516,6 +1589,7 @@ mod tests {
                 ServeLog::JobPicked {
                     origin: origin(1),
                     prompt_tokens: 2048,
+                    estimated: false,
                     queue_wait: Duration::ZERO,
                     deadline: None,
                 },
@@ -1721,6 +1795,7 @@ mod tests {
             ServeLog::JobPicked {
                 origin: origin(1),
                 prompt_tokens: 8,
+                estimated: false,
                 queue_wait: Duration::ZERO,
                 deadline: None,
             },
@@ -1762,9 +1837,10 @@ mod tests {
     }
 
     /// Scrolling means the operator is reading, so the pane stops jumping to the
-    /// newest line until they say otherwise.
+    /// newest line — until they scroll back down onto it (or press End), which
+    /// is arriving back at the live edge and re-engages follow.
     #[test]
-    fn scrolling_the_log_disengages_follow_and_end_restores_it() {
+    fn scrolling_the_log_disengages_follow_and_the_live_edge_restores_it() {
         let mut app = dashboard();
         for _ in 0..20 {
             app.apply(
@@ -1782,6 +1858,18 @@ mod tests {
         // Scrolling past either end stops there rather than wrapping.
         assert!(!app.key(key(KeyCode::PageUp)));
         assert_eq!(app.log_state.selected(), Some(0));
+        // Scrolling down but short of the newest line is still reading.
+        assert!(!app.key(key(KeyCode::PageDown)));
+        assert_eq!(app.log_state.selected(), Some(10));
+        assert!(!app.follow);
+        // Landing on the newest line is the live edge: follow re-engages, and
+        // the next event moves the selection with it.
+        assert!(!app.key(key(KeyCode::PageDown)));
+        assert_eq!(app.log_state.selected(), Some(19));
+        assert!(app.follow);
+        // End still works as the long-jump spelling of the same thing.
+        assert!(!app.key(key(KeyCode::Up)));
+        assert!(!app.follow);
         assert!(!app.key(key(KeyCode::End)));
         assert!(app.follow);
     }
@@ -1849,14 +1937,17 @@ mod tests {
         );
     }
 
-    /// A speculated reply reports acceptance rather than a token rate: the rate
-    /// is the thing speculation was supposed to change, and the acceptance is
-    /// what says whether it did.
+    /// The phase columns each carry their own time and their own rate — a
+    /// generation's prefill and decode are different machines and blending
+    /// them into one figure described neither. Speculation reports its
+    /// acceptance in the detail column, beside TTFT.
     #[test]
-    fn a_speculated_reply_reports_its_acceptance() {
-        assert_eq!(record_rate(&record()), "12.3 t/s");
+    fn phase_columns_report_their_own_times_and_rates() {
+        assert_eq!(prefill_cell(&record()), "5.2s · 321 t/s");
+        assert_eq!(decode_cell(&record()), "3.1s · 12 t/s");
+        assert_eq!(detail_cell(&record()), "TTFT 6.6s");
         assert_eq!(
-            record_rate(&JobRecord {
+            detail_cell(&JobRecord {
                 spec: Some(SpecStats {
                     rounds: 10,
                     drafted: 40,
@@ -1865,8 +1956,42 @@ mod tests {
                 }),
                 ..record()
             }),
-            "spec 55%"
+            "TTFT 6.6s · spec 55%"
         );
+    }
+
+    /// A batch row reads its phases from the batch summary: prefill is engine
+    /// work (shared prefix, tails, scored trials), decode only what was
+    /// actually sampled — a fully scored batch decodes nothing and says so
+    /// with a dash — and the whole wall run lands in the detail column.
+    #[test]
+    fn a_batch_row_reports_measured_phases() {
+        let batch = JobRecord {
+            stop: None,
+            ttft_secs: None,
+            batch: Some(BatchSummary {
+                items: 27,
+                failed: 0,
+                secs: 217.0,
+                prefill_tokens: 45_000,
+                prefill_secs: 180.0,
+                decode_tokens: 0,
+                decode_secs: 0.0,
+            }),
+            ..record()
+        };
+        assert_eq!(outcome(&batch), "27 items");
+        assert_eq!(prefill_cell(&batch), "3m00s · 250 t/s");
+        assert_eq!(decode_cell(&batch), "—");
+        assert_eq!(detail_cell(&batch), "total 3m37s");
+        let failed = JobRecord {
+            batch: Some(BatchSummary {
+                failed: 2,
+                ..batch.batch.unwrap()
+            }),
+            ..batch.clone()
+        };
+        assert_eq!(outcome(&failed), "25/27 items");
     }
 
     #[test]
@@ -1927,6 +2052,7 @@ mod tests {
             ServeLog::JobPicked {
                 origin: origin(1),
                 prompt_tokens: 8,
+                estimated: false,
                 queue_wait: Duration::ZERO,
                 deadline: None,
             },
@@ -1996,6 +2122,7 @@ mod tests {
         let picked = ServeLog::JobPicked {
             origin: origin(1),
             prompt_tokens: 2048,
+            estimated: false,
             queue_wait: Duration::ZERO,
             deadline: None,
         };

@@ -64,6 +64,24 @@ pub struct Generator {
     /// calls (the server snapshots the cache between them); `generate` keeps its
     /// logits on the stack and never touches this.
     last_logits: Option<Tensor>,
+    /// Everything `prefill_tokens` has cost since load, read by delta
+    /// ([`Generator::prefill_spend`]). Decode has no counterpart here because
+    /// every decode call already reports itself (`DecodeOutcome::decode_secs`);
+    /// prefill returns nothing, and a caller that prefills through many calls —
+    /// the batch runner's shared prefix, item tails and scored-option trials —
+    /// would otherwise have to time every site itself.
+    prefill_spend: PrefillSpend,
+}
+
+/// Cumulative wall time and token count of every successful `prefill_tokens`
+/// call. Wall time at the call boundary: device-async completion settles in
+/// whichever call next reads logits back, which on every prefill-heavy path is
+/// still a prefill-phase readback — good for phase attribution, not for kernel
+/// benchmarking.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PrefillSpend {
+    pub tokens: usize,
+    pub secs: f64,
 }
 
 /// One decoded token, tagged with the section of the reply it belongs to and
@@ -1365,6 +1383,7 @@ impl Generator {
             blacklist: Vec::new(),
             grammar: None,
             last_logits: None,
+            prefill_spend: PrefillSpend::default(),
         }
     }
 
@@ -1760,6 +1779,7 @@ impl Generator {
             "prefill of {} tokens at position {start_pos} exceeds max_ctx ({max_ctx})",
             tokens.len()
         );
+        let started = Instant::now();
         let Self {
             model,
             drafter,
@@ -1780,7 +1800,15 @@ impl Generator {
             }
             pos += chunk.len();
         }
+        self.prefill_spend.tokens += tokens.len();
+        self.prefill_spend.secs += started.elapsed().as_secs_f64();
         Ok(())
+    }
+
+    /// Everything `prefill_tokens` has cost since load. Monotonic; a caller
+    /// wanting one job's share reads it before and after and subtracts.
+    pub fn prefill_spend(&self) -> PrefillSpend {
+        self.prefill_spend
     }
 
     /// Log-softmax — over the encodable vocabulary — of the logits the last

@@ -279,6 +279,20 @@ pub struct BatchStats {
     /// Wall time of the shared prefill plus taking the snapshot.
     pub snapshot_ms: f64,
     pub items: usize,
+    /// Tokens actually forwarded as prefill across the whole batch, and the
+    /// wall time they took: the shared prefix once, every item's tail, and —
+    /// for scored items — every teacher-forced segment and option trial. This
+    /// measures engine WORK, so on a scored batch it exceeds the sum of the
+    /// items' logical prompt sizes.
+    pub prefill_tokens: usize,
+    pub prefill_ms: f64,
+    /// Tokens the items actually DECODED (free text, grammar-constrained
+    /// answers, reasoning), and the wall time. A fully scored batch decodes
+    /// only its items' reasoning — with thinking off, nothing at all — because
+    /// assembled answer tokens are teacher-forced, not sampled: they count in
+    /// `completion_tokens`, and their cost lives in the prefill figures.
+    pub decode_tokens: usize,
+    pub decode_ms: f64,
     /// Model + drafter load time, measured by the caller that loaded them.
     pub load_ms: f64,
     pub total_ms: f64,
@@ -316,6 +330,14 @@ struct ItemOutcome {
     text: String,
     finish_reason: FinishReason,
     completion_tokens: usize,
+    /// Tokens this item DECODED and the wall time it took, from the decode
+    /// loop's own outcome. Smaller than `completion_tokens` on a scored item
+    /// (assembled tokens are teacher-forced, and only reasoning decodes) and
+    /// zero for one that never reached a decode. Prefill has no per-item
+    /// counterpart: the runner reads the generator's cumulative spend instead,
+    /// which also covers the shared prefill no single item owns.
+    decode_tokens: usize,
+    decode_secs: f64,
     /// The value a SCORED item assembled. The grammar path leaves this `None`
     /// and its value is parsed back out of the decoded text instead.
     json: Option<Value>,
@@ -487,6 +509,13 @@ pub fn run_batch(
         None
     };
 
+    // Phase accounting: decode comes off each item's own outcome, prefill by
+    // delta from the generator's cumulative spend — the shared prefill above
+    // and the scored path's teacher-forced trials belong to no single item.
+    let prefill_before = generator.prefill_spend();
+    let mut decode_tokens = 0usize;
+    let mut decode_secs = 0.0f64;
+
     let mut items = Vec::with_capacity(req.items.len());
     for (spec, prepared) in req.items.iter().zip(prepared.iter()) {
         // Polled at every item boundary, and again below after a run: a
@@ -512,6 +541,8 @@ pub fn run_batch(
                     completion_tokens: outcome.completion_tokens,
                     ms: elapsed_ms(item_started),
                 });
+                decode_tokens += outcome.decode_tokens;
+                decode_secs += outcome.decode_secs;
                 // A scored item brings its own value and its own refusal; only
                 // the grammar path has a document left to parse.
                 let (json, error) = match (&outcome.json, &outcome.error) {
@@ -541,12 +572,17 @@ pub fn run_batch(
         }
     }
 
+    let prefill = generator.prefill_spend();
     Ok(BatchResponse {
         model: model.to_string(),
         stats: BatchStats {
             shared_prefix_tokens: shared_len,
             snapshot_ms,
             items: items.len(),
+            prefill_tokens: prefill.tokens - prefill_before.tokens,
+            prefill_ms: (prefill.secs - prefill_before.secs) * 1000.0,
+            decode_tokens,
+            decode_ms: decode_secs * 1000.0,
             load_ms,
             total_ms: elapsed_ms(started),
         },
@@ -679,6 +715,8 @@ fn run_item(
             text: String::new(),
             finish_reason: FinishReason::Error,
             completion_tokens: outcome.tokens_out,
+            decode_tokens: outcome.tokens_out,
+            decode_secs: outcome.decode_secs,
             json: None,
             error: Some(CANCELLED.to_string()),
         });
@@ -687,6 +725,8 @@ fn run_item(
     Ok(ItemOutcome {
         content,
         text,
+        decode_tokens: outcome.tokens_out,
+        decode_secs: outcome.decode_secs,
         finish_reason: if outcome.hit_eog {
             FinishReason::Stop
         } else {
@@ -1226,6 +1266,8 @@ fn assemble_scored(
     let prompt_len = item.tokens.len();
     let mut reasoning = String::new();
     let mut written = Vec::new();
+    let mut decode_tokens = 0;
+    let mut decode_secs = 0.0;
     if item.starts_in_thinking {
         let run = decode_reasoning(
             generator,
@@ -1240,6 +1282,8 @@ fn assemble_scored(
         );
         reasoning = run.text;
         written = run.ids;
+        decode_tokens = run.decode_tokens;
+        decode_secs = run.decode_secs;
     }
 
     // Both decode loops may leave their last emitted token unforwarded, so the
@@ -1294,6 +1338,8 @@ fn assemble_scored(
         text: document,
         finish_reason: FinishReason::Stop,
         completion_tokens: written.len() + assembled,
+        decode_tokens,
+        decode_secs,
         json: Some(Value::Object(value)),
         error: None,
     })
@@ -1313,6 +1359,8 @@ fn budget_refusal(item: &Prepared, plan: &ScoredPlan, reasoning_floor: usize) ->
         text: String::new(),
         finish_reason: FinishReason::Length,
         completion_tokens: 0,
+        decode_tokens: 0,
+        decode_secs: 0.0,
         json: None,
         error: Some(format!(
             "the assembled answer needs up to {} tokens{reasoning}, past this item's \
@@ -1329,6 +1377,9 @@ struct Reasoning {
     /// Every id emitted, `</think>` included, in order.
     ids: Vec<u32>,
     closed: bool,
+    /// The decode loop's own accounting, passed through for the item's totals.
+    decode_tokens: usize,
+    decode_secs: f64,
 }
 
 /// Decode a scored item's reasoning and stop the moment `</think>` commits.
@@ -1346,6 +1397,7 @@ fn decode_reasoning(
     let closed = Cell::new(false);
     let mut text = String::new();
     let mut ids = Vec::new();
+    let outcome;
     {
         let mut on_event = |event: GenEvent| {
             ids.push(event.id());
@@ -1355,16 +1407,18 @@ fn decode_reasoning(
             }
         };
         let mut stop = || closed.get();
-        if generator.spec_ready_at(prompt_len) {
-            generator.decode_loop_spec(prompt_len, true, budget, &mut on_event, &mut stop)?;
+        outcome = if generator.spec_ready_at(prompt_len) {
+            generator.decode_loop_spec(prompt_len, true, budget, &mut on_event, &mut stop)?
         } else {
-            generator.decode_loop(prompt_len, true, budget, &mut on_event, &mut stop)?;
-        }
+            generator.decode_loop(prompt_len, true, budget, &mut on_event, &mut stop)?
+        };
     }
     Ok(Reasoning {
         text,
         ids,
         closed: closed.get(),
+        decode_tokens: outcome.tokens_out,
+        decode_secs: outcome.decode_secs,
     })
 }
 
@@ -2160,6 +2214,10 @@ mod tests {
                 shared_prefix_tokens: 190,
                 snapshot_ms: 41.5,
                 items: 2,
+                prefill_tokens: 230,
+                prefill_ms: 260.0,
+                decode_tokens: 9,
+                decode_ms: 95.0,
                 load_ms: 2900.0,
                 total_ms: 3400.0,
             },
@@ -2204,6 +2262,8 @@ mod tests {
             text: text.to_string(),
             finish_reason,
             completion_tokens: 4,
+            decode_tokens: 4,
+            decode_secs: 0.1,
             json: None,
             error: None,
         }

@@ -111,6 +111,10 @@ xwen batch < request.json > response.json
     "shared_prefix_tokens": 317,
     "snapshot_ms": 148.3,
     "items": 1,
+    "prefill_tokens": 391,
+    "prefill_ms": 361.0,
+    "decode_tokens": 9,
+    "decode_ms": 92.0,
     "load_ms": 3470.0,
     "total_ms": 1828.0
   }

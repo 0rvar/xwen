@@ -137,6 +137,35 @@ pub struct JobRecord {
     pub ttft_secs: Option<f64>,
     /// What speculation did, for a reply that was speculated at all.
     pub spec: Option<SpecStats>,
+    /// Present for a batch job, whose shape the generation-centric spans above
+    /// cannot carry: a batch has no single prefill/decode split and no first
+    /// token to time, so those stay zero and THIS is where its duration and
+    /// item arithmetic live.
+    pub batch: Option<BatchSummary>,
+}
+
+/// What one finished batch job amounted to, for the record.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchSummary {
+    /// Items in the response, failed ones included.
+    pub items: usize,
+    /// Items that reported an `error` instead of an answer.
+    pub failed: usize,
+    /// The whole run, shared prefill through last item (the lazy model load,
+    /// reported separately at pickup, is not part of it). Longer than the two
+    /// phase spans below summed: host-side work — rendering, snapshot copies,
+    /// scoring arithmetic — lives here and in neither phase.
+    pub secs: f64,
+    /// Tokens actually FORWARDED as prefill and their wall time: the shared
+    /// prefix once, every tail, every teacher-forced scored trial — engine
+    /// work, not logical prompt size.
+    pub prefill_tokens: usize,
+    pub prefill_secs: f64,
+    /// Tokens actually DECODED and their wall time. A scored item's assembled
+    /// answer is teacher-forced, not decoded, so a fully scored batch decodes
+    /// only reasoning — with thinking off, nothing.
+    pub decode_tokens: usize,
+    pub decode_secs: f64,
 }
 
 /// One cache slot as the engine holds it, for a consumer that wants to show
@@ -361,6 +390,12 @@ pub enum ServeLog {
     JobPicked {
         origin: RequestOrigin,
         prompt_tokens: usize,
+        /// Whether `prompt_tokens` is the queue's bytes-based OVERESTIMATE
+        /// rather than a rendered prompt's real count. True for a batch job,
+        /// whose text nobody has tokenized at pickup (the deliberately loose
+        /// bytes/3 figure the scheduler and watchdog use); a consumer showing
+        /// the number should say so.
+        estimated: bool,
         /// How long it waited between submit and pickup.
         queue_wait: Duration,
         /// The wall-clock ceiling the job was given at this pickup, as the
@@ -1392,11 +1427,13 @@ mod tests {
             decode_secs: 3.1,
             ttft_secs: Some(1.4),
             spec: None,
+            batch: None,
         };
         let silent = [
             ServeLog::JobPicked {
                 origin,
                 prompt_tokens: 380,
+                estimated: false,
                 queue_wait: Duration::from_millis(4),
                 deadline: Some(Instant::now() + Duration::from_secs(60)),
             },

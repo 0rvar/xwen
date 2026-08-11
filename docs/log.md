@@ -91,6 +91,34 @@ the reset: dropping the model drops whatever the cache grew to, and the reload s
 at 8192 again. Verified live: an 11215-token prompt on the new default logged one
 growth step (8192 → 16384, 0.3 GB) and answered correctly.
 
+**The TUI stops lying about batch jobs (same day, operator feedback).** Watching the
+client's workload live exposed two dashboard failures. The NOW pane said "deadline in
+96m15s" — the watchdog kill-ceiling, computed from the queue's deliberately-loose
+bytes/3 estimate (731,183 "tokens" of a ~2.2 MB body ÷ the 150 tok/s floor rate + the
+summed budgets ÷ 10 + slack), rendered as if it were an ETA; it now reads
+"watchdog in …" and the prompt figure carries "~…(est)" when it is the estimate
+(`JobPicked.estimated`, true for a batch, whose text is untokenized at pickup). And
+HISTORY rows for batches read `321,930+0→2,252  —  0.0s  —  —`: unlabeled columns,
+`prefill_tokens`/`*_secs`/`stop` never filled by the batch path — so the flow read as
+"322k from cache, nothing prefilled", the duration as instant, and outcome/rate as
+nothing. The record now carries a `BatchSummary`, `run_batch_job` fills the token arithmetic in
+the record's own `prompt = cache_read + prefill` terms (the shared prefix is prefilled
+once and READ N−1 times, so the summed per-item `cached_prefix_tokens` overcount by
+exactly one span), and the table grew a header row. The first cut blended everything
+into one `output ÷ whole-run` rate; that was called out as misleading (correctly — it
+described neither machine) and replaced the same day by MEASURED per-phase columns:
+the batch runner now reports what it actually forwarded and what it actually decoded
+(`BatchStats.{prefill,decode}_{tokens,ms}`, on the wire for clients too — prefill by
+delta off a new cumulative `Generator::prefill_spend` counter, since the shared prefix
+and the scored trials belong to no single item; decode straight off each item's
+`DecodeOutcome`), and HISTORY shows `prefill` and `decode` as separate columns, each
+with its own time and its own t/s, with TTFT/spec%/whole-run total in a `detail`
+column. A fully scored batch decodes nothing and its decode cell is honestly a dash —
+its work shows up as prefill (teacher-forced trials), which is what it is. The LOG pane's follow latch also stopped being one-way:
+scrolling used to disengage follow permanently (only End re-armed it), so a pane once
+touched sat pinned to a stale line forever; scrolling back down ONTO the newest line
+now re-engages follow — arriving at the live edge means wanting it live.
+
 **Also swept while in there.** Three comments still carried laguna's ~70GB checkpoint
 into a repo whose files are 19-20 GB (`MEMORY_WARN_BYTES` doc, the config template's
 `idle_unload` note, gguf.rs's residency measurement — the last now attributes its ~10%

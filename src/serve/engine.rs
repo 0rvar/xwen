@@ -621,6 +621,10 @@ fn engine_loop(
         logger.log(ServeLog::JobPicked {
             origin: job.origin(),
             prompt_tokens,
+            // A batch's text is untokenized at pickup, so its figure is the
+            // queue's loose bytes-based estimate; a generation's prompt was
+            // rendered and encoded by the HTTP layer and the count is real.
+            estimated: matches!(job, Job::Batch(_)),
             queue_wait: trace.picked.saturating_duration_since(submitted),
             deadline: job.deadline(),
         });
@@ -839,6 +843,7 @@ impl JobTrace {
                 decode_secs: 0.0,
                 ttft_secs: None,
                 spec: None,
+                batch: None,
             },
         }
     }
@@ -1168,20 +1173,37 @@ fn run_batch_job(
     )
     .map_err(JobFailure::from)?;
 
-    // The trace reports measured totals where the estimate stood: what the
-    // items' prompts actually encoded to, how much of that the shared snapshot
-    // covered, and what came out.
+    // The trace reports measured totals where the estimate stood, in the
+    // record's own arithmetic (`prompt = cache_read + prefill`): the summed
+    // item prompts, of which every restore of the shared snapshot past its
+    // first prefill was a cache read — the prefix is prefilled once and read
+    // back N-1 times, so the sum of per-item `cached_prefix_tokens` overcounts
+    // by exactly one span — and the rest ran through the model.
     trace.record.prompt_tokens = response.items.iter().map(|i| i.usage.prompt_tokens).sum();
-    trace.record.cache_read = response
+    let cached_per_item: usize = response
         .items
         .iter()
         .map(|i| i.usage.cached_prefix_tokens)
         .sum();
+    trace.record.cache_read = cached_per_item.saturating_sub(response.stats.shared_prefix_tokens);
+    trace.record.prefill_tokens = trace
+        .record
+        .prompt_tokens
+        .saturating_sub(trace.record.cache_read);
     trace.record.output_tokens = response
         .items
         .iter()
         .map(|i| i.usage.completion_tokens)
         .sum();
+    trace.record.batch = Some(crate::serve::log::BatchSummary {
+        items: response.items.len(),
+        failed: response.items.iter().filter(|i| i.error.is_some()).count(),
+        secs: response.stats.total_ms / 1000.0,
+        prefill_tokens: response.stats.prefill_tokens,
+        prefill_secs: response.stats.prefill_ms / 1000.0,
+        decode_tokens: response.stats.decode_tokens,
+        decode_secs: response.stats.decode_ms / 1000.0,
+    });
     trace.record.abandoned = abandon.reason();
 
     // The one terminal event. A departed client's channel just drops it, and a
