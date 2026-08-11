@@ -195,7 +195,7 @@ impl BatchRequest {
 // --------------------------------------------------------------- response ---
 
 /// The whole answer, printed as JSON on stdout.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct BatchResponse {
     pub model: String,
     pub items: Vec<ItemResponse>,
@@ -205,7 +205,7 @@ pub struct BatchResponse {
 /// One item's answer. Present in request order, including for items that
 /// failed — a failed item carries `error` and empty text, so the response is
 /// always parallel to the request.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ItemResponse {
     pub id: String,
     /// Everything the model emitted, reasoning included. The `</think>` marker
@@ -245,7 +245,7 @@ pub enum FinishReason {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
 pub struct Usage {
     /// Tokens in the rendered prompt, shared prefix included.
     pub prompt_tokens: usize,
@@ -254,7 +254,7 @@ pub struct Usage {
     pub completion_tokens: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
 pub struct BatchStats {
     /// Length of the shared prefix that was prefilled once, or 0 when every
     /// item ran from a reset cache.
@@ -353,6 +353,36 @@ pub fn shared_prefix_len(seqs: &[&[u32]]) -> Option<usize> {
     (len >= MIN_SHARED_PREFIX).then_some(len)
 }
 
+/// Progress worth narrating while a batch runs. The runner reports it through
+/// [`BatchHooks::progress`] rather than writing anywhere itself, so the CLI can
+/// keep its stderr lines and the server can route the same facts into its log.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchProgress {
+    /// The shared prefix was prefilled once and snapshotted.
+    SharedPrefix { tokens: usize, ms: f64 },
+    /// One item ran to completion.
+    Item {
+        id: String,
+        completion_tokens: usize,
+        ms: f64,
+    },
+}
+
+/// What the caller threads into a batch run: a progress sink, and a poll that
+/// says the run has been abandoned. Cancellation is polled between items and
+/// once per decoded token inside an item, so a cancelled batch stops within a
+/// token of the signal; items never run after it, and report `error` instead.
+/// The scored path checks only between items — it teacher-forces short forced
+/// spans rather than decoding, so an item's worth of latency bounds it anyway.
+pub struct BatchHooks<'a> {
+    pub progress: &'a mut dyn FnMut(BatchProgress),
+    pub cancelled: &'a mut dyn FnMut() -> bool,
+}
+
+/// What a cancelled batch reports on every item the cancellation reached: the
+/// one it interrupted and every one it kept from running at all.
+const CANCELLED: &str = "the batch was cancelled before this item completed";
+
 /// Run a whole batch on `generator`, which must already be loaded (and, if the run
 /// wants speculation, have its drafter attached). `load_ms` is what that load
 /// cost, for the stats block.
@@ -360,11 +390,22 @@ pub fn run_batch(
     generator: &mut Generator,
     req: &BatchRequest,
     load_ms: f64,
+    hooks: &mut BatchHooks<'_>,
 ) -> Result<BatchResponse> {
     let started = Instant::now();
     ensure!(!req.items.is_empty(), "batch: the request holds no items");
     let model = req.model()?;
     let max_ctx = generator.max_ctx();
+
+    // The generator may be long-lived (the server's engine) and arrive with
+    // another job's thinking controls still armed. Batch items reason under
+    // their own `thinking` spec and this surface has no budget knob, so both
+    // controls are cleared rather than inherited: a stale ceiling would fail
+    // every item whose budget it does not fit, and silently truncate the
+    // reasoning of the ones it does. The CLI's fresh process has them at zero
+    // already; this is for any caller that reuses a generator.
+    generator.set_min_think(0);
+    generator.set_max_think(0)?;
 
     // Every prompt is rendered and encoded before anything runs: the shared
     // prefix is a fact about the whole set, and an item that cannot be prepared
@@ -400,7 +441,10 @@ pub fn run_batch(
             generator.prefill_tokens(&prefix, 0)?;
             let snapshot = generator.take_cache_snapshot()?;
             snapshot_ms = elapsed_ms(prefill_started);
-            eprintln!("xwen: shared prefix {len} tokens prefilled in {snapshot_ms:.0}ms");
+            (hooks.progress)(BatchProgress::SharedPrefix {
+                tokens: len,
+                ms: snapshot_ms,
+            });
             Some(snapshot)
         }
         None => None,
@@ -421,6 +465,13 @@ pub fn run_batch(
 
     let mut items = Vec::with_capacity(req.items.len());
     for (spec, prepared) in req.items.iter().zip(prepared.iter()) {
+        // Polled at every item boundary, and again below after a run: a
+        // cancelled batch stops running items and reports the rest untouched,
+        // rather than being torn down mid-response.
+        if (hooks.cancelled)() {
+            items.push(failed_item(&spec.id, CANCELLED.to_string()));
+            continue;
+        }
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -430,14 +481,13 @@ pub fn run_batch(
         };
         let cached = snapshot.as_ref().map(|snapshot| (snapshot, shared_len));
         let item_started = Instant::now();
-        match run_item(generator, factory, prepared, cached) {
+        match run_item(generator, factory, prepared, cached, hooks.cancelled) {
             Ok(outcome) => {
-                eprintln!(
-                    "xwen: item {:?} {} tokens in {:.0}ms",
-                    spec.id,
-                    outcome.completion_tokens,
-                    elapsed_ms(item_started),
-                );
+                (hooks.progress)(BatchProgress::Item {
+                    id: spec.id.clone(),
+                    completion_tokens: outcome.completion_tokens,
+                    ms: elapsed_ms(item_started),
+                });
                 // A scored item brings its own value and its own refusal; only
                 // the grammar path has a document left to parse.
                 let (json, error) = match (&outcome.json, &outcome.error) {
@@ -516,6 +566,7 @@ fn run_item(
     factory: Option<&ConstraintFactory>,
     item: &Prepared,
     cached: Option<(&CacheSnapshot, usize)>,
+    cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<ItemOutcome> {
     let resume = match cached {
         Some((snapshot, at)) => {
@@ -561,6 +612,14 @@ fn run_item(
             text.push_str(chunk);
         }
     };
+    // The cancel poll is latched so this item can tell "my decode was cut"
+    // from "the batch was cancelled right after I finished": only the former
+    // makes this item's answer not the one it was asked for.
+    let mut cut = false;
+    let mut should_stop = || {
+        cut = cut || cancelled();
+        cut
+    };
     // The speculative loop draws the same tokens either way; this asks the
     // narrower question of whether it could actually speculate from here, so a
     // drafter that fell behind does not pay the round loop's overhead.
@@ -570,7 +629,7 @@ fn run_item(
             item.starts_in_thinking,
             item.max_tokens,
             &mut on_event,
-            &mut || false,
+            &mut should_stop,
         )?
     } else {
         generator.decode_loop(
@@ -578,9 +637,28 @@ fn run_item(
             item.starts_in_thinking,
             item.max_tokens,
             &mut on_event,
-            &mut || false,
+            &mut should_stop,
         )?
     };
+
+    // A cut decode stopped mid-answer: whatever it produced is not the answer
+    // the item asked for, so the text is dropped and the cancellation reported
+    // in its place — a failed item carries `error` and empty text, which is
+    // the response's documented contract. The usage still counts the tokens
+    // the cut decode actually spent. `hit_eog` overrides the latch: a decode
+    // that ENDED naturally (EOG, or a grammar that completed — a single-token
+    // constrained value completes on its first draw) is a complete answer
+    // however late the cancellation signal landed, and must never be relabeled.
+    if cut && !outcome.hit_eog {
+        return Ok(ItemOutcome {
+            content: String::new(),
+            text: String::new(),
+            finish_reason: FinishReason::Error,
+            completion_tokens: outcome.tokens_out,
+            json: None,
+            error: Some(CANCELLED.to_string()),
+        });
+    }
 
     Ok(ItemOutcome {
         content,

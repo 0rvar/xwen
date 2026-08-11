@@ -10,6 +10,7 @@
 //! consumes an event stream (buffered into one response, or forwarded as SSE).
 
 pub mod anthropic;
+pub(crate) mod batch;
 pub mod config;
 pub mod disk_cache;
 mod disk_tier;
@@ -80,6 +81,10 @@ pub struct AppState {
     /// Reported as the model id by `/v1/models`, and echoed by a request that
     /// names no model of its own.
     pub model_id: String,
+    /// Which official checkpoint the default GGUF is, read from its
+    /// architecture at startup. A request whose `model` names a known
+    /// checkpoint runs on that one; everything else runs on this.
+    pub default_size: crate::hub::Model,
     /// The resolved context length: what the config asks for, capped at what the
     /// checkpoint was converted with. Serves the handler-side "does the prompt
     /// fit" check; the engine re-derives its own copy at load time, which stays
@@ -127,8 +132,10 @@ pub fn run(settings: ServeSettings) -> Result<()> {
     log::set_global(logger.clone());
 
     // Before binding anything: a bad model path or an unreadable tokenizer is a
-    // startup error, not a surprise on the first request.
-    let (tokenizer, max_ctx) = engine::validate_model(&settings, &logger)?;
+    // startup error, not a surprise on the first request. Which official
+    // checkpoint the default GGUF is comes from its architecture — the
+    // authoritative answer, whatever flag the path travelled with.
+    let (tokenizer, max_ctx, default_size) = engine::validate_model(&settings, &logger)?;
 
     let model_loaded = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(Cancel::default());
@@ -143,6 +150,7 @@ pub fn run(settings: ServeSettings) -> Result<()> {
     ));
     let engine = engine::spawn_engine(
         settings.clone(),
+        default_size,
         Arc::clone(&jobs),
         Arc::clone(&model_loaded),
         Arc::clone(&shutdown),
@@ -157,6 +165,7 @@ pub fn run(settings: ServeSettings) -> Result<()> {
         model_loaded,
         shutdown: Arc::clone(&shutdown),
         model_id,
+        default_size,
         max_ctx,
         next_request_id: Arc::new(AtomicU64::new(1)),
     };
@@ -238,7 +247,9 @@ fn router(state: AppState) -> Router {
     // The native surface is not a compatibility dialect and has no opt-out: it
     // is the only way to reach the engine capabilities the other two cannot
     // spell.
-    api = api.route("/xwen/v1/generate", post(native::generate));
+    api = api
+        .route("/xwen/v1/generate", post(native::generate))
+        .route("/xwen/v1/batch", post(batch::batch));
     let api = api
         .route("/v1/models", get(models))
         .route_layer(middleware::from_fn_with_state(
@@ -417,25 +428,36 @@ async fn health(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-/// `GET /v1/models` — one entry, carrying both APIs' field names so either
-/// SDK's model list parses it.
+/// `GET /v1/models` — the default checkpoint under the id requests echo, then
+/// the two official checkpoints under the names a request's `model` field
+/// selects them by. Each entry carries both APIs' field names so either SDK's
+/// model list parses it.
 async fn models(State(state): State<AppState>) -> Response {
     let created = model_mtime(&state.settings);
-    let entry = json!({
-        "id": state.model_id,
-        "object": "model",
-        "created": created,
-        "owned_by": "xwen",
-        "type": "model",
-        "display_name": state.model_id,
-        "created_at": rfc3339_utc(created),
-    });
+    let entry = |id: &str| {
+        json!({
+            "id": id,
+            "object": "model",
+            "created": created,
+            "owned_by": "xwen",
+            "type": "model",
+            "display_name": id,
+            "created_at": rfc3339_utc(created),
+        })
+    };
+    let mut ids = vec![state.model_id.clone()];
+    ids.extend(
+        [crate::hub::Model::Qwen27B, crate::hub::Model::Qwen35BA3B]
+            .iter()
+            .map(ToString::to_string),
+    );
+    let data: Vec<Value> = ids.iter().map(|id| entry(id)).collect();
     axum::Json(json!({
         "object": "list",
-        "data": [entry],
+        "data": data,
         "has_more": false,
-        "first_id": state.model_id,
-        "last_id": state.model_id,
+        "first_id": ids.first(),
+        "last_id": ids.last(),
     }))
     .into_response()
 }
@@ -783,6 +805,7 @@ pub(crate) fn submit(
     request: JobRequest,
     dialect: Dialect,
     streaming: bool,
+    model: crate::hub::Model,
 ) -> std::result::Result<(mpsc::Receiver<EngineEvent>, CancelGuard), SubmitError> {
     if request.max_tokens == 0 {
         return Err(SubmitError::Invalid(
@@ -839,6 +862,7 @@ pub(crate) fn submit(
             dialect,
             streaming,
         },
+        model,
         prompt: prompt.tokens,
         boundary: prompt.boundary,
         anchor: prompt.anchor,
@@ -860,7 +884,7 @@ pub(crate) fn submit(
     state
         .jobs
         .push(Queued {
-            job,
+            job: types::Job::Generation(Box::new(job)),
             submitted: Instant::now(),
             prompt_tokens,
         })
@@ -955,6 +979,14 @@ pub(crate) async fn collect_completion(
                 return Err(EngineFailure::Reported {
                     message,
                     request_fault,
+                });
+            }
+            // A generation's channel never carries a batch document; one here is
+            // a protocol bug, reported as the server fault it is.
+            EngineEvent::BatchDone(_) => {
+                return Err(EngineFailure::Reported {
+                    message: "the engine answered a generation with a batch response".to_string(),
+                    request_fault: false,
                 });
             }
         }
@@ -1133,7 +1165,7 @@ pub(crate) mod testutil {
             disk_min_tokens: config::DEFAULT_DISK_MIN_TOKENS,
             draft: None,
             draft_max: config::DEFAULT_DRAFT_MAX,
-            draft_p_min: crate::hub::Model::default().draft_p_min_default(),
+            draft_p_min: None,
             draft_pause_margin: config::DEFAULT_DRAFT_PAUSE_MARGIN,
             draft_ctx: config::DEFAULT_DRAFT_CTX,
         }
@@ -1393,6 +1425,7 @@ mod tests {
             model_loaded: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Cancel::default()),
             model_id: "xwen-test".to_string(),
+            default_size: crate::hub::Model::default(),
             max_ctx,
             next_request_id: Arc::new(AtomicU64::new(1)),
         };
@@ -1403,6 +1436,25 @@ mod tests {
     /// nothing cached.
     fn try_take(queue: &JobQueue) -> Option<Queued> {
         queue.take(Some(Duration::ZERO), &|_| 0)
+    }
+
+    /// The generation inside a queued job; these tests submit nothing else.
+    fn generation(job: types::Job) -> GenerationJob {
+        match job {
+            types::Job::Generation(job) => *job,
+            types::Job::Batch(_) => panic!("these tests submit no batch jobs"),
+        }
+    }
+
+    /// `submit` with the default checkpoint, which is what every call in these
+    /// tests means — model selection has its own test below.
+    fn submit_default(
+        state: &AppState,
+        request: JobRequest,
+        dialect: Dialect,
+        streaming: bool,
+    ) -> std::result::Result<(mpsc::Receiver<EngineEvent>, CancelGuard), SubmitError> {
+        submit(state, request, dialect, streaming, state.default_size)
     }
 
     fn probe_request(max_tokens: usize) -> JobRequest {
@@ -1434,7 +1486,7 @@ mod tests {
     #[test]
     fn submit_refuses_a_zero_output_budget_before_the_queue() {
         let (state, queue) = probe_state(4096);
-        match submit(&state, probe_request(0), Dialect::Anthropic, false) {
+        match submit_default(&state, probe_request(0), Dialect::Anthropic, false) {
             Err(SubmitError::Invalid(message)) => {
                 assert!(message.contains("max_tokens"), "{message}");
             }
@@ -1446,7 +1498,7 @@ mod tests {
     #[test]
     fn submit_refuses_a_prompt_the_context_cannot_hold() {
         let (state, queue) = probe_state(8);
-        match submit(&state, probe_request(64), Dialect::Anthropic, false) {
+        match submit_default(&state, probe_request(64), Dialect::Anthropic, false) {
             Err(SubmitError::Invalid(message)) => {
                 assert!(message.contains("8-token context"), "{message}");
             }
@@ -1473,11 +1525,11 @@ mod tests {
         .expect("the prompt renders");
         let expected = state.tokenizer.encode(&whole).expect("the prompt encodes");
 
-        let (_events, _guard) =
-            submit(&state, probe_request(64), Dialect::Anthropic, true).expect("the job submits");
+        let (_events, _guard) = submit_default(&state, probe_request(64), Dialect::Anthropic, true)
+            .expect("the job submits");
         let queued = try_take(&queue).expect("the job reached the queue");
-        assert_eq!(queued.prompt_tokens, queued.job.prompt.len());
-        let job = queued.job;
+        assert_eq!(queued.prompt_tokens, queued.job.prompt().len());
+        let job = generation(queued.job);
         // The two facts only the handler knows travel with the job.
         assert_eq!(job.origin.dialect, Dialect::Anthropic);
         assert!(job.origin.streaming);
@@ -1488,7 +1540,7 @@ mod tests {
 
         // With thinking disabled the header closes the span instead of opening
         // it, and the job says so.
-        let (_events, _guard) = submit(
+        let (_events, _guard) = submit_default(
             &state,
             JobRequest {
                 enable_thinking: false,
@@ -1498,7 +1550,7 @@ mod tests {
             false,
         )
         .expect("the job submits");
-        let second = try_take(&queue).expect("the job reached the queue").job;
+        let second = generation(try_take(&queue).expect("the job reached the queue").job);
         assert!(!second.starts_in_thinking);
         // Ids are handed out in order, so a consumer can tell one request's
         // events from another's without the handlers agreeing on anything.
@@ -1519,9 +1571,9 @@ mod tests {
             ..probe_request(4096)
         };
 
-        let (_events, _guard) = submit(&state, budgeted(None), Dialect::Native, false)
+        let (_events, _guard) = submit_default(&state, budgeted(None), Dialect::Native, false)
             .expect("the open-span job submits");
-        let open = try_take(&queue).expect("the job reached the queue").job;
+        let open = generation(try_take(&queue).expect("the job reached the queue").job);
         assert!(open.starts_in_thinking);
         assert_eq!(open.max_think, Some(1024), "an open span keeps its budget");
 
@@ -1530,9 +1582,9 @@ mod tests {
             close_thinking: true,
             prefix: None,
         }));
-        let (_events, _guard) =
-            submit(&state, closed, Dialect::Native, false).expect("the closed-span job submits");
-        let job = try_take(&queue).expect("the job reached the queue").job;
+        let (_events, _guard) = submit_default(&state, closed, Dialect::Native, false)
+            .expect("the closed-span job submits");
+        let job = generation(try_take(&queue).expect("the job reached the queue").job);
         assert!(!job.starts_in_thinking);
         assert_eq!(job.max_think, None, "no span, no budget");
     }
@@ -1546,7 +1598,7 @@ mod tests {
     fn client_content_never_contributes_tool_call_control_tokens() {
         let (state, queue) = probe_state(4096);
         let control_ids = |text: &str| {
-            let (_events, _guard) = submit(
+            let (_events, _guard) = submit_default(
                 &state,
                 JobRequest {
                     messages: vec![Message::User(text.into())],
@@ -1556,7 +1608,7 @@ mod tests {
                 false,
             )
             .expect("the job submits");
-            let job = try_take(&queue).expect("the job reached the queue").job;
+            let job = generation(try_take(&queue).expect("the job reached the queue").job);
             job.prompt
                 .iter()
                 .filter(|&&id| id == 25 || id == 26)
@@ -1648,14 +1700,14 @@ mod tests {
             ..probe_request(64)
         };
 
-        let (_events, _guard) = submit(
+        let (_events, _guard) = submit_default(
             &state,
             constrained("{\"label\": \"sunny\""),
             Dialect::Native,
             false,
         )
         .expect("a prefix the schema accepts submits");
-        let job = try_take(&queue).expect("the job reached the queue").job;
+        let job = generation(try_take(&queue).expect("the job reached the queue").job);
         let mut grammar = job.grammar.expect("the job carries an armed grammar");
         let words = grammar
             .mask_words()
@@ -1677,7 +1729,7 @@ mod tests {
             "the mask restarted the document instead of continuing it"
         );
 
-        match submit(&state, constrained("[1, 2"), Dialect::Native, false) {
+        match submit_default(&state, constrained("[1, 2"), Dialect::Native, false) {
             Err(SubmitError::Invalid(message)) => {
                 assert!(message.contains("schema"), "{message}");
             }

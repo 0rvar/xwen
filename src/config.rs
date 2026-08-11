@@ -55,6 +55,17 @@ impl Arch {
             Arch::Moe => "qwen35moe",
         }
     }
+
+    /// The official checkpoint family this architecture belongs to. The two are
+    /// one-to-one, so a GGUF's architecture is the authoritative answer to
+    /// "which checkpoint is this file" — more reliable than any flag that
+    /// travelled alongside a path.
+    pub fn model(&self) -> crate::hub::Model {
+        match self {
+            Arch::Dense => crate::hub::Model::Qwen27B,
+            Arch::Moe => crate::hub::Model::Qwen35BA3B,
+        }
+    }
 }
 
 /// The IMROPE section layout both checkpoints declare. For text-only input every

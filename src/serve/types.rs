@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
+use crate::batch::{BatchRequest, BatchResponse};
+use crate::hub::Model;
 use crate::sampler::SamplerOptions;
 
 /// Which API a request arrived on. Never affects generation — the two dialects
@@ -48,9 +50,113 @@ pub struct RequestOrigin {
     pub streaming: bool,
 }
 
+/// One unit of the engine thread's work: a chat generation or a whole batch.
+/// Every job names the checkpoint it needs; the engine's pickup ensures that
+/// checkpoint is the one loaded, swapping the resident one out when it is not.
+///
+/// Both variants are boxed for the queue's sake: it holds these by value, and
+/// a `GenerationJob` alone is over a kilobyte.
+pub enum Job {
+    Generation(Box<GenerationJob>),
+    Batch(Box<BatchJob>),
+}
+
+impl Job {
+    pub fn origin(&self) -> RequestOrigin {
+        match self {
+            Job::Generation(job) => job.origin,
+            Job::Batch(job) => job.origin,
+        }
+    }
+
+    /// The checkpoint this job runs on.
+    pub fn model(&self) -> Model {
+        match self {
+            Job::Generation(job) => job.model,
+            Job::Batch(job) => job.model,
+        }
+    }
+
+    pub fn cancel(&self) -> &Arc<Cancel> {
+        match self {
+            Job::Generation(job) => &job.cancel,
+            Job::Batch(job) => &job.cancel,
+        }
+    }
+
+    pub fn events(&self) -> &tokio::sync::mpsc::Sender<EngineEvent> {
+        match self {
+            Job::Generation(job) => &job.events,
+            Job::Batch(job) => &job.events,
+        }
+    }
+
+    /// The encoded prompt the scheduler scores a cache discount against. A
+    /// batch job exposes none — its items are rendered by the runner, so the
+    /// warm slots can never discount it and it is scored by its gross size
+    /// estimate alone.
+    pub fn prompt(&self) -> &[u32] {
+        match self {
+            Job::Generation(job) => &job.prompt,
+            Job::Batch(_) => &[],
+        }
+    }
+
+    /// The job's output budget in tokens, for the watchdog deadline: a
+    /// generation's `max_tokens`, a batch's summed item budgets.
+    pub fn max_tokens(&self) -> usize {
+        match self {
+            Job::Generation(job) => job.max_tokens,
+            Job::Batch(job) => job.max_tokens,
+        }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        match self {
+            Job::Generation(job) => job.deadline,
+            Job::Batch(job) => job.deadline,
+        }
+    }
+
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        match self {
+            Job::Generation(job) => job.deadline = deadline,
+            Job::Batch(job) => job.deadline = deadline,
+        }
+    }
+}
+
+/// A whole `xwen batch` run submitted over HTTP: the request exactly as the CLI
+/// reads it on stdin, run on the engine thread, answered with the one document
+/// the CLI would print. The engine sends exactly one terminal event for it —
+/// [`EngineEvent::BatchDone`] or [`EngineEvent::Error`].
+pub struct BatchJob {
+    pub origin: RequestOrigin,
+    /// The batch to run, exactly as it arrived. The runner renders, encodes
+    /// and validates the items itself.
+    pub request: BatchRequest,
+    /// The checkpoint the request's `model` field resolved to, resolved by the
+    /// handler so an unknown name is a 400 before the queue, never an engine
+    /// error after it.
+    pub model: Model,
+    /// Summed item output budgets, for the watchdog deadline.
+    pub max_tokens: usize,
+    /// The job's cancellation token, exactly as a generation's: client gone,
+    /// deadline, shutdown — first reason wins, polled between items and per
+    /// decoded token.
+    pub cancel: Arc<Cancel>,
+    /// Wall-clock ceiling, stamped at pickup like a generation's.
+    pub deadline: Option<Instant>,
+    pub events: tokio::sync::mpsc::Sender<EngineEvent>,
+}
+
 pub struct GenerationJob {
     /// Which request this job is, and where it came from.
     pub origin: RequestOrigin,
+    /// The checkpoint this job runs on. The compat dialects resolve a request
+    /// `model` that names a known checkpoint, and fall back to the server's
+    /// default for anything else.
+    pub model: Model,
     /// The rendered prompt, already encoded by the HTTP layer with the same
     /// tokenizer the engine decodes with. The engine prefills exactly these ids.
     pub prompt: Vec<u32>,
@@ -213,6 +319,9 @@ pub enum EngineEvent {
         output_tokens: usize,
         thinking_tokens: usize,
     },
+    /// Terminal event of a [`BatchJob`]: the whole response document, exactly
+    /// what the CLI would print. Batch jobs produce no other content events.
+    BatchDone(Box<BatchResponse>),
     /// Terminal event on failure; handlers map this to an API error response.
     /// `request_fault` is true when the request itself is at fault (a prompt that does
     /// not fit the context, an impossible parameter combination) — handlers turn that

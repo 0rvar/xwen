@@ -19,11 +19,15 @@ use super::disk_cache::DiskImage;
 use super::disk_tier::{DiskCache, DiskCandidate};
 use super::log::{JobPhase, JobRecord, ServeLog, ServeLogger, SlotSummary};
 use super::queue::{JobQueue, Queued};
-use super::types::{Cancel, CancelReason, EngineEvent, GenerationJob, RequestOrigin, StopKind};
+use super::types::{
+    BatchJob, Cancel, CancelReason, EngineEvent, GenerationJob, Job, RequestOrigin, StopKind,
+};
 use crate::XwenConfig;
+use crate::batch::{BatchHooks, BatchProgress};
 use crate::dflash::{DflashConfig, DflashDrafter, DrafterImage};
 use crate::generate::{GenEvent, Generator, SpecParams, SpecStats, feasible_think_budget};
 use crate::gguf;
+use crate::hub;
 use crate::kv_cache::{HostFullKv, HostSnapshot};
 use crate::ops::ExpertRunner;
 use crate::sampler::SamplerOptions;
@@ -154,12 +158,13 @@ const ASSISTANT_CLOSE: &str = "</assistant>";
 /// tensor data, no Metal allocation) and loads the tokenizer. Fails fast so a bad model
 /// path or config is caught at startup rather than on the first request. Returns the
 /// tokenizer the HTTP layer renders prompts with — the same vocabulary the engine
-/// decodes with — and the resolved context length its "does the prompt fit" check
-/// applies.
+/// decodes with (both checkpoints share it) — the resolved context length its "does
+/// the prompt fit" check applies, and which official checkpoint the default GGUF is,
+/// read from its architecture rather than trusted from any flag.
 pub fn validate_model(
     settings: &ServeSettings,
     logger: &ServeLogger,
-) -> Result<(Arc<LagunaTokenizer>, usize)> {
+) -> Result<(Arc<LagunaTokenizer>, usize, hub::Model)> {
     let cfg = read_config(&settings.model)?;
     let (max_ctx, warning) = resolve_context_length(settings.context_length, cfg.n_ctx_train)?;
     if let Some(warning) = warning {
@@ -173,15 +178,19 @@ pub fn validate_model(
         read_draft_config(path, &cfg)
             .with_context(|| format!("validating the drafter {}", path.display()))?;
     }
-    Ok((Arc::new(load_tokenizer()?), max_ctx))
+    Ok((Arc::new(load_tokenizer()?), max_ctx, cfg.arch.model()))
 }
 
-/// Spawns the dedicated inference thread. The thread lazily loads the model on the first
-/// job, flips `model_loaded` on load/unload, and drops the model after `idle_unload` of
-/// inactivity (None = never). `shutdown` is the process-wide cancel token: once it fires,
-/// the running job aborts and queued jobs are dropped unstarted.
+/// Spawns the dedicated inference thread. The thread lazily loads whichever checkpoint
+/// the picked job names (the default one for the compat dialects, any for the batch
+/// route), flips `model_loaded` on load/unload, swaps checkpoints when a job needs the
+/// other one, and drops the model after `idle_unload` of inactivity (None = never).
+/// `default_size` is which official checkpoint `settings.model` is, read from its GGUF.
+/// `shutdown` is the process-wide cancel token: once it fires, the running job aborts
+/// and queued jobs are dropped unstarted.
 pub fn spawn_engine(
     settings: ServeSettings,
+    default_size: hub::Model,
     jobs: Arc<JobQueue>,
     model_loaded: Arc<AtomicBool>,
     shutdown: Arc<Cancel>,
@@ -189,7 +198,7 @@ pub fn spawn_engine(
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(ENGINE_THREAD.to_string())
-        .spawn(move || engine_loop(settings, jobs, model_loaded, shutdown, logger))
+        .spawn(move || engine_loop(settings, default_size, jobs, model_loaded, shutdown, logger))
         .expect("spawning the inference thread")
 }
 
@@ -249,6 +258,9 @@ struct EngineState {
     /// uploaded to before the cache can be rewound to it.
     device: Device,
     slots: Slots,
+    /// Which official checkpoint this state holds. The pickup compares it against the
+    /// checkpoint the next job names, and a mismatch is what swaps the state out.
+    size: hub::Model,
     /// The KV cache holds writes from a job that has not finished reconciling them, so
     /// nothing in it may be reused. Set at the first cache mutation and cleared once the
     /// cache and the token history agree again; a job that fails before mutating anything
@@ -257,9 +269,63 @@ struct EngineState {
     dirty: bool,
 }
 
+/// The GGUF and (optional) drafter for one checkpoint. The default checkpoint's paths
+/// come straight from the settings, resolved at startup exactly as before; any other
+/// checkpoint resolves lazily against the Hugging Face cache, downloading on a miss —
+/// the same behavior `xwen batch` has from the CLI. A custom `draft.path` belongs to
+/// the default checkpoint alone (sidecars never transfer between checkpoints), so the
+/// non-default one always speculates with its official sidecar.
+fn checkpoint_paths(
+    settings: &ServeSettings,
+    size: hub::Model,
+    default_size: hub::Model,
+    logger: &ServeLogger,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    if size == default_size {
+        return Ok((settings.model.clone(), settings.draft.clone()));
+    }
+    if hub::cached_model(size).is_none() {
+        logger.log(ServeLog::CheckpointDownloading {
+            repo: size.repo(),
+            file: size.file(),
+            size: size.size(),
+        });
+    }
+    let model = hub::ensure_model(size)
+        .with_context(|| format!("fetching the {size} checkpoint from the Hugging Face cache"))?;
+    let draft = settings
+        .draft
+        .as_ref()
+        .map(|_| {
+            if hub::cached_drafter(size).is_none() {
+                logger.log(ServeLog::CheckpointDownloading {
+                    repo: size.repo(),
+                    file: size.drafter_file(),
+                    size: size.drafter_size(),
+                });
+            }
+            hub::ensure_drafter(size)
+                .with_context(|| format!("fetching the {size} drafter sidecar"))
+        })
+        .transpose()?;
+    Ok((model, draft))
+}
+
 impl EngineState {
-    fn load(settings: &ServeSettings, logger: &ServeLogger) -> Result<Self> {
-        let cfg = read_config(&settings.model)?;
+    fn load(
+        settings: &ServeSettings,
+        size: hub::Model,
+        default_size: hub::Model,
+        logger: &ServeLogger,
+    ) -> Result<Self> {
+        let (model_path, draft_path) = checkpoint_paths(settings, size, default_size, logger)?;
+        let cfg = read_config(&model_path)?;
+        ensure!(
+            cfg.arch.model() == size,
+            "the file for the {size} checkpoint holds a {} model ({})",
+            cfg.arch.model(),
+            model_path.display()
+        );
         let (max_ctx, _) = resolve_context_length(settings.context_length, cfg.n_ctx_train)?;
         let device = gguf::metal_device()?;
         // Every job replaces this through `set_sampler`; the config defaults only cover
@@ -272,19 +338,28 @@ impl EngineState {
         };
         let mut generator = Generator::load(
             &device,
-            &settings.model,
+            &model_path,
             None,
             ExpertRunner::Fused,
             max_ctx,
             sampling,
         )?;
-        if let Some(path) = &settings.draft {
-            attach_drafter(&mut generator, &device, path, settings, max_ctx, logger)?;
+        if let Some(path) = &draft_path {
+            attach_drafter(
+                &mut generator,
+                &device,
+                path,
+                settings,
+                size,
+                max_ctx,
+                logger,
+            )?;
         }
         Ok(Self {
             generator,
             device,
             slots: Slots::new(settings.cache_slots, settings.cache_snapshots),
+            size,
             dirty: false,
         })
     }
@@ -353,6 +428,7 @@ fn attach_drafter(
     device: &Device,
     path: &Path,
     settings: &ServeSettings,
+    size: hub::Model,
     max_ctx: usize,
     logger: &ServeLogger,
 ) -> Result<()> {
@@ -367,7 +443,7 @@ fn attach_drafter(
         drafter,
         SpecParams {
             draft_max: settings.draft_max,
-            draft_p_min: settings.draft_p_min,
+            draft_p_min: resolved_p_min(settings, size),
             pause_margin: settings.draft_pause_margin,
             // Not exposed by the server: a round that drafts anything at all is worth
             // verifying, and the CLI agrees — this is its default too.
@@ -379,6 +455,17 @@ fn attach_drafter(
         draft_ctx,
     });
     Ok(())
+}
+
+/// The drafting floor for the checkpoint being loaded: the operator's pinned
+/// value when one was set, else the checkpoint's own fitted default. Unset is
+/// resolvable only here, at attach time — the merge cannot know which
+/// checkpoint a future job will name. Extracted from [`attach_drafter`] so the
+/// resolution is testable without a Metal device.
+fn resolved_p_min(settings: &ServeSettings, size: hub::Model) -> f32 {
+    settings
+        .draft_p_min
+        .unwrap_or_else(|| size.draft_p_min_default())
 }
 
 /// Closes the queue and clears the model-loaded flag when the engine thread
@@ -402,6 +489,7 @@ impl Drop for EngineExitGuard {
 
 fn engine_loop(
     settings: ServeSettings,
+    default_size: hub::Model,
     jobs: Arc<JobQueue>,
     model_loaded: Arc<AtomicBool>,
     shutdown: Arc<Cancel>,
@@ -416,7 +504,20 @@ fn engine_loop(
     // disk, not to a loaded model, and re-scanning after every unload would only
     // rediscover what it already knows. `None` means no disk tier at all, which
     // every call site reads as "there is nothing stored".
+    //
+    // The tier is bound to the DEFAULT checkpoint. While any other checkpoint is
+    // loaded every site below is handed `None` instead ([`disk_for`]): feeding it a
+    // foreign model's images would poison the store with bytes that claim the
+    // default binding, and verifying it against foreign weights would disable it
+    // for the rest of the process.
     let disk = DiskCache::open(&settings, &logger);
+    let disk_for = |size: hub::Model| -> Option<&DiskCache> {
+        if size == default_size {
+            disk.as_ref()
+        } else {
+            None
+        }
+    };
     let mut state: Option<EngineState> = None;
     loop {
         // The idle timer only matters while something is loaded; with the model already
@@ -429,8 +530,21 @@ fn engine_loop(
         // The scheduler scores a queued prompt by the prefill it would actually need,
         // so the cost closure asks the slots what the KV cache already holds for it —
         // a `&self` read, no paging. With no model loaded nothing is cached and the
-        // policy degrades to shortest-prompt-first.
-        let hot = |prompt: &[u32]| state.as_ref().map_or(0, |s| s.slots.choose(prompt).pos());
+        // policy degrades to shortest-prompt-first. A job for a checkpoint other
+        // than the resident one scores no discount either: the warm slots belong
+        // to the resident checkpoint, and both models share a tokenizer, so a
+        // token-level match against the wrong model's cache would otherwise let a
+        // long re-sent conversation jump the queue and then pay a swap plus a
+        // full cold prefill.
+        let hot = |job: &Job| {
+            state.as_ref().map_or(0, |held| {
+                if held.size == job.model() {
+                    held.slots.choose(job.prompt()).pos()
+                } else {
+                    0
+                }
+            })
+        };
         let Some(Queued {
             job,
             submitted,
@@ -444,7 +558,8 @@ fn engine_loop(
             // The conversation in the cache is on its way out with the model, so it
             // is imaged and stored first: an idle unload is the likeliest moment for
             // a client to come back to a conversation it was in the middle of.
-            store_live_conversation(state.as_mut(), disk.as_ref(), &logger);
+            let held_disk = state.as_ref().map(|held| held.size).and_then(&disk_for);
+            store_live_conversation(state.as_mut(), held_disk, &logger);
             state = None;
             model_loaded.store(false, Ordering::Relaxed);
             // The warm conversations went with the model.
@@ -460,8 +575,29 @@ fn engine_loop(
 
         // The client may have hung up — or the server begun shutting down —
         // while this job sat in the queue.
-        if shutdown.is_cancelled() || job.cancel.is_cancelled() || job.events.is_closed() {
+        if shutdown.is_cancelled() || job.cancel().is_cancelled() || job.events().is_closed() {
             continue;
+        }
+
+        // The checkpoint this job needs. A resident state holding the other one is
+        // imaged out first — through the same path an idle unload takes, so the
+        // live conversation survives the swap in the disk tier when it is on —
+        // and the lazy load below brings in the right one.
+        let required = job.model();
+        if let Some(held) = state
+            .as_ref()
+            .map(|held| held.size)
+            .filter(|held| *held != required)
+        {
+            logger.log(ServeLog::CheckpointSwappingOut {
+                from: held,
+                to: required,
+            });
+            store_live_conversation(state.as_mut(), disk_for(held), &logger);
+            state = None;
+            model_loaded.store(false, Ordering::Relaxed);
+            // The warm conversations went with the model.
+            logger.log(ServeLog::SlotsSnapshot(Vec::new()));
         }
 
         // The wall-clock ceiling is stamped at pickup, before the lazy load
@@ -470,22 +606,29 @@ fn engine_loop(
         // context-capped value needs the loaded model, and a watchdog ceiling
         // only ever errs loose.
         let mut job = job;
-        if job.deadline.is_none() {
-            job.deadline =
-                job_deadline(Instant::now(), job.prompt.len(), job.max_tokens, &settings);
+        if job.deadline().is_none() {
+            job.set_deadline(job_deadline(
+                Instant::now(),
+                prompt_tokens,
+                job.max_tokens(),
+                &settings,
+            ));
         }
 
         // From here the job is this thread's, and it reports one `JobDone` however it
         // ends. A job dropped at the check above was never picked and reports neither.
-        let mut trace = JobTrace::new(job.origin, prompt_tokens, Instant::now());
+        let mut trace = JobTrace::new(job.origin(), prompt_tokens, Instant::now());
         logger.log(ServeLog::JobPicked {
-            origin: job.origin,
+            origin: job.origin(),
             prompt_tokens,
             queue_wait: trace.picked.saturating_duration_since(submitted),
-            deadline: job.deadline,
+            deadline: job.deadline(),
         });
 
-        let events = job.events.clone();
+        let events = job.events().clone();
+        // What this pickup's lazy load cost, if it ran: the batch response's
+        // stats block reports it, exactly as the CLI reports its own load.
+        let load_elapsed: Cell<Option<Duration>> = Cell::new(None);
         let mut drop_model = false;
         // The lazy load runs behind the same panic boundary as the job itself. A panic
         // in the model layer mid-job leaves the KV cache in a state nothing can reason
@@ -496,19 +639,23 @@ fn engine_loop(
             &mut state,
             || {
                 let start = Instant::now();
-                let loaded = EngineState::load(&settings, &logger).map_err(|e| JobFailure {
-                    error: anyhow!("loading the model failed: {e:#}"),
-                    request_fault: false,
-                })?;
+                let loaded = EngineState::load(&settings, required, default_size, &logger)
+                    .map_err(|e| JobFailure {
+                        error: anyhow!("loading the model failed: {e:#}"),
+                        request_fault: false,
+                    })?;
                 logger.log(ServeLog::ModelLoaded {
                     elapsed: start.elapsed(),
                 });
+                load_elapsed.set(Some(start.elapsed()));
                 // The store was bound to the checkpoint on disk before the weights
                 // were read. Nothing stopped that file from being replaced in
                 // between, and an image bound to weights nobody is serving describes
                 // another model's keys — so the tier is checked against what actually
-                // loaded, here and on every reload after an idle unload.
-                if let Some(disk) = disk.as_ref() {
+                // loaded, here and on every reload after an idle unload. Only the
+                // default checkpoint is ever checked: the tier belongs to it, and a
+                // non-default load would merely disable the store it never uses.
+                if let Some(disk) = disk_for(required) {
                     disk.verify(loaded.generator.checkpoint_id());
                 }
                 Ok(loaded)
@@ -519,7 +666,25 @@ fn engine_loop(
                 // building the state and installing it can never leave `/health`
                 // claiming a model nobody holds.
                 model_loaded.store(true, Ordering::Relaxed);
-                run_job(engine, job, disk.as_ref(), &shutdown, &logger, &mut trace)
+                match job {
+                    Job::Generation(job) => run_job(
+                        engine,
+                        *job,
+                        disk_for(required),
+                        &shutdown,
+                        &logger,
+                        &mut trace,
+                    ),
+                    Job::Batch(job) => run_batch_job(
+                        engine,
+                        *job,
+                        load_elapsed.get().map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+                        disk_for(required),
+                        &shutdown,
+                        &logger,
+                        &mut trace,
+                    ),
+                }
             },
         );
         match outcome {
@@ -562,7 +727,7 @@ fn engine_loop(
             // every `JobPicked` is owed. A panicked reset costs the model
             // exactly as a failed one does.
             let cleared = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                engine.reset(disk.as_ref())?;
+                engine.reset(disk_for(engine.size))?;
                 log_slots(&engine.slots, &logger);
                 anyhow::Ok(())
             }));
@@ -601,7 +766,8 @@ fn engine_loop(
     // imaged and queued like one; then the writer gets a bounded window to land
     // whatever it still holds. Losing an image here costs the next server a
     // re-prefill, which is why the wait is bounded and never retried.
-    store_live_conversation(state.as_mut(), disk.as_ref(), &logger);
+    let held_disk = state.as_ref().map(|held| held.size).and_then(&disk_for);
+    store_live_conversation(state.as_mut(), held_disk, &logger);
     if let Some(disk) = disk.as_ref() {
         disk.flush(DISK_FLUSH_GRACE);
     }
@@ -953,6 +1119,82 @@ fn send_deadline(cancelled_at: Option<Instant>, now: Instant) -> Instant {
     }
 }
 
+/// Run one whole batch on the loaded engine and send its response document as the
+/// job's single terminal event.
+///
+/// The batch runner owns the whole KV cache while it runs — its shared-prefix
+/// snapshot machinery is its own, not the slot machinery's — so the live
+/// conversation is imaged out first, through the same path an idle unload takes:
+/// it survives in its slot's host image (and on disk when the tier is on), and the
+/// post-job reset the `dirty` flag forces brings the cache back to a state the
+/// next generation can reason about.
+///
+/// Cancellation (client gone, deadline, shutdown) is folded into the job's token
+/// exactly as a generation's and polled by the runner between items and per
+/// decoded token; items the cancellation reached report it in their own `error`
+/// field, and the partial document is still sent to a client that is owed one.
+fn run_batch_job(
+    engine: &mut EngineState,
+    job: BatchJob,
+    load_ms: f64,
+    disk: Option<&DiskCache>,
+    shutdown: &Cancel,
+    logger: &ServeLogger,
+    trace: &mut JobTrace,
+) -> Result<(), JobFailure> {
+    page_out_live(engine, disk, logger).map_err(JobFailure::from)?;
+    // Set before the first runner call: the shared prefill mutates the cache
+    // immediately, and a failure anywhere after it must cost the cache.
+    engine.dirty = true;
+
+    let abandon = Abandon::new(
+        shutdown,
+        &job.cancel,
+        &job.events,
+        logger,
+        trace.picked,
+        job.deadline,
+    );
+    let mut cancelled = || abandon.reason().is_some();
+    let mut progress = |report: BatchProgress| logger.log(ServeLog::BatchProgress(report));
+    let response = crate::batch::run_batch(
+        &mut engine.generator,
+        &job.request,
+        load_ms,
+        &mut BatchHooks {
+            progress: &mut progress,
+            cancelled: &mut cancelled,
+        },
+    )
+    .map_err(JobFailure::from)?;
+
+    // The trace reports measured totals where the estimate stood: what the
+    // items' prompts actually encoded to, how much of that the shared snapshot
+    // covered, and what came out.
+    trace.record.prompt_tokens = response.items.iter().map(|i| i.usage.prompt_tokens).sum();
+    trace.record.cache_read = response
+        .items
+        .iter()
+        .map(|i| i.usage.cached_prefix_tokens)
+        .sum();
+    trace.record.output_tokens = response
+        .items
+        .iter()
+        .map(|i| i.usage.completion_tokens)
+        .sum();
+    trace.record.abandoned = abandon.reason();
+
+    // The one terminal event. A departed client's channel just drops it, and a
+    // shutdown suppresses it — exactly as a generation's terminal events.
+    send_unless_shutdown(
+        &job.events,
+        EngineEvent::BatchDone(Box::new(response)),
+        shutdown,
+        logger,
+    );
+    Ok(())
+}
+
 /// Prefill and decode one request, streaming events as they happen. The prompt arrives
 /// already rendered and encoded by the HTTP layer. Errors reach the client as
 /// `EngineEvent::Error`; the caller clears the cache behind a job that left `dirty` set.
@@ -973,6 +1215,8 @@ fn run_job(
         // The job's identity is already in the trace, which is where everything this
         // job reports about itself goes.
         origin: _,
+        // The pickup already ensured the loaded checkpoint is this one.
+        model: _,
         prompt,
         boundary,
         anchor,
@@ -5978,6 +6222,27 @@ mod tests {
 
         let unbounded = Abandon::new(&shutdown, &cancel, &events, test_logger(), started, None);
         assert_eq!(unbounded.ceiling(), Duration::ZERO);
+    }
+
+    /// The drafting floor follows the checkpoint being loaded when the
+    /// operator left it unset, and a pinned value applies to both — the arc's
+    /// central config change, testable here because the resolution was
+    /// extracted from the Metal-bound attach path.
+    #[test]
+    fn the_drafting_floor_follows_the_loaded_checkpoint_unless_pinned() {
+        let mut settings = crate::serve::testutil::settings();
+        settings.draft_p_min = None;
+        assert_eq!(
+            resolved_p_min(&settings, hub::Model::Qwen27B),
+            hub::Model::Qwen27B.draft_p_min_default()
+        );
+        assert_eq!(
+            resolved_p_min(&settings, hub::Model::Qwen35BA3B),
+            hub::Model::Qwen35BA3B.draft_p_min_default()
+        );
+        settings.draft_p_min = Some(0.42);
+        assert_eq!(resolved_p_min(&settings, hub::Model::Qwen27B), 0.42);
+        assert_eq!(resolved_p_min(&settings, hub::Model::Qwen35BA3B), 0.42);
     }
 
     /// The ceiling grows with both the prompt and the reply budget, so spans

@@ -54,6 +54,14 @@ written transport-agnostic so that endpoint is a handler, not a port. Its own de
 are in "Deferred from the batch + scored-classification arc (2026-08-09)" below; the one
 with parity implications is the missing Track-B case for snapshot-replay-vs-scratch,
 today an at-ship manual A/B.
+UPDATE 2026-08-11: **`/xwen/v1/batch` shipped, ahead of the rest of P10** — and with
+it the engine became checkpoint-aware: every request names its model, `--model` is only
+the default, the engine swaps lazily with one model resident at a time (log.md
+2026-08-11, decisions.md "Serving"). The endpoint did not need the dialect adaptation
+P10 was gating on, because the batch core renders its own prompts — P10's remaining
+scope (ChatML tool-call parsing in the dialect layers, thinking semantics, prefix-cache
+snapshots carrying recurrent state) is unchanged. New deferrals in "Deferred from the
+serve batch + multi-checkpoint arc (2026-08-11)" below.
 
 1. **Mechanical fork — DONE 2026-07-28.** cp-based copy of ../laguna, maxuna→xwen
    rename, MAXUNA_*→XWEN_* env prefix, Qwen tokenizer/chat-template/configs vendored
@@ -1138,14 +1146,21 @@ closed by it, and the docs it owed are written. The rest stand.
 nine-item demo (log.md 2026-08-09, decisions.md "Batch"). These are the pieces it
 deliberately did not carry.
 
-- [ ] **No `/xwen/v1/batch` HTTP endpoint.** The core (`batch::run_batch`) is
-  transport-agnostic — it takes a `Generator` and a request struct, and the CLI
-  subcommand is a thin stdin/stdout wrapper around it — so serving it is a handler plus
-  a dialect decision (native only, or an OpenAI-batch-shaped alias). Deferred behind P10:
-  the serve tree still needs its Qwen template adaptation (tool-call parsing, thinking
-  semantics, recurrent-state prefix snapshots), and adding an endpoint to a dialect layer
-  that has not been adapted yet means adapting it twice. Nothing about the core needs to
-  change when it lands.
+- [x] **No `/xwen/v1/batch` HTTP endpoint. DONE 2026-08-11.** The core
+  (`batch::run_batch`) is transport-agnostic — it takes a `Generator` and a request
+  struct, and the CLI subcommand is a thin stdin/stdout wrapper around it — so serving
+  it is a handler plus a dialect decision (native only, or an OpenAI-batch-shaped
+  alias). Deferred behind P10: the serve tree still needs its Qwen template adaptation
+  (tool-call parsing, thinking semantics, recurrent-state prefix snapshots), and adding
+  an endpoint to a dialect layer that has not been adapted yet means adapting it twice.
+  Nothing about the core needs to change when it lands.
+  OUTCOME: shipped native-only, ahead of the P10 gate — it turned out not to need the
+  dialect adaptation at all, because the batch core renders its own prompts and never
+  touches the dialect layers. The prediction held: the core changed only by growing
+  hooks (progress callback + cancellation poll), and the endpoint is a handler
+  (`serve/batch.rs`) plus a second `Job` variant. Same document both transports; the
+  request's `model` is honored per request and the engine swaps checkpoints lazily.
+  Log.md 2026-08-11, decisions.md "Serving".
 - [ ] **Prefix grouping is single-level, and there is no cross-batch pinned snapshot.**
   One batch computes one LCP over all items; items that share more with each other than
   with the batch as a whole get no credit for it, and a system prompt shared across
@@ -1274,3 +1289,79 @@ deliberately did not carry.
   unsloth/bartowski on provenance (converter authors, inspectable custom mix, dflash
   sidecars), not on quality. Now that the perplexity gate exists, pointing it at a
   competing Q4_K_M is cheap — run it if output quality ever comes into question.
+
+## Deferred from the serve batch + multi-checkpoint arc (2026-08-11)
+
+`/xwen/v1/batch` and per-request checkpoint selection shipped (log.md 2026-08-11,
+decisions.md "Serving"). These are the pieces deliberately not carried.
+
+- [ ] **The disk tier serves only the default checkpoint.** A non-default checkpoint
+  runs with every disk-tier call site handed `None`: the tier binds to one checkpoint
+  id at startup and `verify()` permanently distrusts itself against any other. The
+  segment layout is already per-checkpoint directories (`root/<checkpoint>/`), so the
+  lift is opening one tier per checkpoint lazily rather than one at startup — do it
+  when a workload actually alternates checkpoints and misses its warm conversations,
+  not before. Until then a swap costs the outgoing checkpoint's warm slots and, with
+  the tier on, keeps only the DEFAULT checkpoint's conversations across swaps.
+- [ ] **Batch-over-HTTP gives no progress until the last item.** The CLI shows stderr
+  progress lines; the HTTP client gets one JSON document at the end and nothing before
+  it (a proxy that times out idle responses will cut a long batch off). The engine-side
+  hooks already emit per-item progress into the server log, so an SSE or NDJSON variant
+  of the route is wiring, not design. Related to the existing "Results are not
+  streamed" item in the 2026-08-09 section — solve both with one shape when picked up.
+- [ ] **Neither `/health` nor the TUI says which checkpoint is loaded.** `/health`
+  reports `model_loaded` as a bare bool and the TUI vitals were built around one model
+  id for the process lifetime. Post-swap, both are truthful but incomplete: nothing
+  outside the log line says the resident model changed. Cheap: a `model` field on
+  `/health` from a shared `AtomicU8`-style cell the engine stamps at load, and a vitals
+  line. Do it with the first operational confusion, or sooner if the TUI gets touched.
+- [ ] **A cache-miss checkpoint downloads inside the request that named it.** ~20 GB
+  on a miss, inside one HTTP request, racing the watchdog deadline if one is configured
+  (the download resumes in place, so a retry eventually completes — hf-hub semantics).
+  Both checkpoints are cached on this machine, so this is theoretical here; if it ever
+  bites, the fix is a 503-with-progress answer while a background fetch runs, not a
+  longer deadline. Also: hf-hub's own byte-level progress bar writes to raw stderr
+  (`ApiBuilder::with_progress(true)`), bypassing `ServeLogger` — under `--tui` it
+  draws over the dashboard, the same hazard class the batch runner's `eprintln!`s
+  were converted to hooks for. Route or suppress it when this item is picked up.
+- [ ] **`/xwen/v1/generate` carries no model field.** Deliberate — the native generate
+  surface documents itself as modelless and the batch route is the native surface that
+  selects — but it is now the only route that cannot reach the non-default checkpoint.
+  Add the field if a native-API consumer ever wants it; it is a two-line change in
+  `prepare` plus tests.
+- [ ] **Mid-batch cancellation does not reach the scored path's forced spans, nor any
+  prefill.** The cancel poll runs between items and per decoded token inside an item's
+  free decode; a scored item's teacher-forced assembly checks only at item boundaries,
+  and neither the shared-prefix prefill nor an item's own tail prefill polls at all
+  (`prefill_tokens` chunks internally but takes no callback). Items are short (≤192
+  tokens in the demo), so the exposure is bounded by one item's latency plus one
+  prefill — thread the poll through `assemble_scored` and the prefill chunk loop only
+  if a real workload makes either span long enough to care.
+- [ ] **The batch route inherits axum's default request-body limit (~2 MB).** The
+  endpoint's contract is "the same document the CLI reads on stdin", but the CLI has
+  no size limit and the route silently does — an oversized batch gets a framework 413
+  that is not in the native error envelope. Decide a deliberate limit (and error
+  shape) when a real batch first trips it; document it either way.
+- [ ] **The batch scheduling estimate is bytes-based and can read zero.** A batch of
+  items with empty message content (schema-only probes) estimates zero prompt tokens
+  and schedules as free; the real cost floor is the rendered template per item. Fold a
+  per-item constant into `size_estimates` (or estimate from the rendered skeleton)
+  when scheduling fairness under real mixed traffic matters; on a single-user box the
+  age limit already bounds the damage.
+- [x] **Startup drafter resolution still trusts `--model-size`, not the file. DONE
+  2026-08-11 (same day, review fix).** `run_serve` resolved the official-sidecar path
+  via the flag before the GGUF was ever opened, so `--model-size 27b -m <35b.gguf>`
+  (or a config-file `model` disagreeing with the flag) selected the 27B sidecar for a
+  35B target — not silent, `validate_model` refused to start, but the error blamed the
+  drafter when the real mistake was the flag/path mismatch. Fixed by deriving the size
+  from the served GGUF's architecture (metadata-only read) before `resolve_draft`. The
+  one-shot CLI commands deliberately keep the flag's double duty — there the flag and
+  the payload are the intent. Pre-existing; surfaced by the 2026-08-11 review.
+- [ ] **The scheduler does not group queued jobs by checkpoint.** `shortest-prefill`
+  scores by prefill cost alone, so a queue holding jobs for both checkpoints can pick
+  them interleaved and pay a ~3 s swap per pickup where checkpoint-grouped ordering
+  would pay two. The cost model could add the swap (a job for the non-resident
+  checkpoint costs its prefill plus a load-equivalent), which also naturally batches
+  same-checkpoint work without starving the other (the age limit already guards
+  starvation). Do it when a real workload actually interleaves checkpoints; a
+  single-user machine mostly will not.

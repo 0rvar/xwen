@@ -38,8 +38,10 @@ struct Cli {
 struct ModelArgs {
     /// Which official Qwen 3.6 checkpoint to run: the dense 27B or the
     /// 35B-A3B MoE. A `--model <gguf>` path overrides the target file
-    /// outright, but this still selects the family, and so the DFlash drafter
-    /// sidecar loaded alongside it.
+    /// outright; for the one-shot commands this flag still selects the family
+    /// (and so the DFlash drafter sidecar), while `xwen serve` reads the
+    /// family from the GGUF itself and uses the flag only to pick the default
+    /// file when nothing else names one.
     #[arg(long, value_name = "27b|35b", default_value_t = Model::default())]
     model_size: Model,
 }
@@ -449,9 +451,6 @@ impl ServeArgs {
     fn overrides(&self) -> CliOverrides {
         CliOverrides {
             model: self.model.clone(),
-            // Not an override of any config key: the merge needs it to resolve
-            // the per-checkpoint draft.p_min default.
-            model_size: self.select.model_size,
             host: self.host.clone(),
             port: self.port,
             context_length: self.ctx,
@@ -538,11 +537,22 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     for warning in &warnings {
         eprintln!("{warning}");
     }
-    if let Some(draft) = settings.draft.take() {
-        settings.draft = Some(resolve_draft(&draft, size)?);
-    }
     if !settings.model.is_file() {
         bail!("model {} does not exist", settings.model.display());
+    }
+    if let Some(draft) = settings.draft.take() {
+        // The sidecar belongs to the checkpoint actually being served, and the
+        // GGUF's own architecture is the authority on which that is — the
+        // `--model-size` flag only chose the file when nothing else named one,
+        // and a config-file `model` (or `-m`) can disagree with it. A
+        // metadata-only read; the serve path re-reads the same header moments
+        // later to validate.
+        let served =
+            XwenConfig::from_gguf(&gguf::open(&settings.model, &candle_core::Device::Cpu)?.content)
+                .with_context(|| format!("reading {}", settings.model.display()))?
+                .arch
+                .model();
+        settings.draft = Some(resolve_draft(&draft, served)?);
     }
     if let Some(draft) = settings.draft.as_ref().filter(|path| !path.is_file()) {
         bail!("drafter {} does not exist", draft.display());
@@ -669,7 +679,30 @@ fn batch_request(
     )?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
-    xwen::batch::run_batch(&mut generator, &request, load_ms)
+    // Progress to stderr in the command's own format; a batch process is never
+    // cancelled from inside — it runs to completion or is killed whole.
+    let mut progress = |report: xwen::batch::BatchProgress| match report {
+        xwen::batch::BatchProgress::SharedPrefix { tokens, ms } => {
+            eprintln!("xwen: shared prefix {tokens} tokens prefilled in {ms:.0}ms");
+        }
+        xwen::batch::BatchProgress::Item {
+            id,
+            completion_tokens,
+            ms,
+        } => {
+            eprintln!("xwen: item {id:?} {completion_tokens} tokens in {ms:.0}ms");
+        }
+    };
+    let mut never = || false;
+    xwen::batch::run_batch(
+        &mut generator,
+        &request,
+        load_ms,
+        &mut xwen::batch::BatchHooks {
+            progress: &mut progress,
+            cancelled: &mut never,
+        },
+    )
 }
 
 fn expert_runner(name: &str) -> Result<ExpertRunner> {

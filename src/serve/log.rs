@@ -188,6 +188,22 @@ pub enum ServeLog {
     ServingModel { path: PathBuf },
     /// The model finished its lazy load.
     ModelLoaded { elapsed: Duration },
+    /// The next job needs the other checkpoint, so the resident one is being
+    /// dropped (imaged out first when the disk tier serves it); the lazy load
+    /// brings the named one in.
+    CheckpointSwappingOut {
+        from: crate::hub::Model,
+        to: crate::hub::Model,
+    },
+    /// A requested checkpoint (or its drafter sidecar) is not in the Hugging
+    /// Face cache and is being downloaded before the job can run.
+    CheckpointDownloading {
+        repo: &'static str,
+        file: &'static str,
+        size: &'static str,
+    },
+    /// The batch runner reported progress: a shared prefill, or one item done.
+    BatchProgress(crate::batch::BatchProgress),
     /// The speculative drafter finished loading, alongside the model.
     DrafterLoaded { elapsed: Duration, draft_ctx: usize },
     /// The idle timer elapsed and the model was dropped. `configured` is the
@@ -398,6 +414,26 @@ impl ServeLog {
             ServeLog::ServingModel { path } => {
                 format!("serving {} (loaded on the first request)", path.display())
             }
+            // Imaging is not claimed here: it happens only when the disk tier
+            // serves the outgoing checkpoint, and when it does the page-out
+            // reports itself (`SlotPagedOut`).
+            ServeLog::CheckpointSwappingOut { from, to } => {
+                format!("xwen: swapping the {from} checkpoint out for {to}")
+            }
+            ServeLog::CheckpointDownloading { repo, file, size } => format!(
+                "xwen: {repo}/{file} is not in the Hugging Face cache; downloading ({size}, \
+                 resumes in place)"
+            ),
+            ServeLog::BatchProgress(progress) => match progress {
+                crate::batch::BatchProgress::SharedPrefix { tokens, ms } => {
+                    format!("xwen: batch shared prefix {tokens} tokens prefilled in {ms:.0}ms")
+                }
+                crate::batch::BatchProgress::Item {
+                    id,
+                    completion_tokens,
+                    ms,
+                } => format!("xwen: batch item {id:?} {completion_tokens} tokens in {ms:.0}ms"),
+            },
             ServeLog::ModelLoaded { elapsed } => {
                 format!("xwen serve: model loaded in {:.1}s", elapsed.as_secs_f64())
             }

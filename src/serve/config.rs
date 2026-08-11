@@ -106,9 +106,11 @@ pub const DEFAULT_SCHEDULE_AGE_LIMIT_SECS: u64 = 20;
 /// decoding".
 ///
 /// `p_min` is the one drafter default that is not a constant here: it is fitted
-/// per checkpoint and lives on [`crate::hub::Model::draft_p_min_default`], which
-/// the merge reads through [`CliOverrides::model_size`]. `draft.p_min` in the
-/// config file, and `--draft-p-min`, override it exactly as before.
+/// per checkpoint and lives on [`crate::hub::Model::draft_p_min_default`]. The
+/// merge leaves it unresolved (`None`) because one server loads whichever
+/// checkpoint a request names; the engine resolves it when it attaches the
+/// drafter, once the checkpoint is known. `draft.p_min` in the config file, and
+/// `--draft-p-min`, pin one floor for every checkpoint instead.
 pub const DEFAULT_DRAFT_ENABLED: bool = true;
 pub const DEFAULT_DRAFT_MAX: usize = 15;
 pub const DEFAULT_DRAFT_PAUSE_MARGIN: f32 = 1.0;
@@ -343,12 +345,6 @@ pub struct DraftToml {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CliOverrides {
     pub model: Option<PathBuf>,
-    /// `--model-size`: which official checkpoint is being served. Always
-    /// present (clap defaults it), and it selects the checkpoint even when
-    /// `--model` names a GGUF by path — the same rule that picks the official
-    /// drafter sidecar. The merge reads it for the per-checkpoint `draft.p_min`
-    /// default and nothing else.
-    pub model_size: crate::hub::Model,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub context_length: Option<usize>,
@@ -451,7 +447,11 @@ pub struct ServeSettings {
     /// apply only when it is set.
     pub draft: Option<PathBuf>,
     pub draft_max: usize,
-    pub draft_p_min: f32,
+    /// The drafting confidence floor, or `None` for each checkpoint's own
+    /// fitted default ([`crate::hub::Model::draft_p_min_default`]) — resolved
+    /// at attach time, since one server loads whichever checkpoint a request
+    /// names. An explicit value pins one floor for every checkpoint.
+    pub draft_p_min: Option<f32>,
     pub draft_pause_margin: f32,
     /// Positions the drafter's cache is sized for, at least 1. Also how far into a
     /// conversation speculation stays active.
@@ -842,15 +842,16 @@ pub fn resolve(
             origin,
             &mut warnings,
         ),
-        // The only default here that depends on which checkpoint is served:
-        // the drafting floor is fitted per model. Precedence is unchanged —
-        // flag over config file over this.
-        draft_p_min: pick(
+        // The one knob with no resolved default: the drafting floor is fitted
+        // per checkpoint, and one server now loads whichever checkpoint a
+        // request names, so `None` here means "each checkpoint's own fitted
+        // default" — resolved at attach time, when the checkpoint is known.
+        // An explicit value pins one floor for every checkpoint served.
+        draft_p_min: pick_opt(
             "draft-p-min",
             "draft.p_min",
             cli.draft_p_min,
             file.draft.p_min,
-            cli.model_size.draft_p_min_default(),
             origin,
             &mut warnings,
         ),
@@ -931,13 +932,14 @@ pub fn resolve(
         "draft.max must be at least 1 (it caps the tokens a round proposes, so zero \
          drafts nothing and every round falls back to plain decode)"
     );
-    ensure!(
-        (0.0..=1.0).contains(&settings.draft_p_min),
-        "draft.p_min must be between 0 and 1, not {} (it is compared against a \
-         probability: above 1 no draft ever qualifies and speculation never runs, \
-         while 0 keeps every draft and proposes full blocks)",
-        settings.draft_p_min
-    );
+    if let Some(p_min) = settings.draft_p_min {
+        ensure!(
+            (0.0..=1.0).contains(&p_min),
+            "draft.p_min must be between 0 and 1, not {p_min} (it is compared against a \
+             probability: above 1 no draft ever qualifies and speculation never runs, \
+             while 0 keeps every draft and proposes full blocks)"
+        );
+    }
     ensure!(
         settings.draft_pause_margin >= 0.0,
         "draft.pause_margin must not be negative ({} would hold speculation paused \
@@ -1000,6 +1002,29 @@ fn pick<T: PartialEq + fmt::Display>(
         (Some(cli), None) => cli,
         (None, Some(file)) => file,
         (None, None) => default,
+    }
+}
+
+/// Same as [`pick`] for a setting with no default (absent stays absent).
+fn pick_opt<T: PartialEq + fmt::Display>(
+    flag: &str,
+    key: &str,
+    cli: Option<T>,
+    file: Option<T>,
+    origin: Origin<'_>,
+    warnings: &mut Vec<String>,
+) -> Option<T> {
+    match (cli, file) {
+        (Some(cli), Some(file)) => {
+            if cli != file {
+                warnings.push(format!(
+                    "warning: --{flag} {cli} overrides config {key} = {file} ({origin})"
+                ));
+            }
+            Some(cli)
+        }
+        (cli @ Some(_), None) => cli,
+        (None, file) => file,
     }
 }
 
@@ -1111,8 +1136,8 @@ pub fn init_template() -> String {
     let snapshots_mib = snapshots * snapshot_mib;
     let slots = DEFAULT_CACHE_SLOTS;
     let draft_max = DEFAULT_DRAFT_MAX;
-    // Per-checkpoint, like the cache sizes above: quoted for the model the
-    // template names.
+    // Per-checkpoint, like the cache sizes above: quoted (commented out) for
+    // the model the template names.
     let draft_p_min = format!("{:?}", TEMPLATE_MODEL.draft_p_min_default());
     let draft_pause_margin = format!("{:?}", DEFAULT_DRAFT_PAUSE_MARGIN);
     let draft_enabled = DEFAULT_DRAFT_ENABLED;
@@ -1353,10 +1378,11 @@ max = {draft_max}
 
 # Stop drafting at the first token whose probability falls below this, so a round
 # drafts as far as the drafter is confident and no further. Adaptive length beats
-# any fixed block. The built-in default is per checkpoint — 0.5 on the 27B, 0.3 on
-# the 35B-A3B, fitted 2026-08-08 — and the value below is the one for the model
-# this template quotes; setting the key here pins it for whichever model is served.
-p_min = {draft_p_min}
+# any fixed block. Unset, each checkpoint the server loads uses its own fitted
+# default — 0.5 on the 27B, 0.3 on the 35B-A3B, fitted 2026-08-08. Setting the key
+# pins one floor for every checkpoint this server is asked to serve; the value below
+# is the 35B-A3B's, and pinning it onto the 27B costs that model ~11%.
+# p_min = {draft_p_min}
 
 # Pause speculation when its measured wall-clock cost per committed token exceeds a
 # plain decode step's times this factor, and resume when it pays again. This is
@@ -1462,40 +1488,26 @@ mod tests {
         // official sidecar, named symbolically for the caller to resolve.
         assert_eq!(s.draft, Some(PathBuf::from("official")));
         assert_eq!(s.draft_max, DEFAULT_DRAFT_MAX);
-        // Per checkpoint, and `model_only()` leaves --model-size at its default.
-        assert_eq!(
-            s.draft_p_min,
-            crate::hub::Model::default().draft_p_min_default()
-        );
+        // Unresolved on purpose: the floor is fitted per checkpoint, and which
+        // checkpoint is only known when the engine attaches the drafter.
+        assert_eq!(s.draft_p_min, None);
         assert_eq!(s.draft_pause_margin, DEFAULT_DRAFT_PAUSE_MARGIN);
         assert_eq!(s.draft_ctx, DEFAULT_DRAFT_CTX);
     }
 
     /// The drafting floor is the one drafter default that follows the
-    /// checkpoint, so serving the 27B has to reach a different value than
-    /// serving the 35B-A3B without anyone passing a flag — while a config file
-    /// that names `p_min` still wins over both.
+    /// checkpoint the engine loads, so the merge must leave it unresolved —
+    /// while a config file that names `p_min` pins one floor for every
+    /// checkpoint served.
     #[test]
-    fn draft_p_min_defaults_per_checkpoint() {
-        use crate::hub::Model;
-
-        let for_size = |size| CliOverrides {
-            model_size: size,
-            ..model_only()
-        };
-        let (dense, _) = resolve(&ServeToml::default(), None, &for_size(Model::Qwen27B)).unwrap();
-        let (moe, _) = resolve(&ServeToml::default(), None, &for_size(Model::Qwen35BA3B)).unwrap();
-        assert_eq!(dense.draft_p_min, 0.5);
-        assert_eq!(moe.draft_p_min, 0.3);
+    fn draft_p_min_stays_unresolved_unless_pinned() {
+        let (unpinned, _) = resolve(&ServeToml::default(), None, &model_only()).unwrap();
+        assert_eq!(unpinned.draft_p_min, None);
 
         let file: ServeToml = toml::from_str("[draft]\np_min = 0.25\n").unwrap();
-        let (pinned, warnings) = resolve(
-            &file,
-            Some(Path::new("/etc/serve.toml")),
-            &for_size(Model::Qwen27B),
-        )
-        .unwrap();
-        assert_eq!(pinned.draft_p_min, 0.25);
+        let (pinned, warnings) =
+            resolve(&file, Some(Path::new("/etc/serve.toml")), &model_only()).unwrap();
+        assert_eq!(pinned.draft_p_min, Some(0.25));
         assert!(warnings.is_empty());
     }
 
@@ -1519,7 +1531,7 @@ mod tests {
             resolve(&file, Some(Path::new("/etc/serve.toml")), &model_only()).unwrap();
         assert_eq!(from_file.draft, Some(PathBuf::from("/from-config.gguf")));
         assert_eq!(from_file.draft_max, 8);
-        assert_eq!(from_file.draft_p_min, 0.25);
+        assert_eq!(from_file.draft_p_min, Some(0.25));
         assert_eq!(from_file.draft_pause_margin, 0.0);
         assert_eq!(from_file.draft_ctx, 12288);
         assert!(warnings.is_empty());
@@ -1535,7 +1547,7 @@ mod tests {
         let (merged, warnings) = resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
         assert_eq!(merged.draft, Some(PathBuf::from("/from-cli.gguf")));
         assert_eq!(merged.draft_max, 4);
-        assert_eq!(merged.draft_p_min, 0.75);
+        assert_eq!(merged.draft_p_min, Some(0.75));
         assert_eq!(merged.draft_pause_margin, 2.0);
         assert_eq!(merged.draft_ctx, 4096);
         assert_eq!(
@@ -1743,7 +1755,7 @@ mod tests {
         };
         let (settings, warnings) = resolve(&ServeToml::default(), None, &cli).unwrap();
         assert_eq!(settings.draft_max, 1);
-        assert_eq!(settings.draft_p_min, 0.0);
+        assert_eq!(settings.draft_p_min, Some(0.0));
         assert_eq!(settings.draft_pause_margin, 0.0);
         assert!(warnings.is_empty());
 
@@ -1756,7 +1768,7 @@ mod tests {
                 .unwrap()
                 .0
                 .draft_p_min,
-            1.0
+            Some(1.0)
         );
     }
 

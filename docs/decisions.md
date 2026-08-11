@@ -763,6 +763,65 @@ tier must additionally carry the recurrent state for the 3-of-4 linear layers �
 alone no longer reconstructs a prefix. Native endpoint moved `/maxuna/v1/*` →
 `/xwen/v1/*` (2026-07-28).
 
+**One server serves both checkpoints; `--model` is only the default (2026-08-11).**
+Every job (generation or batch) names the checkpoint it needs, and the engine's pickup
+compares that against what is resident: a mismatch images the live conversation out
+through the same path an idle unload takes, drops the state, and lazy-loads the named
+checkpoint — one model resident at a time, by construction, which is this machine's
+memory invariant, not a scheduling choice. The alternatives were refused deliberately:
+keeping both models loaded risks GPU OOM (CLAUDE.md operational hazards), and a
+temp-generator-per-foreign-batch would reload on every consecutive same-model batch
+where the swap design keeps the second one warm. Which checkpoint the default GGUF is
+comes from its `general.architecture` (`Arch::model()`), never from `--model-size` —
+the flag and a `-m` path can disagree, the file cannot. The same rule now covers the
+startup drafter resolution (review fix, same day): `run_serve` reads the served GGUF's
+architecture before resolving the official sidecar, so a config-file `model` (or `-m`)
+that disagrees with `--model-size` gets the sidecar for the model actually served
+rather than a geometry error blaming the drafter. The one-shot CLI commands keep the
+flag's old double duty deliberately — there the flag and the payload are the intent.
+Selection strictness follows
+each surface's existing character: the batch route 400s an unknown model (the field
+exists to select), the compat dialects fall back to the default (SDKs send their own
+model ids and must keep working), the native generate endpoint stays modelless.
+
+**The disk tier stays bound to the default checkpoint.** `DiskCache::open` scans and
+binds at startup against `settings.model`, and `verify()` deliberately disables the
+tier for the rest of the process if weights with a different checkpoint id load. Under
+a non-default checkpoint every engine call site is therefore handed `None` instead of
+the tier: feeding it foreign images would poison the store with bytes that claim the
+default binding, and verifying it against foreign weights would permanently disable it.
+The segment layout is already per-checkpoint directories, so a tier-per-checkpoint is a
+straightforward lift when a workload wants it (TODO.md, 2026-08-11 arc).
+
+**`draft.p_min` resolves at drafter attach, not in the config merge (2026-08-11).**
+The merge used to bake `--model-size`'s per-checkpoint default into the settings, which
+was correct while one process meant one checkpoint and silently wrong the moment it
+did not — the fitted floor is a property of the loaded checkpoint. Unset now stays
+`None` through the merge and each load applies `Model::draft_p_min_default()`; an
+explicit value pins one floor for every checkpoint served, which is exactly what the
+CLI flag means. A non-default checkpoint always speculates with its official sidecar —
+a custom `draft.path` belongs to the default checkpoint alone, since sidecars never
+transfer between checkpoints.
+
+**`/xwen/v1/batch` is the CLI's document over HTTP, run as one queue job
+(2026-08-11).** Same request JSON as `xwen batch` stdin, same response document as its
+stdout — one surface, two transports; the core was written transport-agnostic for
+exactly this. The job rides the ordinary `JobQueue` (so it serializes with chat
+requests, honors shutdown, and can be swept when its client leaves) as a second `Job`
+variant whose single terminal event carries the whole response. Scheduling and the
+watchdog deadline use a bytes/3 token overestimate, which errs the right way twice:
+small chat requests keep jumping ahead of a batch still in the queue (once picked, a
+batch runs to completion — the batch=1 engine preempts nothing), and the deadline errs
+loose. The
+runner's stderr `eprintln!`s became a `BatchHooks` progress callback — the CLI prints
+the same lines as before, the server routes them into its log — and the same hooks
+carry cancellation: client-gone/deadline/shutdown fold into the job's cancel token,
+polled between items and per decoded token, and items the cancellation reached report
+it in their own `error` field so a deadline still yields a truthful partial document.
+The batch marks the engine dirty up front and the live conversation is paged out before
+it runs: the runner owns the whole cache, and the existing post-job reset machinery is
+what puts the cache back.
+
 ## The prefix cache and the disk tier
 
 Inherited from laguna; correctness now depends on snapshotting (KV cache for the 10–16

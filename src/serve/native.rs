@@ -422,10 +422,12 @@ impl SseEncoder for GenerationStream {
                 false
             }
             // A request that carries no tools cannot produce a call span: the
-            // engine treats `<tool_call>` in the output as ordinary text.
+            // engine treats `<tool_call>` in the output as ordinary text. A
+            // batch document can never arrive on a generation's channel either.
             EngineEvent::ToolCallStart { .. }
             | EngineEvent::ToolCallDelta(_)
-            | EngineEvent::ToolCallEnd => false,
+            | EngineEvent::ToolCallEnd
+            | EngineEvent::BatchDone(_) => false,
             EngineEvent::Done {
                 stop,
                 output_tokens,
@@ -488,7 +490,10 @@ pub(crate) async fn generate(State(state): State<AppState>, body: Bytes) -> Resp
     let id = random_id("gen_");
     let model = state.model_id.clone();
 
-    let (mut events, guard) = match submit(&state, job, Dialect::Native, stream) {
+    // This endpoint carries no model name by design; it runs on the default
+    // checkpoint. The batch endpoint is the native surface that names one.
+    let (mut events, guard) = match submit(&state, job, Dialect::Native, stream, state.default_size)
+    {
         Ok(submitted) => submitted,
         Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
         Err(SubmitError::Overloaded) => return overloaded().into_response(),

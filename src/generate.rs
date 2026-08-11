@@ -2145,7 +2145,12 @@ impl Generator {
                 &mut thinking_tokens,
             ));
             decoded += 1;
-            if should_stop() {
+            // Polled only while more tokens are owed: with the budget already met
+            // the round loop below never starts, and a cancellation that lands
+            // after the last requested token was fully committed must not relabel
+            // a complete answer as cut (a real case for max_new == 1, the
+            // single-token classification shape).
+            if decoded < max_new && should_stop() {
                 cancelled = true;
             }
         }

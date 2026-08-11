@@ -46,7 +46,9 @@ The default costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the 35B-A
 (`Model::draft_p_min_default`). The 27B's target forward is expensive, so it wants short
 confident drafts; the 35B-A3B's is cheap enough to profit from drafting deeper at lower
 acceptance, and 0.5 costs it ~2.5%. Passing the flag, or `draft.p_min` in a serve
-config, overrides it as before. `--draft-pause-margin` stays a single 1.0 for both.
+config, overrides it — and since one server now loads whichever checkpoint a request
+names, an explicit value pins one floor for every checkpoint it serves; leave it unset
+to give each checkpoint its own. `--draft-pause-margin` stays a single 1.0 for both.
 `bun scripts/retune-draft.ts` re-fits both knobs and prints recommendations; it never
 edits a default. See docs/decisions.md "Speculative decoding".
 
@@ -135,6 +137,38 @@ answers but not always the same bytes; see docs/decisions.md "Batch".
 
 `bun scripts/classify-demo.ts` is the worked example: one support email classified along
 nine taxonomies as nine batch items, with ground truth embedded, run on both checkpoints.
+
+## Serve
+
+`xwen serve` runs an HTTP server over the engine. Routes: `POST /v1/messages` (+
+`/v1/messages/count_tokens`) in the Anthropic dialect, `POST /v1/chat/completions` in
+the OpenAI dialect, `POST /xwen/v1/generate` and `POST /xwen/v1/batch` (the native
+surface), `GET /v1/models`, `GET /health`. `xwen serve --init` writes a commented
+config template; every setting is also a flag.
+
+**One server serves both checkpoints (2026-08-11).** `--model`/`--model-size` picks the
+DEFAULT checkpoint; any request may name the other one and the engine lazy-loads it,
+imaging the live conversation out first (the same path an idle unload takes) — one
+model resident at a time, always, and `idle_unload` applies to whichever is loaded.
+Selection by surface:
+
+- `/xwen/v1/batch` takes the same JSON document `xwen batch` reads on stdin and returns
+  the same document it prints. Its `model` field ("27b"/"35b") is honored per request;
+  absent means the server's default, unknown is a 400.
+- The compat dialects honor a `model` that names a known checkpoint ("27b"/"35b") and
+  fall back to the default for anything else — SDKs sending their own model ids keep
+  working, and the response echoes whatever the client sent, as before.
+- `/xwen/v1/generate` carries no model field and always runs on the default.
+
+Swapping costs a full model load (~3 s warm) plus losing the outgoing checkpoint's warm
+KV slots, so interleaving checkpoints request-by-request is legal but slow. The on-disk
+prefix cache stays bound to the default checkpoint; the other checkpoint runs without
+it. A requested checkpoint (or its drafter) missing from the HF cache is downloaded
+inside the request — a one-line notice in the server log; hf-hub's byte-level progress
+bar goes to raw stderr, so under `--tui` it draws over the dashboard (TODO.md).
+
+The default bind is loopback because with no `api_key` the server accepts every request;
+set `host = "0.0.0.0"` (or `--host`) together with an `api_key` to serve the LAN.
 
 ## Verifying a change
 

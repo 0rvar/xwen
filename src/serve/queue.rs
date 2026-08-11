@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use super::SubmitError;
 use super::config::Schedule;
 use super::log::{QueueEntry, ServeLog, ServeLogger};
-use super::types::{EngineEvent, GenerationJob};
+use super::types::{EngineEvent, Job};
 
 /// How [`choose`] orders the queue: the schedule plus the two time bounds the
 /// sweep and the starvation guard run on. Carried by the queue, passed to the
@@ -32,10 +32,11 @@ pub struct SchedulePolicy {
 
 /// One queued job, with the two facts selection runs on.
 pub struct Queued {
-    pub job: GenerationJob,
+    pub job: Job,
     pub submitted: Instant,
-    /// The encoded prompt's length, the gross cost estimate the cache discount
-    /// is subtracted from.
+    /// The gross cost estimate the cache discount is subtracted from: the
+    /// encoded prompt's length for a generation, a byte-derived estimate of
+    /// every item's prompt for a batch.
     pub prompt_tokens: usize,
 }
 
@@ -116,12 +117,13 @@ impl JobQueue {
     /// idle-unload path — `None` there means "keep the countdown's promise")
     /// or once the queue is closed and drained. `hot` scores a candidate's
     /// cached prefix in tokens; the engine passes a closure over its slots, and
-    /// with no model loaded everything scores 0.
+    /// with no model loaded — or the wrong checkpoint loaded for this job —
+    /// everything scores 0.
     ///
     /// The timeout is measured from this call, so every taken job restarts the
     /// caller's idle countdown in full — the same semantics `recv_timeout` gave
     /// the engine loop.
-    pub fn take(&self, timeout: Option<Duration>, hot: &dyn Fn(&[u32]) -> usize) -> Option<Queued> {
+    pub fn take(&self, timeout: Option<Duration>, hot: &dyn Fn(&Job) -> usize) -> Option<Queued> {
         // A timeout too large for an `Instant` to hold — `parse_idle_unload`
         // accepts spans up to u64::MAX seconds — is the same promise as no
         // timeout at all: block until a job arrives.
@@ -186,7 +188,7 @@ fn report(jobs: &[Queued], logger: &ServeLogger) {
     logger.log(ServeLog::QueueSnapshot(
         jobs.iter()
             .map(|queued| QueueEntry {
-                id: queued.job.origin.id,
+                id: queued.job.origin().id,
                 prompt_tokens: queued.prompt_tokens,
                 queued_at: queued.submitted,
             })
@@ -205,7 +207,7 @@ fn report(jobs: &[Queued], logger: &ServeLogger) {
 /// `try_send` — never blocking, whichever caller is holding the lock.
 fn sweep(jobs: &mut Vec<Queued>, now: Instant, policy: &SchedulePolicy, logger: &ServeLogger) {
     jobs.retain(|queued| {
-        if queued.job.cancel.is_cancelled() || queued.job.events.is_closed() {
+        if queued.job.cancel().is_cancelled() || queued.job.events().is_closed() {
             return false;
         }
         if now.duration_since(queued.submitted) >= policy.queue_timeout {
@@ -213,7 +215,7 @@ fn sweep(jobs: &mut Vec<Queued>, now: Instant, policy: &SchedulePolicy, logger: 
             // Best-effort: a client that stopped reading its channel gets
             // nothing, which is fine — the message is for one that is still
             // there.
-            let _ = queued.job.events.try_send(EngineEvent::Error {
+            let _ = queued.job.events().try_send(EngineEvent::Error {
                 message: format!(
                     "the request waited {:.0}s in the queue without reaching the model \
                      (queue_timeout is {}s); the server is saturated, retry later",
@@ -242,7 +244,7 @@ fn sweep(jobs: &mut Vec<Queued>, now: Instant, policy: &SchedulePolicy, logger: 
 /// the earlier arrival. `Schedule::Fifo` skips the cost model entirely.
 pub fn choose(
     jobs: &mut Vec<Queued>,
-    hot: &dyn Fn(&[u32]) -> usize,
+    hot: &dyn Fn(&Job) -> usize,
     now: Instant,
     policy: &SchedulePolicy,
     logger: &ServeLogger,
@@ -273,7 +275,7 @@ pub fn choose(
                     .enumerate()
                     .min_by_key(|(_, queued)| {
                         (
-                            queued.prompt_tokens.saturating_sub(hot(&queued.job.prompt)),
+                            queued.prompt_tokens.saturating_sub(hot(&queued.job)),
                             queued.submitted,
                         )
                     })
@@ -288,7 +290,7 @@ pub fn choose(
     if picked != oldest {
         let cost = jobs[picked]
             .prompt_tokens
-            .saturating_sub(hot(&jobs[picked].job.prompt));
+            .saturating_sub(hot(&jobs[picked].job));
         let older = jobs
             .iter()
             .filter(|queued| queued.submitted < jobs[picked].submitted)
@@ -313,7 +315,7 @@ mod tests {
 
     use crate::sampler::SamplerOptions;
     use crate::serve::log::EventLog;
-    use crate::serve::types::{Cancel, CancelReason, Dialect, RequestOrigin};
+    use crate::serve::types::{Cancel, CancelReason, Dialect, GenerationJob, RequestOrigin};
 
     fn policy() -> SchedulePolicy {
         SchedulePolicy {
@@ -337,12 +339,13 @@ mod tests {
         let (events, receiver) = tokio::sync::mpsc::channel(8);
         let prompt_tokens = prompt.len();
         let queued = Queued {
-            job: GenerationJob {
+            job: Job::Generation(Box::new(GenerationJob {
                 origin: RequestOrigin {
                     id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                     dialect: Dialect::Anthropic,
                     streaming: true,
                 },
+                model: crate::hub::Model::default(),
                 prompt,
                 boundary: 0,
                 anchor: None,
@@ -356,14 +359,14 @@ mod tests {
                 cancel: Arc::new(Cancel::default()),
                 deadline: None,
                 events,
-            },
+            })),
             submitted: now - waited,
             prompt_tokens,
         };
         (queued, receiver)
     }
 
-    fn no_cache(_: &[u32]) -> usize {
+    fn no_cache(_: &Job) -> usize {
         0
     }
 
@@ -420,7 +423,8 @@ mod tests {
         let picked =
             choose(&mut queue, &no_cache, now, &policy(), &logger()).expect("a job is picked");
         assert_eq!(
-            picked.job.prompt[0], 2,
+            picked.job.prompt()[0],
+            2,
             "the older of two equals runs first"
         );
     }
@@ -453,7 +457,7 @@ mod tests {
         );
         let picked =
             choose(&mut queue, &no_cache, now, &policy(), &logger()).expect("a job is picked");
-        assert_eq!(picked.job.prompt[0], 2, "FIFO among the aged");
+        assert_eq!(picked.job.prompt()[0], 2, "FIFO among the aged");
     }
 
     /// A long prompt whose prefix is already in the KV cache costs less than a
@@ -469,13 +473,13 @@ mod tests {
             now,
         );
         // The 100-token prompt has 95 tokens cached: cost 5 beats cost 40.
-        let hot = |prompt: &[u32]| if prompt[0] == 1 { 95 } else { 0 };
+        let hot = |job: &Job| if job.prompt()[0] == 1 { 95 } else { 0 };
         let picked = choose(&mut queue, &hot, now, &policy(), &logger()).expect("a job is picked");
         assert_eq!(picked.prompt_tokens, 100);
 
         // A discount past the prompt length saturates rather than wrapping.
         let (mut queue, _rx) = jobs(vec![(vec![1; 10], Duration::from_secs(1))], now);
-        let overshoot = |_: &[u32]| 1000usize;
+        let overshoot = |_: &Job| 1000usize;
         assert!(choose(&mut queue, &overshoot, now, &policy(), &logger()).is_some());
     }
 
@@ -499,9 +503,9 @@ mod tests {
         let third = choose(&mut queue, &no_cache, now, &fifo, &logger()).expect("a job is picked");
         assert_eq!(
             [
-                first.job.prompt[0],
-                second.job.prompt[0],
-                third.job.prompt[0]
+                first.job.prompt()[0],
+                second.job.prompt()[0],
+                third.job.prompt()[0]
             ],
             [1, 2, 3]
         );
@@ -520,12 +524,12 @@ mod tests {
             ],
             now,
         );
-        queue[1].job.cancel.cancel(CancelReason::ClientGone);
+        queue[1].job.cancel().cancel(CancelReason::ClientGone);
         let picked =
             choose(&mut queue, &no_cache, now, &policy(), &logger()).expect("a job is picked");
-        assert_eq!(picked.job.prompt[0], 1);
+        assert_eq!(picked.job.prompt()[0], 1);
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].job.prompt[0], 3);
+        assert_eq!(queue[0].job.prompt()[0], 3);
         // The cancelled entry's channel closed with nothing in it.
         match rx[1].try_recv() {
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
@@ -547,7 +551,7 @@ mod tests {
         );
         let picked =
             choose(&mut queue, &no_cache, now, &policy(), &logger()).expect("a job is picked");
-        assert_eq!(picked.job.prompt[0], 2);
+        assert_eq!(picked.job.prompt()[0], 2);
         assert!(queue.is_empty());
         match rx[0].try_recv() {
             Ok(EngineEvent::Error {
@@ -571,7 +575,7 @@ mod tests {
         assert!(choose(&mut empty, &no_cache, now, &policy(), &logger()).is_none());
 
         let (mut queue, _rx) = jobs(vec![(vec![1; 10], Duration::from_secs(1))], now);
-        queue[0].job.cancel.cancel(CancelReason::ClientGone);
+        queue[0].job.cancel().cancel(CancelReason::ClientGone);
         assert!(choose(&mut queue, &no_cache, now, &policy(), &logger()).is_none());
         assert!(queue.is_empty());
     }
@@ -636,7 +640,7 @@ mod tests {
         let taken = queue
             .take(Some(Duration::from_secs(u64::MAX)), &no_cache)
             .expect("the queued job comes out");
-        assert_eq!(taken.job.prompt[0], 3);
+        assert_eq!(taken.job.prompt()[0], 3);
     }
 
     #[test]
@@ -654,7 +658,7 @@ mod tests {
         let taken = queue
             .take(None, &no_cache)
             .expect("the push wakes the blocked take");
-        assert_eq!(taken.job.prompt[0], 7);
+        assert_eq!(taken.job.prompt()[0], 7);
         drop(pusher.join().expect("the pusher finishes"));
     }
 
@@ -702,7 +706,7 @@ mod tests {
                 .take(None, &no_cache)
                 .expect("the accepted job drains")
                 .job
-                .prompt[0],
+                .prompt()[0],
             5
         );
         assert!(queue.take(None, &no_cache).is_none());
@@ -719,7 +723,7 @@ mod tests {
         let now = Instant::now();
         let (first, _r1) = entry(vec![1; 40], Duration::from_secs(2), now);
         let (second, _r2) = entry(vec![2; 10], Duration::ZERO, now);
-        let (first_id, second_id) = (first.job.origin.id, second.job.origin.id);
+        let (first_id, second_id) = (first.job.origin().id, second.job.origin().id);
         queue.push(first).expect("room");
         queue.push(second).expect("room");
 
@@ -732,7 +736,11 @@ mod tests {
         let taken = queue
             .take(Some(Duration::ZERO), &no_cache)
             .expect("a job is ready");
-        assert_eq!(taken.job.origin.id, second_id, "the cheaper job runs first");
+        assert_eq!(
+            taken.job.origin().id,
+            second_id,
+            "the cheaper job runs first"
+        );
         assert_eq!(
             snapshots(&events),
             vec![vec![(first_id, 40)]],
@@ -800,14 +808,45 @@ mod tests {
         queue.push(a).expect("room");
         queue.push(b).expect("room");
         let calls = AtomicUsize::new(0);
-        let hot = |prompt: &[u32]| {
+        let hot = |job: &Job| {
             calls.fetch_add(1, Ordering::Relaxed);
-            if prompt[0] == 1 { 95 } else { 0 }
+            if job.prompt()[0] == 1 { 95 } else { 0 }
         };
         let taken = queue
             .take(Some(Duration::ZERO), &hot)
             .expect("a job is ready");
         assert_eq!(taken.prompt_tokens, 100, "the discount decided it");
         assert!(calls.load(Ordering::Relaxed) >= 2);
+    }
+
+    /// The cost closure sees the whole job, model included — the engine's
+    /// discount is per checkpoint, and a long conversation for the
+    /// non-resident checkpoint must not ride a token-level match against the
+    /// wrong model's warm slots to the front of the queue.
+    #[test]
+    fn the_hot_closure_can_discriminate_by_checkpoint() {
+        let now = Instant::now();
+        let (mut long_other, _ra) = entry(vec![1; 100], Duration::from_secs(1), now);
+        if let Job::Generation(job) = &mut long_other.job {
+            job.model = crate::hub::Model::Qwen27B;
+        }
+        let (short_resident, _rb) = entry(vec![2; 40], Duration::from_secs(1), now);
+        let mut queue = vec![long_other, short_resident];
+        // The resident checkpoint is the default (35B); the 27B job's prefix
+        // would match 95 tokens IF its checkpoint were loaded — the model
+        // check is what must keep that discount from applying.
+        let resident = crate::hub::Model::default();
+        let hot = |job: &Job| {
+            if job.model() == resident && !job.prompt().is_empty() && job.prompt()[0] == 1 {
+                95
+            } else {
+                0
+            }
+        };
+        let picked = choose(&mut queue, &hot, now, &policy(), &logger()).expect("a job is picked");
+        assert_eq!(
+            picked.prompt_tokens, 40,
+            "the short resident-checkpoint job wins; the foreign job's match earns nothing"
+        );
     }
 }

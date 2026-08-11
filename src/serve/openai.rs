@@ -994,6 +994,8 @@ impl SseEncoder for ChunkStream {
                 out.push_back(Self::done());
                 true
             }
+            // A batch document can never arrive on a generation's channel.
+            EngineEvent::BatchDone(_) => false,
         }
     }
 
@@ -1019,6 +1021,17 @@ pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes)
             return bad_request(format!("could not parse the request body: {e}")).into_response();
         }
     };
+    // A model string the CLIENT sent that names a known checkpoint
+    // ("27b"/"35b") selects it; anything else — SDK defaults included — runs
+    // on the server's default. Read before `prepare` substitutes the served
+    // GGUF's basename for an absent field: a file someone named `35b.gguf`
+    // must not route model-less requests by its name. The response still
+    // echoes whatever the client sent, exactly as before.
+    let size = request
+        .model
+        .as_deref()
+        .and_then(|name| name.parse::<crate::hub::Model>().ok())
+        .unwrap_or(state.default_size);
     let prepared = match prepare(request, &state.settings, &state.model_id) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
@@ -1032,7 +1045,7 @@ pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes)
     let id = random_id("chatcmpl-");
     let created = unix_now();
 
-    let (mut events, guard) = match submit(&state, job, Dialect::OpenAi, stream) {
+    let (mut events, guard) = match submit(&state, job, Dialect::OpenAi, stream, size) {
         Ok(submitted) => submitted,
         Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
         Err(SubmitError::Overloaded) => return overloaded().into_response(),
