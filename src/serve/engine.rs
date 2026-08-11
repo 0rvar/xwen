@@ -2317,6 +2317,12 @@ fn page_in(
         .draft_kv
         .as_ref()
         .filter(|planes| drafter_planes_usable(generator.has_drafter(), restore, planes.pos));
+    // Order is load-bearing since KV allocation went lazy: `import_full_kv` is
+    // what GROWS the full-attention buffers to `restore` (a paged-in
+    // conversation can be longer than anything this instance has run), and the
+    // ring restore's own per-layer bound (`pos <= slots`) passes only after
+    // that growth. Swapping these two lines fails the restore at layer zero —
+    // after the live conversation was already paged out.
     generator.import_full_kv(image, restore)?;
     generator.restore_cache_snapshot(&rings.to_snapshot(device)?)?;
     // A drafter that will not take these planes costs speculation, not the request. The

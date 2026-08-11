@@ -57,6 +57,13 @@ use types::{
 /// an unbounded transcript.
 const EVENT_CHANNEL_CAPACITY: usize = 128;
 
+/// Request body cap, replacing axum's implicit 2 MB. Batch requests carry whole
+/// documents inline — per item, until `shared_prefix` collapses the repetition —
+/// so the wire cap must comfortably exceed any request the engine could
+/// actually serve, and 100 MB does: real cost is judged in tokens by the queue
+/// and max_ctx, not in body bytes.
+const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+
 /// Comment-line heartbeat, well under the idle timeouts proxies and SDK clients
 /// apply to a stream that has produced nothing yet (a long prefill looks
 /// exactly like that).
@@ -255,7 +262,16 @@ fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
-        ));
+        ))
+        // axum's implicit body cap is 2 MB, which a batch request over a large
+        // shared document exceeds long before anything else does (a client was
+        // splitting one batch into fourteen POSTs to fit under it, re-prefilling
+        // the shared story each time). 100 MB is still far under anything the
+        // engine could choke on — the queue's token estimates and max_ctx judge
+        // the real cost — so the wire stops being the binding constraint.
+        // NOTE: `layer` wraps only the routes registered ABOVE it; a body-taking
+        // route added after this line silently falls back to the 2 MB default.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     api.route("/health", get(health))
         .method_not_allowed_fallback(method_not_allowed)

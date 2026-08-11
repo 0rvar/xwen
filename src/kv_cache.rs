@@ -153,15 +153,20 @@ pub fn attn_mask_data(kind: MaskKind, seq_len: usize, pos: usize) -> Option<Mask
 }
 
 impl LayerCache {
-    pub fn new(cfg: &XwenConfig, il: usize, max_ctx: usize, device: &Device) -> Result<Self> {
+    /// `slots` is the INITIAL allocation of a full-attention layer, not its
+    /// ceiling: `ensure_full_capacity` grows the buffers on demand, so a caller
+    /// with a large context budget starts small and pays for positions only as
+    /// a sequence actually reaches them. A DeltaNet layer's state is fixed-size
+    /// whatever the context, so `slots` does not apply to it.
+    pub fn new(cfg: &XwenConfig, il: usize, slots: usize, device: &Device) -> Result<Self> {
         match cfg.layer_kind(il) {
             LayerKind::Full => {
                 let alloc = |slots: usize| {
                     Tensor::zeros((cfg.n_kv_head, slots, cfg.head_dim), DType::F16, device)
                 };
                 Ok(LayerCache::Full {
-                    k: alloc(max_ctx)?,
-                    v: alloc(max_ctx)?,
+                    k: alloc(slots)?,
+                    v: alloc(slots)?,
                     len: 0,
                 })
             }
@@ -278,6 +283,53 @@ impl LayerCache {
                 }
             }
         }
+    }
+
+    /// Grow a full-attention layer to hold at least `needed` positions, up to
+    /// the hard ceiling `cap` (the model's max_ctx). Doubles from the current
+    /// allocation so a long prefill costs O(log) reallocations.
+    ///
+    /// The WHOLE old buffer is copied, not just the committed rows `[0, len)`:
+    /// the grown buffer is then the old one plus a zeroed extension,
+    /// byte-identical row for row, so every property that held of the
+    /// allocation before the growth — a data-free [`LayerSnapshot::Full`]
+    /// restoring by truncation, rows above a rewound `len` still holding what
+    /// they held — keeps holding, with nothing to argue about which flows
+    /// depend on rows past `len`. The copy is bounded by the old capacity —
+    /// per layer that peaks at ~268 MB on the 27B's top doubling step
+    /// (65536 → 131072) — and happens O(log) times per model lifetime; the
+    /// model-level grower syncs the device after a growth pass so the old
+    /// buffers actually leave the pool. No-op for the other layer kinds and
+    /// for a `needed` already within the allocation.
+    pub fn ensure_full_capacity(&mut self, needed: usize, cap: usize) -> Result<usize> {
+        let LayerCache::Full { k, v, .. } = self else {
+            return Ok(0);
+        };
+        let slots = k.dim(1)?;
+        if needed <= slots {
+            return Ok(slots);
+        }
+        anyhow::ensure!(
+            needed <= cap,
+            "kv_grow: {needed} positions exceed the {cap}-token context ceiling"
+        );
+        let mut grown = slots.max(1);
+        while grown < needed {
+            grown = grown.saturating_mul(2);
+        }
+        let grown = grown.min(cap);
+        let (n_kv, _, head_dim) = k.dims3()?;
+        let device = k.device().clone();
+        let nk = Tensor::zeros((n_kv, grown, head_dim), DType::F16, &device)?;
+        let nv = Tensor::zeros((n_kv, grown, head_dim), DType::F16, &device)?;
+        // The whole old tensor is contiguous, so this is a real blit into the
+        // fresh allocation (not the shallow-clone trap `materialize` guards
+        // against — that bites `contiguous()` on views, and this is no view).
+        nk.slice_set(k, 1, 0)?;
+        nv.slice_set(v, 1, 0)?;
+        *k = nk;
+        *v = nv;
+        Ok(grown)
     }
 
     /// Convenience wrapper over `attn_mask_for` for a single cache. Production
@@ -1248,7 +1300,7 @@ impl HostSnapshot {
     /// so a caller asking "would this work?" would otherwise have to build the very thing
     /// it is trying to avoid committing to. The rules are the per-layer ones, applied to
     /// the stored shapes instead of the uploaded tensors.
-    pub fn check_restorable(&self, caches: &[LayerCache], pos: usize) -> Result<()> {
+    pub fn check_restorable(&self, caches: &[LayerCache], _pos: usize) -> Result<()> {
         anyhow::ensure!(
             self.layers.len() == caches.len(),
             "kv_host_snapshot: snapshot covers {} layers, the cache stack has {}",
@@ -1257,14 +1309,11 @@ impl HostSnapshot {
         );
         for (idx, (layer, cache)) in self.layers.iter().zip(caches).enumerate() {
             match (layer, cache) {
-                (HostLayerSnapshot::Full, LayerCache::Full { k, .. }) => {
-                    let slots = k.dim(1)?;
-                    anyhow::ensure!(
-                        pos <= slots,
-                        "kv_host_snapshot: layer {idx} restores to {pos}, past the {slots} \
-                         allocated slots"
-                    );
-                }
+                // No position bound here: a full layer's allocation grows on
+                // demand (`LayerCache::ensure_full_capacity`), and the row
+                // import that precedes this restore is what grows it. The
+                // model-level check holds `pos` to max_ctx, the real ceiling.
+                (HostLayerSnapshot::Full, LayerCache::Full { .. }) => {}
                 (
                     HostLayerSnapshot::Swa { shape, window, .. },
                     LayerCache::Swa {
@@ -2124,6 +2173,87 @@ mod tests {
             assert_eq!(bits(&view(&ka)), bits(&view(&kb)), "commit {commit} K");
             assert_eq!(bits(&view(&va)), bits(&view(&vb)), "commit {commit} V");
         }
+    }
+
+    /// Growth is invisible to the data: a cache that started small and grew on
+    /// demand ends bit-identical (over the committed rows) to one allocated at
+    /// the final size from the start, and a snapshot taken before the growth
+    /// still restores after it — LayerSnapshot::Full is a pure length, so this
+    /// is exactly the property the copy in `ensure_full_capacity` must uphold.
+    #[test]
+    fn full_layer_growth_preserves_rows_and_snapshots() {
+        let dev = dev();
+        let (n_kv, hd) = (2, 4);
+
+        let mut grown = fresh_full(8, n_kv, hd, &dev);
+        append_range(&mut grown, 0, 6, n_kv, hd, &dev);
+        let snap = grown.snapshot().unwrap();
+        assert_eq!(grown.ensure_full_capacity(20, 64).unwrap(), 32);
+        append_range(&mut grown, 6, 14, n_kv, hd, &dev);
+
+        let mut flat = fresh_full(32, n_kv, hd, &dev);
+        append_range(&mut flat, 0, 6, n_kv, hd, &dev);
+        append_range(&mut flat, 6, 14, n_kv, hd, &dev);
+
+        assert_eq!(grown.len(), 20);
+        let (kg, vg) = ring_kv(&grown);
+        let (kf, vf) = ring_kv(&flat);
+        let view = |t: &Tensor| t.narrow(1, 0, 20).unwrap();
+        assert_eq!(bits(&view(&kg)), bits(&view(&kf)), "K");
+        assert_eq!(bits(&view(&vg)), bits(&view(&vf)), "V");
+
+        // The pre-growth snapshot still rewinds the grown cache, and the
+        // committed prefix it lands on is the one the copy carried over.
+        grown.restore(&snap, 6).unwrap();
+        assert_eq!(grown.len(), 6);
+        let (kr, _) = ring_kv(&grown);
+        assert_eq!(
+            bits(&kr.narrow(1, 0, 6).unwrap()),
+            bits(&kf.narrow(1, 0, 6).unwrap()),
+            "restored prefix"
+        );
+    }
+
+    /// Growth copies the WHOLE old buffer, so even rows above a rewound `len`
+    /// survive it: a snapshot taken at a deeper position than the cache holds
+    /// at growth time still restores afterwards, exactly as it would have with
+    /// the buffers never moving. (Whether any caller may restore forward is the
+    /// documented rewind discipline's business; growth must not narrow it.)
+    #[test]
+    fn full_layer_growth_survives_a_forward_restore() {
+        let dev = dev();
+        let (n_kv, hd) = (2, 4);
+        let mut c = fresh_full(8, n_kv, hd, &dev);
+        append_range(&mut c, 0, 8, n_kv, hd, &dev);
+        let deep = c.snapshot().unwrap(); // pos 8, the whole allocation
+        let shallow = c.snapshot().unwrap();
+        c.restore(&shallow, 5).unwrap(); // rewind: rows [5, 8) stay in storage
+        c.ensure_full_capacity(20, 64).unwrap();
+        c.restore(&deep, 8).unwrap(); // forward again, across the growth
+
+        let mut want = fresh_full(32, n_kv, hd, &dev);
+        append_range(&mut want, 0, 8, n_kv, hd, &dev);
+        let (kc, vc) = ring_kv(&c);
+        let (kw, vw) = ring_kv(&want);
+        let view = |t: &Tensor| t.narrow(1, 0, 8).unwrap();
+        assert_eq!(bits(&view(&kc)), bits(&view(&kw)), "K");
+        assert_eq!(bits(&view(&vc)), bits(&view(&vw)), "V");
+    }
+
+    /// The ceiling is hard: growth doubles only up to `cap`, and a `needed`
+    /// past it is an error rather than a silent partial allocation.
+    #[test]
+    fn full_layer_growth_respects_the_ceiling() {
+        let dev = dev();
+        let mut c = fresh_full(8, 2, 4, &dev);
+        // Doubling from 8 toward 50 overshoots to 64, which the cap trims.
+        assert_eq!(c.ensure_full_capacity(50, 60).unwrap(), 60);
+        assert!(c.ensure_full_capacity(61, 60).is_err());
+        // Within the allocation, a no-op reports the standing capacity.
+        assert_eq!(c.ensure_full_capacity(10, 60).unwrap(), 60);
+        // Non-full layers have nothing to grow and say so with a 0.
+        let mut lin = fresh_linear(3, 6, 2, 4, &dev);
+        assert_eq!(lin.ensure_full_capacity(1000, 60).unwrap(), 0);
     }
 
     /// Test 2: SWA ring checkpoint/rollback is byte-exact across the interesting

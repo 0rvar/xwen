@@ -166,7 +166,10 @@ enum Cmd {
         max_tokens: usize,
         #[arg(long, default_value = "fused")]
         moe_impl: String,
-        #[arg(long, default_value_t = 8192)]
+        /// Context ceiling in tokens. A ceiling, not an allocation: the KV
+        /// cache starts small and grows on demand, so a large value costs
+        /// memory only when a prompt actually reaches it.
+        #[arg(long, default_value_t = 131072)]
         max_ctx: usize,
         /// Skip the chat template and feed the prompt raw (no BOS — Qwen never
         /// prepends one).
@@ -215,7 +218,10 @@ enum Cmd {
         max_tokens: usize,
         #[arg(long, default_value = "fused")]
         moe_impl: String,
-        #[arg(long, default_value_t = 8192)]
+        /// Context ceiling in tokens. A ceiling, not an allocation: the KV
+        /// cache starts small and grows on demand, so a large value costs
+        /// memory only when a prompt actually reaches it.
+        #[arg(long, default_value_t = 131072)]
         max_ctx: usize,
         /// Show the model's <think> reasoning (dimmed) instead of hiding it.
         #[arg(long)]
@@ -273,7 +279,10 @@ enum Cmd {
         tokenizer: Option<PathBuf>,
         #[arg(long, default_value = "fused")]
         moe_impl: String,
-        #[arg(long, default_value_t = 8192)]
+        /// Context ceiling in tokens. A ceiling, not an allocation: the KV
+        /// cache starts small and grows on demand, so a large value costs
+        /// memory only when a prompt actually reaches it.
+        #[arg(long, default_value_t = 131072)]
         max_ctx: usize,
         #[command(flatten)]
         draft: DraftArgs,
@@ -307,8 +316,9 @@ struct ServeArgs {
     /// TCP port to bind.
     #[arg(long)]
     port: Option<u16>,
-    /// Context length in tokens; the full-attention KV cache is preallocated
-    /// to this size at load.
+    /// Context length in tokens — a ceiling, not an allocation: the
+    /// full-attention KV cache starts small and grows on demand, and an idle
+    /// unload shrinks it back by dropping the model.
     #[arg(long)]
     ctx: Option<usize>,
     /// Unload the model after this long without a request: an integer with an

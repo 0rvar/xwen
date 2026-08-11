@@ -52,8 +52,9 @@ pub struct MmapSource {
     /// registered in ITS queue-attached residency set (the vendored candle
     /// patch `register_buffers`), so aliased weights stay permanently
     /// GPU-resident exactly like candle's own pool buffers — without this the
-    /// 70GB working set pays per-command-buffer residency bookkeeping,
-    /// measured at ~10% of sustained 4k prefill (docs/log.md mmap entry).
+    /// weight working set pays per-command-buffer residency bookkeeping,
+    /// measured at ~10% of sustained 4k prefill on laguna's ~70GB checkpoint
+    /// (this loader is inherited from there, measurement and all).
     /// Residency is perf-only: setBuffer-bound buffers are made resident per
     /// command buffer regardless, so unregistered views compute correctly.
     mdev: MetalDevice,

@@ -16,9 +16,12 @@ use serde::Deserialize;
 /// Loopback only: the server has no auth unless `api_key` is set.
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 5241;
-/// The checkpoint's own trained window: 256k tokens of full-attention KV,
-/// preallocated at load. `resolve_context_length` clamps it for any checkpoint
-/// converted smaller, so this asks for everything the model can hold and no more.
+/// The checkpoint's own trained window: 256k tokens. A CEILING, not an
+/// allocation — the KV cache starts small and grows on demand as a
+/// conversation actually lengthens (`XwenModel`'s lazy KV), and an idle unload
+/// drops the grown buffers, so the next load starts small again.
+/// `resolve_context_length` clamps it for any checkpoint converted smaller, so
+/// this asks for everything the model can hold and no more.
 pub const DEFAULT_CONTEXT_LENGTH: usize = 262144;
 pub const DEFAULT_IDLE_UNLOAD: IdleUnload = IdleUnload(Some(Duration::from_secs(300)));
 pub const DEFAULT_ANTHROPIC: bool = true;
@@ -1185,21 +1188,23 @@ host = "{host}"
 # TCP port.
 port = {port}
 
-# Context length in tokens. The full-attention KV cache is preallocated at load,
-# so this is memory spent up front: about {ctx_gb:.1} GB at {ctx} for the 35B-A3B's
-# geometry, and roughly three times that for the 27B, whose full-attention layers
-# are both more numerous and wider. Only those layers grow with context — the
-# DeltaNet layers carry a fixed recurrent state either way. The default is the
-# checkpoint's own trained window,
-# and a checkpoint converted for less is served at its own limit whatever is set
-# here. Lower it to spend less up front; decode speed depends on the tokens a
-# conversation actually uses, not on what was allocated.
+# Context length in tokens — a ceiling, not an allocation. The full-attention
+# KV cache starts small (8192 positions) and grows on demand as a conversation
+# lengthens, up to about {ctx_gb:.1} GB at {ctx} for the 35B-A3B's geometry and
+# roughly three times that for the 27B, whose full-attention layers are both
+# more numerous and wider; an idle unload drops the grown buffers, so a
+# reloaded server starts small again. Only those layers grow with context —
+# the DeltaNet layers carry a fixed recurrent state either way. The default is
+# the checkpoint's own trained window, and a checkpoint converted for less is
+# served at its own limit whatever is set here. Decode speed depends on the
+# tokens a conversation actually uses, not on what was allocated.
 context_length = {ctx}
 
-# Drop the model after this long without a request, returning about 70 GB of
-# GPU-resident weights to the system. The next request reloads it in a few
-# seconds. Write an integer with an s, m or h suffix, or "off" to hold the
-# model in memory forever.
+# Drop the model after this long without a request, returning the GPU-resident
+# weights (19-37 GB depending on checkpoint and quant) and whatever the KV
+# cache has grown to. The next request reloads in a few seconds and starts the
+# KV cache small again. Write an integer with an s, m or h suffix, or "off" to
+# hold the model in memory forever.
 idle_unload = "{idle}"
 
 # Serve the Anthropic Messages API: POST /v1/messages and

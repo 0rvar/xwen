@@ -55,18 +55,33 @@ fn estimated_tokens(bytes: usize) -> usize {
 }
 
 /// The two size estimates a batch job is queued with: prompt-side tokens
-/// (every item's messages, shared prefix counted once per item — the runner
-/// reports measured truth later) and the summed output budgets.
+/// (every item's messages, plus a declared `shared_prefix` once PER ITEM) and
+/// the summed output budgets.
+///
+/// The prefix is counted per item even though the runner usually prefills it
+/// once: the token-level dedup is conditional (two or more live items, a
+/// common prefix past `MIN_SHARED_PREFIX`, `XWEN_BATCH_NO_CACHE` unset), and
+/// when it does not fire every item repays the prefix in full. Counting it per
+/// item matches what an inline spelling of the same document would have
+/// weighed, and errs the way this whole estimate errs: the scheduler lets
+/// small chats go first, and the watchdog deadline errs loose — an
+/// undercounted estimate would instead arm a deadline shorter than the real
+/// prefill. The runner reports measured truth later.
 fn size_estimates(request: &BatchRequest) -> (usize, usize) {
     // Saturating throughout: these are client-supplied numbers feeding a
     // scheduling estimate, and a request built to overflow them should get a
     // pinned-at-max estimate, not an overflow.
+    let prefix_bytes = request
+        .shared_prefix
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_mul(request.items.len());
     let prompt_bytes = request
         .items
         .iter()
         .flat_map(|item| &item.messages)
         .map(|m| m.content.len() + m.thinking.as_ref().map_or(0, String::len))
-        .fold(0usize, usize::saturating_add);
+        .fold(prefix_bytes, usize::saturating_add);
     let max_tokens = request
         .items
         .iter()
@@ -294,5 +309,20 @@ mod tests {
 
         let unbudgeted = request(r#"{"items":[{"id":"a","messages":[]}]}"#);
         assert_eq!(size_estimates(&unbudgeted).1, DEFAULT_MAX_TOKENS);
+    }
+
+    /// A declared shared_prefix weighs once PER ITEM, exactly as the same
+    /// document spelled inline would — the runner's one-prefill dedup is
+    /// conditional, and an estimate that assumed it would arm a watchdog
+    /// deadline shorter than the worst-case prefill.
+    #[test]
+    fn a_shared_prefix_is_estimated_per_item() {
+        let parsed = request(
+            r#"{"shared_prefix":"aaaaaa","items":[
+                {"id":"a","messages":[{"role":"user","content":"bbb"}]},
+                {"id":"b","messages":[{"role":"user","content":"ccc"}]}]}"#,
+        );
+        let (prompt, _) = size_estimates(&parsed);
+        assert_eq!(prompt, (6 * 2 + 3 + 3) / 3);
     }
 }

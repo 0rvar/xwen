@@ -1803,9 +1803,44 @@ impl Generator {
     /// tail that no longer exists — reading a stale one would score against the
     /// wrong context.
     pub fn last_logprobs_for(&self, ids: &[u32]) -> Result<Vec<f64>> {
-        let logits = self.last_logits.as_ref().ok_or_else(|| {
-            anyhow!("last_logprobs_for: no prefill logits; call prefill_tokens first")
-        })?;
+        let (values, log_denom) = self.held_row("last_logprobs_for")?;
+        let encodable = values.len();
+        ids.iter()
+            .map(|&id| {
+                ensure!(
+                    (id as usize) < encodable,
+                    "token {id} is outside the {encodable} encodable ids"
+                );
+                Ok(f64::from(values[id as usize]) - log_denom)
+            })
+            .collect()
+    }
+
+    /// Softmax — over the encodable vocabulary — of the logits the last
+    /// `prefill_tokens` left held: the whole next-token distribution at the
+    /// position the cache ends at, one probability per encodable id.
+    ///
+    /// This is the full-row companion to [`Generator::last_logprobs_for`],
+    /// normalized identically, for callers that classify the row rather than
+    /// look ids up in it — the scored batch path's escape measure sums it over
+    /// token-text classes.
+    pub fn last_probs(&self) -> Result<Vec<f64>> {
+        let (values, log_denom) = self.held_row("last_probs")?;
+        Ok(values
+            .iter()
+            .map(|&v| (f64::from(v) - log_denom).exp())
+            .collect())
+    }
+
+    /// The held logit row cut to the encodable ids, with its f64 log-softmax
+    /// denominator. Shared by [`Generator::last_logprobs_for`] and
+    /// [`Generator::last_probs`], so a score and the row it is read against are
+    /// normalized the same way.
+    fn held_row(&self, caller: &str) -> Result<(Vec<f32>, f64)> {
+        let logits = self
+            .last_logits
+            .as_ref()
+            .ok_or_else(|| anyhow!("{caller}: no prefill logits; call prefill_tokens first"))?;
         let encodable = self.sampler.encodable();
         let row = logits.flatten_all()?;
         let width = row.dim(0)?;
@@ -1828,16 +1863,7 @@ impl Generator {
         let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         ensure!(max.is_finite(), "the logit row holds no finite value");
         let denom: f64 = values.iter().map(|&v| f64::from(v - max).exp()).sum();
-        let log_denom = f64::from(max) + denom.ln();
-        ids.iter()
-            .map(|&id| {
-                ensure!(
-                    (id as usize) < encodable,
-                    "token {id} is outside the {encodable} encodable ids"
-                );
-                Ok(f64::from(values[id as usize]) - log_denom)
-            })
-            .collect()
+        Ok((values, f64::from(max) + denom.ln()))
     }
 
     /// True when a DFlash drafter is attached, whether or not it can currently

@@ -14,6 +14,12 @@
 //! [`MIN_SHARED_PREFIX`] is not worth a snapshot, and then every item runs from a
 //! reset cache instead.
 //!
+//! The request may also DECLARE the shared text once — `shared_prefix`, which
+//! the runner prepends to every item's first message before rendering. That
+//! changes nothing about the paragraph above (the prefill dedup is token-level
+//! and automatic); it exists so the request body does not carry a large shared
+//! document once per item.
+//!
 //! Items run sequentially in request order. Failures are per item wherever they
 //! can be: a prompt that will not render, a schema the grammar compiler rejects,
 //! a decode that errors — each lands as an `error` on that item's response and
@@ -100,6 +106,17 @@ pub struct BatchRequest {
     /// rather than a flag: one request is one model's work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Text prepended verbatim to the content of every item's FIRST message.
+    ///
+    /// Purely a wire-size measure. The runner already prefills the items'
+    /// shared TOKEN prefix once however it arrived, but a batch whose items
+    /// share a large document otherwise repeats it per item in the request
+    /// body — the one place the repetition still costs something. The prompts
+    /// this produces are byte-identical to spelling the document out in every
+    /// item, so answers (and scores) are too. An item with no messages cannot
+    /// take the prefix and fails as an item; an empty string means absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_prefix: Option<String>,
     /// Per-item settings every item inherits unless it names its own.
     #[serde(default)]
     pub defaults: ItemDefaults,
@@ -410,12 +427,19 @@ pub fn run_batch(
     // Every prompt is rendered and encoded before anything runs: the shared
     // prefix is a fact about the whole set, and an item that cannot be prepared
     // must not contribute a token vector to it.
+    let shared_text = req.shared_prefix.as_deref().filter(|text| !text.is_empty());
     let prepared: Vec<std::result::Result<Prepared, String>> = req
         .items
         .iter()
         .map(|item| {
-            prepare_item(generator.tokenizer(), max_ctx, item, &req.defaults)
-                .map_err(|error| format!("{error:#}"))
+            prepare_item(
+                generator.tokenizer(),
+                max_ctx,
+                item,
+                &req.defaults,
+                shared_text,
+            )
+            .map_err(|error| format!("{error:#}"))
         })
         .collect();
 
@@ -1167,21 +1191,17 @@ struct Pick {
     /// allows. Always at temperature 1 and never truncated, whatever sampling
     /// the item drew under.
     probs: Vec<f64>,
-    /// Mass the choice point put on tokens that open NO option — everything the
-    /// model would rather have written than any allowed value.
+    /// Mass the choice point put on writing something that opens NO option —
+    /// the vocabulary gap: everything the model would rather have SAID than any
+    /// allowed value, with everything it would merely have FORMATTED
+    /// differently factored out (see [`escape_mass`] for the classification).
     ///
-    /// Measured on OPENERS, one row, while `probs` are measured over whole
-    /// sequences. The two answer different questions and do not add up: options
-    /// sharing a first token share its mass here (counted once), and an opener
-    /// this counts as inside may still lead somewhere no option goes.
-    ///
-    /// Read it as a distance from the schema, not as a confidence: "everything
-    /// else" includes how the model would have FORMATTED the answer, and the
-    /// skeleton is compact JSON. A boolean's choice point sits right after the
-    /// colon, where a model that pretty-prints puts almost all of its mass on a
-    /// space, so a near-1 escape there says nothing about the answer. The
-    /// reported probabilities are unaffected — every option is scored from this
-    /// same row, so whatever the model spent elsewhere divides out of them.
+    /// Measured on one row, while `probs` are measured over whole sequences.
+    /// The two answer different questions and do not add up: a token this
+    /// counts as inside may still lead somewhere no option goes. The reported
+    /// probabilities are unaffected either way — every option is scored from
+    /// this same row, so whatever the model spent elsewhere divides out of
+    /// them.
     escape: f64,
 }
 
@@ -1403,7 +1423,11 @@ fn score_field(
         .map(|option| option.tokens[0])
         .collect();
     let mut scores = generator.last_logprobs_for(&openers)?;
-    let escape = escape_mass(&openers, &scores);
+    let escape = escape_mass(
+        &generator.last_probs()?,
+        generator.tokenizer().decoded_vocab(),
+        field,
+    )?;
 
     let choice_pos = generator.cache_len();
     // Taken once for every option: a restore copies by reference, so re-taking
@@ -1483,24 +1507,87 @@ fn truncate_nucleus(ranked: &mut Vec<(usize, f64)>, top_p: f64) {
     ranked.truncate(keep);
 }
 
-/// The probability the choice point put on tokens that open NO option, read off
-/// the RAW (unrenormalized) distribution: `openers` are the options' first
-/// tokens and `logprobs` their log-probabilities under it.
+/// The probability the choice point put on writing something that opens NO
+/// option, with the mass it spent on FORMATTING factored out: `probs` is the
+/// whole next-token distribution ([`Generator::last_probs`]) and `decoded` the
+/// per-id raw bytes it is classified by ([`LagunaTokenizer::decoded_vocab`]).
 ///
-/// Only DISTINCT openers count. Two options that begin with the same token —
-/// `"positive"` and `"positively"` share one — otherwise subtract that token's
-/// mass twice and drive the escape negative. Rounding can still leave the sum a
-/// hair past 1, and a reported probability is never outside [0, 1].
-fn escape_mass(openers: &[u32], logprobs: &[f64]) -> f64 {
-    let mut counted: Vec<u32> = Vec::with_capacity(openers.len());
-    let mut inside = 0.0;
-    for (token, logprob) in openers.iter().zip(logprobs) {
-        if !counted.contains(token) {
-            counted.push(*token);
-            inside += logprob.exp();
+/// The skeleton is compact JSON, and the model's preferred layout usually is
+/// not: at an unquoted choice point (right after a boolean's colon) most of the
+/// mass sits on whitespace-led spellings of the very values the schema allows —
+/// ` true` is a single token — and on pure-whitespace tokens that say nothing
+/// about the answer either way. Counting those as escape pins a document's
+/// first field near 1.0 (later fields sit in an established compact document,
+/// which conditions the formatting away) and buries the actual vocabulary-gap
+/// signal. So every token is classified, by its BYTES — byte-level BPE is free
+/// to cut a multi-byte character across tokens, and a text-level comparison
+/// would misread the canonical opener of any non-ASCII option as escape:
+///
+/// * INSIDE — the bytes, read past any leading JSON whitespace at an unquoted
+///   field (verbatim at a quoted one, where leading whitespace would be string
+///   content), are a nonempty prefix of some option's bytes. This is mass on
+///   paths that can still produce an allowed value, whatever spelling the
+///   tokenizer gave them.
+/// * FORMATTING (unquoted fields only) — nothing but JSON whitespace (space,
+///   tab, CR, LF — the four bytes JSON allows between values, NOT Unicode
+///   whitespace: an NBSP would make the document invalid and is honestly
+///   outside): layout, not an answer. Excluded from both sides.
+/// * OUTSIDE — everything else: the mass the model would rather spend on some
+///   other continuation than any allowed value.
+///
+/// The escape is outside over inside-plus-outside — the gap conditioned on the
+/// model saying anything at all. Prefix matching is deliberately one-way: a
+/// token that BEGINS with an option and carries on (`true,` fused into one
+/// token, were the vocabulary to hold one) counts outside, because so does
+/// `yesterday` against the option `yes`, and the canonical tokenizations that
+/// carry real mass never fuse across the value's edge (check_seams refuses the
+/// plans where they would). Matching is also canonical-spelling-only for a
+/// quoted field: JSON's alternate spellings of the same string (`\/` for `/`,
+/// `\uXXXX` forms) count outside, the same stance check_seams takes on
+/// non-canonical tokenizations — negligible mass, and an escape that read them
+/// as inside would claim to understand a value the assembler would never write.
+fn escape_mass(probs: &[f64], decoded: &[Vec<u8>], field: &ScoredField) -> Result<f64> {
+    // The row is cut to the sampler's encodable bound and the byte table to the
+    // tokenizer's vocab_size; they are the same number by construction
+    // (`Generator::load` derives one from the other), and this is where that
+    // coupling is enforced — a silent zip truncation would drop the surplus
+    // side's mass from BOTH classes and read the escape low with no error.
+    ensure!(
+        probs.len() == decoded.len(),
+        "escape: the probability row covers {} ids but the decoded vocabulary {}",
+        probs.len(),
+        decoded.len()
+    );
+    let json_ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    let mut inside = 0.0f64;
+    let mut outside = 0.0f64;
+    for (bytes, &p) in decoded.iter().zip(probs) {
+        let body: &[u8] = if field.quoted {
+            bytes
+        } else {
+            &bytes[bytes.iter().take_while(|b| json_ws(b)).count()..]
+        };
+        if body.is_empty() {
+            // Pure JSON whitespace (or an id with no bytes): formatting.
+            continue;
+        }
+        if field
+            .options
+            .iter()
+            .any(|option| option.text.as_bytes().starts_with(body))
+        {
+            inside += p;
+        } else {
+            outside += p;
         }
     }
-    (1.0 - inside).clamp(0.0, 1.0)
+    let content = inside + outside;
+    if content <= 0.0 {
+        // Every scrap of mass was formatting: there is no content distribution
+        // to read a gap off, and 0 (rather than an arbitrary ratio) says so.
+        return Ok(0.0);
+    }
+    Ok((outside / content).clamp(0.0, 1.0))
 }
 
 /// `softmax` over option scores at `temperature`, max-subtracted so a long
@@ -1549,17 +1636,25 @@ fn report(field: &ScoredField, pick: &Pick) -> Value {
     }
 }
 
-/// Render, encode and validate one item.
+/// Render, encode and validate one item. `shared_prefix` is the request-level
+/// text prepended to the first message's content ([`BatchRequest::shared_prefix`]),
+/// already normalized to `None` when empty.
 fn prepare_item(
     tokenizer: &LagunaTokenizer,
     max_ctx: usize,
     item: &BatchItem,
     defaults: &ItemDefaults,
+    shared_prefix: Option<&str>,
 ) -> Result<Prepared> {
+    ensure!(
+        shared_prefix.is_none() || !item.messages.is_empty(),
+        "the request's shared_prefix has no first message to prepend to; this item has none"
+    );
     let messages = item
         .messages
         .iter()
-        .map(chat_message)
+        .enumerate()
+        .map(|(at, message)| chat_message(message, if at == 0 { shared_prefix } else { None }))
         .collect::<Result<Vec<_>>>()?;
     let (opts, continuation) = resolve_render(item, defaults)?;
     let (tokens, prefix_len, starts_in_thinking) =
@@ -1614,9 +1709,13 @@ fn prepare_item(
     })
 }
 
-/// Turn a wire message into a renderer message.
-fn chat_message(message: &BatchMessage) -> Result<Message> {
-    let content = message.content.clone();
+/// Turn a wire message into a renderer message, with the request's shared
+/// prefix (if this is the message it lands on) prepended to the content.
+fn chat_message(message: &BatchMessage, shared_prefix: Option<&str>) -> Result<Message> {
+    let content = match shared_prefix {
+        Some(prefix) => format!("{prefix}{}", message.content),
+        None => message.content.clone(),
+    };
     match message.role.as_str() {
         "system" => Ok(Message::System(content)),
         "user" => Ok(Message::User(content)),
@@ -2588,7 +2687,7 @@ mod tests {
         for max_tokens in [usize::MAX, usize::MAX - 1, 8193] {
             let mut spec = item("a");
             spec.max_tokens = Some(max_tokens);
-            let error = prepare_item(&tokenizer, 8192, &spec, &defaults)
+            let error = prepare_item(&tokenizer, 8192, &spec, &defaults, None)
                 .err()
                 .expect("a budget past the context has nowhere to decode")
                 .to_string();
@@ -2597,7 +2696,64 @@ mod tests {
         // And one that fits still prepares.
         let mut spec = item("a");
         spec.max_tokens = Some(64);
-        assert!(prepare_item(&tokenizer, 8192, &spec, &defaults).is_ok());
+        assert!(prepare_item(&tokenizer, 8192, &spec, &defaults, None).is_ok());
+    }
+
+    // A request-level shared_prefix is spelled once on the wire but lands in
+    // every item's prompt: the tokens must be identical to an item whose first
+    // message carried the document inline — same prompts, same answers, same
+    // scores — and only the first message takes it.
+    #[test]
+    fn a_shared_prefix_prepends_to_every_items_first_message() {
+        let tokenizer = LagunaTokenizer::embedded().unwrap();
+        let defaults = ItemDefaults::default();
+
+        let mut declared = item("a");
+        declared.messages = vec![
+            BatchMessage {
+                role: "user".into(),
+                content: "Question one?".into(),
+                thinking: None,
+            },
+            BatchMessage {
+                role: "user".into(),
+                content: "Really?".into(),
+                thinking: None,
+            },
+        ];
+        let mut inline = declared.clone();
+        inline.messages[0].content = "A long shared story.\n\nQuestion one?".into();
+
+        let with_prefix = prepare_item(
+            &tokenizer,
+            8192,
+            &declared,
+            &defaults,
+            Some("A long shared story.\n\n"),
+        )
+        .unwrap();
+        let spelled_out = prepare_item(&tokenizer, 8192, &inline, &defaults, None).unwrap();
+        assert_eq!(with_prefix.tokens, spelled_out.tokens);
+    }
+
+    // An item with no messages has nowhere to put the prefix; that is the
+    // item's failure, not the batch's.
+    #[test]
+    fn a_shared_prefix_without_a_first_message_fails_the_item() {
+        let tokenizer = LagunaTokenizer::embedded().unwrap();
+        let mut spec = item("a");
+        spec.messages.clear();
+        let error = prepare_item(
+            &tokenizer,
+            8192,
+            &spec,
+            &ItemDefaults::default(),
+            Some("story"),
+        )
+        .err()
+        .expect("no first message to prepend to")
+        .to_string();
+        assert!(error.contains("shared_prefix"), "{error}");
     }
 
     // The worst case is what the budget is checked against: every segment plus
@@ -2667,27 +2823,106 @@ mod tests {
         assert_eq!(argmax_index(&[-1.0, -1.0]), 0);
     }
 
-    // The escape is the raw mass on tokens that open no option at all.
-    #[test]
-    fn escape_is_the_mass_outside_the_options() {
-        let half = 0.5f64.ln();
-        // Two options taking half the distribution each leave nothing outside.
-        assert!(escape_mass(&[10, 20], &[half, half]).abs() < 1e-12);
-        // A tenth each leaves four fifths of the mass elsewhere.
-        let tenth = 0.1f64.ln();
-        assert!((escape_mass(&[10, 20], &[tenth, tenth]) - 0.8).abs() < 1e-12);
+    /// Token bytes from strings, for driving [`escape_mass`] directly.
+    fn texts(list: &[&str]) -> Vec<Vec<u8>> {
+        list.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
 
-    // Options sharing a first token share its mass: counting it once per option
-    // would subtract it twice and report a negative escape.
+    /// The one boolean field of a `{"urgent": bool}` plan — an UNQUOTED field.
+    fn boolean_field() -> ScoredField {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "urgent": { "type": "boolean", "include_score": "all" } },
+            "required": ["urgent"],
+            "additionalProperties": false,
+        });
+        plan_of(&schema).unwrap().unwrap().fields.remove(0)
+    }
+
+    // At an unquoted choice point the model's mass sits mostly on
+    // whitespace-led spellings of the allowed values (` true` is one token) and
+    // on pure-whitespace layout tokens. The first are the answer and count
+    // inside; the second are formatting and count on neither side; the escape
+    // is what remains, renormalized over the content mass.
     #[test]
-    fn a_shared_first_token_counts_once() {
-        let two_thirds = (2.0f64 / 3.0).ln();
-        // Both options open on token 10, which holds two thirds of the mass.
-        let escape = escape_mass(&[10, 10], &[two_thirds, two_thirds]);
-        assert!((escape - 1.0 / 3.0).abs() < 1e-12, "{escape}");
-        // And the mass an option's opener holds is never more than all of it.
-        assert_eq!(escape_mass(&[10, 10], &[0.0, 0.0]), 0.0);
+    fn escape_ignores_formatting_and_whitespace_led_spellings() {
+        let field = boolean_field();
+        let decoded = texts(&["true", " false", "\n  ", " \"", "fal"]);
+        let probs = [0.3, 0.4, 0.2, 0.05, 0.05];
+        // Inside 0.3 + 0.4 + 0.05, formatting 0.2, outside the quote's 0.05.
+        let escape = escape_mass(&probs, &decoded, &field).unwrap();
+        assert!((escape - 0.05 / 0.8).abs() < 1e-12, "{escape}");
+    }
+
+    // A quoted field reads token text verbatim: past the opening quote,
+    // leading whitespace is string CONTENT, so a whitespace-led spelling of an
+    // option is a different string and a pure-whitespace token is real mass
+    // outside the options — neither is formatting there.
+    #[test]
+    fn escape_reads_a_quoted_field_verbatim() {
+        let plan = one_field(Value::String("all".into())); // enum ["yes", "no"]
+        let field = &plan.fields[0];
+        assert!(field.quoted);
+        let decoded = texts(&["yes", " yes", " ", "y"]);
+        let probs = [0.4, 0.3, 0.2, 0.1];
+        // Inside `yes` and the prefix `y`; ` yes` and ` ` are other strings.
+        let escape = escape_mass(&probs, &decoded, field).unwrap();
+        assert!((escape - 0.5).abs() < 1e-12, "{escape}");
+    }
+
+    // Prefix matching is one-way: a token that can still BECOME an option
+    // counts inside, a token that starts with one and carries on past its edge
+    // does not (`yesterday` is not headed for `yes`).
+    #[test]
+    fn escape_counts_prefixes_inside_and_extensions_outside() {
+        let plan = one_field(Value::String("all".into())); // enum ["yes", "no"]
+        let field = &plan.fields[0];
+        let decoded = texts(&["ye", "yes", "yesterday", "maybe"]);
+        let probs = [0.25, 0.25, 0.25, 0.25];
+        let escape = escape_mass(&probs, &decoded, field).unwrap();
+        assert!((escape - 0.5).abs() < 1e-12, "{escape}");
+    }
+
+    // A row that is nothing but formatting holds no content distribution to
+    // read a gap off, and the escape says 0 rather than dividing by nothing.
+    #[test]
+    fn an_all_formatting_row_escapes_nothing() {
+        let field = boolean_field();
+        let decoded = texts(&[" ", "\n\n", "\t"]);
+        let probs = [0.6, 0.3, 0.1];
+        assert_eq!(escape_mass(&probs, &decoded, &field).unwrap(), 0.0);
+    }
+
+    // Classification is by BYTES: a token holding the leading bytes of a
+    // multi-byte option character is that option's canonical opener and counts
+    // inside, even though it decodes to no text on its own. And formatting is
+    // JSON whitespace only — an NBSP would make the document invalid, so it is
+    // real mass outside, not layout.
+    #[test]
+    fn escape_reads_bytes_not_lossy_text() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mark": { "enum": ["\u{1F9FF}", "x"], "include_score": "all" }
+            },
+            "required": ["mark"],
+            "additionalProperties": false,
+        });
+        let field = plan_of(&schema).unwrap().unwrap().fields.remove(0);
+        // "🧿" is F0 9F A7 BF; the first two bytes alone open it.
+        let decoded = vec![vec![0xF0, 0x9F], b"x".to_vec(), b"no".to_vec()];
+        let probs = [0.5, 0.25, 0.25];
+        let escape = escape_mass(&probs, &decoded, &field).unwrap();
+        assert!((escape - 0.25).abs() < 1e-12, "{escape}");
+
+        let boolean = boolean_field();
+        let nbsp = vec![vec![0xC2, 0xA0], b"true".to_vec()];
+        let probs = [0.5, 0.5];
+        let escape = escape_mass(&probs, &nbsp, &boolean).unwrap();
+        assert!(
+            (escape - 0.5).abs() < 1e-12,
+            "NBSP is outside, not formatting: {escape}"
+        );
     }
 
     /// A one-field plan whose options are `yes`/`no`, annotated as `include`.
@@ -2798,21 +3033,21 @@ mod tests {
             thinking: None,
         };
         assert!(matches!(
-            chat_message(&message("system")).unwrap(),
+            chat_message(&message("system"), None).unwrap(),
             Message::System(_)
         ));
         assert!(matches!(
-            chat_message(&message("user")).unwrap(),
+            chat_message(&message("user"), None).unwrap(),
             Message::User(_)
         ));
         assert!(matches!(
-            chat_message(&message("assistant")).unwrap(),
+            chat_message(&message("assistant"), None).unwrap(),
             Message::Assistant { .. }
         ));
         assert!(matches!(
-            chat_message(&message("tool")).unwrap(),
+            chat_message(&message("tool"), None).unwrap(),
             Message::ToolResponse(_)
         ));
-        assert!(chat_message(&message("developer")).is_err());
+        assert!(chat_message(&message("developer"), None).is_err());
     }
 }

@@ -35,6 +35,30 @@ use anyhow::{Result, anyhow};
 /// once.
 pub(crate) static EMBEDDED_TOKENIZER_JSON: &[u8] = include_bytes!("../reference/tokenizer.json");
 
+/// The byte-level BPE alphabet, inverted: each of the 256 printable stand-in
+/// characters a BPE vocab entry spells a byte with, mapped back to that byte.
+/// This is GPT-2's `bytes_to_unicode` reversed — the three printable Latin-1
+/// ranges (`!`..=`~`, `¡`..=`¬`, `®`..=`ÿ`) stand for themselves, and every
+/// other byte takes the next code point from U+0100 up, in ascending byte
+/// order (`Ġ` is space, `Ċ` is newline). Qwen's tokenizer is byte-level BPE,
+/// so every non-added vocab entry is a string over exactly this alphabet.
+fn byte_level_inverse() -> std::collections::HashMap<char, u8> {
+    let mut inverse = std::collections::HashMap::with_capacity(256);
+    let mut fallback = 0x100u32;
+    for byte in 0u32..256 {
+        let kept = matches!(byte, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
+        let ch = if kept {
+            char::from_u32(byte).expect("Latin-1 range is valid chars")
+        } else {
+            let ch = char::from_u32(fallback).expect("U+0100.. is valid chars");
+            fallback += 1;
+            ch
+        };
+        inverse.insert(ch, byte as u8);
+    }
+    inverse
+}
+
 pub struct LagunaTokenizer {
     inner: tokenizers::Tokenizer,
     /// Added-token strings with their ids, sorted longest-first so a scan that
@@ -47,6 +71,14 @@ pub struct LagunaTokenizer {
     /// byte-level BPE, under which no added-token string is reachable (no merge
     /// path builds one — `plain_bpe_cannot_reach_any_added_token_id` pins it).
     plain: OnceLock<tokenizers::Tokenizer>,
+    /// Lazily built raw BYTES of every encodable id, for sweeps that classify
+    /// the whole vocabulary by token content (the scored batch path's escape
+    /// measure). Bytes rather than decoded strings deliberately: byte-level
+    /// BPE tokens are free to hold part of a multi-byte UTF-8 character, and
+    /// `decode` on such an id is lossy (U+FFFD), which would misclassify the
+    /// canonical opener of any non-ASCII option value. Built once per
+    /// tokenizer on first use.
+    decoded: OnceLock<Vec<Vec<u8>>>,
 }
 
 impl LagunaTokenizer {
@@ -125,6 +157,7 @@ impl LagunaTokenizer {
             markers,
             marker_first_bytes,
             plain: OnceLock::new(),
+            decoded: OnceLock::new(),
         }
     }
 
@@ -318,6 +351,44 @@ impl LagunaTokenizer {
         self.inner.id_to_token(id)
     }
 
+    /// Raw bytes of every encodable id, indexed by id, materialized once per
+    /// tokenizer on first use and cached (the walk over the ~248k-entry
+    /// vocabulary is too slow to repeat per call site).
+    ///
+    /// A BPE entry's stored string is in the byte-level ALPHABET (`Ġ` for
+    /// space, `Ċ` for newline, one printable char per byte), so it is mapped
+    /// back through the alphabet's inverse — never through `decode`, which is
+    /// lossy (U+FFFD) for a token holding part of a multi-byte UTF-8 character
+    /// and would misclassify exactly the ids a byte-precise sweep exists to
+    /// classify. An added token has no byte-level form and contributes its
+    /// literal text's bytes; an id with no entry at all contributes nothing.
+    /// `token_bytes_reverse_the_byte_level_alphabet` pins the mapping against
+    /// `encode` on ASCII, whitespace-led and multi-byte-UTF-8 text alike.
+    pub fn decoded_vocab(&self) -> &[Vec<u8>] {
+        self.decoded.get_or_init(|| {
+            let inverse = byte_level_inverse();
+            let added: std::collections::HashMap<u32, &str> = self
+                .markers
+                .iter()
+                .map(|(text, id)| (*id, text.as_str()))
+                .collect();
+            (0..self.vocab_size() as u32)
+                .map(|id| {
+                    if let Some(text) = added.get(&id) {
+                        return text.as_bytes().to_vec();
+                    }
+                    let Some(token) = self.inner.id_to_token(id) else {
+                        return Vec::new();
+                    };
+                    token
+                        .chars()
+                        .filter_map(|c| inverse.get(&c).copied())
+                        .collect()
+                })
+                .collect()
+        })
+    }
+
     /// Incremental decoder for streaming (handles multi-token UTF-8).
     pub fn decode_stream(&self) -> DecodeStream<'_> {
         DecodeStream {
@@ -383,6 +454,38 @@ mod tests {
     fn tokenizer() -> LagunaTokenizer {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/tokenizer.json");
         LagunaTokenizer::from_file(path).expect("load reference tokenizer")
+    }
+
+    /// `decoded_vocab` must reverse the byte-level alphabet exactly: for any
+    /// text, the concatenated bytes of its encoded ids are the text's own
+    /// UTF-8 bytes. Checked across the three regimes that differ — plain
+    /// ASCII, whitespace-led spellings (`Ġ`-class stand-ins), and a character
+    /// whose UTF-8 spans multiple tokens, where `decode(&[id])` per id is
+    /// lossy (U+FFFD) and this table must not be.
+    #[test]
+    fn token_bytes_reverse_the_byte_level_alphabet() {
+        let t = tokenizer();
+        let table = t.decoded_vocab();
+        assert_eq!(table.len(), t.vocab_size());
+        for text in [
+            "true",
+            " true",
+            "{\"urgent\":",
+            "h\u{00e9}llo \u{1F9FF}!",
+            "\u{1F9FF}",
+        ] {
+            let ids = t.encode(text).unwrap();
+            let bytes: Vec<u8> = ids
+                .iter()
+                .flat_map(|&id| table[id as usize].iter().copied())
+                .collect();
+            assert_eq!(bytes, text.as_bytes(), "{text:?} via {ids:?}");
+        }
+        // An added token contributes its literal text, not an alphabet form.
+        assert_eq!(
+            table[LagunaTokenizer::IM_END as usize],
+            b"<|im_end|>".to_vec()
+        );
     }
 
     /// The default vocabulary is the bytes compiled into the binary; loading

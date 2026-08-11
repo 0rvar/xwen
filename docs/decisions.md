@@ -43,6 +43,31 @@ Stop tokens are the generation_config list `[248046 <|im_end|>, 248044 <|endofte
 config.json's single `eos_token_id: 248044` is wrong for chat and runs straight past
 turn boundaries (2026-07-28).
 
+**`max_ctx` is a ceiling, not an allocation; the CLI defaults to 131072 and serve to
+the trained window (2026-08-11).** Full-attention KV buffers start at 8192 positions
+(`model::KV_INITIAL_CTX`) and double on demand up to `max_ctx`
+(`LayerCache::ensure_full_capacity`; growth is monotonic for a model's life and logged
+per step). Growth copies the WHOLE old buffer, deliberately not just the committed
+rows: the grown buffer is the old one plus a zeroed extension, so every property that
+held of the fixed allocation — `LayerSnapshot::Full`/`LayerCheckpoint::Full` carrying
+no data because restore and rollback are length truncations, rows above a rewound
+`len` still holding what they held — carries over with nothing to argue about which
+engine flow depends on rows past `len`. A committed-rows-only copy was the first cut
+and was replaced for exactly that argument's sake; the cost difference is a bounded
+device blit, O(log) times per lifetime. Page-in grows through `import_full_kv` exactly
+as a prefill would, and the host-image pre-flight no longer bounds a restore position
+by allocated slots (max_ctx, checked at model level, is the real bound). What "reset" means is
+dropping the model: the serve idle unload therefore shrinks a grown cache for free, and
+no in-life shrink mechanism exists or is wanted (capacity is a high-water mark of real
+usage). The alternative — preallocating at max_ctx, the pre-2026-08-11 behavior — made
+big defaults expensive (16 GiB of idle KV on a 27B serve at 256k) and kept the CLI
+default pinned at a timid 8192; lazy growth makes the 131072 CLI default cost 0.5 GiB
+(27B) / 0.16 GiB (35B) until a prompt actually grows past 8k. A growth pass ends in
+one `wait_until_completed`: candle's Metal pool frees the replaced buffers only at a
+sync, and without one the whole pass holds old and new allocations side by side. Rope
+tables still build to max_ctx at load — 64 MB at 262144, not worth the machinery
+(2026-08-11).
+
 ## Ground truth and parity methodology
 
 **Upstream llama.cpp master replaces the poolside fork as parity ground truth.** The
@@ -822,6 +847,21 @@ The batch marks the engine dirty up front and the live conversation is paged out
 it runs: the runner owns the whole cache, and the existing post-job reset machinery is
 what puts the cache back.
 
+**The request-body cap is an explicit 100 MB, replacing axum's implicit 2 MB
+(2026-08-11).** The implicit cap was never a decision — nobody chose 2 MB, axum's
+default arrived with the framework — and it bound first in practice: a real client
+split one batch over a 377 KB story into 14 POSTs to fit under it, re-prefilling the
+shared prefix each time. The wire is the wrong layer to police cost: the queue's
+bytes/3 token estimates and max_ctx judge what a request actually costs, and both keep
+doing so at any body size. 100 MB is far past any request the engine can serve while
+still bounding a hostile stream; it covers every dialect on the API router (`/health`
+carries no body). Two accepted edges, both recorded in the ledger: `Router::layer`
+wraps only the routes registered before it, so a POST route added after that line
+silently gets axum's 2 MB default back — the layer call carries the warning; and
+bodies are buffered and parsed BEFORE the queue can answer 429, with no concurrency
+bound on connections, which is acceptable exactly because the default bind is loopback
+on a single-user machine (2026-08-11).
+
 ## The prefix cache and the disk tier
 
 Inherited from laguna; correctness now depends on snapshotting (KV cache for the 10–16
@@ -933,17 +973,55 @@ chosen over scoring-the-escape-anyway: an option whose score is not the score of
 value the caller named is worse than an error message. Lifting the limits is ledgered
 (2026-08-09).
 
-**`escape` is opener-level mass, and for a bare literal it is confounded by
-formatting.** It reports the probability the model put on tokens that open no option at
-all, which is the honest reading of "none of the above" at the first choice-point token
-— and nothing deeper, because a per-option-sequence escape would need the full
-non-option continuation space. For a quoted enum the forced opening quote filters
-formatting out and the number means what it says. For a bare literal it does not: a
-boolean's choice point sits right after `:`, where whitespace tokens are exactly what a
-pretty-printer would emit, so the mass on "not `true`, not `false`" is mostly the mass
-on ` `. Observed directly: 0.998 escape sitting beside a 0.9986 answer score on the same
-field. Kept rather than dropped, documented on the field, refinement ledgered
-(2026-08-09).
+**`escape` was opener-level mass, confounded by formatting for bare literals —
+SUPERSEDED 2026-08-11 by the whole-row classification below.** As shipped 2026-08-09 it
+reported the probability on tokens that open no option at the first choice-point token.
+For a quoted enum the forced opening quote filtered formatting out; for a boolean, whose
+choice point sits after `:`, whitespace tokens a pretty-printer would emit competed with
+`true`/`false` and the escape read near 1 beside a near-certain answer score. Kept then
+with the refinement ledgered; the first external client hit it (every multi-field
+item's first field at 0.999-1.000, pinning mean escape at 1/fieldCount) and the
+refinement shipped.
+
+**`escape` is a whole-row classification by token TEXT, with formatting factored out —
+because the mass the opener set missed was mostly the ANSWER in the model's preferred
+spelling.** The client's one-token-early hypothesis was checked and refuted first: a
+row dump at the exact read shows the first boolean slot holding 54.9% ` true` / 44.9%
+` false` — single space-led tokens, the model wanting `{"k": true` against the compact
+skeleton — with bare `true`/`false` at ~5e-5, and the style pinning to compact (bare
+`false` 99.8%) from the second field on, which is why only first fields read ≈1.
+`escape_mass` now classifies every encodable id by its raw BYTES: stripped of leading
+JSON whitespace at an unquoted field (verbatim at a quoted one, where leading
+whitespace is string content), a nonempty prefix of some option's bytes is INSIDE;
+nothing but JSON whitespace at an unquoted field is FORMATTING, excluded from both
+sides; escape = outside / (inside + outside). Bytes, not decoded text, because
+byte-level BPE cuts multi-byte characters across tokens and `decode` of such an id is
+lossy (U+FFFD) — a text-level match would misread the canonical opener of any
+non-ASCII option as escape (found by the second-model review, codex `gpt-5.6-sol`;
+`LagunaTokenizer::decoded_vocab` reverses the byte-level alphabet instead, pinned
+against `encode` by test). JSON whitespace means the four bytes JSON allows — an NBSP
+would invalidate the document and honestly counts outside (same review). Prefix
+matching is one-way — `yesterday` is not headed for `yes`, so a token that begins with
+an option and carries on counts outside; the canonical tokenizations carrying real
+mass never fuse across the value's edge (check_seams refuses the plans where they
+would) — and canonical-spelling-only for quoted fields (`\/` and `\uXXXX` alternates
+count outside, the check_seams stance; negligible mass). Measured: first-field escape
+0.9999 → 0.00197, and the residue is genuine vocabulary-gap signal (mostly ` "`, a
+string where a boolean belongs); scores are untouched by construction (they never read
+the classification) and verified bit-identical. Costs one ~248k-entry vocab walk
+cached per tokenizer plus one full-row softmax readback per field
+(`Generator::last_probs`, normalized by the same code path as the scores) (2026-08-11).
+
+**`shared_prefix` is a wire-size field, deliberately NOT a prefill feature.** The
+runner has prefilled the items' shared TOKEN prefix once since batch shipped; what
+repeated was the request body — a 377 KB story per item forced a real client into 14
+POSTs under the old 2 MB cap. The field is prepended verbatim to every item's first
+message before rendering, so the resulting prompts (and answers, and scores) are
+byte-identical to spelling the document per item — pinned by test and verified live
+over both transports. Alternatives refused: request-level shared MESSAGES would change
+prompt structure (separate turns) and so change answers against the inline spelling;
+placeholder interpolation buys nothing over prepending. An item with no messages
+fails as an item, an empty string means absent (2026-08-11).
 
 **Scores are not bit-stable between the cached and cold arms, and consumers must
 compare with tolerance.** Replaying an item from the snapshot prefills its tail as a

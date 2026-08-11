@@ -124,12 +124,23 @@ thinking is off unless a request says otherwise — both differ from the chat su
 purpose (docs/decisions.md "Batch"). Per-item failures land as `error` on that item and
 the rest of the batch still runs.
 
+**`shared_prefix`.** A request-level string prepended verbatim to every item's first
+message content, so a large shared document is spelled once on the wire instead of once
+per item. Purely a body-size measure: the prompts (and answers, and scores) are
+byte-identical to writing the document into every item, and the one-prefill snapshot
+above works the same either way.
+
 **`include_score`.** Annotate an enum or boolean property with `include_score` and the
 item leaves the grammar path: xwen writes the JSON skeleton itself and picks each
 field's value by scoring every allowed option against the model, reporting
 `{"value": …, "score": …}` instead of a bare value (`"all"` adds the full `scores`
-table and the `escape` mass that fell outside the option set). v1 accepts a flat
-all-required object of enum/boolean fields and refuses anything else by name.
+table and the `escape`). `escape` is the probability the model would rather have
+written something NO option opens, measured over the whole vocabulary at the field's
+choice point with formatting factored out — whitespace-led spellings of an allowed
+value count as that value, pure-whitespace layout tokens count as neither side
+(2026-08-11; before that it was raw opener mass and read ≈1 on a document's first
+bare-literal field). v1 accepts a flat all-required object of enum/boolean fields and
+refuses anything else by name.
 
 `XWEN_BATCH_NO_CACHE=1` runs every item from a reset cache — the A/B lever for what the
 snapshot saves (35B demo: 1203 ms cached vs 1989 ms cold). The two arms decode the same
@@ -169,6 +180,13 @@ prefix cache stays bound to the default checkpoint; the other checkpoint runs wi
 it. A requested checkpoint (or its drafter) missing from the HF cache is downloaded
 inside the request — a one-line notice in the server log; hf-hub's byte-level progress
 bar goes to raw stderr, so under `--tui` it draws over the dashboard (TODO.md).
+
+Request bodies are capped at 100 MB (real cost is judged in tokens by the queue and
+`context_length`, not in bytes). `context_length` — default: the checkpoint's trained
+256k window — is a ceiling, not an allocation: the KV cache starts at 8k positions and
+grows on demand as a conversation lengthens, and an idle unload drops whatever it grew
+to, so the next load starts small again. The one-shot CLI commands' `--max-ctx` works
+the same way and defaults to 131072.
 
 The default bind is loopback because with no `api_key` the server accepts every request;
 set `host = "0.0.0.0"` (or `--host`) together with an `api_key` to serve the LAN.

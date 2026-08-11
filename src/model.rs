@@ -17,10 +17,23 @@ use crate::ops::ExpertRunner;
 use crate::rope::Rope;
 use crate::stack_profile::Stage;
 
-/// Warn at load if the resident footprint (weights mmap-uploaded to the device
-/// plus the preallocated KV cache) exceeds this. The Q4_K_M checkpoint is ~70GB
-/// on its own, so this only fires on an over-large `--max-ctx`.
+/// Warn at load if the worst-case resident footprint (weights mmap-uploaded to
+/// the device plus the KV cache grown to its `max_ctx` ceiling) exceeds this.
+/// The Q4_K_M checkpoints are 19-20GB and the largest blessed file (27B Q8_0)
+/// 28.6GB, with a 17GB KV ceiling at the 27B's full 256k window — so this
+/// fires only on a `--max-ctx` far past anything the checkpoints support.
 const MEMORY_WARN_BYTES: u64 = 90 * 1024 * 1024 * 1024;
+
+/// Initial full-attention KV allocation, in positions. `max_ctx` is a CEILING,
+/// not an allocation: each full-attention layer starts at this many slots
+/// (or `max_ctx`, if smaller) and doubles on demand as a sequence grows into
+/// it (`grow_kv_capacity`), so a 128k+ context budget costs memory only when a
+/// conversation actually reaches it — and costs it only until the model is
+/// dropped, which is what shrinks a grown cache back down (the serve engine's
+/// idle unload rides this). 8192 positions are 0.5 GiB across the 27B's 16
+/// full layers (64 KiB/token, `Model::kv_bytes_per_token`) and 0.16 GiB
+/// across the 35B's 10 (20 KiB/token).
+const KV_INITIAL_CTX: usize = 8192;
 
 /// The per-layer FFN: a plain SwiGLU MLP on the dense checkpoint, the
 /// softmax-routed MoE block (routed experts + gated shared expert) on the MoE
@@ -93,6 +106,10 @@ pub struct XwenModel {
     /// XWEN_ATTN_DEQUANT).
     attn_decode: &'static str,
     max_ctx: usize,
+    /// Positions every full-attention layer currently has allocated — the lazy
+    /// KV allocation's high-water mark, `KV_INITIAL_CTX` at load and grown in
+    /// lockstep by `grow_kv_capacity` up to the `max_ctx` ceiling.
+    kv_slots: usize,
     tap_enabled: bool,
     taps: Vec<(String, Tensor)>,
     /// DFlash spec-decode residual-stream taps: the `l_out` layer indices the
@@ -180,6 +197,7 @@ impl XwenModel {
             embed.to_dtype(DType::F32)?
         };
 
+        let kv_slots = max_ctx.min(KV_INITIAL_CTX);
         let mut layers = Vec::with_capacity(cfg.n_layer);
         let mut caches = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {
@@ -202,7 +220,7 @@ impl XwenModel {
                 ffn_norm: lw.rms_norm("post_attention_norm", cfg.rms_eps)?,
                 ffn,
             });
-            caches.push(LayerCache::new(&cfg, il, max_ctx, &device)?);
+            caches.push(LayerCache::new(&cfg, il, kv_slots, &device)?);
         }
 
         // Attention decode-projection path, for dump provenance. XWEN_ATTN_F32
@@ -232,7 +250,7 @@ impl XwenModel {
         if let Some(src) = gguf.mmap_source() {
             src.register_views();
         }
-        warn_if_over_budget(&gguf, &cfg, max_ctx);
+        warn_if_over_budget(&gguf, &cfg, kv_slots, max_ctx);
 
         Ok(Self {
             cfg,
@@ -248,6 +266,7 @@ impl XwenModel {
             attn_mm,
             attn_decode,
             max_ctx,
+            kv_slots,
             tap_enabled: false,
             taps: Vec::new(),
             spec_tap_layers: None,
@@ -317,6 +336,7 @@ impl XwenModel {
              (raise --max-ctx or shorten the prompt)",
             self.max_ctx
         );
+        self.grow_kv_capacity(pos + seq)?;
 
         // Per-stage timing hooks (`XWEN_STACK_PROFILE`). Off — the normal case —
         // each is one `Option` check; on, each brackets its stage with device
@@ -796,6 +816,9 @@ impl XwenModel {
             "import_full_kv: pos {pos} exceeds max_ctx {}",
             self.max_ctx
         );
+        // A paged-in conversation can be longer than anything this instance has
+        // run yet, so the import grows the buffers exactly as a prefill would.
+        self.grow_kv_capacity(pos)?;
         crate::kv_cache::import_full_kv_into(&mut self.caches, image, pos)
     }
 
@@ -803,6 +826,46 @@ impl XwenModel {
         for cache in &mut self.caches {
             cache.reset()?;
         }
+        Ok(())
+    }
+
+    /// Grow every full-attention layer to hold at least `needed` positions,
+    /// `max_ctx` staying the hard ceiling (the callers' own overflow checks run
+    /// first, so hitting the ceiling here is a bug, not a user error). Growth is
+    /// lockstep across layers and monotonic for the model's lifetime — nothing
+    /// shrinks a cache but dropping the model — and each step is logged because
+    /// it is a real memory event the operator sized the machine around.
+    ///
+    /// An allocation failure partway (a device OOM growing toward a large
+    /// ceiling) leaves some layers grown and others not, and that state is
+    /// SAFE: `kv_slots` is only advanced after every layer succeeded, each
+    /// layer's own `ensure_full_capacity` re-checks its real allocation and is
+    /// idempotent, so a retried forward re-runs the growth and converges —
+    /// already-grown layers no-op, the failed one retries.
+    fn grow_kv_capacity(&mut self, needed: usize) -> Result<()> {
+        if needed <= self.kv_slots {
+            return Ok(());
+        }
+        let mut grown = self.kv_slots;
+        for cache in &mut self.caches {
+            grown = grown.max(cache.ensure_full_capacity(needed, self.max_ctx)?);
+        }
+        // Candle's Metal pool frees dropped buffers only at a device sync, so
+        // without one every layer's OLD allocation stays resident beside its
+        // replacement until whenever the next sync happens to run — ~1.5x the
+        // new KV size at the top doubling step. Growth is rare (O(log) per
+        // lifetime), so one sync here is cheap and bounds the peak; it also
+        // waits for the copy blits above, which it must anyway.
+        if let Device::Metal(mdev) = &self.device {
+            mdev.wait_until_completed()?;
+        }
+        self.kv_slots = grown.max(needed);
+        crate::host_log::host_line(format!(
+            "xwen: KV cache grew to {} of {} positions ({:.1}GB)",
+            self.kv_slots,
+            self.max_ctx,
+            gb(kv_bytes(&self.cfg, self.kv_slots)),
+        ));
         Ok(())
     }
 
@@ -827,10 +890,24 @@ fn order_spec_taps(config: &[usize], captured: Vec<(usize, Tensor)>) -> Vec<Tens
         .collect()
 }
 
-/// Sum the resident bytes (weights + KV cache + recurrent state) and warn if it
-/// clears the budget. Only full-attention layers preallocate to `max_ctx`; a
-/// DeltaNet layer's state is a fixed few MiB whatever the context length.
-fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, max_ctx: usize) {
+/// KV bytes at `slots` allocated positions: k and v, f16 (2 bytes),
+/// `[n_kv_head, slots, head_dim]` per full-attention layer. A DeltaNet layer
+/// has no K/V.
+fn kv_bytes(cfg: &XwenConfig, slots: usize) -> u64 {
+    let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
+    n_full * 2 * cfg.n_kv_head as u64 * slots as u64 * cfg.head_dim as u64 * 2
+}
+
+fn gb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Sum the resident bytes (weights + KV cache + recurrent state), say what the
+/// KV can grow to, and warn if the worst case clears the budget. Only
+/// full-attention layers hold context-scaled state, and they allocate lazily
+/// (`grow_kv_capacity`), so what is resident at load is the initial allocation;
+/// `max_ctx` is the ceiling a long conversation can grow it to.
+fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_ctx: usize) {
     let weight_bytes: u64 = gguf
         .content
         .tensor_infos
@@ -842,11 +919,8 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, max_ctx: usize) {
         })
         .sum();
 
-    let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
-    // k and v, f16 (2 bytes), [n_kv_head, max_ctx, head_dim] per full layer.
-    let kv_bytes = n_full * 2 * cfg.n_kv_head as u64 * max_ctx as u64 * cfg.head_dim as u64 * 2;
-
     // Conv window + delta state, f32, per DeltaNet layer — context-independent.
+    let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
     let n_linear = cfg.n_layer as u64 - n_full;
     let hd = cfg.linear_head_dim as u64;
     let state_bytes = n_linear
@@ -854,19 +928,21 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, max_ctx: usize) {
         * ((cfg.conv_kernel as u64 - 1) * cfg.conv_dim() as u64
             + cfg.linear_v_heads as u64 * hd * hd);
 
-    let total = weight_bytes + kv_bytes + state_bytes;
-    let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let total = weight_bytes + kv_bytes(cfg, kv_slots) + state_bytes;
+    let ceiling = weight_bytes + kv_bytes(cfg, max_ctx) + state_bytes;
     crate::host_log::host_line(format!(
-        "xwen: weights {:.1}GB + KV {:.1}GB + state {:.1}GB = {:.1}GB resident (max_ctx {max_ctx})",
+        "xwen: weights {:.1}GB + KV {:.1}GB + state {:.1}GB = {:.1}GB resident \
+         (KV grows to {:.1}GB at max_ctx {max_ctx})",
         gb(weight_bytes),
-        gb(kv_bytes),
+        gb(kv_bytes(cfg, kv_slots)),
         gb(state_bytes),
-        gb(total)
+        gb(total),
+        gb(kv_bytes(cfg, max_ctx)),
     ));
-    if total > MEMORY_WARN_BYTES {
+    if ceiling > MEMORY_WARN_BYTES {
         crate::host_log::host_line(format!(
-            "xwen: WARNING resident footprint {:.1}GB exceeds {:.0}GB budget",
-            gb(total),
+            "xwen: WARNING footprint can reach {:.1}GB at full context, over the {:.0}GB budget",
+            gb(ceiling),
             gb(MEMORY_WARN_BYTES)
         ));
     }

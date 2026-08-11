@@ -1193,16 +1193,29 @@ deliberately did not carry.
   class needs); it wants a fixture batch with a long shared prefix and enough items to
   make one near-tie likely. Until then a regression in the restore path would be caught
   only by someone running the demo.
-- [ ] **`escape` is opener-level and formatting-confounded for bare literals.** It is the
-  mass on tokens that open no option at the field's first choice-point token. For a
-  quoted enum the forced opening quote filters formatting out and the number is
-  meaningful; for a boolean, whose choice point sits after `:`, whitespace tokens a
-  pretty-printer would emit compete with `true`/`false` and the escape reads near 1 while
-  the answer is near-certain — observed at 0.998 escape beside a 0.9986 answer score. Two
-  candidate refinements: whitespace-normalize the opener set (cheap, narrow), or make the
-  escape sequence-level rather than opener-level (correct, but needs a bound on the
-  non-option continuation space). Do not act on the current number for bare literals; it
-  is documented on the field.
+- [x] **`escape` is opener-level and formatting-confounded for bare literals — DONE
+  2026-08-11.** Forced by the first external client (multi-field first fields pinned at
+  0.999-1.000, mean escape stuck at 1/fieldCount; their one-token-early hypothesis was
+  checked and refuted — the mass was ` true`/` false`, the answer in space-led
+  spelling). Shipped as the first candidate refinement grown to the whole row:
+  `escape_mass` classifies every encodable id by decoded text (whitespace-stripped for
+  unquoted fields, verbatim for quoted; pure-whitespace tokens excluded and
+  renormalized away), via `Generator::last_probs` + `LagunaTokenizer::decoded_vocab`.
+  First-field escape 0.9999 → 0.00197 measured, scores bit-identical. The
+  sequence-level escape (the second candidate) remains unbuilt and unneeded so far.
+  decisions.md "Batch" (2026-08-11) has the full story.
+- [ ] **Scored-field probabilities are conditional on the compact skeleton, and the
+  formatting channels disagree on near-ties.** The 2026-08-11 row dump behind the
+  escape fix shows the first boolean slot at ` true` 54.9% / ` false` 44.9%
+  (space-led spellings) while the bare-token channel the teacher-forced skeleton
+  actually scores through reads true 0.444 / false 0.556 — the two channels pick
+  OPPOSITE winners on this near-tie. Away from ties they agree (spam field: 0.998
+  false both ways), and the scores' renormalization argument ("formatting divides
+  out") holds only when format preference is independent of the value, which this
+  measurement shows it is not exactly. Candidate refinement: also score each option
+  through its space-led single-token spelling and sum the channels; interacts with
+  check_seams and the terminator rule. Do not treat a scored near-tie (|p−0.5| small
+  on a boolean) as a confident answer; the escape fix does not change this.
 - [ ] **v1's scored-schema limits are refusals, and each has a known lift.** The shape
   guard accepts a flat all-required object of enum/boolean fields and refuses everything
   else by name. Four separable extensions, in rough order of value: (1) values that merge
@@ -1337,11 +1350,12 @@ decisions.md "Serving"). These are the pieces deliberately not carried.
   tokens in the demo), so the exposure is bounded by one item's latency plus one
   prefill — thread the poll through `assemble_scored` and the prefill chunk loop only
   if a real workload makes either span long enough to care.
-- [ ] **The batch route inherits axum's default request-body limit (~2 MB).** The
-  endpoint's contract is "the same document the CLI reads on stdin", but the CLI has
-  no size limit and the route silently does — an oversized batch gets a framework 413
-  that is not in the native error envelope. Decide a deliberate limit (and error
-  shape) when a real batch first trips it; document it either way.
+- [x] **The batch route inherits axum's default request-body limit (~2 MB) — DONE
+  2026-08-11.** A real batch tripped it (a 377 KB story split one batch into 14
+  POSTs), which is exactly the condition this item deferred on. Now an explicit
+  100 MB `DefaultBodyLimit` over the whole API router; the 413 stays the framework's
+  (still not the native envelope — accepted, a client at 100 MB has bigger problems).
+  decisions.md "Serving", log.md 2026-08-11 client-feedback entry.
 - [ ] **The batch scheduling estimate is bytes-based and can read zero.** A batch of
   items with empty message content (schema-only probes) estimates zero prompt tokens
   and schedules as free; the real cost floor is the rendered template per item. Fold a
@@ -1365,3 +1379,46 @@ decisions.md "Serving"). These are the pieces deliberately not carried.
   same-checkpoint work without starving the other (the age limit already guards
   starvation). Do it when a real workload actually interleaves checkpoints; a
   single-user machine mostly will not.
+
+## Deferred from the client-feedback arc (2026-08-11)
+
+The escape fix, `shared_prefix`, the 100 MB body cap and lazy KV / the 131072 CLI
+default shipped (log.md 2026-08-11 client-feedback entry; decisions.md "Batch",
+"Serving", "Defaults and CLI surface"). What the arc deliberately did not do:
+
+- [ ] **The 128k operational envelope is unmeasured, and four constants were sized at
+  8192.** Every perf figure in CLAUDE.md is at max_ctx 8192; raising the default makes
+  long contexts REACHABLE, not characterized. Known pressure points, none touched by
+  the lazy-KV change itself: (a) the prefill mask is sized by absolute position, not
+  max_ctx — `PrefillMask::from_host` materializes `[1, n_head, seq, pos+seq]` f16 per
+  512-token chunk, ~3.0 GiB transient at position 128k on the 27B (2.0 on the 35B)
+  plus an f32 host Vec filled by a scalar double loop (~8.6e9 stores over a full 128k
+  prefill) — this, not KV, is the binding cost of long prefill; (b)
+  `DEFAULT_QUEUE_TIMEOUT_SECS` = 300 while a 128k 27B prefill is 187-295 s at the
+  measured 445-702 tok/s, so one long prefill can push a queued request into the
+  saturation drop; (c) `DISK_FLUSH_GRACE` = 25 s was sized on a ~4.2 GiB / ~5 s page-out
+  image, while a 128k 27B conversation images at ~8 GiB; (d) the drafter's
+  `draft_ctx` = 8192 horizon means speculation covers the first 6% of a 131072
+  conversation and goes plain past it with no log line — the shipped drafted tok/s
+  figures describe conversations inside that window only; (e) only the serve path
+  clamps `context_length` to the checkpoint's `n_ctx_train`
+  (`resolve_context_length`) — the CLI's `--max-ctx` never consults it, harmless for
+  the 262144-window blessed files but silently past-window for a checkpoint converted
+  smaller. Measure a real long-context workload before trusting (a)-(d); none matters
+  at yesterday's 8192.
+- [ ] **Lazy KV moves the unaffordable-`max_ctx` failure from load time to
+  mid-conversation.** Eager allocation failed fast at load; now the same misconfigured
+  server starts fine and hits the allocation error at whatever depth exhausts the
+  device — a growth step failing mid-request surfaces as that request's error (the
+  state is safe and retries converge, `grow_kv_capacity`'s doc). `MEMORY_WARN_BYTES`
+  (90 GiB) never fires for any blessed file even at the 262144 ceiling, so the warning
+  is not the guard here. If this ever bites, the fix is a load-time advisory line
+  ("ceiling X GiB exceeds device memory Y") rather than a return to eager allocation.
+- [ ] **100 MB bodies are buffered with no concurrency bound.** The batch handler
+  buffers and serde-parses the whole body (typically 2-5x the text in tree form)
+  BEFORE `submit_batch` can answer 429, and nothing caps concurrent connections — N
+  clients can each hold ~100 MB + parse tree against 19-37 GB of resident weights.
+  Accepted for now: the default bind is loopback on a single-user machine, and the
+  compat dialects never need large bodies. If the server ever fronts a LAN under
+  `api_key`, add a concurrency-limit layer (or move the cap per-route: 100 MB for
+  `/xwen/v1/batch`, default for the dialects) before raising anything else.
