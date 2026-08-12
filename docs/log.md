@@ -4,7 +4,74 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-08-11 (latest) — First client feedback lands: the scored-field escape stops lying about first fields, `shared_prefix` collapses 14 POSTs into one, the body cap goes to 100 MB, and max_ctx becomes a ceiling (lazy KV, 128k CLI default)
+## 2026-08-12 (latest) — The client's residual first-field escape report is reproduced and confirmed as conditioning signal: it follows position, not field identity, and the outside mass is almost entirely the answer in another spelling or a plausible alternative shape. No code change.
+
+**Where it came from.** The escape-fix consumer graded 2e2280b: the 0.999 pin is gone
+(their first-field median now 0.0015, in the expected range), but the first boolean
+field of every multi-field item still reads 50-88× hotter on escape than its siblings
+(their max 0.032 vs ~1e-5 later) — and since "first field" is whatever their TOML lists
+first, it inflates per-category mean escape unevenly. They flagged it as a possible
+position bias at the document's first choice point.
+
+**Reproduced with the same instrument that settled the original bug** — a temporary
+row dump at the exact `score_field` read (reverted after; scoring path untouched).
+Three items, five boolean fields each, `include_score: "all"`, 505-token shared rubric
+prefix, 35B-A3B default model, greedy. Items 1 and 2 classify a byte-identical email
+and differ ONLY in field order (first two fields swapped) — the position-vs-identity
+control the client's data can't run.
+
+**It follows position, decisively.** No-think field-0 escapes: 0.0114 / 0.0349 /
+0.0102; every later field 3.6e-6 to 1.7e-4. In the byte-identical-email control
+(items 1 vs 2): swapping `urgent` out of slot 0 drops it 152× (0.0114 → 7.5e-5),
+swapping `spam` in raises it 311× (1.1e-4 → 0.0349, just above the client's 0.032
+max) — same email, same rubric, same options, only the order moved. Item 3, a
+different email with item 1's order, independently repeats the shape (`urgent` 0.0102
+at slot 0, `spam` 4.2e-5 at slot 1). The hot slot moved with the order, not the name.
+
+**The outside mass is exactly what the 2026-08-11 entry said it was.** At every
+field-0 read the top eight outside tokens carry 99.3-99.7% of the outside mass in the
+no-think run (90-99.9% with thinking) and they are all plausible openers: ` "` dominates (52-73% of outside — a quoted string where a boolean
+belongs), then ` True`/` False` (25-46% — the ANSWER in Python capitalization, which
+would invalidate the JSON and honestly counts outside), then traces of ` {"`, ` [`,
+` null`. Nothing diffuse, nothing unrelated. The contrast that is the whole mechanism (item 1's
+numbers; the shape repeats on all three):
+field 0's argmax is ` true` at 0.986 (space-led, INSIDE) with bare `true` at 0.0024;
+by field 1 one compact `"k":v,` exists and bare `false` reads 0.9995 with the entire
+outside class at 1.1e-4. Style unpinned at the first choice point, fully pinned by the
+second — the 0.00197-vs-0.000051 repro pair from the fix, now at a second data point
+with a different schema.
+
+**The thinking path is exonerated, and thinking amplifies the signal.** The 2026-08-11
+entry's standing suspect for field-0 anomalies (the `held` reasoning-tail
+reconciliation, the one genuinely field-0-specific shape in the assembly loop) is
+cleared two ways: the no-think run has no reasoning tail and shows the full elevation;
+and with `thinking: true` (needs budget — max_tokens 1200 refuses because the
+reasoning block can't close, 6000 runs) field-0 escape rises to 0.042-0.109 (three
+raw per-item values, not an aggregate; 35B only) while
+later fields stay ≤1.1e-4, with ` "` still 71-99% of outside. After 5-6 KB of prose
+reasoning the model is LESS committed to the compact skeleton's style — the same
+signal reading louder, not a defect.
+
+**Verdict passed back to the client.** Not an xwen bug; a real property of the
+measurement they can either embrace or column-split (their with/without-first-field
+columns are the right call). One nuance ledgered as a candidate refinement: much of
+the outside mass everywhere is format drift of the same answer, not value
+disagreement — space-led ` True`/` False` are 25-46% of field-0 outside mass, and
+bare `True`/`False` are 28-87% of the (much smaller) later-field outside — so escape
+overstates value-level disagreement wherever it is large enough to matter, which
+today means first fields.
+
+**Client follow-up, same day.** Their data reproduces the think-vs-plain field-0
+elevation on MEDIANS (4.7× on the 35B, 1.5× on the 27B) but not on means: the 27B's
+no-think arm is heavy-tailed (max 0.109 — reaching without thinking what the 35B
+needed thinking for; we never ran the 27B). Our per-item think/plain ratios
+(9.2/3.1/4.1×) median to ~4.1×, corroborating their 35B figure. Their report records
+medians as the figure to read; agreed — n=3 here says nothing about tails. Dump logs kept in the session scratchpad; working tree
+verified clean after the revert. The 2e2280b parity-gate run is STILL pending — the
+GPU was left free for the client's own benchmark runs (contended prefill reads 3× low;
+see "Benching rules").
+
+## 2026-08-11 — First client feedback lands: the scored-field escape stops lying about first fields, `shared_prefix` collapses 14 POSTs into one, the body cap goes to 100 MB, and max_ctx becomes a ceiling (lazy KV, 128k CLI default)
 
 **Where it came from.** The first external consumer of `/xwen/v1/batch`'s scored path
 reported two things and asked for a third. The bug report: on `include_score: "all"`

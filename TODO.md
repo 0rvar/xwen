@@ -1216,6 +1216,21 @@ deliberately did not carry.
   through its space-led single-token spelling and sum the channels; interacts with
   check_seams and the terminator rule. Do not treat a scored near-tie (|p−0.5| small
   on a boolean) as a confident answer; the escape fix does not change this.
+- [ ] **`escape` conflates value disagreement with format drift, materially so at
+  first fields; a split is a candidate refinement.** The 2026-08-12 confirmation dump
+  (log.md) shows 25-46% of the no-think field-0 outside mass is ` True`/` False` — the
+  chosen answer in a spelling that would invalidate the JSON — and bare `True`/`False`
+  are 28-87% of later fields' outside mass, so the mixture is everywhere, not a
+  first-field artifact. Classifying these OUTSIDE is correct (the assembler would
+  never emit them), but escape therefore overstates value-level disagreement wherever
+  it is read, and first fields are where its absolute magnitude (1e-2 vs 1e-5) makes
+  that material. Candidate: report escape's top outside
+  components, or split it into value-escape (bytes that prefix no option under ANY
+  casing/spelling equivalence) vs format-drift (an option's bytes under a
+  non-canonical spelling). The equivalence class is the hard part — it interacts with
+  the channel-summing refinement one item up, and both should be derived together if
+  either ships. Until then the README definition stands and consumers should compare
+  escape across categories with and without first fields.
 - [ ] **v1's scored-schema limits are refusals, and each has a known lift.** The shape
   guard accepts a flat all-required object of enum/boolean fields and refuses everything
   else by name. Four separable extensions, in rough order of value: (1) values that merge

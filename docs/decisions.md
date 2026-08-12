@@ -1011,6 +1011,14 @@ string where a boolean belongs); scores are untouched by construction (they neve
 the classification) and verified bit-identical. Costs one ~248k-entry vocab walk
 cached per tokenizer plus one full-row softmax readback per field
 (`Generator::last_probs`, normalized by the same code path as the scores) (2026-08-11).
+The residual first-field elevation (absolute 0.010-0.035 without thinking, 0.042-0.109
+with, against later fields at 4.3e-7 to 1.7e-4 — 35B measurements; the client's 27B
+data tails higher, max 0.109 without thinking) was re-reported by the client post-fix and
+confirmed by a position-vs-identity controlled row dump: it follows document position,
+not field identity, and its mass is concentrated on plausible alternative openers —
+mostly ` "` and the space-led capitalized booleans. It is conditioning signal, kept
+as-is; consumers comparing escape across categories should aggregate with and without
+first fields (2026-08-12, log.md same date).
 
 **`shared_prefix` is a wire-size field, deliberately NOT a prefill feature.** The
 runner has prefilled the items' shared TOKEN prefix once since batch shipped; what
