@@ -88,9 +88,17 @@ if (flag("help") || args.includes("-h")) {
   process.exit(0);
 }
 
+/** This script's short names, and the full names the API selects a checkpoint
+ *  by — the wire takes only the latter, while the reports below stay readable
+ *  in the short ones. */
+const API_NAME: Record<string, string> = {
+  "35b": "Qwen3.6-35B-A3B",
+  "27b": "Qwen3.6-27B",
+};
+
 const only = opt("model", "");
-if (only && only !== "35b" && only !== "27b") {
-  console.error(`unknown --model ${only}; expected 35b or 27b`);
+if (only && !(only in API_NAME)) {
+  console.error(`unknown --model ${only}; expected ${Object.keys(API_NAME).join(" or ")}`);
   process.exit(2);
 }
 const models = only ? [only] : ["35b", "27b"];
@@ -365,7 +373,8 @@ function scaffoldFor(t: Taxonomy): string {
 
 function buildRequest(model: string) {
   return {
-    model,
+    // The API selects by full name only; `model` is this script's short one.
+    model: API_NAME[model],
     defaults: {
       max_tokens: 64,
       sampling: { temperature: 0 },

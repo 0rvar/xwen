@@ -345,7 +345,7 @@ mod tests {
                     dialect: Dialect::Anthropic,
                     streaming: true,
                 },
-                model: crate::hub::Model::default(),
+                model: crate::serve::types::Target::official(crate::hub::Model::default()),
                 prompt,
                 boundary: 0,
                 anchor: None,
@@ -828,14 +828,14 @@ mod tests {
         let now = Instant::now();
         let (mut long_other, _ra) = entry(vec![1; 100], Duration::from_secs(1), now);
         if let Job::Generation(job) = &mut long_other.job {
-            job.model = crate::hub::Model::Qwen27B;
+            job.model = crate::serve::types::Target::official(crate::hub::Model::Qwen27B);
         }
         let (short_resident, _rb) = entry(vec![2; 40], Duration::from_secs(1), now);
         let mut queue = vec![long_other, short_resident];
         // The resident checkpoint is the default (35B); the 27B job's prefix
         // would match 95 tokens IF its checkpoint were loaded — the model
         // check is what must keep that discount from applying.
-        let resident = crate::hub::Model::default();
+        let resident = crate::serve::types::Target::official(crate::hub::Model::default());
         let hot = |job: &Job| {
             if job.model() == resident && !job.prompt().is_empty() && job.prompt()[0] == 1 {
                 95

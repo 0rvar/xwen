@@ -4,7 +4,210 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-08-12 (latest) — The client's residual first-field escape report is reproduced and confirmed as conditioning signal: it follows position, not field identity, and the outside mass is almost entirely the answer in another spelling or a plausible alternative shape. No code change.
+## 2026-08-14 (latest, same arc) — Review round: a job now names a FILE, not just a checkpoint; drafting is resolved per checkpoint; a contradicting `--model-size` fails at startup
+
+Two reviews (Claude and Codex/gpt-5.6-sol) of the entry below found one shared root
+behind most of their findings: the arc had introduced a second kind of model identity
+(the served file's own id) without giving the engine a way to represent it. Everything
+here follows from fixing that.
+
+**A job now names a `Target` — a checkpoint plus "is this the served file" — instead of
+a bare `Model`.** On a server started with a GGUF that identifies as none of the official
+checkpoints, the official checkpoint of the same architecture is a DIFFERENT FILE with
+the same name for sizing, and `Model` alone could not say which was meant. The
+consequences the reviewers found, all now fixed: `checkpoint_paths` short-circuited to
+the served file whenever `size == default_size`, so an official name was answered by
+unchecked weights; the id `/v1/models` advertised for a custom GGUF was refused by the
+resolver that was supposed to accept it (400 on the one id it published); and the batch
+handler labeled such a run with the arch-fallback's full name, so the response document
+claimed official weights had run. Equality on `Target` is file identity, which is also
+what the engine's swap check and the disk tier's binding actually wanted — the tier is
+bound to `settings.model`, not to a checkpoint id, and now compares as such.
+
+**`--model-size` is a tie-break, not an override.** It settled a file that identifies as
+nothing; against a file that identifies itself it silently won and then made
+`EngineState::load`'s own checks fail on every request — a server that starts clean and
+500s forever. It is now a startup error naming both sides, and must also agree with the
+architecture. The load-time checks stay as a backstop for a file that changed under a
+running server.
+
+**Drafting is per checkpoint (promoted from a ledger item).** `ServeSettings.draft` was
+one resolved `Option<PathBuf>`, so a server whose DEFAULT checkpoint ships no sidecar ran
+every other checkpoint plain as well — invisibly, and worth -46 to -52% on the 27B. It is
+now a `DraftMode` (`Off` / `Official` / `Custom`), resolved when each checkpoint loads.
+The TUI's drafting cell follows the loaded checkpoint rather than the setting, for the
+same reason. `xwen serve --draft official` on a sidecar-less checkpoint now errors like
+the one-shot commands do instead of degrading quietly.
+
+**`identify`'s file-name branch was dead code, and its live half was too loose.** It
+matched `Path::file_name` (extension included) against full names, so nothing ever
+matched exactly and only a bare `3.6`/`3.8` substring test fired — which would have
+identified `My-Qwen3.6-14B-finetune.gguf` as the official 27B. File names are now matched
+on the full name as a case-insensitive substring of the STEM, the loose release-substring
+pass is kept only for `general.name` (which the converter wrote about the model it
+holds), and a name matching more than one checkpoint identifies as none rather than as
+whichever the table lists first.
+
+**Also fixed:** `/v1/messages/count_tokens` ignored its `model` field, which made the
+"every surface refuses an unknown model" claim false — it validates now (the count itself
+is checkpoint-independent, since every checkpoint shares a tokenizer);
+`retune-draft.ts --dry-run` printed `--draft-p-min undefined` for a sidecar-less
+checkpoint because the drafter guard sat after the dry-run early return, and
+`SHIPPED_P_MIN` is now `Partial` with a checked accessor rather than a `Record` missing a
+key; two tests named `..._echoed_verbatim` asserted strings that can no longer reach
+`prepare`, and now pin the real contract; the fallback drafting floor's comments stop
+calling the 35B's fitted 0.3 "the shared base" and say what it is.
+
+**New tests.** The dialect handlers are now driven directly (`#[tokio::test]` over
+`probe_state`): an SDK id and both CLI aliases 400 in each dialect's own envelope with
+every valid name in the message, nothing reaches the queue, a case-insensitive full name
+does reach it as the right `Target`, and `count_tokens` behaves the same. `identify` gains
+the blessed stems, an ambiguous name, and `My-Qwen3.6-14B-finetune.gguf`. `/v1/models`'s
+test now validates EVERY listed id through the resolver, first entry included — the entry
+it previously skipped is exactly where the custom-GGUF bug lived. One trap worth
+recording: a non-streaming handler test hangs forever against a probe queue (the handler
+waits for engine events that never come), so the servable-model case asks for a stream,
+which returns as soon as the job is queued.
+
+**Second pass over the same round.** A verification pass confirmed the ten findings above
+closed and found four more, two of them introduced by the fixes themselves — worth
+recording, because both were the same mistake in different clothes: a rule stated in a
+comment and not checked anywhere.
+
+**The dashboard's drafting cell was pinned OFF on every drafting server.** The cell was
+made to follow the loaded checkpoint by clearing on `ModelLoaded` and setting on
+`DrafterLoaded` — but `DrafterLoaded` is emitted from `attach_drafter` INSIDE
+`EngineState::load` while `ModelLoaded` is emitted after that load returns, so the
+clearing arm always ran last. Confirmed in a live log: `drafter loaded in 0.5s` then
+`model loaded in 4.0s`. The fix does not reorder the engine (that timing is
+`ModelLoaded`'s meaning): the cell is now decided only by the two drafter events and RESET
+by the events that end a residency (`CheckpointSwappingOut`, `IdleUnloaded`), falling back
+to a new `draft_configured` when nothing is loaded. Ordering-independent by construction.
+The old test fed the events in an order the engine never produces and asserted nothing
+about the cell; the new one feeds the real order through a full swap cycle and asserts the
+rendered header at each step.
+
+**The served checkpoint's official sidecar lost its startup preflight** when `validate_model`
+was narrowed to custom drafters — reintroducing exactly the 500-per-request class this
+round set out to kill, because "official" does not mean "fits": a custom GGUF served as
+its architecture's checkpoint gets that checkpoint's sidecar. Startup now judges the
+served target's official sidecar too (offline, from what the CLI's prefetch left in the
+cache); other checkpoints keep attach-time checking, since their sidecars may not be
+downloaded yet. Verified by manufacturing the case — an APFS clone of the 27B with
+`general.name` blanked to `mymodel-27x` and `embedding_length` patched 5120 → 4096 — which
+now refuses at startup with `the drafter has a hidden size of 5120 but the target has
+4096` instead of starting and failing every request. The old test claimed to pin this and
+only exercised `check_against_target` as a pure function; it now drives `validate_model`
+itself, alongside a test of which drafter startup selects in each mode.
+
+**`general.name`'s loose matching went too.** It kept a bare release-substring pass
+("3.6"/"3.8") that the file-name pass had already been tightened away from — and since
+`Arch::Moe` has exactly one candidate, no ambiguity check could save `MyMoE-3.6` from
+becoming `Qwen3.6-35B-A3B` and answering official-name requests with unchecked weights.
+Both sources now use one rule: exact full name, or a whole full name found inside the
+name. The blessed files are unaffected (their `general.name` IS the exact full name,
+verified on all three).
+
+**Docs corrected where they had gone stale:** CLAUDE.md's cheat-sheet line and a
+decisions.md paragraph still described the old "explicit `--model-size` first" precedence;
+the flag is a cross-check that must agree with a file that identifies itself. The
+decisions.md paragraph carries a SUPERSEDED note per that file's convention. The batch
+label round-trip comment no longer claims a resubmit always works — it does not for a
+custom server's own id, which names no checkpoint.
+
+**Verification.** `cargo build --release`, `cargo fmt --check`, `cargo test --release`:
+873 passed, 0 failed. Live: the full swap cycle above (35B drafting → 3.8 plain → 35B
+drafting) with the event order captured; the manufactured preflight failure; and the serve
+checks in the entry below, re-run after these fixes. One limitation stated plainly: the
+TUI cell itself was verified through its rendering test (a real frame, asserting
+`draft ON`/`draft off`) plus the live event order, not by reading a live dashboard — a
+headless pty gives ratatui a zero-size terminal, so no frame text can be captured here.
+
+## 2026-08-14 — Qwen3.8-27B added as a registry entry (same graph, no drafter), and the APIs go to full model names only: `/v1/models` stops listing one checkpoint three ways and an unknown `model` is a 400 instead of a silent default
+
+**Two changes, one root.** Qwen3.8-27B released today; its `config.json` is
+byte-identical to Qwen3.6-27B's, so it is the same forward pass over different weights
+and needed no model math (the parity gate was deliberately not run: nothing it grades
+changed). Adding it broke two claims the code made. `Arch::model()`'s doc said the GGUF
+architecture identifies the checkpoint one-to-one — true until two releases shipped the
+same dense `qwen35` graph. And the model-name vocabulary, which had been the CLI's short
+aliases, could no longer be stretched: `27b` already meant 3.6 and a third checkpoint
+made the aliases a naming scheme rather than a shorthand.
+
+**What the old `/v1/models` actually returned**, from the server running on this machine
+while the work was underway: `Qwen3.6-35B-A3B-Q4_K_M` (the file stem), `27b`, `35b` —
+three ids for two checkpoints, one of them listed twice under two spellings. A client
+picking a `model` string from that listing is picking between two names for the same
+model. Alongside it, the compat dialects resolved an unrecognized `model` by falling
+back to the default, so an SDK's own id was answered indistinguishably from a correct
+request. Both are now one rule: the APIs speak `Model::full_name()` and nothing else —
+`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B`, the strings ggml-org names the repos
+with and the GGUFs carry as `general.name` — absent or empty still means the served
+checkpoint, and anything else is a 400 listing the valid names. `--model-size` keeps the
+aliases and now also takes full names, so an id from a listing pastes into the CLI.
+
+**The identification chain that replaced `arch.model()`**: explicit `--model-size`
+(threaded into `serve::run` as an `Option<Model>` so an explicit flag is distinguishable
+from the default), then `general.name`, then the file name, then `arch.model()` as the
+last resort with a logged warning naming what it assumed. Verified against the real
+files rather than assumed: the cached 3.6 GGUFs carry `general.name = "Qwen3.6-27B"` and
+`"Qwen3.6-35B-A3B"`, exactly the full names, which is why the first pass is an exact
+match with a substring pass behind it.
+
+**The drafter became optional, which was most of the diff.** Qwen3.8-27B ships no DFlash
+sidecar (the repo's MTP sidecar is unread — ledger item), so `Checkpoint.drafter` is now
+an `Option<Drafter>` holding file, size, layer count and fitted `p_min` together: a
+checkpoint either drafts or it does not, and no caller can ask half the question. Every
+consumer handles `None` by running plain with one line saying so — `ensure_drafter`,
+`resolve_draft`, `checkpoint_paths` (a new `ServeLog::NoDrafterAvailable`), `xwen fetch`
+(prints `drafter none`) — and `resolved_p_min` falls back to the shared base for the one
+path that can still attach a drafter to a sidecar-less checkpoint, a custom `--draft`.
+
+**Facts checked rather than trusted.** The tokenizer is NOT byte-identical between the
+releases: 3.8 adds seven audio/TTS specials at 248070-248076 over an identical base
+vocab (248044 entries) and merge table (247587), verified structurally after the blob
+hashes differed. Text tokenizes identically, so the embedded 3.6 tokenizer still ships
+and nothing was wired; whether a text-only checkpoint can emit those ids is a ledger
+item, not something to improvise a second 12.8 MB embed over. 3.8's chat template DOES
+differ (reasoning_effort preamble, `preserve_thinking` defaulting true, no inline
+`<think>` parsing) and is vendored as `reference/chat_template-qwen38.jinja`; its
+generation prompt is byte-identical to 3.6's, which is why the hand-written renderer is
+unchanged, and chat.rs now cross-checks both vendored templates so a future divergence
+fails a test instead of a reply.
+
+**Verification.** `cargo build --release` clean; `cargo test --release` 869 passed, 0
+failed (the two `unused_mut` warnings predate this work). The parity gate was not run and
+did not need to be: no model math changed.
+
+Qwen3.8-27B end to end, from an empty cache: `xwen fetch --model-size 3.8-27b` downloaded
+18,973,870,432 bytes (the published size) and printed `drafter none (Qwen3.8-27B ships no
+sidecar)`; a second run resolved from cache without a request. `xwen inspect` confirms
+what the registry entry claims — `general.name = "Qwen3.8-27B"` (the exact full name, so
+identification is an exact match rather than the substring fallback), `qwen35`, file_type
+15, rope sections [11,11,10,0], ssm 48/16/128/6144, conv_kernel 4, eos 248046 with
+`add_bos_token = false`, and all 16 `attn_output.weight` at Q6_K, which the loader parses
+and the Metal load accepts without a murmur. `xwen generate --model-size 3.8-27b`: 18.3 GB
+resident, 9.3 s cold load, the line `no drafter available for Qwen3.8-27B; decoding
+without speculation`, coherent answer, thinking block closed, stopped on an EOG id well
+inside the token budget. Plain decode measured **23.8 tok/s** (21-token prompt, 145
+tokens, single greedy run, cold-ish, machine shared with other work — one run, not a
+sweep; the 27B's plain figure is 24.8-25.3 under the 2026-08-08 protocol, which is the
+number to compare against, and both are plain).
+
+Serve, on a 35B-A3B default: `/v1/models` returns exactly
+`["Qwen3.6-35B-A3B", "Qwen3.6-27B", "Qwen3.8-27B"]` — the served one first, each once,
+against the three-ids-for-two-checkpoints listing the old binary was still returning on
+this machine. `"model": "35b"` → 400 in the OpenAI envelope, `"27b"` → 400 in the
+Anthropic envelope, `"gpt-4o"` → 400, `/xwen/v1/batch` `"35b"` → 400, every message
+listing the three valid names. `"Qwen3.6-35B-A3B"` → 200; `"qwen3.6-35b-a3b"` → 200
+(canonical echo); no `model` field → 200 echoing `Qwen3.6-35B-A3B`; batch with no field
+labels its response document with the full name too. On a 3.8-27B default the same
+listing leads with `Qwen3.8-27B`, startup logs `no drafter available for Qwen3.8-27B;
+serving without speculative decoding`, and a request naming `Qwen3.6-35B-A3B` swapped
+checkpoints and answered — the path where `EngineState::load`'s new architecture and
+identity checks run against a non-default checkpoint.
+
+## 2026-08-12 — The client's residual first-field escape report is reproduced and confirmed as conditioning signal: it follows position, not field identity, and the outside mass is almost entirely the answer in another spelling or a plausible alternative shape. No code change.
 
 **Where it came from.** The escape-fix consumer graded 2e2280b: the 0.999 pin is gone
 (their first-field median now 0.0015, in the expected range), but the first boolean

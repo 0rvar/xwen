@@ -15,7 +15,7 @@ use xwen::gguf;
 use xwen::hub::Model;
 use xwen::ops::ExpertRunner;
 use xwen::sampler::SamplerOptions;
-use xwen::serve::config::{CliOverrides, ServeToml};
+use xwen::serve::config::{CliOverrides, DraftMode, ServeToml};
 
 #[derive(Parser)]
 #[command(
@@ -36,14 +36,23 @@ struct Cli {
 /// Which official checkpoint to run.
 #[derive(Parser)]
 struct ModelArgs {
-    /// Which official Qwen 3.6 checkpoint to run: the dense 27B or the
-    /// 35B-A3B MoE. A `--model <gguf>` path overrides the target file
-    /// outright; for the one-shot commands this flag still selects the family
-    /// (and so the DFlash drafter sidecar), while `xwen serve` reads the
-    /// family from the GGUF itself and uses the flag only to pick the default
-    /// file when nothing else names one.
-    #[arg(long, value_name = "27b|35b", default_value_t = Model::default())]
-    model_size: Model,
+    /// Which official checkpoint to run: the dense Qwen3.6-27B, the
+    /// Qwen3.6-35B-A3B MoE (the default), or the dense Qwen3.8-27B. Each
+    /// checkpoint's full name works here too. A `--model <gguf>` path
+    /// overrides the target file outright; for the one-shot commands this flag
+    /// still selects the family (and so the DFlash drafter sidecar), while
+    /// `xwen serve` reads the family from the GGUF itself and uses the flag
+    /// only to pick the default file when nothing else names one — or to break
+    /// the tie when a custom dense GGUF does not say which release it is.
+    #[arg(long, value_name = "27b|35b|3.8-27b")]
+    model_size: Option<Model>,
+}
+
+impl ModelArgs {
+    /// The selected checkpoint, or the default when the flag was omitted.
+    fn size(&self) -> Model {
+        self.model_size.unwrap_or_default()
+    }
 }
 
 /// Shared sampling knobs (generation_config.json defaults: temp 1.0, top-p
@@ -118,12 +127,18 @@ struct DraftArgs {
 impl DraftArgs {
     /// `size` supplies the drafting floor for a run that did not pass
     /// `--draft-p-min`: it is fitted per checkpoint, so the flag's default
-    /// cannot live on the flag itself.
+    /// cannot live on the flag itself. A checkpoint that ships no sidecar has
+    /// no fitted floor either — only a custom `--draft` reaches this for one —
+    /// so that falls back to the shared base.
     fn params(&self, size: Model) -> SpecParams {
+        let base = SpecParams::default();
         SpecParams {
             draft_max: self.draft_max,
             draft_min: self.draft_min,
-            draft_p_min: self.draft_p_min.unwrap_or(size.draft_p_min_default()),
+            draft_p_min: self
+                .draft_p_min
+                .or_else(|| size.draft_p_min_default())
+                .unwrap_or(base.draft_p_min),
             pause_margin: self.draft_pause_margin,
         }
     }
@@ -537,38 +552,61 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     // Neither the CLI nor the config named a model: serve the hub-cached
     // official checkpoint. Injected into the CLI side of the merge (rather than
     // inside `resolve`) so config resolution itself stays pure and testable.
-    let size = args.select.model_size;
+    let selected = args.select.model_size;
     let mut overrides = args.overrides();
     if overrides.model.is_none() && file.model.is_none() {
-        overrides.model = Some(resolve_model(None, size)?);
+        overrides.model = Some(resolve_model(None, args.select.size())?);
     }
 
-    let (mut settings, warnings) = xwen::serve::config::resolve(&file, source, &overrides)?;
+    let (settings, warnings) = xwen::serve::config::resolve(&file, source, &overrides)?;
     for warning in &warnings {
         eprintln!("{warning}");
     }
     if !settings.model.is_file() {
         bail!("model {} does not exist", settings.model.display());
     }
-    if let Some(draft) = settings.draft.take() {
-        // The sidecar belongs to the checkpoint actually being served, and the
-        // GGUF's own architecture is the authority on which that is — the
-        // `--model-size` flag only chose the file when nothing else named one,
-        // and a config-file `model` (or `-m`) can disagree with it. A
-        // metadata-only read; the serve path re-reads the same header moments
-        // later to validate.
-        let served =
-            XwenConfig::from_gguf(&gguf::open(&settings.model, &candle_core::Device::Cpu)?.content)
-                .with_context(|| format!("reading {}", settings.model.display()))?
-                .arch
-                .model();
-        settings.draft = Some(resolve_draft(&draft, served)?);
-    }
-    if let Some(draft) = settings.draft.as_ref().filter(|path| !path.is_file()) {
-        bail!("drafter {} does not exist", draft.display());
+    match &settings.draft {
+        DraftMode::Off => {}
+        DraftMode::Custom(path) => {
+            if !path.is_file() {
+                bail!("drafter {} does not exist", path.display());
+            }
+        }
+        DraftMode::Official => {
+            // Each checkpoint drafts with its own sidecar, resolved when it
+            // loads — this only prefetches the one for the checkpoint being
+            // SERVED, so a first request does not stall behind a 3.5 GB
+            // download. Which checkpoint that is comes from the file, through
+            // the same call the server itself uses a moment later: identifying
+            // it here by any other rule would mean prefetching for one
+            // checkpoint and serving another, and would report a checkpoint the
+            // server is about to refuse (a `--model-size` that contradicts the
+            // file is an error, raised here rather than after the notice).
+            let cfg = XwenConfig::from_gguf(
+                &gguf::open(&settings.model, &candle_core::Device::Cpu)?.content,
+            )
+            .with_context(|| format!("reading {}", settings.model.display()))?;
+            let (target, _) = xwen::serve::engine::identify_checkpoint(&settings, &cfg, selected)?;
+            let served = target.model;
+            // `--draft official` is a request by name and cannot be honored for
+            // a checkpoint that ships no sidecar; the opt-out default asked for
+            // nothing and degrades with a line, since drafting is otherwise on
+            // and its absence would show up only as slower decoding.
+            let by_name = args
+                .draft
+                .as_deref()
+                .is_some_and(|path| path == Path::new(xwen::serve::config::OFFICIAL_DRAFTER));
+            if ensure_drafter_explicit(served, by_name)?.is_none() {
+                eprintln!(
+                    "xwen: no drafter available for {}; serving it without speculative decoding \
+                     (other checkpoints this server loads still draft with their own)",
+                    served.full_name()
+                );
+            }
+        }
     }
 
-    xwen::serve::run(settings)
+    xwen::serve::run(settings, selected)
 }
 
 /// `-m` given: use it verbatim. Omitted: the selected official checkpoint,
@@ -594,24 +632,46 @@ fn resolve_model(model: Option<PathBuf>, size: Model) -> Result<PathBuf> {
 
 /// A draft path of literally `official` (the serve config's opt-out default)
 /// means the selected model's drafter, ensured in the Hugging Face cache like
-/// the model itself.
-fn resolve_draft(path: &std::path::Path, size: Model) -> Result<PathBuf> {
-    if path == std::path::Path::new("official") {
-        ensure_drafter(size)
-    } else {
-        Ok(path.to_path_buf())
+/// the model itself. `None` when that checkpoint ships no sidecar — decoding
+/// then runs plain, which is the only thing it could do.
+fn resolve_draft(path: &std::path::Path, size: Model, explicit: bool) -> Result<Option<PathBuf>> {
+    if path != std::path::Path::new("official") {
+        return Ok(Some(path.to_path_buf()));
     }
+    ensure_drafter_explicit(size, explicit)
+}
+
+/// The checkpoint's official sidecar, fetched on first use.
+///
+/// `explicit` is whether the run asked for it BY NAME (`--draft official`, as
+/// opposed to the opt-out default, which asks for nothing). A named request that
+/// cannot be honored is an error: answering it with a warning would leave a run
+/// that was told to speculate quietly not doing so. The default degrades to
+/// plain decoding instead, and says so.
+fn ensure_drafter_explicit(size: Model, explicit: bool) -> Result<Option<PathBuf>> {
+    if explicit && size.drafter_file().is_none() {
+        bail!(
+            "--draft official: {} ships no DFlash drafter sidecar. Decode plain (drop the flag, \
+             or --no-draft), or pass a drafter GGUF of your own",
+            size.full_name()
+        );
+    }
+    ensure_drafter(size)
 }
 
 /// The selected model's DFlash drafter, with the same download notice the
 /// target gets — the sidecar belongs to one checkpoint and never transfers.
-fn ensure_drafter(size: Model) -> Result<PathBuf> {
+/// `None` for a checkpoint that ships none; saying what that costs is the
+/// caller's, since only the caller knows whether it was about to decode with it.
+fn ensure_drafter(size: Model) -> Result<Option<PathBuf>> {
+    let Some(file) = size.drafter_file() else {
+        return Ok(None);
+    };
     if xwen::hub::cached_drafter(size).is_none() {
         eprintln!(
-            "xwen: {}/{} is not in the Hugging Face cache; downloading ({})",
+            "xwen: {}/{file} is not in the Hugging Face cache; downloading ({})",
             size.repo(),
-            size.drafter_file(),
-            size.drafter_size(),
+            size.drafter_size().unwrap_or("unknown size"),
         );
     }
     xwen::hub::ensure_drafter(size)
@@ -708,6 +768,9 @@ fn batch_request(
         &mut generator,
         &request,
         load_ms,
+        // The checkpoint the payload named, under its canonical name whichever
+        // spelling the document used.
+        size.full_name(),
         &mut xwen::batch::BatchHooks {
             progress: &mut progress,
             cancelled: &mut never,
@@ -750,16 +813,24 @@ fn build_generator(
     // Speculation is opt-out: a zero-flag run speculates with the official
     // drafter, which a first run fetches into the Hugging Face cache (3.5 GB on
     // the 27B, 0.8 GB on the 35B-A3B, with the same download notice the target
-    // gets). `--no-draft` decodes plain.
+    // gets). `--no-draft` decodes plain, and so does a checkpoint that ships no
+    // sidecar — with a line saying so, unless the run asked for one by name.
     if let Some(draft) = draft.filter(|d| !d.no_draft) {
         // resolve_draft keeps `--draft official` — and the default, which is
         // that same symbolic path — meaning the same thing here as in the serve
         // config.
+        let explicit = draft.draft.is_some();
         let requested = draft
             .draft
             .clone()
             .unwrap_or_else(|| PathBuf::from("official"));
-        let path = resolve_draft(&requested, size)?;
+        let Some(path) = resolve_draft(&requested, size, explicit)? else {
+            eprintln!(
+                "xwen: no drafter available for {}; decoding without speculation",
+                size.full_name()
+            );
+            return Ok(generator);
+        };
         let draft_start = std::time::Instant::now();
         let dgguf = gguf::open(&path, &device)?;
         // The drafter's cache is sized by --draft-ctx (capped at the target's
@@ -785,15 +856,17 @@ fn main() -> Result<()> {
         // top level.
         None => run_serve(cli.serve),
         Some(Cmd::Fetch { select }) => {
-            let size = select.model_size;
+            let size = select.size();
             let model = resolve_model(None, size)?;
             println!("model    {}", model.display());
-            let drafter = ensure_drafter(size)?;
-            println!("drafter  {}", drafter.display());
+            match ensure_drafter(size)? {
+                Some(drafter) => println!("drafter  {}", drafter.display()),
+                None => println!("drafter  none ({} ships no sidecar)", size.full_name()),
+            }
             Ok(())
         }
         Some(Cmd::Inspect { model, select }) => {
-            let model = resolve_model(model, select.model_size)?;
+            let model = resolve_model(model, select.size())?;
             let device = candle_core::Device::Cpu;
             let gguf = gguf::open(&model, &device)?;
             print!("{}", gguf::describe(&gguf.content));
@@ -838,8 +911,8 @@ fn main() -> Result<()> {
                 );
             }
             let mut generator = build_generator(
-                &resolve_model(model, select.model_size)?,
-                select.model_size,
+                &resolve_model(model, select.size())?,
+                select.size(),
                 tokenizer.as_deref(),
                 &moe_impl,
                 max_ctx,
@@ -1014,8 +1087,8 @@ fn main() -> Result<()> {
             draft,
         }) => {
             let mut generator = build_generator(
-                &resolve_model(model, select.model_size)?,
-                select.model_size,
+                &resolve_model(model, select.size())?,
+                select.size(),
                 tokenizer.as_deref(),
                 &moe_impl,
                 max_ctx,

@@ -170,7 +170,9 @@ impl Default for SpecParams {
         Self {
             draft_max: 15,
             draft_min: 0,
-            draft_p_min: crate::hub::Model::Qwen35BA3B.draft_p_min_default(),
+            draft_p_min: crate::hub::Model::Qwen35BA3B
+                .draft_p_min_default()
+                .expect("the 35B-A3B ships a drafter, and so a fitted floor"),
             pause_margin: 1.0,
         }
     }

@@ -103,7 +103,17 @@ pub struct Vitals {
     pub model_bytes: Option<u64>,
     pub context_length: usize,
     pub port: u16,
+    /// Whether the checkpoint currently LOADED is speculating. Starts at
+    /// `draft_configured` — nothing is loaded yet, and a header that said "off"
+    /// on a drafting server would be wrong for the whole first request — and is
+    /// then driven by the engine's own drafter events, because which checkpoint
+    /// is resident decides this and a swap can change it.
     pub draft: bool,
+    /// What the SETTINGS asked for, which is what the cell falls back to
+    /// whenever nothing is loaded (a swap, an idle unload). Without it the cell
+    /// would have to invent an answer for "no model resident" — and inventing
+    /// "off" there would read as a configuration problem on a drafting server.
+    pub draft_configured: bool,
     /// Whether the on-disk prefix cache is on, which is what decides whether the
     /// header carries a cell for it: a server that keeps nothing on disk has no
     /// business showing a size of zero.
@@ -117,7 +127,8 @@ impl Vitals {
             model_bytes: file_size(&settings.model),
             context_length: settings.context_length,
             port: settings.port,
-            draft: settings.draft.is_some(),
+            draft: settings.draft.is_on(),
+            draft_configured: settings.draft.is_on(),
             disk_cache: settings.disk_cache && settings.cache_dir.is_some(),
         }
     }
@@ -355,6 +366,23 @@ impl Dashboard {
             // header stops advertising a context the server will not serve.
             ServeLog::ContextClamped { trained, .. } => self.vitals.context_length = trained,
             ServeLog::Listening { address, .. } => self.address = Some(address),
+            // The drafting cell tracks what is LOADED, not what was configured:
+            // speculation is per checkpoint (one may ship no sidecar while the
+            // next one does), so a header that reported the setting would claim
+            // drafting on a checkpoint that decodes plain.
+            //
+            // Only the two drafter events decide it, and only the events that
+            // END a residency reset it. Deliberately NOT keyed off
+            // `ModelLoaded`: that fires AFTER `EngineState::load` returns, while
+            // `DrafterLoaded` fires from inside it, so a "clear on load" arm
+            // runs last and pins the cell off on every drafting server. With
+            // nothing loaded the cell shows the configured intent, which is the
+            // honest answer before a checkpoint has been chosen.
+            ServeLog::DrafterLoaded { .. } => self.vitals.draft = true,
+            ServeLog::NoDrafterAvailable { .. } => self.vitals.draft = false,
+            ServeLog::CheckpointSwappingOut { .. } | ServeLog::IdleUnloaded { .. } => {
+                self.vitals.draft = self.vitals.draft_configured;
+            }
             ServeLog::JobPicked {
                 origin,
                 prompt_tokens,
@@ -1406,6 +1434,7 @@ mod tests {
             context_length: 262_144,
             port: 5241,
             draft: true,
+            draft_configured: true,
             disk_cache: true,
         }
     }
@@ -1636,6 +1665,74 @@ mod tests {
         assert!(text.contains("drafter"), "{text}");
     }
 
+    /// The header's drafting cell reports the LOADED checkpoint, through the
+    /// event order the engine actually produces: `DrafterLoaded` comes from
+    /// inside `EngineState::load` and `ModelLoaded` only after that load
+    /// returns, so anything that keyed "not drafting yet" off `ModelLoaded`
+    /// would run last and pin the cell off on every drafting server. Fed here in
+    /// the real order, across a full swap cycle, so that ordering cannot regress
+    /// unnoticed.
+    #[test]
+    fn the_draft_cell_follows_the_loaded_checkpoint_in_the_engines_own_order() {
+        let mut app = dashboard();
+        let loaded = |ms: u64| ServeLog::ModelLoaded {
+            elapsed: Duration::from_millis(ms),
+        };
+        let drafter = || ServeLog::DrafterLoaded {
+            elapsed: Duration::from_millis(600),
+            draft_ctx: 8192,
+        };
+        let no_drafter = || ServeLog::NoDrafterAvailable {
+            model: crate::hub::Model::Qwen3827B,
+        };
+        let swap = || ServeLog::CheckpointSwappingOut {
+            from: crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B),
+            to: crate::serve::types::Target::official(crate::hub::Model::Qwen3827B),
+        };
+
+        // A drafting checkpoint loads: drafter first, model second.
+        let text = frame(&mut app, vec![drafter(), loaded(4000)]);
+        assert!(app.vitals.draft, "a drafting checkpoint reads ON");
+        assert!(text.contains("draft ON"), "{text}");
+
+        // Swapped out for one that ships no sidecar.
+        let text = frame(&mut app, vec![swap(), no_drafter(), loaded(3800)]);
+        assert!(!app.vitals.draft, "a sidecar-less checkpoint reads off");
+        assert!(text.contains("draft off"), "{text}");
+
+        // And back: the cell recovers rather than staying off for the process.
+        let text = frame(&mut app, vec![swap(), drafter(), loaded(3900)]);
+        assert!(app.vitals.draft, "drafting again after the swap back");
+        assert!(text.contains("draft ON"), "{text}");
+
+        // An idle unload leaves nothing loaded, so the cell falls back to what
+        // the server was configured for rather than to a stale checkpoint's answer.
+        frame(
+            &mut app,
+            vec![
+                no_drafter(),
+                ServeLog::IdleUnloaded {
+                    elapsed: Duration::from_secs(600),
+                    configured: Some(Duration::from_secs(600)),
+                },
+            ],
+        );
+        assert_eq!(app.vitals.draft, app.vitals.draft_configured);
+
+        // A server configured not to speculate never reads ON, whatever loads.
+        let mut plain = Dashboard::new(
+            Vitals {
+                draft: false,
+                draft_configured: false,
+                ..vitals()
+            },
+            Instant::now(),
+            Arc::new(Environment::default()),
+        );
+        let text = frame(&mut plain, vec![loaded(4000), swap(), loaded(4000)]);
+        assert!(!plain.vitals.draft, "{text}");
+    }
+
     /// Every event that has a line to say still says it, in the LOG pane instead
     /// of on stderr. The wording is the stderr sink's, not a second copy of it.
     #[test]
@@ -1654,12 +1751,14 @@ mod tests {
             ServeLog::ServingModel {
                 path: PathBuf::from("/models/laguna.gguf"),
             },
-            ServeLog::ModelLoaded {
-                elapsed: Duration::from_millis(4200),
-            },
+            // The engine's own order: the drafter attaches inside the model
+            // load, so its line comes first.
             ServeLog::DrafterLoaded {
                 elapsed: Duration::from_millis(1600),
                 draft_ctx: 32768,
+            },
+            ServeLog::ModelLoaded {
+                elapsed: Duration::from_millis(4200),
             },
             ServeLog::IdleUnloaded {
                 elapsed: Duration::from_secs(600),

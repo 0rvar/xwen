@@ -88,10 +88,11 @@ pub struct AppState {
     /// Reported as the model id by `/v1/models`, and echoed by a request that
     /// names no model of its own.
     pub model_id: String,
-    /// Which official checkpoint the default GGUF is, read from its
-    /// architecture at startup. A request whose `model` names a known
-    /// checkpoint runs on that one; everything else runs on this.
-    pub default_size: crate::hub::Model,
+    /// What the served GGUF is — the target a request that names nothing, or
+    /// names this server's own model id, runs on. A request naming one of the
+    /// other official checkpoints runs on that one instead, out of its own hub
+    /// file.
+    pub default_target: crate::serve::types::Target,
     /// The resolved context length: what the config asks for, capped at what the
     /// checkpoint was converted with. Serves the handler-side "does the prompt
     /// fit" check; the engine re-derives its own copy at load time, which stays
@@ -124,8 +125,15 @@ impl QuitSignal {
 
 /// Assemble the runtime, the router and the inference worker, and serve until
 /// shutdown.
-pub fn run(settings: ServeSettings) -> Result<()> {
-    let model_id = model_id(&settings);
+/// `selected` is an explicit `--model-size`, which names the checkpoint a GGUF
+/// holds when the file itself does not say — and is a startup error when it
+/// contradicts a file that does. `None` leaves the identity to the file.
+pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Result<()> {
+    // Read before anything is built: the checkpoint's identity decides the model
+    // id every dialect echoes, which the dashboard is constructed around.
+    let cfg = engine::read_startup_config(&settings)?;
+    let (default_target, unidentified) = engine::identify_checkpoint(&settings, &cfg, selected)?;
+    let model_id = model_id(&settings, &default_target);
     let quit = QuitSignal::default();
     // The sink outlives everything that logs: it is started before the first
     // line the server can produce, and the handle's `Drop` stops and joins it on
@@ -139,10 +147,11 @@ pub fn run(settings: ServeSettings) -> Result<()> {
     log::set_global(logger.clone());
 
     // Before binding anything: a bad model path or an unreadable tokenizer is a
-    // startup error, not a surprise on the first request. Which official
-    // checkpoint the default GGUF is comes from its architecture — the
-    // authoritative answer, whatever flag the path travelled with.
-    let (tokenizer, max_ctx, default_size) = engine::validate_model(&settings, &logger)?;
+    // startup error, not a surprise on the first request.
+    if let Some(warning) = unidentified {
+        logger.log(warning);
+    }
+    let (tokenizer, max_ctx) = engine::validate_model(&settings, &cfg, default_target, &logger)?;
 
     let model_loaded = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(Cancel::default());
@@ -157,7 +166,7 @@ pub fn run(settings: ServeSettings) -> Result<()> {
     ));
     let engine = engine::spawn_engine(
         settings.clone(),
-        default_size,
+        default_target,
         Arc::clone(&jobs),
         Arc::clone(&model_loaded),
         Arc::clone(&shutdown),
@@ -172,7 +181,7 @@ pub fn run(settings: ServeSettings) -> Result<()> {
         model_loaded,
         shutdown: Arc::clone(&shutdown),
         model_id,
-        default_size,
+        default_target,
         max_ctx,
         next_request_id: Arc::new(AtomicU64::new(1)),
     };
@@ -224,13 +233,87 @@ pub fn run(settings: ServeSettings) -> Result<()> {
     Ok(())
 }
 
-/// The GGUF's basename without its extension, e.g. `laguna-s-2.1-Q4_K_M`.
-fn model_id(settings: &ServeSettings) -> String {
+/// What the APIs call the served checkpoint: its full name when the file is one
+/// of the official checkpoints (`Qwen3.6-35B-A3B`), quant and file name alike
+/// left out of it. A GGUF that is none of them has no name but its own, so it
+/// keeps reporting its basename without the extension, e.g.
+/// `laguna-s-2.1-Q4_K_M`.
+fn model_id(settings: &ServeSettings, served: &crate::serve::types::Target) -> String {
+    if !served.served_file {
+        return served.model.full_name().to_string();
+    }
     settings
         .model
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "xwen".to_string())
+}
+
+/// The ids `/v1/models` lists: every checkpoint by full name, led by whatever
+/// this server is serving. `served` is already a full name when the served GGUF
+/// is one of them, which is what keeps it from being listed twice — under its
+/// own name and again in the roster.
+fn listed_models(served: &str) -> Vec<String> {
+    let mut ids = vec![served.to_string()];
+    ids.extend(
+        crate::hub::MODELS
+            .iter()
+            .map(|model| model.full_name().to_string())
+            .filter(|name| name != served),
+    );
+    ids
+}
+
+/// The target a request runs on, with the name its response echoes — or the
+/// message for the 400 it gets instead.
+///
+/// One rule for every surface. Absent or empty means the served file. This
+/// server's own model id — a checkpoint's full name, or a custom GGUF's file
+/// name — means the served file too: it is the id `/v1/models` advertises, so
+/// refusing it would advertise something unusable. Any other checkpoint's full
+/// name selects that checkpoint, out of its own hub file. Everything else is
+/// refused: falling back to the default for an unrecognized name is how an SDK's
+/// own model id used to be answered by a model the client never asked for,
+/// indistinguishably from a correct request.
+///
+/// Resolve BEFORE each dialect's `prepare`, which substitutes the served id for
+/// an absent field: a file someone named `35b.gguf` must not route model-less
+/// requests by its name.
+pub(crate) fn resolve_requested_model(
+    requested: Option<&str>,
+    served: crate::serve::types::Target,
+    served_id: &str,
+) -> Result<(crate::serve::types::Target, String), String> {
+    let name = match requested.map(str::trim) {
+        None | Some("") => return Ok((served, served_id.to_string())),
+        Some(name) => name,
+    };
+    if name.eq_ignore_ascii_case(served_id) {
+        return Ok((served, served_id.to_string()));
+    }
+    crate::hub::Model::from_api_name(name)
+        .map(|model| {
+            (
+                crate::serve::types::Target::official(model),
+                model.full_name().to_string(),
+            )
+        })
+        .ok_or_else(|| unknown_model_message(name))
+}
+
+/// The 400 an API answers a `model` it does not know with. Names every valid
+/// one — which is exactly what `/v1/models` lists — because a client that sent
+/// an alias or an SDK default needs to be told what to send instead.
+pub(crate) fn unknown_model_message(name: &str) -> String {
+    let known: Vec<&str> = crate::hub::MODELS
+        .iter()
+        .map(|model| model.full_name())
+        .collect();
+    format!(
+        "unknown model {name:?}: this server serves {} (and whatever GGUF it was started \
+         with, under the id GET /v1/models reports)",
+        known.join(", ")
+    )
 }
 
 /// A disabled API's routes are simply never registered, so it 404s like any
@@ -444,10 +527,14 @@ async fn health(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-/// `GET /v1/models` — the default checkpoint under the id requests echo, then
-/// the two official checkpoints under the names a request's `model` field
-/// selects them by. Each entry carries both APIs' field names so either SDK's
-/// model list parses it.
+/// `GET /v1/models` — every checkpoint this server can load, by the full name a
+/// request's `model` field selects it with, the default one first. Exactly one
+/// entry per checkpoint: the ids here are the same strings the APIs accept, so
+/// a checkpoint listed twice under two spellings is a client picking between
+/// two names for one model. A GGUF that is none of the official checkpoints
+/// leads the list under its own file name, which is what a request reaches it
+/// by. Each entry carries both APIs' field names so either SDK's model list
+/// parses it.
 async fn models(State(state): State<AppState>) -> Response {
     let created = model_mtime(&state.settings);
     let entry = |id: &str| {
@@ -461,12 +548,7 @@ async fn models(State(state): State<AppState>) -> Response {
             "created_at": rfc3339_utc(created),
         })
     };
-    let mut ids = vec![state.model_id.clone()];
-    ids.extend(
-        [crate::hub::Model::Qwen27B, crate::hub::Model::Qwen35BA3B]
-            .iter()
-            .map(ToString::to_string),
-    );
+    let ids = listed_models(&state.model_id);
     let data: Vec<Value> = ids.iter().map(|id| entry(id)).collect();
     axum::Json(json!({
         "object": "list",
@@ -821,7 +903,7 @@ pub(crate) fn submit(
     request: JobRequest,
     dialect: Dialect,
     streaming: bool,
-    model: crate::hub::Model,
+    model: crate::serve::types::Target,
 ) -> std::result::Result<(mpsc::Receiver<EngineEvent>, CancelGuard), SubmitError> {
     if request.max_tokens == 0 {
         return Err(SubmitError::Invalid(
@@ -1179,7 +1261,7 @@ pub(crate) mod testutil {
             disk_cache: false,
             disk_max_gib: config::DEFAULT_DISK_MAX_GIB,
             disk_min_tokens: config::DEFAULT_DISK_MIN_TOKENS,
-            draft: None,
+            draft: config::DraftMode::Off,
             draft_max: config::DEFAULT_DRAFT_MAX,
             draft_p_min: None,
             draft_pause_margin: config::DEFAULT_DRAFT_PAUSE_MARGIN,
@@ -1239,6 +1321,7 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
 
     #[test]
     fn no_configured_key_accepts_anything() {
@@ -1270,12 +1353,248 @@ mod tests {
         assert_eq!(presented_key(None, None), None);
     }
 
+    /// An official checkpoint is reported by its full name, whatever file it was
+    /// loaded from — that name is what the APIs accept — and a file that is none
+    /// of them keeps reporting the GGUF's basename, which is all a request can
+    /// reach it by.
     #[test]
-    fn model_id_is_the_gguf_basename() {
+    fn model_id_is_the_checkpoint_name_or_the_gguf_basename() {
+        use crate::hub::Model;
         let mut settings = testutil::settings();
-        assert_eq!(model_id(&settings), "laguna-s-2.1-Q4_K_M");
+        let custom = types::Target::served(Model::Qwen35BA3B);
+        assert_eq!(model_id(&settings, &custom), "laguna-s-2.1-Q4_K_M");
         settings.model = std::path::PathBuf::from("model.gguf");
-        assert_eq!(model_id(&settings), "model");
+        assert_eq!(model_id(&settings, &custom), "model");
+        assert_eq!(
+            model_id(&settings, &types::Target::official(Model::Qwen3827B)),
+            "Qwen3.8-27B"
+        );
+    }
+
+    /// One entry per checkpoint, the served one first, and no id listed twice —
+    /// a listing is what a client picks a `model` string from, so two ids for
+    /// one model is two ways to ask for the same thing.
+    #[test]
+    fn the_model_listing_names_each_checkpoint_once() {
+        assert_eq!(
+            listed_models("Qwen3.6-35B-A3B"),
+            ["Qwen3.6-35B-A3B", "Qwen3.6-27B", "Qwen3.8-27B"],
+            "the served checkpoint leads and appears once"
+        );
+        // A custom GGUF is none of them, so it leads under its own name and
+        // every official checkpoint still follows.
+        let custom = listed_models("laguna-s-2.1-Q4_K_M");
+        assert_eq!(custom.len(), crate::hub::MODELS.len() + 1);
+        assert_eq!(custom[0], "laguna-s-2.1-Q4_K_M");
+
+        // EVERY id in a listing is one a request can select by, the first
+        // included — that is the whole point of a listing, and the property the
+        // old one broke by mixing aliases in with a file stem. The served entry
+        // is checked through the resolver rather than against the checkpoint
+        // table, because a custom GGUF's id is in no table.
+        for (served, target) in [
+            (
+                "Qwen3.8-27B",
+                types::Target::official(crate::hub::Model::Qwen3827B),
+            ),
+            (
+                "laguna-s-2.1-Q4_K_M",
+                types::Target::served(crate::hub::Model::Qwen35BA3B),
+            ),
+        ] {
+            let ids = listed_models(served);
+            for id in &ids {
+                assert!(
+                    resolve_requested_model(Some(id), target, served).is_ok(),
+                    "a listed id must be selectable: {id}"
+                );
+            }
+            assert_eq!(
+                ids.iter().collect::<std::collections::HashSet<_>>().len(),
+                ids.len(),
+                "no id is listed twice"
+            );
+        }
+    }
+
+    /// One resolution rule for both compat dialects: a full name selects (in any
+    /// case), absent or empty means the served checkpoint under the id this
+    /// server reports it as, and everything else — the CLI's aliases and an
+    /// SDK's own model id alike — is refused rather than answered by the default.
+    #[test]
+    fn a_requested_model_resolves_by_full_name_or_not_at_all() {
+        use crate::hub::Model;
+        use types::Target;
+        // A server started with a GGUF that is none of the official checkpoints:
+        // it answers under its file name, which is also the id `/v1/models`
+        // advertises for it.
+        let served = Target::served(Model::Qwen35BA3B);
+
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_requested_model(absent, served, "custom-file"),
+                Ok((served, "custom-file".to_string()))
+            );
+        }
+        // Its own advertised id reaches it; refusing that would advertise
+        // something unusable.
+        assert_eq!(
+            resolve_requested_model(Some("custom-file"), served, "custom-file"),
+            Ok((served, "custom-file".to_string()))
+        );
+        assert_eq!(
+            resolve_requested_model(Some("CUSTOM-FILE"), served, "custom-file"),
+            Ok((served, "custom-file".to_string()))
+        );
+        // An official name is a DIFFERENT file, even for the checkpoint this one
+        // runs as: unchecked weights never answer under an official name.
+        let same_arch = resolve_requested_model(Some("Qwen3.6-35B-A3B"), served, "custom-file");
+        assert_eq!(
+            same_arch,
+            Ok((
+                Target::official(Model::Qwen35BA3B),
+                "Qwen3.6-35B-A3B".to_string()
+            ))
+        );
+        assert_ne!(same_arch.unwrap().0, served);
+        assert_eq!(
+            resolve_requested_model(Some("Qwen3.8-27B"), served, "custom-file"),
+            Ok((
+                Target::official(Model::Qwen3827B),
+                "Qwen3.8-27B".to_string()
+            ))
+        );
+        // The echoed name is canonical, not the client's spelling of it.
+        assert_eq!(
+            resolve_requested_model(Some("  qwen3.6-27b "), served, "custom-file"),
+            Ok((Target::official(Model::Qwen27B), "Qwen3.6-27B".to_string()))
+        );
+        for refused in ["35b", "27b", "3.8-27b", "gpt-4o", "custom"] {
+            assert!(
+                resolve_requested_model(Some(refused), served, "custom-file").is_err(),
+                "{refused} must not select"
+            );
+        }
+
+        // On a server whose file IS a checkpoint, the id and the full name are
+        // the same string and resolve to the same target — no second identity.
+        let official = Target::official(Model::Qwen27B);
+        assert_eq!(
+            resolve_requested_model(Some("Qwen3.6-27B"), official, "Qwen3.6-27B"),
+            Ok((official, "Qwen3.6-27B".to_string()))
+        );
+    }
+
+    /// Through the real handlers, not just the resolver: a `model` this server
+    /// does not serve is a 400 in each dialect's own error shape, before the
+    /// queue and before any rendering — which is the whole behavior change, and
+    /// the one a client actually sees.
+    ///
+    /// `/v1/messages/count_tokens` is held to the same rule even though its
+    /// answer does not depend on the checkpoint (all of them share a tokenizer):
+    /// a client counting tokens for a model this server does not serve is asking
+    /// about the wrong model, and every other surface tells it so.
+    #[tokio::test]
+    async fn an_unservable_model_is_refused_by_every_dialect() {
+        let (state, queue) = probe_state(4096);
+        let chat = |body: &'static str| {
+            let state = state.clone();
+            async move {
+                openai::chat_completions(State(state), Bytes::from_static(body.as_bytes())).await
+            }
+        };
+        let messages = |body: &'static str| {
+            let state = state.clone();
+            async move { anthropic::messages(State(state), Bytes::from_static(body.as_bytes())).await }
+        };
+        let count = |body: &'static str| {
+            let state = state.clone();
+            async move {
+                anthropic::count_tokens(State(state), Bytes::from_static(body.as_bytes())).await
+            }
+        };
+
+        // An SDK's own id, and the CLI aliases: all refused, none queued.
+        for body in [
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#,
+            r#"{"model":"35b","messages":[{"role":"user","content":"Hi"}]}"#,
+            r#"{"model":"3.8-27b","messages":[{"role":"user","content":"Hi"}]}"#,
+        ] {
+            let response = chat(body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let json = body_json(response).await;
+            assert_eq!(json["error"]["type"], "invalid_request_error", "{body}");
+            let message = json["error"]["message"].as_str().unwrap_or_default();
+            for model in crate::hub::MODELS {
+                assert!(message.contains(model.full_name()), "{message}");
+            }
+        }
+
+        let response = messages(
+            r#"{"model":"claude-sonnet-4-5","max_tokens":16,
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert_eq!(
+            json["type"], "error",
+            "the Anthropic envelope, not OpenAI's"
+        );
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+
+        let response =
+            count(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["type"], "error");
+
+        assert!(
+            try_take(&queue).is_none(),
+            "a refused request must never reach the queue"
+        );
+
+        // The other side of the rule: a name this server DOES serve gets past
+        // resolution and onto the queue. Streaming, deliberately — a
+        // non-streaming handler waits for engine events, and the probe queue has
+        // no engine behind it, so awaiting one here would hang forever rather
+        // than fail. The SSE response returns as soon as the job is queued.
+        let response = chat(
+            r#"{"model":"qwen3.6-35b-a3b","stream":true,
+                "messages":[{"role":"user","content":"Hi"}],"max_tokens":8}"#,
+        )
+        .await;
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+        let queued = try_take(&queue).expect("a servable model is queued");
+        assert_eq!(
+            queued.job.model(),
+            types::Target::official(crate::hub::Model::Qwen35BA3B),
+            "a case-insensitive full name selects that checkpoint"
+        );
+
+        // count_tokens answers a servable model without touching the queue.
+        let response =
+            count(r#"{"model":"Qwen3.8-27B","messages":[{"role":"user","content":"Hi"}]}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_json(response).await["input_tokens"].as_u64().unwrap() > 0);
+        assert!(try_take(&queue).is_none());
+    }
+
+    /// The body of a handler response, as JSON.
+    async fn body_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the body collects");
+        serde_json::from_slice(&bytes).expect("handlers answer JSON")
+    }
+
+    /// The 400 an unknown model gets names every model that would have worked.
+    #[test]
+    fn an_unknown_model_is_told_what_this_server_serves() {
+        let message = unknown_model_message("35b");
+        assert!(message.contains("\"35b\""), "{message}");
+        for model in crate::hub::MODELS {
+            assert!(message.contains(model.full_name()), "{message}");
+        }
     }
 
     #[test]
@@ -1441,7 +1760,7 @@ mod tests {
             model_loaded: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Cancel::default()),
             model_id: "xwen-test".to_string(),
-            default_size: crate::hub::Model::default(),
+            default_target: types::Target::served(crate::hub::Model::default()),
             max_ctx,
             next_request_id: Arc::new(AtomicU64::new(1)),
         };
@@ -1470,7 +1789,7 @@ mod tests {
         dialect: Dialect,
         streaming: bool,
     ) -> std::result::Result<(mpsc::Receiver<EngineEvent>, CancelGuard), SubmitError> {
-        submit(state, request, dialect, streaming, state.default_size)
+        submit(state, request, dialect, streaming, state.default_target)
     }
 
     fn probe_request(max_tokens: usize) -> JobRequest {

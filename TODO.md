@@ -1437,3 +1437,86 @@ default shipped (log.md 2026-08-11 client-feedback entry; decisions.md "Batch",
   compat dialects never need large bodies. If the server ever fronts a LAN under
   `api_key`, add a concurrency-limit layer (or move the cap per-route: 100 MB for
   `/xwen/v1/batch`, default for the dialects) before raising anything else.
+
+## Deferred from the Qwen3.8-27B + API-naming arc (2026-08-14)
+
+Qwen3.8-27B shipped as a registry entry and the APIs went to full model names only
+(log.md 2026-08-14, decisions.md "Defaults and CLI surface" / "Serving"). These are the
+pieces deliberately not carried.
+
+- [ ] **Qwen3.8-27B decodes plain: no DFlash sidecar exists, and its MTP sidecar is
+  unread.** ggml-org ships `mtp-Qwen3.8-27B-*.gguf` (18 tensors, 1 layer,
+  DeepSeek-style: `norm(embed) ⊕ norm(hidden) → fc → one transformer layer → the
+  target's shared lm_head`), which is a different drafter shape from DFlash's
+  block-diffusion sidecar — a new drafter implementation, not a config entry. The cost
+  of not doing it is the whole speculative win on this checkpoint: 3.8 decodes at 23.8
+  tok/s plain (one greedy run, 2026-08-14) where the same-geometry 3.6-27B runs 37-38
+  DRAFTED against its own 24.8-25.3 plain, so this is the largest single tok/s item on
+  the ledger for anyone who actually runs 3.8. The verify machinery
+  (K-snapshot fused verify, rollback, auto-pause) is drafter-shape-agnostic and would be
+  reused; what is new is the drafter forward and its cache. MTP sidecars also exist for
+  both 3.6 checkpoints, so an MTP drafter is testable against a checkpoint that already
+  has a measured DFlash baseline to beat.
+- [ ] **Qwen3.8's chat-template semantics are vendored but not implemented, and TWO of
+  them make every default 3.8 conversation diverge from the official rendering.** The
+  template is at `reference/chat_template-qwen38.jinja` and cross-checked by chat.rs's
+  tests; its behaviors are not.
+  (a) `reasoning_effort` — with thinking on and no effort named, the template resolves
+  to `xhigh` and prepends "Reasoning effort is set to xhigh. Please think carefully
+  through the task, validate key assumptions, consider plausible alternatives, and
+  prioritize correctness, consistency, and clarity in the final answer." to the system
+  block (creating one when the request has none); `low` prepends its own sentence and
+  `medium` prepends nothing. Since xhigh is the DEFAULT, every 3.8 conversation xwen
+  renders today is missing a system instruction the model was trained to see — what we
+  render equals the official `medium` rendering. Note the OpenAI dialect ALREADY takes a
+  `reasoning_effort` field and maps it to a think budget, so implementing this means
+  deciding whether one field drives both or they are separate knobs.
+  (b) `preserve_thinking` defaults to TRUE, the opposite of 3.6's and of what serve does
+  today, so a 3.8 conversation drops reasoning blocks its own template would have kept.
+  (c) The inline `<think>`-in-content parsing fallback was removed, which costs nothing —
+  xwen never implemented it.
+  All are per-checkpoint prompt behavior on a renderer that is currently
+  checkpoint-blind: the design question is where the checkpoint enters `ChatOptions`, and
+  it should be answered once for all of them rather than three times. Until then the
+  divergence is documented, not silent (decisions.md "Tokenization, chat, tool calls").
+- [ ] **Qwen3.8's tokenizer adds seven ids the embedded tokenizer does not know.**
+  248070-248076 (`<|audio_start|>`, `<|audio_end|>`, `<tts_pad>`, `<tts_text_bos>`,
+  `<tts_text_eod>`, `<tts_text_bos_single>`, `<|audio_pad|>`) exist in 3.8's
+  tokenizer.json and not in the vendored 3.6 one; base vocab and merges are identical,
+  so text tokenizes the same and only these ids are affected. Unresolved: whether the
+  text-only checkpoint can emit one at all (its lm_head covers the padded 248320 rows
+  either way), and what `decode` does with it if it does — the likely answer is an empty
+  string or a lossy replacement, silently, mid-reply. Cheapest honest fix if it ever
+  matters is not a second 12.8 MB embed but treating unknown-but-in-range ids as a stop
+  or a logged anomaly. Reopen if a 3.8 reply ever ends strangely for no visible reason.
+- [ ] **No parity-gate or retune arm for Qwen3.8-27B.** `scripts/parity-gate.ts` accepts
+  `--model-size 3.8-27b` and would run it (nothing about the gate is 3.6-specific), but
+  it has never been run against 3.8 and the floors in docs/parity.md were fitted on the
+  3.6 files — so a first run's numbers are unvalidated, not a gate. `retune-draft.ts`
+  deliberately excludes 3.8 (`draftingSizes()`, and `SHIPPED_P_MIN` has no arm for it):
+  there is no drafted arm to sweep without a drafter, and it dies early saying so rather
+  than sweeping a plain-vs-plain comparison. Both open up together if the MTP drafter
+  item above is taken. Note also that `SHIPPED_P_MIN` is typed `Record<ModelSize,
+  number>` and no longer covers every `ModelSize` — harmless (nothing typechecks the
+  scripts, and every read is behind the drafter check) but it is a real type gap to fix
+  when that file is next touched.
+- [x] **DONE 2026-08-14 (review round): drafting is resolved per checkpoint, not per
+  process.** Filed as deferred in the first pass and fixed in the review round, because a
+  sidecar-less DEFAULT checkpoint silently disabled drafting for every OTHER checkpoint
+  that server could load (-46 to -52% on the 27B, invisible). `ServeSettings.draft` is
+  now a `DraftMode` (`Off` / `Official` / `Custom(path)`) rather than one resolved
+  `Option<PathBuf>`: `Official` is resolved by `checkpoint_paths` when a checkpoint
+  loads, so each one drafts with its own sidecar and a checkpoint that ships none decodes
+  plain with its own log line. A `Custom` path still belongs to the checkpoint it was
+  validated against and never transfers (unchanged decision, 2026-08-11); any other
+  checkpoint falls back to its official sidecar. `validate_model` now validates only a
+  custom drafter — an official sidecar is checked when the checkpoint that owns it
+  attaches it. The TUI's drafting cell follows the LOADED checkpoint (`ModelLoaded`
+  clears it, `DrafterLoaded` sets it, `NoDrafterAvailable` clears it) instead of
+  reporting the setting.
+  What remains: nothing about the shape, but the fallback floor it exposes is worth a
+  measurement. A custom drafter attached to a checkpoint with no fitted floor of its own
+  falls back to `SpecParams::default().draft_p_min`, which is the 35B-A3B's fitted 0.3
+  wearing a neutral name — an arbitrary value for that pair. If anyone actually runs a
+  custom drafter on Qwen3.8-27B, fit a floor for it (`scripts/retune-draft.ts` cannot:
+  it sweeps official sidecars only).

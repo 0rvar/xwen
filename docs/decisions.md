@@ -38,6 +38,22 @@ bandwidth-bound and the Q4_K_M mix (attention/ssm/shared-expert Q8_0, expert sta
 Q4_K, lm_head Q6_K) keeps the quality-critical planes at 8-bit anyway. Single files, no
 sharding (2026-07-28).
 
+**Qwen3.8-27B is a registry entry, not a port (2026-08-14).** Its `config.json` is
+byte-identical to Qwen3.6-27B's — same graph, hparams, tokenizer ids, generation config
+— and its GGUF declares the same `qwen35` architecture, rope sectioning and ssm keys, so
+it needs no model math, no new geometry and no parity run: it is the same forward pass
+over different weights. `ggml-org/Qwen3.8-27B-GGUF` for the same reason the 3.6 files
+were chosen. Three things about it are genuinely new. It ships **no DFlash sidecar**, so
+speculation is absent rather than configurable — every drafter accessor is `Option` and
+a zero-flag run logs one line and decodes plain (~25 tok/s, against the 27B's drafted
+37-38); the repo's MTP sidecar is unread (TODO.md). Its Q4_K_M mix puts the 16
+`attn_output.weight` tensors at **Q6_K** where 3.6 had Q8_0 — upstream's
+`output.weight=q6_k` rule substring-catches `attn_output`; nothing asserts on that
+plane's quant and lm_head already exercises Q6_K. And its tokenizer.json is NOT
+byte-identical to 3.6's: it adds seven audio/TTS specials at 248070-248076 over an
+identical base vocab and merge table, which the embedded 3.6 tokenizer therefore
+tokenizes text identically to (see "Tokenization" for what was and was not decided).
+
 **Sampling defaults follow generation_config.json: temp 1.0, top_p 0.95, top_k 20.**
 Stop tokens are the generation_config list `[248046 <|im_end|>, 248044 <|endoftext|>]` —
 config.json's single `eos_token_id: 248044` is wrong for chat and runs straight past
@@ -804,10 +820,88 @@ architecture before resolving the official sidecar, so a config-file `model` (or
 that disagrees with `--model-size` gets the sidecar for the model actually served
 rather than a geometry error blaming the drafter. The one-shot CLI commands keep the
 flag's old double duty deliberately — there the flag and the payload are the intent.
-Selection strictness follows
+Selection strictness followed
 each surface's existing character: the batch route 400s an unknown model (the field
 exists to select), the compat dialects fall back to the default (SDKs send their own
 model ids and must keep working), the native generate endpoint stays modelless.
+SUPERSEDED in two places on 2026-08-14 — the architecture stopped identifying a
+checkpoint (see "The GGUF names itself" below), and the compat dialects stopped falling
+back (see "On the wire a checkpoint has exactly one name").
+
+**On the wire a checkpoint has exactly one name — its full name — and an unknown one
+is a 400 on every surface (2026-08-14).** Two bugs shared a root: the model vocabulary
+was the CLI's. `/v1/models` listed the served file's basename AND every checkpoint's
+short alias, so one model appeared under two ids (a live server listed
+`Qwen3.6-35B-A3B-Q4_K_M`, `27b` and `35b` for two checkpoints), which is not a listing
+a client can pick from; and the compat dialects' fall-back-to-default meant an SDK's
+own id (`gpt-4o`) was answered by whatever checkpoint the server happened to default
+to, indistinguishably from a correct request. Both are fixed by naming: the APIs accept
+and echo `Model::full_name()` only — the string ggml-org names the repo with and the
+GGUF carries as `general.name`, quant-independent — while `--model-size` keeps the
+short aliases (and now also accepts full names, so a `/v1/models` id pastes into the
+CLI). Absent or empty `model` still means the served checkpoint; anything unrecognized
+is a 400 in the dialect's own error format, listing the valid names. The one real cost
+is deliberate: a client that used to get an answer for `"model": "35b"` now gets a 400
+telling it what to send, which is the SDK-default surprise turned into a message
+instead of a silently wrong model. Quant is not part of the name — one server serves
+one file per checkpoint, and the response's job is to say which MODEL answered.
+
+**The GGUF names itself; the architecture is only a fallback (2026-08-14).** Adding
+Qwen3.8-27B broke `Arch::model()`'s one-to-one claim: two releases now ship the dense
+`qwen35` graph with byte-identical configs, so the architecture can no longer say which
+checkpoint a file is. The identification chain is now explicit `--model-size` (the
+operator naming a custom file), then `general.name` (both blessed files carry their
+exact full name; a substring pass catches a re-quantized conversion), then the file
+name, then `Arch::model()` as the last resort with a logged warning. `Arch::model()`
+survives as exactly that fallback and its doc says so. It matters because the identity
+picks the hub repo and the sidecar: guessing 3.6 for a 3.8 file would attach the wrong
+drafter to a graph that accepts it, costing acceptance rather than failing.
+SUPERSEDED in its ordering the same day (review round): `--model-size` is NOT the first
+link and does not override the file — see "`--model-size` is a tie-break, not an
+override" below. The rest of this paragraph stands.
+
+`Model::identify` uses the architecture only to NARROW the candidates, never to answer —
+including for the MoE graph, which one official checkpoint ships. Answering from the
+arch there would have been safe for the engine and wrong for the API: any conversion
+onto that graph would then be reported by `/v1/models` and every response under
+`Qwen3.6-35B-A3B`, which is a claim about weights nobody checked. Unidentified files
+therefore keep reporting under their own file name (unchanged behavior) while the engine
+still runs them as the architecture's checkpoint — the identity and the id are two
+questions, and only the first has a safe default.
+
+Both name sources are read by ONE rule (review round, same day): an exact full name, or a
+whole full name found inside the name, case-insensitively — which accepts the shapes real
+files take (`Qwen3.8-27B-Q8_0`, `Qwen3.6-27B-Instruct`) while requiring that a complete
+checkpoint name actually appear. `general.name` is consulted before the file name because
+it is what the converter wrote INTO the file, but it earns no looser matching for it.
+Matching a bare release series was tried and refused twice over: it identifies
+`My-Qwen3.6-14B-finetune.gguf` as the official 27B, and — since `Arch::Moe` has exactly
+one candidate, so no ambiguity check can save it — `MyMoE-3.6` as Qwen3.6-35B-A3B. Either
+one answers an official name with weights nobody checked, which is the single thing this
+function exists to prevent. A name matching more than one checkpoint identifies as none
+rather than as whichever `MODELS` lists first. The blessed files are unaffected: their
+`general.name` is the exact full name, verified on all three.
+
+**`--model-size` is a tie-break, not an override (2026-08-14, review round).** It names
+the checkpoint a file that says nothing about itself holds. Against a file that DOES say,
+a contradicting flag is a startup error naming both sides, and it must agree with the
+architecture too. It had silently won, which meant the server started clean and then
+failed `EngineState::load`'s own arch/identity checks on every request — a 500 per
+request for a mistake that was fully knowable at startup. Those load-time checks remain
+as a backstop for the case they can still catch: a file replaced under a running server.
+
+**A job names a FILE, not just a checkpoint (2026-08-14, review round).** `Target` is a
+checkpoint plus "is this the served file". The distinction only exists on a server whose
+GGUF identifies as none of the official checkpoints, and there it is the whole ballgame:
+the official checkpoint of the same architecture is a DIFFERENT FILE that happens to size
+its caches identically, so a bare `Model` could not say which was meant. With it: the
+served file answers for its own advertised id (which the resolver now accepts — it was
+400ing the one id `/v1/models` published), an official name resolves that checkpoint's
+real hub file and swaps to it like any other checkpoint, and the batch document is
+labeled with the id that answered rather than with the arch fallback's full name. Two
+things fall out for free: `Target` equality is the engine's swap check (two files, two
+targets), and the disk tier's binding is a `Target` comparison rather than a checkpoint
+one — the tier is bound to `settings.model`, which is a file.
 
 **The disk tier stays bound to the default checkpoint.** `DiskCache::open` scans and
 binds at startup against `settings.model`, and `verify()` deliberately disables the
@@ -817,6 +911,23 @@ the tier: feeding it foreign images would poison the store with bytes that claim
 default binding, and verifying it against foreign weights would permanently disable it.
 The segment layout is already per-checkpoint directories, so a tier-per-checkpoint is a
 straightforward lift when a workload wants it (TODO.md, 2026-08-11 arc).
+
+**Speculation is decided per checkpoint, not per process (2026-08-14, review round).**
+`ServeSettings.draft` was one resolved `Option<PathBuf>`, which was correct while
+"official sidecar" named one file and became silently wrong when a checkpoint shipping
+none arrived: a server whose DEFAULT checkpoint was Qwen3.8-27B ran every OTHER
+checkpoint plain too, costing the 27B its measured +46 to +52% with nothing in the log
+about it. It is now a `DraftMode` — `Off`, `Official`, or `Custom(path)` — and
+`checkpoint_paths` resolves `Official` when a checkpoint loads, so each drafts with its
+own sidecar and a sidecar-less one decodes plain with its own line. A `Custom` path still
+belongs to the checkpoint it was validated against and never transfers (2026-08-11,
+unchanged); any other checkpoint falls back to its official sidecar rather than borrowing
+it. Startup validation follows the same split: a custom drafter is judged at startup as
+before, an official sidecar when the checkpoint that owns it attaches it, and the served
+checkpoint's sidecar is still PREFETCHED at startup so a first request does not stall
+behind a 3.5 GB download. The dashboard's drafting cell tracks the loaded checkpoint
+(`ModelLoaded` clears it, `DrafterLoaded` sets it) instead of the setting, for the same
+reason the setting stopped being the answer.
 
 **`draft.p_min` resolves at drafter attach, not in the config merge (2026-08-11).**
 The merge used to bake `--model-size`'s per-checkpoint default into the settings, which
@@ -1051,8 +1162,50 @@ NFC normalizer, no BOS ever prepended (`add_bos_token: false`, no post-processor
 split regex differs from Qwen3 by `\p{M}` handling — do not reuse a Qwen3 regex
 (2026-07-28).
 
+**Qwen3.8's tokenizer.json differs from 3.6's by seven added tokens and nothing else,
+and the embedded 3.6 file is what still ships (2026-08-14).** Compared structurally, not
+by hash alone: `model.vocab` (248044 entries), `model.merges` (247587), the normalizer,
+pre-tokenizer, post-processor and decoder are byte-identical; 3.8 adds
+`<|audio_start|>`, `<|audio_end|>`, `<tts_pad>`, `<tts_text_bos>`, `<tts_text_eod>`,
+`<tts_text_bos_single>`, `<|audio_pad|>` at ids 248070-248076, above every id the chat
+path uses. Text therefore tokenizes identically under the embedded file, and client text
+spelling one of those markers encodes as plain BPE — which is the safer behavior for
+client content anyway. What is NOT decided here: whether a text-only checkpoint can emit
+one of those ids at all, and what the embedded tokenizer would decode it to. Left as a
+ledger item rather than improvised into a per-checkpoint tokenizer, since a second
+12.8 MB embed for seven ids nothing renders is the kind of thing to decide deliberately.
+
+**Qwen3.8 ships a different chat template; it is vendored beside 3.6's and the renderer
+is unchanged — which means every default 3.8 conversation renders differently from the
+official template, by one sentence (2026-08-14).** `reference/chat_template-qwen38.jinja`
+(8952 bytes, verbatim from Qwen/Qwen3.8-27B). Diffed hunk by hunk against 3.6's: a
+`reasoning_effort` system preamble, `preserve_thinking` defaulting to true instead of
+false, the inline `<think>`-in-content parsing fallback removed, and an empty-arguments
+guard on tool calls. The generation prompt — the block that decides what the model is
+handed to continue — is byte-identical, and so is the `# Tools` prose, which is why one
+hand-written renderer still serves every checkpoint.
+
+The divergence is not hypothetical and is worth stating in full, because the defaults
+make it universal rather than opt-in: with thinking ON (the default) and no
+`reasoning_effort` given, 3.8's template resolves the effort to `xhigh` and prepends
+"Reasoning effort is set to xhigh. Please think carefully through the task, validate key
+assumptions, consider plausible alternatives, and prioritize correctness, consistency,
+and clarity in the final answer." to the system block — creating one if the request has
+no system message. xwen renders neither that sentence nor the `low` variant, so every
+default 3.8 conversation this server renders is missing a system instruction the model
+was trained to see. `medium` is the one effort level that injects nothing, so what xwen
+renders today is exactly the official `reasoning_effort="medium"` rendering. Accepted
+knowingly for the arc that added the checkpoint (it is prompt semantics, not model math,
+and the serve layer already has a conflicting `reasoning_effort` field of its own to
+reconcile — TODO.md), but nobody should read "the generation prompt is byte-identical"
+as "the prompts are the same".
+
+Both vendored templates are cross-checked by chat.rs's tests (the fixed prose must
+appear in each, and the generation-prompt block must match between them), so a future
+release that moves either one fails a test rather than a reply.
+
 **chat.rs is a hand-written Rust port of the official chat_template.jinja (7764 bytes,
-byte-identical across both repos), keeping laguna's content/structure separation** so
+byte-identical across both Qwen 3.6 repos), keeping laguna's content/structure separation** so
 pasted text discussing control tokens can never become control tokens. The subtle rules,
 verified by rendering the real template: string tool-arguments render RAW (non-strings
 JSON-encode); OpenAI-style JSON-string `arguments` must be parsed into a map first

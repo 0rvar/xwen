@@ -14,13 +14,14 @@ use candle_core::Device;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 
-use super::config::ServeSettings;
+use super::config::{DraftMode, ServeSettings};
 use super::disk_cache::DiskImage;
 use super::disk_tier::{DiskCache, DiskCandidate};
 use super::log::{JobPhase, JobRecord, ServeLog, ServeLogger, SlotSummary};
 use super::queue::{JobQueue, Queued};
 use super::types::{
     BatchJob, Cancel, CancelReason, EngineEvent, GenerationJob, Job, RequestOrigin, StopKind,
+    Target,
 };
 use crate::XwenConfig;
 use crate::batch::{BatchHooks, BatchProgress};
@@ -154,43 +155,129 @@ const VALUE_CLOSE: &str = "\n</parameter>";
 /// reported as one, since the client never asked for it.
 const ASSISTANT_CLOSE: &str = "</assistant>";
 
-/// Cheap startup validation: parses the GGUF header + metadata on the CPU device (no
-/// tensor data, no Metal allocation) and loads the tokenizer. Fails fast so a bad model
-/// path or config is caught at startup rather than on the first request. Returns the
-/// tokenizer the HTTP layer renders prompts with — the same vocabulary the engine
-/// decodes with (both checkpoints share it) — the resolved context length its "does
-/// the prompt fit" check applies, and which official checkpoint the default GGUF is,
-/// read from its architecture rather than trusted from any flag.
+/// What the served GGUF is: the target every request for this server's own model
+/// id runs on, plus a warning when the file named no official checkpoint.
+///
+/// The file is the authority. An explicit `--model-size` is a tie-break for a
+/// file that identifies as NOTHING, not an override of one that does — a flag
+/// that contradicts the file is a startup error naming both sides, because the
+/// alternative is a server that starts fine and 500s every request at load. It
+/// must also agree with the architecture, which no name can change.
+///
+/// The returned target is `Target::official` when the file is one of the
+/// checkpoints and `Target::served` when it is not: only the second answers to a
+/// file name, and only the first lets an official name resolve locally.
+pub fn identify_checkpoint(
+    settings: &ServeSettings,
+    cfg: &XwenConfig,
+    selected: Option<hub::Model>,
+) -> Result<(Target, Option<ServeLog>)> {
+    let identified = cfg.checkpoint(&settings.model);
+    if let Some(selected) = selected {
+        ensure!(
+            cfg.arch == selected.arch(),
+            "--model-size {selected} names a {} model, but {} holds a {} model",
+            selected.arch().key(),
+            settings.model.display(),
+            cfg.arch.key()
+        );
+        if let Some(identified) = identified {
+            ensure!(
+                identified == selected,
+                "--model-size {selected} contradicts {}, which says it is {}; drop the flag \
+                 to serve what the file says it is",
+                settings.model.display(),
+                identified.full_name()
+            );
+        }
+        // The file said nothing, so the flag settles it: an official checkpoint
+        // in a file the operator vouched for.
+        return Ok((Target::official(selected), None));
+    }
+    match identified {
+        Some(model) => Ok((Target::official(model), None)),
+        None => {
+            let assumed = cfg.arch.model();
+            Ok((
+                Target::served(assumed),
+                Some(ServeLog::CheckpointUnidentified {
+                    path: settings.model.clone(),
+                    assumed,
+                }),
+            ))
+        }
+    }
+}
+
+/// Metadata-only read of the default checkpoint, done once at startup so the
+/// identity it decides — which model id the APIs speak, which sidecar the
+/// drafter comes from — is read from one look at the file.
+pub fn read_startup_config(settings: &ServeSettings) -> Result<XwenConfig> {
+    read_config(&settings.model)
+}
+
+/// Cheap startup validation: judges the already-parsed metadata (no tensor data, no
+/// Metal allocation) and loads the tokenizer. Fails fast so a bad model path or config
+/// is caught at startup rather than on the first request. Returns the tokenizer the
+/// HTTP layer renders prompts with — the same vocabulary the engine decodes with (every
+/// checkpoint shares it) — and the resolved context length its "does the prompt fit"
+/// check applies.
 pub fn validate_model(
     settings: &ServeSettings,
+    cfg: &XwenConfig,
+    served: Target,
     logger: &ServeLogger,
-) -> Result<(Arc<LagunaTokenizer>, usize, hub::Model)> {
-    let cfg = read_config(&settings.model)?;
+) -> Result<(Arc<LagunaTokenizer>, usize)> {
     let (max_ctx, warning) = resolve_context_length(settings.context_length, cfg.n_ctx_train)?;
     if let Some(warning) = warning {
         logger.log(warning);
     }
-    if let Some(path) = &settings.draft {
-        // A drafter that turns out not to be one is a configuration mistake, and the
-        // first request is far too late to learn it: speculation would simply be
-        // absent, or the load would fail behind a request that had nothing to do
-        // with it.
-        read_draft_config(path, &cfg)
+    // A drafter that turns out not to fit the model is a configuration mistake, and
+    // the first request is far too late to learn it: the load would fail behind a
+    // request that had nothing to do with it, and keep failing, forever.
+    //
+    // Two drafters can be judged at startup. A custom one, which is a path the
+    // operator chose. And the SERVED checkpoint's official sidecar, which the CLI has
+    // already fetched by now — worth checking because "official" does not mean "fits":
+    // a custom GGUF served as its architecture's checkpoint gets that checkpoint's
+    // sidecar, and if the file's geometry differs at all, every request fails at
+    // attach. Any OTHER checkpoint's sidecar cannot be judged here — it may not even
+    // be downloaded yet — and is checked when that checkpoint attaches it.
+    if let Some(path) = startup_drafter(settings, served) {
+        read_draft_config(&path, cfg)
             .with_context(|| format!("validating the drafter {}", path.display()))?;
     }
-    Ok((Arc::new(load_tokenizer()?), max_ctx, cfg.arch.model()))
+    Ok((Arc::new(load_tokenizer()?), max_ctx))
+}
+
+/// Which drafter startup can judge, or `None` when none can be.
+///
+/// Extracted from [`validate_model`] so the selection is testable without a
+/// checkpoint on disk — the rule matters more than the reading of it.
+fn startup_drafter(settings: &ServeSettings, served: Target) -> Option<std::path::PathBuf> {
+    match &settings.draft {
+        DraftMode::Off => None,
+        DraftMode::Custom(path) => Some(path.clone()),
+        // The served checkpoint's own sidecar, offline: whatever the CLI's
+        // prefetch left in the cache. A checkpoint that ships none yields
+        // nothing to check, and on a cache miss the attach's own check is the
+        // only one there can be.
+        DraftMode::Official => hub::cached_drafter(served.model),
+    }
 }
 
 /// Spawns the dedicated inference thread. The thread lazily loads whichever checkpoint
 /// the picked job names (the default one for the compat dialects, any for the batch
 /// route), flips `model_loaded` on load/unload, swaps checkpoints when a job needs the
 /// other one, and drops the model after `idle_unload` of inactivity (None = never).
-/// `default_size` is which official checkpoint `settings.model` is, read from its GGUF.
+/// `default_target` is what `settings.model` is: the official checkpoint it identified
+/// as, or — for a GGUF that identified as none of them — the served file running as its
+/// architecture's checkpoint. It is the only target the served file answers for.
 /// `shutdown` is the process-wide cancel token: once it fires, the running job aborts
 /// and queued jobs are dropped unstarted.
 pub fn spawn_engine(
     settings: ServeSettings,
-    default_size: hub::Model,
+    default_target: Target,
     jobs: Arc<JobQueue>,
     model_loaded: Arc<AtomicBool>,
     shutdown: Arc<Cancel>,
@@ -198,7 +285,16 @@ pub fn spawn_engine(
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(ENGINE_THREAD.to_string())
-        .spawn(move || engine_loop(settings, default_size, jobs, model_loaded, shutdown, logger))
+        .spawn(move || {
+            engine_loop(
+                settings,
+                default_target,
+                jobs,
+                model_loaded,
+                shutdown,
+                logger,
+            )
+        })
         .expect("spawning the inference thread")
 }
 
@@ -258,9 +354,11 @@ struct EngineState {
     /// uploaded to before the cache can be rewound to it.
     device: Device,
     slots: Slots,
-    /// Which official checkpoint this state holds. The pickup compares it against the
-    /// checkpoint the next job names, and a mismatch is what swaps the state out.
-    size: hub::Model,
+    /// Which checkpoint this state holds, and which file that is. The pickup compares
+    /// it against what the next job names, and a mismatch is what swaps the state out —
+    /// so it has to distinguish a served custom file from the official checkpoint it
+    /// runs as, which are different weights under the same architecture.
+    size: Target,
     /// The KV cache holds writes from a job that has not finished reconciling them, so
     /// nothing in it may be reused. Set at the first cache mutation and cleared once the
     /// cache and the token history agree again; a job that fails before mutating anything
@@ -269,63 +367,97 @@ struct EngineState {
     dirty: bool,
 }
 
-/// The GGUF and (optional) drafter for one checkpoint. The default checkpoint's paths
-/// come straight from the settings, resolved at startup exactly as before; any other
-/// checkpoint resolves lazily against the Hugging Face cache, downloading on a miss —
-/// the same behavior `xwen batch` has from the CLI. A custom `draft.path` belongs to
-/// the default checkpoint alone (sidecars never transfer between checkpoints), so the
-/// non-default one always speculates with its official sidecar.
+/// The GGUF and (optional) drafter for one target.
+///
+/// The served file answers only for the target that IS the served file
+/// (`default_target`). A custom GGUF that identified as nothing serves under its
+/// own id and nothing else: a request naming an official checkpoint on such a
+/// server resolves that checkpoint's real hub file, because an official name
+/// must never be answered by weights nobody checked. Everything not served
+/// locally resolves lazily against the Hugging Face cache, downloading on a
+/// miss — the same behavior `xwen batch` has from the CLI.
+///
+/// The drafter follows the mode: `Off` never drafts, `Custom` belongs to the
+/// default checkpoint alone (sidecars never transfer, so any other checkpoint
+/// falls back to its own official one), and `Official` is per checkpoint — which
+/// is the point of it being a mode rather than a path. A checkpoint that ships
+/// no sidecar decodes plain with a line saying so, whatever the others do.
 fn checkpoint_paths(
     settings: &ServeSettings,
-    size: hub::Model,
-    default_size: hub::Model,
+    target: Target,
+    default_target: Target,
     logger: &ServeLogger,
 ) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>)> {
-    if size == default_size {
-        return Ok((settings.model.clone(), settings.draft.clone()));
-    }
-    if hub::cached_model(size).is_none() {
+    let size = target.model;
+    // The served file answers for this target only when it IS this target — which
+    // for a custom GGUF means its own id and nothing else.
+    let local = target == default_target;
+    let model = if local {
+        settings.model.clone()
+    } else {
+        if hub::cached_model(size).is_none() {
+            logger.log(ServeLog::CheckpointDownloading {
+                repo: size.repo(),
+                file: size.file(),
+                size: size.size(),
+            });
+        }
+        hub::ensure_model(size).with_context(|| {
+            format!("fetching the {size} checkpoint from the Hugging Face cache")
+        })?
+    };
+    let draft = match &settings.draft {
+        DraftMode::Off => None,
+        DraftMode::Custom(path) if local => Some(path.clone()),
+        DraftMode::Custom(_) | DraftMode::Official => official_drafter(size, logger)?,
+    };
+    Ok((model, draft))
+}
+
+/// One checkpoint's official sidecar, fetched on a miss — or `None`, with a line
+/// saying so, for a checkpoint that ships none.
+fn official_drafter(size: hub::Model, logger: &ServeLogger) -> Result<Option<std::path::PathBuf>> {
+    let Some(file) = size.drafter_file() else {
+        logger.log(ServeLog::NoDrafterAvailable { model: size });
+        return Ok(None);
+    };
+    if hub::cached_drafter(size).is_none() {
         logger.log(ServeLog::CheckpointDownloading {
             repo: size.repo(),
-            file: size.file(),
-            size: size.size(),
+            file,
+            size: size.drafter_size().unwrap_or("unknown size"),
         });
     }
-    let model = hub::ensure_model(size)
-        .with_context(|| format!("fetching the {size} checkpoint from the Hugging Face cache"))?;
-    let draft = settings
-        .draft
-        .as_ref()
-        .map(|_| {
-            if hub::cached_drafter(size).is_none() {
-                logger.log(ServeLog::CheckpointDownloading {
-                    repo: size.repo(),
-                    file: size.drafter_file(),
-                    size: size.drafter_size(),
-                });
-            }
-            hub::ensure_drafter(size)
-                .with_context(|| format!("fetching the {size} drafter sidecar"))
-        })
-        .transpose()?;
-    Ok((model, draft))
+    hub::ensure_drafter(size).with_context(|| format!("fetching the {size} drafter sidecar"))
 }
 
 impl EngineState {
     fn load(
         settings: &ServeSettings,
-        size: hub::Model,
-        default_size: hub::Model,
+        size: Target,
+        default_target: Target,
         logger: &ServeLogger,
     ) -> Result<Self> {
-        let (model_path, draft_path) = checkpoint_paths(settings, size, default_size, logger)?;
+        let (model_path, draft_path) = checkpoint_paths(settings, size, default_target, logger)?;
         let cfg = read_config(&model_path)?;
+        // A backstop, not the contract: startup already refused a `--model-size`
+        // that contradicts the served file, and every other path here resolved
+        // its file FROM the checkpoint. What is left to catch is a file that
+        // changed under a running server, so the message names both sides.
         ensure!(
-            cfg.arch.model() == size,
+            cfg.arch == size.model.arch(),
             "the file for the {size} checkpoint holds a {} model ({})",
-            cfg.arch.model(),
+            cfg.arch.key(),
             model_path.display()
         );
+        if let Some(held) = cfg.checkpoint(&model_path) {
+            ensure!(
+                held == size.model,
+                "the file for the {size} checkpoint holds {} ({})",
+                held.full_name(),
+                model_path.display()
+            );
+        }
         let (max_ctx, _) = resolve_context_length(settings.context_length, cfg.n_ctx_train)?;
         let device = gguf::metal_device()?;
         // Every job replaces this through `set_sampler`; the config defaults only cover
@@ -428,7 +560,7 @@ fn attach_drafter(
     device: &Device,
     path: &Path,
     settings: &ServeSettings,
-    size: hub::Model,
+    size: Target,
     max_ctx: usize,
     logger: &ServeLogger,
 ) -> Result<()> {
@@ -443,7 +575,7 @@ fn attach_drafter(
         drafter,
         SpecParams {
             draft_max: settings.draft_max,
-            draft_p_min: resolved_p_min(settings, size),
+            draft_p_min: resolved_p_min(settings, size.model),
             pause_margin: settings.draft_pause_margin,
             // Not exposed by the server: a round that drafts anything at all is worth
             // verifying, and the CLI agrees — this is its default too.
@@ -460,12 +592,20 @@ fn attach_drafter(
 /// The drafting floor for the checkpoint being loaded: the operator's pinned
 /// value when one was set, else the checkpoint's own fitted default. Unset is
 /// resolvable only here, at attach time — the merge cannot know which
-/// checkpoint a future job will name. Extracted from [`attach_drafter`] so the
-/// resolution is testable without a Metal device.
+/// checkpoint a future job will name.
+///
+/// The last fallback is `SpecParams::default().draft_p_min`, which is the
+/// 35B-A3B's fitted 0.3 — an arbitrary value for any other checkpoint, and it is
+/// only reachable one way: a custom `draft.path` attached to a checkpoint that
+/// ships no sidecar of its own, so no sweep ever fitted a floor for that pair.
+/// Nothing pretends otherwise; see the retune ledger item in TODO.md.
+/// Extracted from [`attach_drafter`] so the resolution is testable without a
+/// Metal device.
 fn resolved_p_min(settings: &ServeSettings, size: hub::Model) -> f32 {
     settings
         .draft_p_min
-        .unwrap_or_else(|| size.draft_p_min_default())
+        .or_else(|| size.draft_p_min_default())
+        .unwrap_or_else(|| SpecParams::default().draft_p_min)
 }
 
 /// Closes the queue and clears the model-loaded flag when the engine thread
@@ -489,7 +629,7 @@ impl Drop for EngineExitGuard {
 
 fn engine_loop(
     settings: ServeSettings,
-    default_size: hub::Model,
+    default_target: Target,
     jobs: Arc<JobQueue>,
     model_loaded: Arc<AtomicBool>,
     shutdown: Arc<Cancel>,
@@ -505,14 +645,17 @@ fn engine_loop(
     // rediscover what it already knows. `None` means no disk tier at all, which
     // every call site reads as "there is nothing stored".
     //
-    // The tier is bound to the DEFAULT checkpoint. While any other checkpoint is
-    // loaded every site below is handed `None` instead ([`disk_for`]): feeding it a
-    // foreign model's images would poison the store with bytes that claim the
-    // default binding, and verifying it against foreign weights would disable it
-    // for the rest of the process.
+    // The tier is bound to the SERVED FILE — `settings.model`, which is what it was
+    // opened and verified against. While anything else is loaded every site below is
+    // handed `None` instead ([`disk_for`]): feeding it a foreign model's images would
+    // poison the store with bytes that claim the served binding, and verifying it
+    // against foreign weights would disable it for the rest of the process. The
+    // comparison is against the whole target rather than its checkpoint, because on a
+    // custom-GGUF server the official checkpoint of the same architecture is a
+    // different file with the same name for sizing.
     let disk = DiskCache::open(&settings, &logger);
-    let disk_for = |size: hub::Model| -> Option<&DiskCache> {
-        if size == default_size {
+    let disk_for = |target: Target| -> Option<&DiskCache> {
+        if target == default_target {
             disk.as_ref()
         } else {
             None
@@ -643,7 +786,7 @@ fn engine_loop(
             &mut state,
             || {
                 let start = Instant::now();
-                let loaded = EngineState::load(&settings, required, default_size, &logger)
+                let loaded = EngineState::load(&settings, required, default_target, &logger)
                     .map_err(|e| JobFailure {
                         error: anyhow!("loading the model failed: {e:#}"),
                         request_fault: false,
@@ -1162,10 +1305,19 @@ fn run_batch_job(
     );
     let mut cancelled = || abandon.reason().is_some();
     let mut progress = |report: BatchProgress| logger.log(ServeLog::BatchProgress(report));
+    // The handler wrote the id this server answers under into the request; it is
+    // what the document must be labeled with, and the runner no longer re-derives
+    // it (a custom GGUF's id is no checkpoint's name).
+    let label = job
+        .request
+        .model
+        .clone()
+        .unwrap_or_else(|| job.model.model.full_name().to_string());
     let response = crate::batch::run_batch(
         &mut engine.generator,
         &job.request,
         load_ms,
+        &label,
         &mut BatchHooks {
             progress: &mut progress,
             cancelled: &mut cancelled,
@@ -5683,6 +5835,47 @@ mod tests {
     const DRAFT_TARGET_LAYERS: usize = 40;
     const DRAFT_TARGET_VOCAB: usize = 248320;
 
+    /// The 35B-A3B's shape, as much of it as the startup preflight reads: it
+    /// judges the DRAFTER against these, and never opens the target's weights.
+    fn draft_target_config() -> XwenConfig {
+        use crate::config::{Arch, LayerKind, RopeKind};
+        XwenConfig {
+            arch: Arch::Moe,
+            general_name: Some("Qwen3.6-35B-A3B".to_string()),
+            n_layer: DRAFT_TARGET_LAYERS,
+            hidden: DRAFT_TARGET_HIDDEN,
+            vocab: DRAFT_TARGET_VOCAB,
+            n_head: vec![16; DRAFT_TARGET_LAYERS],
+            n_kv_head: 2,
+            head_dim: 256,
+            layer_kind: (0..DRAFT_TARGET_LAYERS)
+                .map(|il| {
+                    if (il + 1).is_multiple_of(4) {
+                        LayerKind::Full
+                    } else {
+                        LayerKind::Linear
+                    }
+                })
+                .collect(),
+            linear_k_heads: 16,
+            linear_v_heads: 32,
+            linear_head_dim: 128,
+            conv_kernel: 4,
+            dense_ff: 0,
+            n_expert: 256,
+            n_expert_used: 8,
+            expert_ff: 512,
+            shared_expert_ff: 512,
+            rms_eps: 1e-6,
+            n_ctx_train: 262_144,
+            rope: RopeKind::Plain {
+                freq_base: 1e7,
+                n_rot: 64,
+            },
+            eog_tokens: vec![248046, 248044],
+        }
+    }
+
     fn draft_config() -> DflashConfig {
         DflashConfig {
             n_layer: 6,
@@ -5728,6 +5921,66 @@ mod tests {
             .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("2048") && text.contains("5120"), "{text}");
+
+        // And that serve actually RUNS it at startup, on the drafter it picked.
+        // A path that is not a GGUF stands in for a drafter that does not fit:
+        // both fail the same read, and what is pinned here is that the failure
+        // happens during `validate_model` rather than inside the first job.
+        let dir = std::env::temp_dir().join(format!("xwen_preflight_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bogus = dir.join("not-a-drafter.gguf");
+        std::fs::write(&bogus, b"not a gguf at all").unwrap();
+        let mut settings = crate::serve::testutil::settings();
+        settings.draft = DraftMode::Custom(bogus.clone());
+        let refused = validate_model(
+            &settings,
+            &draft_target_config(),
+            Target::official(hub::Model::Qwen35BA3B),
+            &ServeLogger::discarding(),
+        );
+        // `LagunaTokenizer` is not Debug, so the Ok side cannot be unwrapped by
+        // `expect_err`; the error is what this test is about either way.
+        let Err(err) = refused else {
+            panic!("a drafter that cannot be read must be a startup error");
+        };
+        let text = format!("{err:#}");
+        assert!(text.contains("validating the drafter"), "{text}");
+        assert!(text.contains("not-a-drafter.gguf"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// WHICH drafter startup can judge. The official sidecar of the checkpoint
+    /// being served is judged too, not just a custom path: "official" does not
+    /// mean "fits" — a custom GGUF served as its architecture's checkpoint gets
+    /// that checkpoint's sidecar, and a geometry mismatch there would otherwise
+    /// surface as every request failing at attach, forever, behind the job
+    /// boundary. Any OTHER checkpoint's sidecar cannot be judged at startup: it
+    /// may not be downloaded yet, and it is checked when it attaches.
+    #[test]
+    fn startup_judges_the_served_checkpoints_own_drafter() {
+        let mut settings = crate::serve::testutil::settings();
+        let served = Target::official(hub::Model::Qwen27B);
+
+        settings.draft = DraftMode::Off;
+        assert_eq!(startup_drafter(&settings, served), None);
+
+        let custom = std::path::PathBuf::from("/drafters/mine.gguf");
+        settings.draft = DraftMode::Custom(custom.clone());
+        assert_eq!(startup_drafter(&settings, served), Some(custom));
+
+        // A checkpoint that ships no sidecar has nothing to preflight, whatever
+        // other checkpoints happen to be in the cache — which is also what keeps
+        // this assertion independent of the machine running it.
+        settings.draft = DraftMode::Official;
+        assert_eq!(
+            startup_drafter(&settings, Target::official(hub::Model::Qwen3827B)),
+            None
+        );
+        // And when there is one, it is the SERVED checkpoint's, not another's.
+        assert_eq!(
+            startup_drafter(&settings, served),
+            hub::cached_drafter(hub::Model::Qwen27B)
+        );
     }
 
     /// The per-request speculation report: made once, and only when speculation was
@@ -6261,16 +6514,23 @@ mod tests {
         let mut settings = crate::serve::testutil::settings();
         settings.draft_p_min = None;
         assert_eq!(
-            resolved_p_min(&settings, hub::Model::Qwen27B),
+            Some(resolved_p_min(&settings, hub::Model::Qwen27B)),
             hub::Model::Qwen27B.draft_p_min_default()
         );
         assert_eq!(
-            resolved_p_min(&settings, hub::Model::Qwen35BA3B),
+            Some(resolved_p_min(&settings, hub::Model::Qwen35BA3B)),
             hub::Model::Qwen35BA3B.draft_p_min_default()
+        );
+        // A checkpoint that ships no sidecar has no fitted floor to fall back
+        // to, so an unset knob lands on the shared base rather than on nothing.
+        assert_eq!(
+            resolved_p_min(&settings, hub::Model::Qwen3827B),
+            SpecParams::default().draft_p_min
         );
         settings.draft_p_min = Some(0.42);
         assert_eq!(resolved_p_min(&settings, hub::Model::Qwen27B), 0.42);
         assert_eq!(resolved_p_min(&settings, hub::Model::Qwen35BA3B), 0.42);
+        assert_eq!(resolved_p_min(&settings, hub::Model::Qwen3827B), 0.42);
     }
 
     /// The ceiling grows with both the prompt and the reply budget, so spans

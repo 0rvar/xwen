@@ -81,7 +81,7 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { DRAFT_PROMPTS } from "./lib/draft-prompts";
-import { CHECKPOINTS, officialDrafter, officialModel, type ModelSize } from "./hf";
+import { CHECKPOINTS, draftingSizes, officialDrafter, officialModel, type ModelSize } from "./hf";
 
 const ROOT = resolve(import.meta.dir, "..");
 
@@ -108,8 +108,26 @@ const N_TOKENS = 128;
  * stage 2 always grades this margin so "keep the current value" is a measured
  * option; a tie resolves toward these; and a checkpoint with no winner is
  * reported as keeping them, which is what the conflict check compares.
+ *
+ * Only the checkpoints that ship a DFlash sidecar have an arm here, because
+ * only they have a drafted arm to grade: `both` means those (`draftingSizes`),
+ * and naming a sidecar-less checkpoint outright dies at the drafter check
+ * before any run. Qwen3.8-27B is the one without (TODO.md: its MTP sidecar).
  */
-const SHIPPED_P_MIN: Record<ModelSize, number> = { "27b": 0.5, "35b": 0.3 };
+const SHIPPED_P_MIN: Partial<Record<ModelSize, number>> = { "27b": 0.5, "35b": 0.3 };
+
+/** The shipped floor for a size this sweep is allowed to grade. Every caller is
+ *  already past the drafter guard in `main`, which refuses a sidecar-less
+ *  checkpoint before any arm is planned; this turns "then the table has it" from
+ *  an assumption into a checked one, rather than printing `undefined` into a
+ *  command line. */
+function shippedPMin(size: ModelSize): number {
+  const value = SHIPPED_P_MIN[size];
+  if (value === undefined) {
+    die(`no shipped draft_p_min for ${size} — it ships no drafter, so there is nothing to grade.`);
+  }
+  return value;
+}
 const SHIPPED_MARGIN = 1.0;
 /** The never-pause diagnostic arm, always present in stage 2. */
 const NEVER_PAUSE_MARGIN = 0;
@@ -200,9 +218,11 @@ function parseArgs(argv: string[]): Opts {
   };
 
   const sizeArg = flags["model-size"] === undefined ? "both" : String(flags["model-size"]).toLowerCase();
+  // `both` means the checkpoints that can speculate at all — a release with no
+  // DFlash sidecar has no floor to fit and no drafted arm to fit it against.
   const sizes: ModelSize[] =
     sizeArg === "both"
-      ? (Object.keys(CHECKPOINTS) as ModelSize[])
+      ? draftingSizes()
       : sizeArg in CHECKPOINTS
         ? [sizeArg as ModelSize]
         : die(`--model-size must be ${Object.keys(CHECKPOINTS).join("|")}|both, got ${JSON.stringify(sizeArg)}`);
@@ -837,7 +857,7 @@ function printCellTable(stage: 1 | 2, size: ModelSize, cells: Cell[], arms: Arm[
  *  shared value would break the tie toward a setting the checkpoint does not
  *  actually ship with. */
 const shippedValueFor = (stage: 1 | 2, size: ModelSize) =>
-  stage === 1 ? SHIPPED_P_MIN[size] : SHIPPED_MARGIN;
+  stage === 1 ? shippedPMin(size) : SHIPPED_MARGIN;
 const armValue = (stage: 1 | 2, a: Arm) => (stage === 1 ? a.pMin : a.margin);
 
 /**
@@ -949,7 +969,7 @@ function planRuns(opts: Opts): PlannedRun[] {
       const arms =
         stage === 1
           ? stage1Arms(opts.pMinGrid)
-          : stage2Arms(stage1Runs ? null : SHIPPED_P_MIN[size], opts.marginGrid);
+          : stage2Arms(stage1Runs ? null : shippedPMin(size), opts.marginGrid);
       const cells: { prompt: string; arm: Arm }[] = [];
       for (const prompt of PROMPT_KINDS) for (const arm of arms) cells.push({ prompt, arm });
       for (let rep = 1; rep <= opts.reps; rep++) {
@@ -976,7 +996,7 @@ function printDryRun(opts: Opts): void {
       opts.stages.includes(1)
         ? "stage 2 p_min prints as <stage1-winner> — it is stage 1's winner, unknown until stage 1 runs"
         : `stage 2 p_min is each checkpoint's shipped default (${opts.sizes
-            .map((s) => `${s} ${SHIPPED_P_MIN[s]}`)
+            .map((s) => `${s} ${shippedPMin(s)}`)
             .join(", ")}) — --stage 2 skips the p_min sweep`,
     );
   }
@@ -1056,7 +1076,7 @@ function printRecommendation(rec: Map<ModelSize, Recommendation>): void {
   // between two checkpoints that each kept their own default (or hide a real
   // one).
   const effective = (size: ModelSize, r: Recommendation) => ({
-    p: r.pMin ?? SHIPPED_P_MIN[size],
+    p: r.pMin ?? shippedPMin(size),
     m: r.margin ?? SHIPPED_MARGIN,
   });
   const pMins = new Set(usable.map(([size, r]) => effective(size, r).p));
@@ -1109,6 +1129,16 @@ function printRecommendation(rec: Map<ModelSize, Recommendation>): void {
 async function main(): Promise<void> {
   OPTS = parseArgs(process.argv.slice(2));
 
+  // Before the dry run too, not just before a real one: a checkpoint with no
+  // sidecar has no drafted arm and no fitted floor, so its "planned matrix"
+  // would print arms at `--draft-p-min undefined` — a matrix nothing could run,
+  // which is exactly what a dry run exists to rule out.
+  for (const size of OPTS.sizes) {
+    if (!CHECKPOINTS[size].drafter) {
+      die(`${size} ships no DFlash drafter sidecar, so there is no drafted arm to sweep.`);
+    }
+  }
+
   if (OPTS.dryRun) {
     printDryRun(OPTS);
     return;
@@ -1137,10 +1167,12 @@ async function main(): Promise<void> {
     } catch (e) {
       die(String((e as Error).message));
     }
+    // Refused above, before the dry run; named again here for the message.
+    const drafter = CHECKPOINTS[size].drafter!;
     if (!officialDrafter(size)) {
       die(
         `the DFlash drafter for ${size} is not in the Hugging Face cache ` +
-          `(${CHECKPOINTS[size].drafter}); run \`xwen fetch --model-size ${size}\`. ` +
+          `(${drafter}); run \`xwen fetch --model-size ${size}\`. ` +
           `Every drafted arm needs it.`,
       );
     }
@@ -1175,7 +1207,7 @@ async function main(): Promise<void> {
   // The status quo every verdict is measured against, printed so a stale mirror
   // of src/hub.rs is visible at the top of the run rather than inferred later.
   console.log(
-    `shipped  draft_p_min ${OPTS.sizes.map((s) => `${s} ${SHIPPED_P_MIN[s]}`).join(", ")}, ` +
+    `shipped  draft_p_min ${OPTS.sizes.map((s) => `${s} ${shippedPMin(s)}`).join(", ")}, ` +
       `pause_margin ${fmtVal(SHIPPED_MARGIN)} (mirrors Model::draft_p_min_default, src/hub.rs)`,
   );
   console.log(`hf cache ${HF_CACHE_ROOT}`);
@@ -1215,8 +1247,8 @@ async function main(): Promise<void> {
     // would tune the margin around a drafting depth the 27B does not ship.
     let marginPMin = winnerPMin;
     if (OPTS.stages.includes(2) && marginPMin === null) {
-      marginPMin = SHIPPED_P_MIN[size];
-      console.log(`\n  stage 2 runs at ${size}'s shipped p_min ${SHIPPED_P_MIN[size]} (no stage-1 winner to carry).`);
+      marginPMin = shippedPMin(size);
+      console.log(`\n  stage 2 runs at ${size}'s shipped p_min ${shippedPMin(size)} (no stage-1 winner to carry).`);
     }
 
     let winnerMargin: number | null = null;

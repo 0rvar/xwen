@@ -131,7 +131,10 @@ const TEMPLATE_MODEL: crate::hub::Model = crate::hub::Model::Qwen35BA3B;
 /// figure is per-model — the 27B sidecar has five layers to the 35B-A3B's six —
 /// and lives on `hub::Model` beside the target's. It informs a `--init` comment
 /// and nothing that allocates.
-const DRAFT_KV_BYTES_PER_TOKEN: usize = TEMPLATE_MODEL.draft_kv_bytes_per_token();
+const DRAFT_KV_BYTES_PER_TOKEN: usize = match TEMPLATE_MODEL.draft_kv_bytes_per_token() {
+    Some(bytes) => bytes,
+    None => panic!("the template model ships a drafter, so its cache has a size"),
+};
 
 /// Config path used when `--config` is not given.
 pub const CONFIG_RELATIVE_PATH: &str = ".config/xwen/serve.toml";
@@ -328,10 +331,55 @@ pub struct CacheToml {
     pub slots: Option<usize>,
 }
 
+/// The symbolic drafter path meaning "each checkpoint's own official sidecar" —
+/// what `--draft official` and `path = "official"` spell, and the name the CLI
+/// documents as the default.
+pub const OFFICIAL_DRAFTER: &str = "official";
+
+/// How this server speculates, as the merge resolves it.
+///
+/// A mode rather than a path because one server loads whichever checkpoint a
+/// request names, and "the official sidecar" is a different file for each of
+/// them — the checkpoint has to be known before the drafter can be. Collapsing
+/// this to one resolved path is what made a server whose DEFAULT checkpoint
+/// ships no sidecar run every OTHER checkpoint plain as well, silently.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DraftMode {
+    /// `--no-draft`, or `enabled = false`: nothing speculates, whatever is
+    /// loaded.
+    Off,
+    /// The default: each checkpoint drafts with its own official sidecar,
+    /// resolved (and fetched) when that checkpoint loads. One that ships none
+    /// decodes plain, with a line saying so.
+    #[default]
+    Official,
+    /// A custom drafter GGUF. It belongs to the checkpoint it was validated
+    /// against — the default one — and never transfers, so any other checkpoint
+    /// this server loads speculates with its own official sidecar instead.
+    Custom(PathBuf),
+}
+
+impl DraftMode {
+    /// Whether this server speculates at all. Not whether the checkpoint that
+    /// is loaded right now does: that also depends on whether it ships a
+    /// sidecar, which only the engine knows.
+    pub fn is_on(&self) -> bool {
+        !matches!(self, DraftMode::Off)
+    }
+
+    /// The custom drafter GGUF, when one was named.
+    pub fn custom_path(&self) -> Option<&Path> {
+        match self {
+            DraftMode::Custom(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
 /// Speculative decoding with a DFlash drafter. Opt-out: on unless
 /// `enabled = false`, which decodes one token per target forward even when a
-/// `path` is set. `path` names a custom drafter; without it the official
-/// sidecar for the checkpoint is used.
+/// `path` is set. `path` names a custom drafter; without it each checkpoint's
+/// own official sidecar is used.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DraftToml {
@@ -443,12 +491,12 @@ pub struct ServeSettings {
     pub cache_snapshots: usize,
     /// Conversations kept warm at once, at least 1.
     pub cache_slots: usize,
-    /// DFlash drafter to speculate with, or `None` for plain one-token-per-forward
-    /// decode. Speculation is opt-out, so the resolved default is the symbolic
-    /// path `official` — the caller maps it to the hub-cached official drafter
-    /// (resolution stays out of the merge, which is pure). The settings below
-    /// apply only when it is set.
-    pub draft: Option<PathBuf>,
+    /// How this server speculates. Speculation is opt-out, so the resolved
+    /// default is [`DraftMode::Official`] — which sidecar that is depends on the
+    /// checkpoint, so the resolution stays out of the merge (which is pure) and
+    /// out of the settings: one server loads whichever checkpoint a request
+    /// names. The settings below apply to whatever drafter ends up attached.
+    pub draft: DraftMode,
     pub draft_max: usize,
     /// The drafting confidence floor, or `None` for each checkpoint's own
     /// fitted default ([`crate::hub::Model::draft_p_min_default`]) — resolved
@@ -827,13 +875,18 @@ pub fn resolve(
                 origin,
                 &mut warnings,
             );
-            // Enabled with no path named means the official drafter, expressed
-            // as the symbolic path `official` so the merge stays pure — the
-            // caller resolves it against the Hugging Face cache.
-            if enabled {
-                path.or_else(|| Some(PathBuf::from("official")))
-            } else {
-                None
+            // Enabled with no path named means each checkpoint's own official
+            // sidecar, which the engine resolves against the Hugging Face cache
+            // when that checkpoint loads — the merge stays pure and, more to the
+            // point, stays out of a decision that depends on which checkpoint a
+            // request names. The literal `official` is the symbolic spelling of
+            // that same default, and stays spellable so a config file (or
+            // `--draft official`) can restate it.
+            match (enabled, path) {
+                (false, _) => DraftMode::Off,
+                (true, Some(path)) if path == Path::new(OFFICIAL_DRAFTER) => DraftMode::Official,
+                (true, Some(path)) => DraftMode::Custom(path),
+                (true, None) => DraftMode::Official,
             }
         },
         draft_max: pick(
@@ -1141,7 +1194,12 @@ pub fn init_template() -> String {
     let draft_max = DEFAULT_DRAFT_MAX;
     // Per-checkpoint, like the cache sizes above: quoted (commented out) for
     // the model the template names.
-    let draft_p_min = format!("{:?}", TEMPLATE_MODEL.draft_p_min_default());
+    let draft_p_min = format!(
+        "{:?}",
+        TEMPLATE_MODEL
+            .draft_p_min_default()
+            .expect("the template model ships a drafter, and so a fitted floor")
+    );
     let draft_pause_margin = format!("{:?}", DEFAULT_DRAFT_PAUSE_MARGIN);
     let draft_enabled = DEFAULT_DRAFT_ENABLED;
     let draft_ctx = DEFAULT_DRAFT_CTX;
@@ -1491,7 +1549,7 @@ mod tests {
         assert_eq!(s.disk_min_tokens, DEFAULT_DISK_MIN_TOKENS);
         // Speculation is opt-out: a zero-flag server speculates with the
         // official sidecar, named symbolically for the caller to resolve.
-        assert_eq!(s.draft, Some(PathBuf::from("official")));
+        assert_eq!(s.draft, DraftMode::Official);
         assert_eq!(s.draft_max, DEFAULT_DRAFT_MAX);
         // Unresolved on purpose: the floor is fitted per checkpoint, and which
         // checkpoint is only known when the engine attaches the drafter.
@@ -1534,7 +1592,10 @@ mod tests {
         .unwrap();
         let (from_file, warnings) =
             resolve(&file, Some(Path::new("/etc/serve.toml")), &model_only()).unwrap();
-        assert_eq!(from_file.draft, Some(PathBuf::from("/from-config.gguf")));
+        assert_eq!(
+            from_file.draft,
+            DraftMode::Custom(PathBuf::from("/from-config.gguf"))
+        );
         assert_eq!(from_file.draft_max, 8);
         assert_eq!(from_file.draft_p_min, Some(0.25));
         assert_eq!(from_file.draft_pause_margin, 0.0);
@@ -1550,7 +1611,10 @@ mod tests {
             ..model_only()
         };
         let (merged, warnings) = resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
-        assert_eq!(merged.draft, Some(PathBuf::from("/from-cli.gguf")));
+        assert_eq!(
+            merged.draft,
+            DraftMode::Custom(PathBuf::from("/from-cli.gguf"))
+        );
         assert_eq!(merged.draft_max, 4);
         assert_eq!(merged.draft_p_min, Some(0.75));
         assert_eq!(merged.draft_pause_margin, 2.0);
@@ -1576,7 +1640,10 @@ mod tests {
             ..model_only()
         };
         let (settings, warnings) = resolve(&ServeToml::default(), None, &cli).unwrap();
-        assert_eq!(settings.draft, Some(PathBuf::from("/only-cli.gguf")));
+        assert_eq!(
+            settings.draft,
+            DraftMode::Custom(PathBuf::from("/only-cli.gguf"))
+        );
         assert_eq!(settings.draft_max, DEFAULT_DRAFT_MAX);
         assert!(warnings.is_empty());
     }
@@ -1591,19 +1658,19 @@ mod tests {
         // Nothing named, nothing enabled: the official drafter, by default.
         let empty: ServeToml = toml::from_str("").unwrap();
         let (settings, warnings) = resolve(&empty, None, &model_only()).unwrap();
-        assert_eq!(settings.draft, Some(PathBuf::from("official")));
+        assert_eq!(settings.draft, DraftMode::Official);
         assert!(warnings.is_empty());
 
         // `enabled = true` restates the default and means the same drafter.
         let file: ServeToml = toml::from_str("[draft]\nenabled = true\n").unwrap();
         let (settings, _) = resolve(&file, None, &model_only()).unwrap();
-        assert_eq!(settings.draft, Some(PathBuf::from("official")));
+        assert_eq!(settings.draft, DraftMode::Official);
 
         // A config path picks a custom drafter, and enables on its own whichever
         // way the default is set.
         let file: ServeToml = toml::from_str("[draft]\npath = \"/d.gguf\"\n").unwrap();
         let (settings, _) = resolve(&file, None, &model_only()).unwrap();
-        assert_eq!(settings.draft, Some(PathBuf::from("/d.gguf")));
+        assert_eq!(settings.draft, DraftMode::Custom(PathBuf::from("/d.gguf")));
 
         // So is `--draft` on the command line.
         let cli = CliOverrides {
@@ -1612,7 +1679,10 @@ mod tests {
             ..model_only()
         };
         let (settings, _) = resolve(&empty, None, &cli).unwrap();
-        assert_eq!(settings.draft, Some(PathBuf::from("/cli.gguf")));
+        assert_eq!(
+            settings.draft,
+            DraftMode::Custom(PathBuf::from("/cli.gguf"))
+        );
     }
 
     /// `--no-draft` and `[draft] enabled = false` both resolve to no drafter,
@@ -1623,7 +1693,7 @@ mod tests {
     fn no_draft_disables_speculation() {
         let file: ServeToml = toml::from_str("[draft]\nenabled = false\n").unwrap();
         let (settings, warnings) = resolve(&file, None, &model_only()).unwrap();
-        assert_eq!(settings.draft, None);
+        assert_eq!(settings.draft, DraftMode::Off);
         assert!(warnings.is_empty());
 
         // The switch beats a config that names a drafter path: enabled is the
@@ -1635,13 +1705,13 @@ mod tests {
         };
         let (settings, warnings) =
             resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
-        assert_eq!(settings.draft, None);
+        assert_eq!(settings.draft, DraftMode::Off);
         assert!(warnings.is_empty());
 
         let file: ServeToml = toml::from_str("[draft]\nenabled = true\n").unwrap();
         let (settings, warnings) =
             resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
-        assert_eq!(settings.draft, None);
+        assert_eq!(settings.draft, DraftMode::Off);
         assert_eq!(
             warnings,
             vec![
@@ -1663,7 +1733,10 @@ mod tests {
         };
         let (settings, warnings) =
             resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
-        assert_eq!(settings.draft, Some(PathBuf::from("/custom.gguf")));
+        assert_eq!(
+            settings.draft,
+            DraftMode::Custom(PathBuf::from("/custom.gguf"))
+        );
         assert_eq!(
             warnings,
             vec![

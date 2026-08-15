@@ -1015,23 +1015,24 @@ impl SseEncoder for ChunkStream {
 // ---------------------------------------------------------------- handler ---
 
 pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Response {
-    let request: ChatRequest = match serde_json::from_slice(&body) {
+    let mut request: ChatRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(e) => {
             return bad_request(format!("could not parse the request body: {e}")).into_response();
         }
     };
-    // A model string the CLIENT sent that names a known checkpoint
-    // ("27b"/"35b") selects it; anything else — SDK defaults included — runs
-    // on the server's default. Read before `prepare` substitutes the served
-    // GGUF's basename for an absent field: a file someone named `35b.gguf`
-    // must not route model-less requests by its name. The response still
-    // echoes whatever the client sent, exactly as before.
-    let size = request
-        .model
-        .as_deref()
-        .and_then(|name| name.parse::<crate::hub::Model>().ok())
-        .unwrap_or(state.default_size);
+    // Full names only, and an unknown one is a 400 — see `resolve_requested_model`.
+    let (size, model_name) = match super::resolve_requested_model(
+        request.model.as_deref(),
+        state.default_target,
+        &state.model_id,
+    ) {
+        Ok(resolved) => resolved,
+        Err(message) => return bad_request(message).into_response(),
+    };
+    // The response echoes the canonical name of the model that answered, not
+    // the client's spelling of it.
+    request.model = Some(model_name);
     let prepared = match prepare(request, &state.settings, &state.model_id) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
@@ -1928,11 +1929,16 @@ mod tests {
         assert_eq!(asked.job.sampling.seed, 1234);
     }
 
+    /// `prepare` echoes the `model` string it is handed, and the handler is what
+    /// decides that string: it resolves the client's name to a checkpoint this
+    /// server serves and writes the CANONICAL spelling back before preparing, so
+    /// a name that could not resolve never reaches here (it was a 400). The two
+    /// cases left for `prepare` are the canonical name and an absent field.
     #[test]
-    fn the_requests_model_string_is_echoed_verbatim() {
+    fn the_model_prepare_is_handed_is_the_one_echoed() {
         assert_eq!(
-            prepared(&format!(r#"{{"model":"gpt-4o",{USER}}}"#)).model,
-            "gpt-4o"
+            prepared(&format!(r#"{{"model":"Qwen3.8-27B",{USER}}}"#)).model,
+            "Qwen3.8-27B"
         );
         assert_eq!(prepared(&format!(r#"{{{USER}}}"#)).model, "laguna-s-2.1");
     }

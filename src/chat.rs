@@ -3,6 +3,24 @@
 //! turns, `<think>` reasoning blocks, a `# Tools` system preamble, and tool
 //! calls written as `<tool_call><function=NAME><parameter=KEY>…`.
 //! Rendered text must match `llama-server --jinja` byte-for-byte (fixtures).
+//!
+//! One renderer serves every checkpoint. Qwen 3.8 ships its own template
+//! (vendored beside the 3.6 one as reference/chat_template-qwen38.jinja) whose
+//! turn rendering and generation prompt are byte-identical to 3.6's. Two of its
+//! differences are live divergences rather than deferrals, and are ledger items
+//! (TODO.md), not accidents:
+//!
+//! - it prepends a `reasoning_effort` sentence to the system block whenever
+//!   thinking is on and no effort is named, which is the DEFAULT — so what this
+//!   module renders for 3.8 equals the official rendering at
+//!   `reasoning_effort="medium"` (the one level that injects nothing) and is
+//!   missing a system instruction at the real default, `xhigh`;
+//! - it defaults `preserve_thinking` to true where 3.6 defaults it to false, so
+//!   a 3.8 conversation rendered here drops reasoning blocks its own template
+//!   would have kept.
+//!
+//! The third difference — no inline `<think>`-in-content parsing — costs
+//! nothing, since this module never implemented that fallback.
 use std::fmt;
 use std::ops::Range;
 
@@ -715,9 +733,15 @@ mod tests {
     use crate::tokenizer::LagunaTokenizer;
     use serde_json::json;
 
-    /// The vendored template, so the fixed prose this module reproduces can be
-    /// checked against its source rather than against itself.
-    const TEMPLATE_SOURCE: &str = include_str!("../reference/chat_template.jinja");
+    /// The vendored templates, so the fixed prose this module reproduces can be
+    /// checked against its source rather than against itself. One per release:
+    /// Qwen 3.8 ships a different template (a `reasoning_effort` preamble, a
+    /// flipped `preserve_thinking` default, no inline `<think>` parsing), and
+    /// what this module renders has to stay the prose of both.
+    const TEMPLATE_SOURCES: [&str; 2] = [
+        include_str!("../reference/chat_template.jinja"),
+        include_str!("../reference/chat_template-qwen38.jinja"),
+    ];
 
     fn thinking(on: bool) -> ChatOptions {
         ChatOptions {
@@ -821,9 +845,10 @@ mod tests {
         )
     }
 
-    /// The fixed prose is the template's own, character for character. The
-    /// template stores it as jinja string literals whose only escape is `\n`,
-    /// so re-escaping the constants reproduces the source text.
+    /// The fixed prose is the template's own, character for character, in every
+    /// release that ships one. The template stores it as jinja string literals
+    /// whose only escape is `\n`, so re-escaping the constants reproduces the
+    /// source text.
     #[test]
     fn the_fixed_prose_is_the_templates_own() {
         // Lengths as well as content: a constant that had lost its tail would
@@ -831,11 +856,44 @@ mod tests {
         for (literal, length) in [(TOOLS_HEADER, 61), (TOOLS_FORMAT_INSTRUCTIONS, 817)] {
             assert_eq!(literal.len(), length);
             let escaped = literal.replace('\n', "\\n");
-            assert!(
-                TEMPLATE_SOURCE.contains(&escaped),
-                "the template does not contain {escaped:?}"
-            );
+            for source in TEMPLATE_SOURCES {
+                assert!(
+                    source.contains(&escaped),
+                    "a vendored template does not contain {escaped:?}"
+                );
+            }
         }
+    }
+
+    /// The generation prompt is the same in both releases, which is why one
+    /// hand-written renderer serves every checkpoint: 3.8 rewrote how thinking
+    /// is preserved and added a reasoning-effort preamble, but the turn the
+    /// model is handed to continue still opens an unclosed `<think>` block, and
+    /// still closes an empty one when thinking is off. The block is compared
+    /// whole, so a release that changed one line of it fails here rather than
+    /// at a checkpoint's first reply.
+    #[test]
+    fn both_releases_open_the_generation_prompt_the_same_way() {
+        const MARKER: &str = "{%- if add_generation_prompt %}";
+        let blocks: Vec<&str> = TEMPLATE_SOURCES
+            .iter()
+            .map(|source| {
+                let start = source
+                    .find(MARKER)
+                    .expect("every template writes a generation prompt");
+                &source[start..]
+            })
+            .collect();
+        assert!(blocks[0].contains("'<think>\\n'"), "{}", blocks[0]);
+        assert!(
+            blocks[0].contains("'<think>\\n\\n</think>\\n\\n'"),
+            "{}",
+            blocks[0]
+        );
+        assert_eq!(
+            blocks[0], blocks[1],
+            "the releases disagree about the generation prompt"
+        );
     }
 
     // (1) The simplest conversation there is, with thinking on: one user turn

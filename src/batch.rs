@@ -102,8 +102,10 @@ pub const BATCH_SAMPLING: SamplerOptions = SamplerOptions {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchRequest {
-    /// Which checkpoint to run (`27b` / `35b`). The model comes from the payload
-    /// rather than a flag: one request is one model's work.
+    /// Which checkpoint to run — a full name ("Qwen3.6-35B-A3B"), or on the CLI
+    /// also a short alias ("35b"). The model comes from the payload rather than
+    /// a flag: one request is one model's work. Over HTTP the full name is the
+    /// only spelling accepted; see `serve::batch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Text prepended verbatim to the content of every item's FIRST message.
@@ -425,15 +427,21 @@ const CANCELLED: &str = "the batch was cancelled before this item completed";
 /// Run a whole batch on `generator`, which must already be loaded (and, if the run
 /// wants speculation, have its drafter attached). `load_ms` is what that load
 /// cost, for the stats block.
+///
+/// `label` is the name the response document reports as its model. The caller
+/// passes it rather than the runner re-deriving it from the request, because the
+/// caller is the one that resolved which weights are actually loaded: over HTTP
+/// that is the id the server answers under, which for a GGUF that is none of the
+/// official checkpoints is its own file name and not a checkpoint's.
 pub fn run_batch(
     generator: &mut Generator,
     req: &BatchRequest,
     load_ms: f64,
+    label: &str,
     hooks: &mut BatchHooks<'_>,
 ) -> Result<BatchResponse> {
     let started = Instant::now();
     ensure!(!req.items.is_empty(), "batch: the request holds no items");
-    let model = req.model()?;
     let max_ctx = generator.max_ctx();
 
     // The generator may be long-lived (the server's engine) and arrive with
@@ -574,7 +582,9 @@ pub fn run_batch(
 
     let prefill = generator.prefill_spend();
     Ok(BatchResponse {
-        model: model.to_string(),
+        // What actually ran, under the name it answers to — the same spelling
+        // `/v1/models` lists and the request field selects by.
+        model: label.to_string(),
         stats: BatchStats {
             shared_prefix_tokens: shared_len,
             snapshot_ms,
@@ -2144,7 +2154,7 @@ mod tests {
     #[test]
     fn a_request_round_trips() {
         let text = r#"{
-            "model": "35b",
+            "model": "Qwen3.6-35B-A3B",
             "defaults": { "max_tokens": 512, "sampling": { "temperature": 0 }, "thinking": false },
             "items": [
                 { "id": "sentiment",
@@ -2163,7 +2173,7 @@ mod tests {
             ]
         }"#;
         let request: BatchRequest = serde_json::from_str(text).unwrap();
-        assert_eq!(request.model.as_deref(), Some("35b"));
+        assert_eq!(request.model.as_deref(), Some("Qwen3.6-35B-A3B"));
         assert_eq!(request.model().unwrap(), Model::Qwen35BA3B);
         assert_eq!(request.items.len(), 2);
         assert_eq!(
@@ -2193,7 +2203,7 @@ mod tests {
     #[test]
     fn a_response_round_trips() {
         let response = BatchResponse {
-            model: "35b".into(),
+            model: "Qwen3.6-35B-A3B".into(),
             items: vec![
                 ItemResponse {
                     id: "sentiment".into(),
@@ -2233,13 +2243,30 @@ mod tests {
         assert!(!text.contains("\"error\":null"));
     }
 
+    /// The CLI reads the document's `model` in the CLI's own vocabulary: the
+    /// short aliases and the full names alike, so a document answered by an
+    /// OFFICIAL checkpoint can be resubmitted unedited — the server labels those
+    /// with the full name, which parses here.
+    ///
+    /// That round trip does not hold for a server started on a GGUF that is none
+    /// of the official checkpoints: it labels its answers with that file's own
+    /// id, which names no checkpoint and so does not parse. Resubmitting such a
+    /// document to the CLI needs `-m <that file>` and the field dropped, which
+    /// is the honest outcome — the alternative would be a label claiming an
+    /// official checkpoint ran.
     #[test]
     fn the_model_comes_from_the_payload() {
         let mut request: BatchRequest = serde_json::from_str(r#"{ "items": [] }"#).unwrap();
         assert_eq!(request.model().unwrap(), Model::default());
         request.model = Some("27b".into());
         assert_eq!(request.model().unwrap(), Model::Qwen27B);
+        request.model = Some("Qwen3.8-27B".into());
+        assert_eq!(request.model().unwrap(), Model::Qwen3827B);
         request.model = Some("13b".into());
+        assert!(request.model().is_err());
+        // A custom server's own label is not a checkpoint name, and says so
+        // rather than resolving to something plausible.
+        request.model = Some("my-finetune-Q4_K_M".into());
         assert!(request.model().is_err());
     }
 

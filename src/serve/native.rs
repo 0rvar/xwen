@@ -492,20 +492,20 @@ pub(crate) async fn generate(State(state): State<AppState>, body: Bytes) -> Resp
 
     // This endpoint carries no model name by design; it runs on the default
     // checkpoint. The batch endpoint is the native surface that names one.
-    let (mut events, guard) = match submit(&state, job, Dialect::Native, stream, state.default_size)
-    {
-        Ok(submitted) => submitted,
-        Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
-        Err(SubmitError::Overloaded) => return overloaded().into_response(),
-        Err(SubmitError::EngineGone) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                "the inference engine is not running",
-            )
-            .into_response();
-        }
-    };
+    let (mut events, guard) =
+        match submit(&state, job, Dialect::Native, stream, state.default_target) {
+            Ok(submitted) => submitted,
+            Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
+            Err(SubmitError::Overloaded) => return overloaded().into_response(),
+            Err(SubmitError::EngineGone) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "the inference engine is not running",
+                )
+                .into_response();
+            }
+        };
 
     if stream {
         return sse_response(events, guard, GenerationStream::new(id, model));

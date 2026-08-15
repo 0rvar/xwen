@@ -35,12 +35,12 @@ pub enum LayerKind {
     Linear,
 }
 
-/// Which of the two checkpoints this is. The only structural difference is the
-/// FFN: `qwen35` is dense SwiGLU on every layer, `qwen35moe` is MoE on every
-/// layer. Attention, DeltaNet and norms are shared.
+/// Which graph a checkpoint holds. The only structural difference is the FFN:
+/// `qwen35` is dense SwiGLU on every layer, `qwen35moe` is MoE on every layer.
+/// Attention, DeltaNet and norms are shared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
-    /// Qwen3.6-27B — dense FFN.
+    /// Dense FFN — Qwen3.6-27B and Qwen3.8-27B both.
     Dense,
     /// Qwen3.6-35B-A3B — 256 routed experts + one shared expert.
     Moe,
@@ -56,10 +56,13 @@ impl Arch {
         }
     }
 
-    /// The official checkpoint family this architecture belongs to. The two are
-    /// one-to-one, so a GGUF's architecture is the authoritative answer to
-    /// "which checkpoint is this file" — more reliable than any flag that
-    /// travelled alongside a path.
+    /// The checkpoint to assume for this architecture when nothing else
+    /// identifies the file. Unambiguous for `qwen35moe`, which only one official
+    /// checkpoint ships; a coin-flip for `qwen35`, which the Qwen3.6-27B and
+    /// Qwen3.8-27B releases share graph-for-graph. Ask
+    /// [`XwenConfig::checkpoint`] first — it reads what the file says about
+    /// itself — and reach for this only when that comes back `None`, which is a
+    /// conversion that names no checkpoint, and say so when you do.
     pub fn model(&self) -> crate::hub::Model {
         match self {
             Arch::Dense => crate::hub::Model::Qwen27B,
@@ -78,6 +81,11 @@ const ROPE_SECTIONS: [usize; 4] = [11, 11, 10, 0];
 #[derive(Debug, Clone)]
 pub struct XwenConfig {
     pub arch: Arch,
+    /// `general.name` — what the file calls the model it holds
+    /// ("Qwen3.6-27B", "Qwen3.8-27B", …). Optional in GGUF, and the only thing
+    /// in a dense file that says which release it is; see
+    /// [`XwenConfig::checkpoint`].
+    pub general_name: Option<String>,
     pub n_layer: usize,
     pub hidden: usize,
     pub vocab: usize,
@@ -113,6 +121,17 @@ pub struct XwenConfig {
 }
 
 impl XwenConfig {
+    /// Which official checkpoint this file is, or `None` when nothing in it
+    /// says. `path` is where the file was read from, consulted only when
+    /// `general.name` does not answer.
+    ///
+    /// Not the same question as [`Arch::model`]: two releases ship the dense
+    /// architecture, so the graph alone no longer names a checkpoint. A caller
+    /// that must have an answer falls back to `arch.model()` and says so.
+    pub fn checkpoint(&self, path: &std::path::Path) -> Option<crate::hub::Model> {
+        crate::hub::Model::identify(self.arch, self.general_name.as_deref(), Some(path))
+    }
+
     pub fn is_full_attn(&self, il: usize) -> bool {
         self.layer_kind[il] == LayerKind::Full
     }
@@ -148,7 +167,8 @@ impl XwenConfig {
             "qwen35" => Arch::Dense,
             "qwen35moe" => Arch::Moe,
             other => bail!(
-                "expected a Qwen 3.6 GGUF (architecture \"qwen35\" or \"qwen35moe\"), got {other:?}"
+                "expected a Qwen 3.6 or 3.8 GGUF (architecture \"qwen35\" or \"qwen35moe\"), \
+                 got {other:?}"
             ),
         };
         let a = arch.key();
@@ -235,6 +255,7 @@ impl XwenConfig {
 
         Ok(Self {
             arch,
+            general_name: md.str("general.name").ok().map(str::to_string),
             n_layer,
             hidden,
             vocab,
@@ -534,6 +555,7 @@ mod tests {
     fn conv_and_value_widths_follow_the_head_counts() {
         let cfg = XwenConfig {
             arch: Arch::Moe,
+            general_name: None,
             n_layer: 40,
             hidden: 2048,
             vocab: 248320,

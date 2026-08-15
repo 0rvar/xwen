@@ -12,8 +12,9 @@ with its evidence; `docs/log.md` is the chronological narrative both point into;
 
 ## Non-negotiables
 
-- Design target: maximum tok/s for Qwen3.6-27B and Qwen3.6-35B-A3B GGUF on this one
-  machine (M5 Max, Metal). Batch 1. No portability hedging.
+- Design target: maximum tok/s for Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B GGUF on
+  this one machine (M5 Max, Metal). Batch 1. No portability hedging. (3.8-27B runs the
+  3.6-27B graph unchanged — it is a registry entry, not a port.)
 - TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, or it
   becomes a ledger item with context. Ledger items are never deleted, only annotated.
 - Every shipped arc updates the docs before it's done: dated log.md entry, README if
@@ -94,10 +95,12 @@ thinking is disabled (then a closed empty block is emitted).
 ## Checkpoint location
 
 HF cache (`HF_HUB_CACHE` > `HF_HOME/hub`), cache-first via hf-hub, download on miss.
-Default repos/files (hub.rs): `ggml-org/Qwen3.6-27B-GGUF` and
-`ggml-org/Qwen3.6-35B-A3B-GGUF`, Q4_K_M. Sizes: 19.1 GB (27B), 20.4 GB (35B). Q8_0:
-28.6 / 36.9 GB. DFlash drafter sidecars: `dflash-*-BF16.gguf` (3.5 GB / 0.8 GB). MTP
-sidecars exist but are unused. `mmproj-*` files are the vision tower — never load them.
+Default repos/files (hub.rs): `ggml-org/Qwen3.6-27B-GGUF`,
+`ggml-org/Qwen3.6-35B-A3B-GGUF` and `ggml-org/Qwen3.8-27B-GGUF`, Q4_K_M. Sizes: 19.1 GB
+(27B), 20.4 GB (35B), 19.0 GB (3.8-27B). Q8_0: 28.6 / 36.9 / 28.6 GB. DFlash drafter
+sidecars: `dflash-*-BF16.gguf` (3.5 GB / 0.8 GB) — **3.8 has none and decodes plain**;
+every drafter accessor on `Model` is `Option`. MTP sidecars exist for all three and are
+unused. `mmproj-*` files are the vision tower — never load them.
 Inherited hf-hub trap: refs/main is read verbatim; a trailing newline in a manually
 edited ref costs a full re-download.
 
@@ -117,7 +120,24 @@ edited ref costs a full re-download.
 - No `ffn_norm`; `post_attention_norm` is the pre-MLP norm.
 - `general.file_type` 15 = Q4_K_M, 7 = Q8_0. The Q4_K_M mix is a custom override:
   attn/ssm/shexp Q8_0, ffn/experts Q4_K (including down_exps — the usual Q6_K bump is
-  absent), lm_head Q6_K, norms/routers/conv/ssm_a/dt F32, token_embd Q4_K.
+  absent), lm_head Q6_K, norms/routers/conv/ssm_a/dt F32, token_embd Q4_K. **Qwen3.8's
+  Q4_K_M differs in exactly one plane**: its 16 `blk.N.attn_output.weight` tensors are
+  Q6_K, not Q8_0 (upstream's `output.weight=q6_k` rule substring-catches `attn_output`).
+  Nothing asserts on that plane's quant and lm_head already exercises Q6_K.
+- `general.name` is what identifies a checkpoint, NOT the architecture: two releases ship
+  the dense `qwen35` graph with byte-identical configs. The blessed files carry their
+  exact full name ("Qwen3.6-27B", "Qwen3.6-35B-A3B", "Qwen3.8-27B"). The FILE decides
+  (`XwenConfig::checkpoint` / `Model::identify`): `general.name` first, then the file
+  name, each matched as an exact full name or a whole full name found inside it (never a
+  bare "3.6"/"3.8" — that would make someone's 14B finetune the official 27B); a name
+  matching two checkpoints identifies as neither. `--model-size` is a CROSS-CHECK, not an
+  override: it must agree with a file that identifies itself (disagreement is a startup
+  error) and only settles a file that identifies as nothing. A file that still says
+  nothing runs as `Arch::model()` with a logged warning, under its own file name.
+  Qwen3.8's tokenizer.json is NOT
+  byte-identical to 3.6's — it adds seven audio/TTS specials at 248070-248076 over an
+  identical base vocab and merge table — but the embedded 3.6 tokenizer is what ships
+  (TODO.md).
 - Both models are single-file GGUFs; tokenizer + chat template are embedded in the GGUF
   metadata AND vendored under reference/ (embedded into the binary via include_bytes!).
 - The GGUF advertises only `eos_token_id = 248046` and has no second-stop key; the
@@ -235,3 +255,17 @@ The serve/ tree runs as forked. Not yet adapted: ChatML/tool-call parsing in the
 dialect layers (Qwen's `<function=...>` XML-ish call format, string-args-raw rule),
 thinking semantics (open-`<think>` seeding, preserve_thinking), and prefix-cache
 snapshots carrying recurrent state (see decisions.md "Serving").
+
+API model names are FULL names only (`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B` —
+`Model::full_name`, matching `general.name` and the repo), plus the served file's own id
+when that file is none of them. The CLI's `27b`/`35b`/`3.8-27b` aliases are refused on
+the wire; an unknown `model` is a 400 on every surface (both dialects, count_tokens and
+the batch route), never a silent fall back to the default. `/v1/models` lists each id
+exactly once and every listed id is selectable (2026-08-14).
+
+A job names a `serve::types::Target` (checkpoint + "is this the served file"), not a bare
+`Model`: on a custom-GGUF server the official checkpoint of the same architecture is a
+DIFFERENT file, so an official name resolves the hub file while the file's own id
+resolves the local one. Speculation is per checkpoint (`DraftMode::{Off,Official,
+Custom}`), resolved at load, so a sidecar-less default checkpoint no longer disables
+drafting for the others.

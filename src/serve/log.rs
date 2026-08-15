@@ -221,8 +221,8 @@ pub enum ServeLog {
     /// dropped (imaged out first when the disk tier serves it); the lazy load
     /// brings the named one in.
     CheckpointSwappingOut {
-        from: crate::hub::Model,
-        to: crate::hub::Model,
+        from: crate::serve::types::Target,
+        to: crate::serve::types::Target,
     },
     /// A requested checkpoint (or its drafter sidecar) is not in the Hugging
     /// Face cache and is being downloaded before the job can run.
@@ -231,6 +231,19 @@ pub enum ServeLog {
         file: &'static str,
         size: &'static str,
     },
+    /// Nothing in the served GGUF names one of the official checkpoints — no
+    /// `general.name`, no release in the file name — so its architecture's
+    /// checkpoint is assumed for everything that needs an identity (the hub repo
+    /// a swap fetches from, the sidecar). Only a custom conversion gets here;
+    /// `--model-size` settles it outright, and the APIs keep reporting the file
+    /// under its own name either way.
+    CheckpointUnidentified {
+        path: PathBuf,
+        assumed: crate::hub::Model,
+    },
+    /// The checkpoint a job needs ships no DFlash sidecar, so it runs without
+    /// speculative decoding however the drafter is configured.
+    NoDrafterAvailable { model: crate::hub::Model },
     /// The batch runner reported progress: a shared prefill, or one item done.
     BatchProgress(crate::batch::BatchProgress),
     /// The speculative drafter finished loading, alongside the model.
@@ -458,6 +471,16 @@ impl ServeLog {
             ServeLog::CheckpointDownloading { repo, file, size } => format!(
                 "xwen: {repo}/{file} is not in the Hugging Face cache; downloading ({size}, \
                  resumes in place)"
+            ),
+            ServeLog::CheckpointUnidentified { path, assumed } => format!(
+                "xwen serve: {} names no official checkpoint; running it as {} \
+                 (pass --model-size to name it)",
+                path.display(),
+                assumed.full_name()
+            ),
+            ServeLog::NoDrafterAvailable { model } => format!(
+                "xwen serve: no drafter available for {}; running without speculative decoding",
+                model.full_name()
             ),
             ServeLog::BatchProgress(progress) => match progress {
                 crate::batch::BatchProgress::SharedPrefix { tokens, ms } => {

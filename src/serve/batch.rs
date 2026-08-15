@@ -3,11 +3,11 @@
 //! The body is exactly the JSON document `xwen batch` reads on stdin
 //! ([`crate::batch::BatchRequest`]) and the response is exactly the document it
 //! prints ([`crate::batch::BatchResponse`]) — one surface, two transports. The
-//! request's `model` field picks the checkpoint per request, `27b` or `35b`,
-//! defaulting to the server's default checkpoint rather than the CLI's
-//! compile-time default: a server was started around one model, and a request
-//! that names none means that one. The engine lazy-loads whichever checkpoint
-//! the job names, swapping the resident one out when they differ.
+//! request's `model` field picks the checkpoint per request by full name
+//! ("Qwen3.6-27B"), defaulting to the server's default checkpoint rather than
+//! the CLI's compile-time default: a server was started around one model, and a
+//! request that names none means that one. The engine lazy-loads whichever
+//! checkpoint the job names, swapping the resident one out when they differ.
 //!
 //! Strict like the rest of the native surface: the request type is
 //! `deny_unknown_fields`, and an unknown model name is a 400 — the CLI errors
@@ -18,10 +18,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use super::types::{BatchJob, Cancel, CancelGuard, Dialect, EngineEvent, RequestOrigin};
+use super::types::{BatchJob, Cancel, CancelGuard, Dialect, EngineEvent, RequestOrigin, Target};
 use super::{ApiError, AppState, EVENT_CHANNEL_CAPACITY, SubmitError, native};
 use crate::batch::{BatchRequest, BatchResponse, DEFAULT_MAX_TOKENS};
-use crate::hub::Model;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -33,17 +32,18 @@ fn bad_request(message: impl Into<String>) -> ApiError {
     native::error(StatusCode::BAD_REQUEST, "invalid_request_error", message)
 }
 
-/// The checkpoint a batch request runs on: the one it names, or the server's
-/// default when it names none. Unlike the compat dialects this is strict — the
-/// field exists to select, so a name that selects nothing is an error, not an
-/// echo.
-fn resolve_model(request: &BatchRequest, default: Model) -> Result<Model, ApiError> {
-    match &request.model {
-        Some(name) => name
-            .parse()
-            .map_err(|e: String| bad_request(format!("model: {e}"))),
-        None => Ok(default),
-    }
+/// The target a batch request runs on, and the name its response document is
+/// labeled with — the same rule the compat dialects use
+/// ([`super::resolve_requested_model`]), so one document means the same thing on
+/// every surface. Full names and this server's own model id; the CLI's short
+/// aliases stay a CLI spelling.
+fn resolve_model(
+    request: &BatchRequest,
+    served: Target,
+    served_id: &str,
+) -> Result<(Target, String), ApiError> {
+    super::resolve_requested_model(request.model.as_deref(), served, served_id)
+        .map_err(|message| bad_request(format!("model: {message}")))
 }
 
 /// A conservative token estimate for text nobody has rendered yet, for queue
@@ -99,7 +99,7 @@ fn size_estimates(request: &BatchRequest) -> (usize, usize) {
 fn submit_batch(
     state: &AppState,
     request: BatchRequest,
-    model: Model,
+    model: Target,
 ) -> Result<(mpsc::Receiver<EngineEvent>, CancelGuard), SubmitError> {
     let (prompt_tokens, max_tokens) = size_estimates(&request);
     let (events, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -163,16 +163,19 @@ pub(crate) async fn batch(State(state): State<AppState>, body: Bytes) -> Respons
     if request.items.is_empty() {
         return bad_request("batch: the request holds no items").into_response();
     }
-    let model = match resolve_model(&request, state.default_size) {
-        Ok(model) => model,
+    let (model, label) = match resolve_model(&request, state.default_target, &state.model_id) {
+        Ok(resolved) => resolved,
         Err(e) => return e.into_response(),
     };
     // Written back so the runner and the response document agree with the
     // resolution above: an absent field means the SERVER's default here, while
     // the runner's own `BatchRequest::model()` would read it as the CLI's
     // compile-time default — on a 27B server those diverge, and the response
-    // would label a 27B run "35b".
-    request.model = Some(model.to_string());
+    // would label a 27B run as the 35B-A3B. The label is the id this server
+    // answers under, which for a GGUF that is none of the official checkpoints
+    // is its own file name and NOT the checkpoint it runs as: the document must
+    // not claim official weights ran.
+    request.model = Some(label);
 
     let (mut events, guard) = match submit_batch(&state, request, model) {
         Ok(submitted) => submitted,
@@ -230,6 +233,7 @@ pub(crate) async fn batch(State(state): State<AppState>, body: Bytes) -> Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::Model;
 
     fn request(json: &str) -> BatchRequest {
         serde_json::from_str(json).expect("request parses")
@@ -240,10 +244,10 @@ mod tests {
     #[test]
     fn the_request_shape_is_the_clis() {
         let parsed = request(
-            r#"{"model":"27b","defaults":{"max_tokens":64},
+            r#"{"model":"Qwen3.6-27B","defaults":{"max_tokens":64},
                 "items":[{"id":"a","messages":[{"role":"user","content":"hi"}]}]}"#,
         );
-        assert_eq!(parsed.model.as_deref(), Some("27b"));
+        assert_eq!(parsed.model.as_deref(), Some("Qwen3.6-27B"));
         assert_eq!(parsed.items.len(), 1);
         assert!(
             serde_json::from_str::<BatchRequest>(r#"{"itmes":[{"id":"a","messages":[]}]}"#)
@@ -252,18 +256,17 @@ mod tests {
         );
     }
 
-    /// The handler's resolution and the runner's own `BatchRequest::model()`
-    /// must agree, and for an absent field they naturally do not (server
-    /// default vs the CLI's compile-time default) — which is why the handler
-    /// writes the resolved name back into the request before queueing it. This
-    /// pins the write-back's effect: after it, the runner reads the same
-    /// checkpoint the job runs on, so the response document is labeled with
-    /// the model that actually ran.
+    /// An absent field means the SERVER's default, which is not the runner's
+    /// own compile-time default — so the handler writes the resolved name back
+    /// into the request, and that written-back name is what labels the response
+    /// document. This pins both halves.
     #[test]
     fn an_absent_model_is_normalized_to_the_servers_default() {
+        let served = Target::official(Model::Qwen27B);
         let mut absent = request(r#"{"items":[{"id":"a","messages":[]}]}"#);
-        let resolved = resolve_model(&absent, Model::Qwen27B).unwrap();
-        absent.model = Some(resolved.to_string());
+        let (target, label) = resolve_model(&absent, served, "Qwen3.6-27B").unwrap();
+        absent.model = Some(label);
+        assert_eq!(target, served);
         assert_eq!(
             absent.model().unwrap(),
             Model::Qwen27B,
@@ -271,25 +274,65 @@ mod tests {
         );
     }
 
-    /// The model field selects per request: a named checkpoint wins, absence
-    /// means the server's default, and an unknown name is a 400 — never a
-    /// silent fallback, this field exists to select.
+    /// The model field selects per request: a checkpoint named by its full name
+    /// wins, absence means the server's default, and anything else is a 400 —
+    /// never a silent fallback, this field exists to select. The CLI's short
+    /// aliases are not the wire's vocabulary and are refused here with the rest.
     #[test]
     fn the_model_field_selects_per_request() {
-        let named = request(r#"{"model":"27b","items":[{"id":"a","messages":[]}]}"#);
+        let served = Target::official(Model::Qwen35BA3B);
+        let named = request(r#"{"model":"Qwen3.6-27B","items":[{"id":"a","messages":[]}]}"#);
         assert_eq!(
-            resolve_model(&named, Model::Qwen35BA3B).unwrap(),
-            Model::Qwen27B
+            resolve_model(&named, served, "Qwen3.6-35B-A3B").unwrap(),
+            (Target::official(Model::Qwen27B), "Qwen3.6-27B".to_string())
         );
         let absent = request(r#"{"items":[{"id":"a","messages":[]}]}"#);
         assert_eq!(
-            resolve_model(&absent, Model::Qwen27B).unwrap(),
-            Model::Qwen27B,
+            resolve_model(&absent, served, "Qwen3.6-35B-A3B").unwrap().0,
+            served,
             "absent means the server default, not the CLI's compile-time default"
         );
-        let unknown = request(r#"{"model":"13b","items":[{"id":"a","messages":[]}]}"#);
-        let error = resolve_model(&unknown, Model::Qwen27B).expect_err("unknown model is refused");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        for name in ["13b", "27b", "3.8"] {
+            let unknown = request(&format!(
+                r#"{{"model":"{name}","items":[{{"id":"a","messages":[]}}]}}"#
+            ));
+            let error = resolve_model(&unknown, served, "Qwen3.6-35B-A3B")
+                .expect_err("only full names select");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// A server started with a GGUF that is none of the official checkpoints
+    /// answers under its own file name — the id `/v1/models` advertises — and a
+    /// request naming an official checkpoint gets that checkpoint's own file,
+    /// never these weights. The response label follows the same rule, so the
+    /// document never claims official weights ran.
+    #[test]
+    fn a_custom_gguf_answers_under_its_own_id_and_no_other() {
+        let served = Target::served(Model::Qwen35BA3B);
+        let stem = "my-finetune-Q4_K_M";
+
+        let by_stem = request(&format!(
+            r#"{{"model":"{stem}","items":[{{"id":"a","messages":[]}}]}}"#
+        ));
+        assert_eq!(
+            resolve_model(&by_stem, served, stem).unwrap(),
+            (served, stem.to_string())
+        );
+
+        // The official checkpoint of the SAME architecture is a different file.
+        let official = request(r#"{"model":"Qwen3.6-35B-A3B","items":[{"id":"a","messages":[]}]}"#);
+        let (target, label) = resolve_model(&official, served, stem).unwrap();
+        assert_eq!(target, Target::official(Model::Qwen35BA3B));
+        assert_ne!(target, served, "an official name is not the served file");
+        assert_eq!(label, "Qwen3.6-35B-A3B");
+
+        let absent = request(r#"{"items":[{"id":"a","messages":[]}]}"#);
+        assert_eq!(
+            resolve_model(&absent, served, stem).unwrap(),
+            (served, stem.to_string()),
+            "an absent field labels the document with the served file's own id"
+        );
     }
 
     /// The scheduling estimates: prompt bytes over three (overestimating, so

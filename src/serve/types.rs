@@ -61,6 +61,56 @@ pub enum Job {
     Batch(Box<BatchJob>),
 }
 
+/// Which checkpoint a job needs — and which FILE that means.
+///
+/// The two are not the same question. On a server started with a GGUF that
+/// identifies as none of the official checkpoints, a request for that file's own
+/// id runs that file, while a request naming an official checkpoint runs the
+/// official hub file, downloading it if need be: an official name must never be
+/// answered by weights nobody checked, and a custom file must answer under its
+/// own name and no other. Equality here is therefore file identity, which is
+/// exactly what the engine's "do I have to swap?" check needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Target {
+    /// The checkpoint this runs AS: what sizes its caches, which official
+    /// sidecar it can draft with, and what the logs call it. For a served file
+    /// that identified as nothing, this is its architecture's checkpoint — the
+    /// assumption reported at startup.
+    pub model: Model,
+    /// Whether this means the server's own `--model` file rather than the
+    /// official hub file for `model`. Only ever true when the served GGUF
+    /// identified as none of the official checkpoints.
+    pub served_file: bool,
+}
+
+impl Target {
+    /// One of the official checkpoints, in its hub file.
+    pub fn official(model: Model) -> Self {
+        Self {
+            model,
+            served_file: false,
+        }
+    }
+
+    /// The file this server was started with, running as `model`.
+    pub fn served(model: Model) -> Self {
+        Self {
+            model,
+            served_file: true,
+        }
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.model)?;
+        if self.served_file {
+            f.write_str(" (the served file)")?;
+        }
+        Ok(())
+    }
+}
+
 impl Job {
     pub fn origin(&self) -> RequestOrigin {
         match self {
@@ -69,8 +119,8 @@ impl Job {
         }
     }
 
-    /// The checkpoint this job runs on.
-    pub fn model(&self) -> Model {
+    /// The checkpoint this job runs on, and the file that means.
+    pub fn model(&self) -> Target {
         match self {
             Job::Generation(job) => job.model,
             Job::Batch(job) => job.model,
@@ -135,10 +185,10 @@ pub struct BatchJob {
     /// The batch to run, exactly as it arrived. The runner renders, encodes
     /// and validates the items itself.
     pub request: BatchRequest,
-    /// The checkpoint the request's `model` field resolved to, resolved by the
-    /// handler so an unknown name is a 400 before the queue, never an engine
-    /// error after it.
-    pub model: Model,
+    /// The checkpoint the request's `model` field resolved to, and the file
+    /// that means — resolved by the handler so an unknown name is a 400 before
+    /// the queue, never an engine error after it.
+    pub model: Target,
     /// Summed item output budgets, for the watchdog deadline.
     pub max_tokens: usize,
     /// The job's cancellation token, exactly as a generation's: client gone,
@@ -153,10 +203,10 @@ pub struct BatchJob {
 pub struct GenerationJob {
     /// Which request this job is, and where it came from.
     pub origin: RequestOrigin,
-    /// The checkpoint this job runs on. The compat dialects resolve a request
-    /// `model` that names a known checkpoint, and fall back to the server's
-    /// default for anything else.
-    pub model: Model,
+    /// The checkpoint this job runs on, and the file that means. The compat
+    /// dialects resolve a request `model` that names a checkpoint this server
+    /// serves, and refuse anything else.
+    pub model: Target,
     /// The rendered prompt, already encoded by the HTTP layer with the same
     /// tokenizer the engine decodes with. The engine prefills exactly these ids.
     pub prompt: Vec<u32>,

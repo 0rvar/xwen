@@ -6,9 +6,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** The two checkpoints, mirroring `CHECKPOINTS` in src/hub.rs. `35b` is the
- *  default everywhere the size is not named, matching the CLI's
- *  `--model-size` default. */
+/** The checkpoints, mirroring the `Checkpoint` consts in src/hub.rs. `35b` is
+ *  the default everywhere the size is not named, matching the CLI's
+ *  `--model-size` default. `drafter` is null for a checkpoint whose release
+ *  ships no DFlash sidecar — Qwen3.8-27B decodes plain. */
 export const CHECKPOINTS = {
   "35b": {
     repo: "ggml-org/Qwen3.6-35B-A3B-GGUF",
@@ -19,6 +20,11 @@ export const CHECKPOINTS = {
     repo: "ggml-org/Qwen3.6-27B-GGUF",
     model: "Qwen3.6-27B-Q4_K_M.gguf",
     drafter: "dflash-Qwen3.6-27B-BF16.gguf",
+  },
+  "3.8-27b": {
+    repo: "ggml-org/Qwen3.8-27B-GGUF",
+    model: "Qwen3.8-27B-Q4_K_M.gguf",
+    drafter: null,
   },
 } as const;
 
@@ -78,9 +84,16 @@ export function officialModel(size: ModelSize = defaultSize()): string {
   return path;
 }
 
+/** The official drafter for `size`, or null — which also covers a checkpoint
+ *  whose release ships no sidecar at all. */
 export function officialDrafter(size: ModelSize = defaultSize()): string | null {
   const ck = CHECKPOINTS[size];
-  return cachedFile(ck.repo, ck.drafter);
+  return ck.drafter ? cachedFile(ck.repo, ck.drafter) : null;
+}
+
+/** The checkpoints that can speculate, for sweeps that only mean those. */
+export function draftingSizes(): ModelSize[] {
+  return (Object.keys(CHECKPOINTS) as ModelSize[]).filter((size) => CHECKPOINTS[size].drafter);
 }
 
 // CLI: `bun scripts/hf.ts [model|drafter] [27b|35b]` prints the resolved cache
@@ -96,17 +109,22 @@ if (import.meta.main) {
   if (which === "model") {
     console.log(officialModel(size));
   } else if (which === "drafter") {
+    const drafter = CHECKPOINTS[size].drafter;
+    if (!drafter) {
+      console.error(`${size} ships no DFlash drafter sidecar`);
+      process.exit(1);
+    }
     const path = officialDrafter(size);
     if (!path) {
       console.error(
-        `${CHECKPOINTS[size].repo}/${CHECKPOINTS[size].drafter} is not in the Hugging Face cache; ` +
+        `${CHECKPOINTS[size].repo}/${drafter} is not in the Hugging Face cache; ` +
           `run \`xwen fetch --model-size ${size}\``,
       );
       process.exit(1);
     }
     console.log(path);
   } else {
-    console.error(`usage: bun scripts/hf.ts [model|drafter] [27b|35b]`);
+    console.error(`usage: bun scripts/hf.ts [model|drafter] [${Object.keys(CHECKPOINTS).join("|")}]`);
     process.exit(2);
   }
 }

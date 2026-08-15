@@ -14,39 +14,65 @@
 //! the cache must store the bare commit hash — `hf download` and hf-hub both
 //! do.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use hf_hub::Cache;
 use hf_hub::api::sync::ApiBuilder;
 
-/// Which official checkpoint to run. Both are ggml-org's Qwen 3.6 GGUF
-/// conversions; the GGUF filenames keep the model's name — only the engine is
-/// called xwen.
+use crate::config::Arch;
+
+/// Which official checkpoint to run. All are ggml-org GGUF conversions; the
+/// GGUF filenames keep the model's name — only the engine is called xwen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Model {
-    /// Dense 27B (`qwen35`).
+    /// Qwen3.6-27B, dense (`qwen35`).
     Qwen27B,
-    /// MoE 35B-A3B (`qwen35moe`) — the bring-up model.
+    /// Qwen3.6-35B-A3B, MoE (`qwen35moe`) — the bring-up model.
     #[default]
     Qwen35BA3B,
+    /// Qwen3.8-27B, dense (`qwen35`). The 3.8 release's config is byte-identical
+    /// to [`Model::Qwen27B`]'s, so the two run the same graph at the same
+    /// geometry and differ only in weights, repo — and drafter: 3.8 ships no
+    /// DFlash sidecar.
+    Qwen3827B,
 }
 
+/// Every checkpoint this build knows, in the order surfaces that enumerate them
+/// (`/v1/models`, an unknown-model error's list of valid names) print them.
+pub const MODELS: [Model; 3] = [Model::Qwen27B, Model::Qwen35BA3B, Model::Qwen3827B];
+
 /// The hub coordinates of one checkpoint: the repo, the Q4_K_M target (the
-/// quant this machine is built around), and its DFlash drafter sidecar. The
-/// sizes are the hub's own byte counts, rounded, and exist only for the
-/// "this is about to download" notice.
+/// quant this machine is built around), and its DFlash drafter sidecar when the
+/// release ships one. The sizes are the hub's own byte counts, rounded, and
+/// exist only for the "this is about to download" notice.
 struct Checkpoint {
     repo: &'static str,
     model: &'static str,
-    drafter: &'static str,
+    /// The model's own name, as the repo and the GGUF's `general.name` spell it.
+    full_name: &'static str,
+    /// Which graph the GGUF holds. Dense is no longer one-to-one with a
+    /// checkpoint — two releases share it — so this identifies the arch alone.
+    arch: Arch,
     model_size: &'static str,
-    drafter_size: &'static str,
-    /// Decoder layers in the DFlash sidecar (`dflash.block_count`). The only
-    /// drafter dimension the two sidecars differ in — 32 Q / 8 KV heads at
-    /// head_dim 128 on both — so it alone decides what a drafter cache costs.
-    drafter_layers: usize,
+    /// The DFlash sidecar, or `None` for a release that ships none. Everything
+    /// speculation needs is in here together: a checkpoint either drafts or it
+    /// does not.
+    drafter: Option<Drafter>,
     geometry: CacheGeometry,
+}
+
+/// One checkpoint's DFlash drafter sidecar.
+struct Drafter {
+    file: &'static str,
+    size: &'static str,
+    /// Decoder layers in the sidecar (`dflash.block_count`). The only drafter
+    /// dimension the two sidecars differ in — 32 Q / 8 KV heads at head_dim 128
+    /// on both — so it alone decides what a drafter cache costs.
+    layers: usize,
+    /// The drafting confidence floor this checkpoint decodes fastest at; see
+    /// [`Model::draft_p_min_default`].
+    p_min: f32,
 }
 
 /// The parts of a checkpoint's shape that decide what its caches cost, so a
@@ -73,33 +99,46 @@ struct CacheGeometry {
     conv_kernel: usize,
 }
 
+/// 64 layers, full attention every fourth. Shared by both dense checkpoints:
+/// Qwen3.8-27B's config is byte-identical to Qwen3.6-27B's.
+const DENSE_27B_GEOMETRY: CacheGeometry = CacheGeometry {
+    full_attn_layers: 16,
+    linear_layers: 48,
+    n_kv_head: 4,
+    head_dim: 256,
+    linear_k_heads: 16,
+    linear_v_heads: 48,
+    linear_head_dim: 128,
+    conv_kernel: 4,
+};
+
 const QWEN_27B: Checkpoint = Checkpoint {
     repo: "ggml-org/Qwen3.6-27B-GGUF",
     model: "Qwen3.6-27B-Q4_K_M.gguf",
-    drafter: "dflash-Qwen3.6-27B-BF16.gguf",
+    full_name: "Qwen3.6-27B",
+    arch: Arch::Dense,
     model_size: "19.1 GB",
-    drafter_size: "3.5 GB",
-    drafter_layers: 5,
-    // 64 layers, full attention every fourth.
-    geometry: CacheGeometry {
-        full_attn_layers: 16,
-        linear_layers: 48,
-        n_kv_head: 4,
-        head_dim: 256,
-        linear_k_heads: 16,
-        linear_v_heads: 48,
-        linear_head_dim: 128,
-        conv_kernel: 4,
-    },
+    drafter: Some(Drafter {
+        file: "dflash-Qwen3.6-27B-BF16.gguf",
+        size: "3.5 GB",
+        layers: 5,
+        p_min: 0.5,
+    }),
+    geometry: DENSE_27B_GEOMETRY,
 };
 
 const QWEN_35B_A3B: Checkpoint = Checkpoint {
     repo: "ggml-org/Qwen3.6-35B-A3B-GGUF",
     model: "Qwen3.6-35B-A3B-Q4_K_M.gguf",
-    drafter: "dflash-Qwen3.6-35B-A3B-BF16.gguf",
+    full_name: "Qwen3.6-35B-A3B",
+    arch: Arch::Moe,
     model_size: "20.4 GB",
-    drafter_size: "0.8 GB",
-    drafter_layers: 6,
+    drafter: Some(Drafter {
+        file: "dflash-Qwen3.6-35B-A3B-BF16.gguf",
+        size: "0.8 GB",
+        layers: 6,
+        p_min: 0.3,
+    }),
     // 40 layers, full attention every fourth.
     geometry: CacheGeometry {
         full_attn_layers: 10,
@@ -113,11 +152,24 @@ const QWEN_35B_A3B: Checkpoint = Checkpoint {
     },
 };
 
+/// The 3.8 release ships no DFlash sidecar, so this checkpoint decodes plain.
+/// The repo does carry an MTP sidecar, which nothing here reads (TODO.md).
+const QWEN_38_27B: Checkpoint = Checkpoint {
+    repo: "ggml-org/Qwen3.8-27B-GGUF",
+    model: "Qwen3.8-27B-Q4_K_M.gguf",
+    full_name: "Qwen3.8-27B",
+    arch: Arch::Dense,
+    model_size: "19.0 GB",
+    drafter: None,
+    geometry: DENSE_27B_GEOMETRY,
+};
+
 impl Model {
     const fn checkpoint(self) -> &'static Checkpoint {
         match self {
             Model::Qwen27B => &QWEN_27B,
             Model::Qwen35BA3B => &QWEN_35B_A3B,
+            Model::Qwen3827B => &QWEN_38_27B,
         }
     }
 
@@ -131,9 +183,26 @@ impl Model {
         self.checkpoint().model
     }
 
-    /// The DFlash block-diffusion drafter for speculative decoding.
-    pub const fn drafter_file(self) -> &'static str {
-        self.checkpoint().drafter
+    /// The checkpoint's own name — what ggml-org calls the repo, what the GGUF
+    /// carries as `general.name`, and the only spelling the HTTP APIs accept or
+    /// echo. Quant-independent: one name covers every quantization of the
+    /// checkpoint. The short aliases ([`Model::to_string`]) are the CLI's.
+    pub const fn full_name(self) -> &'static str {
+        self.checkpoint().full_name
+    }
+
+    /// Which graph this checkpoint's GGUF holds.
+    pub const fn arch(self) -> Arch {
+        self.checkpoint().arch
+    }
+
+    /// The DFlash block-diffusion drafter for speculative decoding, or `None`
+    /// for a checkpoint that ships no sidecar — which decodes plain.
+    pub const fn drafter_file(self) -> Option<&'static str> {
+        match &self.checkpoint().drafter {
+            Some(drafter) => Some(drafter.file),
+            None => None,
+        }
     }
 
     /// Human-readable download size of the target, for the fetch notice.
@@ -142,8 +211,92 @@ impl Model {
     }
 
     /// Human-readable download size of the drafter, for the fetch notice.
-    pub const fn drafter_size(self) -> &'static str {
-        self.checkpoint().drafter_size
+    pub const fn drafter_size(self) -> Option<&'static str> {
+        match &self.checkpoint().drafter {
+            Some(drafter) => Some(drafter.size),
+            None => None,
+        }
+    }
+
+    /// The checkpoint a full name selects, case-insensitively — the API's whole
+    /// model vocabulary. Deliberately narrower than [`std::str::FromStr`]: the
+    /// short aliases are a CLI convenience, and honoring them on the wire made
+    /// one checkpoint answer to several ids.
+    pub fn from_api_name(name: &str) -> Option<Self> {
+        MODELS
+            .into_iter()
+            .find(|model| model.full_name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// Which official checkpoint a GGUF is, from what the file says about
+    /// itself: `general.name` first, then the file name, and `None` when
+    /// neither identifies one.
+    ///
+    /// A name, not an architecture, because the architecture answers neither
+    /// question it is asked here. It cannot tell the 3.6 and 3.8 dense releases
+    /// apart — they share the graph and every hyperparameter — and it cannot
+    /// tell an official checkpoint from someone's conversion of something else
+    /// onto the same graph, which is the difference between reporting a served
+    /// file under a checkpoint's name and reporting it under its own. The
+    /// architecture only narrows the candidates.
+    ///
+    /// One rule for both sources: an exact full-name match, then a full name
+    /// found INSIDE the name (case-insensitive). The substring form is what
+    /// accepts the shapes real files take — `Qwen3.8-27B-Q8_0.gguf` with its
+    /// quant suffix, `Qwen3.6-27B-Instruct` from a re-quantized conversion — and
+    /// the requirement that a WHOLE checkpoint name appear is what keeps it
+    /// honest. A looser rule was tried and refused: matching a bare release
+    /// series ("3.6"/"3.8") identifies `My-Qwen3.6-14B-finetune.gguf` as the
+    /// official 27B, and `MyMoE-3.6` as Qwen3.6-35B-A3B — and since the MoE
+    /// architecture has exactly one candidate, that second one needs no
+    /// ambiguity to go wrong. Both would answer an official name with weights
+    /// nobody checked, which is the one thing this function exists to prevent.
+    ///
+    /// A name that matches more than one checkpoint identifies as none of them
+    /// rather than as whichever the table lists first — an ambiguous name is
+    /// exactly the case where guessing is worst.
+    ///
+    /// `general.name` is tried before the file name because it is what the
+    /// converter wrote INTO the file about the model it holds, where a file name
+    /// is only what somebody called the file. Both blessed checkpoints carry
+    /// their exact full name there, so the substring pass is a courtesy to
+    /// re-quantizers rather than something the shipped files need.
+    ///
+    /// Callers that need an answer regardless fall back to [`Arch::model`] and
+    /// say so.
+    pub fn identify(arch: Arch, general_name: Option<&str>, file: Option<&Path>) -> Option<Self> {
+        let candidates = || MODELS.into_iter().filter(|model| model.arch() == arch);
+        // Only one candidate can match, or none does.
+        let sole = |mut hits: Vec<Model>| -> Option<Model> {
+            hits.dedup();
+            match hits.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            }
+        };
+        let by_name = |name: &str| -> Option<Model> {
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            sole(
+                candidates()
+                    .filter(|model| model.full_name().eq_ignore_ascii_case(name))
+                    .collect(),
+            )
+            .or_else(|| {
+                sole(
+                    candidates()
+                        .filter(|model| contains_ignore_ascii_case(name, model.full_name()))
+                        .collect(),
+                )
+            })
+        };
+        if let Some(model) = general_name.and_then(by_name) {
+            return Some(model);
+        }
+        let stem = file.and_then(Path::file_stem)?.to_string_lossy();
+        by_name(&stem)
     }
 
     /// The drafting confidence floor (`--draft-p-min`) this checkpoint decodes
@@ -151,22 +304,25 @@ impl Model {
     /// full-vocab probability falls below it, so a higher floor drafts shorter
     /// at higher acceptance.
     ///
-    /// The two checkpoints sit at different points on that trade, which is why
-    /// this is per-model rather than one shipped constant. Fitted 2026-08-08 by
-    /// two independent 120-run sweeps (`scripts/retune-draft.ts`) that picked
-    /// the same winner each time: 0.5 on the 27B — 37.2-37.3 tok/s
+    /// The two drafting checkpoints sit at different points on that trade,
+    /// which is why this is per-model rather than one shipped constant. Fitted
+    /// 2026-08-08 by two independent 120-run sweeps (`scripts/retune-draft.ts`)
+    /// that picked the same winner each time: 0.5 on the 27B — 37.2-37.3 tok/s
     /// mean-of-medians against 33.0-33.5 at 0.3, where the shorter drafts run
     /// 78-86% acceptance and the chat prompt stops auto-pausing altogether —
     /// and 0.3 on the 35B-A3B, whose cheaper target forward still profits from
     /// drafting deeper at lower acceptance. `pause_margin` was swept alongside
     /// and stayed a shared 1.0.
     ///
+    /// `None` for a checkpoint that ships no sidecar: there was nothing to fit a
+    /// floor with, and nothing that reads one.
+    ///
     /// This is the default only: `--draft-p-min` and the serve config's
     /// `draft.p_min` override it as before.
-    pub const fn draft_p_min_default(self) -> f32 {
-        match self {
-            Model::Qwen27B => 0.5,
-            Model::Qwen35BA3B => 0.3,
+    pub const fn draft_p_min_default(self) -> Option<f32> {
+        match &self.checkpoint().drafter {
+            Some(drafter) => Some(drafter.p_min),
+            None => None,
         }
     }
 
@@ -185,9 +341,12 @@ impl Model {
     /// drafter is attached: every sidecar layer's K and V over 8 KV heads at
     /// head_dim 128, f32 (the drafter's cache is stored exact — see
     /// `DrafterImage`). 40 KiB/token on the 27B's five layers, 48 on the
-    /// 35B-A3B's six.
-    pub const fn draft_kv_bytes_per_token(self) -> usize {
-        self.checkpoint().drafter_layers * 2 * 8 * 128 * 4
+    /// 35B-A3B's six, and `None` for a checkpoint with no sidecar to size.
+    pub const fn draft_kv_bytes_per_token(self) -> Option<usize> {
+        match &self.checkpoint().drafter {
+            Some(drafter) => Some(drafter.layers * 2 * 8 * 128 * 4),
+            None => None,
+        }
     }
 
     /// Bytes one prefix-cache snapshot costs, whatever position it covers.
@@ -205,25 +364,44 @@ impl Model {
     }
 }
 
+/// The CLI's short alias for the checkpoint — what `--model-size` takes and
+/// what a log line names it by. The APIs speak [`Model::full_name`] instead.
 impl std::fmt::Display for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Model::Qwen27B => "27b",
             Model::Qwen35BA3B => "35b",
+            Model::Qwen3827B => "3.8-27b",
         })
     }
 }
 
+/// The CLI spelling: the short aliases above, plus each checkpoint's full name,
+/// so anything a `/v1/models` listing shows also works as a `--model-size`. The
+/// bare `27b`/`35b` keep meaning the 3.6 checkpoints they always did.
 impl std::str::FromStr for Model {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
+        if let Some(model) = Model::from_api_name(s) {
+            return Ok(model);
+        }
+        match s.trim().to_ascii_lowercase().as_str() {
             "27" | "27b" => Ok(Model::Qwen27B),
             "35" | "35b" | "35b-a3b" => Ok(Model::Qwen35BA3B),
-            other => Err(format!("unknown model {other:?} (expected 27b or 35b)")),
+            "38" | "3.8" | "3.8-27b" => Ok(Model::Qwen3827B),
+            other => Err(format!(
+                "unknown model {other:?} (expected 27b, 35b or 3.8-27b)"
+            )),
         }
     }
+}
+
+/// Case-insensitive substring, ASCII — every checkpoint name is ASCII, and a
+/// file name that spells one in another case is still spelling it.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.to_ascii_lowercase();
+    haystack.contains(&needle.to_ascii_lowercase())
 }
 
 /// The hub cache root, following the python tooling's precedence:
@@ -255,9 +433,10 @@ pub fn cached_model(model: Model) -> Option<PathBuf> {
     cached_file(model.repo(), model.file())
 }
 
-/// The cached DFlash drafter for `model`, or `None`. Offline.
+/// The cached DFlash drafter for `model`, or `None` — which is also the answer
+/// for a checkpoint that ships no sidecar at all. Offline.
 pub fn cached_drafter(model: Model) -> Option<PathBuf> {
-    cached_file(model.repo(), model.drafter_file())
+    cached_file(model.repo(), model.drafter_file()?)
 }
 
 /// The cached drafter of the default model, or `None`. Offline. The zero-arg
@@ -311,9 +490,14 @@ pub fn ensure_model(model: Model) -> Result<PathBuf> {
     ensure_file(model.repo(), model.file())
 }
 
-/// The DFlash drafter for `model`, downloaded on first use.
-pub fn ensure_drafter(model: Model) -> Result<PathBuf> {
-    ensure_file(model.repo(), model.drafter_file())
+/// The DFlash drafter for `model`, downloaded on first use, or `None` for a
+/// checkpoint that ships none — which is not an error anywhere: it decodes
+/// plain.
+pub fn ensure_drafter(model: Model) -> Result<Option<PathBuf>> {
+    match model.drafter_file() {
+        Some(file) => ensure_file(model.repo(), file).map(Some),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -364,9 +548,12 @@ mod tests {
     #[test]
     fn the_drafter_cache_figure_follows_each_sidecars_layer_count() {
         // 5 drafter layers x (K and V) x 8 KV heads x 128 head_dim x 4 bytes.
-        assert_eq!(Model::Qwen27B.draft_kv_bytes_per_token(), 40 * 1024);
+        assert_eq!(Model::Qwen27B.draft_kv_bytes_per_token(), Some(40 * 1024));
         // 6 x 2 x 8 x 128 x 4.
-        assert_eq!(Model::Qwen35BA3B.draft_kv_bytes_per_token(), 48 * 1024);
+        assert_eq!(
+            Model::Qwen35BA3B.draft_kv_bytes_per_token(),
+            Some(48 * 1024)
+        );
 
         // The drafter ordering is the OPPOSITE of the target's: the 27B has the
         // bigger KV cache and the smaller drafter cache, so neither model is the
@@ -382,8 +569,185 @@ mod tests {
     /// serve config fall back to, and they came out of the 2026-08-08 retune.
     #[test]
     fn the_drafting_floor_is_per_checkpoint() {
-        assert_eq!(Model::Qwen27B.draft_p_min_default(), 0.5);
-        assert_eq!(Model::Qwen35BA3B.draft_p_min_default(), 0.3);
+        assert_eq!(Model::Qwen27B.draft_p_min_default(), Some(0.5));
+        assert_eq!(Model::Qwen35BA3B.draft_p_min_default(), Some(0.3));
+    }
+
+    /// Everything speculation needs travels together, so a checkpoint either
+    /// offers all of it or none: Qwen3.8-27B ships no DFlash sidecar and every
+    /// drafter question about it answers `None` rather than pointing at a file
+    /// the repo does not hold.
+    #[test]
+    fn a_checkpoint_without_a_sidecar_offers_no_drafter_at_all() {
+        assert_eq!(Model::Qwen3827B.drafter_file(), None);
+        assert_eq!(Model::Qwen3827B.drafter_size(), None);
+        assert_eq!(Model::Qwen3827B.draft_kv_bytes_per_token(), None);
+        assert_eq!(Model::Qwen3827B.draft_p_min_default(), None);
+        assert!(cached_drafter(Model::Qwen3827B).is_none());
+        assert_eq!(ensure_drafter(Model::Qwen3827B).unwrap(), None);
+    }
+
+    /// The two dense checkpoints share a graph and a geometry — 3.8's config is
+    /// byte-identical to 3.6's — so every cache figure is shared too, and only
+    /// the hub coordinates and the drafter tell them apart.
+    #[test]
+    fn the_two_dense_checkpoints_differ_only_off_the_graph() {
+        assert_eq!(
+            Model::Qwen3827B.kv_bytes_per_token(),
+            Model::Qwen27B.kv_bytes_per_token()
+        );
+        assert_eq!(
+            Model::Qwen3827B.snapshot_bytes(),
+            Model::Qwen27B.snapshot_bytes()
+        );
+        assert_eq!(Model::Qwen3827B.arch(), Model::Qwen27B.arch());
+        assert_ne!(Model::Qwen3827B.repo(), Model::Qwen27B.repo());
+    }
+
+    /// The API's model vocabulary is the full names and nothing else: the CLI's
+    /// short aliases are refused on the wire, where one checkpoint answering to
+    /// several ids is what listing them all duplicated in the first place.
+    #[test]
+    fn the_api_speaks_full_names_only() {
+        assert_eq!(Model::from_api_name("Qwen3.6-27B"), Some(Model::Qwen27B));
+        assert_eq!(
+            Model::from_api_name("qwen3.6-35b-a3b"),
+            Some(Model::Qwen35BA3B)
+        );
+        assert_eq!(Model::from_api_name("QWEN3.8-27B"), Some(Model::Qwen3827B));
+        assert_eq!(Model::from_api_name("35b"), None);
+        assert_eq!(Model::from_api_name("3.8"), None);
+        assert_eq!(Model::from_api_name(""), None);
+
+        // Every full name is distinct and round-trips.
+        for model in MODELS {
+            assert_eq!(Model::from_api_name(model.full_name()), Some(model));
+        }
+    }
+
+    /// What a GGUF says about itself decides which checkpoint it is: a file that
+    /// names none identifies as nothing and the caller falls back with a warning
+    /// rather than reporting someone's conversion under a checkpoint's name.
+    #[test]
+    fn a_gguf_identifies_itself_by_name_then_by_file_name() {
+        use std::path::Path;
+
+        // `general.name` outranks the file name, which the blessed files make
+        // moot and a renamed copy does not.
+        let moe = Path::new("some-other-name.gguf");
+        assert_eq!(
+            Model::identify(Arch::Moe, Some("Qwen3.6-35B-A3B"), Some(moe)),
+            Some(Model::Qwen35BA3B)
+        );
+        // A conversion onto the MoE graph that names no checkpoint is not one:
+        // the arch is shared by anything converted to it, so it identifies
+        // nothing on its own and the file keeps reporting under its own name.
+        assert_eq!(Model::identify(Arch::Moe, None, None), None);
+        assert_eq!(
+            Model::identify(Arch::Moe, Some("my-finetune"), Some(moe)),
+            None
+        );
+        // The arch narrows the candidates before any name is read, so a dense
+        // file claiming the MoE checkpoint's name matches nothing: a name cannot
+        // make a file the other graph, and the dense names are not in it.
+        assert_eq!(
+            Model::identify(Arch::Dense, Some("Qwen3.6-35B-A3B"), None),
+            None
+        );
+
+        // A whole checkpoint name is required — a bare release series is not one.
+        // The MoE case is the sharp one: that architecture has a single
+        // candidate, so a stray "3.6" needs no ambiguity to hand someone's
+        // finetune an official checkpoint's identity.
+        for stray in ["MyMoE-3.6", "3.6", "my-3.6-merge", "Qwen3.6"] {
+            assert_eq!(
+                Model::identify(Arch::Moe, Some(stray), None),
+                None,
+                "{stray}"
+            );
+        }
+        for stray in ["Qwen3.6-14B", "some-3.8-thing", "3.8-27b"] {
+            assert_eq!(
+                Model::identify(Arch::Dense, Some(stray), None),
+                None,
+                "{stray}"
+            );
+        }
+        // The real MoE name still identifies, in any case.
+        assert_eq!(
+            Model::identify(Arch::Moe, Some("qwen3.6-35b-a3b (Q8_0)"), None),
+            Some(Model::Qwen35BA3B)
+        );
+
+        // general.name as both blessed dense files carry it.
+        assert_eq!(
+            Model::identify(Arch::Dense, Some("Qwen3.6-27B"), None),
+            Some(Model::Qwen27B)
+        );
+        assert_eq!(
+            Model::identify(Arch::Dense, Some("Qwen3.8-27B"), None),
+            Some(Model::Qwen3827B)
+        );
+        // A re-quantized conversion that kept the whole name inside its own.
+        assert_eq!(
+            Model::identify(Arch::Dense, Some("Qwen3.6-27B-Instruct"), None),
+            Some(Model::Qwen27B)
+        );
+        assert_eq!(
+            Model::identify(Arch::Dense, Some("Qwen3.8-27B-Instruct (imatrix)"), None),
+            Some(Model::Qwen3827B)
+        );
+        // No general.name: the file name answers instead — but only when it
+        // spells a whole checkpoint name, quant suffix and directories aside.
+        for (path, expected) in [
+            ("/models/Qwen3.8-27B-Q8_0.gguf", Some(Model::Qwen3827B)),
+            ("/models/Qwen3.6-27B-Q4_K_M.gguf", Some(Model::Qwen27B)),
+            ("qwen3.8-27b.gguf", Some(Model::Qwen3827B)),
+            // A release digit is NOT a checkpoint name: this is somebody's 14B
+            // finetune, and calling it the official 27B would serve unchecked
+            // weights under an official name.
+            ("My-Qwen3.6-14B-finetune.gguf", None),
+            ("qwen-3.8-something.gguf", None),
+        ] {
+            assert_eq!(
+                Model::identify(Arch::Dense, None, Some(Path::new(path))),
+                expected,
+                "{path}"
+            );
+        }
+        // The MoE file name identifies its own checkpoint, and never a dense one.
+        assert_eq!(
+            Model::identify(
+                Arch::Moe,
+                None,
+                Some(Path::new("Qwen3.6-35B-A3B-Q4_K_M.gguf"))
+            ),
+            Some(Model::Qwen35BA3B)
+        );
+
+        // A name that spells two checkpoints identifies as neither: an ambiguous
+        // name is where guessing by table order is worst.
+        assert_eq!(
+            Model::identify(
+                Arch::Dense,
+                None,
+                Some(Path::new("Qwen3.6-27B-vs-Qwen3.8-27B.gguf"))
+            ),
+            None
+        );
+        assert_eq!(
+            Model::identify(Arch::Dense, Some("Qwen3.6 and Qwen3.8 merge"), None),
+            None
+        );
+        // A dense file that names no release is not guessed at.
+        assert_eq!(
+            Model::identify(
+                Arch::Dense,
+                Some("mymodel"),
+                Some(Path::new("mymodel.gguf"))
+            ),
+            None
+        );
     }
 
     fn scratch(label: &str) -> PathBuf {
@@ -422,7 +786,7 @@ mod tests {
             path.ends_with("snapshots/cafe01/Qwen3.6-35B-A3B-Q4_K_M.gguf"),
             "{path:?}"
         );
-        assert!(cached_file_in(&root, model.repo(), model.drafter_file()).is_none());
+        assert!(cached_file_in(&root, model.repo(), model.drafter_file().unwrap()).is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -464,10 +828,14 @@ mod tests {
 
     #[test]
     fn model_names_round_trip_through_the_cli_spelling() {
-        for model in [Model::Qwen27B, Model::Qwen35BA3B] {
+        for model in MODELS {
             assert_eq!(model.to_string().parse::<Model>().unwrap(), model);
+            // A name a `/v1/models` listing shows is also a `--model-size`.
+            assert_eq!(model.full_name().parse::<Model>().unwrap(), model);
         }
         assert_eq!("35B-A3B".parse::<Model>().unwrap(), Model::Qwen35BA3B);
+        assert_eq!("38".parse::<Model>().unwrap(), Model::Qwen3827B);
+        assert_eq!("3.8".parse::<Model>().unwrap(), Model::Qwen3827B);
         assert!("70b".parse::<Model>().is_err());
     }
 }

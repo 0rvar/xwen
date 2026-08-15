@@ -398,6 +398,7 @@ mod tests {
     fn cfg_for(k_heads: usize, v_heads: usize, hd: usize, hidden: usize) -> XwenConfig {
         XwenConfig {
             arch: Arch::Moe,
+            general_name: None,
             n_layer: 1,
             hidden,
             vocab: 8,

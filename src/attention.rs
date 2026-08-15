@@ -646,6 +646,7 @@ mod tests {
     fn test_cfg(n_head: usize, n_kv: usize, hd: usize, hidden: usize, n_rot: usize) -> XwenConfig {
         XwenConfig {
             arch: Arch::Moe,
+            general_name: None,
             n_layer: 4,
             hidden,
             vocab: 32,
