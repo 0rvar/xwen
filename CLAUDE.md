@@ -97,10 +97,13 @@ thinking is disabled (then a closed empty block is emitted).
 HF cache (`HF_HUB_CACHE` > `HF_HOME/hub`), cache-first via hf-hub, download on miss.
 Default repos/files (hub.rs): `ggml-org/Qwen3.6-27B-GGUF`,
 `ggml-org/Qwen3.6-35B-A3B-GGUF` and `ggml-org/Qwen3.8-27B-GGUF`, Q4_K_M. Sizes: 19.1 GB
-(27B), 20.4 GB (35B), 19.0 GB (3.8-27B). Q8_0: 28.6 / 36.9 / 28.6 GB. DFlash drafter
-sidecars: `dflash-*-BF16.gguf` (3.5 GB / 0.8 GB) — **3.8 has none and decodes plain**;
-every drafter accessor on `Model` is `Option`. MTP sidecars exist for all three and are
-unused. `mmproj-*` files are the vision tower — never load them.
+(27B), 20.4 GB (35B), 19.0 GB (3.8-27B). Q8_0: 28.6 / 36.9 / 28.6 GB. Drafter sidecars,
+one per checkpoint and TWO kinds: `dflash-*-BF16.gguf` on the 3.6 pair (3.5 GB / 0.8 GB)
+and `mtp-Qwen3.8-27B-Q8_0.gguf` on the 3.8 (3.2 GB). Every drafter accessor on `Model`
+is still `Option` — that shape is about a checkpoint that ships none, and no current one
+is. MTP sidecars also exist for both 3.6 checkpoints and are unused (they have DFlash
+heads, which are the better drafter there). `mmproj-*` files are the vision tower —
+never load them.
 Inherited hf-hub trap: refs/main is read verbatim; a trailing newline in a manually
 edited ref costs a full re-download.
 
@@ -184,21 +187,31 @@ kernel-vs-reference invariants and is the fast pre-check.
 
 ## Perf state
 
-As of 2026-08-08 (`lowpowermode 0` — NOT low-power mode; this machine emits no
-`powermode` key, so high-power mode is never positively confirmable and must not
-be claimed. Interleaved protocol; full history in log.md). Plain (--no-draft),
-measured inside the 2026-08-08 sweeps: 35B-A3B decode 104-107 tok/s, 27B 24.8-25.3.
+As of 2026-08-15 for the 3.8-27B, 2026-08-08 for the 3.6 pair (`lowpowermode 0` —
+NOT low-power mode; this machine emits no `powermode` key, so high-power mode is
+never positively confirmable and must not be claimed. Interleaved protocol; full
+history in log.md). Plain (--no-draft), measured inside the sweeps that graded
+each: 35B-A3B decode 104-107 tok/s, 27B 24.8-25.3, 3.8-27B 23.7-24.8.
 Prefill unchanged since 2026-07-29 and not re-measured: 35B ~1900-2550@4k; 27B
 702@925 / 445@4k. Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run
 adds ~9s of Metal pipeline compilation. With drafting (the default since P9a) at
-the per-model defaults fitted 2026-08-08: **27B 37.5-38.2 code / 36.8-37.4 chat**
-(+46-52% over plain), **35B 133.6-134.8 code / 122.3-123.7 chat** (+26-28% / +15-17%).
-Ranges span the four medians the shipped configuration was measured at (both stages
-of both sweeps).
+the per-model defaults: **27B 37.5-38.2 code / 36.8-37.4 chat** (+46-52% over
+plain), **35B 133.6-134.8 code / 122.3-123.7 chat** (+26-28% / +15-17%), both
+fitted 2026-08-08; **3.8-27B 34.4-35.7 code / 33.1-34.0 chat** (+44-45% / +37-38%)
+at the p_min 0.7, depth 4 fitted 2026-08-15, acceptance 80.0% code / 77.8% chat.
+Ranges span the medians the shipped configuration was measured at (for the 3.8,
+three independent measurements in one session: stage 1, stage 2's shipped-margin
+arm, and the depth probe).
 Those drafted figures are WITHIN-SWEEP against the plain arm of the same sweep;
 do not difference them against a drafted number from another session — the 27B's
 between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 reads
 36.5-37.6 in today's own 0.3 arm.
+Within-session cross-drafter comparison, 2026-08-15 (the only way to compare the
+two kinds honestly — same machine, same hour): the 3.6-27B's DFlash head runs
+1.50x/1.47x over its own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x
+over its own. Same trunk geometry, so the block drafter is still the stronger
+drafter; the MTP head closes most of the gap and is worth roughly ten times less
+KV (4 KiB/token against 40).
 
 **The 27B prefill gap is CLOSED (P8c, 2026-07-29).** It was never the DeltaNet
 scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill
@@ -228,26 +241,72 @@ And on a machine shared with other agents, calibrate every prefill run against
 the classic arm's known baseline before believing absolutes: three separate
 contended runs read 3x low in BOTH arms while the ratio stayed put.
 
-## DFlash (SHIPPED and ON BY DEFAULT as of 2026-07-29)
+## Drafting (SHIPPED and ON BY DEFAULT; all three checkpoints as of 2026-08-15)
 
-Adapted (P9), then made a both-checkpoint win by the K-snapshot fused verify (P9a) and
-flipped to opt-out the same day — `--no-draft` opts out; a zero-flag run fetches and
-loads the sidecar (3.5 GB 27B / 0.8 GB 35B). Sidecar facts (arch `dflash`; 27B: 5
-layers, sliding_window 2048, taps [2,17,32,47,62], mask 248070; 35B: 6 layers,
-sliding_window 4096, taps [2,7,12,17,23,28,33,38], mask 248077; both block_size 16,
-fc.weight over concatenated tapped layer outputs, own ffn_norm, q/k-norms [128]).
-Verify-walk rollback uses the fused scan's K-snapshot planes
-(most-recent-first, llama.cpp's shape; decisions.md "Model math").
+TWO drafter kinds, one verify machinery. `--no-draft` opts out; a zero-flag run fetches
+and loads the checkpoint's own sidecar. Which kind a checkpoint ships is
+`Model::drafter_kind()`, the file itself is the authority once opened
+(`drafter::classify`), and `src/drafter.rs` is the seam. Everything downstream of the
+proposal — checkpoint, batched `forward_all_logits`, `accept_drafts`, `kv_rollback`, the
+retention cap, the auto-pause controller — is kind-agnostic, which is the whole reason a
+second kind was affordable.
 
-Controller constants, RETUNED 2026-08-08 (the retune ledger item is closed): `p_min` is
-PER-MODEL via `Model::draft_p_min_default()` in src/hub.rs — **0.5 on the 27B, 0.3 on
-the 35B-A3B** — and `pause_margin` stays a shared 1.0, now confirmed by its first real
-sweep rather than assumed. Acceptance at those defaults is 78-86% (27B) / 68-74% (35B);
-the older "85-95%" figure was measured at other `p_min` values and does not describe the
-shipped default. The standing retune tool is `bun scripts/retune-draft.ts` (two-stage,
-no cell reuse between stages, P9's qualification criterion, print-only) — if you change
-`hub.rs`'s arms you must also update the script's `SHIPPED_P_MIN` table, or the next
-sweep grades against a status quo that no longer ships.
+**DFlash block drafting (the 3.6 pair).** Adapted (P9), made a both-checkpoint win by the
+K-snapshot fused verify (P9a) and flipped to opt-out the same day (3.5 GB 27B / 0.8 GB
+35B). Sidecar facts (arch `dflash`; 27B: 5 layers, sliding_window 2048, taps
+[2,17,32,47,62], mask 248070; 35B: 6 layers, sliding_window 4096, taps
+[2,7,12,17,23,28,33,38], mask 248077; both block_size 16, fc.weight over concatenated
+tapped layer outputs, own ffn_norm, q/k-norms [128]). It denoises a whole block in ONE
+forward, so depth is nearly free and 15 is a cap, not a fitted value. Verify-walk
+rollback uses the fused scan's K-snapshot planes (most-recent-first, llama.cpp's shape;
+decisions.md "Model math").
+
+**MTP chain drafting (Qwen3.8-27B).** `mtp-Qwen3.8-27B-Q8_0.gguf`, 3.2 GB, 18 tensors,
+`src/mtp.rs`. The head is a 65th trunk-flavour full-attention layer with its own KV:
+`eh_proj` over `[enorm(embed) ⊕ hnorm(hidden)]`, then the trunk's own `AttnBlock`/`Rope`
+(so partial NEoX rope, QK-norm and the sigmoid output gate are the blessed ones, not a
+re-derivation), then `shared_head_norm`. It REUSES the target's quantized `token_embd`
+and `output` — the sidecar's BF16 duplicates of both are deliberately ignored, which is
+3 GB of its 3.16 saved for nothing lost. It chains one forward per step and self-feeds,
+so depth costs linearly and pays off geometrically less: llama.cpp's fitted `n_max` is 3
+and so is ours. Ground truth is llama.cpp `graph_mtp` in `src/models/qwen35.cpp` plus the
+chain semantics in `common/speculative.cpp`.
+
+TWO silent-garbage traps in that head, both pinned by tests because neither fails loudly:
+(1) **concat order is EMBEDDING FIRST** — `eh_proj` takes the embedding in the low half;
+swapping the halves yields a graph that runs and drafts noise. (2) **both residuals
+anchor on `eh_proj`'s OUTPUT** — `inpSA = eh_proj(cat)`, and attention and FFN both add
+back to that; there is no outer residual re-adding the embedding or the incoming hidden.
+A third, invisible in the tensor names: the `h` input is the target's hidden AFTER
+`output_norm` (upstream commit 166fe294 chose that deliberately). The DFlash spec taps
+are PRE-norm layer outputs and are the WRONG source; `XwenModel` has a separate accessor.
+The sync rule is the other thing to get exactly right and it lives in one function: the
+head's KV row for position `p` is built from `(token_p, hidden_{p-1})` — shifted right by
+one, position 0 taking a zero hidden, mirroring llama.cpp's initial `pending_h` — and
+`sync` takes tokens and hiddens at the SAME positions and owns the shift itself
+(`the_sync_pairs_each_token_with_the_previous_positions_hidden`).
+
+MTP limitations, both ledgered (TODO.md) rather than hidden: **a rewind resets the head**
+— it keeps exactly one carry hidden, so `truncate` below what it holds drops it to zero
+and that serve conversation stops speculating until a prefill from zero (the DFlash
+drafter survives the same rewind, because each of its rows depends only on that
+position's taps); and **a stored MTP image resumes only at the exact position it ends
+at**, partial cover being refused by the kind-aware `drafter_planes_usable` predicate.
+Both have the same root and the same fix.
+
+Controller constants: `p_min` PER-CHECKPOINT via `Model::draft_p_min_default()` and depth
+PER-KIND via `Model::draft_max_default()`, both in src/hub.rs; `pause_margin` stays a
+shared 1.0. Values and the acceptance they buy are in "Perf state" below. `p_min` here is
+a FULL-VOCAB probability and deliberately NOT llama.cpp's top-10-renormalized one
+(decisions.md), so any cross-check against llama.cpp must run both sides at `p_min` 0 or
+it is comparing two different gates. The standing retune tool is `bun
+scripts/retune-draft.ts` (two-stage, no cell reuse between stages, P9's qualification
+criterion, print-only; `--depth-grid` crosses depth with p_min in stage 1) — if you
+change `hub.rs`'s arms you must also update the script's `SHIPPED_P_MIN` and
+`SHIPPED_DRAFT_MAX` tables, or the next sweep grades against a status quo that no longer
+ships. `bun scripts/spec-equivalence.ts` covers all three checkpoints; its GREEDY mode is
+the gate, and its sampled mode diverges on the shipped 3.6 checkpoints too (near ties,
+not a regression — see "Perf state").
 
 ## serve (INHERITED, needs template adaptation)
 

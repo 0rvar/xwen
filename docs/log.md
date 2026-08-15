@@ -4,7 +4,325 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-08-14 (latest, same arc) — Review round: a job now names a FILE, not just a checkpoint; drafting is resolved per checkpoint; a contradicting `--model-size` fails at startup
+## 2026-08-15 (latest, same arc) — MTP Stage C: the graph is confirmed against llama.cpp by BYTE-IDENTICAL output, the sweep moves the 3.8's defaults to p_min 0.7 / depth 4 (+44-45% code, +37-38% chat over plain), and two stage-B claims do not survive being re-run
+
+Stage C is the arc's verification half: cross-check the graph against the reference
+implementation (C2), fit the shipped defaults with a real sweep instead of single runs
+(C3), and write the arc down (C4). No implementation changed except the two fitted
+constants and the harness edits that made them measurable.
+
+**Machine state: `lowpowermode 0`, on AC power, 100% charged, machine otherwise idle.**
+Per CLAUDE.md this machine emits no `powermode` key, so high-power mode is not claimed.
+The session is calibrated by its own control: the 3.6-27B's DFlash pair read 38.0 code /
+37.1 chat against 25.3 plain, against the 37.5-38.2 / 36.8-37.4 recorded on 2026-08-08 —
+so this session sits exactly where the last one did, and nothing here needs the
+contended-machine caveat.
+
+**C2 — the graph is confirmed, and by a stronger result than the one asked for.** Both
+implementations ran the same raw fixture, same target and sidecar, depth 3, `p_min` 0 on
+both sides, greedy, 128 tokens. Acceptance: 73.3% (xwen) against 75.0% (llama.cpp) on
+code, 45.7% against 47.1% on chat — 1-2 points, where 10 was the bar. But the load-bearing
+result is that the generated text was **byte-identical on both fixtures**. That means
+acceptance is being compared over the very same continuation rather than over two texts
+that happen to resemble each other, and it independently exercises the trunk: two
+unrelated implementations agreed on every greedy argmax for 128 consecutive tokens. The
+residual 1-2 points is xwen proposing a few more drafts near the end of the token budget
+(120 against 116, 162 against 157) — round bookkeeping, not graph.
+
+Getting there cost two harness traps worth recording. `llama-cli` in the pinned revision
+embeds llama-server and runs CONVERSATION mode regardless of `-no-cnv`: it applied the
+chat template and enabled thinking, so the first attempt compared xwen's raw continuation
+against llama.cpp's chain-of-thought and reported a 11.5-point chat gap that read exactly
+like a graph bug. The tell was in the captured output, not the number — llama.cpp's log
+carried an interactive banner and a `[Start thinking]` block. Driving the comparison
+through `llama-server`'s `/completion` endpoint, which takes the prompt verbatim, and
+reading `timings.draft_n` / `draft_n_accepted` fixed it. The other trap is the one the
+arc already knew about and the brief insisted on: both sides must run at `p_min` 0,
+because xwen's floor is a full-vocab probability and llama.cpp's is renormalized over its
+top-10, so any nonzero threshold compares two different gates. (llama.cpp's `n_max` clamp
+to `n_mtp_layers` applies only to multi-layer `chain_heads`, so with a 1-layer sidecar
+both implementations self-feed the full depth — apples to apples, verified at
+speculative.cpp:1342-1352.)
+
+**C3 — the defaults move, and depth is what moved them.** The sweep crossed `p_min`
+{0.3, 0.5, 0.7} with depth {2, 3, 4} in stage 1, 128 greedy tokens, arms interleaved,
+medians of 3 reps, against a plain arm of 23.7 code / 24.0 chat. All nine arms qualified
+(ahead of plain on both fixtures in every rep). The winner was **p_min 0.7, depth 4** at
+33.8 tok/s mean-of-medians, against the shipped (0.5, 3)'s 32.5.
+
+Depth is the axis that pays and the floor very nearly is not. At fixed depth 4 the three
+floors spanned 33.5 / 33.2 / 33.8 — 1.8% — where depth spanned 12%. Depth 4 beat depth 3
+at every floor, almost entirely on chat (+36.7 to +39.2% over plain against +27.5 to
++32.9%) while code was a wash. What the floor does clearly change is wasted work:
+acceptance at depth 4 runs 65.5% at 0.3 against 80.0% at 0.7, which costs nothing
+measurable at batch 1 because the target forward dominates. So 0.7 ships, and both
+`hub.rs` and the record say plainly that it is the weakest-held of the three checkpoints'
+floors.
+
+Because depth 4 won at the grid's EDGE, a follow-up probe checked the optimum was
+bracketed rather than merely unexplored — at `p_min` 0.7, depths 4 / 5 / 6 / 8 read
+34.9 / 34.0 / 32.6 / 25.4 mean-of-medians. It falls away on both sides, so 4 is a peak.
+Depth 8 is where the auto-pause controller starts firing hard (34-80 rounds paused) and
+drafting stops paying at all, which is the controller working.
+
+At the shipped configuration, measured three independent times in this one session
+(stage 1, stage 2's shipped-margin arm, and the probe): **34.4-35.7 code, 33.1-34.0 chat,
+against plain 23.7-24.8 — +44 to +45% and +37 to +38%**, acceptance 80.0% / 77.8%. The
+cross-drafter comparison the arc wanted: the 3.6-27B's DFlash head runs 1.50x/1.47x over
+its own plain arm where the 3.8's MTP head runs 1.45x/1.38x over its own, same trunk
+geometry, same hour. The block drafter is still the better drafter; the MTP head closes
+most of the gap for an order of magnitude less drafter KV (4 KiB/token against 40).
+
+**A finding that was NOT installed, deliberately.** Stage 2's margin sweep made the
+never-pause arm the winner — `margin 0` at 35.9 mean-of-medians against 34.8 at the
+shipped 1.0. Pausing cannot explain it: both arms recorded ZERO paused rounds. The cause
+is the controller's instrumentation rather than its decisions — `PauseController` forces
+a plain round every 32 (and every 4 until its plain warm-up is met) to keep
+`ema_plain_ms` fresh, and a forced-plain round commits one token where a drafting round
+commits about four; in a ~40-round run that is about three rounds of speedup given up,
+which is the size of the gap. It stays uninstalled because `pause_margin` is ONE shared
+value at three sites, only this checkpoint's stage 2 was run, and decisions.md records
+the controller earning its keep on the 3.6 pair — installing 0 here would silently change
+two checkpoints to a value nothing graded for them, and would remove the safety net the
+depth-8 arm proves still works. Ledgered as an optimization, not a default change.
+
+**Two stage-B claims did not survive being re-run, and the ledger says so.** First, that
+entry's headline "+60%, 39.3 against 24.5" was one run at the OLD defaults; the sweep's
+answer for the shipped configuration is +44-45% / +37-38%, and single runs at 128 tokens
+on this machine are simply not that precise. Second, and more substantively, stage B
+recorded `--draft` byte-identical to `--no-draft` under BOTH equivalence modes including
+sampled at 192 tokens, seed 42. It does not reproduce: the 3.8 diverges in sampled mode
+at seed 42 (line 7) and at seed 7 (line 1, both fixtures), while seed 99 code and seed 1
+chat come back identical.
+
+This is not an MTP regression, and the control is what establishes that: **the shipped
+DFlash 27B diverges in sampled mode too**, on the chat fixture at every one of seeds
+42/7/99. Sampled divergence is the pre-existing near-tie class the script's own header
+documents — the batched verify forward reassociates its f32 sums differently from the
+single-token forward, and at temperature a near tie resolves to a different token. A
+structural sampler-stream bug is separately ruled out: it would fire on every seed, and
+two 3.8 seed/fixture pairs came back byte-identical over 128 sampled tokens, which is
+impossible if the spec loop drew a different number of times than plain. GREEDY, which is
+the mode that actually gates, is clean on both fixtures at 128 and at 256 tokens, and
+again after the defaults moved (at the script's 0.3 coverage floor and at the shipped
+0.7). What is left open is the SCRIPT's criterion, ledgered: its "a first-line fork means
+the sampler stream" rule mis-grades, and its exit code presents sampled mode as a gate
+that no checkpoint has ever passed.
+
+**Harness.** `scripts/hf.ts`'s `drafter: null` for 3.8 was the single thing excluding it
+from both harnesses; setting it wires up `draftingSizes()` for the sweep and the default
+model list for the equivalence check at once. `retune-draft.ts` grew a `--depth-grid`
+that CROSSES depth with `p_min` in stage 1 rather than sweeping it separately (fitting
+each against the other's stale shipped value is how you get a half-fit), a
+`SHIPPED_DRAFT_MAX` table mirroring `Model::draft_max_default`, and a status-quo
+tie-break that now compares the pair. Without a depth grid the arms, labels and cell keys
+are exactly what they were, so the ordinary p_min retune still measures what it always
+measured. 888 tests green (819 lib + 69 binary).
+
+## 2026-08-15 (superseded in part by Stage C above — its "+60%" is a single run at the old defaults, and its sampled-equivalence claim does not reproduce) — MTP drafting SHIPS on Qwen3.8-27B: 39.3 tok/s drafted against 24.5 plain in the same session (+60%) at 93.5% acceptance, and `--draft` is byte-identical to `--no-draft` under both equivalence modes
+
+The checkpoint that had no drafter now has one. `src/mtp.rs` is the head (one extra
+trunk-flavour full-attention layer with its own KV), `src/drafter.rs` the seam between the
+two drafter kinds, and `generate.rs` the chain round. Stage A built the head and the seam
+and left two `bail!` stubs where the loops go; this entry covers both stages, since A
+shipped no user-visible behaviour on its own.
+
+**Machine state: `lowpowermode 0`, on AC power, charging.** Per CLAUDE.md this machine
+emits no `powermode` key, so high-power mode is not claimed — only that low-power mode is
+off, which is a different state from the Phase 0 entry below (`lowpowermode 1`, on
+battery) and is why none of its absolute numbers are compared against these.
+
+**What a round does.** Draft: chain the head `min(--draft-max, 3)` steps from the token the
+target just sampled. Step 1 consumes that token and the target's post-final-norm hidden at
+the position before it; every later step is fully self-feeding, consuming its own previous
+token and its own post-`shared_head_norm` hidden. Greedy, and a step whose argmax
+probability falls below `p_min` DISCARDS its token and ends the chain. Verify, accept and
+roll back are the existing DFlash machinery unchanged — checkpoint, batched
+`forward_all_logits`, `accept_drafts`, `kv_rollback`, the retention cap, the auto-pause
+controller — which is the whole reason a second drafter kind was affordable at all. Then
+sync the head over the kept rows.
+
+**The sync rule is the part that had to be got exactly right, and it now lives in one
+function.** The head's KV row for position `p` is built from `(token_p, hidden_{p-1})` —
+shifted right by one — with position 0 taking a zero hidden, mirroring llama.cpp's initial
+`pending_h`. Stage A's `sync` took an already-shifted `h` and left the shift at the call
+site, of which there are three (prefill, the round's plain step, the round's verify). That
+was reconciled: `sync` now takes the tokens and the hiddens at the SAME positions, exactly
+as a forward hands them over, and owns the shift itself, carrying the one hidden the next
+row will need. `the_sync_pairs_each_token_with_the_previous_positions_hidden` pins it
+against a synthetic head whose attention and FFN contribute nothing, so each row's hidden
+is directly readable off the output and an off-by-one cannot hide.
+
+**The chain stays on the GPU.** Phase 0 measured a per-step CPU readback at +1.45-2.96 ms
+of pure sync, which on a 3-step chain is most of what drafting saves. So each step's argmax
+and probability are reduced on device, the next step's embedding is gathered BY DEVICE
+INDEX (`XwenModel::embed_rows`), the hidden is carried forward as a tensor, and one
+readback happens at the end of the chain. The per-step vocabulary projection — Phase 0's
+"51.8-53.6% of the step's time" — goes through the vendored seq=1 mat-vec
+(`XwenModel::lm_head_row`, extracted from `forward`'s decode bypass), not QMatMul. The
+`p_min` walk then runs on the host over the read-back probabilities, which means a chain
+that will be cut at step 1 has already paid for steps 2 and 3; that is the trade the
+on-device accumulation buys, and at depth 3 it is the cheaper side.
+
+**Prefill pays for the head, and the cost is small.** llama.cpp pays an 84 MB-per-4k-ubatch
+device-to-host round trip here because its two contexts cannot see each other's tensors;
+xwen is one process on one device, so the hiddens go from the trunk's final norm into the
+head without leaving the GPU. Measured as an interleaved A/B (XWEN_BENCH=1, 5 reps per arm,
+alternating, medians), MTP-attached against plain: **-4.2% at 839 prompt tokens** (median 694.8 vs 725.5 tok/s,
+arms spanning 691-702 and 721-734) and **-5.8% at 3286** (424.8 vs 450.9, reps 3-5 alone
+430.7 vs 456.8 for 0.943 — the same ratio). Mildly worse at the longer prompt, which is
+the shape the mechanism predicts: the head builds its OWN `[1, n_head, seq, pos+seq]`
+prefill mask per chunk, where the trunk builds one and hoists it across all sixteen of its
+full-attention layers, so the head adds a second full-size mask rather than a sixteenth of
+one and the cost grows with `pos`. That mask is reusable as-is — at sync time the head's
+committed length and head count both equal the trunk's — and is ledgered.
+
+Both figures are interleaved medians and neither is a clean-machine absolute: the 4k arm's
+first two reps read 237-339 tok/s against the last three's 425-460 while the machine
+settled out of a concurrent test run, which is the duty-cycle effect CLAUDE.md warns about
+(a doubled `XWEN_BENCH` prefill at 3286 tokens is a long run). The RATIO held across that
+swing, which is the only reason the number is quotable at all. An earlier reading of -31%
+at 4k was contention plus a real bug, both since resolved.
+
+That bug is worth recording because it only appears past 1024 tokens: the head's
+`LayerCache` is allocated at `max_ctx.min(1024)` and grown on demand like the trunk's, and
+nothing was calling `ensure_full_capacity`. Anything over 1024 tokens of context failed
+with a `slice_set` shape mismatch. The 4k prefill measurement is what caught it — the
+decode smoke and every unit test run below the boundary.
+
+**Numbers, all within-session.** First live smoke, 200 greedy-ish tokens on a code prompt
+at the shipped defaults (`p_min` 0.5, chain 3): 39.3 tok/s drafted against 24.5 tok/s
+plain in the same session, **+60%**, at 93.5% acceptance over 55 rounds and 3.8 tokens per
+round. With the confidence floor removed entirely (`--draft-p-min 0`, chains always 3)
+acceptance falls to 82.0% and throughput to 36.4 tok/s, which is the expected direction and
+is what makes 0.5 the right shipped default to start Stage C from. These are single runs,
+not a qualification sweep — that is Stage C.
+
+**Equivalence holds in both modes.** `--draft` and `--no-draft` produce byte-identical
+output at temperature 0 over 256 tokens, and at temperature 0.8 seed 42 over 192 tokens
+with `--draft-p-min 0 --draft-pause-margin 0` — the mode that catches the spec loop
+advancing the sampler stream a different number of times than the plain loop. Both were run
+by hand; `scripts/spec-equivalence.ts` still has no 3.8 arm (TODO.md).
+
+**Two shapes had to grow a kind.** The disk-tier drafter record now stores which drafter
+wrote it, and `CONTAINER_VERSION` goes 2 → 3 so a v2 record is refused rather than
+misread — the checkpoint binding cannot help here, since the same target file can be served
+with either drafter attached. The two records genuinely differ: DFlash is f32 across
+several layers, MTP is f16 across one (it reuses the trunk's own `LayerCache`) and carries
+the shift-right carry besides its KV. Same for `hub::Drafter`, whose per-token cache
+arithmetic hardcoded DFlash's 8 heads at dim 128: the MTP head is 4 KiB/token against
+DFlash's 40-48, an order of magnitude cheaper to give context to.
+
+**One real limitation, ledgered rather than hidden.** The head cannot follow a rewind. Row
+`pos` needs the target hidden at `pos - 1` and the head keeps exactly one such hidden, so
+`truncate` to anything shorter than it holds resets it to zero rather than resume on
+another position's hidden — speculation goes off for the rest of that serve conversation
+until a prefill from zero. The DFlash drafter keeps its rows across the same rewind because
+each of its rows is a function of that position's taps alone. Three ways out are costed in
+TODO.md; the cheapest correct thing was chosen for stage B because syncing on a stale carry
+would be a silently wrong draft context rather than a slow one.
+
+886 tests green (817 lib passed plus 26 ignored, and 69 in the binary; the ignored set
+is the perf benches and the fixtures that need a checkpoint on disk) (`the_confidence_walk_discards_from_the_first_shortfall`,
+`the_sync_pairs_each_token_with_the_previous_positions_hidden`,
+`an_mtp_image_round_trips_and_cannot_be_read_as_a_dflash_one`, and the hub's kind
+assertions are new). Stage C — the llama.cpp acceptance cross-check and the qualification
+sweep — is a separate brief.
+
+## 2026-08-15 — Phase 0 for MTP drafting on Qwen3.8-27B: the 3.6 DFlash head partially transfers but does not pay (0.86-1.02x vs the native head's 1.33-1.65x in the same session), and an MTP draft step costs 7-8.5% of a target forward
+
+Measurement only — no shipped code changed. Two experiments that feed the MTP arc's design
+(the arc itself is committed regardless of how they read).
+
+**Machine state, which everything below is conditional on: `lowpowermode 1`, ON BATTERY,
+discharging.** Every perf figure in this repo's "Perf state" was taken at `lowpowermode 0`.
+Plain 3.8 decode read 9.0-9.4 tok/s here against the 23.8 recorded on 2026-08-14 — a 2.5x
+depression — and the plain chat arm swung 9.7 → 6.5 → 9.4 tok/s WITHIN one interleaved
+sweep (1.49x), with the microbench's short ops drifting monotonically slower run to run
+(1.87 → 10.15 ms for the same 1 GB matvec). No absolute number here is comparable to any
+other session's, and the sweep's tok/s ratios would have been worthless on their own. What
+makes the experiments readable anyway is that both are built on quantities a throttled
+machine cannot move: acceptance rate (a model-vs-model property), a within-session control
+arm, and a bytes-moved budget.
+
+**EXPERIMENT 1 — the 3.6-27B DFlash head DOES attach to the 3.8 target, and partially
+transfers, but does not earn its keep.** The configs being byte-identical means
+`check_against_target` passes and `--model-size 3.8-27b --draft <3.6 sidecar>` just works;
+nothing about the mask token id (248070, which 3.8's tokenizer reads as `<|audio_start|>`)
+obstructs it, because the mask is only ever fed to the drafter. Four arms, 128 greedy
+tokens, XWEN_BENCH=1, the P9a code/chat fixtures, arms interleaved across reps, 3 reps,
+medians — plus a NATIVE control (the same head on its own 3.6 target) and a 3.6 plain
+baseline, all in the same thermal epoch, because the shipped 78-86% figure was recorded in
+a different power state and comparing against it would have been the exact error CLAUDE.md
+warns about.
+
+Acceptance was deterministic to the point of boredom (50/50/50, 68/68/66, 81/81/81 across
+reps), which is what makes it the load-bearing number:
+
+| p_min | code: 3.8 / native 3.6 | chat: 3.8 / native 3.6 |
+| --- | --- | --- |
+| 0.3 | 50.0% / 87.4% (retains 57%) | 47.5% / 65.9% (72%) |
+| 0.5 | 67.6% / 92.1% (73%) | 75.8% / 81.1% (93%) |
+| 0.7 | 79.5% / 94.0% (85%) | 80.6% / 97.0% (83%) |
+
+With the auto-pause controller removed entirely (`--draft-pause-margin 0`, p_min 0.5), so
+every round drafts and the controller's timing-dependent decisions stop mediating:
+code 63.7% (3.8) vs 90.6% (native), chat 69.1% vs 73.5%.
+
+Throughput, same session: native 3.6 plain 9.2-9.3 tok/s, native 3.6 drafted 13.2 code /
+12.4 chat (**1.43x / 1.33x**, and 15.2/12.7 = 1.65x/1.37x never-paused) — while the 3.8
+target with the transferred head ran 8.9 code / 8.9 chat against 9.0/9.4 plain
+(**0.99x / 0.95x**; 1.02x/0.86x never-paused). The controller saw it and paused 72-89% of
+rounds, which is it working as designed.
+
+The native control is what licenses the conclusion: speculation still pays 1.3-1.65x on
+this machine in this state, so the transferred head's ~1.0x is a property of the transfer,
+not of the battery. **The head survives the retrain partially — acceptance is far above
+chance and never collapsed — but a head that proposes 64-76% where the native one proposes
+81-92% does not clear its own overhead.** It is not an interim default for 3.8. What it is
+is the baseline MTP has to beat, and the bar it sets is the native pair's 1.33-1.65x.
+
+**EXPERIMENT 2 — one MTP draft step costs 7.1-8.5% of a target decode forward, and the
+lm_head is half its time and 70% of its bytes.** `mtp-Qwen3.8-27B-Q8_0.gguf` (3.16 GB, 18
+tensors, `general.name` "Qwen3.8-27B", `block_count 65`, `nextn_predict_layers 1`) is
+structurally a 65th trunk full-attention layer. Measured through a throwaway harness over
+the real weights and the shipped loader, amortized (32 dispatches per sync, outputs held
+alive, warm-up batch discarded, median of 7), ctx 1024:
+
+| | run 1 | run 2 |
+| --- | --- | --- |
+| (a) whole MTP step | 7.818 ms | 9.472 ms |
+| (b) lm_head mat-vec alone | 4.187 ms | 4.904 ms |
+| (d) lm_head + per-step CPU readback | 7.145 ms | 6.355 ms |
+| (c) target decode forward | 109.395 ms | 111.506 ms |
+| **step / target forward** | **7.1%** | **8.5%** |
+
+The timing is noisy (see the machine state) so it is cross-checked against bytes, which
+throttling cannot move: the step must read 451.3 MB of MTP layer weights (Q8_0) plus the
+target's 1042.9 MB Q6_K lm_head = 1494.3 MB, against ~18.25 GB for a target forward —
+**8.19% by bytes**, which the two timed runs bracket. Three independent routes to the same
+answer. Internal consistency check: (c)'s 109 ms/token is 9.14 tok/s, matching the sweep's
+independently measured 9.0-9.4 tok/s plain arm.
+
+Two design inputs fall out. The lm_head is **51.8-53.6% of the step's time and 69.8% of its
+bytes** — the chain-drafter tax dominates, so anything that shrinks the per-step vocabulary
+projection is worth more than anything that shrinks the layer. And a per-step CPU readback
+(sync + device→host copy, which is what a CPU-side argmax between chain steps costs) added
++1.45 to +2.96 ms/step over the same op batched, 1.3-1.7x; against a step that is itself
+~2-9 ms, that is a large fraction to pay 2-3 times per draft chain. It measures the same
+way in both runs and it does not shrink when the clock recovers, since it is a
+synchronization cost rather than a compute one.
+
+Verdicts as design inputs: the step-cost ratio is comfortably inside the "<10% → viable at
+depth 2-3" band, and it says the draft chain should stay ON-GPU rather than reading back
+per step. Every number here should be re-measured at `lowpowermode 0` before it is quoted
+as a perf claim; the RATIOS and the acceptance figures are the parts expected to survive
+that re-measurement, and the byte budget is not expected to move at all.
+
+Harness (throwaway, unstaged): `examples/mtp_step_bench.rs` in-repo (untracked) and the
+sweep scripts under this session's scratchpad; raw per-run JSON alongside them.
+
+## 2026-08-14 — Review round: a job now names a FILE, not just a checkpoint; drafting is resolved per checkpoint; a contradicting `--model-size` fails at startup
 
 Two reviews (Claude and Codex/gpt-5.6-sol) of the entry below found one shared root
 behind most of their findings: the arc had introduced a second kind of model identity

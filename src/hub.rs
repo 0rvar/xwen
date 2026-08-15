@@ -21,6 +21,7 @@ use hf_hub::Cache;
 use hf_hub::api::sync::ApiBuilder;
 
 use crate::config::Arch;
+use crate::drafter::DrafterKind;
 
 /// Which official checkpoint to run. All are ggml-org GGUF conversions; the
 /// GGUF filenames keep the model's name — only the engine is called xwen.
@@ -33,8 +34,8 @@ pub enum Model {
     Qwen35BA3B,
     /// Qwen3.8-27B, dense (`qwen35`). The 3.8 release's config is byte-identical
     /// to [`Model::Qwen27B`]'s, so the two run the same graph at the same
-    /// geometry and differ only in weights, repo — and drafter: 3.8 ships no
-    /// DFlash sidecar.
+    /// geometry and differ only in weights, repo — and drafter KIND: 3.8 ships an
+    /// MTP head where the 3.6 checkpoints ship DFlash sidecars.
     Qwen3827B,
 }
 
@@ -43,8 +44,8 @@ pub enum Model {
 pub const MODELS: [Model; 3] = [Model::Qwen27B, Model::Qwen35BA3B, Model::Qwen3827B];
 
 /// The hub coordinates of one checkpoint: the repo, the Q4_K_M target (the
-/// quant this machine is built around), and its DFlash drafter sidecar when the
-/// release ships one. The sizes are the hub's own byte counts, rounded, and
+/// quant this machine is built around), and its drafter sidecar — of whichever
+/// kind the release ships — when it ships one. The sizes are the hub's own byte counts, rounded, and
 /// exist only for the "this is about to download" notice.
 struct Checkpoint {
     repo: &'static str,
@@ -55,20 +56,23 @@ struct Checkpoint {
     /// checkpoint — two releases share it — so this identifies the arch alone.
     arch: Arch,
     model_size: &'static str,
-    /// The DFlash sidecar, or `None` for a release that ships none. Everything
-    /// speculation needs is in here together: a checkpoint either drafts or it
-    /// does not.
+    /// The drafter sidecar, of whichever kind the release ships, or `None` for
+    /// one that ships none. Everything speculation needs is in here together: a
+    /// checkpoint either drafts or it does not.
     drafter: Option<Drafter>,
     geometry: CacheGeometry,
 }
 
-/// One checkpoint's DFlash drafter sidecar.
+/// One checkpoint's drafter sidecar.
 struct Drafter {
+    kind: DrafterKind,
     file: &'static str,
     size: &'static str,
-    /// Decoder layers in the sidecar (`dflash.block_count`). The only drafter
-    /// dimension the two sidecars differ in — 32 Q / 8 KV heads at head_dim 128
-    /// on both — so it alone decides what a drafter cache costs.
+    /// Layers in the sidecar the cache is sized over: `dflash.block_count` for a
+    /// DFlash sidecar, and one for an MTP head, which is a single block however
+    /// many the file declares. Within a kind it is the only dimension the
+    /// shipped sidecars differ in, so it alone decides what a drafter cache
+    /// costs.
     layers: usize,
     /// The drafting confidence floor this checkpoint decodes fastest at; see
     /// [`Model::draft_p_min_default`].
@@ -119,6 +123,7 @@ const QWEN_27B: Checkpoint = Checkpoint {
     arch: Arch::Dense,
     model_size: "19.1 GB",
     drafter: Some(Drafter {
+        kind: DrafterKind::Dflash,
         file: "dflash-Qwen3.6-27B-BF16.gguf",
         size: "3.5 GB",
         layers: 5,
@@ -134,6 +139,7 @@ const QWEN_35B_A3B: Checkpoint = Checkpoint {
     arch: Arch::Moe,
     model_size: "20.4 GB",
     drafter: Some(Drafter {
+        kind: DrafterKind::Dflash,
         file: "dflash-Qwen3.6-35B-A3B-BF16.gguf",
         size: "0.8 GB",
         layers: 6,
@@ -152,15 +158,24 @@ const QWEN_35B_A3B: Checkpoint = Checkpoint {
     },
 };
 
-/// The 3.8 release ships no DFlash sidecar, so this checkpoint decodes plain.
-/// The repo does carry an MTP sidecar, which nothing here reads (TODO.md).
+/// The 3.8 release ships no DFlash sidecar. It ships an MTP head instead — one
+/// extra trunk-flavour layer, chained rather than blocked — which is why this is
+/// the one checkpoint whose speculation is a different shape from the other two.
 const QWEN_38_27B: Checkpoint = Checkpoint {
     repo: "ggml-org/Qwen3.8-27B-GGUF",
     model: "Qwen3.8-27B-Q4_K_M.gguf",
     full_name: "Qwen3.8-27B",
     arch: Arch::Dense,
     model_size: "19.0 GB",
-    drafter: None,
+    drafter: Some(Drafter {
+        kind: DrafterKind::Mtp,
+        file: "mtp-Qwen3.8-27B-Q8_0.gguf",
+        size: "3.2 GB",
+        // The sidecar declares 65 blocks — the trunk's 64 plus the head — but
+        // only the head's one is ever cached.
+        layers: 1,
+        p_min: 0.7,
+    }),
     geometry: DENSE_27B_GEOMETRY,
 };
 
@@ -196,8 +211,10 @@ impl Model {
         self.checkpoint().arch
     }
 
-    /// The DFlash block-diffusion drafter for speculative decoding, or `None`
-    /// for a checkpoint that ships no sidecar — which decodes plain.
+    /// The drafter sidecar for speculative decoding, or `None` for a checkpoint
+    /// that ships none — which decodes plain. Which KIND of drafter the file
+    /// holds is [`Model::drafter_kind`], and the file itself is the authority
+    /// once opened (`drafter::classify`).
     pub const fn drafter_file(self) -> Option<&'static str> {
         match &self.checkpoint().drafter {
             Some(drafter) => Some(drafter.file),
@@ -299,20 +316,64 @@ impl Model {
         by_name(&stem)
     }
 
+    /// The deepest draft this checkpoint's drafter is asked for when the run did
+    /// not pin `--draft-max`, or `None` for one that ships no sidecar.
+    ///
+    /// Per-checkpoint because the two kinds have opposite economics and read the
+    /// same flag. A DFlash sidecar proposes its whole block in ONE forward, so
+    /// widening it is nearly free and its structural ceiling (`block_size - 1`,
+    /// 15 on both shipped sidecars) is the sensible ask. An MTP head pays a
+    /// forward per step AND compounds k-1 of its own guesses into step k, so
+    /// depth costs linearly and pays off geometrically less.
+    ///
+    /// The MTP arm is 4, FITTED 2026-08-15 (Stage C) rather than inherited:
+    /// llama.cpp's default for this head is 3, and a 3x3 p_min-by-depth sweep on
+    /// this machine had every depth-4 arm ahead of its depth-3 sibling, almost
+    /// entirely on the chat fixture (+36.7 to +39.2% over plain against +27.5 to
+    /// +32.9%) while code was a wash. The optimum is bracketed, not merely the
+    /// grid edge: a follow-up probe at p_min 0.7 read 34.9 / 34.0 / 32.6 / 25.4
+    /// mean-of-medians at depths 4 / 5 / 6 / 8, so it falls away on both sides.
+    /// Depth 8 is where the auto-pause controller starts firing (34-80 rounds
+    /// paused) and drafting stops paying at all — the ceiling is real and the
+    /// controller finds it.
+    ///
+    /// A default only. `--draft-max` and the serve config's `draft.max` override
+    /// it, which is what lets a sweep explore depth without a rebuild — the
+    /// reason this stopped being a constant inside the head.
+    pub const fn draft_max_default(self) -> Option<usize> {
+        match &self.checkpoint().drafter {
+            Some(drafter) => Some(match drafter.kind {
+                DrafterKind::Dflash => 15,
+                DrafterKind::Mtp => 4,
+            }),
+            None => None,
+        }
+    }
+
     /// The drafting confidence floor (`--draft-p-min`) this checkpoint decodes
     /// fastest at: a round stops proposing at the first drafter token whose
     /// full-vocab probability falls below it, so a higher floor drafts shorter
     /// at higher acceptance.
     ///
-    /// The two drafting checkpoints sit at different points on that trade,
-    /// which is why this is per-model rather than one shipped constant. Fitted
-    /// 2026-08-08 by two independent 120-run sweeps (`scripts/retune-draft.ts`)
-    /// that picked the same winner each time: 0.5 on the 27B — 37.2-37.3 tok/s
+    /// The drafting checkpoints sit at different points on that trade, which is
+    /// why this is per-model rather than one shipped constant. Fitted 2026-08-08
+    /// by two independent 120-run sweeps (`scripts/retune-draft.ts`) that picked
+    /// the same winner each time: 0.5 on the 27B — 37.2-37.3 tok/s
     /// mean-of-medians against 33.0-33.5 at 0.3, where the shorter drafts run
     /// 78-86% acceptance and the chat prompt stops auto-pausing altogether —
     /// and 0.3 on the 35B-A3B, whose cheaper target forward still profits from
     /// drafting deeper at lower acceptance. `pause_margin` was swept alongside
     /// and stayed a shared 1.0.
+    ///
+    /// 0.7 on the 3.8-27B, fitted 2026-08-15 (Stage C) crossed with depth. This
+    /// is the WEAKEST-held of the three arms and should be read as such: across
+    /// the 3x3 grid the floor moved the mean-of-medians by at most 1.8% at a
+    /// fixed depth (33.5 / 33.2 / 33.8 at depth 4 for 0.3 / 0.5 / 0.7), where
+    /// depth moved it by 12%. What the floor clearly does change is wasted work
+    /// — acceptance at depth 4 runs 65.5% at 0.3 against 80.0% at 0.7 — which
+    /// costs nothing measurable at batch 1 on this machine because the target
+    /// forward dominates, but would matter anywhere the drafter competes for the
+    /// same silicon. 0.7 won every comparison it was in; it did not win by much.
     ///
     /// `None` for a checkpoint that ships no sidecar: there was nothing to fit a
     /// floor with, and nothing that reads one.
@@ -337,14 +398,41 @@ impl Model {
         g.full_attn_layers * g.n_kv_head * g.head_dim * 2 * 2
     }
 
-    /// Bytes of DFlash drafter KV cache one more token of context costs, when a
-    /// drafter is attached: every sidecar layer's K and V over 8 KV heads at
-    /// head_dim 128, f32 (the drafter's cache is stored exact — see
-    /// `DrafterImage`). 40 KiB/token on the 27B's five layers, 48 on the
-    /// 35B-A3B's six, and `None` for a checkpoint with no sidecar to size.
+    /// Bytes of drafter KV cache one more token of context costs, when a
+    /// drafter is attached, or `None` for a checkpoint with no sidecar to size.
+    ///
+    /// The two kinds differ in heads, head dim AND dtype, so neither figure is
+    /// the other's with a different layer count. A DFlash sidecar has a geometry
+    /// of its OWN — 8 KV heads at head_dim 128 — and stores its cache f32,
+    /// because the drafter is tiny and the exactness keeps its export/import
+    /// round trip free of rounding (see `DrafterImage`). An MTP head has no
+    /// geometry of its own at all: it reuses the trunk's full-attention
+    /// `LayerCache`, so it inherits the trunk's heads, head dim and f16 dtype,
+    /// and is read off the same [`CacheGeometry`] the target's own
+    /// [`Model::kv_bytes_per_token`] is read from rather than restated here.
+    ///
+    /// 40 KiB/token on the 27B's five DFlash layers, 48 on the 35B-A3B's six,
+    /// and 4 KiB on the 3.8's single-layer MTP head — an order of magnitude
+    /// cheaper to give context to than either block drafter.
     pub const fn draft_kv_bytes_per_token(self) -> Option<usize> {
+        let checkpoint = self.checkpoint();
+        let g = &checkpoint.geometry;
+        match &checkpoint.drafter {
+            Some(drafter) => Some(match drafter.kind {
+                DrafterKind::Dflash => drafter.layers * 2 * 8 * 128 * 4,
+                DrafterKind::Mtp => drafter.layers * g.n_kv_head * g.head_dim * 2 * 2,
+            }),
+            None => None,
+        }
+    }
+
+    /// Which shape of drafter this checkpoint ships, or `None` for one that
+    /// ships none. Asked before a sidecar is opened — the two kinds are loaded
+    /// and driven by different code, and the file itself is the authority once
+    /// it is open (an operator's own `--draft <path>` need not be this one).
+    pub const fn drafter_kind(self) -> Option<DrafterKind> {
         match &self.checkpoint().drafter {
-            Some(drafter) => Some(drafter.layers * 2 * 8 * 128 * 4),
+            Some(drafter) => Some(drafter.kind),
             None => None,
         }
     }
@@ -433,8 +521,8 @@ pub fn cached_model(model: Model) -> Option<PathBuf> {
     cached_file(model.repo(), model.file())
 }
 
-/// The cached DFlash drafter for `model`, or `None` — which is also the answer
-/// for a checkpoint that ships no sidecar at all. Offline.
+/// The cached drafter sidecar for `model`, or `None` — which is also the answer
+/// for a checkpoint that ships none at all. Offline.
 pub fn cached_drafter(model: Model) -> Option<PathBuf> {
     cached_file(model.repo(), model.drafter_file()?)
 }
@@ -490,7 +578,7 @@ pub fn ensure_model(model: Model) -> Result<PathBuf> {
     ensure_file(model.repo(), model.file())
 }
 
-/// The DFlash drafter for `model`, downloaded on first use, or `None` for a
+/// The drafter sidecar for `model`, downloaded on first use, or `None` for a
 /// checkpoint that ships none — which is not an error anywhere: it decodes
 /// plain.
 pub fn ensure_drafter(model: Model) -> Result<Option<PathBuf>> {
@@ -541,10 +629,12 @@ mod tests {
     /// quoted in the `serve --init` template and in `--draft-ctx`'s help, where a
     /// wrong number becomes an operator's wrong memory budget.
     ///
-    /// The two DFlash sidecars differ only in layer count — both are 32 Q / 8 KV
-    /// heads at head_dim 128 — so that is the only factor that varies. K and V are
-    /// stored f32, not f16 like the target's: the drafter is tiny and the exactness
-    /// keeps its export/import round trip free of rounding.
+    /// Within the DFlash kind the two sidecars differ only in layer count — both
+    /// are 32 Q / 8 KV heads at head_dim 128 — so that is the only factor that
+    /// varies. K and V are stored f32, not f16 like the target's: the drafter is
+    /// tiny and the exactness keeps its export/import round trip free of
+    /// rounding. The MTP head is the other kind entirely and is pinned in
+    /// `the_mtp_head_costs_an_order_of_magnitude_less_to_cache`.
     #[test]
     fn the_drafter_cache_figure_follows_each_sidecars_layer_count() {
         // 5 drafter layers x (K and V) x 8 KV heads x 128 head_dim x 4 bytes.
@@ -568,23 +658,79 @@ mod tests {
     /// act with a sweep behind it — these are the values `--draft-p-min` and the
     /// serve config fall back to, and they came out of the 2026-08-08 retune.
     #[test]
+    fn the_draft_depth_default_is_per_kind() {
+        // A block drafter proposes its whole block in one forward, so the ask is
+        // the structural ceiling both shipped sidecars have.
+        assert_eq!(Model::Qwen27B.draft_max_default(), Some(15));
+        assert_eq!(Model::Qwen35BA3B.draft_max_default(), Some(15));
+        // A chain pays a forward per step, so it is asked for far less. Fitted
+        // by the Stage C sweep (2026-08-15), which moved it off llama.cpp's 3
+        // and bracketed the optimum on both sides.
+        assert_eq!(Model::Qwen3827B.draft_max_default(), Some(4));
+    }
+
+    #[test]
     fn the_drafting_floor_is_per_checkpoint() {
         assert_eq!(Model::Qwen27B.draft_p_min_default(), Some(0.5));
         assert_eq!(Model::Qwen35BA3B.draft_p_min_default(), Some(0.3));
+        // Fitted by the Stage C sweep (2026-08-15), crossed with depth, which
+        // moved it off llama.cpp's 0.5 — by a small margin on this axis; see
+        // `draft_p_min_default` for how weakly this arm is held.
+        assert_eq!(Model::Qwen3827B.draft_p_min_default(), Some(0.7));
+    }
+
+    /// The MTP head caches an order of magnitude cheaper than either block
+    /// drafter, which is what makes `--draft-ctx` a different decision on this
+    /// checkpoint: the same context budget buys ten times the drafting depth.
+    ///
+    /// The figure is quoted wherever an operator sizes memory, so it is pinned
+    /// with its arithmetic rather than as a number somebody would have to
+    /// re-derive to check.
+    #[test]
+    fn the_mtp_head_costs_an_order_of_magnitude_less_to_cache() {
+        // 1 head layer x (K and V) x 4 KV heads x 256 head_dim x 2 bytes (f16,
+        // the trunk's own full-attention cache dtype, which the head reuses).
+        assert_eq!(Model::Qwen3827B.draft_kv_bytes_per_token(), Some(4 * 1024));
+        assert!(
+            Model::Qwen3827B.draft_kv_bytes_per_token() < Model::Qwen27B.draft_kv_bytes_per_token()
+        );
     }
 
     /// Everything speculation needs travels together, so a checkpoint either
-    /// offers all of it or none: Qwen3.8-27B ships no DFlash sidecar and every
-    /// drafter question about it answers `None` rather than pointing at a file
-    /// the repo does not hold.
+    /// offers all of it or none. Every shipped checkpoint now offers all of it,
+    /// each naming its own kind, file and fitted floor — so what this pins is
+    /// that the answers agree with each other, rather than a `None` that no
+    /// shipped checkpoint produces any more.
     #[test]
-    fn a_checkpoint_without_a_sidecar_offers_no_drafter_at_all() {
-        assert_eq!(Model::Qwen3827B.drafter_file(), None);
-        assert_eq!(Model::Qwen3827B.drafter_size(), None);
-        assert_eq!(Model::Qwen3827B.draft_kv_bytes_per_token(), None);
-        assert_eq!(Model::Qwen3827B.draft_p_min_default(), None);
-        assert!(cached_drafter(Model::Qwen3827B).is_none());
-        assert_eq!(ensure_drafter(Model::Qwen3827B).unwrap(), None);
+    fn every_checkpoint_answers_the_whole_drafter_question() {
+        for model in MODELS {
+            let kind = model
+                .drafter_kind()
+                .unwrap_or_else(|| panic!("{model:?} names no drafter kind"));
+            assert!(model.drafter_file().is_some(), "{model:?} names no file");
+            assert!(model.drafter_size().is_some(), "{model:?} names no size");
+            assert!(
+                model.draft_kv_bytes_per_token().is_some(),
+                "{model:?} sizes no drafter cache"
+            );
+            assert!(
+                model.draft_p_min_default().is_some(),
+                "{model:?} has no fitted floor"
+            );
+            // The file name says which kind it is, and it had better be the kind
+            // the checkpoint claims: everything that loads one branches on this.
+            let file = model.drafter_file().unwrap();
+            let expected = match kind {
+                DrafterKind::Dflash => "dflash-",
+                DrafterKind::Mtp => "mtp-",
+            };
+            assert!(
+                file.starts_with(expected),
+                "{model:?} claims {kind:?} but its sidecar is named {file}"
+            );
+        }
+        assert_eq!(Model::Qwen3827B.drafter_kind(), Some(DrafterKind::Mtp));
+        assert_eq!(Model::Qwen27B.drafter_kind(), Some(DrafterKind::Dflash));
     }
 
     /// The two dense checkpoints share a graph and a geometry — 3.8's config is

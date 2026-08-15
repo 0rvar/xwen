@@ -13,7 +13,13 @@
  * What it measures. Two stages per checkpoint, each a set of interleaved arms:
  *
  *   stage 1  p_min over the grid at the current default pause_margin, against
- *            a `--no-draft` plain arm. Picks the p_min.
+ *            a `--no-draft` plain arm. Picks the p_min — and, when a depth grid
+ *            is given, the chain depth with it: the arms are then the CROSS
+ *            PRODUCT of the two, because the pair interacts. A confidence floor
+ *            is a rule about when to stop drafting and a depth is a cap on the
+ *            same thing, so the best floor at depth 2 need not be the best at
+ *            depth 4, and sweeping them separately would fit each against the
+ *            other's shipped value rather than against its own best partner.
  *   stage 2  pause_margin over the grid at stage 1's winning p_min, again
  *            against plain, and always including both `margin 0` (never-pause)
  *            and the shipped margin. The never-pause arm is the diagnostic that
@@ -33,8 +39,10 @@
  * stage-2 data.
  *
  * The status quo it measures against is PER-CHECKPOINT for p_min (27B 0.5, 35B
- * 0.3) and shared for pause_margin (1.0). `SHIPPED_P_MIN` below mirrors
- * `Model::draft_p_min_default()` in src/hub.rs and must be updated with it.
+ * 0.3, 3.8-27B 0.7) and for depth (15 on the two DFlash block drafters, 4 on
+ * the 3.8's MTP head), and shared for pause_margin (1.0). `SHIPPED_P_MIN` and
+ * `SHIPPED_DRAFT_MAX` below mirror `Model::draft_p_min_default()` and
+ * `Model::draft_max_default()` in src/hub.rs and must be updated with them.
  *
  * The criterion is the one the shipped default was chosen by, not a bare mean:
  * an arm qualifies only if it is ahead of plain decode on BOTH prompt kinds in
@@ -67,15 +75,17 @@
  * changed default has to land, and stops there.
  *
  * Usage:
- *   bun scripts/retune-draft.ts                          # both models, both stages, 3 reps
+ *   bun scripts/retune-draft.ts                          # every drafting model, both stages, 3 reps
  *   bun scripts/retune-draft.ts --dry-run                # print the run matrix, run nothing
  *   bun scripts/retune-draft.ts --model-size 27b --stage 1
  *   bun scripts/retune-draft.ts --reps 5 --p-min-grid 0.2,0.3,0.4
  *   bun scripts/retune-draft.ts --margin-grid 0.8,1.0,1.2 --timeout 600
+ *   bun scripts/retune-draft.ts --model-size 3.8-27b --p-min-grid 0.3,0.5,0.7 --depth-grid 2,3,4
  *
- * Wall time: one run is ~128 greedy tokens plus a model load. The default
- * matrix is 2 models x 2 stages x 5 arms x 2 prompts x 3 reps = 120 runs, so
- * budget in tens of minutes and keep the machine otherwise idle.
+ * Wall time: one run is ~128 greedy tokens plus a model load. Without a depth
+ * grid one model's two stages are 5 arms x 2 prompts x 3 reps x 2 stages = 60
+ * runs; a 3x3 p_min-by-depth stage 1 is 60 runs on its own. Budget in tens of
+ * minutes per checkpoint and keep the machine otherwise idle.
  */
 
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, realpathSync, renameSync, writeFileSync } from "node:fs";
@@ -109,12 +119,39 @@ const N_TOKENS = 128;
  * option; a tie resolves toward these; and a checkpoint with no winner is
  * reported as keeping them, which is what the conflict check compares.
  *
- * Only the checkpoints that ship a DFlash sidecar have an arm here, because
- * only they have a drafted arm to grade: `both` means those (`draftingSizes`),
- * and naming a sidecar-less checkpoint outright dies at the drafter check
- * before any run. Qwen3.8-27B is the one without (TODO.md: its MTP sidecar).
+ * Only the checkpoints that ship a sidecar have an arm here, because only they
+ * have a drafted arm to grade: `both` means those (`draftingSizes`), and naming
+ * a sidecar-less checkpoint outright dies at the drafter check before any run.
+ * Every current checkpoint ships one; the table stays `Partial` because a
+ * future release need not.
  */
-const SHIPPED_P_MIN: Partial<Record<ModelSize, number>> = { "27b": 0.5, "35b": 0.3 };
+const SHIPPED_P_MIN: Partial<Record<ModelSize, number>> = {
+  "27b": 0.5,
+  "35b": 0.3,
+  "3.8-27b": 0.7,
+};
+
+/**
+ * The shipped chain depth, mirroring `Model::draft_max_default()` in src/hub.rs
+ * under the same must-be-updated-together rule as `SHIPPED_P_MIN`.
+ *
+ * It is per-checkpoint because it is per-DRAFTER-KIND, and the split is large.
+ * A DFlash block drafter emits its whole block in one forward, so depth is very
+ * nearly free and 15 is a cap rather than a fitted value. An MTP head pays one
+ * forward per step and compounds its own guesses, so depth costs linearly and
+ * each further step is likelier to be wrong: 4 was fitted here on 2026-08-15
+ * (llama.cpp's own default for this head is 3), and it is a real trade-off
+ * rather than a ceiling — depths 5, 6 and 8 all measured worse.
+ *
+ * Which is why only a sweep that NAMES a depth grid varies it. The default is
+ * each checkpoint's shipped depth and nothing else, so the ordinary p_min
+ * retune keeps measuring exactly what it always measured.
+ */
+const SHIPPED_DRAFT_MAX: Partial<Record<ModelSize, number>> = {
+  "27b": 15,
+  "35b": 15,
+  "3.8-27b": 4,
+};
 
 /** The shipped floor for a size this sweep is allowed to grade. Every caller is
  *  already past the drafter guard in `main`, which refuses a sidecar-less
@@ -125,6 +162,16 @@ function shippedPMin(size: ModelSize): number {
   const value = SHIPPED_P_MIN[size];
   if (value === undefined) {
     die(`no shipped draft_p_min for ${size} — it ships no drafter, so there is nothing to grade.`);
+  }
+  return value;
+}
+
+/** The shipped chain depth for a size this sweep is allowed to grade, checked
+ *  the same way and for the same reason as `shippedPMin`. */
+function shippedDraftMax(size: ModelSize): number {
+  const value = SHIPPED_DRAFT_MAX[size];
+  if (value === undefined) {
+    die(`no shipped draft_max for ${size} — it ships no drafter, so there is nothing to grade.`);
   }
   return value;
 }
@@ -168,6 +215,10 @@ interface Opts {
   stages: (1 | 2)[];
   pMinGrid: number[];
   marginGrid: number[];
+  /** Chain depths to cross with the p_min grid, or null for "each checkpoint's
+   *  shipped depth only". Null rather than a default array because the default
+   *  is PER-SIZE, so it cannot be resolved until a size is in hand. */
+  depthGrid: number[] | null;
   dryRun: boolean;
   binary: string;
   timeoutMs: number;
@@ -193,7 +244,8 @@ function parseArgs(argv: string[]): Opts {
   }
 
   const known = new Set([
-    "model-size", "reps", "stage", "p-min-grid", "margin-grid", "dry-run", "binary", "timeout",
+    "model-size", "reps", "stage", "p-min-grid", "margin-grid", "depth-grid", "dry-run", "binary",
+    "timeout",
   ]);
   for (const k of Object.keys(flags)) {
     if (!known.has(k)) die(`unknown flag --${k} (valid: ${[...known].map((f) => `--${f}`).join(", ")})`);
@@ -216,6 +268,20 @@ function parseArgs(argv: string[]): Opts {
     if (items.length === 0) die(`${label}: empty grid`);
     return items;
   };
+
+  // Depth is a token COUNT, not a rate: a fractional or zero depth is not a
+  // slower setting, it is a command line the binary would reject or silently
+  // round. Kept separate from `grid` for that reason alone.
+  const depthGrid = ((v: unknown): number[] | null => {
+    if (v === undefined) return null;
+    const items = String(v).split(",").map((s) => s.trim()).filter(Boolean).map((s) => {
+      const n = Number(s);
+      if (!Number.isInteger(n) || n < 1) die(`--depth-grid: ${JSON.stringify(s)} is not an integer >= 1`);
+      return n;
+    });
+    if (items.length === 0) die("--depth-grid: empty grid");
+    return items;
+  })(flags["depth-grid"]);
 
   const sizeArg = flags["model-size"] === undefined ? "both" : String(flags["model-size"]).toLowerCase();
   // `both` means the checkpoints that can speculate at all — a release with no
@@ -246,6 +312,7 @@ function parseArgs(argv: string[]): Opts {
     stages,
     pMinGrid: grid(flags["p-min-grid"], DEFAULT_P_MIN_GRID, "--p-min-grid", 1),
     marginGrid: grid(flags["margin-grid"], DEFAULT_MARGIN_GRID, "--margin-grid"),
+    depthGrid,
     dryRun: Boolean(flags["dry-run"]),
     binary: typeof flags.binary === "string" ? resolve(String(flags.binary)) : join(ROOT, "target/release/xwen"),
     timeoutMs: Math.round(timeoutS * 1000),
@@ -260,6 +327,9 @@ interface Arm {
   plain: boolean;
   pMin: number | null;
   margin: number | null;
+  /** Chain depth (`--draft-max`). Null only on the plain arm and in the dry
+   *  run's stage 2, where stage 1's winner is not known yet. */
+  draftMax: number | null;
   /** Set on the stage-2 never-pause diagnostic, so the table can mark it. */
   diagnostic?: boolean;
 }
@@ -279,7 +349,7 @@ function fmtVal(v: number): string {
  *  values can never produce the same key. */
 const exact = (v: number | null) => (v === null ? "none" : String(v));
 
-const PLAIN: Arm = { label: "plain", plain: true, pMin: null, margin: null };
+const PLAIN: Arm = { label: "plain", plain: true, pMin: null, margin: null, draftMax: null };
 
 /** Exact-duplicate grid values collapse to one arm. Set uses SameValueZero, so
  *  this dedupes on the exact double — 0.301 and 0.304 stay two arms, as they
@@ -297,19 +367,35 @@ function assertUniqueLabels(arms: Arm[]): Arm[] {
   return arms;
 }
 
-function stage1Arms(pMinGrid: number[]): Arm[] {
-  return assertUniqueLabels([
-    PLAIN,
-    ...dedupe(pMinGrid).map((p) => ({
-      label: `p=${fmtVal(p)}`,
-      plain: false,
-      pMin: p,
-      margin: SHIPPED_MARGIN,
-    })),
-  ]);
+/**
+ * Stage 1's arms: the p_min grid crossed with the depth grid.
+ *
+ * `depthGrid` is this SIZE's already-resolved list — a single-element one when
+ * no `--depth-grid` was given, which is the case that keeps the labels (and so
+ * the tables, and so the comparability with previous sweeps) exactly as they
+ * were. The depth only enters the label when there is more than one of them,
+ * because a label that never varies is column noise; the CELL KEY carries it
+ * unconditionally, since that is identity rather than display.
+ */
+function stage1Arms(pMinGrid: number[], depthGrid: number[]): Arm[] {
+  const depths = dedupe(depthGrid);
+  const showDepth = depths.length > 1;
+  const arms: Arm[] = [PLAIN];
+  for (const p of dedupe(pMinGrid)) {
+    for (const d of depths) {
+      arms.push({
+        label: showDepth ? `p=${fmtVal(p)} d=${d}` : `p=${fmtVal(p)}`,
+        plain: false,
+        pMin: p,
+        margin: SHIPPED_MARGIN,
+        draftMax: d,
+      });
+    }
+  }
+  return assertUniqueLabels(arms);
 }
 
-function stage2Arms(pMin: number | null, marginGrid: number[]): Arm[] {
+function stage2Arms(pMin: number | null, draftMax: number | null, marginGrid: number[]): Arm[] {
   // Two margins are always graded whatever the grid says: 0, the never-pause
   // control that decides whether auto-pause earns its keep, and the shipped
   // margin, so "keep the current value" is a measured option rather than an
@@ -322,6 +408,7 @@ function stage2Arms(pMin: number | null, marginGrid: number[]): Arm[] {
       plain: false,
       pMin,
       margin: m,
+      draftMax,
       diagnostic: m === NEVER_PAUSE_MARGIN,
     })),
   ]);
@@ -331,7 +418,7 @@ function stage2Arms(pMin: number | null, marginGrid: number[]): Arm[] {
  *  stage 1 and stage 2 measure the shipped-margin configuration separately and
  *  those measurements must never be conflated (they are thermally unrelated). */
 function cellKey(stage: 1 | 2, size: ModelSize, prompt: string, arm: Arm): string {
-  const cfg = arm.plain ? "plain" : `p${exact(arm.pMin)}_m${exact(arm.margin)}`;
+  const cfg = arm.plain ? "plain" : `p${exact(arm.pMin)}_m${exact(arm.margin)}_d${exact(arm.draftMax)}`;
   return `s${stage}|${size}|${prompt}|${cfg}`;
 }
 
@@ -348,7 +435,15 @@ function argsFor(size: ModelSize, prompt: string, arm: Arm): string[] {
       ? ["--no-draft"]
       // `--draft official` is passed explicitly rather than relying on the
       // default, so the drafted arms stay pinned if the default ever flips.
-      : ["--draft", "official", "--draft-p-min", String(arm.pMin), "--draft-pause-margin", String(arm.margin)]),
+      // `--draft-max` likewise: its resolved default is per-checkpoint, so an
+      // arm that omitted it would be measuring whatever hub.rs currently says
+      // rather than the depth this cell is named for.
+      : [
+          "--draft", "official",
+          "--draft-p-min", String(arm.pMin),
+          "--draft-pause-margin", String(arm.margin),
+          "--draft-max", String(arm.draftMax),
+        ]),
   ];
 }
 
@@ -819,7 +914,7 @@ function fmtTps(v: number | null | undefined): string {
 function printCellTable(stage: 1 | 2, size: ModelSize, cells: Cell[], arms: Arm[], plainMedians: Record<string, number | null>): void {
   console.log(`\n  ${size} stage ${stage} — median tok/s, then every rep in run order`);
   console.log(
-    `    ${"prompt".padEnd(6)} ${"arm".padEnd(9)} ${"median".padStart(6)} ${"vs plain".padStart(9)}  ${"reps".padEnd(26)} spec (rounds/paused/accept%)`,
+    `    ${"prompt".padEnd(6)} ${"arm".padEnd(13)} ${"median".padStart(6)} ${"vs plain".padStart(9)}  ${"reps".padEnd(26)} spec (rounds/paused/accept%)`,
   );
   for (const prompt of PROMPT_KINDS) {
     for (const arm of arms) {
@@ -846,19 +941,27 @@ function printCellTable(stage: 1 | 2, size: ModelSize, cells: Cell[], arms: Arm[
         : "-";
       const marks = arm.diagnostic ? " (never-pause diagnostic)" : "";
       console.log(
-        `    ${prompt.padEnd(6)} ${arm.label.padEnd(9)} ${fmtTps(med)} ${delta.padStart(9)}  ${repStr.padEnd(26)} ${spec}${marks}`,
+        `    ${prompt.padEnd(6)} ${arm.label.padEnd(13)} ${fmtTps(med)} ${delta.padStart(9)}  ${repStr.padEnd(26)} ${spec}${marks}`,
       );
     }
   }
 }
 
-/** The value the stage is choosing, for tie-breaking toward the status quo.
- *  Per-size on stage 1: the 27B's status quo is 0.5, the 35B's is 0.3, so a
- *  shared value would break the tie toward a setting the checkpoint does not
- *  actually ship with. */
-const shippedValueFor = (stage: 1 | 2, size: ModelSize) =>
-  stage === 1 ? shippedPMin(size) : SHIPPED_MARGIN;
-const armValue = (stage: 1 | 2, a: Arm) => (stage === 1 ? a.pMin : a.margin);
+/**
+ * Is this arm the configuration the checkpoint already ships, for the knobs the
+ * stage is choosing? Ties resolve toward it.
+ *
+ * Per-size, because the status quo is: the 27B ships p_min 0.5 and the 35B 0.3,
+ * so a shared value would break the tie toward a setting the checkpoint does
+ * not actually have. Stage 1 tests BOTH its knobs — an arm at the shipped p_min
+ * but a different depth is a change, and a tie gives no more reason to install
+ * it than a tie on p_min would.
+ */
+function isStatusQuo(stage: 1 | 2, size: ModelSize, a: Arm): boolean {
+  return stage === 1
+    ? a.pMin === shippedPMin(size) && a.draftMax === shippedDraftMax(size)
+    : a.margin === SHIPPED_MARGIN;
+}
 
 /**
  * Everything at the maximum mean, compared at FULL float precision.
@@ -882,7 +985,7 @@ function printStageVerdict(stage: 1 | 2, size: ModelSize, stageScores: StageScor
   for (const s of scores) {
     const tag = s.qualifies ? "QUALIFIES" : "no       ";
     const meanStr = s.mean === null ? " --" : s.mean.toFixed(1);
-    console.log(`    ${tag} ${s.arm.label.padEnd(9)} mean-of-medians ${meanStr.padStart(6)} tok/s${s.note ? `  (${s.note})` : ""}`);
+    console.log(`    ${tag} ${s.arm.label.padEnd(13)} mean-of-medians ${meanStr.padStart(6)} tok/s${s.note ? `  (${s.note})` : ""}`);
   }
 
   // Plain is the ruler. A broken ruler invalidates every comparison made with
@@ -900,7 +1003,7 @@ function printStageVerdict(stage: 1 | 2, size: ModelSize, stageScores: StageScor
     if (top.length <= 1) return top[0] ?? null;
     // Prefer the status quo when it is among the tied: changing a shipped
     // constant needs evidence that it is BETTER, and a tie is not that.
-    const shipped = top.find((s) => armValue(stage, s.arm) === shippedValueFor(stage, size));
+    const shipped = top.find((s) => isStatusQuo(stage, size, s.arm));
     if (shipped) {
       console.log(
         `     tie at ${top[0].mean!.toFixed(3)} tok/s between ${top.map((s) => s.arm.label).join(", ")} ` +
@@ -961,6 +1064,12 @@ interface PlannedRun {
  * stage 2's p_min VALUE is unknown before stage 1 runs, and that is shown
  * symbolically.
  */
+/** The depths to sweep for one size: the named grid, else that checkpoint's
+ *  shipped depth alone. */
+function depthsFor(opts: Opts, size: ModelSize): number[] {
+  return opts.depthGrid ?? [shippedDraftMax(size)];
+}
+
 function planRuns(opts: Opts): PlannedRun[] {
   const plan: PlannedRun[] = [];
   for (const size of opts.sizes) {
@@ -968,8 +1077,12 @@ function planRuns(opts: Opts): PlannedRun[] {
     for (const stage of opts.stages) {
       const arms =
         stage === 1
-          ? stage1Arms(opts.pMinGrid)
-          : stage2Arms(stage1Runs ? null : shippedPMin(size), opts.marginGrid);
+          ? stage1Arms(opts.pMinGrid, depthsFor(opts, size))
+          : stage2Arms(
+              stage1Runs ? null : shippedPMin(size),
+              stage1Runs ? null : shippedDraftMax(size),
+              opts.marginGrid,
+            );
       const cells: { prompt: string; arm: Arm }[] = [];
       for (const prompt of PROMPT_KINDS) for (const arm of arms) cells.push({ prompt, arm });
       for (let rep = 1; rep <= opts.reps; rep++) {
@@ -985,6 +1098,11 @@ function printDryRun(opts: Opts): void {
   console.log(
     `models=[${opts.sizes.join(",")}] stages=[${opts.stages.join(",")}] reps=${opts.reps} ` +
       `p-min-grid=[${opts.pMinGrid.join(",")}] margin-grid=[${opts.marginGrid.join(",")}] ` +
+      `depth-grid=[${
+        opts.depthGrid
+          ? opts.depthGrid.join(",")
+          : opts.sizes.map((s) => `${s} ${shippedDraftMax(s)}`).join(", ") + " (shipped)"
+      }] ` +
       `(stage 1 holds pause_margin at ${fmtVal(SHIPPED_MARGIN)}; stage 2 always adds margins ` +
       `${fmtVal(NEVER_PAUSE_MARGIN)} and ${fmtVal(SHIPPED_MARGIN)})`,
   );
@@ -1013,7 +1131,7 @@ function printDryRun(opts: Opts): void {
     }
     i++;
     const shown = displayArgs(p.size, p.prompt, p.arm);
-    console.log(`  ${String(i).padStart(3)}. rep${p.rep} ${p.prompt.padEnd(4)} ${p.arm.label.padEnd(9)} XWEN_BENCH=1 ${opts.binary} ${shown}`);
+    console.log(`  ${String(i).padStart(3)}. rep${p.rep} ${p.prompt.padEnd(4)} ${p.arm.label.padEnd(13)} XWEN_BENCH=1 ${opts.binary} ${shown}`);
   }
   console.log(`\ntotal: ${plan.length} model runs (${N_TOKENS} greedy tokens each, plus a model load)`);
 }
@@ -1026,6 +1144,8 @@ function printDryRun(opts: Opts): void {
  *  is still one shared value spelled out at three sites. */
 const P_MIN_LOCATION =
   "src/hub.rs             Model::draft_p_min_default() — one arm per checkpoint";
+const DRAFT_MAX_LOCATION =
+  "src/hub.rs             Model::draft_max_default() — one arm per drafter KIND";
 const MARGIN_LOCATIONS = [
   "src/generate.rs        SpecParams::default() — pause_margin",
   "src/serve/config.rs    DEFAULT_DRAFT_PAUSE_MARGIN",
@@ -1035,6 +1155,11 @@ const MARGIN_LOCATIONS = [
 interface Recommendation {
   /** Stage 1's winning p_min, or null — never the fallback stage 2 ran at. */
   pMin: number | null;
+  /** Stage 1's winning depth, or null. Null also when the sweep never varied
+   *  depth, which is not a result and must not print as one. */
+  draftMax: number | null;
+  /** Whether depth was swept at all. */
+  depthSwept: boolean;
   margin: number | null;
   stage1Ran: boolean;
   stage2Ran: boolean;
@@ -1059,7 +1184,19 @@ function printRecommendation(rec: Map<ModelSize, Recommendation>): void {
       r.pMin !== null ? String(r.pMin) : r.stage1Ran ? "KEEP CURRENT (no stage-1 winner)" : "not measured (stage 1 skipped)";
     const m =
       r.margin !== null ? String(r.margin) : r.stage2Ran ? "KEEP CURRENT (no stage-2 winner)" : "not measured (stage 2 skipped)";
-    console.log(`  ${size}: draft_p_min = ${p}, pause_margin = ${m}${r.robust ? "" : "   [NON-ROBUST: see the stage verdicts above]"}`);
+    // "not swept" and "swept and unchanged" are different findings, and only the
+    // second is evidence about the depth.
+    const d = !r.depthSwept
+      ? `not swept (held at the shipped ${shippedDraftMax(size)})`
+      : r.draftMax !== null
+        ? String(r.draftMax)
+        : r.stage1Ran
+          ? "KEEP CURRENT (no stage-1 winner)"
+          : "not measured (stage 1 skipped)";
+    console.log(
+      `  ${size}: draft_p_min = ${p}, draft_max = ${d}, pause_margin = ${m}` +
+        `${r.robust ? "" : "   [NON-ROBUST: see the stage verdicts above]"}`,
+    );
   }
 
   // This compares the value each checkpoint would END UP with, not just the
@@ -1106,17 +1243,24 @@ function printRecommendation(rec: Map<ModelSize, Recommendation>): void {
   console.log("\n  These are the only places a default lives. This script never edits them:");
   console.log("    draft_p_min — per checkpoint, one site:");
   console.log(`      ${P_MIN_LOCATION}`);
+  console.log("    draft_max — per drafter kind, one site:");
+  console.log(`      ${DRAFT_MAX_LOCATION}`);
   console.log("    pause_margin — one shared value, three sites:");
   for (const loc of MARGIN_LOCATIONS) console.log(`      ${loc}`);
   console.log(
-    "\n  MIRROR BOTH PLACES: installing a new draft_p_min means editing src/hub.rs AND the\n" +
+    "\n  MIRROR BOTH PLACES: installing a new draft_p_min or draft_max means editing src/hub.rs\n" +
       // The WHOLE table, not just the swept checkpoints: whoever edits the Rust
-      // match needs to see both arms to keep them in step.
-      `    SHIPPED_P_MIN table in this script (currently ${Object.entries(SHIPPED_P_MIN)
+      // match needs to see every arm to keep them in step.
+      `    AND this script's tables (currently SHIPPED_P_MIN ${Object.entries(SHIPPED_P_MIN)
         .map(([s, v]) => `${s} ${v}`)
-        .join(", ")}). The Rust function is what ships; the\n` +
-      "    table is what the NEXT sweep grades \"keep current\" against, breaks ties toward, and\n" +
-      "    compares across checkpoints. A stale table measures the wrong status quo in silence.",
+        .join(", ")}; SHIPPED_DRAFT_MAX ${Object.entries(SHIPPED_DRAFT_MAX)
+        .map(([s, v]) => `${s} ${v}`)
+        .join(", ")}).\n` +
+      "    The Rust functions are what ship; the tables are what the NEXT sweep grades \"keep\n" +
+      "    current\" against, breaks ties toward, and compares across checkpoints. A stale table\n" +
+      "    measures the wrong status quo in silence. Note draft_max is keyed by KIND in Rust and\n" +
+      "    by SIZE here, so changing it for one checkpoint changes it for every checkpoint that\n" +
+      "    shares that drafter kind — check the other arms before installing one.",
   );
   console.log(
     "\n  A changed default is a shipped decision: it needs a dated docs/log.md entry and a\n" +
@@ -1135,7 +1279,7 @@ async function main(): Promise<void> {
   // which is exactly what a dry run exists to rule out.
   for (const size of OPTS.sizes) {
     if (!CHECKPOINTS[size].drafter) {
-      die(`${size} ships no DFlash drafter sidecar, so there is no drafted arm to sweep.`);
+      die(`${size} ships no drafter sidecar, so there is no drafted arm to sweep.`);
     }
   }
 
@@ -1171,7 +1315,7 @@ async function main(): Promise<void> {
     const drafter = CHECKPOINTS[size].drafter!;
     if (!officialDrafter(size)) {
       die(
-        `the DFlash drafter for ${size} is not in the Hugging Face cache ` +
+        `the drafter sidecar for ${size} is not in the Hugging Face cache ` +
           `(${drafter}); run \`xwen fetch --model-size ${size}\`. ` +
           `Every drafted arm needs it.`,
       );
@@ -1188,6 +1332,7 @@ async function main(): Promise<void> {
     opts: { ...OPTS },
     nTokens: N_TOKENS,
     shippedPMin: SHIPPED_P_MIN,
+    shippedDraftMax: SHIPPED_DRAFT_MAX,
     shippedMargin: SHIPPED_MARGIN,
     neverPauseMargin: NEVER_PAUSE_MARGIN,
     hfCacheRoot: HF_CACHE_ROOT,
@@ -1201,6 +1346,13 @@ async function main(): Promise<void> {
   console.log(`models   ${OPTS.sizes.join(", ")}   stages ${OPTS.stages.join(",")}   reps ${OPTS.reps}`);
   console.log(`p_min    ${OPTS.pMinGrid.join(", ")} (at pause_margin ${fmtVal(SHIPPED_MARGIN)})`);
   console.log(
+    `depth    ${
+      OPTS.depthGrid
+        ? `${OPTS.depthGrid.join(", ")} (crossed with p_min in stage 1)`
+        : `${OPTS.sizes.map((s) => `${s} ${shippedDraftMax(s)}`).join(", ")} (shipped; not swept)`
+    }`,
+  );
+  console.log(
     `margin   ${OPTS.marginGrid.join(", ")} (+ ${fmtVal(NEVER_PAUSE_MARGIN)} never-pause diagnostic, ` +
       `+ ${fmtVal(SHIPPED_MARGIN)} shipped)`,
   );
@@ -1208,7 +1360,9 @@ async function main(): Promise<void> {
   // of src/hub.rs is visible at the top of the run rather than inferred later.
   console.log(
     `shipped  draft_p_min ${OPTS.sizes.map((s) => `${s} ${shippedPMin(s)}`).join(", ")}, ` +
-      `pause_margin ${fmtVal(SHIPPED_MARGIN)} (mirrors Model::draft_p_min_default, src/hub.rs)`,
+      `draft_max ${OPTS.sizes.map((s) => `${s} ${shippedDraftMax(s)}`).join(", ")}, ` +
+      `pause_margin ${fmtVal(SHIPPED_MARGIN)} ` +
+      `(mirrors Model::draft_p_min_default / draft_max_default, src/hub.rs)`,
   );
   console.log(`hf cache ${HF_CACHE_ROOT}`);
   // Recorded, not interpreted: no `powermode` key on this machine means high
@@ -1221,6 +1375,7 @@ async function main(): Promise<void> {
   for (const size of OPTS.sizes) {
     console.log(`\n================ ${size} ================`);
     let winnerPMin: number | null = null;
+    let winnerDraftMax: number | null = null;
     let robust = true;
     const invalidBaselines: string[] = [];
 
@@ -1236,8 +1391,11 @@ async function main(): Promise<void> {
     };
 
     if (OPTS.stages.includes(1)) {
-      const w = await doStage(1, stage1Arms(OPTS.pMinGrid));
-      if (w) winnerPMin = w.arm.pMin;
+      const w = await doStage(1, stage1Arms(OPTS.pMinGrid, depthsFor(OPTS, size)));
+      if (w) {
+        winnerPMin = w.arm.pMin;
+        winnerDraftMax = w.arm.draftMax;
+      }
     }
 
     // Stage 2 needs a p_min. Without a stage-1 winner it sweeps the margin at
@@ -1246,14 +1404,19 @@ async function main(): Promise<void> {
     // Per-size matters here: running the 27B's margin sweep at the 35B's 0.3
     // would tune the margin around a drafting depth the 27B does not ship.
     let marginPMin = winnerPMin;
+    let marginDraftMax = winnerDraftMax;
     if (OPTS.stages.includes(2) && marginPMin === null) {
       marginPMin = shippedPMin(size);
-      console.log(`\n  stage 2 runs at ${size}'s shipped p_min ${shippedPMin(size)} (no stage-1 winner to carry).`);
+      marginDraftMax = shippedDraftMax(size);
+      console.log(
+        `\n  stage 2 runs at ${size}'s shipped p_min ${shippedPMin(size)} and depth ` +
+          `${shippedDraftMax(size)} (no stage-1 winner to carry).`,
+      );
     }
 
     let winnerMargin: number | null = null;
     if (OPTS.stages.includes(2)) {
-      const w = await doStage(2, stage2Arms(marginPMin, OPTS.marginGrid));
+      const w = await doStage(2, stage2Arms(marginPMin, marginDraftMax, OPTS.marginGrid));
       if (w) winnerMargin = w.arm.margin;
     }
 
@@ -1261,6 +1424,8 @@ async function main(): Promise<void> {
     // shipped p_min is not a measurement result and must not print as one.
     recommendation.set(size, {
       pMin: winnerPMin,
+      draftMax: winnerDraftMax,
+      depthSwept: depthsFor(OPTS, size).length > 1,
       margin: winnerMargin,
       stage1Ran: OPTS.stages.includes(1),
       stage2Ran: OPTS.stages.includes(2),
@@ -1304,8 +1469,8 @@ if (import.meta.main) {
 }
 
 export {
-  PLAIN, SHIPPED_MARGIN, SHIPPED_P_MIN, cellKey, contentionPatterns, dedupe, fmtVal, maxima,
-  median, parseStats, printCellTable, printStageVerdict, rates, scoreArms, setOptsForTest,
-  stage1Arms, stage2Arms, usableRun,
+  PLAIN, SHIPPED_DRAFT_MAX, SHIPPED_MARGIN, SHIPPED_P_MIN, cellKey, contentionPatterns, dedupe,
+  fmtVal, maxima, median, parseStats, printCellTable, printStageVerdict, rates, scoreArms,
+  setOptsForTest, stage1Arms, stage2Arms, usableRun,
 };
 export type { Arm, ArmScore, Cell, RunRecord, StageScores };

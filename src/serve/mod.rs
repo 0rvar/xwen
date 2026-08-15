@@ -1262,7 +1262,7 @@ pub(crate) mod testutil {
             disk_max_gib: config::DEFAULT_DISK_MAX_GIB,
             disk_min_tokens: config::DEFAULT_DISK_MIN_TOKENS,
             draft: config::DraftMode::Off,
-            draft_max: config::DEFAULT_DRAFT_MAX,
+            draft_max: None,
             draft_p_min: None,
             draft_pause_margin: config::DEFAULT_DRAFT_PAUSE_MARGIN,
             draft_ctx: config::DEFAULT_DRAFT_CTX,

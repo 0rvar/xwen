@@ -683,7 +683,7 @@ impl DflashDrafter {
                 Ok((f32_rows(&c.k, pos)?, f32_rows(&c.v, pos)?))
             })
             .collect::<Result<Vec<_>>>()?;
-        DrafterImage::new(pos, n_kv, hd, planes)
+        DrafterImage::new_dflash(pos, n_kv, hd, planes)
     }
 
     /// Upload `image`'s rows `[0, pos)` back into every layer and set the
@@ -691,6 +691,11 @@ impl DflashDrafter {
     /// from there. Rows past `pos` keep whatever they held — they are scratch,
     /// and every forward overwrites the scratch rows it reads.
     pub fn import_cache(&mut self, image: &DrafterImage, pos: usize) -> Result<()> {
+        ensure!(
+            image.kind() == DrafterImageKind::Dflash,
+            "this image was written by a {} drafter; the DFlash drafter cannot read it",
+            image.kind().name()
+        );
         ensure!(
             pos <= image.pos,
             "drafter_image: requested pos {pos} exceeds the image's {} positions",
@@ -1038,60 +1043,232 @@ impl DflashDrafter {
 /// shorter prefix had to be gathered.
 type DrafterBytes<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 
-/// Host-RAM image of a drafter's committed KV rows `[0, pos)`. The drafter's
+/// Which drafter wrote an image, which is also what its bytes mean.
+///
+/// The two kinds' caches are not the same record wearing different numbers. A
+/// DFlash image is f32 (its cache is stored exact — the drafter is tiny and it
+/// keeps the naive-reference tests bit-tight) across the sidecar's several
+/// layers; an MTP image is f16 (the head reuses the trunk's full-attention
+/// `LayerCache`, so it inherits the trunk's dtype) across exactly one, and it
+/// carries a hidden state besides its KV. Two records that differ in element
+/// size, plane count AND field list must not be distinguishable only by
+/// arithmetic that happens not to add up, so the kind is stored and checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrafterImageKind {
+    Dflash,
+    Mtp,
+}
+
+impl DrafterImageKind {
+    /// The name an error uses when an image meets the wrong drafter.
+    pub fn name(self) -> &'static str {
+        match self {
+            DrafterImageKind::Dflash => "DFlash",
+            DrafterImageKind::Mtp => "MTP",
+        }
+    }
+
+    /// Bytes per stored cache element. See the type's own doc for why they
+    /// differ.
+    fn elem_size(self) -> usize {
+        match self {
+            DrafterImageKind::Dflash => size_of::<f32>(),
+            DrafterImageKind::Mtp => size_of::<half::f16>(),
+        }
+    }
+
+    /// The on-disk discriminant. Written first so a reader learns how to size
+    /// everything after it.
+    fn tag(self) -> usize {
+        match self {
+            DrafterImageKind::Dflash => 1,
+            DrafterImageKind::Mtp => 2,
+        }
+    }
+
+    fn from_tag(tag: usize) -> Result<Self> {
+        match tag {
+            1 => Ok(DrafterImageKind::Dflash),
+            2 => Ok(DrafterImageKind::Mtp),
+            other => anyhow::bail!("drafter_image: unknown drafter kind tag {other}"),
+        }
+    }
+}
+
+/// Host-RAM image of a drafter's committed KV rows `[0, pos)`. A drafter's
 /// cache is plain position-indexed storage with no ring, so these rows ARE the
-/// whole of its state: a conversation whose rows are copied out here resumes
-/// bit-exactly through `DflashDrafter::import_cache`.
+/// whole of its KV state: a conversation whose rows are copied out here resumes
+/// bit-exactly through the matching drafter's `import_cache`.
 ///
 /// Like `HostFullKv` and `HostSnapshot` this is an on-disk record, and its layout
-/// is part of the contract: one `(K, V)` pair per drafter layer in layer order,
-/// little-endian f32, row-major `(n_kv_head, pos, head_dim)`. f32 is stored
-/// verbatim — the drafter's cache is f32 for exactness and narrowing the image
-/// would put rounding into a round trip. `write_to`/`read_from` frame exactly
-/// that.
+/// is part of the contract: the kind, then one `(K, V)` pair per drafter layer in
+/// layer order, little-endian, row-major `(n_kv_head, pos, head_dim)` at the
+/// kind's element size, then the carry. Elements are stored at the dtype the
+/// cache holds them in — narrowing would put rounding into a round trip.
+/// `write_to`/`read_from` frame exactly that.
 pub struct DrafterImage {
+    kind: DrafterImageKind,
     /// Positions the image covers: rows `[0, pos)` of every drafter layer.
     pub pos: usize,
     /// KV heads and head dim the planes are laid out over. Kept in the image so
     /// it describes itself — an on-disk record cannot lean on a live config.
     n_kv_head: usize,
     head_dim: usize,
+    /// Width of the carry hidden, 0 on a DFlash image. Stored for the same
+    /// reason the KV shape is: the record has to size its own fields without a
+    /// live config to ask.
+    hidden: usize,
     planes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The MTP head's shift-right-by-one carry: the target's post-final-norm
+    /// hidden at position `pos - 1`, little-endian f32, empty on a DFlash image.
+    ///
+    /// It rides along because the KV alone is not a resumable MTP head: the row
+    /// at `pos` is built from the hidden at `pos - 1`, so an image without this
+    /// restores a head that holds the right context and still cannot take
+    /// another token. A block drafter has no such coupling — every one of its
+    /// rows is a function of that position's taps alone — which is why the field
+    /// is empty for one kind and load-bearing for the other.
+    carry: Vec<u8>,
 }
 
 impl DrafterImage {
-    /// Assemble an image, checking every plane against the shape it claims. The
-    /// record is only self-describing if those agree, and every later read
-    /// (`prefix`, `byte_len`, the on-disk write) trusts them.
-    pub(crate) fn new(
+    /// Assemble a DFlash image, checking every plane against the shape it
+    /// claims. The record is only self-describing if those agree, and every
+    /// later read (`prefix`, `byte_len`, the on-disk write) trusts them.
+    pub(crate) fn new_dflash(
         pos: usize,
         n_kv_head: usize,
         head_dim: usize,
         planes: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Self> {
-        let want = f32_bytes_for(&[n_kv_head, pos, head_dim])?;
+        Self::new(
+            DrafterImageKind::Dflash,
+            pos,
+            n_kv_head,
+            head_dim,
+            0,
+            planes,
+            Vec::new(),
+        )
+    }
+
+    /// Assemble an MTP image: the head's single layer plus the carry hidden,
+    /// which is as much a part of its state as the rows are.
+    pub(crate) fn new_mtp(
+        pos: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        hidden: usize,
+        planes: Vec<(Vec<u8>, Vec<u8>)>,
+        carry: Vec<u8>,
+    ) -> Result<Self> {
+        Self::new(
+            DrafterImageKind::Mtp,
+            pos,
+            n_kv_head,
+            head_dim,
+            hidden,
+            planes,
+            carry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        kind: DrafterImageKind,
+        pos: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        hidden: usize,
+        planes: Vec<(Vec<u8>, Vec<u8>)>,
+        carry: Vec<u8>,
+    ) -> Result<Self> {
+        let want = elem_bytes_for(kind, &[n_kv_head, pos, head_dim])?;
         for (idx, (k, v)) in planes.iter().enumerate() {
             ensure!(
                 k.len() == want && v.len() == want,
                 "drafter_image: layer {idx} holds {} K and {} V bytes, expected {want} for \
-                 ({n_kv_head}, {pos}, {head_dim}) f32",
+                 ({n_kv_head}, {pos}, {head_dim}) at {} bytes per element",
                 k.len(),
-                v.len()
+                v.len(),
+                kind.elem_size()
             );
         }
+        if kind == DrafterImageKind::Dflash {
+            ensure!(
+                hidden == 0,
+                "drafter_image: a DFlash image carries no hidden state, but declares a width of \
+                 {hidden}"
+            );
+        } else {
+            ensure!(
+                hidden > 0,
+                "drafter_image: an MTP image without a carry width cannot describe its own carry"
+            );
+        }
+        let want_carry = hidden
+            .checked_mul(size_of::<f32>())
+            .context("drafter_image: the carry's byte count overflows usize")?;
+        ensure!(
+            carry.len() == want_carry,
+            "drafter_image: the carry is {} bytes, expected {want_carry} for a {hidden}-wide f32 \
+             hidden row",
+            carry.len()
+        );
         Ok(Self {
+            kind,
             pos,
             n_kv_head,
             head_dim,
+            hidden,
             planes,
+            carry,
         })
     }
 
-    /// Host bytes this image occupies — 40 KiB per token on the 27B sidecar
-    /// (5 layers x K/V x 8 heads x 128 dims x f32), 48 KiB on the 35B-A3B's six
-    /// layers.
+    /// Which drafter wrote this, and therefore which can read it back.
+    pub fn kind(&self) -> DrafterImageKind {
+        self.kind
+    }
+
+    /// The MTP carry hidden, little-endian f32; empty on a DFlash image.
+    pub(crate) fn carry(&self) -> &[u8] {
+        &self.carry
+    }
+
+    /// The shape the planes are laid out over, for an importer checking that
+    /// this image describes ITS cache. Byte length does not settle that on its
+    /// own — (8, 128) and (4, 256) hold the same number of values.
+    pub(crate) fn n_kv_head(&self) -> usize {
+        self.n_kv_head
+    }
+
+    pub(crate) fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// Layer `idx`'s whole K/V planes, for an importer that takes the image
+    /// entire rather than a prefix of it.
+    pub(crate) fn plane(&self, idx: usize) -> Result<(&[u8], &[u8])> {
+        let (k, v) = self.planes.get(idx).with_context(|| {
+            format!(
+                "drafter_image: layer {idx} is past the image's {} layers",
+                self.planes.len()
+            )
+        })?;
+        Ok((k, v))
+    }
+
+    /// Host bytes this image occupies — 40 KiB per token on the 27B DFlash
+    /// sidecar (5 layers x K/V x 8 heads x 128 dims x f32), 48 KiB on the
+    /// 35B-A3B's six layers, 4 KiB on the MTP head (1 layer x K/V x 4 heads x
+    /// 256 dims x f16).
     pub fn byte_len(&self) -> usize {
-        self.planes.iter().map(|(k, v)| k.len() + v.len()).sum()
+        self.planes
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+            + self.carry.len()
     }
 
     /// Number of drafter layers covered.
@@ -1119,8 +1296,8 @@ impl DrafterImage {
         if pos == self.pos {
             return Ok((Cow::Borrowed(k), Cow::Borrowed(v)));
         }
-        let stride = self.pos * self.head_dim * size_of::<f32>();
-        let take = pos * self.head_dim * size_of::<f32>();
+        let stride = self.pos * self.head_dim * self.kind.elem_size();
+        let take = pos * self.head_dim * self.kind.elem_size();
         let gather = |src: &[u8]| {
             let mut out = Vec::with_capacity(self.n_kv_head * take);
             for head in 0..self.n_kv_head {
@@ -1131,29 +1308,36 @@ impl DrafterImage {
         Ok((Cow::Owned(gather(k)), Cow::Owned(gather(v))))
     }
 
-    /// Frame this image into `w`: the position, the shape its planes are laid out
-    /// over, the plane count, then K and V per layer in layer order.
+    /// Frame this image into `w`: the kind, the position, the shape its planes
+    /// are laid out over, the plane count, then K and V per layer in layer
+    /// order, then the carry.
+    ///
+    /// The kind leads because it decides how many bytes an element of everything
+    /// after it takes.
     pub(crate) fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
+        write_count(w, self.kind.tag())?;
         write_count(w, self.pos)?;
         write_count(w, self.n_kv_head)?;
         write_count(w, self.head_dim)?;
+        write_count(w, self.hidden)?;
         write_count(w, self.planes.len())?;
         for (k, v) in &self.planes {
             write_plane(w, k)?;
             write_plane(w, v)?;
         }
-        Ok(())
+        write_plane(w, &self.carry)
     }
 
     /// Bytes `write_to` produces, for the container directory that has to declare
     /// this record's length before the planes are streamed out.
     pub(crate) fn serialized_len(&self) -> usize {
-        4 * size_of::<u64>()
+        6 * size_of::<u64>()
             + self
                 .planes
                 .iter()
                 .map(|(k, v)| plane_bytes(k.len()) + plane_bytes(v.len()))
                 .sum::<usize>()
+            + plane_bytes(self.carry.len())
     }
 
     /// Read back a `write_to` body of `len` bytes. The shape and plane lengths are
@@ -1162,11 +1346,13 @@ impl DrafterImage {
     /// bytes is rejected.
     pub(crate) fn read_from(src: impl Read, len: u64) -> Result<Self> {
         let mut r = RecordReader::new(src, len);
+        let kind = DrafterImageKind::from_tag(r.count()?)?;
         let pos = plausible("position count", r.count()?, MAX_STORED_POS)?;
         let n_kv_head = plausible("KV head count", r.count()?, MAX_STORED_KV_HEADS)?;
         let head_dim = plausible("head dim", r.count()?, MAX_STORED_HEAD_DIM)?;
+        let hidden = plausible("hidden size", r.count()?, MAX_STORED_HIDDEN)?;
         let plane_count = plausible("layer count", r.count()?, MAX_STORED_LAYERS)?;
-        let plane = f32_bytes_for(&[n_kv_head, pos, head_dim])?;
+        let plane = elem_bytes_for(kind, &[n_kv_head, pos, head_dim])?;
         // Grown rather than reserved, for the reason `plausible` documents.
         let mut planes = Vec::new();
         for _ in 0..plane_count {
@@ -1174,22 +1360,30 @@ impl DrafterImage {
             let v = r.plane_of(plane)?;
             planes.push((k, v));
         }
+        // Sized from the declared width like every other plane, so a carry that
+        // does not describe a hidden row is refused before it is allocated.
+        let carry = r.plane_of(hidden * size_of::<f32>())?;
         r.finish()?;
-        Self::new(pos, n_kv_head, head_dim, planes)
+        Self::new(kind, pos, n_kv_head, head_dim, hidden, planes, carry)
     }
 }
 
-/// Bytes an f32 tensor of `dims` occupies, erroring rather than wrapping on
-/// overflow.
+/// The widest residual stream this build will read a stored carry for. The
+/// dense checkpoints are 5120 and the MoE 2048; this is well clear of both and
+/// still small enough that a corrupted field cannot ask for a large allocation.
+const MAX_STORED_HIDDEN: usize = 1 << 16;
+
+/// Bytes a `kind`-dtype tensor of `dims` occupies, erroring rather than wrapping
+/// on overflow.
 ///
 /// A [`DrafterImage`] computes this from its OWN declared shape. In process that
 /// comes from a real allocation and cannot overflow, but the same record is the
 /// on-disk format, where the shape fields are untrusted input — a wrapped product
 /// would size a buffer that a later index walks straight past.
-fn f32_bytes_for(dims: &[usize]) -> Result<usize> {
-    dims.iter().try_fold(size_of::<f32>(), |acc, &d| {
+fn elem_bytes_for(kind: DrafterImageKind, dims: &[usize]) -> Result<usize> {
+    dims.iter().try_fold(kind.elem_size(), |acc, &d| {
         acc.checked_mul(d)
-            .with_context(|| format!("drafter_image: f32 byte count for {dims:?} overflows usize"))
+            .with_context(|| format!("drafter_image: byte count for {dims:?} overflows usize"))
     })
 }
 
@@ -1221,7 +1415,7 @@ fn f32_rows(plane: &Tensor, len: usize) -> Result<Vec<u8>> {
 /// `t` must own its storage rather than view part of a larger allocation: the
 /// readback copies the whole storage and only then applies the layout. Callers
 /// holding a slice of a cache plane go through `f32_rows`.
-fn f32_bytes(t: &Tensor) -> Result<Vec<u8>> {
+pub(crate) fn f32_bytes(t: &Tensor) -> Result<Vec<u8>> {
     ensure!(
         t.dtype() == DType::F32,
         "drafter_image: drafter caches are f32, got {:?}",
@@ -1245,7 +1439,7 @@ fn f32_bytes(t: &Tensor) -> Result<Vec<u8>> {
 
 /// A device tensor of `shape` read from little-endian f32 `bytes`, the inverse of
 /// [`f32_bytes`].
-fn f32_tensor(bytes: &[u8], shape: &[usize], device: &Device) -> Result<Tensor> {
+pub(crate) fn f32_tensor(bytes: &[u8], shape: &[usize], device: &Device) -> Result<Tensor> {
     let elems: usize = shape.iter().product();
     ensure!(
         bytes.len() == elems * size_of::<f32>(),
@@ -2763,7 +2957,7 @@ mod tests {
         let planes: Vec<(Vec<u8>, Vec<u8>)> = (0..layers)
             .map(|il| (pattern(il as u8), pattern(0x40 + il as u8)))
             .collect();
-        let image = DrafterImage::new(pos, n_kv, hd, planes.clone()).unwrap();
+        let image = DrafterImage::new_dflash(pos, n_kv, hd, planes.clone()).unwrap();
 
         let mut bytes = Vec::new();
         image.write_to(&mut bytes).unwrap();
@@ -2774,6 +2968,7 @@ mod tests {
         );
 
         let back = DrafterImage::read_from(&bytes[..], bytes.len() as u64).unwrap();
+        assert_eq!(back.kind(), DrafterImageKind::Dflash);
         assert_eq!(back.pos, pos);
         assert_eq!(back.n_kv_head, n_kv);
         assert_eq!(back.head_dim, hd);
@@ -2797,9 +2992,11 @@ mod tests {
         // planes carry. Refused where the plane's declared length is compared
         // against the shape, which is before a buffer is sized from either.
         let mut lie = Vec::new();
+        write_count(&mut lie, DrafterImageKind::Dflash.tag()).unwrap();
         write_count(&mut lie, pos).unwrap();
         write_count(&mut lie, n_kv).unwrap();
         write_count(&mut lie, hd).unwrap();
+        write_count(&mut lie, 0usize).unwrap();
         write_count(&mut lie, 1usize).unwrap();
         write_plane(&mut lie, &pattern(1)[..plane - 4]).unwrap();
         write_plane(&mut lie, &pattern(2)[..plane - 4]).unwrap();
@@ -2813,8 +3010,77 @@ mod tests {
 
         // A shape whose f32 byte count would wrap a usize sizes nothing.
         assert!(
-            DrafterImage::new(usize::MAX / 2, 3, 5, Vec::new()).is_err(),
+            DrafterImage::new_dflash(usize::MAX / 2, 3, 5, Vec::new()).is_err(),
             "an overflowing byte count must error rather than wrap"
         );
+    }
+
+    /// The MTP image is a different record wearing the same tag: half the
+    /// element size, one layer, and a carry the DFlash image does not have. It
+    /// has to survive its own round trip, and — the point of storing the kind at
+    /// all — it must not be readable AS a DFlash image, because the two shapes
+    /// can agree on byte counts by coincidence and would then differ only in what
+    /// the numbers mean.
+    #[test]
+    fn an_mtp_image_round_trips_and_cannot_be_read_as_a_dflash_one() {
+        let (pos, n_kv, hd, hidden) = (7usize, 4usize, 5usize, 6usize);
+        let plane = n_kv * pos * hd * size_of::<half::f16>();
+        let pattern =
+            |seed: u8, n: usize| -> Vec<u8> { (0..n).map(|i| (i as u8) ^ seed ^ 0x5a).collect() };
+        let k = pattern(1, plane);
+        let v = pattern(2, plane);
+        let carry = pattern(3, hidden * size_of::<f32>());
+        let image = DrafterImage::new_mtp(
+            pos,
+            n_kv,
+            hd,
+            hidden,
+            vec![(k.clone(), v.clone())],
+            carry.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            image.byte_len(),
+            2 * plane + carry.len(),
+            "the carry is part of what the image costs to hold"
+        );
+
+        let mut bytes = Vec::new();
+        image.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), image.serialized_len());
+        let back = DrafterImage::read_from(&bytes[..], bytes.len() as u64).unwrap();
+        assert_eq!(back.kind(), DrafterImageKind::Mtp);
+        assert_eq!(back.pos, pos);
+        assert_eq!(back.layers(), 1);
+        assert_eq!(back.carry(), &carry[..]);
+        let (bk, bv) = back.plane(0).unwrap();
+        assert_eq!(bk, &k[..]);
+        assert_eq!(bv, &v[..]);
+
+        // The same planes declared as a DFlash image describe twice the bytes,
+        // so the kind is not decoration: without it these records could only be
+        // told apart by an arithmetic coincidence.
+        assert!(
+            DrafterImage::new_dflash(pos, n_kv, hd, vec![(k, v)]).is_err(),
+            "f16 planes must not pass as f32 ones"
+        );
+
+        // And a DFlash image that reaches the MTP head is refused by name rather
+        // than by whatever its bytes happen to mean.
+        let dflash_plane = n_kv * pos * hd * size_of::<f32>();
+        let dflash = DrafterImage::new_dflash(
+            pos,
+            n_kv,
+            hd,
+            vec![(pattern(4, dflash_plane), pattern(5, dflash_plane))],
+        )
+        .unwrap();
+        assert_eq!(
+            dflash.carry(),
+            b"",
+            "a DFlash image carries no hidden state"
+        );
+        assert_eq!(dflash.kind().name(), "DFlash");
+        assert_eq!(image.kind().name(), "MTP");
     }
 }

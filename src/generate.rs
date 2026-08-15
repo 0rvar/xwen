@@ -8,10 +8,12 @@ use candle_core::{D, DType, Device, Tensor};
 
 use crate::config::XwenConfig;
 use crate::constrain::GrammarState;
-use crate::dflash::{DflashDrafter, DrafterImage};
+use crate::dflash::DrafterImage;
+use crate::drafter::{AttachedDrafter, DrafterOps};
 use crate::gguf;
 use crate::kv_cache::{CacheSnapshot, HostFullKv, HostSnapshot, KvCheckpoint};
 use crate::model::XwenModel;
+use crate::mtp::MtpDrafter;
 use crate::ops::ExpertRunner;
 use crate::sampler::{SampleControl, Sampler, SamplerOptions};
 use crate::stack_profile::Phase;
@@ -25,7 +27,7 @@ const PREFILL_CHUNK: usize = 512;
 /// streaming callback. One GPU->CPU sync per decoded token (the logits
 /// readback that feeds the CPU sampler).
 ///
-/// When a DFlash drafter is attached (`attach_drafter`), `generate` runs the
+/// When a drafter is attached (`attach_drafter`), `generate` runs the
 /// speculative decode loop instead; with the drafter absent it is byte-identical
 /// to the pre-DFlash single-token loop.
 pub struct Generator {
@@ -33,7 +35,8 @@ pub struct Generator {
     tokenizer: LagunaTokenizer,
     sampler: Sampler,
     /// The speculative drafter, or `None` for the plain single-token loop.
-    drafter: Option<DflashDrafter>,
+    /// Either kind — the round code branches on it where the two differ.
+    drafter: Option<AttachedDrafter>,
     spec_params: SpecParams,
     /// Forced-reasoning floor: while fewer than this many tokens have been
     /// decoded in a call, `</think>` and the EOG ids are banned from sampling,
@@ -1394,7 +1397,7 @@ impl Generator {
     /// from one place so the CLI and the server load a model identically.
     /// `tokenizer` is override-only — `None` uses the vocabulary embedded in
     /// the binary (`LagunaTokenizer::embedded`), which is what every default
-    /// path wants. Attaching a DFlash drafter stays the caller's business —
+    /// path wants. Attaching a drafter stays the caller's business —
     /// it needs the same `device`, which is why the device is passed in
     /// rather than made here.
     pub fn load(
@@ -1491,7 +1494,7 @@ impl Generator {
         ban
     }
 
-    /// Attach a DFlash drafter so subsequent `generate` calls run speculative
+    /// Attach a drafter so subsequent `generate` calls run speculative
     /// decoding. The target's spec taps come from the drafter's config via
     /// `DflashConfig::spec_tap_layers` (the enforced `target_layers -> l_out`
     /// translation), kept in `target_layers` order — the order the drafter's
@@ -1504,16 +1507,36 @@ impl Generator {
     /// asserts, i.e. panics), a hidden size the encoder cannot consume (which
     /// would not surface until the first forward), and a mask token outside the
     /// target's vocabulary (which fails at the first speculative round).
-    pub fn attach_drafter(&mut self, drafter: DflashDrafter, params: SpecParams) -> Result<()> {
-        let target = self.model.config();
-        drafter
-            .config()
-            .check_against_target(target.hidden, target.n_layer, target.vocab)?;
-        let tap_layers = drafter.config().spec_tap_layers()?;
-        self.model.set_spec_taps(Some(tap_layers));
+    pub fn attach_drafter(&mut self, drafter: AttachedDrafter, params: SpecParams) -> Result<()> {
+        // Each kind is checked against the target by its own rules, and arms the
+        // hidden-state channel it reads: DFlash the PRE-norm residual taps at the
+        // layers its encoder was built for, MTP the POST-final-norm hidden. Wiring
+        // the wrong channel is the failure this dispatch exists to make impossible.
+        let target = self.model.config().clone();
+        match &drafter {
+            AttachedDrafter::Dflash(d) => {
+                d.config()
+                    .check_against_target(target.hidden, target.n_layer, target.vocab)?;
+                let tap_layers = d.config().spec_tap_layers()?;
+                self.model.set_spec_taps(Some(tap_layers));
+                self.model.set_keep_post_norm(false);
+            }
+            AttachedDrafter::Mtp(m) => {
+                m.config().check_against_target(&target)?;
+                self.model.set_spec_taps(None);
+                self.model.set_keep_post_norm(true);
+            }
+        }
         self.drafter = Some(drafter);
         self.spec_params = params;
         Ok(())
+    }
+
+    /// The loaded checkpoint's config. A caller loading a drafter needs it: the
+    /// MTP head has no geometry of its own — it is an extra trunk layer — so its
+    /// shapes are read from the target it will draft for.
+    pub fn model_config(&self) -> &XwenConfig {
+        self.model.config()
     }
 
     /// Longest prompt + generation budget the KV cache can hold. Callers can
@@ -1794,11 +1817,24 @@ impl Generator {
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             let input = Tensor::new(chunk, &device)?;
             *last_logits = Some(model.forward(&input, pos)?);
-            // Drain unconditionally: taps left in the model would be read by a
-            // later chunk as if they described its own positions.
+            // Drain both hidden-state channels unconditionally: either one left
+            // in the model would be read by a later chunk as if it described
+            // that chunk's own positions. Only one is ever armed — `attach_drafter`
+            // arms the channel its kind reads — so the other is empty here.
             let taps = model.take_spec_taps();
-            if let Some(drafter) = drafter.as_mut() {
-                inject_capped(drafter, &taps, pos, chunk.len())?;
+            let post_norm = model.take_post_norm_hidden();
+            match drafter.as_mut() {
+                Some(AttachedDrafter::Dflash(d)) => inject_capped(d, &taps, pos, chunk.len())?,
+                Some(AttachedDrafter::Mtp(head)) => {
+                    let hidden = post_norm.ok_or_else(|| {
+                        anyhow!(
+                            "an MTP head is attached but the prefill forward kept no \
+                             post-final-norm hidden; the capture was not armed"
+                        )
+                    })?;
+                    mtp_sync_capped(model, head, chunk, &hidden, pos)?;
+                }
+                None => {}
             }
             pos += chunk.len();
         }
@@ -1896,7 +1932,7 @@ impl Generator {
         Ok((values, f64::from(max) + denom.ln()))
     }
 
-    /// True when a DFlash drafter is attached, whether or not it can currently
+    /// True when a drafter is attached, whether or not it can currently
     /// speculate (see `spec_ready_at`).
     ///
     /// A stored cache image can carry drafter planes into a process that has none: the
@@ -1907,19 +1943,28 @@ impl Generator {
         self.drafter.is_some()
     }
 
+    /// Which kind of drafter is attached, or `None` when none is.
+    ///
+    /// A stored cache image names the kind that WROTE it, and the two kinds'
+    /// records are not interchangeable, so a caller holding one has to compare
+    /// it against this before offering it to the import.
+    pub fn drafter_kind(&self) -> Option<crate::drafter::DrafterKind> {
+        self.drafter.as_ref().map(AttachedDrafter::kind)
+    }
+
     /// Positions the drafter's own KV cache can hold — smaller than the target's
-    /// context by design, since its f32 planes cost 40 KiB/token on the 27B
-    /// sidecar and 48 on the 35B-A3B's extra layer
+    /// context by design, since its planes cost 40 KiB/token on the 27B DFlash
+    /// sidecar, 48 on the 35B-A3B's extra layer, and 4 on the 3.8's MTP head
     /// (`hub::Model::draft_kv_bytes_per_token`). `None` when no drafter is
     /// attached.
     pub fn drafter_max_ctx(&self) -> Option<usize> {
-        self.drafter.as_ref().map(|d| d.max_ctx())
+        self.drafter.as_ref().map(DrafterOps::max_ctx)
     }
 
     /// Tokens the drafter's KV cache holds, 0 with no drafter attached. Equal to
     /// `cache_len()` whenever speculation is live.
     pub fn drafter_committed_len(&self) -> usize {
-        self.drafter.as_ref().map_or(0, |d| d.committed_len())
+        self.drafter.as_ref().map_or(0, DrafterOps::committed_len)
     }
 
     /// Whether `decode_loop_spec` can actually speculate when resumed at `pos`:
@@ -1959,9 +2004,18 @@ impl Generator {
     /// Drop the drafter's cached context, so it resynchronizes on the next prefill
     /// from position 0. Pair it with `reset_cache` on the target. No-op with no
     /// drafter attached.
-    pub fn reset_drafter(&mut self) {
-        if let Some(drafter) = self.drafter.as_mut() {
-            drafter.reset();
+    ///
+    /// Fallible, and the error must not be discarded: the MTP head's reset
+    /// allocates its zero carry on the device, and a head that reported a
+    /// successful reset while keeping the previous conversation's carry would
+    /// build the next row 0 out of somebody else's hidden. The head's own reset
+    /// is atomic, so a failure here leaves it holding its OLD context — which
+    /// still belongs to a conversation the caller is abandoning, and is a state
+    /// the caller has to decide about rather than one to ignore.
+    pub fn reset_drafter(&mut self) -> Result<()> {
+        match self.drafter.as_mut() {
+            Some(drafter) => drafter.reset(),
+            None => Ok(()),
         }
     }
 
@@ -1971,7 +2025,7 @@ impl Generator {
     /// without an image resumes with speculation off (see `import_drafter_cache`).
     pub fn export_drafter_cache(&self) -> Result<Option<DrafterImage>> {
         match &self.drafter {
-            Some(drafter) => Ok(Some(drafter.export_cache()?)),
+            Some(drafter) => drafter.export_cache(),
             None => Ok(None),
         }
     }
@@ -2087,6 +2141,20 @@ impl Generator {
             self.drafter.is_some(),
             "decode_loop_spec: no drafter is attached"
         );
+        // The round below is DFlash-shaped end to end — a noise block, tap
+        // injection, one non-causal denoising forward. The MTP head chains
+        // instead, so it gets its own loop rather than this one growing a union
+        // of both shapes. Dispatched here, before `self` is split into field
+        // borrows, because the other loop needs all of `self` back.
+        if matches!(self.drafter, Some(AttachedDrafter::Mtp(_))) {
+            return self.decode_loop_mtp(
+                start_pos,
+                starts_in_thinking,
+                max_new,
+                on_event,
+                should_stop,
+            );
+        }
         let ban_floor = self.ban_ids(true);
         let ban_plain = self.ban_ids(false);
         let min_think = self.min_think;
@@ -2107,7 +2175,9 @@ impl Generator {
         } = self;
         let drafter = drafter
             .as_mut()
-            .expect("checked before the logits were taken");
+            .expect("checked before the logits were taken")
+            .as_dflash_mut()
+            .expect("the MTP head was routed to its own loop above");
         think.reset();
         let device = model.device().clone();
         // A verify forward feeds a whole span of tokens and is still decode, so
@@ -2261,12 +2331,7 @@ impl Generator {
                 let hidden_masked = hidden.narrow(0, 1, n_draft)?;
                 let dlogits = model.lm_head(&hidden_masked)?; // [n_draft, vocab]
                 let (ids, probs) = draft_argmax_probs(&dlogits)?;
-                for (&tok, &p) in ids.iter().zip(&probs) {
-                    if p < params.draft_p_min {
-                        break;
-                    }
-                    drafts.push(tok);
-                }
+                drafts = keep_confident(&ids, &probs, params.draft_p_min);
                 if drafts.len() < params.draft_min {
                     drafts.clear();
                 }
@@ -2518,6 +2583,399 @@ impl Generator {
         Ok(finish(decoded, thinking_tokens, hit_eog, cancelled, stats))
     }
 
+    /// The MTP head's decode loop — the chain-drafting counterpart of
+    /// [`Generator::decode_loop_spec`], which handles the block-diffusion shape.
+    /// Same arguments, same `GenEvent` surface, same stopping rules, and the
+    /// same sample-stream invariant: exactly one target-sampler draw per
+    /// committed token, in sequence order, so under one seed this decodes what
+    /// `decode_loop` would except where the batched forward's numerics flip a
+    /// near-tie.
+    ///
+    /// The middle of a round is shared with the DFlash one and is deliberately
+    /// written to diff against it line for line: the checkpoint, the batched
+    /// verify forward, `accept_drafts`, the rollback, the retention cap, the
+    /// pause controller. The two ENDS are what differ.
+    ///
+    /// Drafting: a chain steps the head once per proposed token, each step
+    /// consuming the previous step's own token and hidden, where a block drafter
+    /// denoises every position in one forward. Feeding: the head is caught up by
+    /// SYNCING the target's accepted tokens against the target's post-final-norm
+    /// hiddens shifted right by one, where a block drafter injects fused
+    /// pre-norm taps. Those are different enough that a union of both rounds
+    /// would be harder to check than two rounds that read the same.
+    ///
+    /// The caller establishes the invariants `decode_loop_spec` checks — a think
+    /// budget that can close, and a cache that ends exactly at `start_pos`.
+    fn decode_loop_mtp(
+        &mut self,
+        start_pos: usize,
+        starts_in_thinking: bool,
+        max_new: usize,
+        on_event: &mut dyn FnMut(GenEvent),
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<DecodeOutcome> {
+        ensure!(
+            self.model.cache_len() == start_pos,
+            "decode_loop_mtp: start_pos {start_pos} disagrees with the {} tokens the KV cache \
+             holds",
+            self.model.cache_len()
+        );
+        let ban_floor = self.ban_ids(true);
+        let ban_plain = self.ban_ids(false);
+        let min_think = self.min_think;
+        let logits = self
+            .last_logits
+            .take()
+            .ok_or_else(|| anyhow!("decode_loop_mtp: no prefill logits; call prefill first"))?;
+        // Destructure into per-field borrows so the head can stay borrowed
+        // across target-model / sampler / tokenizer calls (distinct fields).
+        let Self {
+            model,
+            tokenizer,
+            sampler,
+            drafter,
+            spec_params,
+            think,
+            grammar,
+            ..
+        } = self;
+        let head = drafter
+            .as_mut()
+            .and_then(AttachedDrafter::as_mtp_mut)
+            .ok_or_else(|| anyhow!("decode_loop_mtp: no MTP head is attached"))?;
+        think.reset();
+        let device = model.device().clone();
+        // A verify forward feeds a whole span of tokens and is still decode, so
+        // the XWEN_STACK_PROFILE phase is declared rather than left to the shape
+        // of the batch.
+        model.set_phase(Phase::Decode);
+        let params = spec_params.clone();
+
+        // A chain is bounded by the head's own fitted cap as well as by
+        // `--draft-max`, whose default is a block drafter's and far too deep for
+        // a chain that pays a forward per step (mtp.rs, `max_chain_len`).
+        let draft_max = params.draft_max.min(head.max_chain_len());
+        let target_max_ctx = model.max_ctx();
+        let draft_ctx = head.max_ctx();
+
+        let decode_start = Instant::now();
+        let mut stream = tokenizer.decode_stream();
+        let mut stats = SpecStats::default();
+        // Absolute position of the token that has been sampled but not yet
+        // forwarded, and equally the number of tokens the KV cache holds.
+        let mut n_past = start_pos;
+        let mut decoded = 0usize;
+        let mut thinking_tokens = 0usize;
+        let mut in_thinking = starts_in_thinking;
+        let mut hit_eog = false;
+        let mut cancelled = false;
+        let mut pause = PauseController::new(params.pause_margin as f64);
+
+        let finish = |decoded, thinking_tokens, hit_eog, cancelled, stats| DecodeOutcome {
+            tokens_out: decoded,
+            thinking_tokens,
+            hit_eog,
+            cancelled,
+            decode_secs: decode_start.elapsed().as_secs_f64(),
+            spec: Some(stats),
+        };
+
+        // A zero budget must not draw from the sampler at all.
+        if max_new == 0 {
+            device.synchronize()?;
+            return Ok(finish(0, 0, false, false, stats));
+        }
+        if should_stop() {
+            device.synchronize()?;
+            return Ok(finish(0, 0, false, true, stats));
+        }
+
+        // First token: sampled from the prefill logits, exactly as plain decode
+        // does. Every later token is committed by a verify round.
+        let mut id_last = {
+            let banned = if min_think > 0 {
+                &ban_floor
+            } else {
+                &ban_plain
+            };
+            let allowed = match grammar.as_mut() {
+                Some(g) => g.mask_words()?,
+                None => None,
+            };
+            let tc = think.control_for();
+            let ctl = SampleControl {
+                allowed,
+                banned,
+                bias: tc.bias,
+                pull: tc.pull,
+                force: tc.force,
+            };
+            let token = sampler.sample_controlled(&logits, &ctl)?;
+            think.on_committed(0, token);
+            if let Some(g) = grammar.as_mut() {
+                g.on_committed(token)?;
+            }
+            token
+        };
+        if sampler.is_eog(id_last) {
+            device.synchronize()?;
+            return Ok(finish(0, 0, true, false, stats));
+        }
+        {
+            let chunk = stream.step(id_last)?;
+            think.on_emitted(chunk.as_deref());
+            on_event(section_event(
+                id_last,
+                chunk.unwrap_or_default(),
+                &mut in_thinking,
+                &mut thinking_tokens,
+            ));
+            decoded += 1;
+            if decoded < max_new && should_stop() {
+                cancelled = true;
+            }
+        }
+        if grammar.as_ref().is_some_and(|g| g.is_done()) {
+            device.synchronize()?;
+            return Ok(finish(decoded, thinking_tokens, true, cancelled, stats));
+        }
+
+        while !cancelled && decoded < max_new {
+            if should_stop() {
+                cancelled = true;
+                break;
+            }
+
+            // Speculation needs the head's cache to describe exactly the tokens
+            // the target's does, and a head cache position to write into.
+            let spec_live = drafter_span_rows(head.committed_len(), draft_ctx, n_past, 1) == 1;
+            let round_kind = pause.next_kind();
+            let serial = think.needs_serial_rounds(draft_max);
+            let want_draft =
+                spec_live && !serial && matches!(round_kind, RoundKind::Spec | RoundKind::Probe);
+            let accounted = spec_live && !serial;
+            let round_start = Instant::now();
+
+            // ---- Draft: chain the head forward from `id_last`, keeping the
+            // leading run of steps that cleared the confidence floor.
+            let n_draft = draft_max
+                .min(target_max_ctx.saturating_sub(n_past + 1))
+                .min(draft_ctx.saturating_sub(n_past + 1));
+            let mut drafts: Vec<u32> = Vec::new();
+            let drafter_ran = want_draft && n_draft > 0;
+            if drafter_ran {
+                stats.draft_rounds += 1;
+                drafts =
+                    mtp_draft_chain(model, head, id_last, n_past, n_draft, params.draft_p_min)?;
+                if drafts.len() < params.draft_min {
+                    drafts.clear();
+                }
+            }
+
+            // Split the round timer at the draft/commit boundary, on the same
+            // rule the DFlash round uses: the draft phase ended at the chain's
+            // one readback, the commit phase ends at its own sampler readback,
+            // and a round that drafted and kept nothing still charges its draft
+            // time here.
+            let draft_ms = if drafter_ran {
+                round_start.elapsed().as_secs_f64() * 1000.0
+            } else {
+                0.0
+            };
+
+            // The tokens this round commits, and — when it verified a chain —
+            // the rollback point and the hiddens the sync below needs.
+            let committed: Vec<u32>;
+            let mut verified: Option<(KvCheckpoint, Tensor)> = None;
+            let mut matched = 0usize;
+            if drafts.is_empty() {
+                // No usable draft: a plain single-token decode step, the same
+                // target forward + sampler draw plain decode runs.
+                let input = Tensor::new(&[id_last], &device)?;
+                let step_logits = model.forward(&input, n_past)?;
+                let hidden = take_post_norm(model)?; // [1, hidden]
+                if spec_live {
+                    mtp_sync_capped(model, head, &[id_last], &hidden, n_past)?;
+                }
+                let banned = if decoded < min_think {
+                    &ban_floor
+                } else {
+                    &ban_plain
+                };
+                let allowed = match grammar.as_mut() {
+                    Some(g) => g.mask_words()?,
+                    None => None,
+                };
+                let tc = think.control_for();
+                let ctl = SampleControl {
+                    allowed,
+                    banned,
+                    bias: tc.bias,
+                    pull: tc.pull,
+                    force: tc.force,
+                };
+                let s = sampler.sample_controlled(&step_logits, &ctl)?;
+                think.on_committed(decoded, s);
+                if let Some(g) = grammar.as_mut() {
+                    g.on_committed(s)?;
+                }
+                stats.rounds += 1;
+                committed = vec![s];
+            } else {
+                // ---- Verify: forward [id_last, drafts...] in one batch,
+                // checkpointing the KV first so a partial accept can roll the
+                // span back to the positions it keeps. The error regime is the
+                // DFlash round's, for the same reason: a failure between the
+                // checkpoint and the rollback leaves a dirty slot that the
+                // server's next `cache_len` cross-check replays from zero.
+                let span = 1 + drafts.len();
+                let ckpt = model.kv_checkpoint(span)?;
+                let mut verify_ids = Vec::with_capacity(span);
+                verify_ids.push(id_last);
+                verify_ids.extend_from_slice(&drafts);
+                let vinput = Tensor::new(verify_ids.as_slice(), &device)?;
+                let logits_all = model.forward_all_logits(&vinput, n_past)?; // [span, vocab]
+                let hidden = take_post_norm(model)?; // [span, hidden]
+                let logits_cpu = logits_all.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+
+                let (m, accepted) = accept_drafts(&drafts, max_new - decoded, |i| {
+                    let row = logits_cpu.narrow(0, i, 1)?;
+                    let t = decoded + i;
+                    let banned = if t < min_think {
+                        &ban_floor
+                    } else {
+                        &ban_plain
+                    };
+                    let allowed = match grammar.as_mut() {
+                        Some(g) => g.mask_words()?,
+                        None => None,
+                    };
+                    let tc = think.control_for();
+                    let ctl = SampleControl {
+                        allowed,
+                        banned,
+                        bias: tc.bias,
+                        pull: tc.pull,
+                        force: tc.force,
+                    };
+                    let s = sampler.sample_controlled(&row, &ctl)?;
+                    think.on_committed(t, s);
+                    if let Some(g) = grammar.as_mut() {
+                        g.on_committed(s)?;
+                    }
+                    Ok((
+                        s,
+                        sampler.is_eog(s) || grammar.as_ref().is_some_and(|g| g.is_done()),
+                    ))
+                })?;
+                stats.rounds += 1;
+                stats.drafted += drafts.len();
+                matched = m;
+                verified = Some((ckpt, hidden));
+                committed = accepted;
+            }
+
+            // ---- Emit. The KV span is committed AFTER this, because how much of
+            // it to keep depends on how far the emit got.
+            let emit_start = Instant::now();
+            let mut emitted_here = 0usize;
+            for &tok in &committed {
+                if sampler.is_eog(tok) {
+                    hit_eog = true;
+                    break;
+                }
+                let chunk = stream.step(tok)?;
+                think.on_emitted(chunk.as_deref());
+                on_event(section_event(
+                    tok,
+                    chunk.unwrap_or_default(),
+                    &mut in_thinking,
+                    &mut thinking_tokens,
+                ));
+                decoded += 1;
+                emitted_here += 1;
+                if decoded >= max_new {
+                    break;
+                }
+                if should_stop() {
+                    cancelled = true;
+                    break;
+                }
+            }
+            let emit_ms = emit_start.elapsed().as_secs_f64() * 1000.0;
+
+            let retained = retained_commits(committed.len(), emitted_here, hit_eog);
+            stats.accepted += matched.min(retained);
+
+            let keep = verify_keep(committed.len(), emitted_here);
+            if let Some((ckpt, hidden)) = verified {
+                model.kv_rollback(&ckpt, keep)?;
+                // The head's rows for these positions were written by the draft
+                // chain out of its own guesses and rolled back with it; the sync
+                // writes them again from what the target actually committed.
+                // Row p pairs token p with the hidden at p-1, so the tokens are
+                // the round's anchor followed by every kept commit but the last,
+                // and `sync` supplies the shift itself.
+                let synced = verify_sync_rows(id_last, &committed, keep);
+                mtp_sync_capped(model, head, &synced, &hidden.narrow(0, 0, keep)?, n_past)?;
+                n_past += keep;
+            } else {
+                // The plain step's single position is already in the cache and
+                // the head already holds its row.
+                n_past += 1;
+            }
+            // Assigned only now: the sync above needs the token this round
+            // ANCHORED on, which is the one the previous round left here.
+            //
+            // When `keep < committed.len()` the token taken here sits at a
+            // position the rollback just discarded, so a NEXT round would anchor
+            // on a token the caches do not hold. That is unreachable, but only by
+            // an invariant that lives elsewhere: `keep` falls short exactly when
+            // the emit loop stopped early, and every way it can stop early — an
+            // EOG, the `max_new` cap, a cancel — also ends the round loop before
+            // it comes back around. Anything that adds a fourth way to leave that
+            // loop while the round continues has to move this assignment above
+            // the emit, or clamp it to the kept prefix.
+            id_last = *committed.last().expect("a round always commits >= 1 token");
+
+            // Feed the round's wall-clock cost to the pause controller, with the
+            // same one-synchronize-per-round barrier the DFlash round documents:
+            // the rollback and sync are queued but not yet synced here, and their
+            // GPU tail would otherwise skew the next round's window.
+            let ran_spec = !drafts.is_empty();
+            device.synchronize()?;
+            let round_ms = round_start.elapsed().as_secs_f64() * 1000.0 - emit_ms;
+            stats.draft_ms += draft_ms;
+            stats.verify_ms += round_ms - draft_ms;
+            stats.verify_positions += 1 + drafts.len();
+            stats.bucket_round(
+                round_ms,
+                draft_ms,
+                ran_spec,
+                ran_spec && matched == drafts.len(),
+                retained,
+            );
+            if accounted {
+                pause.record(round_kind, round_ms, draft_ms, retained, ran_spec);
+                if round_kind == RoundKind::PausedPlain
+                    || (round_kind == RoundKind::Probe && !ran_spec)
+                {
+                    stats.paused_rounds += 1;
+                }
+            }
+
+            if grammar.as_ref().is_some_and(|g| g.is_done()) {
+                hit_eog = true;
+            }
+            if hit_eog {
+                break;
+            }
+        }
+
+        device.synchronize()?;
+        Ok(finish(decoded, thinking_tokens, hit_eog, cancelled, stats))
+    }
+
     /// The single-token decode loop both `generate` and `decode_loop` run:
     /// sample under the floor/budget controls, stop at EOG, stream the finalized
     /// text, feed the token back. `logits` are for the position before
@@ -2640,6 +3098,11 @@ impl Generator {
              grammar"
         );
         check_think_budget(&self.think, self.min_think, max_tokens)?;
+        // Same split as `decode_loop_spec`: the MTP head chains and takes its
+        // own loop, dispatched before the field borrows below.
+        if matches!(self.drafter, Some(AttachedDrafter::Mtp(_))) {
+            return self.generate_mtp(prompt, content_ranges, max_tokens, on_text, should_stop);
+        }
         let ban_floor = self.ban_ids(true);
         let ban_plain = self.ban_ids(false);
         let min_think = self.min_think;
@@ -2658,7 +3121,11 @@ impl Generator {
             ..
         } = self;
         think.reset();
-        let drafter = drafter.as_mut().expect("generate_spec requires a drafter");
+        let drafter = drafter
+            .as_mut()
+            .expect("generate_spec requires a drafter")
+            .as_dflash_mut()
+            .expect("the MTP head was routed to its own loop above");
         model.reset_cache()?;
         let device = model.device().clone();
         drafter.reset();
@@ -2873,12 +3340,7 @@ impl Generator {
                     // walk below is then a cheap CPU scan, identical in semantics
                     // to the old per-row full-vocab argmax_softmax.
                     let (ids, probs) = draft_argmax_probs(&dlogits)?;
-                    for (&tok, &p) in ids.iter().zip(&probs) {
-                        if p < params.draft_p_min {
-                            break;
-                        }
-                        drafts.push(tok);
-                    }
+                    drafts = keep_confident(&ids, &probs, params.draft_p_min);
                     if drafts.len() < params.draft_min {
                         drafts.clear();
                     }
@@ -3066,12 +3528,164 @@ impl Generator {
             think: think.enabled().then(|| think.stats(decoded)),
         })
     }
+
+    /// The MTP head's one-shot counterpart of [`Generator::generate_spec`]:
+    /// reset, prefill from zero while syncing the head, then hand the decode to
+    /// [`Generator::decode_loop_mtp`].
+    ///
+    /// The DFlash pair writes its round out twice, once here and once in the
+    /// server's loop. The MTP pair does not, because there turned out to be
+    /// nothing to duplicate: the one-shot path differs from the server's only in
+    /// owning the prefill — resetting the cache, honouring `XWEN_BENCH`, and
+    /// polling `should_stop` between chunks, none of which `prefill_tokens` does
+    /// — so it owns that and delegates the rest. One round implementation is
+    /// also one place for the sync rule to be right.
+    fn generate_mtp(
+        &mut self,
+        prompt: &str,
+        content_ranges: &[Range<usize>],
+        max_tokens: usize,
+        on_text: &mut dyn FnMut(&str),
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<GenStats> {
+        let tokens = self.tokenizer.encode_prompt(prompt, content_ranges)?;
+        ensure!(!tokens.is_empty(), "prompt encoded to zero tokens");
+        let max_ctx = self.model.max_ctx();
+        ensure!(
+            tokens.len() + max_tokens <= max_ctx,
+            "prompt ({} tokens) + max_tokens ({max_tokens}) exceeds max_ctx ({max_ctx}); \
+             raise --max-ctx or lower -n",
+            tokens.len()
+        );
+        // Same floor-vs-budget guard as the plain path (see generate()).
+        ensure!(
+            self.min_think == 0 || self.min_think < max_tokens,
+            "min_think ({}) must be below max_tokens ({max_tokens}) or the think \
+             block can never close",
+            self.min_think
+        );
+
+        // Any logits a previous `prefill_tokens` left behind describe a cache
+        // that no longer exists (this path resets it below).
+        self.last_logits = None;
+        self.model.reset_cache()?;
+        self.reset_drafter()?;
+        let device = self.model.device().clone();
+
+        // Benchmark warm-up (XWEN_BENCH): page weights + compile pipelines on a
+        // throwaway prefill (target and head both), then reset. Never affects
+        // output. Mirrors the plain-decode path so spec timings are steady-state.
+        if std::env::var_os("XWEN_BENCH").is_some() {
+            self.prefill_mtp(&tokens, &mut || false)?;
+            device.synchronize()?;
+            self.model.reset_cache()?;
+            self.reset_drafter()?;
+            self.last_logits = None;
+            // The warm-up's stages are the page-in and pipeline-compile costs
+            // this block exists to keep out of the measurement; they must not
+            // survive into the profile either.
+            self.model.reset_stack_profile();
+        }
+
+        self.model.set_phase(Phase::Prefill);
+        let prefill_start = Instant::now();
+        let prefilled = self.prefill_mtp(&tokens, should_stop)?;
+        device.synchronize()?;
+        let prefill_secs = prefill_start.elapsed().as_secs_f64();
+        self.model.dump_stack_profile("after-prefill");
+        if prefilled < tokens.len() {
+            // Cancelled during (or before) prefill: no logits to decode from.
+            return Ok(GenStats {
+                prefill_tokens: prefilled,
+                prefill_secs,
+                cancelled: true,
+                spec: Some(SpecStats::default()),
+                ..GenStats::default()
+            });
+        }
+
+        // The rendered prompt's `</think>` is part of the text stream this path
+        // hands out (the REPL splits on the literal), so every chunk is
+        // forwarded verbatim whichever section the round assigns it to.
+        let mut forward_text = |event: GenEvent| {
+            if !event.text().is_empty() {
+                on_text(event.text());
+            }
+        };
+        let outcome = self.decode_loop_mtp(
+            tokens.len(),
+            false,
+            max_tokens,
+            &mut forward_text,
+            should_stop,
+        )?;
+        self.model.dump_stack_profile("end-of-generation");
+
+        Ok(GenStats {
+            prefill_tokens: tokens.len(),
+            prefill_secs,
+            decode_tokens: outcome.tokens_out,
+            decode_secs: outcome.decode_secs,
+            cancelled: outcome.cancelled,
+            spec: outcome.spec,
+            think: self
+                .think
+                .enabled()
+                .then(|| self.think.stats(outcome.tokens_out)),
+        })
+    }
+
+    /// Prefill `tokens` from position zero in chunks, syncing the MTP head after
+    /// each one, and keep the last chunk's logits for the decode loop. Returns
+    /// how many tokens landed — short of `tokens.len()` only when `should_stop`
+    /// fired at a chunk boundary.
+    ///
+    /// The head's catch-up is batched over the whole chunk, which is the point:
+    /// llama.cpp pays an 84 MB-per-4k-ubatch device-to-host round trip here
+    /// because its two contexts cannot see each other's tensors, and xwen is one
+    /// process on one device, so the hiddens go from the trunk's final norm into
+    /// the head without leaving the GPU.
+    fn prefill_mtp(
+        &mut self,
+        tokens: &[u32],
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<usize> {
+        let Self {
+            model,
+            drafter,
+            last_logits,
+            ..
+        } = self;
+        let device = model.device().clone();
+        let mut pos = 0usize;
+        for chunk in tokens.chunks(PREFILL_CHUNK) {
+            if should_stop() {
+                break;
+            }
+            let input = Tensor::new(chunk, &device)?;
+            *last_logits = Some(model.forward(&input, pos)?);
+            let hidden = take_post_norm(model)?;
+            if let Some(head) = drafter.as_mut().and_then(AttachedDrafter::as_mtp_mut) {
+                mtp_sync_capped(model, head, chunk, &hidden, pos)?;
+            }
+            // XWEN_CHUNK_SYNC: bound each chunk's work at the chunk boundary
+            // instead of letting chunks pipeline (ops::chunk_sync).
+            if crate::ops::chunk_sync() {
+                device.synchronize()?;
+            }
+            pos += chunk.len();
+        }
+        Ok(pos)
+    }
 }
 
 /// How many rows of a `len`-token span starting at absolute position `pos` a
 /// drafter whose cache holds `committed` tokens and has `draft_ctx` slots can be
 /// fed: the whole span, a leading prefix of it when the span straddles the end of
 /// the drafter's context, or none at all.
+///
+/// Shared by both drafter kinds — the DFlash injection and the MTP sync ask the
+/// same question of the same three numbers.
 ///
 /// The exact-position condition carries weight: injection is positional and
 /// appends only at the committed length, so a drafter that missed a span — a
@@ -3080,9 +3694,9 @@ impl Generator {
 /// instead.
 ///
 /// Taking a PREFIX rather than skipping a straddling span matters because the
-/// drafter's context is sized independently of the target's (its f32 planes cost
-/// 40-48 KiB/token depending on the sidecar) and a prefill chunk rarely lands on
-/// that boundary. Filling the
+/// drafter's context is sized independently of the target's (its planes cost
+/// 40-48 KiB/token on the f32 DFlash sidecars and 4 on the f16 MTP head) and a
+/// prefill chunk rarely lands on that boundary. Filling the
 /// drafter right up to its capacity is what keeps the widest set of later rewind
 /// points able to re-enable speculation — a rewind can only do so if it lands
 /// exactly on the committed length.
@@ -3099,7 +3713,7 @@ fn drafter_span_rows(committed: usize, draft_ctx: usize, pos: usize, len: usize)
 /// stopping a chunk short of it; one wholly past it is dropped. The caller has
 /// already drained the taps from the model either way.
 fn inject_capped(
-    drafter: &mut DflashDrafter,
+    drafter: &mut crate::dflash::DflashDrafter,
     taps: &[Tensor],
     pos: usize,
     len: usize,
@@ -3120,6 +3734,176 @@ fn inject_capped(
     drafter.inject(&fused, pos)
 }
 
+/// The target's post-final-norm hidden from the forward that just ran,
+/// `[seq, hidden]` f32.
+///
+/// Absent means the capture was never armed, and with an MTP head attached that
+/// is a wiring bug rather than a state a round can carry on from: the head would
+/// be synced against nothing, which is a silently wrong draft context rather than
+/// a slow one. `Generator::attach_drafter` arms it for exactly this reason.
+fn take_post_norm(model: &mut XwenModel) -> Result<Tensor> {
+    model.take_post_norm_hidden().ok_or_else(|| {
+        anyhow!(
+            "an MTP head is attached but the last forward kept no post-final-norm hidden; the \
+             capture was not armed"
+        )
+    })
+}
+
+/// Sync one span of committed tokens into the MTP head, capped at its capacity
+/// exactly as [`inject_capped`] caps the DFlash drafter: a span straddling the
+/// head's context is taken up to the boundary so the head fills to capacity, one
+/// wholly past it is dropped, and one whose start disagrees with what the head
+/// holds is dropped too.
+///
+/// `tokens` are the tokens AT positions `[pos, pos+len)` and `hiddens` the
+/// target's post-final-norm hiddens at those SAME positions, both straight out
+/// of the forward that produced them. Neither is shifted here: `MtpDrafter::sync`
+/// owns the shift-right-by-one, which is what keeps it in one checkable place
+/// instead of at each of the three call sites.
+fn mtp_sync_capped(
+    model: &XwenModel,
+    head: &mut MtpDrafter,
+    tokens: &[u32],
+    hiddens: &Tensor,
+    pos: usize,
+) -> Result<()> {
+    let rows_available = hiddens.dim(0)?;
+    ensure!(
+        tokens.len() == rows_available,
+        "mtp sync: {} tokens against {rows_available} hidden rows",
+        tokens.len()
+    );
+    let rows = drafter_span_rows(head.committed_len(), head.max_ctx(), pos, tokens.len());
+    if rows == 0 {
+        return Ok(());
+    }
+    let embed = model.embed_ids(&tokens[..rows])?;
+    let hiddens = if rows == rows_available {
+        hiddens.clone()
+    } else {
+        // The rows that fit are the span's LEADING ones: the head fills up to
+        // its capacity in order and stops there.
+        hiddens.narrow(0, 0, rows)?
+    };
+    head.sync(&embed, &hiddens, pos)?;
+    Ok(())
+}
+
+/// One MTP draft chain: step the head `n_max` times from the target's last
+/// committed state and return the leading run of proposals that cleared `p_min`.
+///
+/// `first_token` is the token the target has sampled but not yet forwarded, and
+/// it lives at absolute position `pos` — which is also where the chain's first
+/// head row goes. Step 1 pairs it with the head's carry (the target's hidden at
+/// `pos - 1`) and predicts the token after next; every later step is fully
+/// self-feeding, consuming its own previous token and its own
+/// post-`shared_head_norm` hidden. Greedy throughout: a chain is a proposal, and
+/// the target's own draw is what decides.
+///
+/// The whole chain stays on the device. Each step's argmax and its probability
+/// are reduced there and accumulated as tensors, and exactly one readback
+/// happens at the end — a per-step readback measured +1.45-2.96 ms of pure sync
+/// in the Phase 0 microbench, which at this depth is most of what drafting is
+/// trying to save in the first place.
+fn mtp_draft_chain(
+    model: &XwenModel,
+    head: &mut MtpDrafter,
+    first_token: u32,
+    pos: usize,
+    n_max: usize,
+    p_min: f32,
+) -> Result<Vec<u32>> {
+    // The chain's head rows are scratch by construction: each pairs a GUESSED
+    // token with a hidden the head invented, and the sync after the verify
+    // rewrites those same positions from what the target actually committed. So
+    // the chain gives them back itself rather than leaving a rollback the caller
+    // has to remember on every exit path.
+    //
+    // Including the ERROR exits, which is why the stepping is a closure and the
+    // rollback is outside it. A step that fails partway leaves rows past the
+    // committed length in the head's cache while every gate — `spec_ready_at`,
+    // `drafter_span_rows` — reads `committed_len` and reports the head aligned,
+    // so the next round would sync on top of somebody's abandoned guesses. The
+    // failure is what the caller sees either way; the head is left consistent
+    // for whoever handles it.
+    let stepped = (|| -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let mut step_ids = Vec::with_capacity(n_max);
+        let mut step_probs = Vec::with_capacity(n_max);
+        let mut embed = model.embed_ids(&[first_token])?;
+        let mut h = head.carry().clone();
+        for step in 0..n_max {
+            let out = head.step(&embed, &h, pos + step)?; // [1, hidden]
+            let (id, prob) = argmax_probs_device(&model.lm_head_row(&out)?)?;
+            // The next step's embedding is gathered BY DEVICE INDEX, so the
+            // drafted id never has to be known on the host.
+            if step + 1 < n_max {
+                embed = model.embed_rows(&id.flatten_all()?)?;
+                h = out;
+            }
+            step_ids.push(id);
+            step_probs.push(prob);
+        }
+        Ok((step_ids, step_probs))
+    })();
+    // The rollback's own failure is reported only when the chain itself
+    // succeeded: a step error is the more informative of the two, and the head
+    // is equally unusable either way.
+    let rolled_back = head.draft_rollback();
+    let (step_ids, step_probs) = stepped?;
+    rolled_back?;
+
+    let ids: Vec<u32> = Tensor::cat(&step_ids, 0)?
+        .flatten_all()?
+        .to_dtype(DType::U32)?
+        .to_device(&Device::Cpu)?
+        .to_vec1()?;
+    let probs: Vec<f32> = Tensor::cat(&step_probs, 0)?
+        .flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1()?;
+
+    // The same confidence walk the block drafter runs, and the reason it is one
+    // function: a chain truncates where a block truncates, and for the same
+    // reason.
+    //
+    // It runs on the host after the fact, which means a chain that will be cut
+    // at step 1 has already paid for steps 2 and 3. That is the trade the
+    // on-device accumulation buys: the alternative is a sync per step to decide
+    // whether to keep going, which at this depth costs more than the wasted
+    // steps do.
+    Ok(keep_confident(&ids, &probs, p_min))
+}
+
+/// The leading run of proposals a round keeps: every token from the front whose
+/// argmax probability is at or above `p_min`, stopping at the first that is not.
+///
+/// The stopping token is DISCARDED, never emitted — a proposal the drafter is
+/// unsure of is one the target would probably reject, and verifying it costs a
+/// row of the batch to learn nothing. Everything past it goes too, whatever its
+/// own confidence: acceptance is prefix-ordered, so a token whose predecessor
+/// was rejected is never reached.
+///
+/// Shared by both drafters, which reach it from opposite shapes — a block's rows
+/// come from one forward, a chain's from one step each — and truncate
+/// identically once they have their numbers.
+///
+/// A NaN probability truncates, because `NaN >= p_min` is false. That is the
+/// safe direction and it is deliberate: a NaN means the forward that produced it
+/// is corrupt, and the answer to a corrupt drafter is to propose nothing rather
+/// than to propose a token whose confidence is unknown. It costs a round of
+/// speculation, not correctness — the target re-samples every position either
+/// way. Note this makes the floor comparison asymmetric on purpose; a `p < p_min`
+/// break would ACCEPT the NaN instead.
+fn keep_confident(ids: &[u32], probs: &[f32], p_min: f32) -> Vec<u32> {
+    let kept = ids
+        .iter()
+        .zip(probs)
+        .take_while(|&(_, &p)| p >= p_min)
+        .count();
+    ids[..kept].to_vec()
+}
+
 /// Verify-span positions a round keeps in the KV cache after emitting `emitted` of
 /// its `committed` tokens: the anchor row (the previous round's last token,
 /// emitted then) plus every token emitted here except the last, which plain decode
@@ -3132,6 +3916,38 @@ fn inject_capped(
 /// nobody has.
 fn verify_keep(committed: usize, emitted: usize) -> usize {
     committed.min(emitted + 1)
+}
+
+/// The tokens a verify round syncs into the MTP head, given that it kept `keep`
+/// of its span: the round's ANCHOR token followed by every kept commit but the
+/// last, which is `keep` tokens in all.
+///
+/// It is one short of the commits because of the shift the head's rows are built
+/// on. The head's row for position `p` pairs the token AT `p` with the hidden at
+/// `p - 1`, and the round's kept positions start at the anchor's — so the tokens
+/// are the anchor and the commits, and the last kept commit's own row belongs to
+/// the NEXT round, whose anchor it will be.
+///
+/// Extracted so the count is checkable without a model. `keep`, not the verified
+/// span, is what decides it: a partial accept rolled the rest out of the target's
+/// caches, and syncing the head over positions the target has forgotten would
+/// leave it holding rows for tokens nobody committed. The hidden rows are cut to
+/// the same `keep` at the call site, and `mtp_sync_capped` refuses a batch whose
+/// two halves disagree — so pinning the token count pins the pairing.
+fn verify_sync_rows(anchor: u32, committed: &[u32], keep: usize) -> Vec<u32> {
+    // `keep` is `verify_keep`'s output, which is `min(committed, emitted + 1)`
+    // over a round that always commits at least one token — so it is never zero
+    // and never past the commits. Asserted rather than left to the slice index,
+    // which would panic one line later with nothing to say about why.
+    debug_assert!(
+        (1..=committed.len()).contains(&keep),
+        "verify_sync_rows: keep {keep} is outside 1..={}",
+        committed.len()
+    );
+    let mut rows = Vec::with_capacity(keep);
+    rows.push(anchor);
+    rows.extend_from_slice(&committed[..keep - 1]);
+    rows
 }
 
 /// Committed tokens a round RETAINED, as opposed to merely drew: everything the
@@ -3230,13 +4046,17 @@ fn accept_drafts(
 }
 
 /// For each row of `logits` `[n, vocab]`, the argmax token id and the full-vocab
-/// softmax probability of that argmax (`1 / Σ_j exp(logit_j - max)`). The reduce
-/// runs on whatever device `logits` is on (the GPU in production) and only the
-/// tiny `[n]` id and prob vectors are read back — not the `[n, vocab]` logits.
+/// softmax probability of that argmax (`1 / Σ_j exp(logit_j - max)`), both left
+/// ON the device as `[n, 1]` tensors.
+///
+/// Kept separate from the readback so a chain drafter can accumulate a step's
+/// answer without touching the host: the reduce is the expensive part to get
+/// right and the cheap part to move, and both drafters share it.
+///
 /// On an exact logit tie candle's argmax returns the FIRST maximal index; the
 /// probability is derived from the max VALUE, so it is unaffected by which index
 /// wins.
-fn draft_argmax_probs(logits: &Tensor) -> Result<(Vec<u32>, Vec<f32>)> {
+fn argmax_probs_device(logits: &Tensor) -> Result<(Tensor, Tensor)> {
     let logits = logits.to_dtype(DType::F32)?;
     let max = logits.max_keepdim(D::Minus1)?; // [n, 1]
     // prob(argmax) = exp(max - logsumexp) = 1 / Σ_j exp(logit_j - max).
@@ -3246,6 +4066,14 @@ fn draft_argmax_probs(logits: &Tensor) -> Result<(Vec<u32>, Vec<f32>)> {
         .sum_keepdim(D::Minus1)?
         .recip()?; // [n, 1]
     let ids = logits.argmax_keepdim(D::Minus1)?; // [n, 1]
+    Ok((ids, probs))
+}
+
+/// [`argmax_probs_device`] read back to the host: the reduce runs on whatever
+/// device `logits` is on (the GPU in production) and only the tiny `[n]` id and
+/// prob vectors cross — not the `[n, vocab]` logits.
+fn draft_argmax_probs(logits: &Tensor) -> Result<(Vec<u32>, Vec<f32>)> {
+    let (ids, probs) = argmax_probs_device(logits)?;
     let ids = ids
         .flatten_all()?
         .to_dtype(DType::U32)?
@@ -4720,6 +5548,89 @@ mod tests {
                 "row {r} prob {} vs {want_p}",
                 probs[r]
             );
+        }
+    }
+
+    /// The confidence walk truncates rather than emits: the first proposal
+    /// below the floor is DISCARDED along with everything behind it, however
+    /// confident those later ones look. Both drafters truncate through this, so
+    /// a chain that stops at step 2 and a block that stops at row 2 keep the
+    /// same tokens.
+    #[test]
+    fn the_confidence_walk_discards_from_the_first_shortfall() {
+        let ids = [10u32, 11, 12, 13];
+
+        // Every step clears the floor: the whole proposal survives, including a
+        // probability exactly AT the floor, which is not a shortfall.
+        assert_eq!(
+            keep_confident(&ids, &[0.9, 0.5, 0.7, 0.6], 0.5),
+            vec![10, 11, 12, 13]
+        );
+
+        // The token that fell short is not among them — the walk stops before
+        // it, not after — and neither is the confident one behind it.
+        assert_eq!(keep_confident(&ids, &[0.9, 0.4, 0.99, 0.99], 0.5), vec![10]);
+
+        // A first step below the floor leaves nothing to verify at all, which is
+        // how a chain ends before it began.
+        assert!(keep_confident(&ids, &[0.1, 0.9, 0.9, 0.9], 0.5).is_empty());
+
+        // A floor of zero keeps everything: probabilities are non-negative, so
+        // nothing can fall below it. This is the mode the equivalence harness
+        // runs in, where every round must draft a full span.
+        assert_eq!(
+            keep_confident(&ids, &[0.0, 0.0, 0.0, 0.0], 0.0),
+            vec![10, 11, 12, 13]
+        );
+
+        assert!(keep_confident(&[], &[], 0.5).is_empty());
+
+        // A NaN truncates rather than passing. Pinned because the comparison is
+        // asymmetric on purpose — `p >= p_min` rejects a NaN where `p < p_min`
+        // would have accepted it — and a corrupt forward must propose nothing
+        // rather than a token whose confidence is unknown.
+        assert_eq!(
+            keep_confident(&ids, &[0.9, f32::NAN, 0.9, 0.9], 0.5),
+            vec![10]
+        );
+        assert!(keep_confident(&ids, &[f32::NAN, 0.9, 0.9, 0.9], 0.0).is_empty());
+    }
+
+    /// A round syncs the head over exactly the positions it KEPT, not the
+    /// positions it verified. The distinction only exists on a partial accept,
+    /// and getting it wrong would feed the head the last VERIFIED row's hidden —
+    /// a hidden for a position the rollback just discarded — which no shape check
+    /// downstream would catch, because the count would still look plausible.
+    ///
+    /// The token list is the whole of it: the hidden rows are cut to the same
+    /// `keep` at the call site, and `mtp_sync_capped` refuses a batch whose
+    /// tokens and hiddens disagree in length, so a token list of the right length
+    /// cannot be paired with hiddens of another.
+    #[test]
+    fn a_partial_accept_syncs_the_kept_rows_and_not_the_verified_ones() {
+        let anchor = 100u32;
+        let committed = [200u32, 201, 202, 203];
+
+        // Full accept plus the bonus row: every commit but the last is synced
+        // behind the anchor, and the last is the next round's anchor.
+        assert_eq!(
+            verify_sync_rows(anchor, &committed, 4),
+            vec![100, 200, 201, 202]
+        );
+
+        // Partial accept: the round kept two positions, so two rows are synced
+        // and the drafts past them are gone. A regression to the verified span
+        // would have produced four rows here.
+        assert_eq!(verify_sync_rows(anchor, &committed, 2), vec![100, 200]);
+
+        // The narrowest round there is — one position kept — syncs the anchor
+        // alone, which is the row whose hidden the head already carries.
+        assert_eq!(verify_sync_rows(anchor, &committed, 1), vec![100]);
+
+        // In every case the row count is exactly `keep`, which is what the
+        // hidden narrow uses.
+        for keep in 1..=committed.len() {
+            assert_eq!(verify_sync_rows(anchor, &committed, keep).len(), keep);
         }
     }
 }

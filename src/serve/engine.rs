@@ -25,11 +25,13 @@ use super::types::{
 };
 use crate::XwenConfig;
 use crate::batch::{BatchHooks, BatchProgress};
-use crate::dflash::{DflashConfig, DflashDrafter, DrafterImage};
+use crate::dflash::{DflashConfig, DflashDrafter, DrafterImage, DrafterImageKind};
+use crate::drafter::DrafterKind;
 use crate::generate::{GenEvent, Generator, SpecParams, SpecStats, feasible_think_budget};
 use crate::gguf;
 use crate::hub;
 use crate::kv_cache::{HostFullKv, HostSnapshot};
+use crate::mtp::{MtpConfig, MtpDrafter};
 use crate::ops::ExpertRunner;
 use crate::sampler::SamplerOptions;
 use crate::tokenizer::LagunaTokenizer;
@@ -310,20 +312,34 @@ fn read_config(path: &Path) -> Result<XwenConfig> {
     XwenConfig::from_gguf(&gguf.content)
 }
 
-/// Metadata-only read of a DFlash drafter, on the CPU device for the same reason
-/// [`read_config`] uses it: header and tensor index only, no Metal allocation.
+/// Metadata-only read of a drafter sidecar, on the CPU device for the same
+/// reason [`read_config`] uses it: header and tensor index only, no Metal
+/// allocation.
 ///
-/// The drafter is judged against `target` by the same
-/// [`DflashConfig::check_against_target`] the model load runs, hoisted to startup.
-/// A drafter that turns out not to describe a wiring this model can provide is a
-/// configuration mistake, and the lazy load is far too late to learn it: that load
-/// runs behind the panic boundary around a job, so the mistake would not kill the
-/// engine — it would fail a request, and every retry after it, forever.
-fn read_draft_config(path: &Path, target: &XwenConfig) -> Result<DflashConfig> {
+/// The classification is [`crate::drafter::classify`]'s — shared with the CLI's
+/// attach path, so a sidecar cannot be judged one kind here and loaded as
+/// another there. Whichever kind it is, it is then judged against `target` by
+/// that kind's own checks, hoisted to startup. A drafter that turns out not to
+/// describe a wiring this model can provide is a configuration mistake, and the
+/// lazy load is far too late to learn it: that load runs behind the panic
+/// boundary around a job, so the mistake would not kill the engine — it would
+/// fail a request, and every retry after it, forever.
+fn read_draft_config(path: &Path, target: &XwenConfig) -> Result<DrafterKind> {
     let gguf = gguf::open(path, &Device::Cpu)?;
-    let cfg = DflashConfig::from_gguf(&gguf.content)?;
-    cfg.check_against_target(target.hidden, target.n_layer, target.vocab)?;
-    Ok(cfg)
+    let kind = crate::drafter::classify(&gguf.content)?;
+    match kind {
+        DrafterKind::Dflash => {
+            DflashConfig::from_gguf(&gguf.content)?.check_against_target(
+                target.hidden,
+                target.n_layer,
+                target.vocab,
+            )?;
+        }
+        DrafterKind::Mtp => {
+            MtpConfig::from_gguf(&gguf.content)?.check_against_target(target)?;
+        }
+    }
+    Ok(kind)
 }
 
 fn load_tokenizer() -> Result<LagunaTokenizer> {
@@ -543,18 +559,19 @@ impl EngineState {
         // The drafter's cache mirrors the target's, so it is cleared with it: the
         // invariant every dispatch path relies on is that the drafter never holds
         // positions the target does not.
-        self.generator.reset_drafter();
+        self.generator.reset_drafter()?;
         self.generator.reset_cache()
     }
 }
 
-/// Load the DFlash drafter and attach it for speculative decoding. Same device as
-/// the target by requirement, not convenience: the drafter borrows the target's
-/// embeddings and lm_head, so its ops interleave with the target's.
+/// Load the drafter — whichever kind the file holds — and attach it for
+/// speculative decoding. Same device as the target by requirement, not
+/// convenience: both kinds borrow the target's embeddings and lm_head, so their
+/// ops interleave with the target's.
 ///
 /// The drafter's cache is sized by `draft_ctx`, capped at the target's context —
 /// positions the target cannot hold are positions the drafter could never be
-/// injected at.
+/// given.
 fn attach_drafter(
     generator: &mut Generator,
     device: &Device,
@@ -566,15 +583,26 @@ fn attach_drafter(
 ) -> Result<()> {
     let started = Instant::now();
     let draft_ctx = settings.draft_ctx.min(max_ctx);
-    let load = || {
+    // Classified through the same reader startup preflights with, so the two
+    // cannot disagree about what a file is.
+    let target = generator.model_config().clone();
+    let load = || -> Result<crate::drafter::AttachedDrafter> {
+        let kind = read_draft_config(path, &target)?;
         let gguf = gguf::open(path, device)?;
-        DflashDrafter::load(&gguf, device, draft_ctx)
+        Ok(match kind {
+            DrafterKind::Dflash => crate::drafter::AttachedDrafter::Dflash(DflashDrafter::load(
+                &gguf, device, draft_ctx,
+            )?),
+            DrafterKind::Mtp => crate::drafter::AttachedDrafter::Mtp(MtpDrafter::load(
+                &gguf, &target, device, draft_ctx,
+            )?),
+        })
     };
     let drafter = load().with_context(|| format!("loading the drafter {}", path.display()))?;
     generator.attach_drafter(
         drafter,
         SpecParams {
-            draft_max: settings.draft_max,
+            draft_max: resolved_draft_max(settings, size.model),
             draft_p_min: resolved_p_min(settings, size.model),
             pause_margin: settings.draft_pause_margin,
             // Not exposed by the server: a round that drafts anything at all is worth
@@ -595,12 +623,30 @@ fn attach_drafter(
 /// checkpoint a future job will name.
 ///
 /// The last fallback is `SpecParams::default().draft_p_min`, which is the
-/// 35B-A3B's fitted 0.3 — an arbitrary value for any other checkpoint, and it is
-/// only reachable one way: a custom `draft.path` attached to a checkpoint that
-/// ships no sidecar of its own, so no sweep ever fitted a floor for that pair.
-/// Nothing pretends otherwise; see the retune ledger item in TODO.md.
+/// 35B-A3B's fitted 0.3 — an arbitrary value for any other checkpoint. Every
+/// shipped checkpoint now carries a fitted floor of its own, so reaching it takes
+/// a custom `draft.path` attached to a checkpoint that ships no sidecar, which is
+/// currently no checkpoint at all. Nothing pretends otherwise; see the retune
+/// ledger item in TODO.md.
 /// Extracted from [`attach_drafter`] so the resolution is testable without a
 /// Metal device.
+/// The draft depth for the checkpoint being loaded: the operator's pinned value
+/// when one was set, else that checkpoint's own fitted default. Resolvable only
+/// here, at attach time, for the same reason `resolved_p_min` is — the merge
+/// cannot know which checkpoint a future job will name.
+///
+/// It matters more than a shared default would suggest: the two drafter kinds
+/// want opposite depths off the same knob (15 for a block that costs one forward
+/// however wide, 3 for a chain that costs a forward per step), so a server that
+/// applied one number to both would be drafting five times too deep on whichever
+/// checkpoint it got wrong.
+fn resolved_draft_max(settings: &ServeSettings, size: hub::Model) -> usize {
+    settings
+        .draft_max
+        .or_else(|| size.draft_max_default())
+        .unwrap_or_else(|| SpecParams::default().draft_max)
+}
+
 fn resolved_p_min(settings: &ServeSettings, size: hub::Model) -> f32 {
     settings
         .draft_p_min
@@ -1647,7 +1693,7 @@ fn run_job(
                 }
                 page_out_live(engine, disk, logger)?;
                 engine.generator.reset_cache()?;
-                engine.generator.reset_drafter();
+                engine.generator.reset_drafter()?;
                 engine.slots.start_fresh(slot);
                 // The slot this conversation lands in may have been holding another
                 // one, linked to its own stored image. That link is not this
@@ -2245,7 +2291,7 @@ fn restore_live(engine: &mut EngineState, pos: usize) -> Result<()> {
 /// against eviction on behalf of a conversation nothing is serving.
 fn restart_live(engine: &mut EngineState, disk: Option<&DiskCache>) -> Result<()> {
     engine.generator.reset_cache()?;
-    engine.generator.reset_drafter();
+    engine.generator.reset_drafter()?;
     if let (Some(live), Some(disk)) = (engine.slots.live, disk) {
         disk.unlink(live);
     }
@@ -2487,10 +2533,9 @@ fn page_in(
     // uploaded or refused (see `drafter_planes_usable`). The planes stay in the slot
     // either way — a later turn that resumes at or below their length can still use
     // them, and a server restarted with a drafter can still use ones stored without.
-    let planes = target
-        .draft_kv
-        .as_ref()
-        .filter(|planes| drafter_planes_usable(generator.has_drafter(), restore, planes.pos));
+    let planes = target.draft_kv.as_ref().filter(|planes| {
+        drafter_planes_usable(generator.drafter_kind(), planes.kind(), restore, planes.pos)
+    });
     // Order is load-bearing since KV allocation went lazy: `import_full_kv` is
     // what GROWS the full-attention buffers to `restore` (a paged-in
     // conversation can be longer than anything this instance has run), and the
@@ -2511,12 +2556,23 @@ fn page_in(
     // by target-layer taps during target forwards, so a reset drafter at a nonzero
     // restore point has no way to catch up (`drafter_span_rows` stays 0), and re-seeding
     // would mean re-running the target prefill the snapshot exists to avoid — see the
-    // TODO.md ledger item. `import_cache` validates
-    // before it writes anything, so the drafter is intact and a reset is the whole repair;
-    // the conversation carries on with the target KV it just hydrated, decoding plain.
+    // TODO.md ledger item. Every ground a stored record can be refused on — kind, shape,
+    // position, capacity — is settled before a single row is written, so a refusal leaves
+    // the drafter untouched; a device failure part-way through the writes does not, which
+    // is why the repair is a full reset rather than a length fix, and why that reset is
+    // not allowed to fail quietly. Either way the conversation carries on with the target
+    // KV it just hydrated, decoding plain.
+    // Split so a failure reports what actually failed: with the no-planes reset folded into
+    // the same match, a reset that errored was logged as a failure to import planes that
+    // were never there.
     let imported = match planes {
         Some(planes) => generator.import_drafter_cache(planes, restore),
-        None => Ok(generator.reset_drafter()),
+        None => {
+            generator
+                .reset_drafter()
+                .context("clearing the drafter for a conversation with no stored planes")?;
+            Ok(())
+        }
     };
     let drafter_planes = match imported {
         Ok(()) => planes,
@@ -2527,15 +2583,21 @@ fn page_in(
                 action: "importing a stored drafter's planes",
                 error: format!("{e:#}"),
             });
-            generator.reset_drafter();
+            // A refused import costs speculation and not the request, but a
+            // refused RESET is a different failure: it leaves the drafter
+            // holding whatever the last conversation put there, and the next
+            // prefill would feed this conversation's tokens against those rows.
+            // There is no local repair for that, so it propagates.
+            generator.reset_drafter()?;
             None
         }
     };
     // What the uploads above actually moved: the image's rows below `restore` — its
     // layout is contiguous in position, so the share is exact — plus the rings, plus the
     // drafter rows, when those were uploaded at all. A refused drafter contributes zero
-    // rather than an undercount: `import_cache` settles every shape before its write
-    // loop, so a refusal uploaded no layer at all.
+    // rather than an undercount: `import_cache` settles every shape, and allocates
+    // everything it needs, before its write loop — so a refusal on any ground the stored
+    // record can be wrong about uploaded no layer at all.
     let moved = image.byte_len() / image.pos.max(1) * restore
         + rings.byte_len()
         + drafter_planes.map_or(0, |planes| planes.byte_len() / planes.pos.max(1) * restore);
@@ -4221,22 +4283,53 @@ fn log_slots(slots: &Slots, logger: &ServeLogger) {
     )));
 }
 
-/// Whether drafter planes covering `covered` positions can back a conversation resuming
-/// at `restore`, in a process where `attached` says whether a drafter exists.
+/// Whether drafter planes of `kind` covering `covered` positions can back a conversation
+/// resuming at `restore`, in a process where `attached` says whether a drafter exists.
 ///
 /// All-or-nothing rather than a bound, because a partial cover is worth nothing: the
-/// prefill injects into the drafter only while its committed length equals the position it
+/// prefill feeds the drafter only while its committed length equals the position it
 /// resumes at, so planes that stop short would be uploaded — up to a gigabyte of them —
 /// and then ignored for the rest of the conversation. Stopping short is routine rather
-/// than exceptional, since the drafter stops injecting at its own smaller context: any
+/// than exceptional, since the drafter stops taking rows at its own smaller context: any
 /// conversation longer than `draft_ctx` images fewer positions than the target holds.
 ///
-/// `attached` is what makes a stored image portable across configurations. Planes written
+/// The two kinds differ in what "enough" means, and that difference is why this takes a
+/// kind at all. A DFlash image is usable whenever it REACHES the resume point: each of its
+/// rows is a function of that position's taps alone, so a prefix of a longer image is a
+/// valid shorter drafter. An MTP image is usable only at EXACTLY the position it ends at,
+/// because it carries one carry hidden — the one its own last position produced — and the
+/// head's next row is built from the hidden before it. Handing an over-long MTP image to a
+/// shorter resume is a refusal rather than a partial upload, and asking here rather than
+/// discovering it inside `import_cache` is what keeps that routine case a quiet skip
+/// instead of a logged disk-tier failure.
+///
+/// `attached` is what makes a stored image portable across configurations, and it carries
+/// the KIND rather than a yes/no for the same reason the stored record does. Planes written
 /// by a server running with `--draft` can arrive at one running without, and the answer
 /// there is to leave them alone and decode plain — never to fail the request over a
-/// speculation nobody asked for.
-fn drafter_planes_usable(attached: bool, restore: usize, covered: usize) -> bool {
-    attached && covered >= restore
+/// speculation nobody asked for. Planes written by a server running the OTHER kind can
+/// arrive too, and that is not hypothetical: `--draft <path>` accepts either kind against
+/// any checkpoint, so serving 3.8 with the 3.6 DFlash sidecar writes DFlash records against
+/// a checkpoint whose official drafter is an MTP head, and a restart without the flag finds
+/// them. Same answer, and for the same reason: a mismatch here is a quiet skip, where
+/// letting `import_cache` refuse it would log a disk-tier failure on a configuration change
+/// nobody got wrong.
+fn drafter_planes_usable(
+    attached: Option<DrafterKind>,
+    stored: DrafterImageKind,
+    restore: usize,
+    covered: usize,
+) -> bool {
+    let Some(attached) = attached else {
+        return false;
+    };
+    if attached.image_kind() != stored {
+        return false;
+    }
+    match stored {
+        DrafterImageKind::Dflash => covered >= restore,
+        DrafterImageKind::Mtp => covered == restore,
+    }
 }
 
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
@@ -5736,7 +5829,12 @@ mod tests {
         assert_eq!(slots.slots[a].prefix.tokens, vec![1, 2, 3, 4]);
         // They still reach the point the next page-in of this slot can resume at, which is
         // the only thing the extra length is judged by.
-        assert!(drafter_planes_usable(true, 4, planes));
+        assert!(drafter_planes_usable(
+            Some(DrafterKind::Dflash),
+            DrafterImageKind::Dflash,
+            4,
+            planes
+        ));
 
         // A slot emptied outright — nothing the image can back — drops them with the rest.
         slots.page_in(a, 4);
@@ -5759,16 +5857,112 @@ mod tests {
     /// plain rather than failing the request.
     #[test]
     fn drafter_planes_are_usable_only_when_they_reach_the_resume_point() {
+        let dflash = |restore, covered| {
+            drafter_planes_usable(
+                Some(DrafterKind::Dflash),
+                DrafterImageKind::Dflash,
+                restore,
+                covered,
+            )
+        };
         // Every row the target needs is there, extra length included.
-        assert!(drafter_planes_usable(true, 400, 1000));
-        assert!(drafter_planes_usable(true, 1000, 1000));
+        assert!(dflash(400, 1000));
+        assert!(dflash(1000, 1000));
         // A drafter that fell behind: nothing to import.
-        assert!(!drafter_planes_usable(true, 4000, 1000));
+        assert!(!dflash(4000, 1000));
         // Resuming at zero needs no rows at all.
-        assert!(drafter_planes_usable(true, 0, 0));
+        assert!(dflash(0, 0));
         // And no drafter at all means no upload, however complete the planes are.
-        assert!(!drafter_planes_usable(false, 400, 1000));
-        assert!(!drafter_planes_usable(false, 0, 0));
+        assert!(!drafter_planes_usable(
+            None,
+            DrafterImageKind::Dflash,
+            400,
+            1000
+        ));
+        assert!(!drafter_planes_usable(None, DrafterImageKind::Dflash, 0, 0));
+    }
+
+    /// An MTP image is usable at EXACTLY its own position and nowhere else, where a
+    /// DFlash image of the same length backs every resume at or below it. The reason is
+    /// the carry: the image holds the one hidden its last position produced, and the
+    /// head's next row is built from the hidden before it, so an over-long image has the
+    /// wrong one for a shorter resume.
+    ///
+    /// This is the routine case, not the edge: a conversation resuming anywhere but the
+    /// exact tip its planes were written at hits it. Answering here keeps it a quiet
+    /// skip; letting `import_cache` answer it would log a disk-tier failure on every
+    /// ordinary partial resume.
+    #[test]
+    fn an_mtp_image_backs_only_the_position_it_ends_at() {
+        let mtp = |restore, covered| {
+            drafter_planes_usable(
+                Some(DrafterKind::Mtp),
+                DrafterImageKind::Mtp,
+                restore,
+                covered,
+            )
+        };
+        assert!(mtp(1000, 1000));
+        assert!(
+            !mtp(400, 1000),
+            "an over-long MTP image has the wrong carry"
+        );
+        assert!(!mtp(4000, 1000));
+        assert!(mtp(0, 0));
+        // Where the same lengths are fine for a block drafter, whose every row stands on
+        // its own position's taps.
+        assert!(drafter_planes_usable(
+            Some(DrafterKind::Dflash),
+            DrafterImageKind::Dflash,
+            400,
+            1000
+        ));
+        assert!(!drafter_planes_usable(
+            None,
+            DrafterImageKind::Mtp,
+            1000,
+            1000
+        ));
+    }
+
+    /// Planes written by the OTHER kind of drafter are skipped, not offered to an
+    /// import that would refuse them. Reachable without anybody misconfiguring
+    /// anything: `--draft <path>` takes either kind against any checkpoint, so a
+    /// server told to run 3.8 with the 3.6 DFlash sidecar writes DFlash records for
+    /// a checkpoint whose official drafter is an MTP head, and the next restart
+    /// without the flag reads them back.
+    ///
+    /// Length is not what settles it — every case below reaches its resume point —
+    /// so a predicate comparing only coverage would pass all of them straight into
+    /// a logged import failure.
+    #[test]
+    fn planes_from_the_other_kind_of_drafter_are_skipped() {
+        assert!(!drafter_planes_usable(
+            Some(DrafterKind::Mtp),
+            DrafterImageKind::Dflash,
+            1000,
+            1000
+        ));
+        assert!(!drafter_planes_usable(
+            Some(DrafterKind::Dflash),
+            DrafterImageKind::Mtp,
+            1000,
+            1000
+        ));
+        // And the matching pairs still pass, so the new condition is not simply
+        // refusing everything.
+        assert!(drafter_planes_usable(
+            Some(DrafterKind::Mtp),
+            DrafterImageKind::Mtp,
+            1000,
+            1000
+        ));
+        assert!(drafter_planes_usable(
+            Some(DrafterKind::Dflash),
+            DrafterImageKind::Dflash,
+            1000,
+            1000
+        ));
     }
 
     /// What the slots report about themselves: the histories and positions the manager
@@ -5968,18 +6162,17 @@ mod tests {
         settings.draft = DraftMode::Custom(custom.clone());
         assert_eq!(startup_drafter(&settings, served), Some(custom));
 
-        // A checkpoint that ships no sidecar has nothing to preflight, whatever
-        // other checkpoints happen to be in the cache — which is also what keeps
-        // this assertion independent of the machine running it.
+        // The official mode preflights the SERVED checkpoint's own sidecar and
+        // no other's — whatever else happens to be in the cache, which is what
+        // keeps these assertions independent of the machine running them.
         settings.draft = DraftMode::Official;
-        assert_eq!(
-            startup_drafter(&settings, Target::official(hub::Model::Qwen3827B)),
-            None
-        );
-        // And when there is one, it is the SERVED checkpoint's, not another's.
         assert_eq!(
             startup_drafter(&settings, served),
             hub::cached_drafter(hub::Model::Qwen27B)
+        );
+        assert_eq!(
+            startup_drafter(&settings, Target::official(hub::Model::Qwen3827B)),
+            hub::cached_drafter(hub::Model::Qwen3827B)
         );
     }
 
@@ -6521,11 +6714,19 @@ mod tests {
             Some(resolved_p_min(&settings, hub::Model::Qwen35BA3B)),
             hub::Model::Qwen35BA3B.draft_p_min_default()
         );
-        // A checkpoint that ships no sidecar has no fitted floor to fall back
-        // to, so an unset knob lands on the shared base rather than on nothing.
         assert_eq!(
-            resolved_p_min(&settings, hub::Model::Qwen3827B),
-            SpecParams::default().draft_p_min
+            Some(resolved_p_min(&settings, hub::Model::Qwen3827B)),
+            hub::Model::Qwen3827B.draft_p_min_default()
+        );
+        // Every shipped checkpoint now carries a fitted floor, so the shared
+        // base behind them is reachable only the one way its doc describes: a
+        // custom `draft.path` attached to a checkpoint that ships no sidecar of
+        // its own. There is no such checkpoint to name here.
+        assert!(
+            hub::MODELS
+                .iter()
+                .all(|m| m.draft_p_min_default().is_some()),
+            "a checkpoint without a fitted floor needs the base-fallback arm covered again"
         );
         settings.draft_p_min = Some(0.42);
         assert_eq!(resolved_p_min(&settings, hub::Model::Qwen27B), 0.42);

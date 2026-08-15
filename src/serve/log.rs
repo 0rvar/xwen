@@ -241,7 +241,7 @@ pub enum ServeLog {
         path: PathBuf,
         assumed: crate::hub::Model,
     },
-    /// The checkpoint a job needs ships no DFlash sidecar, so it runs without
+    /// The checkpoint a job needs ships no drafter sidecar, so it runs without
     /// speculative decoding however the drafter is configured.
     NoDrafterAvailable { model: crate::hub::Model },
     /// The batch runner reported progress: a shared prefill, or one item done.

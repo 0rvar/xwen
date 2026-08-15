@@ -491,7 +491,7 @@ pub fn run_batch(
             let prefix: Vec<u32> = live[0][..len].to_vec();
             let prefill_started = Instant::now();
             generator.reset_cache()?;
-            generator.reset_drafter();
+            generator.reset_drafter()?;
             generator.prefill_tokens(&prefix, 0)?;
             let snapshot = generator.take_cache_snapshot()?;
             snapshot_ms = elapsed_ms(prefill_started);
@@ -649,7 +649,7 @@ fn run_item(
         }
         None => {
             generator.reset_cache()?;
-            generator.reset_drafter();
+            generator.reset_drafter()?;
             0
         }
     };

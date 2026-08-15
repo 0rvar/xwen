@@ -32,50 +32,71 @@ use:
 
 | Full name | Repo | `--model-size` | Drafter |
 | --- | --- | --- | --- |
-| `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash, 3.5 GB |
-| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` (default) | DFlash, 0.8 GB |
-| `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | none — decodes plain |
+| `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash block drafter, 3.5 GB |
+| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` (default) | DFlash block drafter, 0.8 GB |
+| `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | MTP head, 3.2 GB |
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full
 names); the HTTP APIs take the **full names only**. Qwen3.8-27B (added 2026-08-14) runs
 the same graph as Qwen3.6-27B — its config is byte-identical — so it needs no model math
-of its own; what it lacks is a DFlash sidecar, so it decodes plain wherever the other two
-speculate, which costs it the whole speculative win (TODO.md tracks an MTP drafter).
+of its own. It ships no DFlash sidecar, but it does ship a first-party MTP head, which is
+a different drafter shape and became a second drafter implementation (2026-08-15); all
+three checkpoints now speculate.
 
 ## Speculative decoding
 
-DFlash drafter sidecars ship alongside both Qwen 3.6 checkpoints and are adapted. It is
-**opt-out** as of 2026-07-29: a zero-flag run speculates with the checkpoint's official
-sidecar, `--no-draft` decodes plain, and `--draft <gguf>` swaps in a custom drafter.
-Qwen3.8-27B ships no sidecar, so it decodes plain with one line saying so (23.8 tok/s
-measured, one greedy run, 2026-08-14); `--draft <gguf>` still attaches a drafter you
-supply, and an explicit `--draft official` is an error rather than a silent downgrade.
-Speculation is decided **per checkpoint, not per process**: a server whose default
-checkpoint ships no sidecar still drafts for every other checkpoint it loads, each with
-its own sidecar, and the dashboard's `draft` cell reports what the LOADED checkpoint is
-doing rather than what was configured.
-At the defaults fitted 2026-08-08, drafting measured +46 to +52% on the 27B (both prompt
-kinds) and +26 to +28% on code / +15 to +17% on chat on the 35B-A3B, over plain decode
-on the same machine state (greedy, 128 tokens, warm, medians of 3 reps, two independent
-runs). Acceptance at those defaults is 78-86% on the 27B and 68-74% on the 35B-A3B; it
-trades against draft length, so raising `--draft-p-min` buys acceptance and loses tok/s.
-The default costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the 35B-A3B).
+Every checkpoint ships a drafter and speculates, in one of **two kinds**. The Qwen 3.6
+pair carry DFlash sidecars: block drafters that propose a whole block out of one forward,
+so depth is nearly free (`--draft-max` defaults to 15, a structural ceiling rather than a
+fitted number). Qwen3.8-27B carries a first-party MTP head, which is a different shape —
+one extra transformer layer that chains a forward per step and feeds itself, so depth
+costs linearly and is fitted rather than capped (4).
 
-**`--draft-p-min` has a per-checkpoint default: 0.5 on the 27B, 0.3 on the 35B-A3B**
-(`Model::draft_p_min_default`). The 27B's target forward is expensive, so it wants short
-confident drafts; the 35B-A3B's is cheap enough to profit from drafting deeper at lower
-acceptance, and 0.5 costs it ~2.5%. Passing the flag, or `draft.p_min` in a serve
-config, overrides it — and since one server now loads whichever checkpoint a request
-names, an explicit value pins one floor for every checkpoint it serves; leave it unset
-to give each checkpoint its own. `--draft-pause-margin` stays a single 1.0 for both.
-`bun scripts/retune-draft.ts` re-fits both knobs and prints recommendations; it never
-edits a default. See docs/decisions.md "Speculative decoding".
+Drafting is **opt-out** as of 2026-07-29: a zero-flag run speculates with the
+checkpoint's official sidecar, `--no-draft` decodes plain, and `--draft <gguf>` swaps in
+a custom drafter. Speculation is decided **per checkpoint, not per process**: a server
+drafts for each checkpoint it loads with that checkpoint's own sidecar, and the
+dashboard's `draft` cell reports what the LOADED checkpoint is doing rather than what was
+configured. The default costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the
+35B-A3B, 3.2 GB on the 3.8-27B).
+
+Measured over plain decode on the same machine state (greedy, 128 tokens, warm, medians
+of 3 reps, arms interleaved, `lowpowermode 0` on AC):
+
+| Checkpoint | code | chat | acceptance | fitted |
+| --- | --- | --- | --- | --- |
+| `Qwen3.6-27B` | +46 to +52% | +46 to +52% | 78-86% | 2026-08-08 |
+| `Qwen3.6-35B-A3B` | +26 to +28% | +15 to +17% | 68-74% | 2026-08-08 |
+| `Qwen3.8-27B` | +44 to +45% | +37 to +38% | 78-80% | 2026-08-15 |
+
+Acceptance trades against draft length, so raising `--draft-p-min` buys acceptance and
+loses tok/s. Ranges span the medians each shipped configuration was measured at; compare
+a drafted number only against the plain arm of its OWN sweep, never against another
+session's.
+
+**Both defaults are per-checkpoint.** `--draft-p-min` is 0.5 on the 27B, 0.3 on the
+35B-A3B and 0.7 on the 3.8-27B (`Model::draft_p_min_default`); `--draft-max` is 15 on the
+two block drafters and 4 on the MTP head (`Model::draft_max_default`, keyed by drafter
+kind). The 27B's target forward is expensive, so it wants short confident drafts; the
+35B-A3B's is cheap enough to profit from drafting deeper at lower acceptance. On the
+3.8-27B depth is the knob that matters and the floor barely does — across a 3x3 sweep the
+floor moved throughput by at most 1.8% at fixed depth where depth moved it 12%. Passing
+either flag, or `draft.p_min` / `draft.max` in a serve config, overrides it — and since
+one server loads whichever checkpoint a request names, an explicit value pins one setting
+for every checkpoint it serves; leave them unset to give each its own.
+`--draft-pause-margin` stays a single shared 1.0. `bun scripts/retune-draft.ts` re-fits
+these and prints recommendations; it never edits a default. See docs/decisions.md
+"Speculative decoding".
 
 `--draft` should reproduce `--no-draft`; `bun scripts/spec-equivalence.ts` checks that on
-both models in two modes — greedy, and sampled at a fixed seed (the only one that can
-catch the spec loop drawing from the RNG a different number of times than plain decoding).
-It prints the fork point when they differ; a near-tie landing differently is expected, a
-first-line fork in sampled mode is not. See the script's header.
+all three models in two modes — greedy, and sampled at a fixed seed. **Greedy is the
+gate.** Sampled mode is a diagnostic and currently fails on healthy builds: the batched
+verify forward reassociates its f32 sums differently from the single-token forward, so at
+temperature a near tie can resolve to a different token, and the shipped 27B diverges on
+the chat fixture at every seed tried. Read a sampled divergence only against a control
+run of another checkpoint, and note the script's "a first-line fork means the sampler
+stream" rule is a heuristic that mis-grades (TODO.md). What actually separates a near tie
+from a sampler-stream bug is seed-dependence: a stream bug diverges at every seed.
 
 ## Batch
 

@@ -2278,9 +2278,18 @@ fn compose(chain: Vec<Read>) -> anyhow::Result<DiskImage> {
         tokens.extend_from_slice(&segment.tokens);
         spans.push(segment.full_kv);
         snapshots.extend(segment.snapshots);
-        // Only one set of drafter planes can be installed, and only at its exact
-        // position, so the deepest wins: it is the only one a resume at the chain's tip
-        // could use.
+        // Only one set of drafter planes can be installed, so the deepest wins: it is
+        // the only one a resume at the chain's tip could use, and the tip is where a
+        // resume normally lands.
+        //
+        // Deliberately kind-blind, because the restore point is not known here — it is
+        // chosen against the request's own prefix match, long after assembly — so there
+        // is nothing better to select on. For a DFlash image the choice is free: the
+        // deepest backs every resume at or below it. For an MTP image, which backs only
+        // its own exact position (`drafter_planes_usable`), a resume short of the tip
+        // finds these planes unusable and decodes plain, where a shallower set might
+        // coincidentally have matched. That is the same limitation the head's single
+        // carry hidden imposes everywhere else, and it is on the ledger with the rest.
         let deeper = segment
             .drafter
             .filter(|planes| drafter.as_ref().is_none_or(|held| held.pos < planes.pos));
@@ -2347,7 +2356,7 @@ mod tests {
         let planes = (0..2u8)
             .map(|il| (pattern(plane, 0x80 + il), pattern(plane, 0xc0 + il)))
             .collect();
-        DrafterImage::new(pos, N_KV, HEAD_DIM, planes).unwrap()
+        DrafterImage::new_dflash(pos, N_KV, HEAD_DIM, planes).unwrap()
     }
 
     fn snapshot(pos: usize) -> Arc<HostSnapshot> {

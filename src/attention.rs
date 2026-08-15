@@ -240,6 +240,44 @@ impl AttnBlock {
         })
     }
 
+    /// TEST ONLY: a block over weights the caller chose, instead of a GGUF.
+    ///
+    /// It exists so a test can make one contribution of the block vanish — a
+    /// zeroed `attn_output` — and assert what the rest of a graph does without
+    /// it. `MtpDrafter`'s residual-anchor test is the reason it exists: with real
+    /// weights that property has no falsifiable knob. Additive and unreachable
+    /// from any shipped path; the loading constructor above is untouched.
+    ///
+    /// Every weight is `[out_dim, in_dim]` f16, the layout `Proj::DenseF16`
+    /// consumes, so this needs a Metal device like the rest of the ops tests.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_raw_weights(
+        qg: Tensor,
+        k: Tensor,
+        v: Tensor,
+        o: Tensor,
+        q_norm: candle_nn::RmsNorm,
+        k_norm: candle_nn::RmsNorm,
+        rope: Arc<Rope>,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+    ) -> Self {
+        Self {
+            qg_proj: Proj::DenseF16(qg),
+            k_proj: Proj::DenseF16(k),
+            v_proj: Proj::DenseF16(v),
+            o_proj: Proj::DenseF16(o),
+            q_norm,
+            k_norm,
+            rope,
+            n_head,
+            n_kv_head,
+            head_dim,
+        }
+    }
+
     /// Whether this block's projections hold the q8_0 decode alias (a
     /// q8_0-quantized checkpoint under `AttnWeights::F16`). Uniform across the
     /// block's projections, so `q_proj` is representative. Surfaced so the model

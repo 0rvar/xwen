@@ -31,11 +31,20 @@
 // `cargo test` gate. A fork at the very first line in `sampled` mode is the
 // opposite: that is the sampler stream, and it is a real bug.
 //
+// Both drafter kinds are covered, and they are not the same test. A DFlash
+// block drafter proposes a whole block out of one forward, so its verify walk
+// rolls back a block at a time; an MTP head chains one forward per step and
+// feeds itself, so a rollback has to unwind the head's own carried hidden as
+// well as the target's KV. The 3.8-27b arm is the only one that exercises the
+// second. It was hand-run for the MTP arc's stage B and wired up here in stage
+// C (docs/log.md 2026-08-15).
+//
 // Measured 2026-07-29 on the P9 adaptation: see docs/log.md.
 //
 // Usage:
-//   bun scripts/spec-equivalence.ts                     # both models, both modes
+//   bun scripts/spec-equivalence.ts                     # every model, both modes
 //   bun scripts/spec-equivalence.ts --models 27b        # one model
+//   bun scripts/spec-equivalence.ts --models 3.8-27b    # the MTP arm alone
 //   bun scripts/spec-equivalence.ts --modes sampled --n 256
 
 import { mkdirSync, writeFileSync, statSync, readdirSync } from "node:fs";
@@ -49,9 +58,14 @@ const opt = (n: string, d: string) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : d;
 };
 
-const models = opt("models", "27b,35b").split(",");
+const models = opt("models", "27b,35b,3.8-27b").split(",");
 const modes = opt("modes", "greedy,sampled").split(",");
 const nTokens = opt("n", "128");
+// One value for every model on purpose, and deliberately below every shipped
+// floor (0.5 / 0.3 / 0.5): this is a COVERAGE knob, not a fitted default. A
+// lower floor drafts longer chains, which is more verify and more rollback per
+// run — the opposite of what a sweep wants and exactly what a lossless-ness
+// check wants.
 const greedyPMin = opt("p-min", "0.3");
 const seed = opt("seed", "42");
 const temp = opt("temp", "0.8");

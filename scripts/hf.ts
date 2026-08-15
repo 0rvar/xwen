@@ -9,7 +9,9 @@ import { join } from "node:path";
 /** The checkpoints, mirroring the `Checkpoint` consts in src/hub.rs. `35b` is
  *  the default everywhere the size is not named, matching the CLI's
  *  `--model-size` default. `drafter` is null for a checkpoint whose release
- *  ships no DFlash sidecar — Qwen3.8-27B decodes plain. */
+ *  ships no sidecar at all; every current one ships one, in one of the two
+ *  KINDS — a DFlash block drafter on the 3.6 pair, an MTP head on the 3.8 —
+ *  which the scripts only care about where the kind changes what a run costs. */
 export const CHECKPOINTS = {
   "35b": {
     repo: "ggml-org/Qwen3.6-35B-A3B-GGUF",
@@ -24,7 +26,7 @@ export const CHECKPOINTS = {
   "3.8-27b": {
     repo: "ggml-org/Qwen3.8-27B-GGUF",
     model: "Qwen3.8-27B-Q4_K_M.gguf",
-    drafter: null,
+    drafter: "mtp-Qwen3.8-27B-Q8_0.gguf",
   },
 } as const;
 
@@ -111,7 +113,7 @@ if (import.meta.main) {
   } else if (which === "drafter") {
     const drafter = CHECKPOINTS[size].drafter;
     if (!drafter) {
-      console.error(`${size} ships no DFlash drafter sidecar`);
+      console.error(`${size} ships no drafter sidecar`);
       process.exit(1);
     }
     const path = officialDrafter(size);

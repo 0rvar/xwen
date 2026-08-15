@@ -13,6 +13,7 @@ use xwen::dflash::DflashDrafter;
 use xwen::generate::{Generator, SpecParams};
 use xwen::gguf;
 use xwen::hub::Model;
+use xwen::mtp::MtpDrafter;
 use xwen::ops::ExpertRunner;
 use xwen::sampler::SamplerOptions;
 use xwen::serve::config::{CliOverrides, DraftMode, ServeToml};
@@ -40,7 +41,7 @@ struct ModelArgs {
     /// Qwen3.6-35B-A3B MoE (the default), or the dense Qwen3.8-27B. Each
     /// checkpoint's full name works here too. A `--model <gguf>` path
     /// overrides the target file outright; for the one-shot commands this flag
-    /// still selects the family (and so the DFlash drafter sidecar), while
+    /// still selects the family (and so the drafter sidecar), while
     /// `xwen serve` reads the family from the GGUF itself and uses the flag
     /// only to pick the default file when nothing else names one — or to break
     /// the tie when a custom dense GGUF does not say which release it is.
@@ -85,25 +86,32 @@ impl SamplingArgs {
 /// otherwise, and `--draft <gguf>` swaps in a custom one.
 #[derive(Parser)]
 struct DraftArgs {
-    /// Speculate with a custom DFlash drafter GGUF instead of the checkpoint's
-    /// official one (which the literal `official`, and the default, select).
+    /// Speculate with a custom drafter GGUF — either kind, a DFlash sidecar or
+    /// an MTP head — instead of the checkpoint's official one (which the literal
+    /// `official`, and the default, select).
     #[arg(long, value_name = "GGUF", conflicts_with = "no_draft")]
     draft: Option<PathBuf>,
     /// Decode without speculation. Drafting is on by default: measured faster on
-    /// both checkpoints on 2026-07-29 — 27B +19.3 to +21.0% on code and +7.6 to
-    /// +8.4% on chat, 35B-A3B +18.1 to +19.8% on code and +12.6 to +12.8% on
-    /// chat (see docs/decisions.md, "Speculative decoding").
+    /// every checkpoint, at each one's fitted defaults — 27B +46 to +52%,
+    /// 35B-A3B +26 to +28% on code and +15 to +17% on chat (both 2026-08-08),
+    /// 3.8-27B +44 to +45% on code and +37 to +38% on chat (2026-08-15). See
+    /// docs/decisions.md, "Speculative decoding".
     #[arg(long)]
     no_draft: bool,
-    /// Max draft tokens proposed per verify round (clamped to block_size-1).
-    #[arg(long, default_value_t = 15)]
-    draft_max: usize,
+    /// Max draft tokens proposed per verify round. The default is per-model,
+    /// because the two drafter kinds have opposite economics: 15 on the DFlash
+    /// checkpoints, whose sidecar proposes a whole block in one forward (and
+    /// where this is clamped to block_size-1 anyway), and 4 on 3.8-27b, whose
+    /// MTP head pays a forward per step (fitted 2026-08-15; depths 5, 6 and 8
+    /// all measured worse).
+    #[arg(long)]
+    draft_max: Option<usize>,
     /// Discard a round's whole draft if fewer than this many are collected.
     #[arg(long, default_value_t = 0)]
     draft_min: usize,
     /// Stop drafting at the first token whose full-vocab softmax prob is below
     /// this. Adaptive draft length; the default is per-model — 0.5 for 27b, 0.3
-    /// for 35b, fitted 2026-08-08.
+    /// for 35b (both fitted 2026-08-08), 0.5 for 3.8-27b.
     #[arg(long)]
     draft_p_min: Option<f32>,
     /// Auto-pause speculation when its wall-clock cost per committed token
@@ -133,7 +141,10 @@ impl DraftArgs {
     fn params(&self, size: Model) -> SpecParams {
         let base = SpecParams::default();
         SpecParams {
-            draft_max: self.draft_max,
+            draft_max: self
+                .draft_max
+                .or_else(|| size.draft_max_default())
+                .unwrap_or(base.draft_max),
             draft_min: self.draft_min,
             draft_p_min: self
                 .draft_p_min
@@ -146,7 +157,7 @@ impl DraftArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Ensure the official model + DFlash drafter are in the Hugging Face
+    /// Ensure the official model + drafter sidecar are in the Hugging Face
     /// cache (idempotent: anything already cached is not touched), then print
     /// their paths. Every command does this lazily for whatever it needs; this
     /// just prefetches.
@@ -408,7 +419,8 @@ struct ServeArgs {
     /// on the 27B — plus one snapshot's DeltaNet state per snapshot kept
     /// (62.8 / 149.6 MiB). The live one holds an image too, so budget
     /// N x (--ctx x per-token + snapshots x per-snapshot), plus
-    /// min(--draft-ctx, --ctx) x 40-48 KiB of drafter planes per slot while
+    /// min(--draft-ctx, --ctx) x 4-48 KiB of drafter planes per slot (4 on the
+    /// 3.8's MTP head, 40-48 on the DFlash sidecars) while
     /// speculation is on, plus one slot's images again while a swap is in
     /// flight. Lower this or --ctx if that does not fit. 1 keeps a single
     /// conversation warm.
@@ -435,18 +447,21 @@ struct ServeArgs {
     /// saves grows with the token count.
     #[arg(long, value_name = "TOKENS")]
     disk_min_tokens: Option<usize>,
-    /// Custom DFlash drafter GGUF to speculate with, in place of the
-    /// checkpoint's official one (which the literal `official`, and the
-    /// default, select — fetched into the Hugging Face cache on first use).
+    /// Custom drafter GGUF to speculate with — either kind, a DFlash sidecar or
+    /// an MTP head — in place of the checkpoint's official one (which the
+    /// literal `official`, and the default, select — fetched into the Hugging
+    /// Face cache on first use).
     /// Greedy output matches decoding without it except where a near-tie lands
     /// differently.
     #[arg(long, value_name = "GGUF", conflicts_with = "no_draft")]
     draft: Option<PathBuf>,
     /// Decode without speculation. Drafting is on by default: measured faster on
-    /// both checkpoints on 2026-07-29 — 27B +19.3 to +21.0% on code and +7.6 to
-    /// +8.4% on chat, 35B-A3B +18.1 to +19.8% on code and +12.6 to +12.8% on
-    /// chat. It costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the
-    /// 35B-A3B) plus drafter planes per cache slot (see --draft-ctx).
+    /// every checkpoint, at each one's fitted defaults — 27B +46 to +52%,
+    /// 35B-A3B +26 to +28% on code and +15 to +17% on chat (both 2026-08-08),
+    /// 3.8-27B +44 to +45% on code and +37 to +38% on chat (2026-08-15). It
+    /// costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the 35B-A3B,
+    /// 3.2 GB on the 3.8-27B) plus drafter planes per cache slot (see
+    /// --draft-ctx).
     #[arg(long)]
     no_draft: bool,
     /// Max draft tokens proposed per verify round.
@@ -464,10 +479,12 @@ struct ServeArgs {
     /// Positions the drafter's KV cache is sized for, and equally how far into a
     /// conversation speculation stays active — past it decode continues plain
     /// (the drafter's proposal quality collapses with context depth, so deep
-    /// drafting is a pure loss). The cache is f32 at 40 KiB per token on the
-    /// 27B sidecar and 48 on the 35B-A3B — about 0.4 GB at the default 8192, and that
-    /// again per warm conversation, since each cache slot images its own
-    /// drafter planes (see --cache-slots).
+    /// drafting is a pure loss). What the cache costs depends on the sidecar's
+    /// kind: f32 at 40 KiB per token on the 27B DFlash sidecar and 48 on the
+    /// 35B-A3B — about 0.4 GB at the default 8192 — against f16 at 4 KiB on the
+    /// 3.8's single-layer MTP head, an order of magnitude less. And that again
+    /// per warm conversation, since each cache slot images its own drafter
+    /// planes (see --cache-slots).
     #[arg(long)]
     draft_ctx: Option<usize>,
 }
@@ -648,10 +665,15 @@ fn resolve_draft(path: &std::path::Path, size: Model, explicit: bool) -> Result<
 /// cannot be honored is an error: answering it with a warning would leave a run
 /// that was told to speculate quietly not doing so. The default degrades to
 /// plain decoding instead, and says so.
+/// No checkpoint currently reaches the refusal: every shipped one names a
+/// sidecar. It stays because the POLICY is what matters and it is not about
+/// today's registry — a named request that cannot be honored must fail rather
+/// than warn — and because the alternative, deleting it, would have to be
+/// rewritten the first time a release ships without one.
 fn ensure_drafter_explicit(size: Model, explicit: bool) -> Result<Option<PathBuf>> {
     if explicit && size.drafter_file().is_none() {
         bail!(
-            "--draft official: {} ships no DFlash drafter sidecar. Decode plain (drop the flag, \
+            "--draft official: {} ships no drafter sidecar. Decode plain (drop the flag, \
              or --no-draft), or pass a drafter GGUF of your own",
             size.full_name()
         );
@@ -659,7 +681,7 @@ fn ensure_drafter_explicit(size: Model, explicit: bool) -> Result<Option<PathBuf
     ensure_drafter(size)
 }
 
-/// The selected model's DFlash drafter, with the same download notice the
+/// The selected model's drafter sidecar, with the same download notice the
 /// target gets — the sidecar belongs to one checkpoint and never transfers.
 /// `None` for a checkpoint that ships none; saying what that costs is the
 /// caller's, since only the caller knows whether it was about to decode with it.
@@ -788,7 +810,7 @@ fn expert_runner(name: &str) -> Result<ExpertRunner> {
 
 /// Load the model + tokenizer + sampler and assemble a Generator on Metal.
 /// Speculation is opt-out: with `draft` present and not `--no-draft`, the
-/// DFlash drafter (custom `--draft` path, else the hub-ensured official one)
+/// drafter (custom `--draft` path, else the hub-ensured official one)
 /// is loaded on the SAME Metal device (its ops interleave with the target's
 /// shared embeddings/lm_head, so they must share a device) and attached.
 fn build_generator(
@@ -836,9 +858,11 @@ fn build_generator(
         // The drafter's cache is sized by --draft-ctx (capped at the target's
         // context), which is also the drafting depth limit — the same rule the
         // serve engine applies. Sizing it at the target's max_ctx would buy
-        // 40-48 KiB/token of f32 cache for depths where drafting never pays (and
+        // 4-48 KiB/token of cache for depths where drafting never pays (and
         // OOMs outright at 262k alongside the 68 GB target).
-        let drafter = DflashDrafter::load(&dgguf, &device, draft.draft_ctx.min(max_ctx))?;
+        let draft_ctx = draft.draft_ctx.min(max_ctx);
+        let drafter = load_drafter(&dgguf, &generator, &device, draft_ctx)
+            .with_context(|| format!("loading the drafter {}", path.display()))?;
         generator.attach_drafter(drafter, draft.params(size))?;
         eprintln!(
             "xwen: drafter loaded in {:.1}s",
@@ -847,6 +871,36 @@ fn build_generator(
     }
 
     Ok(generator)
+}
+
+/// Build the drafter an opened sidecar holds, whichever kind that is.
+///
+/// The kind comes from `drafter::classify`, the same classifier the server's
+/// startup preflight uses — one classifier, so a file cannot be judged one kind
+/// by the server and loaded as another here. `MtpDrafter::load` additionally
+/// needs the target's config, because the head has no geometry of its own: it is
+/// an extra trunk layer and reads its shapes from the trunk.
+///
+/// The full validation — that this sidecar actually fits this checkpoint — is
+/// each kind's own `check_against_target`, which `Generator::attach_drafter`
+/// runs on the way in.
+fn load_drafter(
+    gguf: &std::sync::Arc<xwen::gguf::GgufFile>,
+    generator: &Generator,
+    device: &candle_core::Device,
+    draft_ctx: usize,
+) -> Result<xwen::drafter::AttachedDrafter> {
+    Ok(match xwen::drafter::classify(&gguf.content)? {
+        xwen::drafter::DrafterKind::Dflash => {
+            xwen::drafter::AttachedDrafter::Dflash(DflashDrafter::load(gguf, device, draft_ctx)?)
+        }
+        xwen::drafter::DrafterKind::Mtp => xwen::drafter::AttachedDrafter::Mtp(MtpDrafter::load(
+            gguf,
+            generator.model_config(),
+            device,
+            draft_ctx,
+        )?),
+    })
 }
 
 fn main() -> Result<()> {

@@ -108,7 +108,14 @@ const MAGIC: &[u8; 8] = b"LAGKVIMG";
 /// match the live cache. That is why the DeltaNet recurrent-state snapshot
 /// landed here without a bump: it is a new per-layer tag inside an unchanged
 /// framing, and the tag is what tells it apart.
-const CONTAINER_VERSION: u32 = 2;
+///
+/// Version 3 is where the drafter record (`TAG_DRAFTER`) grew its own kind tag
+/// and a carry field, because the two drafter kinds a checkpoint can ship differ
+/// in element size AND field list. The bump is what makes a v2 record — which
+/// begins with the position where a v3 one begins with the kind — unreadable
+/// rather than misread: the checkpoint binding cannot help here, since the same
+/// target file can be served with either drafter attached.
+const CONTAINER_VERSION: u32 = 3;
 
 /// Extension every stored segment carries. The name in front of it is the segment's
 /// identity (see [`chain_id`]).
@@ -1181,7 +1188,7 @@ mod tests {
         let planes = (0..2u8)
             .map(|il| (pattern(plane, 0x80 + il), pattern(plane, 0xc0 + il)))
             .collect();
-        DrafterImage::new(pos, N_KV, HEAD_DIM, planes).unwrap()
+        DrafterImage::new_dflash(pos, N_KV, HEAD_DIM, planes).unwrap()
     }
 
     fn tokens(n: usize) -> Vec<u32> {

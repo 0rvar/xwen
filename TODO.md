@@ -1444,7 +1444,22 @@ Qwen3.8-27B shipped as a registry entry and the APIs went to full model names on
 (log.md 2026-08-14, decisions.md "Defaults and CLI surface" / "Serving"). These are the
 pieces deliberately not carried.
 
-- [ ] **Qwen3.8-27B decodes plain: no DFlash sidecar exists, and its MTP sidecar is
+- [x] **DONE 2026-08-15 (MTP arc, stages A+B): Qwen3.8-27B drafts with its MTP head.**
+  `src/mtp.rs` implements the head, `src/drafter.rs` the two-kind seam, and
+  `generate.rs` the chain round; `hub.rs` names the sidecar so a zero-flag run fetches
+  it. First live smoke on the 27B, `lowpowermode 0` on AC: 39.3 tok/s drafted against
+  24.5 plain in the same session at 93.5% acceptance, and `--draft` is byte-identical to
+  `--no-draft` at temp 0 and at temp 0.8 seed 42 over 192-256 tokens.
+  ANNOTATION 2026-08-15 (Stage C): both of those numbers are superseded, and neither was
+  wrong so much as under-measured. The +60% was one run at the then-shipped (0.5, 3); the
+  qualification sweep puts the shipped configuration — now (0.7, 4) — at +44-45% code /
+  +37-38% chat, and 93.5% acceptance was a single code run against the sweep's 80.0%. The
+  byte-identical claim holds for GREEDY (re-verified at 128 and 256 tokens, and again
+  after the defaults moved) but NOT for sampled, which diverges at some seeds on the 3.8
+  and on the shipped 3.6-27B alike — the pre-existing near-tie class, not a regression.
+  See the Stage C log entry and the spec-equivalence items. What follows below was the
+  case before any of this. ORIGINAL:
+  **Qwen3.8-27B decodes plain: no DFlash sidecar exists, and its MTP sidecar is
   unread.** ggml-org ships `mtp-Qwen3.8-27B-*.gguf` (18 tensors, 1 layer,
   DeepSeek-style: `norm(embed) ⊕ norm(hidden) → fc → one transformer layer → the
   target's shared lm_head`), which is a different drafter shape from DFlash's
@@ -1500,6 +1515,144 @@ pieces deliberately not carried.
   number>` and no longer covers every `ModelSize` — harmless (nothing typechecks the
   scripts, and every read is behind the drafter check) but it is a real type gap to fix
   when that file is next touched.
+  ANNOTATION 2026-08-15 (MTP stage B): the drafter half of this is no longer hypothetical
+  — 3.8 now HAS a drafted arm, so `retune-draft.ts`'s exclusion has gone from "there is
+  nothing to sweep" to "the thing to sweep is not wired up", and `SHIPPED_P_MIN` needs a
+  3.8 entry carrying the 0.5 that `hub.rs` ships or the next sweep grades against a status
+  quo that does not exist. Both are Stage C's, alongside the parity-gate run.
+  ANNOTATION 2026-08-15 (Stage C, C3): **the retune half is DONE; the parity-gate half is
+  still open and is all that keeps this item alive.** `retune-draft.ts` has a 3.8 arm and
+  swept it — `SHIPPED_P_MIN` and the new `SHIPPED_DRAFT_MAX` both carry it, and both were
+  moved to the fitted 0.7 / 4 in the same commit as `hub.rs`. The `Record<ModelSize,
+  number>` type gap named above no longer exists either: the table is
+  `Partial<Record<...>>` with a checked accessor that dies rather than printing
+  `undefined` into a command line. What remains untouched is the FIRST half:
+  `scripts/parity-gate.ts` has still never been run against 3.8, and the docs/parity.md
+  floors are still the ones fitted on the 3.6 files. Stage C did not run it — its brief
+  was the acceptance cross-check, the sweep and the docs. Note the arc did produce
+  indirect evidence the 3.8 forward is sound: C2 got BYTE-IDENTICAL 128-token greedy
+  output from llama.cpp on two fixtures, which is a strong end-to-end agreement but is not
+  a parity gate and does not set a floor.
+
+## Deferred from the MTP drafting arc (2026-08-15, stages B and C)
+
+The MTP head ships and drafts (see the closed item above). These are the pieces stages B
+and C deliberately did not carry.
+
+- [ ] **The auto-pause controller costs 3-6% on a checkpoint it never pauses, and the
+  cost is its instrumentation rather than its decisions.** Stage C's margin sweep on the
+  3.8-27B made `margin 0` the winner: 35.9 tok/s mean-of-medians against 34.8 at the
+  shipped 1.0 (code 37.7 vs 35.7, chat 34.1 vs 33.9; reps tight enough to be
+  non-overlapping). Pausing does not explain it — BOTH arms recorded ZERO paused rounds.
+  The mechanism is `PauseController`'s forced-plain cadence: with `margin > 0` it spends a
+  round decoding plain every `FORCE_PLAIN_EVERY` (32, and every `WARMUP_FORCE_PLAIN_EVERY`
+  = 4 until the plain warm-up is met) purely to keep `ema_plain_ms` from going stale, and
+  a forced-plain round commits one token where a drafting round commits about four. In a
+  128-token run of ~40 rounds that is roughly three rounds' worth of speedup spent on
+  measurement, which is the size of the observed gap.
+  NOT fixed by setting the margin to 0: that is one shared value at three sites, only the
+  3.8's stage 2 was run, decisions.md records the controller earning its keep on the 3.6
+  pair, and the depth-8 probe arm (34-80 rounds paused, drafting reduced to +2%) shows the
+  safety net still catching real cases. Two real fixes, either of which keeps the
+  controller and stops paying a whole round for its baseline: derive `ema_plain_ms` from
+  the verify forward, which already decodes a known number of positions and could yield a
+  per-token cost without a dedicated round; or make the cadence adaptive — back the forced
+  plain round off geometrically while the speculative margin is wide, the way the paused
+  state already backs off its probes. Wants a 3.6 stage-2 re-run alongside, so the shared
+  constant moves on evidence from every checkpoint it governs rather than one.
+
+- [ ] **The MTP head cannot follow a rewind, so a serve conversation that rewinds stops
+  speculating until it prefills from zero.** The head's row at position `p` is built from
+  the target's post-final-norm hidden at `p - 1`, and the head keeps exactly one such
+  hidden — the carry, for the position it currently ends at. `sync_drafter_to(pos)` on a
+  rewind therefore has no hidden to build row `pos` from, so `MtpDrafter::truncate` drops
+  the head to zero rather than resume on another position's hidden. The DFlash drafter
+  keeps its rows across the same rewind, because each of ITS rows is a function of that
+  position's taps alone. Cost: every intra-slot rewind (engine.rs `sync_drafter_to` call
+  sites, batch.rs's two) costs speculation for the rest of that conversation — unmeasured,
+  and it does not arise at all on the one-shot CLI path. Three ways out, cheapest first:
+  keep the last N hiddens and accept rewinds that land inside that window; keep the whole
+  hidden history on device (`draft_ctx x hidden x 4` = 168 MB at the default 8192 on the
+  27B, which is 40x the head's own 4 KiB/token KV and is why it was not done now); or
+  recover the hidden by re-running the target's last committed token, which costs one
+  decode step per rewind but no memory. Decide with a measurement of how often serve
+  actually rewinds a drafting conversation.
+- [ ] **A stored MTP cache image resumes only at the position it ends at.** Same root as
+  the item above, seen from the disk tier: `DrafterImage` carries one carry hidden, so
+  `MtpDrafter::import_cache` refuses a `pos` short of `image.pos` rather than restoring a
+  head that cannot take another token. A page-in that resumes at an earlier snapshot
+  therefore loses the drafter planes and runs that conversation plain — which is the
+  regime `Engine::rejects_image` already documents as acceptable (a drafter refusal costs
+  speculation, not the conversation), but it is more common for this kind than for
+  DFlash, whose images take any prefix. Fixed by whichever fix the item above gets.
+- [x] **DONE 2026-08-15 (Stage C, C1): the MTP chain length is a per-checkpoint knob.**
+  `hub::Model::draft_max_default` returns 15 for the DFlash checkpoints and 3 for the
+  3.8's MTP head, exactly as `draft_p_min_default` works; `--draft-max` and the serve
+  config's `draft.max` override it, and both are now `Option` so "unset" is
+  distinguishable from "set to the old shared default". `MtpDrafter::max_chain_len` stays
+  as a sanity ceiling (16) so a mistyped `--draft-max 500` costs a bad round rather than
+  five hundred forwards. The `serve --init` template comments `max` out and explains the
+  per-kind split, like `p_min`. ORIGINAL:
+  **The MTP chain length is a compile-time 3, not a knob.** `MtpDrafter::max_chain_len`
+  returns llama.cpp's fitted `n_max` default and a round takes `min(--draft-max, 3)`. It
+  is deliberately not on the flag: `--draft-max`'s default of 15 is a block drafter's
+  number and both kinds read the same flag, so honouring it would draft 15-step chains by
+  default. The consequence is that a Stage C sweep cannot explore chain depth without
+  editing the constant. Promote it the way `p_min` was promoted — a per-checkpoint default
+  on `hub::Model` with the flag overriding — when the sweep needs it.
+- [ ] **The MTP head builds its own prefill mask, doubling the prefill mask cost.**
+  `MtpDrafter::step` calls `AttnBlock::prefill_mask`, which materializes a
+  `[1, n_head, seq, pos+seq]` f16 tensor — 24 x 512 x 4096 x 2 = 100 MB per chunk at a 4k
+  prompt. The trunk builds exactly one such mask per chunk and hoists it across all
+  sixteen of its full-attention layers (model.rs, `full_mask`), so the head's one extra
+  layer adds a SECOND full-size mask build and upload per chunk rather than a
+  sixteenth of one — which is the shape of a cost that is invisible at 1k and grows with
+  the prompt, matching the measured regression's shape. The mask is reusable as-is: at
+  sync time the head's committed length equals the trunk's cache length and its head
+  count equals the trunk's, so the parameters `(n_head, seq, pos)` are identical. Plumb
+  the trunk's hoisted mask into the sync instead of rebuilding it. Unquantified — the
+  regression was measured end to end, not attributed — so measure before and after
+  rather than assuming this is all of it.
+- [x] **DONE 2026-08-15 (Stage C, C3): `scripts/spec-equivalence.ts` has a 3.8 arm.** It
+  and `retune-draft.ts` were wired up together, both through `scripts/hf.ts`, whose
+  `drafter: null` for 3.8 was the single thing excluding it from both harnesses. The
+  default model list is now `27b,35b,3.8-27b`.
+  **The stage-B claim it was meant to re-run does NOT fully reproduce, and the ledger
+  says so rather than the harness quietly passing.** GREEDY is clean on both fixtures at
+  128 and at 256 tokens. SAMPLED (temp 0.8, fixed seed, `p_min` 0, `pause_margin` 0)
+  diverges on 3.8 at some seeds and not others — seed 42 code forks at line 7, seed 7
+  forks at line 1 on both fixtures, seed 99 code and seed 1 chat are byte-identical —
+  where stage B recorded it byte-identical at 192 tokens, seed 42. That claim was one
+  hand-run pair and did not survive being re-run.
+  It is NOT an MTP regression, and the control is why: the shipped DFlash 27B diverges in
+  sampled mode too, on the chat fixture at every one of seeds 42/7/99 (lines 9-13), while
+  its code fixture is always clean. So sampled-mode divergence is the pre-existing
+  near-tie class the script's own header documents — the batched verify forward
+  reassociates its f32 sums differently from the single-token forward, and at temperature
+  a near tie resolves to a different token. A structural sampler-stream bug is separately
+  ruled out: it would fire on every seed, and two 3.8 seed/fixture pairs came back
+  byte-identical over 128 sampled tokens, which is impossible if the spec loop drew a
+  different number of times than plain.
+  What is left open is the SCRIPT'S OWN CRITERION, not the engine — split out as its own
+  item below. Until it is fixed: GREEDY is the gate, and a sampled divergence needs the
+  control run beside it before it means anything.
+- [ ] **`spec-equivalence.ts`'s sampled mode grades itself with a heuristic that
+  mis-grades, and exits nonzero as though it were a gate.** Two separate problems, both
+  found by running the 3.8 arm and its 27B control (Stage C, C3). First, the "a fork at
+  line 1 under a fixed seed points at the sampler stream, not a near tie" rule is wrong as
+  stated: 3.8 seed 7 forks at line 1 on both fixtures, and a sampler-stream bug is ruled
+  out for that build by other seeds of the SAME build coming back byte-identical, which a
+  structural off-by-one in draw count could not produce. Position is a weak proxy for
+  cause; the strong one is seed-dependence, and the script never varies the seed. Second,
+  the script exits nonzero on a sampled divergence, which reads as a regression gate —
+  but the shipped 27B fails it on the chat fixture at every seed tried, so it has never
+  been a gate on any checkpoint and treating it as one trains the reflex to ignore it.
+  Fix: sweep two or three seeds per comparison and grade on "diverged at EVERY seed"
+  (stream) versus "diverged at some" (near tie), and either make sampled advisory or hold
+  it to a criterion it can actually pass. Cost of not doing it: the next person to run
+  this reads a red result on a healthy build, or misses a real stream bug behind a
+  heuristic that cried wolf.
+
 - [x] **DONE 2026-08-14 (review round): drafting is resolved per checkpoint, not per
   process.** Filed as deferred in the first pass and fixed in the review round, because a
   sidecar-less DEFAULT checkpoint silently disabled drafting for every OTHER checkpoint

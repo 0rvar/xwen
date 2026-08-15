@@ -121,6 +121,14 @@ pub struct XwenModel {
     /// The most recent forward's spec taps, in configured order, drained by
     /// `take_spec_taps`.
     spec_taps: Vec<Tensor>,
+    /// Whether to retain the post-final-norm hidden for the MTP draft head.
+    /// Off by default: a forward that nobody is drafting from should not hold a
+    /// `[seq, hidden]` handle alive past its own scope.
+    keep_post_norm: bool,
+    /// The most recent forward's post-final-norm hidden `[seq, hidden]` f32,
+    /// drained by `take_post_norm_hidden`. This is what the MTP head's `h` input
+    /// is — NOT the pre-norm residual `spec_taps` carries.
+    post_norm_hidden: Option<Tensor>,
     /// Per-stage forward timing, present only under `XWEN_STACK_PROFILE`
     /// (`ops::stack_profile`). `None` — the normal case — costs one `Option`
     /// check per instrumented site; `Some` brackets every stage with device
@@ -271,6 +279,8 @@ impl XwenModel {
             taps: Vec::new(),
             spec_tap_layers: None,
             spec_taps: Vec::new(),
+            keep_post_norm: false,
+            post_norm_hidden: None,
             profile: crate::ops::stack_profile().then(crate::stack_profile::StackProfiler::new),
             _weights_mmap: gguf.mmap_source().cloned(),
             checkpoint: gguf.checkpoint_id(),
@@ -443,6 +453,14 @@ impl XwenModel {
         }
 
         let normed = stage!(Stage::FinalNorm, self.output_norm.forward(&x)?); // [seq, hidden]
+        // The MTP draft head consumes the POST-final-norm hidden, per position —
+        // deliberately not the pre-norm residual the DFlash taps above capture.
+        // A handle clone when armed, an `Option` check when not; the tensor is
+        // returned unchanged either way, so no forward computes anything
+        // differently for being observed.
+        if self.keep_post_norm {
+            self.post_norm_hidden = Some(normed.clone());
+        }
         Ok((normed, taps, spec_captured))
     }
 
@@ -486,26 +504,12 @@ impl XwenModel {
         // last-position gather, so it is last-position-only too.
         crate::stack_profile::stage_begin(&mut self.profile, &self.device)?;
         let last = normed.narrow(0, seq - 1, 1)?.contiguous()?; // [1, hidden]
-        // Decode bypass: at one query position, run the vendored ggml-geometry
-        // plain mat-vec over the shared lm_head buffer (candle's baked quantized
-        // mv kernels run ~15x under bandwidth, measured on the retired q6_K
-        // lm_head). Falls back to QMatMul for prefill (seq > 1),
-        // off Metal, an unsupported dtype, or under XWEN_MV_CLASSIC.
-        let logits = match &self.lm_head_buffer {
-            Some(buf)
-                if seq == 1
-                    && !crate::ops::mv_classic()
-                    && crate::ops::mv_vendored_supported(self.lm_head_dtype) =>
-            {
-                crate::ops::mul_mv(
-                    buf,
-                    self.lm_head_dtype,
-                    self.lm_head.out_dim,
-                    self.lm_head.in_dim,
-                    &last,
-                )? // [1, vocab]
-            }
-            _ => self.lm_head(&last)?, // [1, vocab] — shared raw projection
+        // Decode bypass at one query position; a prefill chunk (seq > 1) keeps
+        // the QMatMul path, which is the numerics the whole prefill shares.
+        let logits = if seq == 1 {
+            self.lm_head_row(&last)?
+        } else {
+            self.lm_head(&last)? // [1, vocab] — shared raw projection
         };
         let logits = logits.flatten_all()?; // [vocab]
         crate::stack_profile::stage_end(&mut self.profile, &self.device, Stage::LmHead)?;
@@ -626,6 +630,24 @@ impl XwenModel {
         std::mem::take(&mut self.spec_taps)
     }
 
+    /// Retain the post-final-norm hidden on every forward, for the MTP draft
+    /// head. Its `h` input is the tensor AFTER `output_norm` — the one the trunk
+    /// otherwise feeds straight to its lm_head — which is a different tensor from
+    /// the pre-norm residual [`XwenModel::set_spec_taps`] captures, and using the
+    /// wrong one drafts plausible noise rather than failing.
+    pub fn set_keep_post_norm(&mut self, on: bool) {
+        self.keep_post_norm = on;
+        // Unconditional, like the spec-tap reconfigure: turning capture off must
+        // not leave the last forward's tensor readable.
+        self.post_norm_hidden = None;
+    }
+
+    /// Drain the most recent forward's post-final-norm hidden `[seq, hidden]`
+    /// f32, or `None` if capture is off or no forward has run since it was armed.
+    pub fn take_post_norm_hidden(&mut self) -> Option<Tensor> {
+        self.post_norm_hidden.take()
+    }
+
     /// Reorder a forward's loop-captured spec taps into the configured order and
     /// stash them for `take_spec_taps`. No-op when taps are unset.
     fn publish_spec_taps(&mut self, captured: Vec<(usize, Tensor)>) {
@@ -644,6 +666,18 @@ impl XwenModel {
         self.embed_tokens(&tokens)
     }
 
+    /// [`XwenModel::embed_ids`] for ids that are already a device tensor `[n]`.
+    ///
+    /// What this buys over the slice form is that the ids never have to be
+    /// known on the host. A draft chain picks each step's token with a device
+    /// argmax and immediately needs that token's embedding row for the next
+    /// step; going through `embed_ids` would mean reading the id back, and a
+    /// per-step readback is a per-step device sync — the cost the whole chain
+    /// is shaped to avoid.
+    pub fn embed_rows(&self, ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens(ids)
+    }
+
     /// The embedding lookup `run_stack` uses: gather rows and upcast to f32.
     fn embed_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
         let tokens = tokens.to_dtype(DType::U32)?;
@@ -660,6 +694,38 @@ impl XwenModel {
         // Offset/non-contiguous views are materialized inside QLinear::forward
         // (the Metal quantized matmul silently drops the input start_offset).
         Ok(self.lm_head.forward(h)?)
+    }
+
+    /// The output projection at ONE query position: `[1, hidden] -> [1, vocab]`,
+    /// no final norm.
+    ///
+    /// This is the vendored ggml-geometry plain mat-vec over the shared lm_head
+    /// buffer — candle's baked quantized mat-vec kernels run ~15x under
+    /// bandwidth here, measured on the retired q6_K lm_head — falling back to
+    /// [`XwenModel::lm_head`] off Metal, on an unsupported dtype, or under
+    /// `XWEN_MV_CLASSIC`. Numerically equivalent to that fallback, so which one
+    /// runs is a perf question and not an output one.
+    ///
+    /// Decode reads it through `forward`; the MTP draft chain reads it directly,
+    /// because a chain step is exactly one query position and going through the
+    /// quantized matmul instead would spend the chain's whole budget on the
+    /// vocab projection.
+    pub fn lm_head_row(&self, h: &Tensor) -> Result<Tensor> {
+        match &self.lm_head_buffer {
+            Some(buf)
+                if !crate::ops::mv_classic()
+                    && crate::ops::mv_vendored_supported(self.lm_head_dtype) =>
+            {
+                Ok(crate::ops::mul_mv(
+                    buf,
+                    self.lm_head_dtype,
+                    self.lm_head.out_dim,
+                    self.lm_head.in_dim,
+                    h,
+                )?)
+            }
+            _ => self.lm_head(h),
+        }
     }
 
     /// Snapshot the KV caches BEFORE a `span`-token verify forward, so a partial

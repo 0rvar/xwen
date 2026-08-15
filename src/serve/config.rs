@@ -376,7 +376,7 @@ impl DraftMode {
     }
 }
 
-/// Speculative decoding with a DFlash drafter. Opt-out: on unless
+/// Speculative decoding with the checkpoint's drafter. Opt-out: on unless
 /// `enabled = false`, which decodes one token per target forward even when a
 /// `path` is set. `path` names a custom drafter; without it each checkpoint's
 /// own official sidecar is used.
@@ -497,7 +497,12 @@ pub struct ServeSettings {
     /// out of the settings: one server loads whichever checkpoint a request
     /// names. The settings below apply to whatever drafter ends up attached.
     pub draft: DraftMode,
-    pub draft_max: usize,
+    /// The deepest draft a round asks for, or `None` to take the loaded
+    /// checkpoint's own fitted default ([`crate::hub::Model::draft_max_default`])
+    /// — resolved at attach time, like `draft_p_min`, because the merge cannot
+    /// know which checkpoint a future job will name and the two drafter kinds
+    /// want very different depths.
+    pub draft_max: Option<usize>,
     /// The drafting confidence floor, or `None` for each checkpoint's own
     /// fitted default ([`crate::hub::Model::draft_p_min_default`]) — resolved
     /// at attach time, since one server loads whichever checkpoint a request
@@ -889,12 +894,11 @@ pub fn resolve(
                 (true, None) => DraftMode::Official,
             }
         },
-        draft_max: pick(
+        draft_max: pick_opt(
             "draft-max",
             "draft.max",
             cli.draft_max,
             file.draft.max,
-            DEFAULT_DRAFT_MAX,
             origin,
             &mut warnings,
         ),
@@ -983,11 +987,13 @@ pub fn resolve(
         "draft_ctx must be at least 1 (it sizes the drafter's KV cache, so zero \
          positions is speculation that can never run)"
     );
-    ensure!(
-        settings.draft_max >= 1,
-        "draft.max must be at least 1 (it caps the tokens a round proposes, so zero \
-         drafts nothing and every round falls back to plain decode)"
-    );
+    if let Some(draft_max) = settings.draft_max {
+        ensure!(
+            draft_max >= 1,
+            "draft.max must be at least 1 (it caps the tokens a round proposes, so zero \
+             drafts nothing and every round falls back to plain decode)"
+        );
+    }
     if let Some(p_min) = settings.draft_p_min {
         ensure!(
             (0.0..=1.0).contains(&p_min),
@@ -1192,8 +1198,8 @@ pub fn init_template() -> String {
     let snapshots_mib = snapshots * snapshot_mib;
     let slots = DEFAULT_CACHE_SLOTS;
     let draft_max = DEFAULT_DRAFT_MAX;
-    // Per-checkpoint, like the cache sizes above: quoted (commented out) for
-    // the model the template names.
+    // Per-checkpoint, like the cache sizes above: both quoted (commented out)
+    // for the model the template names.
     let draft_p_min = format!(
         "{:?}",
         TEMPLATE_MODEL
@@ -1423,26 +1429,37 @@ snapshots = {snapshots}
 slots = {slots}
 
 [draft]
-# Speculative decoding with a DFlash drafter: the drafter proposes a block of
-# tokens, one batched target forward verifies them, and every token the target
-# would have sampled anyway is committed for free. Greedy output matches decoding
+# Speculative decoding: the drafter proposes several tokens ahead, one batched
+# target forward verifies them, and every token the target would have sampled
+# anyway is committed for free. Which drafter depends on the checkpoint — the 3.6
+# files ship DFlash sidecars that propose a block per forward, the 3.8 an MTP head
+# that chains a few steps. Greedy output matches decoding
 # without it except where a near-tie lands differently. On by default: measured
 # faster on both checkpoints on 2026-07-29 — 27B +19.3 to +21.0% on code and
 # +7.6 to +8.4% on chat, 35B-A3B +18.1 to +19.8% on code and +12.6 to +12.8% on
 # chat (greedy, 128 tokens, warm). It uses the official drafter for the
 # checkpoint, fetched into the Hugging Face cache on first use (3.5 GB on the
-# 27B, 0.8 GB on the 35B-A3B); `path` names a custom drafter GGUF instead.
+# 27B, 0.8 GB on the 35B-A3B, 3.2 GB on the 3.8-27B); `path` names a custom
+# drafter GGUF instead, of either kind.
 # `enabled = false` decodes plain.
 enabled = {draft_enabled}
 # path = "/path/to/custom-drafter.gguf"
 
-# Max draft tokens proposed per verify round.
-max = {draft_max}
+# Max draft tokens proposed per verify round. Unset, each checkpoint the server
+# loads uses its own fitted default, because the two drafter kinds have opposite
+# economics off this one knob: a DFlash sidecar proposes its whole block in one
+# forward, so {draft_max} costs no more than 3 would, while an MTP head pays a
+# forward per step and is asked for 3. Setting the key pins one depth for every
+# checkpoint this server is asked to serve; the value below is the DFlash one,
+# and pinning it onto the 3.8-27B would draft five times deeper than that head
+# earns.
+# max = {draft_max}
 
 # Stop drafting at the first token whose probability falls below this, so a round
 # drafts as far as the drafter is confident and no further. Adaptive length beats
 # any fixed block. Unset, each checkpoint the server loads uses its own fitted
-# default — 0.5 on the 27B, 0.3 on the 35B-A3B, fitted 2026-08-08. Setting the key
+# default — 0.5 on the 27B and 0.3 on the 35B-A3B (fitted 2026-08-08), 0.5 on the
+# 3.8-27B. Setting the key
 # pins one floor for every checkpoint this server is asked to serve; the value below
 # is the 35B-A3B's, and pinning it onto the 27B costs that model ~11%.
 # p_min = {draft_p_min}
@@ -1459,7 +1476,7 @@ pause_margin = {draft_pause_margin}
 
 # Positions the drafter's KV cache is sized for, and equally how far into a
 # conversation speculation stays active — past it decode continues plain. Sized
-# separately from context_length because the drafter's cache is f32 and costs
+# separately from context_length because the drafter's cache costs
 # {draft_kib_per_token} KiB per token: about {draft_ctx_gb:.1} GB at {draft_ctx}, and that again for every warm
 # conversation that has an image (see cache.slots above), where inheriting the
 # target's context would spend several times as much on positions speculation
@@ -1550,9 +1567,10 @@ mod tests {
         // Speculation is opt-out: a zero-flag server speculates with the
         // official sidecar, named symbolically for the caller to resolve.
         assert_eq!(s.draft, DraftMode::Official);
-        assert_eq!(s.draft_max, DEFAULT_DRAFT_MAX);
-        // Unresolved on purpose: the floor is fitted per checkpoint, and which
-        // checkpoint is only known when the engine attaches the drafter.
+        // Both unresolved on purpose: the depth and the floor are fitted per
+        // checkpoint, and which checkpoint is only known when the engine
+        // attaches the drafter.
+        assert_eq!(s.draft_max, None);
         assert_eq!(s.draft_p_min, None);
         assert_eq!(s.draft_pause_margin, DEFAULT_DRAFT_PAUSE_MARGIN);
         assert_eq!(s.draft_ctx, DEFAULT_DRAFT_CTX);
@@ -1596,7 +1614,7 @@ mod tests {
             from_file.draft,
             DraftMode::Custom(PathBuf::from("/from-config.gguf"))
         );
-        assert_eq!(from_file.draft_max, 8);
+        assert_eq!(from_file.draft_max, Some(8));
         assert_eq!(from_file.draft_p_min, Some(0.25));
         assert_eq!(from_file.draft_pause_margin, 0.0);
         assert_eq!(from_file.draft_ctx, 12288);
@@ -1615,7 +1633,7 @@ mod tests {
             merged.draft,
             DraftMode::Custom(PathBuf::from("/from-cli.gguf"))
         );
-        assert_eq!(merged.draft_max, 4);
+        assert_eq!(merged.draft_max, Some(4));
         assert_eq!(merged.draft_p_min, Some(0.75));
         assert_eq!(merged.draft_pause_margin, 2.0);
         assert_eq!(merged.draft_ctx, 4096);
@@ -1644,7 +1662,7 @@ mod tests {
             settings.draft,
             DraftMode::Custom(PathBuf::from("/only-cli.gguf"))
         );
-        assert_eq!(settings.draft_max, DEFAULT_DRAFT_MAX);
+        assert_eq!(settings.draft_max, None);
         assert!(warnings.is_empty());
     }
 
@@ -1832,7 +1850,7 @@ mod tests {
             ..model_only()
         };
         let (settings, warnings) = resolve(&ServeToml::default(), None, &cli).unwrap();
-        assert_eq!(settings.draft_max, 1);
+        assert_eq!(settings.draft_max, Some(1));
         assert_eq!(settings.draft_p_min, Some(0.0));
         assert_eq!(settings.draft_pause_margin, 0.0);
         assert!(warnings.is_empty());
