@@ -375,6 +375,16 @@ serve batch + multi-checkpoint arc (2026-08-11)" below.
     (enable_thinking / preserve_thinking) surfaced per dialect, prefix-cache + disk
     tier snapshots extended with recurrent state (48–96 KiB conv + 2–6 MiB delta per
     snapshot depending on model). Estimated-prefill scheduling unchanged.
+    - ANNOTATED 2026-08-19: the thinking-flags half is now covered (commits
+      a2e02d0/205d9ba). enable_thinking was already per dialect (Anthropic `thinking`,
+      OpenAI `reasoning_effort: "none"`, native `thinking`); OpenAI additionally takes
+      `chat_template_kwargs.enable_thinking`. preserve_thinking is surfaced on the
+      native dialect (`preserve_thinking`) and the OpenAI dialect
+      (`chat_template_kwargs.preserve_thinking`), with the checkpoint template's own
+      default when absent (3.6 false, 3.8 true); the Anthropic dialect deliberately has
+      no per-request field — see the 2026-08-19 deferred section. The template
+      `reasoning_effort` rides the same paths. What this item still holds open:
+      nothing about thinking flags.
 
 11. **27B dense bring-up — MOSTLY DONE 2026-07-28 via P7.** The parity gate ran the
     27B end to end: first forward correct, all gated tiers pass (strict is
@@ -1472,7 +1482,24 @@ pieces deliberately not carried.
   reused; what is new is the drafter forward and its cache. MTP sidecars also exist for
   both 3.6 checkpoints, so an MTP drafter is testable against a checkpoint that already
   has a measured DFlash baseline to beat.
-- [ ] **Qwen3.8's chat-template semantics are vendored but not implemented, and TWO of
+- [x] **DONE 2026-08-19 (commits a2e02d0/205d9ba): Qwen3.8's chat-template semantics are
+  implemented as a per-checkpoint dialect.** The design question at the bottom of this
+  item was answered once, as asked: `ChatDialect { Qwen36, Qwen38 }` on `ChatOptions`,
+  from `Model::chat_dialect()`, with `ChatOptions::for_dialect` carrying each template's
+  defaults. (a) shipped: the xhigh/low preambles render verbatim (pinned against the
+  vendored template character-for-character), medium injects nothing, the system block
+  is synthesized when the conversation has none, and the preamble precedes the `# Tools`
+  header; the OpenAI `reasoning_effort` field now drives the think budget AND the
+  template level (nearest-mapping — the one-field-or-two question this item posed was
+  answered "one", decisions.md "Serving"). (b) shipped: preserve_thinking defaults true
+  under the 3.8 dialect, and is per-request on the native and OpenAI dialects.
+  (c) was WRONG as recorded: xwen HAD implemented the inline `<think>`-in-content
+  fallback (`split_reasoning`, running unconditionally), so 3.8 turns were getting the
+  3.6 reading rather than a free pass — it is now gated to the Qwen36 dialect, and a 3.8
+  turn renders such content verbatim. TOKENIZATION_RULES_VERSION went 2 → 3 for the
+  encoding change. See log.md 2026-08-19 and the new deferred section below for what the
+  arc deliberately did not carry. ORIGINAL:
+  **Qwen3.8's chat-template semantics are vendored but not implemented, and TWO of
   them make every default 3.8 conversation diverge from the official rendering.** The
   template is at `reference/chat_template-qwen38.jinja` and cross-checked by chat.rs's
   tests; its behaviors are not.
@@ -1673,3 +1700,50 @@ and C deliberately did not carry.
   wearing a neutral name — an arbitrary value for that pair. If anyone actually runs a
   custom drafter on Qwen3.8-27B, fit a floor for it (`scripts/retune-draft.ts` cannot:
   it sweeps official sidecars only).
+
+## Deferred from the chat-dialect and sampling-defaults arc (2026-08-19)
+
+The chat template became a per-checkpoint dialect and sampling defaults went mode-keyed
+(log.md 2026-08-19; commits a2e02d0/205d9ba). These are the pieces deliberately not
+carried.
+
+- [ ] **The cards' recommended penalties (presence_penalty 1.5) are not implemented, and
+  the reason is the speculative verify path, not laziness.** The official model cards
+  recommend `presence_penalty` 1.5 for instruct (non-thinking) mode on ALL THREE
+  checkpoints, and ALSO for thinking mode on the 35B-A3B alone — the 27B and 3.8-27B
+  thinking recommendations say 0.0. Sources: HF README.md of Qwen/Qwen3.6-27B (~lines
+  633-639), Qwen/Qwen3.6-35B-A3B (~661-667), Qwen/Qwen3.8-27B (~250-255);
+  generation_config.json carries NO penalty keys, so anyone reading only the config
+  files misses this entirely. Not implemented because (1) the sampler has no penalty
+  machinery at all (`repetition_penalty` and `min_p` are likewise absent), and (2) a
+  penalty makes the target distribution history-dependent, which entangles speculative
+  decoding: the batched verify forward (`forward_all_logits`) scores every draft
+  position in one pass, and each position's distribution would need the penalty applied
+  over ITS history prefix — per-position penalty state, on both the drafted and the
+  plain arm, or `--draft` and `--no-draft` sample from different distributions and the
+  spec-equivalence gate is broken by design. llama.cpp does carry penalties through its
+  verify, so there is a reference when this is taken; it is sampler + verify + gate work
+  as one unit. Until then the OpenAI dialect accepts and DROPS
+  `presence_penalty`/`repetition_penalty`/`min_p` (decisions.md "Serving" for why
+  dropping sampling params is acceptable where dropping template kwargs is not), and the
+  35B-A3B's thinking-mode sampling is the one place the shipped defaults knowingly
+  deviate from the full card recipe. Related but separate: the 3.6 pair's cards list a
+  third "thinking, precise coding" set (temp 0.6 / top_p 0.95 / top_k 20) — not
+  auto-selectable (nothing in a request says "coding"), achievable as an explicit
+  `--temp 0.6`, recorded here so nobody rediscovers it as a gap.
+- [ ] **`--min-think`/`--max-think` are not guarded against `--no-think`.** The same
+  distortion class as the guarded `--raw` combos (`--show-thinking`, `--no-think`,
+  `--reasoning-effort` with `--raw` are all startup errors): with thinking off the
+  prompt closes the `<think>` block itself, so a min/max think budget describes a span
+  that will never open — the flags are inert, and inert-but-accepted is the shape this
+  CLI otherwise refuses. Cheap fix in `main.rs` next to the existing guards; the only
+  care needed is serve, where `thinking.default_budget` is a server-wide setting that
+  legitimately coexists with per-request thinking-off (there it means "when a request
+  thinks, cap it", so serve is NOT in scope for this guard).
+- [ ] **The Anthropic dialect has no per-request template-effort knob.** Its API shape
+  has no natural field: `thinking.budget_tokens` is a budget, not a level, and inventing
+  a nonstandard field on a compat dialect defeats the point of speaking the dialect.
+  Requests get the server-wide `[thinking] effort` default (which `count_tokens` also
+  renders, so counts match generation); a client that needs per-request effort on 3.8
+  uses the OpenAI or native dialect. Revisit only if Anthropic's API grows an effort
+  field to mirror.

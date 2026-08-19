@@ -58,9 +58,48 @@ identical base vocab and merge table, which the embedded 3.6 tokenizer therefore
 tokenizes text identically to (see "Tokenization" for what was and was not decided).
 
 **Sampling defaults follow generation_config.json: temp 1.0, top_p 0.95, top_k 20.**
-Stop tokens are the generation_config list `[248046 <|im_end|>, 248044 <|endoftext|>]` —
+[SUPERSEDED 2026-08-19 for the sampling half: defaults are now keyed to thinking mode —
+see the mode-keyed entry below. generation_config.json's values ARE the thinking set,
+which stays the default for thinking runs and for every mode-less path.] Stop tokens
+are the generation_config list `[248046 <|im_end|>, 248044 <|endoftext|>]` —
 config.json's single `eos_token_id: 248044` is wrong for chat and runs straight past
 turn boundaries (2026-07-28).
+
+**Sampling defaults are mode-keyed: thinking temp 1.0 / top_p 0.95, non-thinking 0.7 /
+0.80, top_k 20 both, identical across all three checkpoints (2026-08-19).** The
+evidence is the official model cards, which key their recommendation to thinking on/off
+and nothing else: the HF READMEs of Qwen/Qwen3.6-27B, Qwen/Qwen3.6-35B-A3B and
+Qwen/Qwen3.8-27B all give thinking 1.0/0.95/20 and instruct 0.7/0.80/20 — three cards,
+two sets, no per-checkpoint variation, which is why
+`SamplerOptions::recommended(thinking)` takes a bool and not a `Model`.
+generation_config.json carries only the
+thinking set, which is why the old fixed defaults were that set and why `Default` stays
+it (raw prompts and benches have no chat mode and keep sampling as they always did).
+The resolution order everywhere is explicit value → mode recommendation: CLI sampling
+flags became Option-valued (a mode-dependent default cannot live on a clap
+`default_value_t` — the DraftArgs precedent), and serve's fixed
+`DEFAULT_TEMPERATURE`/`TOP_K`/`TOP_P` constants are gone because a server-wide constant
+cannot know a request's mode; `ServeSettings` sampling keys are Options resolved per
+request AFTER thinking is known, request over config over recommendation. A pinned
+config value deliberately pins one number for both modes — that is what an operator
+writing a number means — and unset gives each request its mode's own. The cards'
+remaining recommendations did not ship: the penalties (see "Thinking budget and
+sampling controls") and the 3.6 pair's third "thinking, precise coding" set
+(0.6/0.95/20), which is not auto-selectable — nothing in a request says "coding" — and
+is reachable as an explicit `--temp 0.6`.
+
+**`--reasoning-effort` on a 3.6 checkpoint is a startup error, not a no-op
+(2026-08-19).** The flag names a parameter of the 3.8 chat template; the 3.6 template
+has none, so a supplied level would change nothing. Ignoring it would train the
+operator to believe it did something — the `--model-size` rule again: flags
+cross-check instead of shrugging, and the check runs before the 20 GB load. Unset is
+allowed everywhere because the default level (xhigh) renders nothing on 3.6 anyway.
+The serve-side `[thinking] effort` / `--reasoning-effort` default is the deliberate
+exception: it is a server-wide setting on a server that may load any checkpoint per
+request, so it is documented as inert on 3.6 rather than refused (refusing would make
+a 3.8-tuned config invalid the day a 3.6 request arrives). Both `--no-think` and
+`--reasoning-effort` are rejected with `--raw`, the same class as the existing guarded
+combos: they describe the chat template, which a raw prompt never renders.
 
 **`max_ctx` is a ceiling, not an allocation; the CLI defaults to 131072 and serve to
 the trained window (2026-08-11).** Full-attention KV buffers start at 8192 positions
@@ -1142,6 +1181,44 @@ bodies are buffered and parsed BEFORE the queue can answer 429, with no concurre
 bound on connections, which is acceptable exactly because the default bind is loopback
 on a single-user machine (2026-08-11).
 
+**One `reasoning_effort` field drives both the think budget and the 3.8 template
+preamble, with off-scale levels nearest-mapped instead of raised (2026-08-19).** The
+OpenAI dialect's field kept its budget mapping (none=off, minimal=1024, low=4096,
+medium=16384, high/xhigh/max=uncapped — the budget scale is this server's own) and now
+also selects the template level a 3.8 prompt renders: minimal→low, high/max→xhigh. One
+knob rather than two because a client saying "low effort" means low effort, not "cap
+the tokens but instruct the model to think hard" — the split-knob reading was the
+"conflicting field" the 2026-08-14 ledger item worried about, and it dissolves once the
+field drives both. The nearest-mapping is a deliberate divergence from llama.cpp, which
+passes the raw string into the jinja and lets the template raise: `minimal`, `high` and
+`max` are real levels of this API's vocabulary that the template happens not to define,
+and answering them with the nearest defined level serves the request where upstream
+turns it into a template error. The level is dropped whenever thinking resolves off, because the template
+renders it only inside the thinking guard. Clients that want the raw template parameter
+have it: `chat_template_kwargs.reasoning_effort` takes exactly the template's three
+levels, and the top-level field wins over the kwarg — llama.cpp's precedence, kept so a
+client speaking both shapes gets upstream's answer. The server-wide default
+(`[thinking] effort` / serve `--reasoning-effort`) fills in when a request names
+nothing, and `count_tokens` renders under the same default so a count matches the
+generation it predicts. The native dialect exposes the raw parameter directly
+(`reasoning_effort`, three levels only) plus `preserve_thinking`; the Anthropic dialect
+exposes no per-request effort knob — its API has no natural field for it, so the
+server-wide default applies (TODO.md).
+
+**`chat_template_kwargs` is validated strictly — the one exception to the compat
+dialects' accept-and-drop permissiveness (2026-08-19).** The OpenAI dialect accepts and
+drops sampling parameters this engine has no equivalent for (penalties, logprobs,
+`min_p`) because a client sending them still gets a correct completion, merely sampled
+without them. Template kwargs are a different category: they steer the rendered prompt
+itself, so a kwarg silently ignored means the client got a DIFFERENT PROMPT than it
+believes it asked for, with nothing anywhere saying so. An unknown key, a wrong type,
+or a `reasoning_effort` outside the template's three levels is therefore a 400 naming
+the offender (the error for an off-scale level points at the top-level field, where the
+wider none/minimal/high/max vocabulary belongs). The accepted keys are the three
+parameters the vendored templates actually take — `enable_thinking`,
+`preserve_thinking`, `reasoning_effort` — the official Qwen card's (and vLLM's) request
+shape.
+
 ## The prefix cache and the disk tier
 
 Inherited from laguna; correctness now depends on snapshotting (KV cache for the 10–16
@@ -1346,7 +1423,9 @@ ledger item rather than improvised into a per-checkpoint tokenizer, since a seco
 
 **Qwen3.8 ships a different chat template; it is vendored beside 3.6's and the renderer
 is unchanged — which means every default 3.8 conversation renders differently from the
-official template, by one sentence (2026-08-14).** `reference/chat_template-qwen38.jinja`
+official template, by one sentence (2026-08-14).** [SUPERSEDED 2026-08-19: the renderer
+is now dialect-parameterized and the divergence is closed — see the next entry. The
+template facts below all stand.] `reference/chat_template-qwen38.jinja`
 (8952 bytes, verbatim from Qwen/Qwen3.8-27B). Diffed hunk by hunk against 3.6's: a
 `reasoning_effort` system preamble, `preserve_thinking` defaulting to true instead of
 false, the inline `<think>`-in-content parsing fallback removed, and an empty-arguments
@@ -1360,18 +1439,52 @@ make it universal rather than opt-in: with thinking ON (the default) and no
 "Reasoning effort is set to xhigh. Please think carefully through the task, validate key
 assumptions, consider plausible alternatives, and prioritize correctness, consistency,
 and clarity in the final answer." to the system block — creating one if the request has
-no system message. xwen renders neither that sentence nor the `low` variant, so every
-default 3.8 conversation this server renders is missing a system instruction the model
+no system message. xwen rendered neither that sentence nor the `low` variant, so every
+default 3.8 conversation this server rendered was missing a system instruction the model
 was trained to see. `medium` is the one effort level that injects nothing, so what xwen
-renders today is exactly the official `reasoning_effort="medium"` rendering. Accepted
+rendered then was exactly the official `reasoning_effort="medium"` rendering. Accepted
 knowingly for the arc that added the checkpoint (it is prompt semantics, not model math,
-and the serve layer already has a conflicting `reasoning_effort` field of its own to
-reconcile — TODO.md), but nobody should read "the generation prompt is byte-identical"
+and the serve layer already had a conflicting `reasoning_effort` field of its own to
+reconcile), but nobody should read "the generation prompt is byte-identical"
 as "the prompts are the same".
 
 Both vendored templates are cross-checked by chat.rs's tests (the fixed prose must
 appear in each, and the generation-prompt block must match between them), so a future
 release that moves either one fails a test rather than a reply.
+
+**The renderer is parameterized by `ChatDialect`, and the 3.8 divergences above are
+implemented behavior, not an accepted gap (2026-08-19).** `Model::chat_dialect()` maps
+the 3.6 pair to `Qwen36` and the 3.8 to `Qwen38`; `ChatOptions::for_dialect` carries
+each template's own defaults, and every prompt-building path (CLI gen/chat, all three
+serve dialects, count_tokens, batch) reaches its options through it. The dialect was
+kept a two-value enum on the options rather than a second renderer because the
+templates' turn rendering and generation prompt are byte-identical — the differences
+are confined to the system block and two defaults, and each is pinned by a test rather
+than asserted in prose:
+
+- The `reasoning_effort` preamble renders under `Qwen38` with thinking on: `xhigh`
+  (the template's default) and `low` prepend their sentences — held as constants
+  asserted verbatim, length included, against the vendored 3.8 template and asserted
+  ABSENT from the 3.6 one — while `medium` injects nothing, making a medium render
+  byte-equal to a 3.6 render of the same conversation. With no system message the
+  dialect synthesizes a system block to carry the sentence (the template's own
+  behavior); the block anchors the prefix cache like a client's and the preamble stays
+  out of the client-content spans, since it is template prose, not client content.
+  With tools it opens the block ahead of the `# Tools` header.
+- `preserve_thinking` defaults true under `Qwen38` (template line 116's `is undefined
+  or is true`), false under `Qwen36`.
+- An empty system message emits no block under `Qwen38` where `Qwen36` emits the empty
+  block its template unconditionally writes.
+- `split_reasoning` — the inline `<think>`-in-content fallback — runs under `Qwen36`
+  only. The 2026-08-14 record (and the ledger item it fed) claimed xwen "never
+  implemented that fallback"; that was WRONG — chat.rs had it and ran it
+  unconditionally, so a 3.8 turn replaying reasoning inside content was getting the
+  3.6 reading. It is now dialect-gated, and a 3.8 turn renders such content verbatim,
+  as its template does.
+
+`TOKENIZATION_RULES_VERSION` went 2 → 3 with this: the same 3.8 conversation encodes
+differently under the current rules, and a stale disk image must fail the stamp check
+rather than longest-common-prefix-match a stream these rules would never produce.
 
 **chat.rs is a hand-written Rust port of the official chat_template.jinja (7764 bytes,
 byte-identical across both Qwen 3.6 repos), keeping laguna's content/structure separation** so
@@ -1546,6 +1659,27 @@ CPU `SampleControl` path softmax the same values. The bound is passed in from th
 tokenizer at construction, never written as a literal: the two vocabulary sizes are a
 per-checkpoint fact and `PADDED_VOCAB` vs `vocab_size()` is the distinction that decides
 which callers belong on which side (2026-07-29).
+
+**The cards' recommended penalties are refused for now, not quietly half-done
+(2026-08-19).** The official cards recommend `presence_penalty` 1.5 for instruct mode
+on ALL three checkpoints, and for thinking mode on the 35B-A3B alone (the 27B and
+3.8-27B thinking recommendations say 0.0) — HF README.md of Qwen/Qwen3.6-27B (~lines
+633-639), Qwen/Qwen3.6-35B-A3B (~661-667), Qwen/Qwen3.8-27B (~250-255);
+generation_config.json carries none of them, so the files and the cards disagree and
+the cards are the fuller recipe. Not implemented, for a reason beyond "the sampler has
+no penalty machinery": a penalty makes the target distribution HISTORY-DEPENDENT, and
+the speculative verify path assumes it is not — `forward_all_logits` scores a whole
+draft in one batched forward against per-position distributions that would each need
+the penalty applied over a different history prefix, and `spec-equivalence`'s
+greedy gate would have to hold under that per-position application on both the drafted
+and plain arms. That is a real design (llama.cpp does it) but it is sampler + verify +
+gate work as one unit, and shipping the penalty on the plain path alone would make
+`--draft` and `--no-draft` sample from different distributions — the exact property the
+equivalence gate exists to forbid. Until then the OpenAI dialect keeps accepting and
+dropping `presence_penalty`/`repetition_penalty`/`min_p` (they degrade sampling, not
+the prompt — see the kwargs entry under "Serving" for the line between the two), and
+the mode-keyed defaults ship the cards' temp/top_p/top_k, which ARE mode-pure.
+Ledgered with the values and sources (TODO.md).
 
 ## Measurement discipline
 

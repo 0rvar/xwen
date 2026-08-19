@@ -89,8 +89,16 @@ Tokenizer/chat: ChatML. Specials: `<|im_start|>` 248045, `<|im_end|>` 248046,
 `<|endoftext|>` 248044, `<think>` 248068 / `</think>` 248069 (single tokens but
 `special: false` — handle by id in the gen loop), `<tool_call>` 248058/248059,
 `<tool_response>` 248066/248067. No BOS, ever. Stop on 248046 OR 248044. Sampling
-defaults 1.0 / 0.95 / 20. Generation prompt ends inside an open `<think>\n` unless
-thinking is disabled (then a closed empty block is emitted).
+defaults are MODE-KEYED per the official cards, identical across all three checkpoints:
+thinking 1.0 / 0.95 / 20, non-thinking 0.7 / 0.80 / 20 (`SamplerOptions::recommended`;
+explicit flags/config/request values always win). Generation prompt ends inside an open
+`<think>\n` unless thinking is disabled (then a closed empty block is emitted). The chat
+template is a per-checkpoint DIALECT (`Model::chat_dialect`): the 3.8 template renders a
+reasoning_effort system preamble (xhigh default / low have sentences, medium renders
+nothing; only with thinking on; synthesizes a system block when the conversation has
+none), defaults preserve_thinking TRUE (3.6: false), emits no block for an empty system
+message (3.6 does), and does not split inline `<think>` out of assistant content
+(3.6 does — `split_reasoning` is Qwen36-gated).
 
 ## Checkpoint location
 
@@ -308,12 +316,24 @@ ships. `bun scripts/spec-equivalence.ts` covers all three checkpoints; its GREED
 the gate, and its sampled mode diverges on the shipped 3.6 checkpoints too (near ties,
 not a regression — see "Perf state").
 
-## serve (INHERITED, needs template adaptation)
+## serve (INHERITED, partially adapted)
 
 The serve/ tree runs as forked. Not yet adapted: ChatML/tool-call parsing in the
-dialect layers (Qwen's `<function=...>` XML-ish call format, string-args-raw rule),
-thinking semantics (open-`<think>` seeding, preserve_thinking), and prefix-cache
-snapshots carrying recurrent state (see decisions.md "Serving").
+dialect layers (Qwen's `<function=...>` XML-ish call format, string-args-raw rule) and
+prefix-cache snapshots carrying recurrent state (see decisions.md "Serving"). Thinking
+semantics ARE adapted as of 2026-08-19: open-`<think>` seeding, per-dialect
+preserve_thinking (a request field on the native and OpenAI dialects, the checkpoint
+template's default otherwise), the 3.8 reasoning_effort preamble (the OpenAI
+`reasoning_effort` field drives the think budget AND the template level, off-scale
+levels nearest-mapped — a deliberate divergence from llama.cpp, which passes them raw
+and lets the template raise; `chat_template_kwargs` {enable_thinking, preserve_thinking,
+reasoning_effort} is STRICTLY validated with 400s, the one exception to accept-and-drop;
+`[thinking] effort` / `serve --reasoning-effort` set a server-wide default, inert on
+3.6), and mode-keyed sampling resolved per request after thinking is known (the fixed
+DEFAULT_TEMPERATURE/TOP_K/TOP_P constants are gone; ServeSettings sampling keys are
+Options, and a pinned value pins both modes). Still open on thinking: the Anthropic
+dialect has no per-request effort knob (server-wide default applies) and penalties stay
+accept-and-drop — both ledgered (TODO.md 2026-08-19 section).
 
 API model names are FULL names only (`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B` —
 `Model::full_name`, matching `general.name` and the repo), plus the served file's own id

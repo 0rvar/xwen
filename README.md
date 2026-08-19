@@ -43,6 +43,43 @@ of its own. It ships no DFlash sidecar, but it does ship a first-party MTP head,
 a different drafter shape and became a second drafter implementation (2026-08-15); all
 three checkpoints now speculate.
 
+## Thinking, effort and sampling
+
+Thinking is on by default everywhere except batch: the prompt ends inside an open
+`<think>` block and the reply's reasoning is split from its answer. `xwen generate` and
+`xwen chat` take `--no-think` (the prompt closes an empty think block; the reply is all
+answer) and `--reasoning-effort <low|medium|xhigh>` — a Qwen 3.8 chat-template parameter
+that renders a system-preamble instruction (`xhigh` is the template's own default;
+`medium` renders nothing). On a 3.6 checkpoint `--reasoning-effort` is a startup error:
+that template has no such parameter, and inert flags are refused rather than ignored.
+Both flags are also rejected with `--raw`, which never renders a template.
+
+Each checkpoint renders under its own template dialect (`Model::chat_dialect`,
+2026-08-19): besides the effort preamble, the 3.8 template defaults `preserve_thinking`
+to true where 3.6 defaults it false, and no longer parses inline `<think>` blocks out of
+assistant content. Details and evidence in decisions.md "Tokenization, chat, tool
+calls".
+
+**Sampling defaults are keyed to thinking mode**, per the official model cards and
+identical across all three checkpoints: thinking temp 1.0 / top_p 0.95 / top_k 20,
+non-thinking 0.7 / 0.80 / 20. Explicit flags, config keys and request fields always win;
+a server-configured sampling value pins one number for both modes, unset lets each
+request use its mode's own. The cards also recommend `presence_penalty` 1.5 for
+non-thinking mode — not implemented: the sampler has no penalty machinery and penalties
+entangle the speculative verify path (TODO.md).
+
+On the serve side, requests pick thinking per dialect: Anthropic `thinking`, native
+`thinking`, OpenAI `reasoning_effort` — which drives both the think-token budget
+(none/minimal/low/medium/high/xhigh/max) and, on 3.8, the template preamble
+(nearest-mapping the levels the template lacks). The OpenAI dialect also accepts
+`chat_template_kwargs` with `enable_thinking`, `preserve_thinking` and
+`reasoning_effort` (the official Qwen card's shape; strictly validated — an unknown key,
+wrong type, or off-scale level is a 400, unlike the sampling params this dialect accepts
+and drops). The native dialect takes `reasoning_effort` and `preserve_thinking`
+directly. `[thinking] effort` in a serve config, or `serve --reasoning-effort`, sets a
+server-wide template-effort default (inert on the 3.6 checkpoints); the Anthropic
+dialect has no per-request effort field, so that default is what its requests get.
+
 ## Speculative decoding
 
 Every checkpoint ships a drafter and speculates, in one of **two kinds**. The Qwen 3.6
