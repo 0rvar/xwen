@@ -1235,6 +1235,15 @@ clients at it); kwargs `enable_thinking`/`preserve_thinking` stay accepted on 3.
 stays inert-but-legal on 3.6 — it is an operator setting covering whatever checkpoints
 a server serves, not a request asking this model for a level.
 
+Extended again 2026-08-19 (later still): the batch surface applies the same refusal
+with the module's own failure shape. A `reasoning_effort` on a batch item or on the
+request's `defaults` against a 3.6 checkpoint fails PER ITEM (message naming the
+checkpoint and the 3.8-template provenance), not as a request-level error — batch
+validation failures land on the item so the other N-1 keep their prefill, and a
+defaults-level effort fails every item identically because the defaults reach the
+renderer only through the items. Effort with thinking off (batch's default) stays
+accepted and inert on 3.8, as everywhere else.
+
 **Normalization passes assistant reasoning through in native tools mode; retention is
 decided once, in the renderer, per dialect (2026-08-19, the arc's review pass).** Both
 compat normalizers used to strip `reasoning` from every assistant turn before the

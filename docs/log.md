@@ -4,6 +4,37 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-19 (later still, same day) — Batch stops pinning the template effort at xhigh: `reasoning_effort` lands on items and defaults, refused per item on 3.6
+
+The dialect arc gave every surface an effort knob except one. Batch's
+`resolve_render` built its `ChatOptions` from `for_dialect` and overrode only
+`enable_thinking`, so a batch item that enabled thinking on the 3.8 checkpoint always
+rendered the xhigh preamble with no way to ask for `low` or `medium`. Spotted
+reviewing the shipped arc's coverage; closed same day.
+
+`reasoning_effort` is now a field on both the item and the request's `defaults`,
+layering exactly as `thinking` does — item over defaults over the template's own
+`xhigh`. On the wire it is a JSON string in the template's three spellings:
+`ReasoningEffort` gained `Serialize`/`Deserialize` through its existing
+`Display`/`FromStr`, so the JSON form accepts and rejects exactly what the CLI flag
+does, and the key is known to the strict `deny_unknown_fields` wire types while
+typos stay refused. On a 3.6 checkpoint a supplied effort — either layer — is
+refused with the checkpoint named and the 3.8-template provenance stated, matching
+the CLI startup error and serve's 400; batch's refusal lands PER ITEM, the module's
+shape for validation failures (a defaults-level effort fails every item identically,
+since the defaults reach the renderer only through the items — decisions.md
+"Serving", the effort-refusal decision's second extension). Effort with thinking off
+(batch's default) or alongside injected reasoning is accepted and inert/independent,
+as on the other surfaces: the 3.8 template reads the level only inside
+`enable_thinking`'s guard. Note the asymmetry the tests pin: an effort-ABSENT
+thinking item renders the template's xhigh sentence; `medium` is the level that
+renders no preamble at all.
+
+**Verification.** `cargo build --release` clean; `cargo test --release` fully green —
+849 lib + 3 CLI + 69 parity-harness tests passed, 0 failed (6 new batch tests).
+`cargo fmt --check` clean. No model math touched; the parity gate was not run and did
+not need to be.
+
 ## 2026-08-19 (later, same day) — The dialect arc's review pass lands three fixes: reasoning retention moves wholly to the renderer, --no-think rejects armed think budgets, and a request-level template effort on 3.6 is a 400
 
 The arc below went through review before closing: one internal reviewer came back

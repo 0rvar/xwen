@@ -207,11 +207,13 @@ xwen batch < request.json > response.json
 ```
 
 An item takes `messages`, an optional JSON `schema` (constrained decode), `thinking`
-(`false` / `true` / a string to inject), an assistant `prefill`, `max_tokens` and
-`sampling`; `defaults` sets any of them batch-wide. Batch sampling is greedy and
-thinking is off unless a request says otherwise — both differ from the chat surface on
-purpose (docs/decisions.md "Batch"). Per-item failures land as `error` on that item and
-the rest of the batch still runs.
+(`false` / `true` / a string to inject), `reasoning_effort` (`"low"` / `"medium"` /
+`"xhigh"` — the 3.8 template's levels, defaulting to the template's own `xhigh`;
+supplying one on a 3.6 checkpoint fails the item, since that template has no such
+parameter), an assistant `prefill`, `max_tokens` and `sampling`; `defaults` sets any of
+them batch-wide. Batch sampling is greedy and thinking is off unless a request says
+otherwise — both differ from the chat surface on purpose (docs/decisions.md "Batch").
+Per-item failures land as `error` on that item and the rest of the batch still runs.
 
 **`shared_prefix`.** A request-level string prepended verbatim to every item's first
 message content, so a large shared document is spelled once on the wire instead of once

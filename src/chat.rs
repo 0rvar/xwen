@@ -234,6 +234,25 @@ impl std::str::FromStr for ReasoningEffort {
     }
 }
 
+/// On the wire (the batch request's `reasoning_effort` fields) a level is a
+/// JSON string in its template spelling: [`fmt::Display`] out, [`FromStr`] in,
+/// so the JSON form accepts and rejects exactly what the CLI flag does.
+///
+/// [`FromStr`]: std::str::FromStr
+impl serde::Serialize for ReasoningEffort {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatOptions {
     /// Whether the model is asked to think. On, the generation prompt ends

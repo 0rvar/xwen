@@ -69,7 +69,7 @@ use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::chat::{self, ChatDialect, ChatOptions, Continuation, Message};
+use crate::chat::{self, ChatDialect, ChatOptions, Continuation, Message, ReasoningEffort};
 use crate::constrain::{self, ConstraintFactory, GrammarState};
 use crate::generate::{GenEvent, Generator};
 use crate::hub::Model;
@@ -136,6 +136,8 @@ pub struct ItemDefaults {
     pub sampling: Option<SamplingSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// One item: a whole conversation, its output shape, and the knobs that differ
@@ -152,6 +154,12 @@ pub struct BatchItem {
     pub schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingSpec>,
+    /// The 3.8 template's `reasoning_effort` level, as its own spelling
+    /// (`"low"` / `"medium"` / `"xhigh"`). Read by the template only with
+    /// thinking on; refused on a 3.6 checkpoint, whose template has no such
+    /// parameter. Absent, the template's default (`xhigh`) stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Assistant text the answer continues from, rendered into the generation
     /// header. It may not open with a newline (see [`Continuation::prefix`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -473,6 +481,7 @@ pub fn run_batch(
                 item,
                 &req.defaults,
                 shared_text,
+                label,
                 dialect,
             )
             .map_err(|error| format!("{error:#}"))
@@ -1715,6 +1724,7 @@ fn prepare_item(
     item: &BatchItem,
     defaults: &ItemDefaults,
     shared_prefix: Option<&str>,
+    label: &str,
     dialect: ChatDialect,
 ) -> Result<Prepared> {
     ensure!(
@@ -1727,7 +1737,7 @@ fn prepare_item(
         .enumerate()
         .map(|(at, message)| chat_message(message, if at == 0 { shared_prefix } else { None }))
         .collect::<Result<Vec<_>>>()?;
-    let (opts, continuation) = resolve_render(item, defaults, dialect)?;
+    let (opts, continuation) = resolve_render(item, defaults, label, dialect)?;
     let (tokens, prefix_len, starts_in_thinking) =
         encode_item(tokenizer, &messages, &opts, continuation.as_ref())?;
     // The renderer writes the prefix verbatim, so what it was asked to render
@@ -1812,11 +1822,27 @@ fn chat_message(message: &BatchMessage, shared_prefix: Option<&str>) -> Result<M
 /// would be rendered inside the open thinking span and read back as reasoning
 /// (`chat.rs` refuses it too — this is where it gets a message naming the two
 /// fields).
+///
+/// `reasoning_effort` layers the same way `thinking` does — item over defaults
+/// over the template's own level — and is a 3.8 template parameter: supplied
+/// against a 3.6 checkpoint it is refused rather than silently dropped, the
+/// same rule as every other surface (the CLI's startup error, serve's 400).
+/// With thinking off it is accepted and inert (the template reads it only
+/// inside `enable_thinking`'s guard), and it is independent of injected
+/// reasoning. `label` is the name the refusal reports, [`run_batch`]'s own.
 fn resolve_render(
     item: &BatchItem,
     defaults: &ItemDefaults,
+    label: &str,
     dialect: ChatDialect,
 ) -> Result<(ChatOptions, Option<Continuation>)> {
+    let effort = item.reasoning_effort.or(defaults.reasoning_effort);
+    if effort.is_some() && dialect == ChatDialect::Qwen36 {
+        bail!(
+            "reasoning_effort: {label} renders the Qwen 3.6 chat template, which has no \
+             reasoning_effort parameter (it is a Qwen 3.8 template feature)"
+        );
+    }
     let thinking = item
         .thinking
         .clone()
@@ -1838,11 +1864,14 @@ fn resolve_render(
         );
     }
 
+    let base = ChatOptions::for_dialect(dialect);
     let opts = ChatOptions {
         enable_thinking,
+        // Absent at both levels, the template's own effort default stands.
+        reasoning_effort: effort.unwrap_or(base.reasoning_effort),
         // The checkpoint's template decides everything else, its
-        // preserve_thinking and reasoning_effort defaults included.
-        ..ChatOptions::for_dialect(dialect)
+        // preserve_thinking default included.
+        ..base
     };
     let continuation = (injected.is_some() || prefill.is_some()).then(|| Continuation {
         close_thinking: injected.is_some(),
@@ -1974,6 +2003,7 @@ mod tests {
             }],
             schema: None,
             thinking: None,
+            reasoning_effort: None,
             prefill: None,
             max_tokens: None,
             sampling: None,
@@ -2086,8 +2116,13 @@ mod tests {
     // from the chat surface batch makes on purpose.
     #[test]
     fn thinking_defaults_off() {
-        let (opts, continuation) =
-            resolve_render(&item("a"), &ItemDefaults::default(), ChatDialect::Qwen36).unwrap();
+        let (opts, continuation) = resolve_render(
+            &item("a"),
+            &ItemDefaults::default(),
+            "Qwen3.6-35B-A3B",
+            ChatDialect::Qwen36,
+        )
+        .unwrap();
         assert!(!opts.enable_thinking);
         assert!(continuation.is_none());
     }
@@ -2096,8 +2131,13 @@ mod tests {
     fn thinking_true_leaves_the_span_open() {
         let mut spec = item("a");
         spec.thinking = Some(ThinkingSpec::Enabled(true));
-        let (opts, continuation) =
-            resolve_render(&spec, &ItemDefaults::default(), ChatDialect::Qwen36).unwrap();
+        let (opts, continuation) = resolve_render(
+            &spec,
+            &ItemDefaults::default(),
+            "Qwen3.6-35B-A3B",
+            ChatDialect::Qwen36,
+        )
+        .unwrap();
         assert!(opts.enable_thinking);
         assert!(continuation.is_none());
     }
@@ -2108,8 +2148,13 @@ mod tests {
     fn injected_thinking_closes_the_span() {
         let mut spec = item("a");
         spec.thinking = Some(ThinkingSpec::Injected("the label is positive".into()));
-        let (opts, continuation) =
-            resolve_render(&spec, &ItemDefaults::default(), ChatDialect::Qwen36).unwrap();
+        let (opts, continuation) = resolve_render(
+            &spec,
+            &ItemDefaults::default(),
+            "Qwen3.6-35B-A3B",
+            ChatDialect::Qwen36,
+        )
+        .unwrap();
         assert!(opts.enable_thinking);
         let continuation = continuation.expect("injected reasoning renders a continuation");
         assert_eq!(
@@ -2124,8 +2169,13 @@ mod tests {
     fn prefill_rides_the_continuation() {
         let mut spec = item("a");
         spec.prefill = Some("{\"label\":".into());
-        let (opts, continuation) =
-            resolve_render(&spec, &ItemDefaults::default(), ChatDialect::Qwen36).unwrap();
+        let (opts, continuation) = resolve_render(
+            &spec,
+            &ItemDefaults::default(),
+            "Qwen3.6-35B-A3B",
+            ChatDialect::Qwen36,
+        )
+        .unwrap();
         assert!(!opts.enable_thinking);
         let continuation = continuation.expect("a prefill renders a continuation");
         assert_eq!(continuation.prefix.as_deref(), Some("{\"label\":"));
@@ -2138,8 +2188,13 @@ mod tests {
         let mut spec = item("a");
         spec.thinking = Some(ThinkingSpec::Enabled(true));
         spec.prefill = Some("{".into());
-        let error = resolve_render(&spec, &ItemDefaults::default(), ChatDialect::Qwen36)
-            .expect_err("a prefix inside the thinking span has no rendering");
+        let error = resolve_render(
+            &spec,
+            &ItemDefaults::default(),
+            "Qwen3.6-35B-A3B",
+            ChatDialect::Qwen36,
+        )
+        .expect_err("a prefix inside the thinking span has no rendering");
         assert!(
             error.to_string().contains("thinking span closed"),
             "{error}"
@@ -2153,13 +2208,170 @@ mod tests {
             thinking: Some(ThinkingSpec::Enabled(true)),
             ..Default::default()
         };
-        let (opts, _) = resolve_render(&item("a"), &defaults, ChatDialect::Qwen36).unwrap();
+        let (opts, _) = resolve_render(
+            &item("a"),
+            &defaults,
+            "Qwen3.6-35B-A3B",
+            ChatDialect::Qwen36,
+        )
+        .unwrap();
         assert!(opts.enable_thinking);
 
         let mut spec = item("a");
         spec.thinking = Some(ThinkingSpec::Enabled(false));
-        let (opts, _) = resolve_render(&spec, &defaults, ChatDialect::Qwen36).unwrap();
+        let (opts, _) =
+            resolve_render(&spec, &defaults, "Qwen3.6-35B-A3B", ChatDialect::Qwen36).unwrap();
         assert!(!opts.enable_thinking);
+    }
+
+    // Effort layers exactly like thinking: the item's level wins over the
+    // defaults', and with neither supplied the template's own default (xhigh)
+    // stands untouched.
+    #[test]
+    fn an_item_overrides_the_default_reasoning_effort() {
+        let defaults = ItemDefaults {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        };
+        let (opts, _) =
+            resolve_render(&item("a"), &defaults, "Qwen3.8-27B", ChatDialect::Qwen38).unwrap();
+        assert_eq!(opts.reasoning_effort, ReasoningEffort::Low);
+
+        let mut spec = item("a");
+        spec.reasoning_effort = Some(ReasoningEffort::Medium);
+        let (opts, _) =
+            resolve_render(&spec, &defaults, "Qwen3.8-27B", ChatDialect::Qwen38).unwrap();
+        assert_eq!(opts.reasoning_effort, ReasoningEffort::Medium);
+
+        let (opts, _) = resolve_render(
+            &item("a"),
+            &ItemDefaults::default(),
+            "Qwen3.8-27B",
+            ChatDialect::Qwen38,
+        )
+        .unwrap();
+        assert_eq!(opts.reasoning_effort, ReasoningEffort::Xhigh);
+    }
+
+    // The resolved options drive the 3.8 renderer: low writes its preamble
+    // sentence into the system block; medium writes no preamble at all, so with
+    // no client system message the block itself disappears. An effort-absent
+    // item is NOT the no-preamble render — it is the template's xhigh default,
+    // sentence and all.
+    #[test]
+    fn the_effort_level_renders_the_38_preamble() {
+        let msgs = [Message::User("hello".into())];
+        let render = |spec: &BatchItem| {
+            let (opts, _) = resolve_render(
+                spec,
+                &ItemDefaults::default(),
+                "Qwen3.8-27B",
+                ChatDialect::Qwen38,
+            )
+            .unwrap();
+            chat::build_prompt(&msgs, &opts).unwrap()
+        };
+        let mut thinking = item("a");
+        thinking.thinking = Some(ThinkingSpec::Enabled(true));
+        let absent = render(&thinking);
+        assert!(
+            absent.starts_with("<|im_start|>system\nReasoning effort is set to xhigh."),
+            "{absent}"
+        );
+
+        let mut low = thinking.clone();
+        low.reasoning_effort = Some(ReasoningEffort::Low);
+        assert_eq!(
+            render(&low),
+            "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and \
+             focused, moving directly to the conclusion without unnecessary elaboration.\
+             <|im_end|>\n<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+
+        let mut medium = thinking.clone();
+        medium.reasoning_effort = Some(ReasoningEffort::Medium);
+        assert_eq!(
+            render(&medium),
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    // reasoning_effort is a 3.8 template parameter: supplied against a 3.6
+    // checkpoint it is refused rather than silently dropped, matching every
+    // other surface. The failure is the item's — a defaults-level effort
+    // reaches the renderer through each item and fails each the same way — and
+    // the message names the checkpoint that cannot honor it.
+    #[test]
+    fn a_reasoning_effort_on_a_36_checkpoint_fails_the_item() {
+        let mut spec = item("a");
+        spec.reasoning_effort = Some(ReasoningEffort::Low);
+        let error = resolve_render(
+            &spec,
+            &ItemDefaults::default(),
+            "Qwen3.6-27B",
+            ChatDialect::Qwen36,
+        )
+        .expect_err("the 3.6 template has no reasoning_effort parameter")
+        .to_string();
+        assert!(error.contains("Qwen3.6-27B"), "{error}");
+        assert!(error.contains("Qwen 3.8 template feature"), "{error}");
+
+        let defaults = ItemDefaults {
+            reasoning_effort: Some(ReasoningEffort::Xhigh),
+            ..Default::default()
+        };
+        let error = resolve_render(
+            &item("a"),
+            &defaults,
+            "Qwen3.6-35B-A3B",
+            ChatDialect::Qwen36,
+        )
+        .expect_err("a defaults-level effort fails the same way an item's does")
+        .to_string();
+        assert!(error.contains("Qwen3.6-35B-A3B"), "{error}");
+    }
+
+    // The template reads the effort only inside `enable_thinking`'s guard, so
+    // effort with thinking off is accepted and inert: the render is
+    // byte-identical to the effort-less one.
+    #[test]
+    fn effort_with_thinking_off_is_accepted_and_inert() {
+        let msgs = [Message::User("hello".into())];
+        let render = |spec: &BatchItem| {
+            let (opts, _) = resolve_render(
+                spec,
+                &ItemDefaults::default(),
+                "Qwen3.8-27B",
+                ChatDialect::Qwen38,
+            )
+            .unwrap();
+            chat::build_prompt(&msgs, &opts).unwrap()
+        };
+        // Thinking defaults off on this surface; only the effort is supplied.
+        let mut with_effort = item("a");
+        with_effort.reasoning_effort = Some(ReasoningEffort::Low);
+        assert_eq!(render(&with_effort), render(&item("a")));
+    }
+
+    // The preamble and injected reasoning are independent: the effort still
+    // resolves and the caller's reasoning still lands in the closed block.
+    #[test]
+    fn effort_rides_alongside_injected_reasoning() {
+        let mut spec = item("a");
+        spec.thinking = Some(ThinkingSpec::Injected("the tone is upbeat".into()));
+        spec.reasoning_effort = Some(ReasoningEffort::Low);
+        let (opts, continuation) = resolve_render(
+            &spec,
+            &ItemDefaults::default(),
+            "Qwen3.8-27B",
+            ChatDialect::Qwen38,
+        )
+        .unwrap();
+        assert_eq!(opts.reasoning_effort, ReasoningEffort::Low);
+        assert!(opts.enable_thinking);
+        let continuation = continuation.expect("injected reasoning renders a continuation");
+        assert!(continuation.close_thinking);
+        assert_eq!(continuation.thinking.as_deref(), Some("the tone is upbeat"));
     }
 
     // The wire shapes survive a round trip, `thinking` in all three of its
@@ -2168,7 +2380,8 @@ mod tests {
     fn a_request_round_trips() {
         let text = r#"{
             "model": "Qwen3.6-35B-A3B",
-            "defaults": { "max_tokens": 512, "sampling": { "temperature": 0 }, "thinking": false },
+            "defaults": { "max_tokens": 512, "sampling": { "temperature": 0 }, "thinking": false,
+                          "reasoning_effort": "low" },
             "items": [
                 { "id": "sentiment",
                   "messages": [
@@ -2177,6 +2390,7 @@ mod tests {
                   ],
                   "schema": { "type": "object" },
                   "thinking": "the tone is upbeat",
+                  "reasoning_effort": "medium",
                   "prefill": "{",
                   "max_tokens": 64,
                   "sampling": { "top_k": 1 } },
@@ -2198,12 +2412,37 @@ mod tests {
             request.defaults.thinking,
             Some(ThinkingSpec::Enabled(false))
         );
+        assert_eq!(
+            request.defaults.reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            request.items[0].reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(request.items[1].reasoning_effort, None);
 
         let again: BatchRequest =
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(again.items[0].thinking, request.items[0].thinking);
         assert_eq!(again.items[0].prefill, request.items[0].prefill);
+        assert_eq!(
+            again.items[0].reasoning_effort,
+            request.items[0].reasoning_effort
+        );
+        assert_eq!(again.defaults.reasoning_effort, Some(ReasoningEffort::Low));
         assert_eq!(again.items[1].id, "topic");
+    }
+
+    // The wire spelling is the template's own three; the OpenAI dialect's wider
+    // effort scale ("none"/"minimal"/"high"/...) does not parse here.
+    #[test]
+    fn a_reasoning_effort_outside_the_templates_spellings_is_refused() {
+        let text = r#"{ "items": [], "defaults": { "reasoning_effort": "high" } }"#;
+        let error = serde_json::from_str::<BatchRequest>(text)
+            .expect_err("only the template's own spellings parse")
+            .to_string();
+        assert!(error.contains("unknown reasoning effort"), "{error}");
     }
 
     // A typo'd field is a request error rather than a silently ignored setting.
@@ -2793,6 +3032,7 @@ mod tests {
                 &spec,
                 &defaults,
                 None,
+                "Qwen3.6-35B-A3B",
                 ChatDialect::Qwen36,
             )
             .err()
@@ -2810,6 +3050,7 @@ mod tests {
                 &spec,
                 &defaults,
                 None,
+                "Qwen3.6-35B-A3B",
                 ChatDialect::Qwen36
             )
             .is_ok()
@@ -2847,6 +3088,7 @@ mod tests {
             &declared,
             &defaults,
             Some("A long shared story.\n\n"),
+            "Qwen3.6-35B-A3B",
             ChatDialect::Qwen36,
         )
         .unwrap();
@@ -2856,6 +3098,7 @@ mod tests {
             &inline,
             &defaults,
             None,
+            "Qwen3.6-35B-A3B",
             ChatDialect::Qwen36,
         )
         .unwrap();
@@ -2875,6 +3118,7 @@ mod tests {
             &spec,
             &ItemDefaults::default(),
             Some("story"),
+            "Qwen3.6-35B-A3B",
             ChatDialect::Qwen36,
         )
         .err()
