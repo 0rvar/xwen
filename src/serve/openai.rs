@@ -3,9 +3,11 @@
 //! Same permissiveness as the Anthropic handler: unknown fields are ignored,
 //! and the parameters this engine has no equivalent for (penalties, logprobs,
 //! `min_p`, `repeat_penalty`) are accepted and dropped rather than rejected,
-//! since a client sending them still gets a correct completion. What cannot be
-//! served correctly — JSON-mode, more than one choice, a `tool_choice` that
-//! insists on a call — is refused. Tool definitions are rendered into the
+//! since a client sending them still gets a correct completion. The exception
+//! is `chat_template_kwargs`: its keys change the rendered prompt itself, so an
+//! unknown key or a wrong type there is a 400 rather than a silent drop. What
+//! cannot be served correctly — JSON-mode, more than one choice, a
+//! `tool_choice` that insists on a call — is refused. Tool definitions are rendered into the
 //! prompt and calls are parsed back out of the generation; the `reject` and
 //! `strip` tools modes refuse or drop them instead, for debugging.
 
@@ -25,7 +27,7 @@ use super::{
     ApiError, AppState, Completion, EngineFailure, JobRequest, SseEncoder, SseFrame, SubmitError,
     collect_completion, random_id, sse_response, submit, unix_now,
 };
-use crate::chat::{Message, ToolCall};
+use crate::chat::{Message, ReasoningEffort, ToolCall};
 use crate::constrain::{self, Grammar};
 use crate::generate::feasible_think_budget;
 use crate::sampler::SamplerOptions;
@@ -146,6 +148,10 @@ pub(crate) struct ChatRequest {
     pub stream: Option<bool>,
     pub stream_options: Option<StreamOptions>,
     pub reasoning_effort: Option<String>,
+    /// Raw chat-template parameters, the official Qwen card's (and vLLM's)
+    /// shape. Held as a map so validation can name the offending key; see
+    /// [`template_kwargs`].
+    pub chat_template_kwargs: Option<serde_json::Map<String, Value>>,
     pub n: Option<u32>,
     pub tools: Option<Value>,
     /// Held as a `Value` because every shape it can take — a string, a named
@@ -471,19 +477,103 @@ pub(crate) fn normalize(request: &ChatRequest, mode: ToolsMode) -> Result<Vec<Me
     Ok(messages)
 }
 
-/// Map `reasoning_effort` onto this engine's thinking switch and budget.
+/// The recognized `chat_template_kwargs`. Unlike the sampling parameters this
+/// server accepts and drops, an unknown or ill-typed kwarg is a 400: a template
+/// kwarg silently ignored would change the rendered prompt the client believes
+/// it asked for, not merely how it is sampled.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct TemplateKwargs {
+    enable_thinking: Option<bool>,
+    preserve_thinking: Option<bool>,
+    /// The raw template parameter, so only the template's own three levels
+    /// (`low`/`medium`/`xhigh`) are valid here — no budget semantics, unlike
+    /// the top-level field's wider scale.
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Validate a request's `chat_template_kwargs` into the three parameters this
+/// server's templates take.
+fn template_kwargs(
+    kwargs: Option<&serde_json::Map<String, Value>>,
+) -> Result<TemplateKwargs, ApiError> {
+    let mut out = TemplateKwargs::default();
+    let Some(kwargs) = kwargs else {
+        return Ok(out);
+    };
+    for (key, value) in kwargs {
+        match key.as_str() {
+            "enable_thinking" => match value.as_bool() {
+                Some(on) => out.enable_thinking = Some(on),
+                None => {
+                    return Err(bad_request(format!(
+                        "chat_template_kwargs.enable_thinking must be a boolean, not {value}"
+                    )));
+                }
+            },
+            "preserve_thinking" => match value.as_bool() {
+                Some(on) => out.preserve_thinking = Some(on),
+                None => {
+                    return Err(bad_request(format!(
+                        "chat_template_kwargs.preserve_thinking must be a boolean, not {value}"
+                    )));
+                }
+            },
+            "reasoning_effort" => match value.as_str() {
+                Some(text) => {
+                    out.reasoning_effort = Some(text.parse().map_err(|_| {
+                        bad_request(format!(
+                            "chat_template_kwargs.reasoning_effort {text:?} is not a template \
+                             level: expected \"low\", \"medium\" or \"xhigh\" (the wider \
+                             none/minimal/high/max scale belongs to the top-level \
+                             reasoning_effort field)"
+                        ))
+                    })?);
+                }
+                None => {
+                    return Err(bad_request(format!(
+                        "chat_template_kwargs.reasoning_effort must be a string, not {value}"
+                    )));
+                }
+            },
+            other => {
+                return Err(bad_request(format!(
+                    "unknown chat_template_kwargs key {other:?}: expected \"enable_thinking\", \
+                     \"preserve_thinking\" or \"reasoning_effort\""
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Map the request's reasoning controls onto this engine's thinking switch,
+/// thinking budget, and the template effort level a 3.8 prompt renders.
+///
+/// The top-level `reasoning_effort` field speaks this API's wider scale and
+/// wins over the template kwarg (llama.cpp's precedence); a kwarg
+/// `enable_thinking: false` is this API's "none". The budget scale is this
+/// server's own. `minimal`, `high` and `max` are not template levels — upstream
+/// llama.cpp passes them raw into the template, which raises — so they are
+/// accepted here and mapped to the nearest official level instead.
 pub(crate) fn resolve_reasoning(
     effort: Option<&str>,
+    kwargs: &TemplateKwargs,
     settings: &ServeSettings,
-) -> Result<(bool, Option<usize>), ApiError> {
-    let (enabled, budget) = match effort {
-        None => (settings.thinking_force, settings.thinking_budget),
-        Some("none") => (false, None),
-        Some("minimal") => (true, Some(EFFORT_MINIMAL)),
-        Some("low") => (true, Some(EFFORT_LOW)),
-        Some("medium") => (true, Some(EFFORT_MEDIUM)),
+) -> Result<(bool, Option<usize>, Option<ReasoningEffort>), ApiError> {
+    let (enabled, budget, level) = match effort {
+        // No top-level field: the kwarg speaks next, then the server's
+        // configuration. `None` for the level means the template's own default.
+        None => (
+            kwargs.enable_thinking.unwrap_or(settings.thinking_force),
+            settings.thinking_budget,
+            kwargs.reasoning_effort.or(settings.reasoning_effort),
+        ),
+        Some("none") => (false, None, None),
+        Some("minimal") => (true, Some(EFFORT_MINIMAL), Some(ReasoningEffort::Low)),
+        Some("low") => (true, Some(EFFORT_LOW), Some(ReasoningEffort::Low)),
+        Some("medium") => (true, Some(EFFORT_MEDIUM), Some(ReasoningEffort::Medium)),
         // The top of the scale means "think as long as you need to".
-        Some("high") | Some("xhigh") | Some("max") => (true, None),
+        Some("high") | Some("xhigh") | Some("max") => (true, None, Some(ReasoningEffort::Xhigh)),
         Some(other) => {
             return Err(bad_request(format!(
                 "unknown reasoning_effort {other:?}: expected \"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\" or \"max\""
@@ -496,11 +586,12 @@ pub(crate) fn resolve_reasoning(
     // answer that never opened one — and under a grammar constraint that
     // forced token is outside the mask, poisoning the matcher. Reachable via
     // `thinking_force = false` + a configured default budget; the Anthropic
-    // resolver has carried the same guard all along.
+    // resolver has carried the same guard all along. The effort level is
+    // dropped with them: the template renders it only inside thinking.
     Ok(if enabled {
-        (true, budget)
+        (true, budget, level)
     } else {
-        (false, None)
+        (false, None, None)
     })
 }
 
@@ -722,20 +813,33 @@ pub(crate) fn prepare(
     }
 
     let messages = normalize(&request, settings.tools_mode)?;
-    let (enable_thinking, budget) =
-        resolve_reasoning(request.reasoning_effort.as_deref(), settings)?;
+    let kwargs = template_kwargs(request.chat_template_kwargs.as_ref())?;
+    let (enable_thinking, budget, reasoning_effort) =
+        resolve_reasoning(request.reasoning_effort.as_deref(), &kwargs, settings)?;
     // The ceiling has to leave the reply room to conclude in: it is lowered to
     // the largest one that fits, or dropped when none does. A `reasoning_effort`
     // this server cannot express as a ceiling still has to answer, and
     // reasoning without one always can.
     let max_think = budget.and_then(|budget| feasible_think_budget(budget, max_tokens));
 
-    let defaults = SamplerOptions::default();
+    // Request over server config over the model card's recommendation for the
+    // RESOLVED thinking mode: the card keys sampling to thinking on/off, and
+    // only now is the mode known.
+    let recommended = SamplerOptions::recommended(enable_thinking);
     let sampling = SamplerOptions {
-        temperature: request.temperature.unwrap_or(settings.temperature),
-        top_k: request.top_k.unwrap_or(settings.top_k),
-        top_p: request.top_p.unwrap_or(settings.top_p),
-        seed: request.seed.unwrap_or(defaults.seed),
+        temperature: request
+            .temperature
+            .or(settings.temperature)
+            .unwrap_or(recommended.temperature),
+        top_k: request
+            .top_k
+            .or(settings.top_k)
+            .unwrap_or(recommended.top_k),
+        top_p: request
+            .top_p
+            .or(settings.top_p)
+            .unwrap_or(recommended.top_p),
+        seed: request.seed.unwrap_or(recommended.seed),
     };
 
     Ok(Prepared {
@@ -752,6 +856,8 @@ pub(crate) fn prepare(
         job: JobRequest {
             messages,
             enable_thinking,
+            preserve_thinking: kwargs.preserve_thinking,
+            reasoning_effort,
             max_think,
             max_tokens,
             sampling,
@@ -1211,44 +1317,214 @@ mod tests {
         );
     }
 
+    /// No kwargs on the wire, for the resolver cases that are about the
+    /// top-level field alone.
+    fn no_kwargs() -> TemplateKwargs {
+        TemplateKwargs::default()
+    }
+
     #[test]
-    fn reasoning_effort_maps_onto_thinking_budgets() {
+    fn reasoning_effort_maps_onto_thinking_budgets_and_template_levels() {
         let settings = settings();
         assert_eq!(
-            resolve_reasoning(Some("none"), &settings).unwrap(),
-            (false, None)
+            resolve_reasoning(Some("none"), &no_kwargs(), &settings).unwrap(),
+            (false, None, None)
+        );
+        // minimal/high/max are not template levels: each maps to the nearest
+        // official one, the way llama.cpp would not (it raises in the template).
+        assert_eq!(
+            resolve_reasoning(Some("minimal"), &no_kwargs(), &settings).unwrap(),
+            (true, Some(1024), Some(ReasoningEffort::Low))
         );
         assert_eq!(
-            resolve_reasoning(Some("minimal"), &settings).unwrap(),
-            (true, Some(1024))
+            resolve_reasoning(Some("low"), &no_kwargs(), &settings).unwrap(),
+            (true, Some(4096), Some(ReasoningEffort::Low))
         );
         assert_eq!(
-            resolve_reasoning(Some("low"), &settings).unwrap(),
-            (true, Some(4096))
-        );
-        assert_eq!(
-            resolve_reasoning(Some("medium"), &settings).unwrap(),
-            (true, Some(16384))
+            resolve_reasoning(Some("medium"), &no_kwargs(), &settings).unwrap(),
+            (true, Some(16384), Some(ReasoningEffort::Medium))
         );
         for uncapped in ["high", "xhigh", "max"] {
             assert_eq!(
-                resolve_reasoning(Some(uncapped), &settings).unwrap(),
-                (true, None)
+                resolve_reasoning(Some(uncapped), &no_kwargs(), &settings).unwrap(),
+                (true, None, Some(ReasoningEffort::Xhigh))
             );
         }
-        // Absent: the server's configuration decides.
-        assert_eq!(resolve_reasoning(None, &settings).unwrap(), (true, None));
+        // Absent: the server's configuration decides, and with no configured
+        // effort the template's own default level stands (None).
+        assert_eq!(
+            resolve_reasoning(None, &no_kwargs(), &settings).unwrap(),
+            (true, None, None)
+        );
+        let mut configured = settings.clone();
+        configured.reasoning_effort = Some(ReasoningEffort::Low);
+        assert_eq!(
+            resolve_reasoning(None, &no_kwargs(), &configured).unwrap(),
+            (true, None, Some(ReasoningEffort::Low))
+        );
+        // ...but an explicit request level beats the configured one.
+        assert_eq!(
+            resolve_reasoning(Some("medium"), &no_kwargs(), &configured).unwrap(),
+            (true, Some(16384), Some(ReasoningEffort::Medium))
+        );
         let mut off = settings.clone();
         off.thinking_force = false;
-        assert_eq!(resolve_reasoning(None, &off).unwrap(), (false, None));
+        assert_eq!(
+            resolve_reasoning(None, &no_kwargs(), &off).unwrap(),
+            (false, None, None)
+        );
 
-        let error = resolve_reasoning(Some("gigantic"), &settings).unwrap_err();
+        let error = resolve_reasoning(Some("gigantic"), &no_kwargs(), &settings).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(
             message(&error).contains("reasoning_effort"),
             "{}",
             message(&error)
         );
+    }
+
+    /// `chat_template_kwargs` carries the raw template parameters:
+    /// `enable_thinking: false` behaves exactly like `reasoning_effort: "none"`
+    /// (thinking off, no budget), the kwarg effort takes only the template's
+    /// own three levels, and the top-level field wins over the kwarg —
+    /// llama.cpp's precedence.
+    #[test]
+    fn template_kwargs_resolve_with_top_level_precedence() {
+        let settings = settings();
+        let kwargs = |body: &str| {
+            template_kwargs(Some(
+                serde_json::from_str::<Value>(body)
+                    .expect("kwargs parse")
+                    .as_object()
+                    .expect("kwargs are an object"),
+            ))
+            .expect("kwargs validate")
+        };
+
+        assert_eq!(
+            resolve_reasoning(None, &kwargs(r#"{"enable_thinking":false}"#), &settings).unwrap(),
+            (false, None, None)
+        );
+        // An explicit true forces thinking on even with the server default off.
+        let mut off = settings.clone();
+        off.thinking_force = false;
+        assert_eq!(
+            resolve_reasoning(None, &kwargs(r#"{"enable_thinking":true}"#), &off).unwrap(),
+            (true, off.thinking_budget, None)
+        );
+        // The kwarg effort is the raw template parameter, no budget attached.
+        assert_eq!(
+            resolve_reasoning(None, &kwargs(r#"{"reasoning_effort":"low"}"#), &settings).unwrap(),
+            (true, settings.thinking_budget, Some(ReasoningEffort::Low))
+        );
+        // ...and it beats the server-wide configured level.
+        let mut configured = settings.clone();
+        configured.reasoning_effort = Some(ReasoningEffort::Xhigh);
+        assert_eq!(
+            resolve_reasoning(None, &kwargs(r#"{"reasoning_effort":"low"}"#), &configured).unwrap(),
+            (true, configured.thinking_budget, Some(ReasoningEffort::Low))
+        );
+        // The top-level field wins over the kwarg, for both the thinking
+        // switch and the level.
+        assert_eq!(
+            resolve_reasoning(
+                Some("medium"),
+                &kwargs(r#"{"enable_thinking":false,"reasoning_effort":"low"}"#),
+                &settings
+            )
+            .unwrap(),
+            (true, Some(16384), Some(ReasoningEffort::Medium))
+        );
+        assert_eq!(
+            resolve_reasoning(
+                Some("none"),
+                &kwargs(r#"{"reasoning_effort":"low"}"#),
+                &settings
+            )
+            .unwrap(),
+            (false, None, None)
+        );
+    }
+
+    /// This server never silently drops a template kwarg, unlike its sampling
+    /// passthroughs: an unknown key, a wrong type, or an effort outside the
+    /// template's three levels is a 400 naming the offender.
+    #[test]
+    fn bad_template_kwargs_are_refused_rather_than_dropped() {
+        let reject = |body: &str| {
+            let error = rejected(&format!(r#"{{"chat_template_kwargs":{body},{USER}}}"#));
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            message(&error)
+        };
+        assert!(reject(r#"{"add_generation_prompt":true}"#).contains("add_generation_prompt"));
+        assert!(reject(r#"{"enable_thinking":"yes"}"#).contains("enable_thinking"));
+        assert!(reject(r#"{"preserve_thinking":1}"#).contains("preserve_thinking"));
+        assert!(reject(r#"{"reasoning_effort":3}"#).contains("reasoning_effort"));
+        // The kwarg is the raw template parameter: the top-level field's wider
+        // scale ("none"/"minimal"/"high"/"max") is not valid here.
+        assert!(reject(r#"{"reasoning_effort":"high"}"#).contains("reasoning_effort"));
+
+        // The valid shape reaches the job: the kwarg preserve and effort ride
+        // it to the renderer.
+        let request = prepared(&format!(
+            r#"{{"chat_template_kwargs":{{"preserve_thinking":false,"reasoning_effort":"low"}},{USER}}}"#
+        ));
+        assert_eq!(request.job.preserve_thinking, Some(false));
+        assert_eq!(request.job.reasoning_effort, Some(ReasoningEffort::Low));
+        // Absent kwargs leave both at the template's defaults.
+        let plain = prepared(&format!(r#"{{{USER}}}"#));
+        assert_eq!(plain.job.preserve_thinking, None);
+        assert_eq!(plain.job.reasoning_effort, None);
+    }
+
+    /// Sampling resolves request over server config over the model card's
+    /// mode-keyed recommendation: a thinking request defaults to 1.0/20/0.95,
+    /// a non-thinking one ("none", or a kwarg opt-out) to 0.7/20/0.80, and an
+    /// explicit request or server value beats both.
+    #[test]
+    fn sampling_defaults_follow_the_resolved_thinking_mode() {
+        let thinking = prepared(&format!(r#"{{{USER}}}"#));
+        assert!(thinking.job.enable_thinking);
+        assert_eq!(thinking.job.sampling.temperature, 1.0);
+        assert_eq!(thinking.job.sampling.top_k, 20);
+        assert_eq!(thinking.job.sampling.top_p, 0.95);
+
+        let instruct = prepared(&format!(r#"{{"reasoning_effort":"none",{USER}}}"#));
+        assert!(!instruct.job.enable_thinking);
+        assert_eq!(instruct.job.sampling.temperature, 0.7);
+        assert_eq!(instruct.job.sampling.top_k, 20);
+        assert_eq!(instruct.job.sampling.top_p, 0.80);
+
+        // A kwarg opt-out is the same mode switch.
+        let via_kwarg = prepared(&format!(
+            r#"{{"chat_template_kwargs":{{"enable_thinking":false}},{USER}}}"#
+        ));
+        assert_eq!(via_kwarg.job.sampling.temperature, 0.7);
+        assert_eq!(via_kwarg.job.sampling.top_p, 0.80);
+
+        // Server config beats the mode default; the request beats both.
+        let mut pinned = settings();
+        pinned.temperature = Some(0.5);
+        let configured = prepare(
+            parse(&format!(r#"{{"reasoning_effort":"none",{USER}}}"#)),
+            &pinned,
+            "m",
+        )
+        .unwrap();
+        assert_eq!(configured.job.sampling.temperature, 0.5);
+        assert_eq!(
+            configured.job.sampling.top_p, 0.80,
+            "unpinned keys keep the mode default"
+        );
+        let explicit = prepare(
+            parse(&format!(
+                r#"{{"temperature":0.2,"reasoning_effort":"none",{USER}}}"#
+            )),
+            &pinned,
+            "m",
+        )
+        .unwrap();
+        assert_eq!(explicit.job.sampling.temperature, 0.2);
     }
 
     /// An effort level whose budget does not fit the reply is lowered to one
@@ -1914,11 +2190,14 @@ mod tests {
 
     #[test]
     fn sampling_takes_the_request_then_the_server_defaults() {
+        // Nothing pinned server-side: the default is the resolved mode's
+        // recommendation (thinking here, since thinking_force is on).
         let defaults = prepared(&format!(r#"{{{USER}}}"#));
-        assert_eq!(defaults.job.sampling.temperature, settings().temperature);
-        assert_eq!(defaults.job.sampling.top_p, settings().top_p);
-        assert_eq!(defaults.job.sampling.top_k, settings().top_k);
-        assert_eq!(defaults.job.sampling.seed, SamplerOptions::default().seed);
+        let recommended = SamplerOptions::recommended(true);
+        assert_eq!(defaults.job.sampling.temperature, recommended.temperature);
+        assert_eq!(defaults.job.sampling.top_p, recommended.top_p);
+        assert_eq!(defaults.job.sampling.top_k, recommended.top_k);
+        assert_eq!(defaults.job.sampling.seed, recommended.seed);
 
         let asked = prepared(&format!(
             r#"{{"temperature":0.3,"top_p":0.7,"top_k":8,"seed":1234,{USER}}}"#

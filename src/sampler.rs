@@ -51,6 +51,25 @@ impl Default for SamplerOptions {
     }
 }
 
+impl SamplerOptions {
+    /// The model card's recommended sampling for each chat mode: thinking is
+    /// temp 1.0 / top_p 0.95, instruct (non-thinking) is temp 0.7 / top_p 0.80,
+    /// top_k 20 either way. The cards key the recommendation to thinking on/off
+    /// alone — all three checkpoints share both sets. The seed is this
+    /// runtime's own fixed default; the cards name none.
+    ///
+    /// [`Default`] is the thinking set: it is what every path without a chat
+    /// mode (raw prompts, benches) samples with, as it always has.
+    pub fn recommended(thinking: bool) -> Self {
+        Self {
+            temperature: if thinking { 1.0 } else { 0.7 },
+            top_k: 20,
+            top_p: if thinking { 0.95 } else { 0.80 },
+            seed: 42,
+        }
+    }
+}
+
 /// Post-logit adjustments applied to a single draw, all on the CPU copy of the
 /// logits and in this order: `allowed` -> `banned` -> `bias` -> `pull` ->
 /// `force`.
@@ -476,6 +495,31 @@ mod tests {
 
     fn logits(values: &[f32]) -> Tensor {
         Tensor::new(values, &Device::Cpu).unwrap()
+    }
+
+    // The recommended sampling is keyed to thinking on/off, per the model
+    // cards: thinking 1.0/20/0.95, instruct 0.7/20/0.80, seed 42 both. The
+    // struct's `Default` is the thinking set — the historical default every
+    // mode-less path keeps.
+    #[test]
+    fn recommended_sampling_is_keyed_to_thinking_mode() {
+        let thinking = SamplerOptions::recommended(true);
+        assert_eq!(thinking.temperature, 1.0);
+        assert_eq!(thinking.top_k, 20);
+        assert_eq!(thinking.top_p, 0.95);
+        assert_eq!(thinking.seed, 42);
+
+        let instruct = SamplerOptions::recommended(false);
+        assert_eq!(instruct.temperature, 0.7);
+        assert_eq!(instruct.top_k, 20);
+        assert_eq!(instruct.top_p, 0.80);
+        assert_eq!(instruct.seed, 42);
+
+        let default = SamplerOptions::default();
+        assert_eq!(default.temperature, thinking.temperature);
+        assert_eq!(default.top_k, thinking.top_k);
+        assert_eq!(default.top_p, thinking.top_p);
+        assert_eq!(default.seed, thinking.seed);
     }
 
     // A fixed seed and identical logits must produce the same token every time,

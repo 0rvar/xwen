@@ -31,7 +31,7 @@ use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_m
 use crossterm::{cursor, execute, queue};
 use unicode_width::UnicodeWidthChar;
 
-use xwen::chat::{ChatDialect, ChatOptions, Message, build_prompt_with_spans};
+use xwen::chat::{ChatOptions, Message, build_prompt_with_spans};
 use xwen::generate::{GenStats, Generator};
 
 const DIM: &str = "\x1b[2m";
@@ -41,19 +41,19 @@ const PROMPT_PREFIX: &str = "\x1b[36m\u{276f}\x1b[0m ";
 const CONT_PREFIX: &str = "\x1b[2m\u{2502}\x1b[0m ";
 const PREFIX_W: usize = 2;
 
+/// `opts` carries the checkpoint's template dialect with the run's thinking
+/// and effort knobs already applied; the caller builds it once at startup.
 pub fn run(
     generator: &mut Generator,
     max_tokens: usize,
     show_thinking: bool,
-    dialect: ChatDialect,
+    opts: ChatOptions,
 ) -> Result<()> {
     if !std::io::stdin().is_terminal() || !stdout().is_terminal() {
-        return pipe_repl(generator, max_tokens, show_thinking, dialect);
+        return pipe_repl(generator, max_tokens, show_thinking, opts);
     }
 
     let mut show_thinking = show_thinking;
-    // The checkpoint's own template dialect, at its defaults.
-    let opts = ChatOptions::for_dialect(dialect);
     let mut messages: Vec<Message> = Vec::new();
     let mut history: Vec<String> = Vec::new();
     let mut out = stdout();
@@ -119,6 +119,7 @@ pub fn run(
             &content_ranges,
             max_tokens,
             show_thinking,
+            opts.enable_thinking,
             &cancel,
             &mut out,
         );
@@ -136,7 +137,11 @@ pub fn run(
                 // A cancel before `</think>` leaves only raw reasoning in
                 // `full`, which split_thinking misfiles as content — nothing
                 // usable either way. Forget the turn so it can be retried.
-                if stats.cancelled && (content.is_empty() || !full.contains("</think>")) {
+                // (With thinking off there is no marker to wait for: a
+                // cancelled turn keeps whatever answer text it produced.)
+                if stats.cancelled
+                    && (content.is_empty() || (opts.enable_thinking && !full.contains("</think>")))
+                {
                     messages.pop();
                 } else {
                     messages.push(Message::Assistant {
@@ -693,6 +698,7 @@ fn stream_reply(
     content_ranges: &[std::ops::Range<usize>],
     max_tokens: usize,
     show_thinking: bool,
+    thinking: bool,
     cancel: &AtomicBool,
     out: &mut Stdout,
 ) -> Result<(String, GenStats)> {
@@ -700,7 +706,9 @@ fn stream_reply(
     out.flush()?;
 
     let mut full = String::new();
-    let mut in_think = true;
+    // With thinking off the prompt already closed the `<think>` block, so the
+    // whole reply is answer text: there is no `</think>` to wait for.
+    let mut in_think = thinking;
     // Whether the pending/thinking indicator line has been cleared yet.
     let mut started = false;
     let mut think_chunks = 0usize;
@@ -820,11 +828,10 @@ fn pipe_repl(
     generator: &mut Generator,
     max_tokens: usize,
     show_thinking: bool,
-    dialect: ChatDialect,
+    opts: ChatOptions,
 ) -> Result<()> {
     use std::io::BufRead;
 
-    let opts = ChatOptions::for_dialect(dialect);
     let mut messages: Vec<Message> = Vec::new();
     let stdin = std::io::stdin();
     let mut out = stdout();
@@ -846,7 +853,8 @@ fn pipe_repl(
         let (prompt, content_ranges) = build_prompt_with_spans(&messages, &opts)?;
 
         let mut full = String::new();
-        let mut in_think = true;
+        // As in `stream_reply`: with thinking off the reply is all answer text.
+        let mut in_think = opts.enable_thinking;
         generator.generate_with_content_ranges(
             &prompt,
             &content_ranges,

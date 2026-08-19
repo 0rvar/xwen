@@ -16,12 +16,10 @@
 //!   [`ChatOptions::for_dialect`] carries each dialect's default.
 //! - it never emits a system block for a system message whose content is
 //!   empty, where 3.6 emits the empty block.
-//!
-//! One further 3.8 difference is NOT modeled: its template no longer splits
-//! inline `<think>` blocks out of assistant content (3.6 lines 93-97 have no
-//! 3.8 counterpart). This module still splits under both dialects
-//! ([`split_reasoning`]); a 3.8 client that replays reasoning inside content
-//! rather than in the reasoning field gets the 3.6 reading (TODO.md).
+//! - it no longer splits inline `<think>` blocks out of assistant content
+//!   (3.6 lines 93-97 have no 3.8 counterpart): a turn that carries no
+//!   reasoning field renders its content verbatim, where 3.6 cuts it at the
+//!   block ([`split_reasoning`] runs only under the 3.6 dialect).
 use std::fmt;
 use std::ops::Range;
 
@@ -206,6 +204,34 @@ pub enum ReasoningEffort {
     Medium,
     #[default]
     Xhigh,
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::Xhigh => "xhigh",
+        })
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = anyhow::Error;
+
+    /// The template's own three spellings, exactly. The OpenAI dialect's wider
+    /// `reasoning_effort` scale (`none`/`minimal`/`high`/...) is that API's own
+    /// vocabulary and is mapped there, not here.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "xhigh" => Ok(Self::Xhigh),
+            other => anyhow::bail!(
+                "unknown reasoning effort {other:?}: expected \"low\", \"medium\" or \"xhigh\""
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -522,9 +548,11 @@ fn trim(text: &str) -> &str {
 }
 
 /// Split an assistant turn's content into `(reasoning, answer)` for a turn that
-/// carries its reasoning inline rather than in a separate field.
+/// carries its reasoning inline rather than in a separate field. A 3.6-dialect
+/// behavior only: the 3.8 template dropped this parsing, so its renderer never
+/// calls this.
 ///
-/// The two halves are cut at different places, as the template cuts them: the
+/// The two halves are cut at different places, as the 3.6 template cuts them: the
 /// reasoning is what precedes the FIRST `</think>` (after its last `<think>`
 /// opener, if it has one), while the answer is what follows the LAST one. A
 /// turn with a single well-formed block — the shape a decode produces — sees no
@@ -684,11 +712,14 @@ pub fn build_prompt_parts_with_spans_continued(
             } => {
                 let text = trim(text);
                 // An explicit reasoning field wins and leaves the content
-                // alone; without one the content is split at its own `<think>`
-                // block (jinja lines 90-99).
+                // alone. Without one the dialects diverge: 3.6 splits the
+                // content at its own inline `<think>` block (its jinja lines
+                // 90-99), while the 3.8 template dropped that parsing and
+                // renders the content verbatim.
                 let (reasoning, body) = match reasoning {
                     Some(reasoning) => (reasoning.as_str(), text),
-                    None => split_reasoning(text),
+                    None if opts.dialect == ChatDialect::Qwen36 => split_reasoning(text),
+                    None => ("", text),
                 };
                 out.push_str("<|im_start|>assistant\n");
                 // A turn keeps its reasoning only while it is still the current
@@ -1142,6 +1173,58 @@ mod tests {
         );
         let parts = build_prompt_parts_with_spans(&msgs, &opts).unwrap();
         assert_eq!(parts.system_end, None);
+    }
+
+    // An assistant turn that carries its reasoning inline (content holding a
+    // `<think>` block, no reasoning field) is the dialects' other rendering
+    // divergence: 3.6 splits the block out (and here drops it, the turn being
+    // superseded), while the 3.8 template has no inline parsing and renders
+    // the content verbatim.
+    #[test]
+    fn inline_think_content_renders_verbatim_under_the_38_dialect() {
+        let msgs = [
+            Message::User("Q1".into()),
+            Message::Assistant {
+                content: "<think>\nsome reasoning\n</think>\n\nA1".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            Message::User("Q2".into()),
+        ];
+        // Medium renders no preamble, so the dialects' bytes differ only by
+        // this turn's rendering.
+        assert_eq!(
+            build_prompt(&msgs, &qwen38(true, ReasoningEffort::Medium)).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\n<think>\nsome reasoning\n</think>\n\nA1<|im_end|>\n\
+             <|im_start|>user\nQ2<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(
+            build_prompt(&msgs, &thinking(true)).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\nA1<|im_end|>\n\
+             <|im_start|>user\nQ2<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    // The effort levels parse from and print as the template's own three
+    // spellings; anything else — the OpenAI dialect's wider scale included —
+    // is refused here, because this is the raw template parameter.
+    #[test]
+    fn reasoning_effort_parses_the_templates_three_spellings() {
+        for (text, level) in [
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("xhigh", ReasoningEffort::Xhigh),
+        ] {
+            assert_eq!(text.parse::<ReasoningEffort>().unwrap(), level);
+            assert_eq!(level.to_string(), text);
+        }
+        for bad in ["none", "minimal", "high", "max", "XHIGH", ""] {
+            assert!(bad.parse::<ReasoningEffort>().is_err(), "{bad:?}");
+        }
     }
 
     // Each dialect's options carry its template's own `preserve_thinking`

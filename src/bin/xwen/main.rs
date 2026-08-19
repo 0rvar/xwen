@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 
 use xwen::batch::{BatchRequest, BatchResponse};
-use xwen::chat::{ChatOptions, Message, build_prompt_with_spans};
+use xwen::chat::{ChatOptions, Message, ReasoningEffort, build_prompt_with_spans};
 use xwen::config::XwenConfig;
 use xwen::dflash::DflashDrafter;
 use xwen::generate::{Generator, SpecParams};
@@ -56,28 +56,98 @@ impl ModelArgs {
     }
 }
 
-/// Shared sampling knobs (generation_config.json defaults: temp 1.0, top-p
-/// 0.95, top-k 20).
+/// Shared sampling knobs. The model card keys its recommended sampling to
+/// thinking on/off, so the defaults are mode-dependent and cannot live on the
+/// flags themselves (the same rationale as DraftArgs' per-model defaults):
+/// each unset flag resolves against `SamplerOptions::recommended` for the
+/// run's thinking mode.
 #[derive(Parser)]
 struct SamplingArgs {
-    #[arg(long, default_value_t = 1.0)]
-    temp: f64,
-    #[arg(long, default_value_t = 20)]
-    top_k: usize,
-    #[arg(long, default_value_t = 0.95)]
-    top_p: f64,
+    /// Sampling temperature (default: 1.0 with thinking, 0.7 with --no-think).
+    #[arg(long)]
+    temp: Option<f64>,
+    /// Top-k truncation (default: 20 in both modes).
+    #[arg(long)]
+    top_k: Option<usize>,
+    /// Top-p nucleus truncation (default: 0.95 with thinking, 0.80 with
+    /// --no-think).
+    #[arg(long)]
+    top_p: Option<f64>,
     #[arg(long, default_value_t = 42)]
     seed: u64,
 }
 
 impl SamplingArgs {
-    fn options(&self) -> SamplerOptions {
+    /// Resolve the flags over the recommended set for `thinking`. A caller
+    /// with no chat mode at all (a raw prompt) passes `true`: the thinking set
+    /// is the historical default, so those paths sample as they always have.
+    fn options(&self, thinking: bool) -> SamplerOptions {
+        let recommended = SamplerOptions::recommended(thinking);
         SamplerOptions {
-            temperature: self.temp,
-            top_k: self.top_k,
-            top_p: self.top_p,
+            temperature: self.temp.unwrap_or(recommended.temperature),
+            top_k: self.top_k.unwrap_or(recommended.top_k),
+            top_p: self.top_p.unwrap_or(recommended.top_p),
             seed: self.seed,
         }
+    }
+}
+
+/// A [`ReasoningEffort`] as a CLI value: the 3.8 template's three levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum EffortArg {
+    Low,
+    Medium,
+    Xhigh,
+}
+
+impl From<EffortArg> for ReasoningEffort {
+    fn from(effort: EffortArg) -> Self {
+        match effort {
+            EffortArg::Low => Self::Low,
+            EffortArg::Medium => Self::Medium,
+            EffortArg::Xhigh => Self::Xhigh,
+        }
+    }
+}
+
+/// Chat-template knobs shared by the chat-mode commands (generate and chat).
+#[derive(Parser)]
+struct ThinkArgs {
+    /// Answer without thinking: the prompt closes an empty <think> block ahead
+    /// of the reply, and sampling switches to the instruct defaults
+    /// (temp 0.7 / top_p 0.80).
+    #[arg(long)]
+    no_think: bool,
+    /// Reasoning-effort level rendered into the Qwen 3.8 chat template
+    /// (default: xhigh, the template's own). A system-preamble instruction
+    /// with no budget semantics. The 3.6 template has no such parameter, so
+    /// the flag is a startup error on a 3.6 checkpoint.
+    #[arg(long, value_name = "low|medium|xhigh")]
+    reasoning_effort: Option<EffortArg>,
+}
+
+impl ThinkArgs {
+    /// The checkpoint's [`ChatOptions`] with these knobs applied.
+    ///
+    /// A supplied `--reasoning-effort` on a checkpoint whose template has no
+    /// such parameter is refused rather than ignored — the flag would change
+    /// nothing, and this repo's flags cross-check instead of shrugging (the
+    /// `--model-size` rule). Unset, the default level renders nothing on 3.6
+    /// anyway, so there is nothing to refuse.
+    fn chat_options(&self, size: Model) -> Result<ChatOptions> {
+        let mut opts = ChatOptions::for_dialect(size.chat_dialect());
+        opts.enable_thinking = !self.no_think;
+        if let Some(effort) = self.reasoning_effort {
+            ensure!(
+                size.chat_dialect() == xwen::chat::ChatDialect::Qwen38,
+                "--reasoning-effort {}: {} renders the Qwen 3.6 chat template, which has no \
+                 reasoning_effort parameter (it is a Qwen 3.8 template feature)",
+                ReasoningEffort::from(effort),
+                size.full_name(),
+            );
+            opts.reasoning_effort = effort.into();
+        }
+        Ok(opts)
     }
 }
 
@@ -224,6 +294,8 @@ enum Cmd {
         #[arg(long)]
         ban_string: Vec<String>,
         #[command(flatten)]
+        think: ThinkArgs,
+        #[command(flatten)]
         sampling: SamplingArgs,
         #[command(flatten)]
         draft: DraftArgs,
@@ -271,6 +343,8 @@ enum Cmd {
         /// sentences --max-think injects bypass the ban.
         #[arg(long)]
         ban_string: Vec<String>,
+        #[command(flatten)]
+        think: ThinkArgs,
         #[command(flatten)]
         sampling: SamplingArgs,
         #[command(flatten)]
@@ -400,15 +474,23 @@ struct ServeArgs {
     /// Print plain log lines to stderr instead of drawing the dashboard.
     #[arg(long)]
     no_tui: bool,
-    /// Default sampling temperature for requests that omit one.
+    /// Default sampling temperature for requests that omit one. Unset, each
+    /// request uses the mode default for its resolved thinking state (1.0
+    /// thinking / 0.7 not); setting this pins one value for both modes.
     #[arg(long)]
     temp: Option<f64>,
-    /// Default top-k for requests that omit one.
+    /// Default top-k for requests that omit one (mode default: 20 either way).
     #[arg(long)]
     top_k: Option<usize>,
-    /// Default top-p for requests that omit one.
+    /// Default top-p for requests that omit one. Unset, the mode default
+    /// applies (0.95 thinking / 0.80 not); setting this pins both modes.
     #[arg(long)]
     top_p: Option<f64>,
+    /// Default template reasoning-effort for requests that name none
+    /// (low|medium|xhigh; default: the template's own, xhigh). Rendered by
+    /// the Qwen 3.8 chat template; inert on the 3.6 checkpoints.
+    #[arg(long, value_name = "low|medium|xhigh")]
+    reasoning_effort: Option<String>,
     /// KV snapshots kept for turn-boundary prefix reuse.
     #[arg(long)]
     cache_snapshots: Option<usize>,
@@ -514,6 +596,7 @@ impl ServeArgs {
             temperature: self.temp,
             top_k: self.top_k,
             top_p: self.top_p,
+            reasoning_effort: self.reasoning_effort.clone(),
             cache_snapshots: self.cache_snapshots,
             cache_slots: self.cache_slots,
             cache_dir: self.cache_dir.clone(),
@@ -942,6 +1025,7 @@ fn main() -> Result<()> {
             min_think,
             max_think,
             ban_string,
+            think,
             sampling,
             draft,
         }) => {
@@ -965,13 +1049,34 @@ fn main() -> Result<()> {
                      model out of the chat template's <think> block, which a raw prompt never opens"
                 );
             }
+            // Both template knobs describe the chat template, which a raw
+            // prompt never renders.
+            if raw && think.no_think {
+                bail!(
+                    "--no-think is meaningless with --raw: it closes the chat template's \
+                     <think> block, which a raw prompt never opens"
+                );
+            }
+            if raw && think.reasoning_effort.is_some() {
+                bail!(
+                    "--reasoning-effort is meaningless with --raw: it selects the chat \
+                     template's system preamble, which a raw prompt never renders"
+                );
+            }
+            // Validated whether or not thinking is on, so a 3.6 run learns
+            // about a useless flag at startup rather than never.
+            let chat_opts = think.chat_options(select.size())?;
             let mut generator = build_generator(
                 &resolve_model(model, select.size())?,
                 select.size(),
                 tokenizer.as_deref(),
                 &moe_impl,
                 max_ctx,
-                sampling.options(),
+                // The mode-dependent sampling defaults follow the resolved
+                // thinking state; a raw prompt has no mode and keeps the
+                // (thinking-set) historical default, --no-think being rejected
+                // above.
+                sampling.options(!think.no_think),
                 Some(&draft),
             )?;
             generator.set_min_think(min_think);
@@ -985,11 +1090,9 @@ fn main() -> Result<()> {
             let (text, content_ranges) = if raw {
                 (prompt.clone(), Vec::new())
             } else {
-                build_prompt_with_spans(
-                    &[Message::User(prompt)],
-                    // The checkpoint's own template dialect, at its defaults.
-                    &ChatOptions::for_dialect(select.size().chat_dialect()),
-                )?
+                // The checkpoint's own template dialect, with the run's
+                // thinking and effort knobs applied.
+                build_prompt_with_spans(&[Message::User(prompt)], &chat_opts)?
             };
 
             let mut stdout = std::io::stdout();
@@ -1136,27 +1239,25 @@ fn main() -> Result<()> {
             min_think,
             max_think,
             ban_string,
+            think,
             sampling,
             draft,
         }) => {
+            // Validated before the 20 GB load, like every startup cross-check.
+            let chat_opts = think.chat_options(select.size())?;
             let mut generator = build_generator(
                 &resolve_model(model, select.size())?,
                 select.size(),
                 tokenizer.as_deref(),
                 &moe_impl,
                 max_ctx,
-                sampling.options(),
+                sampling.options(!think.no_think),
                 Some(&draft),
             )?;
             generator.set_min_think(min_think);
             generator.set_max_think(max_think)?;
             generator.set_banned_strings(&ban_string)?;
-            repl::run(
-                &mut generator,
-                max_tokens,
-                show_thinking,
-                select.size().chat_dialect(),
-            )
+            repl::run(&mut generator, max_tokens, show_thinking, chat_opts)
         }
         Some(Cmd::Batch {
             model,
@@ -1166,5 +1267,76 @@ fn main() -> Result<()> {
             draft,
         }) => run_batch(model, tokenizer, &moe_impl, max_ctx, &draft),
         Some(Cmd::Serve(args)) => run_serve(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xwen::chat::ChatDialect;
+
+    // Unset sampling flags resolve to the recommended set for the run's
+    // thinking mode — 1.0/20/0.95 thinking, 0.7/20/0.80 with --no-think — and
+    // a flag that was passed wins in either mode.
+    #[test]
+    fn sampling_flags_resolve_against_the_modes_recommendation() {
+        let unset = SamplingArgs {
+            temp: None,
+            top_k: None,
+            top_p: None,
+            seed: 42,
+        };
+        let thinking = unset.options(true);
+        assert_eq!(
+            (thinking.temperature, thinking.top_k, thinking.top_p),
+            (1.0, 20, 0.95)
+        );
+        let instruct = unset.options(false);
+        assert_eq!(
+            (instruct.temperature, instruct.top_k, instruct.top_p),
+            (0.7, 20, 0.80)
+        );
+
+        let pinned = SamplingArgs {
+            temp: Some(0.5),
+            top_k: None,
+            top_p: Some(0.9),
+            seed: 7,
+        };
+        let resolved = pinned.options(false);
+        assert_eq!(resolved.temperature, 0.5);
+        assert_eq!(resolved.top_k, 20, "an unset flag keeps the mode default");
+        assert_eq!(resolved.top_p, 0.9);
+        assert_eq!(resolved.seed, 7);
+    }
+
+    // --reasoning-effort is a 3.8 template parameter: supplied on a 3.6
+    // checkpoint it is a startup error naming the checkpoint, on the 3.8 it
+    // lands in the options, and unset it is the template default everywhere.
+    #[test]
+    fn reasoning_effort_is_refused_on_a_36_checkpoint() {
+        let supplied = ThinkArgs {
+            no_think: false,
+            reasoning_effort: Some(EffortArg::Low),
+        };
+        for size in [Model::Qwen27B, Model::Qwen35BA3B] {
+            let error = supplied.chat_options(size).unwrap_err().to_string();
+            assert!(error.contains(size.full_name()), "{error}");
+            assert!(error.contains("Qwen 3.8 template feature"), "{error}");
+        }
+        let opts = supplied.chat_options(Model::Qwen3827B).unwrap();
+        assert_eq!(opts.dialect, ChatDialect::Qwen38);
+        assert_eq!(opts.reasoning_effort, ReasoningEffort::Low);
+        assert!(opts.enable_thinking);
+
+        let unset = ThinkArgs {
+            no_think: true,
+            reasoning_effort: None,
+        };
+        let opts = unset
+            .chat_options(Model::Qwen27B)
+            .expect("the default level renders nothing on 3.6, so nothing to refuse");
+        assert!(!opts.enable_thinking);
+        assert_eq!(opts.reasoning_effort, ReasoningEffort::Xhigh);
     }
 }

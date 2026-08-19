@@ -100,6 +100,14 @@ pub(crate) struct GenerateRequest {
     /// Whether the turn reasons before answering. Absent follows the server's
     /// thinking policy, like the compat dialects.
     pub thinking: Option<bool>,
+    /// The template's reasoning-effort level — "low", "medium" or "xhigh", the
+    /// raw parameter with no budget semantics. Absent follows the server's
+    /// configured default, else the template's own (xhigh). Rendered by the
+    /// 3.8 template only; inert on a 3.6 checkpoint.
+    pub reasoning_effort: Option<String>,
+    /// Replay superseded turns' reasoning. Absent keeps the checkpoint
+    /// template's own default (3.6 drops it, 3.8 keeps it).
+    pub preserve_thinking: Option<bool>,
     /// Ceiling on newly GENERATED reasoning tokens; injected `continue.thinking`
     /// is prompt content and does not count against it. Absent follows the
     /// server's configured budget.
@@ -269,6 +277,15 @@ pub(crate) fn prepare(
     // Absent fields follow the operator's server policy, like the compat
     // dialects; explicit fields override it.
     let enable_thinking = request.thinking.unwrap_or(settings.thinking_force);
+    let reasoning_effort = request
+        .reasoning_effort
+        .as_deref()
+        .map(|text| {
+            text.parse::<crate::chat::ReasoningEffort>()
+                .map_err(|e| bad_request(e.to_string()))
+        })
+        .transpose()?
+        .or(settings.reasoning_effort);
     let continuation = resolve_continuation(request.continuation.as_ref(), enable_thinking)?;
     let grammar = resolve_format(request.format.as_ref())?;
     let messages = normalize(&request)?;
@@ -284,19 +301,32 @@ pub(crate) fn prepare(
         })
         .flatten();
 
-    let defaults = SamplerOptions::default();
+    // Request over server config over the model card's recommendation for the
+    // resolved thinking mode (temp 1.0 / top_p 0.95 thinking, 0.7 / 0.80 not).
+    let recommended = SamplerOptions::recommended(enable_thinking);
     Ok(Prepared {
         stream: request.stream.unwrap_or(false),
         job: JobRequest {
             messages,
             enable_thinking,
+            preserve_thinking: request.preserve_thinking,
+            reasoning_effort,
             max_think,
             max_tokens: request.max_tokens,
             sampling: SamplerOptions {
-                temperature: request.temperature.unwrap_or(settings.temperature),
-                top_k: request.top_k.unwrap_or(settings.top_k),
-                top_p: request.top_p.unwrap_or(settings.top_p),
-                seed: request.seed.unwrap_or(defaults.seed),
+                temperature: request
+                    .temperature
+                    .or(settings.temperature)
+                    .unwrap_or(recommended.temperature),
+                top_k: request
+                    .top_k
+                    .or(settings.top_k)
+                    .unwrap_or(recommended.top_k),
+                top_p: request
+                    .top_p
+                    .or(settings.top_p)
+                    .unwrap_or(recommended.top_p),
+                seed: request.seed.unwrap_or(recommended.seed),
             },
             stop_sequences: request.stop_sequences.unwrap_or_default(),
             tools: Vec::new(),
@@ -596,12 +626,87 @@ mod tests {
         assert!(plain.job.grammar.is_none());
         assert!(plain.job.tools.is_empty());
         assert_eq!(plain.job.max_think, None);
+        assert_eq!(plain.job.preserve_thinking, None, "template default");
+        assert_eq!(plain.job.reasoning_effort, None, "template default");
         assert_eq!(shape(&plain.job.messages), vec!["user:Hi"]);
-        let settings = settings();
-        assert_eq!(plain.job.sampling.temperature, settings.temperature);
-        assert_eq!(plain.job.sampling.top_k, settings.top_k);
-        assert_eq!(plain.job.sampling.top_p, settings.top_p);
-        assert_eq!(plain.job.sampling.seed, SamplerOptions::default().seed);
+        // Nothing pinned in the server config: the mode's own recommendation
+        // applies, thinking's here since thinking defaults on.
+        let recommended = SamplerOptions::recommended(true);
+        assert_eq!(plain.job.sampling.temperature, recommended.temperature);
+        assert_eq!(plain.job.sampling.top_k, recommended.top_k);
+        assert_eq!(plain.job.sampling.top_p, recommended.top_p);
+        assert_eq!(plain.job.sampling.seed, recommended.seed);
+    }
+
+    /// A non-thinking request samples with the instruct recommendation
+    /// (0.7/20/0.80); a server-pinned value beats it, a stated one beats both.
+    #[test]
+    fn thinking_off_selects_the_instruct_sampling_defaults() {
+        let instruct = prepared(
+            r#"{"max_tokens":16,"thinking":false,"messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        assert_eq!(instruct.job.sampling.temperature, 0.7);
+        assert_eq!(instruct.job.sampling.top_k, 20);
+        assert_eq!(instruct.job.sampling.top_p, 0.80);
+
+        let mut pinned = settings();
+        pinned.top_p = Some(0.9);
+        let configured = prepare(
+            parse(
+                r#"{"max_tokens":16,"thinking":false,
+                    "messages":[{"role":"user","content":"Hi"}]}"#,
+            ),
+            &pinned,
+        )
+        .unwrap();
+        assert_eq!(configured.job.sampling.top_p, 0.9);
+        assert_eq!(
+            configured.job.sampling.temperature, 0.7,
+            "unpinned keys keep the mode default"
+        );
+    }
+
+    /// The effort field takes the template's three levels only, rides the job
+    /// to the renderer, and falls back to the server's configured default.
+    #[test]
+    fn reasoning_effort_is_validated_and_threaded() {
+        let low = prepared(
+            r#"{"max_tokens":16,"reasoning_effort":"low",
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        assert_eq!(
+            low.job.reasoning_effort,
+            Some(crate::chat::ReasoningEffort::Low)
+        );
+        let preserved = prepared(
+            r#"{"max_tokens":16,"preserve_thinking":true,
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        assert_eq!(preserved.job.preserve_thinking, Some(true));
+
+        let error = rejected(
+            r#"{"max_tokens":16,"reasoning_effort":"high",
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            message(&error).contains("reasoning effort"),
+            "{}",
+            message(&error)
+        );
+
+        // The server-wide configured level fills in when the request has none.
+        let mut configured = settings();
+        configured.reasoning_effort = Some(crate::chat::ReasoningEffort::Medium);
+        let fallback = prepare(
+            parse(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#),
+            &configured,
+        )
+        .unwrap();
+        assert_eq!(
+            fallback.job.reasoning_effort,
+            Some(crate::chat::ReasoningEffort::Medium)
+        );
     }
 
     /// An absent `thinking` follows the operator's server policy — both the

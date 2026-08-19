@@ -13,6 +13,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
+use crate::chat::ReasoningEffort;
+
 /// Loopback only: the server has no auth unless `api_key` is set.
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 5241;
@@ -43,11 +45,6 @@ pub const DEFAULT_THINKING_FORCE: bool = true;
 /// cap degrades gracefully. 0 = uncapped; a request's own
 /// `thinking.budget_tokens` / `reasoning_effort` always wins.
 pub const DEFAULT_THINKING_BUDGET: usize = 4096;
-/// Sampling defaults are the checkpoint's generation_config.json values, not
-/// the GGUF's embedded `general.sampling.*` (see CLAUDE.md).
-pub const DEFAULT_TEMPERATURE: f64 = 1.0;
-pub const DEFAULT_TOP_K: usize = 20;
-pub const DEFAULT_TOP_P: f64 = 0.95;
 pub const DEFAULT_CACHE_SNAPSHOTS: usize = 4;
 /// Conversations kept warm at once. One of them occupies the GPU cache; the rest
 /// are host-RAM images the engine pages back in when their conversation returns.
@@ -314,6 +311,8 @@ pub struct ServeToml {
 pub struct ThinkingToml {
     pub force: Option<bool>,
     pub default_budget: Option<usize>,
+    /// Raw text; parsed during the merge so the error names this file.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -425,6 +424,8 @@ pub struct CliOverrides {
     pub temperature: Option<f64>,
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
+    /// Raw text; parsed during the merge so errors name the flag.
+    pub reasoning_effort: Option<String>,
     pub cache_snapshots: Option<usize>,
     pub cache_slots: Option<usize>,
     pub draft: Option<PathBuf>,
@@ -485,9 +486,19 @@ pub struct ServeSettings {
     pub thinking_force: bool,
     /// `None` is uncapped.
     pub thinking_budget: Option<usize>,
-    pub temperature: f64,
-    pub top_k: usize,
-    pub top_p: f64,
+    /// The template `reasoning_effort` rendered when a request names none, or
+    /// `None` for the template's own default (xhigh). A system-preamble knob of
+    /// Qwen 3.8's chat template — inert on the 3.6 checkpoints, whose template
+    /// has no such parameter, which is why serving one is not a config error.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Server-wide sampling defaults for requests that omit a value, or `None`
+    /// for the per-request mode default (`SamplerOptions::recommended`): the
+    /// model card keys sampling to thinking on/off — temp 1.0 / top_p 0.95
+    /// thinking, 0.7 / 0.80 non-thinking, top_k 20 both — and only the request
+    /// knows its mode. An explicit value here pins one number for both modes.
+    pub temperature: Option<f64>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f64>,
     pub cache_snapshots: usize,
     /// Conversations kept warm at once, at least 1.
     pub cache_slots: usize,
@@ -596,6 +607,24 @@ pub fn resolve(
         .schedule
         .as_deref()
         .map(|text| parse_schedule(text).context("config schedule"))
+        .transpose()?;
+
+    let cli_effort = cli
+        .reasoning_effort
+        .as_deref()
+        .map(|text| {
+            text.parse::<ReasoningEffort>()
+                .context("--reasoning-effort")
+        })
+        .transpose()?;
+    let file_effort = file
+        .thinking
+        .effort
+        .as_deref()
+        .map(|text| {
+            text.parse::<ReasoningEffort>()
+                .context("config thinking.effort")
+        })
         .transpose()?;
 
     // The dashboard is the one setting with a switch each way, so the conflict
@@ -814,30 +843,39 @@ pub fn resolve(
             0 => None,
             n => Some(n),
         },
-        temperature: pick(
+        // Absent stays absent, meaning the template's own default level.
+        reasoning_effort: pick_opt(
+            "reasoning-effort",
+            "thinking.effort",
+            cli_effort,
+            file_effort,
+            origin,
+            &mut warnings,
+        ),
+        // Sampling has no resolved defaults: the model card's recommendation is
+        // keyed to each request's thinking mode, so absent stays absent and the
+        // dialects fill in `SamplerOptions::recommended` per request.
+        temperature: pick_opt(
             "temp",
             "sampling.temperature",
             cli.temperature,
             file.sampling.temperature,
-            DEFAULT_TEMPERATURE,
             origin,
             &mut warnings,
         ),
-        top_k: pick(
+        top_k: pick_opt(
             "top-k",
             "sampling.top_k",
             cli.top_k,
             file.sampling.top_k,
-            DEFAULT_TOP_K,
             origin,
             &mut warnings,
         ),
-        top_p: pick(
+        top_p: pick_opt(
             "top-p",
             "sampling.top_p",
             cli.top_p,
             file.sampling.top_p,
-            DEFAULT_TOP_P,
             origin,
             &mut warnings,
         ),
@@ -1190,9 +1228,15 @@ pub fn init_template() -> String {
     let tui = DEFAULT_TUI;
     let think_force = DEFAULT_THINKING_FORCE;
     let think_budget = DEFAULT_THINKING_BUDGET;
-    let temperature = format!("{:?}", DEFAULT_TEMPERATURE);
-    let top_k = DEFAULT_TOP_K;
-    let top_p = format!("{:?}", DEFAULT_TOP_P);
+    // Sampling defaults are per-request and mode-dependent; the template quotes
+    // both sets from the same source the dialects resolve against.
+    let thinking_sampling = crate::sampler::SamplerOptions::recommended(true);
+    let instruct_sampling = crate::sampler::SamplerOptions::recommended(false);
+    let temp_think = format!("{:?}", thinking_sampling.temperature);
+    let top_p_think = format!("{:?}", thinking_sampling.top_p);
+    let temp_instruct = format!("{:?}", instruct_sampling.temperature);
+    let top_p_instruct = format!("{:?}", instruct_sampling.top_p);
+    let top_k = thinking_sampling.top_k;
     let snapshots = DEFAULT_CACHE_SNAPSHOTS;
     let snapshot_mib = snapshot_bytes / (1024 * 1024);
     let snapshots_mib = snapshots * snapshot_mib;
@@ -1386,14 +1430,22 @@ force = {think_force}
 # over this; 0 is uncapped.
 default_budget = {think_budget}
 
+# Reasoning-effort level rendered into Qwen 3.8's chat template when a request
+# names none: "low", "medium" or "xhigh" (the template's own default). A
+# system-preamble instruction only — no token-budget semantics — and inert on
+# the 3.6 checkpoints, whose template has no such parameter. A request's own
+# reasoning_effort wins over this.
+# effort = "xhigh"
+
 [sampling]
-# Defaults for requests that omit them, taken from the checkpoint's
-# generation_config.json (temp 1.0 / top_k 20 / top_p 0.95). The GGUF embeds
-# the same values under general.sampling.*, but generation_config.json is the
-# authoritative serving recipe and is what these defaults follow.
-temperature = {temperature}
-top_k = {top_k}
-top_p = {top_p}
+# Server-wide defaults for requests that omit a value. Unset (the default),
+# each request samples with the model card's recommendation for its own mode,
+# which is keyed to thinking on/off: temp {temp_think} / top_p {top_p_think} with thinking,
+# temp {temp_instruct} / top_p {top_p_instruct} without, top_k {top_k} either way. Setting a key here
+# pins one number for both modes on every request that omits it.
+# temperature = {temp_think}
+# top_k = {top_k}
+# top_p = {top_p_think}
 
 [cache]
 # KV snapshots kept at turn boundaries, so a conversation that edits or retries
@@ -1553,9 +1605,12 @@ mod tests {
         assert!(s.tui);
         assert!(s.thinking_force);
         assert_eq!(s.thinking_budget, Some(DEFAULT_THINKING_BUDGET));
-        assert_eq!(s.temperature, DEFAULT_TEMPERATURE);
-        assert_eq!(s.top_k, DEFAULT_TOP_K);
-        assert_eq!(s.top_p, DEFAULT_TOP_P);
+        // No resolved effort or sampling defaults: the effort falls to the
+        // template's own default, and sampling to each request's mode set.
+        assert_eq!(s.reasoning_effort, None);
+        assert_eq!(s.temperature, None);
+        assert_eq!(s.top_k, None);
+        assert_eq!(s.top_p, None);
         assert_eq!(s.cache_snapshots, DEFAULT_CACHE_SNAPSHOTS);
         assert_eq!(s.cache_slots, DEFAULT_CACHE_SLOTS);
         // The disk tier is on, budgeted, and lives under $HOME unless told
@@ -2139,9 +2194,9 @@ mod tests {
         assert_eq!(from_file.port, 9000);
         assert_eq!(from_file.host, "0.0.0.0");
         assert_eq!(from_file.idle_unload, None);
-        assert_eq!(from_file.temperature, 0.5);
-        // Untouched keys still come from the built-in defaults.
-        assert_eq!(from_file.top_k, DEFAULT_TOP_K);
+        assert_eq!(from_file.temperature, Some(0.5));
+        // An untouched sampling key stays absent — resolved per request.
+        assert_eq!(from_file.top_k, None);
 
         let cli = CliOverrides {
             port: Some(8080),
@@ -2152,7 +2207,7 @@ mod tests {
         let (merged, warnings) = resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
         assert_eq!(merged.port, 8080);
         assert_eq!(merged.idle_unload, Some(Duration::from_secs(90)));
-        assert_eq!(merged.temperature, 0.7);
+        assert_eq!(merged.temperature, Some(0.7));
         // The config's model survives: no --model was passed.
         assert_eq!(merged.model, PathBuf::from("/from-config.gguf"));
         assert_eq!(
@@ -2327,6 +2382,69 @@ mod tests {
         let file: ServeToml = toml::from_str("[thinking]\ndefault_budget = 0\n").unwrap();
         let (settings, _) = resolve(&file, None, &model_only()).unwrap();
         assert_eq!(settings.thinking_budget, None);
+    }
+
+    /// `[thinking] effort` merges like every other key — flag beats file, with
+    /// a warning when they disagree — and both spellings are parsed during the
+    /// merge so the error names its source. Absent stays absent, which is the
+    /// template's own default level.
+    #[test]
+    fn thinking_effort_merges_flag_over_file() {
+        let file: ServeToml = toml::from_str("[thinking]\neffort = \"low\"\n").unwrap();
+        let (settings, warnings) = resolve(&file, None, &model_only()).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(settings.reasoning_effort, Some(ReasoningEffort::Low));
+
+        let cli = CliOverrides {
+            reasoning_effort: Some("medium".into()),
+            ..model_only()
+        };
+        let (settings, warnings) =
+            resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
+        assert_eq!(settings.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            warnings,
+            vec![
+                "warning: --reasoning-effort medium overrides config thinking.effort = low \
+                 (/etc/serve.toml)"
+                    .to_string()
+            ]
+        );
+
+        // A level neither the template nor the flag defines is refused, naming
+        // the side it came from.
+        let err = resolve(
+            &file,
+            None,
+            &CliOverrides {
+                reasoning_effort: Some("high".into()),
+                ..model_only()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--reasoning-effort"), "{err}");
+        let bad: ServeToml = toml::from_str("[thinking]\neffort = \"maximum\"\n").unwrap();
+        let err = resolve(&bad, None, &model_only()).unwrap_err();
+        assert!(err.to_string().contains("thinking.effort"), "{err}");
+    }
+
+    /// The sampling keys have no built-in fallback: a value set in the file or
+    /// on a flag is pinned for both modes, and an absent one stays `None` for
+    /// the dialects to resolve against each request's own thinking mode.
+    #[test]
+    fn sampling_keys_stay_absent_unless_pinned() {
+        let (settings, _) = resolve(&ServeToml::default(), None, &model_only()).unwrap();
+        assert_eq!(
+            (settings.temperature, settings.top_k, settings.top_p),
+            (None, None, None)
+        );
+
+        let file: ServeToml = toml::from_str("[sampling]\ntop_k = 40\ntop_p = 0.9\n").unwrap();
+        let (settings, warnings) = resolve(&file, None, &model_only()).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(settings.temperature, None);
+        assert_eq!(settings.top_k, Some(40));
+        assert_eq!(settings.top_p, Some(0.9));
     }
 
     #[test]

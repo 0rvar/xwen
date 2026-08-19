@@ -597,14 +597,25 @@ pub(crate) fn resolve_thinking(
     Ok((enabled, budget))
 }
 
-/// Sampling for one request: whatever it asked for, over the server's defaults.
-fn sampling(request: &MessagesRequest, settings: &ServeSettings) -> SamplerOptions {
-    let defaults = SamplerOptions::default();
+/// Sampling for one request: whatever it asked for, over the server's
+/// configured defaults, over the model card's recommendation for the request's
+/// resolved thinking mode (temp 1.0 / top_p 0.95 thinking, 0.7 / 0.80 not).
+fn sampling(request: &MessagesRequest, settings: &ServeSettings, thinking: bool) -> SamplerOptions {
+    let recommended = SamplerOptions::recommended(thinking);
     SamplerOptions {
-        temperature: request.temperature.unwrap_or(settings.temperature),
-        top_k: request.top_k.unwrap_or(settings.top_k),
-        top_p: request.top_p.unwrap_or(settings.top_p),
-        seed: defaults.seed,
+        temperature: request
+            .temperature
+            .or(settings.temperature)
+            .unwrap_or(recommended.temperature),
+        top_k: request
+            .top_k
+            .or(settings.top_k)
+            .unwrap_or(recommended.top_k),
+        top_p: request
+            .top_p
+            .or(settings.top_p)
+            .unwrap_or(recommended.top_p),
+        seed: recommended.seed,
     }
 }
 
@@ -780,9 +791,14 @@ pub(crate) fn prepare(
             .unwrap_or_else(|| default_model.to_string()),
         stream: request.stream.unwrap_or(false),
         job: JobRequest {
-            sampling: sampling(&request, settings),
+            sampling: sampling(&request, settings, enable_thinking),
             messages,
             enable_thinking,
+            // This API has no fields for the template knobs, so the encode
+            // path keeps the dialect's preserve default and the server-wide
+            // configured effort (or, unset, the template's own).
+            preserve_thinking: None,
+            reasoning_effort: settings.reasoning_effort,
             max_think,
             max_tokens,
             stop_sequences: request.stop_sequences.unwrap_or_default(),
@@ -1206,6 +1222,11 @@ fn counted_tokens(
         &messages,
         target.model.chat_dialect(),
         enable_thinking,
+        // The count must describe the prompt a generation would render, so it
+        // carries the same server-wide effort default; the preamble it selects
+        // is tokens.
+        None,
+        settings.reasoning_effort,
         tools,
         None,
     )
@@ -2162,13 +2183,44 @@ mod tests {
         assert_eq!(request.job.max_tokens, 100);
     }
 
+    /// Sampling resolves request over server config over the model card's
+    /// mode-keyed recommendation: with nothing pinned, a thinking request
+    /// defaults to 1.0/20/0.95 and a `thinking: disabled` one to 0.7/20/0.80.
     #[test]
-    fn sampling_falls_back_to_the_server_defaults() {
-        let defaults = prepared(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#);
-        assert_eq!(defaults.job.sampling.temperature, settings().temperature);
-        assert_eq!(defaults.job.sampling.top_k, settings().top_k);
-        assert_eq!(defaults.job.sampling.top_p, settings().top_p);
-        assert_eq!(defaults.job.sampling.seed, SamplerOptions::default().seed);
+    fn sampling_falls_back_to_the_resolved_modes_defaults() {
+        let thinking = prepared(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#);
+        assert!(thinking.job.enable_thinking);
+        assert_eq!(thinking.job.sampling.temperature, 1.0);
+        assert_eq!(thinking.job.sampling.top_k, 20);
+        assert_eq!(thinking.job.sampling.top_p, 0.95);
+        assert_eq!(thinking.job.sampling.seed, SamplerOptions::default().seed);
+
+        let instruct = prepared(
+            r#"{"max_tokens":16,"thinking":{"type":"disabled"},
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        assert!(!instruct.job.enable_thinking);
+        assert_eq!(instruct.job.sampling.temperature, 0.7);
+        assert_eq!(instruct.job.sampling.top_k, 20);
+        assert_eq!(instruct.job.sampling.top_p, 0.80);
+
+        // A server-pinned value beats the mode default; the request beats both.
+        let mut pinned = settings();
+        pinned.temperature = Some(0.5);
+        let configured = prepare(
+            parse(
+                r#"{"max_tokens":16,"thinking":{"type":"disabled"},
+                    "messages":[{"role":"user","content":"Hi"}]}"#,
+            ),
+            &pinned,
+            "m",
+        )
+        .unwrap();
+        assert_eq!(configured.job.sampling.temperature, 0.5);
+        assert_eq!(
+            configured.job.sampling.top_p, 0.80,
+            "unpinned keys keep the mode default"
+        );
 
         let asked = prepared(
             r#"{"max_tokens":16,"temperature":0.2,"top_p":0.8,"top_k":5,

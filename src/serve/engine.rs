@@ -477,12 +477,14 @@ impl EngineState {
         let (max_ctx, _) = resolve_context_length(settings.context_length, cfg.n_ctx_train)?;
         let device = gguf::metal_device()?;
         // Every job replaces this through `set_sampler`; the config defaults only cover
-        // the window between load and the first draw.
+        // the window between load and the first draw (unpinned keys take the
+        // standard thinking-mode set, since no request mode exists yet).
+        let defaults = SamplerOptions::default();
         let sampling = SamplerOptions {
-            temperature: settings.temperature,
-            top_k: settings.top_k,
-            top_p: settings.top_p,
-            ..SamplerOptions::default()
+            temperature: settings.temperature.unwrap_or(defaults.temperature),
+            top_k: settings.top_k.unwrap_or(defaults.top_k),
+            top_p: settings.top_p.unwrap_or(defaults.top_p),
+            seed: defaults.seed,
         };
         let mut generator = Generator::load(
             &device,

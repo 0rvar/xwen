@@ -724,6 +724,14 @@ impl IntoResponse for ApiError {
 pub(crate) struct JobRequest {
     pub messages: Vec<Message>,
     pub enable_thinking: bool,
+    /// Replay superseded turns' reasoning, or `None` for the checkpoint
+    /// template's own default (3.6 drops it, 3.8 keeps it).
+    pub preserve_thinking: Option<bool>,
+    /// The template `reasoning_effort` level, or `None` for the template's own
+    /// default. The dialects fold the server-wide `[thinking] effort` setting
+    /// in before the job is built, so `None` here really is the template
+    /// default. Rendered by the 3.8 template only; inert on 3.6.
+    pub reasoning_effort: Option<chat::ReasoningEffort>,
     pub max_think: Option<usize>,
     pub max_tokens: usize,
     pub sampling: SamplerOptions,
@@ -805,9 +813,22 @@ pub(crate) fn encode_conversation(
     messages: &[Message],
     dialect: chat::ChatDialect,
     enable_thinking: bool,
+    preserve_thinking: Option<bool>,
+    reasoning_effort: Option<chat::ReasoningEffort>,
     tools: Vec<Value>,
     continuation: Option<&chat::Continuation>,
 ) -> Result<EncodedPrompt> {
+    // The checkpoint's template supplies every option the request left open:
+    // `None` for preserve or effort means that template's own default.
+    let mut opts = ChatOptions::for_dialect(dialect);
+    opts.enable_thinking = enable_thinking;
+    opts.tools = tools;
+    if let Some(preserve) = preserve_thinking {
+        opts.preserve_thinking = preserve;
+    }
+    if let Some(effort) = reasoning_effort {
+        opts.reasoning_effort = effort;
+    }
     let chat::PromptParts {
         context,
         header,
@@ -816,17 +837,7 @@ pub(crate) fn encode_conversation(
         header_prefix_start,
         starts_in_thinking,
         system_end,
-    } = chat::build_prompt_parts_with_spans_continued(
-        messages,
-        &ChatOptions {
-            enable_thinking,
-            tools,
-            // The checkpoint's template decides everything else, its
-            // preserve_thinking and reasoning_effort defaults included.
-            ..ChatOptions::for_dialect(dialect)
-        },
-        continuation,
-    )?;
+    } = chat::build_prompt_parts_with_spans_continued(messages, &opts, continuation)?;
     let (mut tokens, anchor) = match system_end {
         Some(split) => {
             let (system_ranges, body_ranges) = split_content_ranges(&content_ranges, split);
@@ -915,6 +926,8 @@ pub(crate) fn submit(
         &request.messages,
         model.model.chat_dialect(),
         request.enable_thinking,
+        request.preserve_thinking,
+        request.reasoning_effort,
         request.tools.clone(),
         request.continuation.as_ref(),
     )
@@ -1251,9 +1264,10 @@ pub(crate) mod testutil {
             tui: config::DEFAULT_TUI,
             thinking_force: config::DEFAULT_THINKING_FORCE,
             thinking_budget: None,
-            temperature: config::DEFAULT_TEMPERATURE,
-            top_k: config::DEFAULT_TOP_K,
-            top_p: config::DEFAULT_TOP_P,
+            reasoning_effort: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
             cache_snapshots: config::DEFAULT_CACHE_SNAPSHOTS,
             cache_slots: config::DEFAULT_CACHE_SLOTS,
             // No disk tier for a handler test: nothing here reaches the engine, and
@@ -1797,6 +1811,8 @@ mod tests {
         JobRequest {
             messages: vec![Message::User("Hi".into())],
             enable_thinking: true,
+            preserve_thinking: None,
+            reasoning_effort: None,
             max_think: None,
             max_tokens,
             sampling: SamplerOptions::default(),
@@ -1976,6 +1992,8 @@ mod tests {
             &messages,
             chat::ChatDialect::Qwen36,
             true,
+            None,
+            None,
             Vec::new(),
             Some(&continuation),
         )
@@ -2023,6 +2041,8 @@ mod tests {
             &messages,
             chat::ChatDialect::Qwen36,
             true,
+            None,
+            None,
             Vec::new(),
             None,
         )
@@ -2176,9 +2196,17 @@ mod tests {
                     let boundary = expected.len();
                     expected.extend(tok.encode(&parts.header).expect("the header encodes"));
 
-                    let encoded =
-                        encode_conversation(&tok, msgs, chat::ChatDialect::Qwen36, on, tools, None)
-                            .expect("the conversation encodes");
+                    let encoded = encode_conversation(
+                        &tok,
+                        msgs,
+                        chat::ChatDialect::Qwen36,
+                        on,
+                        None,
+                        None,
+                        tools,
+                        None,
+                    )
+                    .expect("the conversation encodes");
                     assert_eq!(
                         encoded.tokens, expected,
                         "thinking={on} tokenizes differently when split at the system block"
