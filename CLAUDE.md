@@ -323,13 +323,16 @@ dialect layers (Qwen's `<function=...>` XML-ish call format, string-args-raw rul
 prefix-cache snapshots carrying recurrent state (see decisions.md "Serving"). Thinking
 semantics ARE adapted as of 2026-08-19: open-`<think>` seeding, per-dialect
 preserve_thinking (a request field on the native and OpenAI dialects, the checkpoint
-template's default otherwise), the 3.8 reasoning_effort preamble (the OpenAI
-`reasoning_effort` field drives the think budget AND the template level, off-scale
-levels nearest-mapped — a deliberate divergence from llama.cpp, which passes them raw
-and lets the template raise; `chat_template_kwargs` {enable_thinking, preserve_thinking,
-reasoning_effort} is STRICTLY validated with 400s, the one exception to accept-and-drop;
-`[thinking] effort` / `serve --reasoning-effort` set a server-wide default, inert on
-3.6), and mode-keyed sampling resolved per request after thinking is known (the fixed
+template's default otherwise — the normalizers pass ALL replayed reasoning through in
+native tools mode; the renderer's dialect rule alone decides what renders), the 3.8
+reasoning_effort preamble (the OpenAI `reasoning_effort` field drives the think budget
+AND the template level, off-scale levels nearest-mapped — a deliberate divergence from
+llama.cpp, which passes them raw and lets the template raise; `chat_template_kwargs`
+{enable_thinking, preserve_thinking, reasoning_effort} is STRICTLY validated with
+400s, the one exception to accept-and-drop, and a request-level template effort — the
+kwarg or the native field — on a 3.6 target is itself a 400; `[thinking] effort` /
+`serve --reasoning-effort` set a server-wide default, inert-but-legal on 3.6), and
+mode-keyed sampling resolved per request after thinking is known (the fixed
 DEFAULT_TEMPERATURE/TOP_K/TOP_P constants are gone; ServeSettings sampling keys are
 Options, and a pinned value pins both modes). Still open on thinking: the Anthropic
 dialect has no per-request effort knob (server-wide default applies) and penalties stay

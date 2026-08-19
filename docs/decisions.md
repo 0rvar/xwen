@@ -1219,6 +1219,43 @@ parameters the vendored templates actually take — `enable_thinking`,
 `preserve_thinking`, `reasoning_effort` — the official Qwen card's (and vLLM's) request
 shape.
 
+Extended 2026-08-19 (the arc's review pass): a request-level TEMPLATE effort on a 3.6
+target is a 400 by the same argument. `chat_template_kwargs.reasoning_effort` (and the
+native dialect's `reasoning_effort` field — the same raw parameter) name a parameter
+only the 3.8 template defines; on a 3.6 checkpoint they would render nothing, which is
+precisely the silently-different-prompt outcome strict validation exists to prevent,
+and it contradicted the CLI, where `--reasoning-effort` on a 3.6 checkpoint had been a
+startup error since the arc landed. llama.cpp would silently ignore an unused kwarg —
+a deliberate divergence, consistent with this repo's cross-check-instead-of-shrug flag
+policy. Both `prepare`s take the resolved `Target` and the error names the model. The
+boundaries, each deliberate: the OpenAI TOP-LEVEL `reasoning_effort` field stays
+accepted on 3.6 (it carries budget semantics on every checkpoint, and the error points
+clients at it); kwargs `enable_thinking`/`preserve_thinking` stay accepted on 3.6
+(real parameters of that template); and the server-wide `[thinking] effort` default
+stays inert-but-legal on 3.6 — it is an operator setting covering whatever checkpoints
+a server serves, not a request asking this model for a level.
+
+**Normalization passes assistant reasoning through in native tools mode; retention is
+decided once, in the renderer, per dialect (2026-08-19, the arc's review pass).** Both
+compat normalizers used to strip `reasoning` from every assistant turn before the
+trailing assistant/tool run. That rule predates the dialect arc, when the renderer
+dropped exactly those turns anyway (`preserve_thinking || index > last_query`, with
+preserve always false), so the early strip was invisible. The 3.8 template made it a
+bug: its `preserve_thinking` default is TRUE — the 3.8 card recommends preserved
+thinking for agent workloads — so the dialect asked the renderer to keep reasoning the
+normalizers had already destroyed, the OpenAI kwarg `preserve_thinking: true` was
+defeated on every checkpoint, and the three dialects disagreed (native replayed
+everything, the compat APIs didn't). Now native tools mode passes every turn's
+reasoning through and the renderer's dialect rule is the single owner; the
+`trailing_run_start` predicates are gone. The debug tools modes keep dropping
+reasoning everywhere — they render the history as if tools had never existed, which is
+their documented point. One nuance recorded so nobody "fixes" it back: Anthropic's
+real Messages API strips non-trailing thinking blocks, and this dialect deliberately
+does NOT emulate that — it is a wire-compatibility layer over Qwen checkpoints, and
+what renders must follow the checkpoint's template, not the API vendor's serving
+policy. A 3.6 request still renders without superseded reasoning, but because the 3.6
+template says so, not because the API layer pre-judged it.
+
 ## The prefix cache and the disk tier
 
 Inherited from laguna; correctness now depends on snapshotting (KV cache for the 10–16

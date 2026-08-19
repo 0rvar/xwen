@@ -102,8 +102,9 @@ pub(crate) struct GenerateRequest {
     pub thinking: Option<bool>,
     /// The template's reasoning-effort level — "low", "medium" or "xhigh", the
     /// raw parameter with no budget semantics. Absent follows the server's
-    /// configured default, else the template's own (xhigh). Rendered by the
-    /// 3.8 template only; inert on a 3.6 checkpoint.
+    /// configured default, else the template's own (xhigh). Only the 3.8
+    /// template defines the parameter, so naming a level on a 3.6 checkpoint
+    /// is a 400, not a silent no-op.
     pub reasoning_effort: Option<String>,
     /// Replay superseded turns' reasoning. Absent keeps the checkpoint
     /// template's own default (3.6 drops it, 3.8 keeps it).
@@ -126,9 +127,10 @@ pub(crate) struct GenerateRequest {
 pub(crate) struct InputMessage {
     pub role: String,
     pub content: String,
-    /// An assistant turn's reasoning, replayed verbatim. Unlike the compat
-    /// dialects there is no trailing-run predicate: this API replays exactly
-    /// what the caller sent, and thinking being off is what drops it.
+    /// An assistant turn's reasoning, replayed verbatim — the same
+    /// pass-through the compat dialects' native tools mode applies. Which
+    /// turns render it is the checkpoint template's decision
+    /// (`preserve_thinking`), and thinking being off is what drops it.
     pub thinking: Option<String>,
 }
 
@@ -267,6 +269,7 @@ fn normalize(request: &GenerateRequest) -> Result<Vec<Message>, ApiError> {
 pub(crate) fn prepare(
     request: GenerateRequest,
     settings: &ServeSettings,
+    target: crate::serve::types::Target,
 ) -> Result<Prepared, ApiError> {
     if request.messages.is_empty() {
         return Err(bad_request(EMPTY_MESSAGES));
@@ -277,6 +280,20 @@ pub(crate) fn prepare(
     // Absent fields follow the operator's server policy, like the compat
     // dialects; explicit fields override it.
     let enable_thinking = request.thinking.unwrap_or(settings.thinking_force);
+    // The field is the raw template parameter, and the target's 3.6 template
+    // has no such parameter: this API refuses fields it would ignore, the same
+    // rule the OpenAI dialect's effort kwarg and the CLI's --reasoning-effort
+    // follow. The server-wide configured effort is an operator default, not a
+    // request, and stays inert-but-legal below.
+    if request.reasoning_effort.is_some()
+        && target.model.chat_dialect() == crate::chat::ChatDialect::Qwen36
+    {
+        return Err(bad_request(format!(
+            "reasoning_effort: {} renders the Qwen 3.6 chat template, which has no \
+             reasoning_effort parameter (it is a Qwen 3.8 template feature)",
+            target.model.full_name(),
+        )));
+    }
     let reasoning_effort = request
         .reasoning_effort
         .as_deref()
@@ -512,7 +529,7 @@ pub(crate) async fn generate(State(state): State<AppState>, body: Bytes) -> Resp
             return bad_request(format!("could not parse the request body: {e}")).into_response();
         }
     };
-    let prepared = match prepare(request, &state.settings) {
+    let prepared = match prepare(request, &state.settings, state.default_target) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
     };
@@ -561,18 +578,25 @@ pub(crate) async fn generate(State(state): State<AppState>, body: Bytes) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::testutil::{encode_all, names, payload, settings, shape};
+    use crate::serve::testutil::{encode_all, names, payload, render, settings, shape};
 
     fn parse(body: &str) -> GenerateRequest {
         serde_json::from_str(body).expect("request parses")
     }
 
+    /// The default test target: the checkpoint whose template takes every
+    /// field this API exposes, so a test is about the field it names rather
+    /// than about the dialect refusal. The refusal test passes a 3.6 target.
+    fn target() -> crate::serve::types::Target {
+        crate::serve::types::Target::official(crate::hub::Model::Qwen3827B)
+    }
+
     fn prepared(body: &str) -> Prepared {
-        prepare(parse(body), &settings()).expect("request prepares")
+        prepare(parse(body), &settings(), target()).expect("request prepares")
     }
 
     fn rejected(body: &str) -> ApiError {
-        prepare(parse(body), &settings())
+        prepare(parse(body), &settings(), target())
             .err()
             .expect("request is rejected")
     }
@@ -657,6 +681,7 @@ mod tests {
                     "messages":[{"role":"user","content":"Hi"}]}"#,
             ),
             &pinned,
+            target(),
         )
         .unwrap();
         assert_eq!(configured.job.sampling.top_p, 0.9);
@@ -701,12 +726,76 @@ mod tests {
         let fallback = prepare(
             parse(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#),
             &configured,
+            target(),
         )
         .unwrap();
         assert_eq!(
             fallback.job.reasoning_effort,
             Some(crate::chat::ReasoningEffort::Medium)
         );
+    }
+
+    /// The effort field on a 3.6 checkpoint is a 400 naming the model — its
+    /// template has no such parameter, and this API refuses fields it would
+    /// ignore. The server-wide configured default is an operator setting, not
+    /// a request, and stays inert-but-legal there.
+    #[test]
+    fn reasoning_effort_on_a_36_checkpoint_is_refused() {
+        let q36 = crate::serve::types::Target::official(crate::hub::Model::Qwen27B);
+        let error = prepare(
+            parse(
+                r#"{"max_tokens":16,"reasoning_effort":"low",
+                    "messages":[{"role":"user","content":"Hi"}]}"#,
+            ),
+            &settings(),
+            q36,
+        )
+        .err()
+        .expect("a 3.6 target refuses the field");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            message(&error).contains("Qwen3.6-27B"),
+            "{}",
+            message(&error)
+        );
+
+        let mut configured = settings();
+        configured.reasoning_effort = Some(crate::chat::ReasoningEffort::Medium);
+        let request = prepare(
+            parse(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#),
+            &configured,
+            q36,
+        )
+        .expect("a configured default prepares on 3.6");
+        assert_eq!(
+            request.job.reasoning_effort,
+            Some(crate::chat::ReasoningEffort::Medium)
+        );
+    }
+
+    /// The retention rule, end to end: the replayed reasoning reaches the
+    /// renderer on every turn, each dialect's template default decides what
+    /// renders, and the request's `preserve_thinking` turns the 3.6 default
+    /// around.
+    #[test]
+    fn the_renderer_dialect_decides_which_replayed_reasoning_survives() {
+        const HISTORY: &str = r#""messages":[
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":"answered","thinking":"stale"},
+            {"role":"user","content":"second"}]"#;
+        let job = prepared(&format!(r#"{{"max_tokens":16,{HISTORY}}}"#)).job;
+        let q36 = render(&job, crate::chat::ChatDialect::Qwen36);
+        assert!(!q36.contains("stale"), "{q36}");
+        let q38 = render(&job, crate::chat::ChatDialect::Qwen38);
+        assert!(q38.contains("stale"), "{q38}");
+
+        // preserve_thinking: true keeps the superseded reasoning on 3.6 too.
+        let job = prepared(&format!(
+            r#"{{"max_tokens":16,"preserve_thinking":true,{HISTORY}}}"#
+        ))
+        .job;
+        let q36 = render(&job, crate::chat::ChatDialect::Qwen36);
+        assert!(q36.contains("stale"), "{q36}");
     }
 
     /// An absent `thinking` follows the operator's server policy — both the
@@ -720,6 +809,7 @@ mod tests {
             prepare(
                 serde_json::from_str::<GenerateRequest>(body).expect("parse"),
                 &policy,
+                target(),
             )
             .expect("prepare")
         };
@@ -758,8 +848,8 @@ mod tests {
     }
 
     /// The conversation is replayed exactly as sent: a system message leads it,
-    /// and an assistant turn keeps the reasoning the caller attached — no
-    /// trailing-run predicate, which is the compat dialects' problem.
+    /// and an assistant turn keeps the reasoning the caller attached — the
+    /// renderer's dialect decides what actually renders.
     #[test]
     fn the_conversation_is_replayed_verbatim() {
         let history = prepared(

@@ -52,7 +52,9 @@ answer) and `--reasoning-effort <low|medium|xhigh>` — a Qwen 3.8 chat-template
 that renders a system-preamble instruction (`xhigh` is the template's own default;
 `medium` renders nothing). On a 3.6 checkpoint `--reasoning-effort` is a startup error:
 that template has no such parameter, and inert flags are refused rather than ignored.
-Both flags are also rejected with `--raw`, which never renders a template.
+Both flags are also rejected with `--raw`, which never renders a template, and
+`--no-think` rejects a nonzero `--min-think`/`--max-think` — both budgets govern the
+`<think>` block a no-think prompt closes itself.
 
 Each checkpoint renders under its own template dialect (`Model::chat_dialect`,
 2026-08-19): besides the effort preamble, the 3.8 template defaults `preserve_thinking`
@@ -76,9 +78,15 @@ On the serve side, requests pick thinking per dialect: Anthropic `thinking`, nat
 `reasoning_effort` (the official Qwen card's shape; strictly validated — an unknown key,
 wrong type, or off-scale level is a 400, unlike the sampling params this dialect accepts
 and drops). The native dialect takes `reasoning_effort` and `preserve_thinking`
-directly. `[thinking] effort` in a serve config, or `serve --reasoning-effort`, sets a
-server-wide template-effort default (inert on the 3.6 checkpoints); the Anthropic
-dialect has no per-request effort field, so that default is what its requests get.
+directly. A request-level template effort — the kwarg or the native field — on a 3.6
+target is a 400 naming the model, the same rule as the CLI flag; the top-level OpenAI
+field stays accepted there (it carries budget semantics on every checkpoint).
+`[thinking] effort` in a serve config, or `serve --reasoning-effort`, sets a
+server-wide template-effort default (inert-but-legal on the 3.6 checkpoints); the
+Anthropic dialect has no per-request effort field, so that default is what its
+requests get. Replayed reasoning is passed through to the renderer on every assistant
+turn; each checkpoint's `preserve_thinking` rule decides what renders (3.6 drops
+superseded reasoning, 3.8 keeps it).
 
 ## Speculative decoding
 

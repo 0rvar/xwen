@@ -378,46 +378,6 @@ fn push_turn(messages: &mut Vec<Message>, turn: Message) {
     }
 }
 
-/// Where the trailing run of assistant and tool-result turns starts: just past
-/// the last user message that carried content of its own.
-///
-/// Reasoning is replayed verbatim only from there on. That run is the model's
-/// own working notes on the request it is still answering — a tool loop is one
-/// turn of thought interrupted by results — while reasoning from before the
-/// last real user message belongs to a question already answered, and renders
-/// as the template's empty `<think></think>`.
-fn trailing_run_start(request: &MessagesRequest, mode: ToolsMode) -> usize {
-    let mut start = 0;
-    for (index, message) in request.messages.iter().enumerate() {
-        if message.role != "user" {
-            continue;
-        }
-        let Some(content) = &message.content else {
-            continue;
-        };
-        let mut parts = Vec::new();
-        // A block this server refuses is not this function's error to report:
-        // the normalization pass raises it with the right message.
-        if segments(content, &mut parts, mode).is_err() {
-            continue;
-        }
-        // A message carrying tool results is the loop continuing, not a new
-        // request — even when it carries text as well, which is how a harness
-        // attaches a reminder to the results it is returning. Only a turn that
-        // is purely the user speaking starts a new run.
-        let answers_a_call = parts
-            .iter()
-            .any(|part| matches!(part, Segment::ToolResult { .. }));
-        let speaks = parts
-            .iter()
-            .any(|part| matches!(part, Segment::Text(text) if !text.is_empty()));
-        if speaks && !answers_a_call {
-            start = index + 1;
-        }
-    }
-    start
-}
-
 /// Put a user turn's tool results into the order the calls they answer were
 /// made in, leaving everything else where it is.
 ///
@@ -472,13 +432,12 @@ pub(crate) fn normalize(
     if let Some(system) = &request.system {
         messages.push(Message::System(text_of(system, mode)?));
     }
-    let trailing_run = trailing_run_start(request, mode);
     // The ids of the calls the assistant turn just before this one made, which
     // is the only turn a client's `tool_use_id`s can refer to. Cleared by
     // anything that is not an assistant turn, and accumulated across a run of
     // them, since `push_turn` merges those into one rendered turn.
     let mut preceding_calls: Vec<String> = Vec::new();
-    for (index, message) in request.messages.iter().enumerate() {
+    for message in &request.messages {
         let Some(content) = &message.content else {
             continue;
         };
@@ -530,10 +489,14 @@ pub(crate) fn normalize(
                     }
                 }
                 // Replaying reasoning is part of serving tools: it is what
-                // carries a plan across the results it is waiting on. A server
-                // told not to serve them renders the history it always did.
-                let keep_reasoning =
-                    mode == ToolsMode::Native && index >= trailing_run && !reasoning.is_empty();
+                // carries a plan across the results it is waiting on. It is
+                // passed through on EVERY assistant turn — which turns render
+                // it is the renderer's per-dialect decision (chat.rs: 3.6
+                // drops superseded reasoning, 3.8's preserve_thinking default
+                // keeps it), so Anthropic's own strip of non-trailing thinking
+                // is deliberately not emulated here. A server told not to
+                // serve tools renders the history it always did.
+                let keep_reasoning = mode == ToolsMode::Native && !reasoning.is_empty();
                 push_turn(
                     &mut messages,
                     Message::Assistant {
@@ -1267,7 +1230,7 @@ mod tests {
     use super::*;
     use crate::chat;
     use crate::serve::CompletedToolCall;
-    use crate::serve::testutil::{encode_all, names, payload, settings, shape};
+    use crate::serve::testutil::{encode_all, names, payload, render, settings, shape};
 
     fn parse(body: &str) -> MessagesRequest {
         serde_json::from_str(body).expect("request parses")
@@ -1443,8 +1406,11 @@ mod tests {
         assert_eq!(shape(&blocks.job.messages), shape(&plain.job.messages));
     }
 
+    /// Thinking blocks ride the history to the renderer even on a superseded
+    /// turn — retention is the template dialect's call — while a redacted
+    /// block contributes nothing.
     #[test]
-    fn assistant_thinking_blocks_are_stripped_from_the_history() {
+    fn assistant_thinking_blocks_ride_the_history() {
         let request = prepared(
             r#"{"max_tokens":16,"messages":[
                 {"role":"user","content":"2+2?"},
@@ -1456,7 +1422,7 @@ mod tests {
         );
         assert_eq!(
             shape(&request.job.messages),
-            vec!["user:2+2?", "assistant:4", "user:thanks"]
+            vec!["user:2+2?", "assistant:4|think:add them", "user:thanks"]
         );
     }
 
@@ -1699,11 +1665,16 @@ mod tests {
         }
     }
 
-    /// Reasoning is the model's working notes on the request it is still
-    /// answering, so it survives across the tool loop it belongs to and is
-    /// dropped once a new user message starts a new one.
+    /// Native mode passes every assistant turn's reasoning to the renderer,
+    /// superseded turns included: which turns render it is the template
+    /// dialect's decision (chat.rs: 3.6 drops pre-last-query reasoning, 3.8's
+    /// `preserve_thinking` default keeps it), and normalization dropping any
+    /// of it would overrule the template. Anthropic's own API strips
+    /// non-trailing thinking; this dialect deliberately does not emulate that
+    /// — it serves Qwen checkpoints, and the 3.8 card asks for preserved
+    /// thinking (decisions.md "Serving").
     #[test]
-    fn reasoning_survives_the_trailing_tool_loop_only() {
+    fn reasoning_is_passed_through_on_every_assistant_turn() {
         let request = prepared_in(
             r#"{"max_tokens":16,"messages":[
                 {"role":"user","content":"first"},
@@ -1725,7 +1696,7 @@ mod tests {
             shape(&request.job.messages),
             vec![
                 "user:first",
-                "assistant:answered",
+                "assistant:answered|think:old notes",
                 "user:second",
                 "assistant:|think:fresh notes",
                 "tool:42",
@@ -1734,12 +1705,35 @@ mod tests {
         );
     }
 
-    /// Returning results with something else to say — a harness attaching a
-    /// reminder to them — is still the loop continuing, so the reasoning it was
-    /// carrying survives. Getting this wrong drops the model's plan at exactly
-    /// the turn it needs it.
+    /// The retention rule, end to end: the same normalized history rendered
+    /// under each dialect. 3.6 drops pre-last-query reasoning (the superseded
+    /// turn shows its answer alone); 3.8's `preserve_thinking` default keeps
+    /// every turn's. This API has no preserve field of its own, so the
+    /// checkpoint's template default is the whole rule here.
     #[test]
-    fn a_user_turn_that_mixes_text_with_results_does_not_end_the_run() {
+    fn the_renderer_dialect_decides_which_replayed_reasoning_survives() {
+        let job = prepared_in(
+            r#"{"max_tokens":16,"messages":[
+                {"role":"user","content":"first"},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"stale","signature":"x"},
+                    {"type":"text","text":"answered"}]},
+                {"role":"user","content":"second"}]}"#,
+            ToolsMode::Native,
+        )
+        .job;
+        let q36 = render(&job, chat::ChatDialect::Qwen36);
+        assert!(!q36.contains("stale"), "{q36}");
+        let q38 = render(&job, chat::ChatDialect::Qwen38);
+        assert!(q38.contains("stale"), "{q38}");
+    }
+
+    /// A user turn that returns results with something else to say — a harness
+    /// attaching a reminder to them — splits into tool turns and a user turn
+    /// in the client's order, and the reasoning on both sides of it passes
+    /// through.
+    #[test]
+    fn a_user_turn_that_mixes_text_with_results_keeps_the_turns_order() {
         let request = prepared_in(
             r#"{"max_tokens":16,"messages":[
                 {"role":"user","content":"look it up"},
@@ -1858,7 +1852,7 @@ mod tests {
             {"role":"assistant","content":[
                 {"type":"thinking","thinking":"add them","signature":"x"},
                 {"type":"text","text":"4"}]}]}"#;
-        // Native keeps it: the assistant turn is the trailing run.
+        // Native passes it through.
         assert_eq!(
             shape(&prepared_in(HISTORY, ToolsMode::Native).job.messages),
             vec!["user:2+2?", "assistant:4|think:add them"]
@@ -1890,8 +1884,8 @@ mod tests {
             vec!["user:hi", "assistant:hello"]
         );
 
-        // Even alone in the turn, and even inside the trailing run where
-        // reasoning is kept: there is nothing to keep.
+        // Even alone in the turn, and even in native mode where reasoning is
+        // passed through: there is nothing to pass.
         let request = prepared_in(
             r#"{"max_tokens":16,"messages":[
                 {"role":"user","content":"hi"},

@@ -730,7 +730,9 @@ pub(crate) struct JobRequest {
     /// The template `reasoning_effort` level, or `None` for the template's own
     /// default. The dialects fold the server-wide `[thinking] effort` setting
     /// in before the job is built, so `None` here really is the template
-    /// default. Rendered by the 3.8 template only; inert on 3.6.
+    /// default. Rendered by the 3.8 template only; a REQUEST naming a level is
+    /// a 400 on a 3.6 target, so on 3.6 only the server-wide default reaches
+    /// this field, where it renders nothing.
     pub reasoning_effort: Option<chat::ReasoningEffort>,
     pub max_think: Option<usize>,
     pub max_tokens: usize,
@@ -1282,6 +1284,23 @@ pub(crate) mod testutil {
             draft_pause_margin: config::DEFAULT_DRAFT_PAUSE_MARGIN,
             draft_ctx: config::DEFAULT_DRAFT_CTX,
         }
+    }
+
+    /// Render a prepared job's conversation the way [`encode_conversation`]
+    /// would under `dialect` — the render half of the encode path, mirroring
+    /// its option assembly — for asserting what a checkpoint's template keeps
+    /// or drops from the history a dialect normalized.
+    pub(crate) fn render(job: &JobRequest, dialect: chat::ChatDialect) -> String {
+        let mut opts = ChatOptions::for_dialect(dialect);
+        opts.enable_thinking = job.enable_thinking;
+        opts.tools = job.tools.clone();
+        if let Some(preserve) = job.preserve_thinking {
+            opts.preserve_thinking = preserve;
+        }
+        if let Some(effort) = job.reasoning_effort {
+            opts.reasoning_effort = effort;
+        }
+        chat::build_prompt(&job.messages, &opts).expect("the conversation renders")
     }
 
     /// A conversation as `role:text` lines. `chat::Message` has no `PartialEq`,

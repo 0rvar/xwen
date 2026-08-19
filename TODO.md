@@ -1731,7 +1731,7 @@ carried.
   third "thinking, precise coding" set (temp 0.6 / top_p 0.95 / top_k 20) — not
   auto-selectable (nothing in a request says "coding"), achievable as an explicit
   `--temp 0.6`, recorded here so nobody rediscovers it as a gap.
-- [ ] **`--min-think`/`--max-think` are not guarded against `--no-think`.** The same
+- [x] **`--min-think`/`--max-think` are not guarded against `--no-think`.** The same
   distortion class as the guarded `--raw` combos (`--show-thinking`, `--no-think`,
   `--reasoning-effort` with `--raw` are all startup errors): with thinking off the
   prompt closes the `<think>` block itself, so a min/max think budget describes a span
@@ -1740,6 +1740,14 @@ carried.
   care needed is serve, where `thinking.default_budget` is a server-wide setting that
   legitimately coexists with per-request thinking-off (there it means "when a request
   thinks, cap it", so serve is NOT in scope for this guard).
+  - DONE 2026-08-19, same day (the arc's review pass): both combinations are startup
+    errors in both gen and chat arms (`ThinkArgs::check_think_budgets`, unit-tested).
+    One correction to the text above: the flags were never merely inert — the CLI arms
+    the ThinkBudget machinery unconditionally, so an armed `--max-think` against a
+    no-think reply would have injected the wrap-up sentence and a stray `</think>`
+    into the answer (serve guards this via `max_think.filter(|_|
+    starts_in_thinking)`; the CLI path had no such filter). Serve stays out of scope,
+    as argued.
 - [ ] **The Anthropic dialect has no per-request template-effort knob.** Its API shape
   has no natural field: `thinking.budget_tokens` is a budget, not a level, and inventing
   a nonstandard field on a compat dialect defeats the point of speaking the dialect.

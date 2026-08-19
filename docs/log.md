@@ -4,6 +4,58 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-19 (later, same day) — The dialect arc's review pass lands three fixes: reasoning retention moves wholly to the renderer, --no-think rejects armed think budgets, and a request-level template effort on 3.6 is a 400
+
+The arc below went through review before closing: one internal reviewer came back
+clean, the external second-model reviewer (a different model family, per the working
+rule that different families catch different bugs) found all three defects fixed here.
+Nothing else changed; the docs entries this pass touches are annotated in place.
+
+**Reasoning retention is decided ONCE, in the renderer, per dialect.** Both compat
+normalizers (openai.rs, anthropic.rs) were stripping assistant `reasoning` from every
+turn before the trailing assistant/tool run — a rule from before the dialect arc, when
+the renderer dropped exactly those turns anyway, so stripping early was invisible.
+After the arc it was load-bearing and wrong: the Qwen38 dialect's
+`preserve_thinking=true` default (and the OpenAI kwarg `preserve_thinking: true` on
+any checkpoint) asked the renderer to keep reasoning the normalizers had already
+destroyed, and the three dialects disagreed — native replayed everything while the two
+compat APIs silently didn't. Now NATIVE tools mode passes reasoning through on every
+assistant turn and `chat.rs`'s dialect rule (`preserve_thinking || index > last_query`)
+is the single owner of what renders; the `trailing_run_start` predicates are deleted.
+The debug tools modes still drop reasoning everywhere, deliberately (they render the
+pre-tools history). Noted in decisions.md: Anthropic's real API strips non-trailing
+thinking and this dialect deliberately does NOT emulate that — it serves Qwen
+checkpoints, whose 3.8 card recommends preserved thinking for agent workloads.
+End-to-end tests in all three dialect files render a normalized multi-turn history
+under both dialects: 3.6 drops the pre-last-query reasoning, 3.8 keeps it, and
+`preserve_thinking: true` keeps it on 3.6 too.
+
+**CLI: `--no-think` with a nonzero `--min-think`/`--max-think` is a startup error**
+(both gen and chat arms, `ThinkArgs::check_think_budgets`). The ledger item had filed
+the combination as "inert"; the review found it worse — the CLI arms the ThinkBudget
+machinery unconditionally, so the ceiling would have waited for a `</think>` a
+no-think reply never emits and eventually forced its wrap-up sentence and a stray
+`</think>` into the answer. Serve already guards the same hazard by dropping the
+budget when the prompt does not start in thinking; the CLI now refuses it up front,
+same pattern as the `--raw` combos. TODO.md item annotated done, same day.
+
+**A request-level TEMPLATE effort on a 3.6 target is a 400, not a silent no-op.**
+`chat_template_kwargs.reasoning_effort` (OpenAI) and `reasoning_effort` (native)
+reached the renderer but only the 3.8 dialect consumes them — on a 3.6 model they
+changed nothing, contradicting both the CLI's startup error and the module's own
+strict-kwargs stance. Both `prepare`s now take the resolved `Target` and refuse the
+request with the model named; the OpenAI error points at the top-level
+`reasoning_effort` field, which keeps its budget semantics on 3.6 and stays accepted,
+as do kwargs `enable_thinking`/`preserve_thinking` (real 3.6 template parameters) and
+the server-wide `[thinking] effort` default (an operator setting, inert-but-legal on
+3.6 as before).
+
+**Verification.** `cargo build --release` clean; `cargo test --release` fully green —
+843 lib + 3 CLI + 69 parity-harness tests passed, 0 failed (5 new serve tests, 1 new
+CLI test; the four tests that pinned the old normalize-level strip are rewritten to
+pin the pass-through contract). `cargo fmt --check` clean. No model math touched; the
+parity gate was not run and did not need to be.
+
 ## 2026-08-19 — The chat template becomes a per-checkpoint DIALECT: 3.8 gets its reasoning_effort preamble and preserve_thinking default, gen/chat gain --no-think and --reasoning-effort, and sampling defaults go mode-keyed (1.0/0.95/20 thinking, 0.7/0.80/20 instruct)
 
 Two commits, one arc (a2e02d0, 205d9ba). The first makes the renderer

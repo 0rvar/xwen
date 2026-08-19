@@ -149,6 +149,37 @@ impl ThinkArgs {
         }
         Ok(opts)
     }
+
+    /// Cross-check the think-budget flags against `--no-think`.
+    ///
+    /// Both budgets govern the open `<think>` block, which a no-think prompt
+    /// closes itself before the reply begins. The floor would then just ban the
+    /// EOG ids and suppress stopping, and the armed ceiling would wait for a
+    /// decoded `</think>` that never comes, eventually forcing its wrap-up
+    /// sentence and a stray `</think>` into the answer (serve guards the same
+    /// hazard by dropping the budget when the prompt does not start in
+    /// thinking) — so the combination is a startup error, same rule as the
+    /// `--raw` combos.
+    fn check_think_budgets(&self, min_think: usize, max_think: usize) -> Result<()> {
+        if !self.no_think {
+            return Ok(());
+        }
+        if min_think > 0 {
+            bail!(
+                "--min-think {min_think} is meaningless with --no-think: the floor holds the \
+                 model inside the chat template's <think> block, which --no-think closes before \
+                 the reply begins"
+            );
+        }
+        if max_think > 0 {
+            bail!(
+                "--max-think {max_think} is meaningless with --no-think: the ceiling steers the \
+                 model out of the chat template's <think> block, which --no-think closes before \
+                 the reply begins"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// DFlash speculative-decode knobs. Speculation is opt-OUT on xwen: decoding
@@ -1065,6 +1096,7 @@ fn main() -> Result<()> {
             }
             // Validated whether or not thinking is on, so a 3.6 run learns
             // about a useless flag at startup rather than never.
+            think.check_think_budgets(min_think, max_think)?;
             let chat_opts = think.chat_options(select.size())?;
             let mut generator = build_generator(
                 &resolve_model(model, select.size())?,
@@ -1244,6 +1276,7 @@ fn main() -> Result<()> {
             draft,
         }) => {
             // Validated before the 20 GB load, like every startup cross-check.
+            think.check_think_budgets(min_think, max_think)?;
             let chat_opts = think.chat_options(select.size())?;
             let mut generator = build_generator(
                 &resolve_model(model, select.size())?,
@@ -1338,5 +1371,37 @@ mod tests {
             .expect("the default level renders nothing on 3.6, so nothing to refuse");
         assert!(!opts.enable_thinking);
         assert_eq!(opts.reasoning_effort, ReasoningEffort::Xhigh);
+    }
+
+    // The think budgets govern the <think> block that --no-think closes before
+    // the reply begins, so arming either alongside it is a startup error;
+    // either side alone is fine.
+    #[test]
+    fn think_budgets_are_refused_with_no_think() {
+        let no_think = ThinkArgs {
+            no_think: true,
+            reasoning_effort: None,
+        };
+        let error = no_think
+            .check_think_budgets(128, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--min-think"), "{error}");
+        let error = no_think
+            .check_think_budgets(0, 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--max-think"), "{error}");
+        no_think
+            .check_think_budgets(0, 0)
+            .expect("no armed budget, nothing to refuse");
+
+        let thinking = ThinkArgs {
+            no_think: false,
+            reasoning_effort: None,
+        };
+        thinking
+            .check_think_budgets(128, 4096)
+            .expect("with thinking on the budgets govern a real block");
     }
 }

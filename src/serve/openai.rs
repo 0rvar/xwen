@@ -319,24 +319,6 @@ fn push_turn(messages: &mut Vec<Message>, turn: Message) {
     }
 }
 
-/// Where the trailing run of assistant and tool-result turns begins: the
-/// stretch of the conversation since the last user message. Reasoning is
-/// replayed only inside that run — the model needs the thinking that led to the
-/// calls it is still resolving, while reasoning from turns the user has already
-/// answered is stale context the template is happy to render empty.
-fn trailing_run_start(messages: &[ChatMessage]) -> usize {
-    let mut start = messages.len();
-    while start > 0
-        && matches!(
-            messages[start - 1].role.as_str(),
-            "assistant" | "tool" | "function"
-        )
-    {
-        start -= 1;
-    }
-    start
-}
-
 /// The order to read the messages in. The template writes no ids and pairs a
 /// result with a call by position, while this API pairs them by
 /// `tool_call_id` — so a client that returns results in completion order rather
@@ -430,13 +412,16 @@ fn tool_calls_of(specs: Option<&Vec<ToolCallSpec>>) -> Result<Vec<ToolCall>, Api
 /// Turn a request's messages into the conversation the template renders.
 ///
 /// The tools mode decides how much of a tool-using history survives: `native`
-/// replays the calls and the reasoning that led to them, while the two debug
-/// modes answer as if tools had never existed — which they can only do for a
-/// conversation that contains none, and which means reasoning is dropped
-/// everywhere, exactly as it was before this server rendered tools at all.
+/// replays the calls and passes every assistant turn's reasoning through —
+/// which turns actually render it is the renderer's per-dialect decision
+/// (`chat.rs`: the 3.6 template drops superseded reasoning, the 3.8 template's
+/// `preserve_thinking` default keeps it), so dropping any of it here would
+/// overrule the template. The two debug modes answer as if tools had never
+/// existed — which they can only do for a conversation that contains none, and
+/// which means reasoning is dropped everywhere, exactly as it was before this
+/// server rendered tools at all.
 pub(crate) fn normalize(request: &ChatRequest, mode: ToolsMode) -> Result<Vec<Message>, ApiError> {
     let native = matches!(mode, ToolsMode::Native);
-    let reasoning_from = trailing_run_start(&request.messages);
     let mut messages = Vec::new();
     for index in result_order(&request.messages) {
         let message = &request.messages[index];
@@ -449,7 +434,7 @@ pub(crate) fn normalize(request: &ChatRequest, mode: ToolsMode) -> Result<Vec<Me
             "user" => Message::User(text),
             "assistant" => Message::Assistant {
                 content: text,
-                reasoning: if native && index >= reasoning_from {
+                reasoning: if native {
                     message
                         .reasoning_content
                         .clone()
@@ -789,6 +774,7 @@ pub(crate) fn prepare(
     request: ChatRequest,
     settings: &ServeSettings,
     default_model: &str,
+    target: crate::serve::types::Target,
 ) -> Result<Prepared, ApiError> {
     let tools = check_tools(&request, settings.tools_mode)?;
     if request.messages.is_empty() {
@@ -814,6 +800,23 @@ pub(crate) fn prepare(
 
     let messages = normalize(&request, settings.tools_mode)?;
     let kwargs = template_kwargs(request.chat_template_kwargs.as_ref())?;
+    // The kwarg is the raw template parameter, and the resolved target's 3.6
+    // template has no such parameter: honoring the request is impossible and
+    // dropping it is the silent-prompt-change this module's strict kwargs
+    // exist to prevent (the CLI's --reasoning-effort applies the same rule).
+    // The TOP-LEVEL field stays accepted here — it carries budget semantics on
+    // every checkpoint — and so does a server-wide configured effort, which is
+    // an operator default, not a request.
+    if kwargs.reasoning_effort.is_some()
+        && target.model.chat_dialect() == crate::chat::ChatDialect::Qwen36
+    {
+        return Err(bad_request(format!(
+            "chat_template_kwargs.reasoning_effort: {} renders the Qwen 3.6 chat template, \
+             which has no reasoning_effort parameter (it is a Qwen 3.8 template feature); \
+             for a reasoning budget on this model, use the top-level reasoning_effort field",
+            request.model.as_deref().unwrap_or(default_model),
+        )));
+    }
     let (enable_thinking, budget, reasoning_effort) =
         resolve_reasoning(request.reasoning_effort.as_deref(), &kwargs, settings)?;
     // The ceiling has to leave the reply room to conclude in: it is lowered to
@@ -1139,7 +1142,7 @@ pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes)
     // The response echoes the canonical name of the model that answered, not
     // the client's spelling of it.
     request.model = Some(model_name);
-    let prepared = match prepare(request, &state.settings, &state.model_id) {
+    let prepared = match prepare(request, &state.settings, &state.model_id, size) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
     };
@@ -1199,18 +1202,25 @@ pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes)
 mod tests {
     use super::*;
     use crate::serve::CompletedToolCall;
-    use crate::serve::testutil::{encode_all, payload, settings, shape};
+    use crate::serve::testutil::{encode_all, payload, render, settings, shape};
 
     fn parse(body: &str) -> ChatRequest {
         serde_json::from_str(body).expect("request parses")
     }
 
+    /// The default test target: the checkpoint whose template takes all three
+    /// kwargs, so a test is about the parameter it names rather than about the
+    /// dialect refusal. Tests about that refusal pass a 3.6 target explicitly.
+    fn target() -> crate::serve::types::Target {
+        crate::serve::types::Target::official(crate::hub::Model::Qwen3827B)
+    }
+
     fn prepared(body: &str) -> Prepared {
-        prepare(parse(body), &settings(), "laguna-s-2.1").expect("request prepares")
+        prepare(parse(body), &settings(), "laguna-s-2.1", target()).expect("request prepares")
     }
 
     fn rejected(body: &str) -> ApiError {
-        prepare(parse(body), &settings(), "laguna-s-2.1")
+        prepare(parse(body), &settings(), "laguna-s-2.1", target())
             .err()
             .expect("request is rejected")
     }
@@ -1233,11 +1243,11 @@ mod tests {
 
     /// Prepare under an explicit tools policy.
     fn prepared_with(mode: ToolsMode, body: &str) -> Prepared {
-        prepare(parse(body), &tools(mode), "laguna-s-2.1").expect("request prepares")
+        prepare(parse(body), &tools(mode), "laguna-s-2.1", target()).expect("request prepares")
     }
 
     fn rejected_with(mode: ToolsMode, body: &str) -> ApiError {
-        prepare(parse(body), &tools(mode), "laguna-s-2.1")
+        prepare(parse(body), &tools(mode), "laguna-s-2.1", target())
             .err()
             .unwrap_or_else(|| panic!("request is rejected: {body}"))
     }
@@ -1286,7 +1296,7 @@ mod tests {
     fn the_default_cap_never_exceeds_the_context() {
         let mut settings = settings();
         settings.context_length = 4096;
-        let request = prepare(parse(&format!(r#"{{{USER}}}"#)), &settings, "m").unwrap();
+        let request = prepare(parse(&format!(r#"{{{USER}}}"#)), &settings, "m", target()).unwrap();
         assert_eq!(request.job.max_tokens, 4096);
     }
 
@@ -1300,7 +1310,7 @@ mod tests {
         let mut settings = settings();
         settings.thinking_force = false;
         settings.thinking_budget = Some(4096);
-        let request = prepare(parse(&format!(r#"{{{USER}}}"#)), &settings, "m").unwrap();
+        let request = prepare(parse(&format!(r#"{{{USER}}}"#)), &settings, "m", target()).unwrap();
         assert!(!request.job.enable_thinking);
         assert_eq!(request.job.max_think, None);
     }
@@ -1477,6 +1487,71 @@ mod tests {
         assert_eq!(plain.job.reasoning_effort, None);
     }
 
+    /// The effort kwarg is the raw template parameter, and only the 3.8
+    /// template defines it: on a resolved 3.6 target it is a 400 naming the
+    /// model and pointing at the top-level field, not a silent no-op — the
+    /// same rule as the CLI's --reasoning-effort startup error. The top-level
+    /// field keeps its budget semantics on 3.6, the other two kwargs are real
+    /// 3.6 template parameters, and a server-wide configured effort is an
+    /// operator default that stays inert-but-legal there.
+    #[test]
+    fn a_template_effort_kwarg_on_a_36_target_is_refused() {
+        let q36 = crate::serve::types::Target::official(crate::hub::Model::Qwen27B);
+        let error = prepare(
+            parse(&format!(
+                r#"{{"model":"Qwen3.6-27B","chat_template_kwargs":{{"reasoning_effort":"low"}},{USER}}}"#
+            )),
+            &settings(),
+            "laguna-s-2.1",
+            q36,
+        )
+        .err()
+        .expect("a 3.6 target refuses the effort kwarg");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            message(&error).contains("Qwen3.6-27B"),
+            "{}",
+            message(&error)
+        );
+        assert!(message(&error).contains("top-level"), "{}", message(&error));
+
+        // The same kwarg on the 3.8 target (the helper default) prepares.
+        let request = prepared(&format!(
+            r#"{{"chat_template_kwargs":{{"reasoning_effort":"low"}},{USER}}}"#
+        ));
+        assert_eq!(request.job.reasoning_effort, Some(ReasoningEffort::Low));
+
+        // The top-level field is the budget control and stays accepted on 3.6.
+        let request = prepare(
+            parse(&format!(r#"{{"reasoning_effort":"low",{USER}}}"#)),
+            &settings(),
+            "laguna-s-2.1",
+            q36,
+        )
+        .expect("the top-level field prepares on 3.6");
+        assert_eq!(request.job.max_think, Some(EFFORT_LOW));
+
+        // The two boolean kwargs are 3.6 template parameters and stay accepted.
+        let request = prepare(
+            parse(&format!(
+                r#"{{"chat_template_kwargs":{{"enable_thinking":false,"preserve_thinking":true}},{USER}}}"#
+            )),
+            &settings(),
+            "laguna-s-2.1",
+            q36,
+        )
+        .expect("the boolean kwargs prepare on 3.6");
+        assert!(!request.job.enable_thinking);
+        assert_eq!(request.job.preserve_thinking, Some(true));
+
+        // A server-wide effort default is not a request naming one.
+        let mut configured = settings();
+        configured.reasoning_effort = Some(ReasoningEffort::Low);
+        let request = prepare(parse(&format!(r#"{{{USER}}}"#)), &configured, "m", q36)
+            .expect("a configured default prepares on 3.6");
+        assert_eq!(request.job.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
     /// Sampling resolves request over server config over the model card's
     /// mode-keyed recommendation: a thinking request defaults to 1.0/20/0.95,
     /// a non-thinking one ("none", or a kwarg opt-out) to 0.7/20/0.80, and an
@@ -1509,6 +1584,7 @@ mod tests {
             parse(&format!(r#"{{"reasoning_effort":"none",{USER}}}"#)),
             &pinned,
             "m",
+            target(),
         )
         .unwrap();
         assert_eq!(configured.job.sampling.temperature, 0.5);
@@ -1522,6 +1598,7 @@ mod tests {
             )),
             &pinned,
             "m",
+            target(),
         )
         .unwrap();
         assert_eq!(explicit.job.sampling.temperature, 0.2);
@@ -1580,7 +1657,7 @@ mod tests {
     fn tool_definitions_are_rejected_but_an_empty_list_is_not() {
         let rejecting = tools(ToolsMode::Reject);
         let reject = |body: &str| {
-            prepare(parse(body), &rejecting, "laguna-s-2.1")
+            prepare(parse(body), &rejecting, "laguna-s-2.1", target())
                 .err()
                 .unwrap_or_else(|| panic!("reject mode refuses {body}"))
         };
@@ -1601,7 +1678,7 @@ mod tests {
             format!(r#"{{"tool_choice":"auto",{USER}}}"#),
             format!(r#"{{"tool_choice":"none",{USER}}}"#),
         ] {
-            let request = prepare(parse(&body), &rejecting, "laguna-s-2.1")
+            let request = prepare(parse(&body), &rejecting, "laguna-s-2.1", target())
                 .unwrap_or_else(|_| panic!("reject mode accepts {body}"));
             assert_eq!(shape(&request.job.messages), vec!["user:Hi"]);
             assert!(request.job.tools.is_empty());
@@ -1621,10 +1698,16 @@ mod tests {
             )),
             &stripping,
             "laguna-s-2.1",
+            target(),
         )
         .expect("strip mode accepts tool definitions");
-        let toolless = prepare(parse(&format!(r#"{{{USER}}}"#)), &stripping, "laguna-s-2.1")
-            .expect("a request with no tools prepares");
+        let toolless = prepare(
+            parse(&format!(r#"{{{USER}}}"#)),
+            &stripping,
+            "laguna-s-2.1",
+            target(),
+        )
+        .expect("a request with no tools prepares");
 
         assert_eq!(shape(&stripped.job.messages), vec!["user:Hi"]);
         assert_eq!(shape(&stripped.job.messages), shape(&toolless.job.messages));
@@ -1675,8 +1758,10 @@ mod tests {
             );
         }
 
-        // Native is the mode that replays the trailing run's reasoning.
+        // Native passes every turn's reasoning through; the renderer's dialect
+        // decides which turns actually render it.
         let native = prepared_with(ToolsMode::Native, REPLAYED);
+        assert!(shape(&native.job.messages).contains(&"assistant:answered|think:old".to_string()));
         assert!(shape(&native.job.messages).contains(&"assistant:again|think:fresh".to_string()));
     }
 
@@ -2017,8 +2102,13 @@ mod tests {
     /// Reasoning is replayed for the turns since the last user message — the
     /// thinking behind the calls still being resolved — and dropped for
     /// everything the user has already answered.
+    /// Native mode passes every assistant turn's reasoning to the renderer,
+    /// superseded turns included: which turns render it is the template
+    /// dialect's decision (3.6 drops pre-last-query reasoning, 3.8's
+    /// `preserve_thinking` default keeps it), and normalization dropping any
+    /// of it would overrule the template.
     #[test]
-    fn reasoning_is_replayed_only_for_the_turns_since_the_last_user_message() {
+    fn reasoning_is_passed_through_on_every_assistant_turn() {
         let request = prepared_with(
             ToolsMode::Native,
             r#"{"messages":[
@@ -2033,7 +2123,7 @@ mod tests {
             shape(&request.job.messages),
             vec![
                 "user:first",
-                "assistant:old",
+                "assistant:old|think:stale",
                 "user:second",
                 "assistant:|think:fresh",
                 "tool:result"
@@ -2041,8 +2131,37 @@ mod tests {
         );
     }
 
-    /// A conversation that never had a user message is all trailing run: there
-    /// is no earlier turn for its reasoning to be stale relative to.
+    /// The retention rule, end to end: the same normalized history rendered
+    /// under each dialect. 3.6 drops pre-last-query reasoning (the superseded
+    /// turn shows its answer alone); 3.8's `preserve_thinking` default keeps
+    /// every turn's; and the kwarg turns the 3.6 default around, which is
+    /// exactly what normalization stripping the history would have made
+    /// impossible.
+    #[test]
+    fn the_renderer_dialect_decides_which_replayed_reasoning_survives() {
+        const HISTORY: &str = r#""messages":[
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":"answered","reasoning_content":"stale"},
+            {"role":"user","content":"second"}]"#;
+        let job = prepared_with(ToolsMode::Native, &format!(r#"{{{HISTORY}}}"#)).job;
+        let q36 = render(&job, crate::chat::ChatDialect::Qwen36);
+        assert!(!q36.contains("stale"), "{q36}");
+        let q38 = render(&job, crate::chat::ChatDialect::Qwen38);
+        assert!(q38.contains("stale"), "{q38}");
+
+        // preserve_thinking: true keeps the superseded reasoning on 3.6 too.
+        let job = prepared_with(
+            ToolsMode::Native,
+            &format!(r#"{{"chat_template_kwargs":{{"preserve_thinking":true}},{HISTORY}}}"#),
+        )
+        .job;
+        assert_eq!(job.preserve_thinking, Some(true));
+        let q36 = render(&job, crate::chat::ChatDialect::Qwen36);
+        assert!(q36.contains("stale"), "{q36}");
+    }
+
+    /// A history that opens on an assistant turn keeps that turn's reasoning
+    /// like any other.
     #[test]
     fn reasoning_survives_a_conversation_with_no_user_message() {
         let request = prepared_with(
@@ -2113,7 +2232,7 @@ mod tests {
                 "tools":[{{"type":"function","function":{{"name":"f","parameters":{{}}}}}}],
                 {USER}}}"#
         );
-        let error = prepare(parse(&body), &tools(ToolsMode::Native), "m")
+        let error = prepare(parse(&body), &tools(ToolsMode::Native), "m", target())
             .err()
             .expect("schema + tools must be refused");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
@@ -2124,7 +2243,7 @@ mod tests {
         );
         // With tools stripped by policy, the same request is servable: nothing
         // reaches the prompt for the schema to conflict with.
-        let stripped = prepare(parse(&body), &tools(ToolsMode::Strip), "m")
+        let stripped = prepare(parse(&body), &tools(ToolsMode::Strip), "m", target())
             .expect("stripped tools leave the schema free to apply");
         assert!(stripped.job.grammar.is_some());
     }
@@ -2148,7 +2267,7 @@ mod tests {
             r#"{"messages":[
                 {"role":"system","content":"Be brief."},
                 {"role":"user","content":"weather?"},
-                {"role":"assistant","content":null,"reasoning_content":"dropped"},
+                {"role":"assistant","content":null,"reasoning_content":"notes"},
                 {"role":"tool","tool_call_id":"t1","content":"sunny"},
                 {"role":"user","content":[{"type":"text","text":"thanks"}]}]}"#,
         );
@@ -2157,7 +2276,7 @@ mod tests {
             vec![
                 "system:Be brief.",
                 "user:weather?",
-                "assistant:",
+                "assistant:|think:notes",
                 "tool:sunny",
                 "user:thanks"
             ]
