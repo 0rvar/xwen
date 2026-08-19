@@ -803,6 +803,7 @@ pub(crate) struct EncodedPrompt {
 pub(crate) fn encode_conversation(
     tokenizer: &LagunaTokenizer,
     messages: &[Message],
+    dialect: chat::ChatDialect,
     enable_thinking: bool,
     tools: Vec<Value>,
     continuation: Option<&chat::Continuation>,
@@ -819,11 +820,10 @@ pub(crate) fn encode_conversation(
         messages,
         &ChatOptions {
             enable_thinking,
-            // The wire protocols have no knob for this yet, so replayed turns
-            // drop their reasoning once a later query supersedes them — the
-            // template's own default.
-            preserve_thinking: false,
             tools,
+            // The checkpoint's template decides everything else, its
+            // preserve_thinking and reasoning_effort defaults included.
+            ..ChatOptions::for_dialect(dialect)
         },
         continuation,
     )?;
@@ -913,6 +913,7 @@ pub(crate) fn submit(
     let prompt = encode_conversation(
         &state.tokenizer,
         &request.messages,
+        model.model.chat_dialect(),
         request.enable_thinking,
         request.tools.clone(),
         request.continuation.as_ref(),
@@ -1855,6 +1856,7 @@ mod tests {
                 enable_thinking: true,
                 preserve_thinking: false,
                 tools: Vec::new(),
+                ..ChatOptions::default()
             },
         )
         .expect("the prompt renders");
@@ -1969,14 +1971,22 @@ mod tests {
             prefix: Some("{\"label\": \"".into()),
         };
 
-        let encoded = encode_conversation(&tok, &messages, true, Vec::new(), Some(&continuation))
-            .expect("the conversation encodes");
+        let encoded = encode_conversation(
+            &tok,
+            &messages,
+            chat::ChatDialect::Qwen36,
+            true,
+            Vec::new(),
+            Some(&continuation),
+        )
+        .expect("the conversation encodes");
         let parts = chat::build_prompt_parts_with_spans_continued(
             &messages,
             &ChatOptions {
                 enable_thinking: true,
                 preserve_thinking: false,
                 tools: Vec::new(),
+                ..ChatOptions::default()
             },
             Some(&continuation),
         )
@@ -2008,8 +2018,15 @@ mod tests {
 
         // Without a continuation nothing is appended, and the header is the
         // template's own.
-        let plain = encode_conversation(&tok, &messages, true, Vec::new(), None)
-            .expect("the conversation encodes");
+        let plain = encode_conversation(
+            &tok,
+            &messages,
+            chat::ChatDialect::Qwen36,
+            true,
+            Vec::new(),
+            None,
+        )
+        .expect("the conversation encodes");
         assert_eq!(plain.prefix_len, 0);
         assert!(plain.starts_in_thinking);
     }
@@ -2149,6 +2166,7 @@ mod tests {
                         enable_thinking: on,
                         preserve_thinking: false,
                         tools: tools.clone(),
+                        ..ChatOptions::default()
                     };
                     let parts = chat::build_prompt_parts_with_spans(msgs, &opts)
                         .expect("the conversation renders");
@@ -2158,8 +2176,9 @@ mod tests {
                     let boundary = expected.len();
                     expected.extend(tok.encode(&parts.header).expect("the header encodes"));
 
-                    let encoded = encode_conversation(&tok, msgs, on, tools, None)
-                        .expect("the conversation encodes");
+                    let encoded =
+                        encode_conversation(&tok, msgs, chat::ChatDialect::Qwen36, on, tools, None)
+                            .expect("the conversation encodes");
                     assert_eq!(
                         encoded.tokens, expected,
                         "thinking={on} tokenizes differently when split at the system block"

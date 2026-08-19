@@ -4,23 +4,24 @@
 //! calls written as `<tool_call><function=NAME><parameter=KEY>…`.
 //! Rendered text must match `llama-server --jinja` byte-for-byte (fixtures).
 //!
-//! One renderer serves every checkpoint. Qwen 3.8 ships its own template
-//! (vendored beside the 3.6 one as reference/chat_template-qwen38.jinja) whose
-//! turn rendering and generation prompt are byte-identical to 3.6's. Two of its
-//! differences are live divergences rather than deferrals, and are ledger items
-//! (TODO.md), not accidents:
+//! One renderer serves every checkpoint, parameterized by [`ChatDialect`].
+//! Qwen 3.8 ships its own template (vendored beside the 3.6 one as
+//! reference/chat_template-qwen38.jinja) whose turn rendering and generation
+//! prompt are byte-identical to 3.6's. Its differences:
 //!
 //! - it prepends a `reasoning_effort` sentence to the system block whenever
-//!   thinking is on and no effort is named, which is the DEFAULT — so what this
-//!   module renders for 3.8 equals the official rendering at
-//!   `reasoning_effort="medium"` (the one level that injects nothing) and is
-//!   missing a system instruction at the real default, `xhigh`;
-//! - it defaults `preserve_thinking` to true where 3.6 defaults it to false, so
-//!   a 3.8 conversation rendered here drops reasoning blocks its own template
-//!   would have kept.
+//!   thinking is on and the effort is not `medium` (the one level that injects
+//!   nothing); the default level is `xhigh`. See [`ReasoningEffort`].
+//! - it defaults `preserve_thinking` to true where 3.6 defaults it to false —
+//!   [`ChatOptions::for_dialect`] carries each dialect's default.
+//! - it never emits a system block for a system message whose content is
+//!   empty, where 3.6 emits the empty block.
 //!
-//! The third difference — no inline `<think>`-in-content parsing — costs
-//! nothing, since this module never implemented that fallback.
+//! One further 3.8 difference is NOT modeled: its template no longer splits
+//! inline `<think>` blocks out of assistant content (3.6 lines 93-97 have no
+//! 3.8 counterpart). This module still splits under both dialects
+//! ([`split_reasoning`]); a 3.8 client that replays reasoning inside content
+//! rather than in the reasoning field gets the 3.6 reading (TODO.md).
 use std::fmt;
 use std::ops::Range;
 
@@ -36,11 +37,19 @@ use anyhow::Result;
 /// different token stream. Left unbumped, a stale image longest-common-prefix
 /// matches a stream the current rules would never produce, and the conversation
 /// resumes from another one's KV — the failure this stamp exists to prevent.
-pub const TOKENIZATION_RULES_VERSION: u32 = 2;
+pub const TOKENIZATION_RULES_VERSION: u32 = 3;
 
 /// The opening of the system block a request carrying tools gets, up to and
 /// including the `<tools>` tag the schemas are listed inside.
 const TOOLS_HEADER: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+
+/// The 3.8 template's system preamble for [`ReasoningEffort::Xhigh`], verbatim
+/// from reference/chat_template-qwen38.jinja. Fixed template prose, not client
+/// content: it never enters the client-content spans.
+const REASONING_EFFORT_XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+
+/// The 3.8 template's system preamble for [`ReasoningEffort::Low`], verbatim.
+const REASONING_EFFORT_LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
 
 /// The call-format instructions that follow the schema list, verbatim from the
 /// template. The example call inside it is prose, not a call the model made, but
@@ -171,19 +180,52 @@ pub enum Message {
     ToolResponse(String),
 }
 
+/// Which release's chat template a conversation renders under. The two differ
+/// only around the system block (the 3.8 `reasoning_effort` preamble and its
+/// empty-system handling) and in their `preserve_thinking` default
+/// ([`ChatOptions::for_dialect`]); every turn and the generation prompt render
+/// identically.
+///
+/// A checkpoint's dialect is [`crate::hub::Model::chat_dialect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatDialect {
+    /// reference/chat_template.jinja — Qwen3.6-27B and Qwen3.6-35B-A3B.
+    #[default]
+    Qwen36,
+    /// reference/chat_template-qwen38.jinja — Qwen3.8-27B.
+    Qwen38,
+}
+
+/// The 3.8 template's `reasoning_effort` levels. With thinking on, `xhigh` and
+/// `low` each prepend their sentence to the system block; `medium` prepends
+/// nothing. The default is the template's own `|default('xhigh')`. Meaningless
+/// under [`ChatDialect::Qwen36`], whose template has no such parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    #[default]
+    Xhigh,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatOptions {
     /// Whether the model is asked to think. On, the generation prompt ends
     /// inside an open `<think>` block; off, it ends past a closed empty one.
     pub enable_thinking: bool,
     /// Keep the reasoning of assistant turns that precede the current query.
-    /// Off — the template's own default — a replayed turn shows only its answer
-    /// once a later user message has superseded it, which is what the model was
-    /// trained to read back.
+    /// Off, a replayed turn shows only its answer once a later user message has
+    /// superseded it. The templates default this opposite ways — 3.6 off, 3.8
+    /// on ([`ChatOptions::for_dialect`]).
     pub preserve_thinking: bool,
     /// OpenAI-shape tool objects (`{"type":"function","function":{…}}`), already
     /// normalized by the HTTP layer. Empty means the request carries no tools.
     pub tools: Vec<serde_json::Value>,
+    /// Which release's template renders the conversation.
+    pub dialect: ChatDialect,
+    /// The 3.8 reasoning-effort level; read only when `dialect` is
+    /// [`ChatDialect::Qwen38`] and thinking is on.
+    pub reasoning_effort: ReasoningEffort,
 }
 
 impl Default for ChatOptions {
@@ -192,6 +234,22 @@ impl Default for ChatOptions {
             enable_thinking: true,
             preserve_thinking: false,
             tools: Vec::new(),
+            dialect: ChatDialect::Qwen36,
+            reasoning_effort: ReasoningEffort::Xhigh,
+        }
+    }
+}
+
+impl ChatOptions {
+    /// The default options for one dialect: like [`Default`], but rendering
+    /// under `dialect` with that template's own `preserve_thinking` default —
+    /// 3.6 drops superseded reasoning, 3.8 keeps it (`preserve_thinking is
+    /// undefined or is true`, template line 116).
+    pub fn for_dialect(dialect: ChatDialect) -> Self {
+        Self {
+            dialect,
+            preserve_thinking: matches!(dialect, ChatDialect::Qwen38),
+            ..Self::default()
         }
     }
 }
@@ -538,8 +596,18 @@ pub fn build_prompt_parts_with_spans_continued(
         ranges.push(start..out.len());
     }
 
-    // Header (jinja lines 45-66). Every message body, the system message
-    // included, is rendered with both ends stripped.
+    // The 3.8 template's reasoning-effort preamble (its jinja lines 45-56):
+    // fixed template prose that opens the system block whenever thinking is on
+    // and the effort is a level that names itself. Template text, not client
+    // content — it is pushed directly, never through `content`.
+    let preamble = match (opts.dialect, thinking, opts.reasoning_effort) {
+        (ChatDialect::Qwen38, true, ReasoningEffort::Xhigh) => Some(REASONING_EFFORT_XHIGH),
+        (ChatDialect::Qwen38, true, ReasoningEffort::Low) => Some(REASONING_EFFORT_LOW),
+        _ => None,
+    };
+
+    // Header (3.6 jinja lines 45-66; 3.8 lines 57-87). Every message body, the
+    // system message included, is rendered with both ends stripped.
     let leading_system = match messages.first() {
         Some(Message::System(text)) => Some(trim(text)),
         _ => None,
@@ -547,7 +615,12 @@ pub fn build_prompt_parts_with_spans_continued(
     if !opts.tools.is_empty() {
         // Tools replace the system block with the `# Tools` preamble; the
         // client's own system message, when it has one, is appended after it.
+        // The reasoning-effort sentence, when there is one, comes first of all.
         out.push_str("<|im_start|>system\n");
+        if let Some(preamble) = preamble {
+            out.push_str(preamble);
+            out.push_str("\n\n");
+        }
         out.push_str(TOOLS_HEADER);
         for tool in &opts.tools {
             out.push('\n');
@@ -564,11 +637,31 @@ pub fn build_prompt_parts_with_spans_continued(
         }
         out.push_str("<|im_end|>\n");
         system_end = Some(out.len());
-    } else if let Some(system) = leading_system {
-        // Without tools the block is the system message alone, and it is
-        // emitted even when that message is empty.
+    } else if let Some(system) = leading_system.filter(|text| !text.is_empty()) {
+        // Without tools the block is the system message, with the preamble
+        // prepended when there is one (3.8 jinja line 80).
         out.push_str("<|im_start|>system\n");
+        if let Some(preamble) = preamble {
+            out.push_str(preamble);
+            out.push_str("\n\n");
+        }
         content(&mut out, &mut ranges, system);
+        out.push_str("<|im_end|>\n");
+        system_end = Some(out.len());
+    } else if leading_system.is_some() && opts.dialect == ChatDialect::Qwen36 {
+        // A system message whose content is empty is a real dialect divergence:
+        // 3.6 emits the empty block (its jinja line 64 writes unconditionally),
+        // 3.8 does not (its lines 81-82 emit only when a preamble exists, and
+        // then hold the preamble alone — the branch below).
+        out.push_str("<|im_start|>system\n");
+        out.push_str("<|im_end|>\n");
+        system_end = Some(out.len());
+    } else if let Some(preamble) = preamble {
+        // No renderable system content, but a preamble: 3.8 synthesizes the
+        // block to carry it (jinja lines 81-82 and 84-85 — the empty-content
+        // and no-message cases render identically).
+        out.push_str("<|im_start|>system\n");
+        out.push_str(preamble);
         out.push_str("<|im_end|>\n");
         system_end = Some(out.len());
     }
@@ -763,6 +856,18 @@ mod tests {
             enable_thinking: on,
             preserve_thinking: false,
             tools,
+            ..ChatOptions::default()
+        }
+    }
+
+    /// 3.8-dialect options at one effort level, with the 3.6 `preserve` default
+    /// so a fixture's bytes can be compared across dialects turn for turn.
+    fn qwen38(on: bool, effort: ReasoningEffort) -> ChatOptions {
+        ChatOptions {
+            enable_thinking: on,
+            reasoning_effort: effort,
+            preserve_thinking: false,
+            ..ChatOptions::for_dialect(ChatDialect::Qwen38)
         }
     }
 
@@ -863,6 +968,223 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The 3.8 preamble sentences are the template's own, character for
+    /// character. They are jinja string literals with no escapes, so the raw
+    /// constants must appear verbatim — and only in the 3.8 template, which is
+    /// what makes the preamble a dialect behavior rather than a shared one.
+    /// Lengths as well as content: a constant that had lost its tail would
+    /// still be found inside the template's copy of it.
+    #[test]
+    fn the_reasoning_effort_prose_is_the_38_templates_own() {
+        for (literal, length) in [(REASONING_EFFORT_XHIGH, 207), (REASONING_EFFORT_LOW, 136)] {
+            assert_eq!(literal.len(), length);
+            assert!(
+                TEMPLATE_SOURCES[1].contains(literal),
+                "the 3.8 template does not contain {literal:?}"
+            );
+            assert!(
+                !TEMPLATE_SOURCES[0].contains(literal),
+                "the 3.6 template has no reasoning-effort prose"
+            );
+        }
+    }
+
+    // With no system message, the 3.8 dialect synthesizes a system block to
+    // carry the preamble. The block anchors the prefix cache like a client's
+    // own, and the preamble is template prose — never client content.
+    #[test]
+    fn the_38_dialect_synthesizes_a_system_block_for_the_preamble() {
+        let msgs = [Message::User("Hi".into())];
+        let opts = qwen38(true, ReasoningEffort::Xhigh);
+        let expected = format!(
+            "<|im_start|>system\n{REASONING_EFFORT_XHIGH}<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(build_prompt(&msgs, &opts).unwrap(), expected);
+
+        let parts = build_prompt_parts_with_spans(&msgs, &opts).unwrap();
+        let end = parts
+            .system_end
+            .expect("the synthesized block sets the anchor");
+        assert_eq!(
+            &parts.context[..end],
+            format!("<|im_start|>system\n{REASONING_EFFORT_XHIGH}<|im_end|>\n")
+        );
+        let slices: Vec<&str> = parts
+            .content_ranges
+            .iter()
+            .map(|r| &parts.context[r.clone()])
+            .collect();
+        assert_eq!(
+            slices,
+            vec!["Hi"],
+            "the preamble must not enter the client-content spans"
+        );
+    }
+
+    // A client system message keeps its block; the preamble is prepended with
+    // the template's blank line between them.
+    #[test]
+    fn the_38_dialect_prepends_the_preamble_to_a_system_message() {
+        let msgs = [
+            Message::System("Be brief.".into()),
+            Message::User("Hi".into()),
+        ];
+        let expected = format!(
+            "<|im_start|>system\n{REASONING_EFFORT_XHIGH}\n\nBe brief.<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(
+            build_prompt(&msgs, &qwen38(true, ReasoningEffort::Xhigh)).unwrap(),
+            expected
+        );
+    }
+
+    // With tools the preamble opens the system block, ahead of the `# Tools`
+    // header; everything after it renders as the 3.6 tools block does.
+    #[test]
+    fn the_38_dialect_puts_the_preamble_ahead_of_the_tools_header() {
+        let msgs = [
+            Message::System("You are a pirate.".into()),
+            Message::User("weather?".into()),
+        ];
+        let opts = ChatOptions {
+            tools: fixture_tools(),
+            ..qwen38(true, ReasoningEffort::Xhigh)
+        };
+        let block = tools_block().replace(
+            "<|im_start|>system\n",
+            &format!("<|im_start|>system\n{REASONING_EFFORT_XHIGH}\n\n"),
+        );
+        let expected = format!(
+            "{}\n\nYou are a pirate.<|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            block.strip_suffix("<|im_end|>\n").unwrap()
+        );
+        assert_eq!(build_prompt(&msgs, &opts).unwrap(), expected);
+    }
+
+    // `low` renders its own sentence; `medium` renders nothing at all, so the
+    // bytes equal a 3.6 render of the same conversation — the preamble is the
+    // dialects' only rendering difference here.
+    #[test]
+    fn effort_low_renders_its_sentence_and_medium_renders_nothing() {
+        let msgs = [
+            Message::System("Be brief.".into()),
+            Message::User("Hi".into()),
+        ];
+        let expected = format!(
+            "<|im_start|>system\n{REASONING_EFFORT_LOW}\n\nBe brief.<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(
+            build_prompt(&msgs, &qwen38(true, ReasoningEffort::Low)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            build_prompt(&msgs, &qwen38(true, ReasoningEffort::Medium)).unwrap(),
+            build_prompt(&msgs, &thinking(true)).unwrap()
+        );
+    }
+
+    // The preamble exists only inside `enable_thinking`'s guard (3.8 jinja
+    // line 46): with thinking off no effort level renders anything, and the
+    // bytes equal the 3.6 render.
+    #[test]
+    fn thinking_off_renders_no_preamble_at_any_effort() {
+        let msgs = [
+            Message::System("Be brief.".into()),
+            Message::User("Hi".into()),
+        ];
+        for effort in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::Xhigh,
+        ] {
+            assert_eq!(
+                build_prompt(&msgs, &qwen38(false, effort)).unwrap(),
+                build_prompt(&msgs, &thinking(false)).unwrap(),
+                "{effort:?}"
+            );
+        }
+        // With no system message either, there is no block at all.
+        let msgs = [Message::User("Hi".into())];
+        assert_eq!(
+            build_prompt(&msgs, &qwen38(false, ReasoningEffort::Xhigh)).unwrap(),
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    // A system message whose content is empty is a real dialect divergence:
+    // 3.6 emits the block its template unconditionally writes, empty and all;
+    // 3.8 emits a block only when there is a preamble to carry, and then the
+    // block holds the preamble alone.
+    #[test]
+    fn an_empty_system_message_diverges_between_the_dialects() {
+        let msgs = [Message::System(String::new()), Message::User("Hi".into())];
+        assert_eq!(
+            build_prompt(&msgs, &thinking(true)).unwrap(),
+            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(
+            build_prompt(&msgs, &qwen38(true, ReasoningEffort::Xhigh)).unwrap(),
+            format!(
+                "<|im_start|>system\n{REASONING_EFFORT_XHIGH}<|im_end|>\n\
+                 <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            )
+        );
+        // No preamble (medium), no block — and so no anchor either.
+        let opts = qwen38(true, ReasoningEffort::Medium);
+        assert_eq!(
+            build_prompt(&msgs, &opts).unwrap(),
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        let parts = build_prompt_parts_with_spans(&msgs, &opts).unwrap();
+        assert_eq!(parts.system_end, None);
+    }
+
+    // Each dialect's options carry its template's own `preserve_thinking`
+    // default: 3.6 drops superseded reasoning, 3.8 keeps it. Everything else
+    // is the shared default.
+    #[test]
+    fn for_dialect_carries_each_templates_preserve_default() {
+        let q36 = ChatOptions::for_dialect(ChatDialect::Qwen36);
+        assert_eq!(q36.dialect, ChatDialect::Qwen36);
+        assert!(!q36.preserve_thinking);
+        let q38 = ChatOptions::for_dialect(ChatDialect::Qwen38);
+        assert_eq!(q38.dialect, ChatDialect::Qwen38);
+        assert!(q38.preserve_thinking);
+        for opts in [q36, q38] {
+            assert!(opts.enable_thinking);
+            assert_eq!(opts.reasoning_effort, ReasoningEffort::Xhigh);
+            assert!(opts.tools.is_empty());
+        }
+        assert_eq!(ChatOptions::default().dialect, ChatDialect::Qwen36);
+    }
+
+    // With preserve_thinking on, every replayed assistant turn gets its
+    // reasoning wrapper — including a turn that carries no reasoning at all,
+    // whose wrapper closes empty. Both templates write the wrapper
+    // unconditionally under preserve (reasoning_content defaults to '' and the
+    // preserve branch does not test it), so a turn without the field must not
+    // skip it.
+    #[test]
+    fn preserve_thinking_wraps_a_turn_with_no_reasoning() {
+        let msgs = [
+            Message::User("Q1".into()),
+            Message::Assistant {
+                content: "A1".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            Message::User("Q2".into()),
+        ];
+        let expected = "<|im_start|>user\nQ1<|im_end|>\n\
+                        <|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n\
+                        <|im_start|>user\nQ2<|im_end|>\n\
+                        <|im_start|>assistant\n<think>\n";
+        assert_eq!(build_prompt(&msgs, &preserving(true)).unwrap(), expected);
     }
 
     /// The generation prompt is the same in both releases, which is why one
@@ -1376,6 +1698,7 @@ mod tests {
                             enable_thinking: on,
                             preserve_thinking: preserve,
                             tools,
+                            ..ChatOptions::default()
                         };
                         let (context, header) = build_prompt_parts(msgs, &opts).unwrap();
                         let mut split = tok.encode(&context).unwrap();
@@ -1392,20 +1715,29 @@ mod tests {
     }
 
     // The system block's end is a token boundary too: the prefix cache anchors
-    // there, counting the ids below it rather than guessing them.
+    // there, counting the ids below it rather than guessing them. Swept under
+    // both dialects, so the 3.8 blocks the preamble opens — the synthesized
+    // no-system one included — hold the same invariant.
     #[test]
     fn the_system_block_ends_on_a_token_boundary() {
         let tok = load_tokenizer();
         for msgs in &seam_conversations() {
             for tools in [Vec::new(), fixture_tools()] {
-                let opts = with_tools(true, tools);
-                let parts = build_prompt_parts_with_spans(msgs, &opts).unwrap();
-                let Some(split) = parts.system_end else {
-                    continue;
-                };
-                let mut spans = tok.encode(&parts.context[..split]).unwrap();
-                spans.extend(tok.encode(&parts.context[split..]).unwrap());
-                assert_eq!(spans, tok.encode(&parts.context).unwrap());
+                for opts in [
+                    with_tools(true, tools.clone()),
+                    ChatOptions {
+                        tools: tools.clone(),
+                        ..qwen38(true, ReasoningEffort::Xhigh)
+                    },
+                ] {
+                    let parts = build_prompt_parts_with_spans(msgs, &opts).unwrap();
+                    let Some(split) = parts.system_end else {
+                        continue;
+                    };
+                    let mut spans = tok.encode(&parts.context[..split]).unwrap();
+                    spans.extend(tok.encode(&parts.context[split..]).unwrap());
+                    assert_eq!(spans, tok.encode(&parts.context).unwrap());
+                }
             }
         }
     }
@@ -1484,6 +1816,7 @@ mod tests {
             enable_thinking: true,
             preserve_thinking: true,
             tools: fixture_tools(),
+            ..ChatOptions::default()
         };
         let parts = build_prompt_parts_with_spans(&msgs, &opts).unwrap();
         assert_eq!(

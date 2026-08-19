@@ -69,7 +69,7 @@ use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::chat::{self, ChatOptions, Continuation, Message};
+use crate::chat::{self, ChatDialect, ChatOptions, Continuation, Message};
 use crate::constrain::{self, ConstraintFactory, GrammarState};
 use crate::generate::{GenEvent, Generator};
 use crate::hub::Model;
@@ -433,11 +433,16 @@ const CANCELLED: &str = "the batch was cancelled before this item completed";
 /// caller is the one that resolved which weights are actually loaded: over HTTP
 /// that is the id the server answers under, which for a GGUF that is none of the
 /// official checkpoints is its own file name and not a checkpoint's.
+///
+/// `dialect` is the loaded checkpoint's chat dialect
+/// (`hub::Model::chat_dialect`), which decides how every item's conversation
+/// renders — passed by the caller for the same reason `label` is.
 pub fn run_batch(
     generator: &mut Generator,
     req: &BatchRequest,
     load_ms: f64,
     label: &str,
+    dialect: ChatDialect,
     hooks: &mut BatchHooks<'_>,
 ) -> Result<BatchResponse> {
     let started = Instant::now();
@@ -468,6 +473,7 @@ pub fn run_batch(
                 item,
                 &req.defaults,
                 shared_text,
+                dialect,
             )
             .map_err(|error| format!("{error:#}"))
         })
@@ -1709,6 +1715,7 @@ fn prepare_item(
     item: &BatchItem,
     defaults: &ItemDefaults,
     shared_prefix: Option<&str>,
+    dialect: ChatDialect,
 ) -> Result<Prepared> {
     ensure!(
         shared_prefix.is_none() || !item.messages.is_empty(),
@@ -1720,7 +1727,7 @@ fn prepare_item(
         .enumerate()
         .map(|(at, message)| chat_message(message, if at == 0 { shared_prefix } else { None }))
         .collect::<Result<Vec<_>>>()?;
-    let (opts, continuation) = resolve_render(item, defaults)?;
+    let (opts, continuation) = resolve_render(item, defaults, dialect)?;
     let (tokens, prefix_len, starts_in_thinking) =
         encode_item(tokenizer, &messages, &opts, continuation.as_ref())?;
     // The renderer writes the prefix verbatim, so what it was asked to render
@@ -1808,6 +1815,7 @@ fn chat_message(message: &BatchMessage, shared_prefix: Option<&str>) -> Result<M
 fn resolve_render(
     item: &BatchItem,
     defaults: &ItemDefaults,
+    dialect: ChatDialect,
 ) -> Result<(ChatOptions, Option<Continuation>)> {
     let thinking = item
         .thinking
@@ -1832,8 +1840,9 @@ fn resolve_render(
 
     let opts = ChatOptions {
         enable_thinking,
-        preserve_thinking: false,
-        tools: Vec::new(),
+        // The checkpoint's template decides everything else, its
+        // preserve_thinking and reasoning_effort defaults included.
+        ..ChatOptions::for_dialect(dialect)
     };
     let continuation = (injected.is_some() || prefill.is_some()).then(|| Continuation {
         close_thinking: injected.is_some(),
@@ -2077,7 +2086,8 @@ mod tests {
     // from the chat surface batch makes on purpose.
     #[test]
     fn thinking_defaults_off() {
-        let (opts, continuation) = resolve_render(&item("a"), &ItemDefaults::default()).unwrap();
+        let (opts, continuation) =
+            resolve_render(&item("a"), &ItemDefaults::default(), ChatDialect::Qwen36).unwrap();
         assert!(!opts.enable_thinking);
         assert!(continuation.is_none());
     }
@@ -2086,7 +2096,8 @@ mod tests {
     fn thinking_true_leaves_the_span_open() {
         let mut spec = item("a");
         spec.thinking = Some(ThinkingSpec::Enabled(true));
-        let (opts, continuation) = resolve_render(&spec, &ItemDefaults::default()).unwrap();
+        let (opts, continuation) =
+            resolve_render(&spec, &ItemDefaults::default(), ChatDialect::Qwen36).unwrap();
         assert!(opts.enable_thinking);
         assert!(continuation.is_none());
     }
@@ -2097,7 +2108,8 @@ mod tests {
     fn injected_thinking_closes_the_span() {
         let mut spec = item("a");
         spec.thinking = Some(ThinkingSpec::Injected("the label is positive".into()));
-        let (opts, continuation) = resolve_render(&spec, &ItemDefaults::default()).unwrap();
+        let (opts, continuation) =
+            resolve_render(&spec, &ItemDefaults::default(), ChatDialect::Qwen36).unwrap();
         assert!(opts.enable_thinking);
         let continuation = continuation.expect("injected reasoning renders a continuation");
         assert_eq!(
@@ -2112,7 +2124,8 @@ mod tests {
     fn prefill_rides_the_continuation() {
         let mut spec = item("a");
         spec.prefill = Some("{\"label\":".into());
-        let (opts, continuation) = resolve_render(&spec, &ItemDefaults::default()).unwrap();
+        let (opts, continuation) =
+            resolve_render(&spec, &ItemDefaults::default(), ChatDialect::Qwen36).unwrap();
         assert!(!opts.enable_thinking);
         let continuation = continuation.expect("a prefill renders a continuation");
         assert_eq!(continuation.prefix.as_deref(), Some("{\"label\":"));
@@ -2125,7 +2138,7 @@ mod tests {
         let mut spec = item("a");
         spec.thinking = Some(ThinkingSpec::Enabled(true));
         spec.prefill = Some("{".into());
-        let error = resolve_render(&spec, &ItemDefaults::default())
+        let error = resolve_render(&spec, &ItemDefaults::default(), ChatDialect::Qwen36)
             .expect_err("a prefix inside the thinking span has no rendering");
         assert!(
             error.to_string().contains("thinking span closed"),
@@ -2140,12 +2153,12 @@ mod tests {
             thinking: Some(ThinkingSpec::Enabled(true)),
             ..Default::default()
         };
-        let (opts, _) = resolve_render(&item("a"), &defaults).unwrap();
+        let (opts, _) = resolve_render(&item("a"), &defaults, ChatDialect::Qwen36).unwrap();
         assert!(opts.enable_thinking);
 
         let mut spec = item("a");
         spec.thinking = Some(ThinkingSpec::Enabled(false));
-        let (opts, _) = resolve_render(&spec, &defaults).unwrap();
+        let (opts, _) = resolve_render(&spec, &defaults, ChatDialect::Qwen36).unwrap();
         assert!(!opts.enable_thinking);
     }
 
@@ -2774,16 +2787,33 @@ mod tests {
         for max_tokens in [usize::MAX, usize::MAX - 1, 8193] {
             let mut spec = item("a");
             spec.max_tokens = Some(max_tokens);
-            let error = prepare_item(&tokenizer, 8192, &spec, &defaults, None)
-                .err()
-                .expect("a budget past the context has nowhere to decode")
-                .to_string();
+            let error = prepare_item(
+                &tokenizer,
+                8192,
+                &spec,
+                &defaults,
+                None,
+                ChatDialect::Qwen36,
+            )
+            .err()
+            .expect("a budget past the context has nowhere to decode")
+            .to_string();
             assert!(error.contains("exceeds the context"), "{error}");
         }
         // And one that fits still prepares.
         let mut spec = item("a");
         spec.max_tokens = Some(64);
-        assert!(prepare_item(&tokenizer, 8192, &spec, &defaults, None).is_ok());
+        assert!(
+            prepare_item(
+                &tokenizer,
+                8192,
+                &spec,
+                &defaults,
+                None,
+                ChatDialect::Qwen36
+            )
+            .is_ok()
+        );
     }
 
     // A request-level shared_prefix is spelled once on the wire but lands in
@@ -2817,9 +2847,18 @@ mod tests {
             &declared,
             &defaults,
             Some("A long shared story.\n\n"),
+            ChatDialect::Qwen36,
         )
         .unwrap();
-        let spelled_out = prepare_item(&tokenizer, 8192, &inline, &defaults, None).unwrap();
+        let spelled_out = prepare_item(
+            &tokenizer,
+            8192,
+            &inline,
+            &defaults,
+            None,
+            ChatDialect::Qwen36,
+        )
+        .unwrap();
         assert_eq!(with_prefix.tokens, spelled_out.tokens);
     }
 
@@ -2836,6 +2875,7 @@ mod tests {
             &spec,
             &ItemDefaults::default(),
             Some("story"),
+            ChatDialect::Qwen36,
         )
         .err()
         .expect("no first message to prepend to")

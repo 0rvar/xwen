@@ -793,6 +793,7 @@ fn batch_request(
         // The checkpoint the payload named, under its canonical name whichever
         // spelling the document used.
         size.full_name(),
+        size.chat_dialect(),
         &mut xwen::batch::BatchHooks {
             progress: &mut progress,
             cancelled: &mut never,
@@ -986,10 +987,8 @@ fn main() -> Result<()> {
             } else {
                 build_prompt_with_spans(
                     &[Message::User(prompt)],
-                    &ChatOptions {
-                        enable_thinking: true,
-                        ..Default::default()
-                    },
+                    // The checkpoint's own template dialect, at its defaults.
+                    &ChatOptions::for_dialect(select.size().chat_dialect()),
                 )?
             };
 
@@ -1152,7 +1151,12 @@ fn main() -> Result<()> {
             generator.set_min_think(min_think);
             generator.set_max_think(max_think)?;
             generator.set_banned_strings(&ban_string)?;
-            repl::run(&mut generator, max_tokens, show_thinking)
+            repl::run(
+                &mut generator,
+                max_tokens,
+                show_thinking,
+                select.size().chat_dialect(),
+            )
         }
         Some(Cmd::Batch {
             model,

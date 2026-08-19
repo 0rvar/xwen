@@ -31,7 +31,7 @@ use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_m
 use crossterm::{cursor, execute, queue};
 use unicode_width::UnicodeWidthChar;
 
-use xwen::chat::{ChatOptions, Message, build_prompt_with_spans};
+use xwen::chat::{ChatDialect, ChatOptions, Message, build_prompt_with_spans};
 use xwen::generate::{GenStats, Generator};
 
 const DIM: &str = "\x1b[2m";
@@ -41,16 +41,19 @@ const PROMPT_PREFIX: &str = "\x1b[36m\u{276f}\x1b[0m ";
 const CONT_PREFIX: &str = "\x1b[2m\u{2502}\x1b[0m ";
 const PREFIX_W: usize = 2;
 
-pub fn run(generator: &mut Generator, max_tokens: usize, show_thinking: bool) -> Result<()> {
+pub fn run(
+    generator: &mut Generator,
+    max_tokens: usize,
+    show_thinking: bool,
+    dialect: ChatDialect,
+) -> Result<()> {
     if !std::io::stdin().is_terminal() || !stdout().is_terminal() {
-        return pipe_repl(generator, max_tokens, show_thinking);
+        return pipe_repl(generator, max_tokens, show_thinking, dialect);
     }
 
     let mut show_thinking = show_thinking;
-    let opts = ChatOptions {
-        enable_thinking: true,
-        ..Default::default()
-    };
+    // The checkpoint's own template dialect, at its defaults.
+    let opts = ChatOptions::for_dialect(dialect);
     let mut messages: Vec<Message> = Vec::new();
     let mut history: Vec<String> = Vec::new();
     let mut out = stdout();
@@ -813,13 +816,15 @@ fn dim_line(out: &mut Stdout, text: &str) -> Result<()> {
 // Non-TTY fallback (piped stdin/stdout, e.g. scripted smoke tests)
 
 /// Plain line-per-message loop, one reply per line, no terminal control.
-fn pipe_repl(generator: &mut Generator, max_tokens: usize, show_thinking: bool) -> Result<()> {
+fn pipe_repl(
+    generator: &mut Generator,
+    max_tokens: usize,
+    show_thinking: bool,
+    dialect: ChatDialect,
+) -> Result<()> {
     use std::io::BufRead;
 
-    let opts = ChatOptions {
-        enable_thinking: true,
-        ..Default::default()
-    };
+    let opts = ChatOptions::for_dialect(dialect);
     let mut messages: Vec<Message> = Vec::new();
     let stdin = std::io::stdin();
     let mut out = stdout();

@@ -1364,6 +1364,7 @@ fn run_batch_job(
         &job.request,
         load_ms,
         &label,
+        job.model.model.chat_dialect(),
         &mut BatchHooks {
             progress: &mut progress,
             cancelled: &mut cancelled,
@@ -7984,6 +7985,7 @@ mod tests {
                 enable_thinking: false,
                 preserve_thinking: false,
                 tools: Vec::new(),
+                ..Default::default()
             },
         )
         .expect("the template renders");

@@ -211,6 +211,19 @@ impl Model {
         self.checkpoint().arch
     }
 
+    /// Which release's chat template renders this checkpoint's conversations.
+    /// The 3.8 release ships its own template (a `reasoning_effort` system
+    /// preamble, a flipped `preserve_thinking` default); the 3.6 pair share
+    /// the original. Everything that builds a prompt for a checkpoint reaches
+    /// its [`crate::chat::ChatOptions`] through this, usually via
+    /// [`crate::chat::ChatOptions::for_dialect`].
+    pub const fn chat_dialect(self) -> crate::chat::ChatDialect {
+        match self {
+            Model::Qwen27B | Model::Qwen35BA3B => crate::chat::ChatDialect::Qwen36,
+            Model::Qwen3827B => crate::chat::ChatDialect::Qwen38,
+        }
+    }
+
     /// The drafter sidecar for speculative decoding, or `None` for a checkpoint
     /// that ships none — which decodes plain. Which KIND of drafter the file
     /// holds is [`Model::drafter_kind`], and the file itself is the authority

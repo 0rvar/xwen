@@ -1191,6 +1191,7 @@ fn counted_tokens(
     request: &MessagesRequest,
     settings: &ServeSettings,
     tokenizer: &crate::tokenizer::LagunaTokenizer,
+    target: crate::serve::types::Target,
 ) -> Result<usize, ApiError> {
     let tools = resolve_tools(request, settings.tools_mode)?;
     if request.messages.is_empty() {
@@ -1200,9 +1201,15 @@ fn counted_tokens(
     // `max_tokens` is not required here, so the budget is left unclamped: it
     // caps the thinking span, which does not change the prompt being counted.
     let (enable_thinking, _) = resolve_thinking(request.thinking.as_ref(), settings, None)?;
-    let prompt =
-        crate::serve::encode_conversation(tokenizer, &messages, enable_thinking, tools, None)
-            .map_err(|e| bad_request(format!("rendering the prompt failed: {e:#}")))?;
+    let prompt = crate::serve::encode_conversation(
+        tokenizer,
+        &messages,
+        target.model.chat_dialect(),
+        enable_thinking,
+        tools,
+        None,
+    )
+    .map_err(|e| bad_request(format!("rendering the prompt failed: {e:#}")))?;
     Ok(prompt.tokens.len())
 }
 
@@ -1215,19 +1222,20 @@ pub(crate) async fn count_tokens(State(state): State<AppState>, body: Bytes) -> 
             return bad_request(format!("could not parse the request body: {e}")).into_response();
         }
     };
-    // Judged by the same rule as a generation even though the answer does not
-    // depend on which checkpoint runs: a client counting tokens for a model this
-    // server does not serve is asking a question about the wrong model, and
-    // every other surface tells it so. All checkpoints share one tokenizer, so
-    // the count itself is the same either way.
-    if let Err(message) = super::resolve_requested_model(
+    // Judged by the same rule as a generation: a client counting tokens for a
+    // model this server does not serve is asking a question about the wrong
+    // model, and every other surface tells it so. All checkpoints share one
+    // tokenizer, but the count still depends on WHICH checkpoint would answer —
+    // its chat dialect decides the rendering the count describes.
+    let (target, _) = match super::resolve_requested_model(
         request.model.as_deref(),
         state.default_target,
         &state.model_id,
     ) {
-        return bad_request(message).into_response();
-    }
-    match counted_tokens(&request, &state.settings, &state.tokenizer) {
+        Ok(resolved) => resolved,
+        Err(message) => return bad_request(message).into_response(),
+    };
+    match counted_tokens(&request, &state.settings, &state.tokenizer, target) {
         Ok(count) => axum::Json(json!({"input_tokens": count})).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1993,6 +2001,7 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/tokenizer.json");
         let tokenizer =
             crate::tokenizer::LagunaTokenizer::from_file(path).expect("load reference tokenizer");
+        let target = crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B);
         let with_tools = counted_tokens(
             &parse(
                 r#"{"messages":[{"role":"user","content":"Hi"}],
@@ -2001,12 +2010,14 @@ mod tests {
             ),
             &settings,
             &tokenizer,
+            target,
         )
         .expect("the prompt renders");
         let without = counted_tokens(
             &parse(r#"{"messages":[{"role":"user","content":"Hi"}]}"#),
             &settings,
             &tokenizer,
+            target,
         )
         .expect("the prompt renders");
         assert!(with_tools > without, "{with_tools} vs {without}");
@@ -2020,6 +2031,7 @@ mod tests {
             ),
             &settings,
             &tokenizer,
+            target,
         )
         .expect("the prompt renders");
         assert_eq!(disabled, without);
