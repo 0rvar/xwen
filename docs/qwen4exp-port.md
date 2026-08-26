@@ -13,7 +13,11 @@ divergence is resolved at construction time.
 
 ## Status
 
-- Phase: **P0 (loader/config/registry scaffold)** — in progress.
+- Phase: **P0 COMPLETE (2026-08-26); arc PAUSED by Orvar's request before P1.**
+  Resume point: P1 = Rust reference implementations of hyper-connections, PLE,
+  and the QSA indexer against tests/fixtures/qwen4exp/ (D5), plus the deferred
+  registry entry (waiting on a Q4-class file to name/size it — see Open
+  questions). Everything below this line was accurate at pause time.
 - Runnable weights: none locally yet. Unsloth `UD-IQ1_S` (72.5 GB) is up; waiting
   on a Q4-class file for first real testing. Metadata-only shard 1 (10.9 MB) is
   usable for loader dev today.
@@ -410,3 +414,16 @@ in oracle diffs, do not copy blindly)
   whole-blocks-plus-tail confirmed (PR #27742 diverges); PLE gate clamp
   retraction; tail-0 case can mask the query's own token. Real shard-0
   metadata confirms tokenizer eos 248046 / ple.eos 248044 as separate keys.
+- **2026-08-26 (P0 close)**: Split-GGUF loading committed (e99ffee) after
+  dual review — Claude clean, Codex 6 hardening findings all fixed with tests
+  (checked offset rebase, loud whole-file accessors via SingleFilePath,
+  actual-table-driven allocation, filename shard-number bounds, partial-split-
+  metadata errors, both-present-must-match cross-shard keys). qwen4exp config
+  parsing committed (2914d7c) after dual review — Claude clean, Codex 6
+  findings: 4 fixed with tests (u32_checked token ids, PLE geometry incl.
+  running-sum offsets and multipliers.len()==ngram_size confirmed against the
+  C++ reference hash loop, Bool-rejecting/I8-I16-accepting u64 accessor,
+  load-time arch refusal before tensor work), 1 accepted-as-intended
+  (both-stops eog guarantee, now commented), 1 rejected (cadence validation
+  against the file's declaration is by design). Full lib suite 872/872 at
+  close. **P0 done; arc paused before P1.**
