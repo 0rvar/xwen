@@ -278,16 +278,20 @@ there, NOT in the qwen4exp file), plus the gguf-py and core-C++ diffs.
 ### Known llama.cpp-impl divergences (PR quirks, not ground truth — expect them
 in oracle diffs, do not copy blindly)
 
-1. **QSA top-k width**: the PR always selects `top_k + ratio - 1` TOKEN slots
-   with the tail biased +1e9. When the tail is shorter than ratio-1, spare slots
-   partially admit the 513th-ranked block. Whether the HF reference does the
-   same needs a one-time check against `modular_qwen4_exp.py` before P1 fixes
-   our reference behavior.
+1. **QSA top-k width — CONFIRMED PR-vs-HF DIVERGENCE (settled 2026-08-26 by
+   fixture)**: HF selects WHOLE top-k blocks plus the raw tail — a short tail
+   admits nothing from the 513th-ranked block; the `budget + ratio - 1` width
+   in HF is buffer capacity only, unused slots dropped. The PR's unconditional
+   `top_k + ratio - 1` token fill diverges whenever `visible mod ratio ≠
+   ratio−1` above budget. xwen follows HF (pinned by
+   tests/fixtures/qwen4exp/qsa_indexer.json); expect small oracle diffs vs the
+   PR at long contexts. Worth reporting upstream.
 2. **Partially-filled non-tail blocks are hard-masked** (-inf) rather than
    pooled over what exists — invisible on a contiguous cache, bites after
    rewind/defrag. Our rollback machinery must not inherit this silently.
-3. **PLE gate**: PR clamps `|s|` to ≥1e-6 inside the signed sqrt; HF doesn't.
-   Sub-1e-6 difference only; will show in strict fixture comparisons.
+3. ~~PLE gate clamp~~ RETRACTED 2026-08-26: HF DOES clamp `|s| ≥ 1e-6` inside
+   the signed sqrt (modular line 770, pinned by the fixture gate probe). No
+   divergence; implement the clamp.
 4. **MoE renorm clamp**: llama.cpp's shared `build_moe_ffn` applies the
    6.103515625e-5 sum clamp unconditionally, including for qwen4exp — the HF
    math has no clamp. Practically a no-op (top-10 softmax sums are far larger);
@@ -305,8 +309,11 @@ in oracle diffs, do not copy blindly)
 7. Signed sqrt in the PLE gate; dilation 3 in the PLE conv.
 8. MoE: no renorm clamp; `shared_expert_gate` is `[1,2560]` not `[2560]`.
 9. QSA: keys cached raw (pool→norm→rope at query time, block-first position);
-   fp32 block mean; tail block always visible; rope on indexer q at own
-   position, 64 of 128 dims.
+   fp32 block mean; the incomplete tail (when one exists) always visible; rope
+   on indexer q at own position, 64 of 128 dims. Precision (fixture-pinned):
+   when `visible mod ratio == 0` there IS no tail — the query's own complete
+   block competes in top-k and can lose, masking the query's own token. Whole
+   blocks + tail, never a fixed token count (see divergence #1).
 10. Residual stream seeded by repeat×4 of the embedding; final mixer before
     lm_head (no output_norm tensor).
 11. `general.name` has spaces; don't let "Qwen3.8" substring-collide with
@@ -390,3 +397,16 @@ in oracle diffs, do not copy blindly)
   field; QSA decode gather), trap #12 added (sdpa vector kernel silently
   ignores masks). Next wave dispatched: config/registry scaffold, HF fixture
   generation for the new components.
+- **2026-08-26**: P0 units landed (unstaged, review in flight): split-GGUF
+  loading in gguf.rs (any shard opens the set; single-file path unchanged;
+  CheckpointId folds all shards; first reviewer clean); qwen4exp config
+  parsing (Arch::Qwen4Exp, Qwen4ExpConfig/PleConfig sub-structs, u64-array
+  Meta accessors, per-arch z_gate()/moe_sum_floor(); Arch::model() now
+  Option — no registry entry until a blessed file exists; eog list now
+  guarantees both stop ids whatever single eos the GGUF advertises). P1
+  golden fixtures generated from transformers main @ 598d8ba8 into
+  tests/fixtures/qwen4exp/ (5 files, ~556 KB, deterministic; generator +
+  venv recipe in scripts/qwen4exp-fixtures/). Fixture findings: QSA
+  whole-blocks-plus-tail confirmed (PR #27742 diverges); PLE gate clamp
+  retraction; tail-0 case can mask the query's own token. Real shard-0
+  metadata confirms tokenizer eos 248046 / ple.eos 248044 as separate keys.
