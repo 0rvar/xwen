@@ -152,8 +152,20 @@ pub struct XwenModel {
 }
 
 impl XwenModel {
+    /// The qwen4exp trunk (hyper-connection carrier, QSA, PLE) is its own
+    /// graph module, not this stack (docs/qwen4exp-port.md D1): `load` refuses
+    /// it here, before the rope table and the ~1.2 GB token-embedding dequant
+    /// materialize anything, rather than building a wrong graph.
+    fn check_arch(cfg: &XwenConfig) -> Result<()> {
+        match cfg.arch {
+            Arch::Dense | Arch::Moe => Ok(()),
+            Arch::Qwen4Exp => anyhow::bail!("the qwen4exp graph is not built by XwenModel"),
+        }
+    }
+
     pub fn load(gguf: Arc<GgufFile>, runner: ExpertRunner, max_ctx: usize) -> Result<Self> {
         let cfg = XwenConfig::from_gguf(&gguf.content)?;
+        Self::check_arch(&cfg)?;
         let device = gguf.device.clone();
         let w = Weights::from_gguf(gguf.clone());
 
@@ -220,6 +232,12 @@ impl XwenModel {
             let ffn = match cfg.arch {
                 Arch::Dense => Ffn::Dense(DenseMlp::new(&lw)?),
                 Arch::Moe => Ffn::Moe(MoeBlock::new(&lw, &cfg, runner)?),
+                // Refused by `check_arch` at the top of `load`, before any
+                // tensor materialized; this arm only keeps the match
+                // exhaustive.
+                Arch::Qwen4Exp => {
+                    unreachable!("qwen4exp is refused at the top of XwenModel::load")
+                }
             };
             layers.push(Layer {
                 attn_norm: lw.rms_norm("attn_norm", cfg.rms_eps)?,
@@ -1018,6 +1036,46 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_c
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RopeKind;
+
+    /// The qwen4exp arch is refused up front: `load` runs `check_arch` on the
+    /// parsed config before the rope table and the token-embedding dequant, so
+    /// the refusal materializes no tensors.
+    #[test]
+    fn qwen4exp_arch_is_refused_before_any_tensor_work() {
+        let cfg = |arch: Arch| XwenConfig {
+            arch,
+            general_name: None,
+            n_layer: 48,
+            hidden: 2560,
+            vocab: 248320,
+            n_head: vec![24; 48],
+            n_kv_head: 2,
+            head_dim: 256,
+            layer_kind: vec![LayerKind::Linear; 48],
+            linear_k_heads: 16,
+            linear_v_heads: 48,
+            linear_head_dim: 128,
+            conv_kernel: 4,
+            dense_ff: 0,
+            n_expert: 512,
+            n_expert_used: 10,
+            expert_ff: 640,
+            shared_expert_ff: 640,
+            rms_eps: 1e-6,
+            n_ctx_train: 262144,
+            rope: RopeKind::Plain {
+                freq_base: 1e7,
+                n_rot: 64,
+            },
+            eog_tokens: vec![248046, 248044],
+            qwen4exp: None,
+        };
+        let err = XwenModel::check_arch(&cfg(Arch::Qwen4Exp)).unwrap_err();
+        assert!(err.to_string().contains("not built by XwenModel"));
+        assert!(XwenModel::check_arch(&cfg(Arch::Dense)).is_ok());
+        assert!(XwenModel::check_arch(&cfg(Arch::Moe)).is_ok());
+    }
 
     fn probe(id: usize) -> Tensor {
         // Distinct 1x3 f32 tensor per layer id, so ordering is observable.

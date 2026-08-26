@@ -663,6 +663,7 @@ mod tests {
                 n_rot: 64,
             },
             eog_tokens: vec![248_046, 248_044],
+            qwen4exp: None,
         }
     }
 
@@ -782,6 +783,7 @@ mod tests {
                 n_rot: head_dim.min(2),
             },
             eog_tokens: vec![0],
+            qwen4exp: None,
         }
     }
 

@@ -422,6 +422,7 @@ mod tests {
                 n_rot: 2,
             },
             eog_tokens: vec![0],
+            qwen4exp: None,
         }
     }
 

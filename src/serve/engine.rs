@@ -199,7 +199,13 @@ pub fn identify_checkpoint(
     match identified {
         Some(model) => Ok((Target::official(model), None)),
         None => {
-            let assumed = cfg.arch.model();
+            let assumed = cfg.arch.model().with_context(|| {
+                format!(
+                    "{} names no official checkpoint and its architecture has no registry \
+                     checkpoint to assume; it cannot be served",
+                    settings.model.display()
+                )
+            })?;
             Ok((
                 Target::served(assumed),
                 Some(ServeLog::CheckpointUnidentified {
@@ -6070,6 +6076,7 @@ mod tests {
                 n_rot: 64,
             },
             eog_tokens: vec![248046, 248044],
+            qwen4exp: None,
         }
     }
 
