@@ -76,6 +76,33 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   `fc_embedding`/`fc_hidden` projections, NOT 3.8's concat `eh_proj`) — deferred
   to a drafting arc once vLLM/SGLang or the tech report settles it. Serve
   integration follows CLI bring-up.
+- **D8 (2026-08-26) GGUF parsing ownership + IQ4_NL in three classes.** candle's
+  `GgmlDType` cannot even PARSE a file containing an IQ tensor (unknown dtype →
+  `Content::read` fails before any kernel question), so the split-GGUF loader
+  (already xwen-owned code) also owns the tensor-table/dtype parsing; the pinned
+  candle stays unpatched. IQ4_NL work splits: (1) metadata visibility — in the
+  loader; (2) CPU row dequant — needed only for the PLE table per D2, ~small;
+  (3) Metal matmul kernels (mv_id/mm_id) — needed only if a matmul weight is
+  IQ4_NL; DEFERRED, and D3's self-converted blessed file can choose Q4_K for
+  the table + down_exps to avoid class 3 entirely.
+- **D9 (2026-08-26) DeltaNet z-gate as a construction-time enum.** `ZGate
+  {Silu, Sigmoid}` on `LinearAttnBlock`: reference path branches at the one
+  silu(z) line; fused path gets a `kernel_delta_gnorm_sigmoid` sibling selected
+  by name at dispatch. Existing checkpoints construct Silu — their kernel and
+  code path unchanged.
+- **D10 (2026-08-26) MoE renorm clamp becomes a field.** `sum_floor` on
+  `MoeBlock` set at construction (existing checkpoints keep 6.103515625e-5,
+  qwen4exp passes 0.0). The fused router already takes it as a runtime param;
+  only the candle-chain fallback hardcodes the const.
+- **D11 (2026-08-26, provisional) QSA decode via K/V row gather.** candle's
+  sdpa VECTOR kernel (the seq==1 route) is compiled without mask support and
+  SILENTLY IGNORES a mask tensor — so masked decode cannot ride the stock sdpa
+  path. P2 correctness: gather the ≤2051 selected K/V rows into a packed
+  contiguous view and run maskless sdpa over it. P3 may replace with a vendored
+  masked-decode kernel if the gather (~25 MB/token across 12 layers) shows up
+  in profiles. Prefill overlays the QSA mask via the existing
+  `Option<&PrefillMask>` argument — needs only a device-side mask constructor
+  (today's masks are host-built).
 - **D7 (2026-08-26) Phase plan.** P0 scaffold (split-GGUF loader, config parse,
   registry) → P1 CPU references + fixtures for the three new components → P2
   graph assembly, load a real file, greedy smoke, ppl sanity vs PR #27742's
@@ -283,7 +310,48 @@ in oracle diffs, do not copy blindly)
 10. Residual stream seeded by repeat×4 of the embedding; final mixer before
     lm_head (no output_norm tensor).
 11. `general.name` has spaces; don't let "Qwen3.8" substring-collide with
-    "Qwen3.8-27B" in identify().
+    "Qwen3.8-27B" in identify(). (Arch-first filtering in identify() makes the
+    cross-arch collision impossible by construction; the spaced spelling still
+    needs to be an accepted alias.)
+12. candle's sdpa vector kernel (q_seq==1) is compiled WITHOUT mask support and
+    silently ignores a passed mask — a masked QSA decode through stock sdpa
+    runs dense attention with no error. See D11.
+
+## Reuse-seams map (audited 2026-08-26; file:line refs from that audit)
+
+- `AttnBlock`/`LinearAttnBlock`/`MoeBlock`/`SharedExpert` take pre-normed
+  `[seq, 2560]` and return pre-residual output — norms and residual adds live
+  in `XwenModel::run_stack` (model.rs:337), NOT in the blocks. A new
+  `src/qwen4exp.rs` outer loop owning the 4-stream carrier calls them
+  unchanged. The `[1,2560]`-vs-`[2560]` shexp gate shape is already handled.
+- Parameterize (small): ZGate (D9); MoE sum_floor (D10); `Rope::rotate`
+  assumes consecutive positions from a scalar start — QSA ropes pooled block
+  keys at block-first positions (stride 4), needs a positions-gather variant;
+  `XwenConfig` gains Option-shaped fields (hc/indexer/ple incl. the three
+  UINT64 metadata arrays — `Meta` today has no i64/u64-array accessor);
+  `register_views`/`_weights_mmap` become Vec for split files;
+  `warn_if_over_budget` hardcodes conv+delta as the only recurrent state.
+- Plumbing seam: `Generator` holds a concrete `XwenModel` (~25 call sites) —
+  needs an enum/trait for a second trunk type; also logits-dump and
+  spec-verify-bench binaries.
+- Recurrent-state plumbing is wide but mechanical: `LayerCache` + the
+  checkpoint/snapshot/host-snapshot/disk record enums (~15 match sites) grow a
+  PLE variant (conv 10240×9 + the 2-token id history — the history is
+  sequence-level, store beside `CacheSnapshot::pos`, not per layer); new disk
+  LAYER_* tag correctly rejects on old readers.
+- MoE caps confirmed for 512/top-10: fused router fits EXACTLY at both limits
+  (MAX_EXPERTS 512, reduction width 256) — a >512-expert file falls back
+  gracefully. FusedExperts/mm_id/mv_id have no expert-count ceiling.
+- Ops for P2 (composed, correctness-first): HC read/write and grouped RMSNorm
+  from candle primitives (~15 dispatches/layer-pair — fused `hc_mix` is the top
+  P3 kernel candidate); QSA top-k via arg_sort (partial top-k kernel is P3);
+  block mean-pool + ragged tail is new composed code; indexer q/k norms and
+  partial rope reuse existing pieces; BF16 indexer weights ride the
+  dflash-established `dense_alias_tensor` + `matmul_bf16` pattern. PLE conv
+  needs dilation — `delta_conv` has none and hardcodes silu — new kernel
+  (host-side conv acceptable for P2 given one layer).
+- PLE table reads ride `MmapSource::bytes` (raw range reads, already
+  crate-visible) — never `QTensor::dequantize`.
 
 ## Open questions (blocked, with what unblocks them)
 
@@ -304,3 +372,8 @@ in oracle diffs, do not copy blindly)
   PROVENANCE.md); converter audited — conversion-baked deltas and four PR
   quirks recorded above. Doc corrected: sampling key is `general.sampling.temp`,
   no presence-penalty key exists in converted GGUFs, PR is open-not-draft.
+- **2026-08-26**: Reuse-seams audit complete — blocks compose unchanged,
+  decisions D8-D11 taken (loader owns GGUF parsing; ZGate enum; sum_floor
+  field; QSA decode gather), trap #12 added (sdpa vector kernel silently
+  ignores masks). Next wave dispatched: config/registry scaffold, HF fixture
+  generation for the new components.
