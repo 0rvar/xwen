@@ -377,6 +377,68 @@ in oracle diffs, do not copy blindly)
   `Weights` holds `Arc<GgufFile>` — the split façade changes that field's type,
   the highest-blast-radius edit of the loader work.
 
+## Notes captured at the P0 pause (context that would otherwise live only in
+the session that ran P0)
+
+- **Quant-sensitivity hint for D3's self-converted mix**: Qwen's own FP8 repo
+  keeps a long `modules_to_not_convert` list in BF16 — lm_head, embed_tokens,
+  ALL hyper-connection projections (input_mix_weight_down/up,
+  block_inject_weight), ALL GDN projections and conv1d, the indexer, norms,
+  routers. That is Qwen telling us which planes they consider
+  quantization-sensitive; a self-converted file should keep hc/indexer/GDN
+  planes at Q8_0-or-better (Unsloth's IQ1_S mix independently made the same
+  call: hc Q8_0, indexer BF16, attn/ssm Q5_K/Q6_K).
+- **PLE runtime design (P3)**: eviction is free — the table mmap is read-only
+  file-backed, clean pages are the kernel's first reclaim target, and Zipf
+  reuse means the resident slice converges on the hot few GB (judge by
+  `footprint`, not RSS, as always). The effort goes into PREFETCH: at prefill,
+  all row addresses are computable from token ids before layer 0 runs — hash
+  everything, dedupe, batch-fault on a background thread; at decode, the
+  moment token t is sampled, positions t+1's ~16 rows are known — touch them
+  while the trunk runs. Never gate the fetch on the PLE gate value (it's
+  computed mid-forward; acting on it serializes the lookup and kills the
+  prefetch; unconditional retrieval is cheap). Wired-GPU cost of the table:
+  zero — hash+gather+dequant host-side, ship 2560 floats/token to the graph.
+- **Perf expectation (scaling guess, NOT a measurement)**: 6B active at
+  Q4-class on this machine, scaled from the 35B-A3B's measured 104-107 tok/s
+  at ~3B active (~1.7 GB/token → ~3.4 GB/token), lands around ~50 tok/s
+  decode. Memory: ~70-75 GB wired trunk + ~29 GB file-backed table on 128 GB.
+  One-process-at-a-time becomes absolute.
+- **State-allocation note**: llama.cpp's PR adds `ple_conv_state()` into
+  `n_embd_r()` for EVERY recurrent layer — 36 layers × 9 × 10240 floats of
+  dead state on this checkpoint (only layer 1 has PLE). We allocate PLE state
+  per-layer, only where a PLE layer exists.
+- **Card sampling details beyond the doc's main bullet**: min_p 0.0 and
+  repetition_penalty 1.0 in both modes; recommended output budgets 262144
+  reasoning / 131072 final. (Mode-keyed temp/top_p/top_k match 3.6/3.8
+  exactly; the one genuine novelty is non-thinking presence_penalty 1.5.)
+- **Design lineage citations** (for whoever wonders why the math looks the way
+  it does): PLE is DeepSeek Engram (arXiv 2601.07372, code
+  github.com/deepseek-ai/Engram) with deviations noted in the spec section
+  (raw ids, one layer, dot-product gate); allocation background: SCONE (arXiv
+  2502.01637), LongCat "Scaling Embeddings Outperforms Scaling Experts"
+  (arXiv 2601.21204), Meta "Memory Layers at Scale" (arXiv 2412.09764). QSA's
+  nearest published relative is DeepSeek DSA (three implementations in our
+  pinned llama.cpp clone; glm-dsa.cpp is the cleanest read). Hyper-connections
+  trace to arXiv 2512.24880 (ggml `ggml_dsv4_hc_*`).
+
+## MTP head (deferred to a drafting arc; facts frozen here so they aren't lost)
+
+34 `mtp.*` tensors ship in the BF16 repo; the PR's converter SKIPS them (no
+GGUF has them today — a drafting arc must convert its own sidecar or extend
+the converter). Structure from tensor names + config: `pre_fc_norm_embedding`
++ `fc_embedding` over the token embedding, `pre_fc_norm_hidden` + `fc_hidden`
+over the trunk's final hidden (`mtp_use_hidden_state_from_layer: null` ⇒
+post-`hyper_connection_mixer`, consistent with the 3.8 head's choice) — TWO
+separate projections, NOT 3.8's concat `eh_proj`; presumed summed, but the
+composition is UNCONFIRMED (transformers ships no MTP class — confirm against
+vLLM/SGLang or the tech report before implementing). One full trunk-flavour
+layer: QSA attention with its own indexer + full MoE (experts, router, shexp)
++ both hyper-connection blocks + its own `hyper_connection_mixer`.
+`mtp_use_dedicated_embeddings: false` ⇒ reuses target embd/lm_head, like 3.8.
+Config: `mtp.hybrid: true`, 1 layer, rope_theta 1e7. Card: "trained with
+multi-steps".
+
 ## Open questions (blocked, with what unblocks them)
 
 - MTP head forward semantics (fc_embedding/fc_hidden composition) — vLLM/SGLang

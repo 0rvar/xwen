@@ -1531,6 +1531,10 @@ pieces deliberately not carried.
   string or a lossy replacement, silently, mid-reply. Cheapest honest fix if it ever
   matters is not a second 12.8 MB embed but treating unknown-but-in-range ids as a stop
   or a logged anomaly. Reopen if a 3.8 reply ever ends strangely for no visible reason.
+  2026-08-26: Qwen3.8-Flash-Next ships this exact tokenizer (hash-verified: base
+  identical, added tokens through 248076), so the qwen4exp port arc makes a third
+  checkpoint carry these seven ids — the question stops being 3.8-27B-only and the
+  answer should be settled once, in that arc's P4, for all of them.
 - [ ] **No parity-gate or retune arm for Qwen3.8-27B.** `scripts/parity-gate.ts` accepts
   `--model-size 3.8-27b` and would run it (nothing about the gate is 3.6-specific), but
   it has never been run against 3.8 and the floors in docs/parity.md were fitted on the
