@@ -352,6 +352,19 @@ in oracle diffs, do not copy blindly)
   (host-side conv acceptable for P2 given one layer).
 - PLE table reads ride `MmapSource::bytes` (raw range reads, already
   crate-visible) — never `QTensor::dequantize`.
+- Parity taps: `tap!`/`spec_taps`/`post_norm_hidden` hang off `l_out` and
+  `output_norm`, neither of which exists on qwen4exp — the new module defines
+  its own tap convention (the pre-`output_hc` carrier is the natural analogue).
+- Split-file identity: `CheckpointId::compute` hashes ONE file's metadata
+  section; for a split file the identity is shard 0's KV block (it carries the
+  full metadata and zero tensors). Prefix-cache/disk-tier keying depends on
+  this being stable.
+- PLE state shape preference: extra optional planes on the `Linear` cache
+  variant (a PLE layer IS a DeltaNet layer with extra state — keeps
+  `advance_linear`'s lockstep), not a fourth variant. The 2-id token history is
+  u32 in an all-f32 plane world; it needs its own plane type + validator.
+  `Weights` holds `Arc<GgufFile>` — the split façade changes that field's type,
+  the highest-blast-radius edit of the loader work.
 
 ## Open questions (blocked, with what unblocks them)
 
