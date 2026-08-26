@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -5,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
-use candle_core::quantized::gguf_file::Content;
+use candle_core::quantized::gguf_file::{Content, Value};
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use candle_core::{DType, Device, MetalDevice, MetalStorage, Module, Storage, Tensor};
 use candle_metal_kernels::metal::Buffer;
@@ -210,10 +211,23 @@ pub struct CheckpointId {
 }
 
 impl CheckpointId {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x100_0000_01b3;
+
     /// FNV-1a 64 over `file`'s first `metadata_len` bytes, plus the file length.
     /// Reads in chunks rather than mapping, so the cost is one pass over a few
     /// megabytes at load time.
     fn compute(file: &mut File, metadata_len: u64) -> Result<Self> {
+        let (hash, file_len) = Self::fold(file, metadata_len, Self::OFFSET_BASIS)?;
+        Ok(Self { hash, file_len })
+    }
+
+    /// One file's contribution to the id: continues `hash` over the file's
+    /// first `metadata_len` bytes and returns it with the file's total length.
+    /// A split checkpoint chains this across its shards in shard order and sums
+    /// the lengths, so the id pins every shard's tensor table (each shard's
+    /// metadata section includes its own), not only the first shard's.
+    fn fold(file: &mut File, metadata_len: u64, mut hash: u64) -> Result<(u64, u64)> {
         let file_len = file.metadata().context("stat for the checkpoint id")?.len();
         ensure!(
             metadata_len <= file_len,
@@ -222,9 +236,6 @@ impl CheckpointId {
         );
         file.seek(SeekFrom::Start(0))
             .context("rewinding for the checkpoint id")?;
-        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-        const PRIME: u64 = 0x100_0000_01b3;
-        let mut hash = OFFSET_BASIS;
         let mut left = metadata_len;
         let mut buf = vec![0u8; 1 << 20];
         while left > 0 {
@@ -233,11 +244,11 @@ impl CheckpointId {
                 .context("reading the metadata section for the checkpoint id")?;
             for &byte in &buf[..want] {
                 hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(PRIME);
+                hash = hash.wrapping_mul(Self::PRIME);
             }
             left -= want as u64;
         }
-        Ok(Self { hash, file_len })
+        Ok((hash, file_len))
     }
 
     /// A specific id, for tests that have to bind and mis-bind a persisted
@@ -262,25 +273,114 @@ impl CheckpointId {
     }
 }
 
-/// An opened GGUF: parsed header plus the file handle tensors are read from,
-/// and (on Metal, unless `XWEN_LOAD_CLASSIC`) the whole file mapped for the
-/// no-copy alias load path.
-pub struct GgufFile {
-    pub content: Content,
-    pub device: Device,
-    pub path: PathBuf,
+/// The backing file's path, for consumers that go back to disk and read the
+/// WHOLE file by path (the drafter loaders do exactly that). A split GGUF has
+/// no such single file — shard 0's path would silently stand in for bytes that
+/// live in other shards — so any access through this handle panics for a
+/// multi-shard open. Split-aware consumers route reads per tensor
+/// (`shard_for`) and hold `mmap_sources` instead. Field syntax (`gguf.path`)
+/// is deliberately preserved: existing single-file consumers compile and
+/// behave unchanged.
+pub struct SingleFilePath {
+    path: PathBuf,
+    shard_count: usize,
+}
+
+impl SingleFilePath {
+    fn whole(&self) -> &Path {
+        assert!(
+            self.shard_count == 1,
+            "GgufFile::path on a split GGUF ({} shards): {} is only shard 0, not the whole \
+             checkpoint — read per shard via mmap_sources()/shard-aware accessors instead",
+            self.shard_count,
+            self.path.display()
+        );
+        &self.path
+    }
+}
+
+impl std::ops::Deref for SingleFilePath {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        self.whole()
+    }
+}
+
+impl AsRef<Path> for SingleFilePath {
+    fn as_ref(&self) -> &Path {
+        self.whole()
+    }
+}
+
+/// One shard of an opened (possibly split) GGUF: the file handle its tensors
+/// are read from, and (on Metal, unless `XWEN_LOAD_CLASSIC`) that file's
+/// mapping for the no-copy alias load path. A single-file open is exactly one
+/// shard.
+struct Shard {
+    path: PathBuf,
     file: Mutex<File>,
     mmap: Option<Arc<MmapSource>>,
+}
+
+/// An opened GGUF — one file, or every shard of a gguf-split set presented as
+/// one logical file.
+pub struct GgufFile {
+    /// The unified header. Single-file: exactly as parsed. Split: shard 0's
+    /// metadata block, the union tensor table with each tensor's offset
+    /// rebased to its absolute position in its own shard's file, and
+    /// `tensor_data_offset` 0 — so `tensor_data_offset + info.offset` is the
+    /// correct read position in the backing shard on both paths, provided the
+    /// read goes through that shard's file/mapping (`shard_for`).
+    pub content: Content,
+    pub device: Device,
+    /// THE file's path for a single-file GGUF; panics on access for a split
+    /// one (see `SingleFilePath` — there is no single path whole-file reads
+    /// would be correct against).
+    pub path: SingleFilePath,
     checkpoint: CheckpointId,
+    /// The files backing `content`'s tensors, in shard order.
+    shards: Vec<Shard>,
+    /// Tensor name → index into `shards`. Populated only for a split GGUF;
+    /// single-file lookups never consult it.
+    shard_of: HashMap<String, usize>,
 }
 
 impl GgufFile {
-    /// The alias-load mapping, present on Metal unless `XWEN_LOAD_CLASSIC`.
-    /// A holder of aliased weights whose tensors cannot carry the Arc
-    /// themselves (the attention planes) must clone this and keep it alive —
-    /// see `MmapSource`'s lifetime invariant.
+    /// THE alias-load mapping of a single-file GGUF, present on Metal unless
+    /// `XWEN_LOAD_CLASSIC`. A holder of aliased weights whose tensors cannot
+    /// carry the Arc themselves (the attention planes) must keep the mapping
+    /// alive — see `MmapSource`'s lifetime invariant — and for a
+    /// possibly-split file that means holding `mmap_sources`, all of them.
+    /// Panics on a split GGUF: shard 0's mapping alone is not the checkpoint,
+    /// and a whole-file consumer reading it as such would silently get wrong
+    /// bytes.
     pub fn mmap_source(&self) -> Option<&Arc<MmapSource>> {
-        self.mmap.as_ref()
+        assert!(
+            self.shards.len() == 1,
+            "mmap_source() on a split GGUF ({} shards): no single mapping covers it — use \
+             mmap_sources()",
+            self.shards.len()
+        );
+        self.shards[0].mmap.as_ref()
+    }
+
+    /// Every shard's alias-load mapping (one entry for a single-file GGUF,
+    /// empty off Metal or under `XWEN_LOAD_CLASSIC`). Keep-alive and view
+    /// registration must cover all of them: a tensor aliases whichever shard's
+    /// mapping holds it.
+    pub fn mmap_sources(&self) -> Vec<Arc<MmapSource>> {
+        self.shards.iter().filter_map(|s| s.mmap.clone()).collect()
+    }
+
+    /// The shard whose file (and mapping) hold `name`'s data. Single-file
+    /// opens have an empty `shard_of`, so every lookup lands on the one shard;
+    /// so does an unknown name, whose caller then fails its own tensor-info
+    /// lookup.
+    fn shard_for(&self, name: &str) -> &Shard {
+        match self.shard_of.get(name) {
+            Some(&i) => &self.shards[i],
+            None => &self.shards[0],
+        }
     }
 
     /// Identity of this checkpoint, computed once at `open`. Persisted artifacts
@@ -300,6 +400,38 @@ pub fn open(path: impl AsRef<Path>, device: &Device) -> Result<Arc<GgufFile>> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let content =
         Content::read(&mut file).with_context(|| format!("parsing GGUF {}", path.display()))?;
+    // A shard of a split GGUF (the gguf-split layout) hands the whole sibling
+    // set to `open_split`. A self-contained split.count = 1 export (split.no
+    // 0) is a complete single-file GGUF; any other partial or self-
+    // contradicting combination of the split.* trio is refused rather than
+    // read as a single file that would be missing most of its tensors.
+    let split_count = metadata_uint(&content, SPLIT_COUNT_KEY)
+        .with_context(|| format!("reading {SPLIT_COUNT_KEY} of {}", path.display()))?;
+    let split_no = metadata_uint(&content, SPLIT_NO_KEY)
+        .with_context(|| format!("reading {SPLIT_NO_KEY} of {}", path.display()))?;
+    let split_tensors = metadata_uint(&content, SPLIT_TENSORS_COUNT_KEY)
+        .with_context(|| format!("reading {SPLIT_TENSORS_COUNT_KEY} of {}", path.display()))?;
+    match split_count {
+        Some(count) if count > 1 => return open_split(path, device, count),
+        Some(1) => ensure!(
+            matches!(split_no, None | Some(0)),
+            "{}: {SPLIT_COUNT_KEY} is 1 but {SPLIT_NO_KEY} is {} — a shard of a larger set, not \
+             a one-shard export",
+            path.display(),
+            split_no.unwrap_or(0)
+        ),
+        Some(count) => bail!(
+            "{}: {SPLIT_COUNT_KEY} is {count}, which describes no shard set",
+            path.display()
+        ),
+        None => ensure!(
+            split_no.is_none() && split_tensors.is_none(),
+            "{}: carries split shard keys ({SPLIT_NO_KEY}/{SPLIT_TENSORS_COUNT_KEY}) but no \
+             {SPLIT_COUNT_KEY} — a shard with half-stripped split metadata, not a single-file \
+             GGUF",
+            path.display()
+        ),
+    }
     // Hashed here rather than lazily: `Content::read` has just told us where the
     // metadata section ends, and every consumer of the id wants it before the
     // first request.
@@ -313,10 +445,262 @@ pub fn open(path: impl AsRef<Path>, device: &Device) -> Result<Arc<GgufFile>> {
     Ok(Arc::new(GgufFile {
         content,
         device: device.clone(),
-        path: path.to_path_buf(),
-        file: Mutex::new(file),
-        mmap,
+        path: SingleFilePath {
+            path: path.to_path_buf(),
+            shard_count: 1,
+        },
         checkpoint,
+        shards: vec![Shard {
+            path: path.to_path_buf(),
+            file: Mutex::new(file),
+            mmap,
+        }],
+        shard_of: HashMap::new(),
+    }))
+}
+
+/// gguf-split KV keys. Every shard of a split GGUF carries all three:
+/// `split.no` (0-INDEXED, unlike the 1-indexed file names), `split.count`, and
+/// `split.tensors.count` (the TOTAL tensor count across all shards).
+const SPLIT_NO_KEY: &str = "split.no";
+const SPLIT_COUNT_KEY: &str = "split.count";
+const SPLIT_TENSORS_COUNT_KEY: &str = "split.tensors.count";
+
+/// A non-negative integer metadata value, whatever width the writer chose
+/// (gguf-split writes `split.no`/`split.count` as u16 but `split.tensors.count`
+/// as i32). `Ok(None)` when the key is absent; a present key that is not a
+/// non-negative integer is an error.
+fn metadata_uint(content: &Content, key: &str) -> Result<Option<u64>> {
+    let Some(v) = content.metadata.get(key) else {
+        return Ok(None);
+    };
+    let n = match v {
+        Value::U8(v) => u64::from(*v),
+        Value::U16(v) => u64::from(*v),
+        Value::U32(v) => u64::from(*v),
+        Value::U64(v) => *v,
+        Value::I8(v) if *v >= 0 => *v as u64,
+        Value::I16(v) if *v >= 0 => *v as u64,
+        Value::I32(v) if *v >= 0 => *v as u64,
+        Value::I64(v) if *v >= 0 => *v as u64,
+        other => bail!("metadata key {key} is not a non-negative integer: {other:?}"),
+    };
+    Ok(Some(n))
+}
+
+/// Parses the gguf-split naming convention `<base>-000NN-of-000MM.gguf`
+/// (shard numbers 1-indexed and zero-padded to five digits). Returns
+/// `(base, shard_number, shard_count)`; `None` for any other name shape.
+fn split_name_parts(path: &Path) -> Option<(String, usize, usize)> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    let (rest, count) = stem.rsplit_once("-of-")?;
+    let (base, no) = rest.rsplit_once('-')?;
+    if no.len() != 5 || count.len() != 5 {
+        return None;
+    }
+    if !no.bytes().all(|b| b.is_ascii_digit()) || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((base.to_string(), no.parse().ok()?, count.parse().ok()?))
+}
+
+/// Opens every shard of a split GGUF (discovered as siblings of `handed`, any
+/// one shard of the set) and assembles the one logical file the rest of the
+/// loader sees: shard 0's complete metadata block, the union tensor table with
+/// offsets rebased to shard-absolute positions (see `GgufFile::content`), and
+/// the tensor → shard map that routes each read to its backing file.
+fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<GgufFile>> {
+    let Some((base, handed_no, name_count)) = split_name_parts(handed) else {
+        bail!(
+            "{} declares {SPLIT_COUNT_KEY} = {split_count} but its file name does not follow the \
+             <base>-000NN-of-000MM.gguf convention, so the sibling shards cannot be located",
+            handed.display()
+        );
+    };
+    ensure!(
+        name_count as u64 == split_count,
+        "{}: the file name says {name_count} shards but {SPLIT_COUNT_KEY} says {split_count}",
+        handed.display()
+    );
+    // The handed file must itself be a member of the set its name describes
+    // (shard numbers are 1-indexed): a stray `-00000-` or `-99999-` file would
+    // otherwise silently open the canonical siblings while its own bytes are
+    // never validated against them.
+    ensure!(
+        (1..=name_count).contains(&handed_no),
+        "{}: shard number {handed_no} is outside 1..={name_count} — not a member of the set its \
+         name describes",
+        handed.display()
+    );
+    let dir = handed.parent().map(Path::to_path_buf).unwrap_or_default();
+    let count = name_count;
+
+    let mut parts: Vec<(PathBuf, File, Content)> = Vec::with_capacity(count);
+    let mut expected_tensors = 0u64;
+    for i in 1..=count {
+        let path = dir.join(format!("{base}-{i:05}-of-{count:05}.gguf"));
+        let mut file = File::open(&path).with_context(|| {
+            format!(
+                "opening shard {i} of {count} ({}) — a split GGUF needs every sibling shard \
+                 present",
+                path.display()
+            )
+        })?;
+        let content = Content::read(&mut file)
+            .with_context(|| format!("parsing GGUF shard {}", path.display()))?;
+        let key = |k: &'static str| {
+            metadata_uint(&content, k)?
+                .with_context(|| format!("{}: shard carries no {k} key", path.display()))
+        };
+        let no = key(SPLIT_NO_KEY)?;
+        ensure!(
+            no == (i - 1) as u64,
+            "{}: {SPLIT_NO_KEY} is {no}, expected {} (shard file names are 1-indexed, \
+             {SPLIT_NO_KEY} 0-indexed)",
+            path.display(),
+            i - 1
+        );
+        let sc = key(SPLIT_COUNT_KEY)?;
+        ensure!(
+            sc == split_count,
+            "{}: {SPLIT_COUNT_KEY} is {sc}, but the shard set was opened as {split_count}",
+            path.display()
+        );
+        let tc = key(SPLIT_TENSORS_COUNT_KEY)?;
+        if i == 1 {
+            expected_tensors = tc;
+        } else {
+            ensure!(
+                tc == expected_tensors,
+                "{}: {SPLIT_TENSORS_COUNT_KEY} is {tc}, but shard 1 of the set says \
+                 {expected_tensors}",
+                path.display()
+            );
+            // Real gguf-split shards carry ONLY the split.* trio beyond shard
+            // 0 (verified against the Unsloth set), so absent keys are the
+            // normal case — but a key present in BOTH shards with different
+            // values means the files are not shards of one export (e.g. a mix
+            // of two quants under one base name) and must be refused.
+            // candle's `Value` has no `PartialEq`; the Debug rendering carries
+            // the variant name and full contents, so equal renderings mean
+            // equal values.
+            for (k, v) in &content.metadata {
+                if matches!(
+                    k.as_str(),
+                    SPLIT_NO_KEY | SPLIT_COUNT_KEY | SPLIT_TENSORS_COUNT_KEY
+                ) {
+                    continue;
+                }
+                if let Some(first) = parts[0].2.metadata.get(k) {
+                    ensure!(
+                        format!("{first:?}") == format!("{v:?}"),
+                        "{}: metadata key {k} is {v:?} but shard 1 ({}) says {first:?} — these \
+                         files are not shards of one split",
+                        path.display(),
+                        parts[0].0.display()
+                    );
+                }
+            }
+        }
+        parts.push((path, file, content));
+    }
+
+    // The id chains the FNV fold over every shard's metadata section in shard
+    // order and sums the file lengths, so it pins each shard's tensor table
+    // and catches a replaced payload in any shard — and is identical whichever
+    // shard the set was opened through.
+    let mut hash = CheckpointId::OFFSET_BASIS;
+    let mut total_len = 0u64;
+    for (path, file, content) in &mut parts {
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("stat of shard {}", path.display()))?
+            .len();
+        // A metadata-only shard may end exactly where its KV block does, short
+        // of the aligned tensor-data offset no tensor data exists to occupy;
+        // its metadata section is then the whole file.
+        let metadata_len = content.tensor_data_offset.min(file_len);
+        (hash, _) = CheckpointId::fold(file, metadata_len, hash)
+            .with_context(|| format!("identifying GGUF shard {}", path.display()))?;
+        total_len += file_len;
+    }
+    let checkpoint = CheckpointId {
+        hash,
+        file_len: total_len,
+    };
+
+    // Union tensor table, offsets rebased to shard-absolute so the unified
+    // content's tensor_data_offset of 0 keeps every existing offset
+    // computation correct. Capacity comes from the tensor tables actually
+    // parsed, never from the declared split.tensors.count — two tiny shards
+    // declaring u64::MAX must fail the count check below, not size an
+    // allocation here.
+    let actual_tensors = parts
+        .iter()
+        .try_fold(0usize, |acc, p| acc.checked_add(p.2.tensor_infos.len()))
+        .context("tensor count across shards overflows usize")?;
+    let mut tensor_infos = HashMap::with_capacity(actual_tensors);
+    let mut shard_of = HashMap::with_capacity(actual_tensors);
+    for idx in 0..parts.len() {
+        let data_offset = parts[idx].2.tensor_data_offset;
+        for (name, mut info) in std::mem::take(&mut parts[idx].2.tensor_infos) {
+            info.offset = info.offset.checked_add(data_offset).with_context(|| {
+                format!(
+                    "shard {}: tensor {name}: offset {} + tensor data offset {data_offset} \
+                     overflows u64",
+                    parts[idx].0.display(),
+                    info.offset
+                )
+            })?;
+            if let Some(prev) = shard_of.insert(name.clone(), idx) {
+                bail!(
+                    "duplicate tensor {name}: appears in both {} and {}",
+                    parts[prev].0.display(),
+                    parts[idx].0.display()
+                );
+            }
+            tensor_infos.insert(name, info);
+        }
+    }
+    ensure!(
+        tensor_infos.len() as u64 == expected_tensors,
+        "split GGUF {}: its shards carry {} tensors but {SPLIT_TENSORS_COUNT_KEY} says \
+         {expected_tensors}",
+        handed.display(),
+        tensor_infos.len()
+    );
+
+    let content = Content {
+        magic: parts[0].2.magic,
+        metadata: std::mem::take(&mut parts[0].2.metadata),
+        tensor_infos,
+        tensor_data_offset: 0,
+    };
+    let mmap_wanted = matches!(device, Device::Metal(_)) && !load_classic();
+    let mut shards = Vec::with_capacity(parts.len());
+    for (path, file, _) in parts {
+        let mmap = if mmap_wanted {
+            Some(MmapSource::open(&path, device)?)
+        } else {
+            None
+        };
+        shards.push(Shard {
+            path,
+            file: Mutex::new(file),
+            mmap,
+        });
+    }
+    Ok(Arc::new(GgufFile {
+        content,
+        device: device.clone(),
+        path: SingleFilePath {
+            path: shards[0].path.clone(),
+            shard_count: shards.len(),
+        },
+        checkpoint,
+        shards,
+        shard_of,
     }))
 }
 
@@ -547,7 +931,7 @@ impl Weights {
 
     pub fn qtensor(&self, name: &str) -> Result<Arc<QTensor>> {
         let full = self.name(name);
-        let mut file = self.src.file.lock().unwrap();
+        let mut file = self.src.shard_for(&full).file.lock().unwrap();
         let qt = self
             .src
             .content
@@ -610,7 +994,7 @@ impl Weights {
 
         let mut raw = vec![0u8; size_in_bytes];
         {
-            let mut file = self.src.file.lock().unwrap();
+            let mut file = self.src.shard_for(&full).file.lock().unwrap();
             file.seek(SeekFrom::Start(tensor_start))
                 .with_context(|| format!("seeking to {full}"))?;
             file.read_exact(&mut raw)
@@ -697,8 +1081,8 @@ impl Weights {
     /// stored dtype (or a classic open) takes the copying path, whose f32
     /// intermediate is dropped before this returns; no f32 copy stays alive.
     pub fn dense_f16(&self, name: &str) -> Result<Tensor> {
-        if let Some(src) = self.src.mmap.as_ref() {
-            let full = self.name(name);
+        let full = self.name(name);
+        if let Some(src) = self.src.shard_for(&full).mmap.as_ref() {
             let info = self
                 .src
                 .content
@@ -770,7 +1154,8 @@ impl Weights {
         let size_in_bytes = elems / block * dtype.type_size();
         let tensor_start = (self.src.content.tensor_data_offset + info.offset) as usize;
 
-        let (buffer, base_off, mmap) = match self.src.mmap.as_ref() {
+        let shard = self.src.shard_for(&full);
+        let (buffer, base_off, mmap) = match shard.mmap.as_ref() {
             Some(src) => {
                 let (buffer, base_off) = src
                     .view(tensor_start, size_in_bytes)
@@ -800,7 +1185,7 @@ impl Weights {
                 let padded_rows = out_dim.div_ceil(Q8_DECODE_NR0) * Q8_DECODE_NR0;
                 let mut raw = vec![0u8; padded_rows * bytes_per_row];
                 {
-                    let mut file = self.src.file.lock().unwrap();
+                    let mut file = shard.file.lock().unwrap();
                     file.seek(SeekFrom::Start(tensor_start as u64))
                         .with_context(|| format!("seeking to {full}"))?;
                     file.read_exact(&mut raw[..size_in_bytes])
@@ -834,8 +1219,9 @@ impl Weights {
     /// open: read + upload once, sharing the allocation with a wrapping
     /// QTensor.
     pub fn expert_stack(&self, name: &str) -> Result<ExpertStack> {
-        match self.src.mmap.as_ref() {
-            Some(src) => self.expert_stack_mmap(name, src),
+        let full = self.name(name);
+        match self.src.shard_for(&full).mmap.clone() {
+            Some(src) => self.expert_stack_mmap(name, &src),
             None => self.expert_stack_classic(name),
         }
     }
@@ -869,7 +1255,7 @@ impl Weights {
 
         let mut raw = vec![0u8; size_in_bytes];
         {
-            let mut file = self.src.file.lock().unwrap();
+            let mut file = self.src.shard_for(&full).file.lock().unwrap();
             file.seek(SeekFrom::Start(tensor_start))
                 .with_context(|| format!("seeking to {full}"))?;
             file.read_exact(&mut raw)
@@ -951,7 +1337,7 @@ impl Weights {
     /// Loads a tensor by its fully-qualified GGUF name (dtype suffix included),
     /// bypassing the implicit `.weight` suffix that `qtensor` appends.
     fn qtensor_named(&self, full: &str) -> Result<Arc<QTensor>> {
-        let mut file = self.src.file.lock().unwrap();
+        let mut file = self.src.shard_for(full).file.lock().unwrap();
         let qt = self
             .src
             .content
@@ -1351,6 +1737,575 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A fresh directory for a split-GGUF shard set, so sibling discovery only
+    /// ever sees the shards the test wrote.
+    fn split_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xwen_split_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The three KV keys every shard of a split GGUF carries, at the widths
+    /// gguf-split writes them (`split.no`/`split.count` u16,
+    /// `split.tensors.count` i32).
+    fn split_kvs(no: u16, count: u16, total_tensors: i32) -> Vec<(&'static str, Value)> {
+        vec![
+            (SPLIT_NO_KEY, Value::U16(no)),
+            (SPLIT_COUNT_KEY, Value::U16(count)),
+            (SPLIT_TENSORS_COUNT_KEY, Value::I32(total_tensors)),
+        ]
+    }
+
+    fn write_gguf(path: &Path, kvs: &[(&'static str, Value)], tensors: &[(&str, &QTensor)]) {
+        let kv_refs: Vec<(&str, &Value)> = kvs.iter().map(|(k, v)| (*k, v)).collect();
+        let mut f = File::create(path).unwrap();
+        gguf_file::write(&mut f, &kv_refs, tensors).unwrap();
+    }
+
+    /// The full context chain of an `open` expected to fail.
+    fn open_err(path: PathBuf) -> String {
+        match open(&path, &Device::Cpu) {
+            Ok(_) => panic!("open unexpectedly succeeded for {}", path.display()),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    fn q8_tensor(rows: usize, cols: usize, seed: u64) -> QTensor {
+        let w = Tensor::from_vec(fill(rows * cols, seed), (rows, cols), &Device::Cpu).unwrap();
+        QTensor::quantize(&w, GgmlDType::Q8_0).unwrap()
+    }
+
+    fn dequant(qt: &QTensor) -> Vec<f32> {
+        qt.dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// A split GGUF opens from ANY shard's path into one logical file: the
+    /// unified metadata is shard 0's complete KV block (shard 0 itself holding
+    /// no tensors, the gguf-split layout), the tensor table is the union
+    /// across shards, and every tensor reads back its own shard's bytes. The
+    /// checkpoint id covers all shards, so it is identical whichever shard the
+    /// set was opened through.
+    #[test]
+    fn split_gguf_presents_one_logical_file() {
+        let dir = split_dir("logical");
+        let (a, b, c) = (
+            q8_tensor(4, 64, 0x5EED_A),
+            q8_tensor(2, 96, 0x5EED_B),
+            q8_tensor(3, 32, 0x5EED_C),
+        );
+        let mut meta = split_kvs(0, 3, 3);
+        meta.push(("general.name", Value::String("Synthetic Split".into())));
+        write_gguf(&dir.join("m-00001-of-00003.gguf"), &meta, &[]);
+        write_gguf(
+            &dir.join("m-00002-of-00003.gguf"),
+            &split_kvs(1, 3, 3),
+            &[("a.weight", &a)],
+        );
+        write_gguf(
+            &dir.join("m-00003-of-00003.gguf"),
+            &split_kvs(2, 3, 3),
+            &[("b.weight", &b), ("c.weight", &c)],
+        );
+
+        let gguf = open(dir.join("m-00001-of-00003.gguf"), &Device::Cpu).unwrap();
+        assert_eq!(
+            gguf.content
+                .metadata
+                .get("general.name")
+                .map(|v| v.to_string().unwrap().as_str()),
+            Some("Synthetic Split"),
+            "unified metadata is shard 0's KV block"
+        );
+        assert_eq!(gguf.content.tensor_infos.len(), 3, "union tensor table");
+        let w = Weights::from_gguf(gguf.clone());
+        for (name, src) in [("a", &a), ("b", &b), ("c", &c)] {
+            let loaded = w.qtensor(name).unwrap();
+            assert_eq!(loaded.shape(), src.shape());
+            assert_eq!(
+                dequant(&loaded),
+                dequant(src),
+                "tensor {name} read back the wrong bytes"
+            );
+        }
+
+        // Opened through a different shard: same logical file, same identity.
+        let via_last = open(dir.join("m-00003-of-00003.gguf"), &Device::Cpu).unwrap();
+        assert_eq!(via_last.checkpoint_id(), gguf.checkpoint_id());
+        let loaded = Weights::from_gguf(via_last).qtensor("a").unwrap();
+        assert_eq!(dequant(&loaded), dequant(&a));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A complete single-file GGUF whose NAME happens to be split-shaped (no
+    /// split.* keys) must take the single-file path — no sibling probing, no
+    /// new failure mode.
+    #[test]
+    fn split_shaped_name_without_split_keys_stays_single_file() {
+        let dir = split_dir("solo");
+        let a = q8_tensor(4, 64, 0x5010);
+        let path = dir.join("solo-00001-of-00002.gguf");
+        write_gguf(&path, &[], &[("a.weight", &a)]);
+
+        let gguf = open(&path, &Device::Cpu).unwrap();
+        assert_eq!(gguf.content.tensor_infos.len(), 1);
+        let loaded = Weights::from_gguf(gguf).qtensor("a").unwrap();
+        assert_eq!(dequant(&loaded), dequant(&a));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_gguf_missing_shard_is_an_error() {
+        let dir = split_dir("missing");
+        let a = q8_tensor(4, 64, 0x0111);
+        write_gguf(&dir.join("m-00001-of-00003.gguf"), &split_kvs(0, 3, 1), &[]);
+        // Shard 2 is never written.
+        write_gguf(
+            &dir.join("m-00003-of-00003.gguf"),
+            &split_kvs(2, 3, 1),
+            &[("a.weight", &a)],
+        );
+
+        let err = open_err(dir.join("m-00001-of-00003.gguf"));
+        assert!(err.contains("shard 2 of 3"), "unexpected error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shard self-description must agree with the shard's position in the set:
+    /// a wrong split.no (a renamed or shuffled file) and a wrong split.count (a
+    /// shard from a different split of the same base name) are both refused.
+    #[test]
+    fn split_gguf_inconsistent_split_keys_are_an_error() {
+        let dir = split_dir("badno");
+        write_gguf(&dir.join("m-00001-of-00002.gguf"), &split_kvs(0, 2, 0), &[]);
+        // split.no says 0 where the file name says shard 2 (split.no 1).
+        write_gguf(&dir.join("m-00002-of-00002.gguf"), &split_kvs(0, 2, 0), &[]);
+        let err = open_err(dir.join("m-00001-of-00002.gguf"));
+        assert!(err.contains(SPLIT_NO_KEY), "unexpected error: {err}");
+
+        // split.count disagrees with the set the file names describe.
+        write_gguf(&dir.join("m-00002-of-00002.gguf"), &split_kvs(1, 4, 0), &[]);
+        let err = open_err(dir.join("m-00001-of-00002.gguf"));
+        assert!(err.contains(SPLIT_COUNT_KEY), "unexpected error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_gguf_duplicate_tensor_name_is_an_error() {
+        let dir = split_dir("dup");
+        let a = q8_tensor(4, 64, 0xD0);
+        write_gguf(&dir.join("m-00001-of-00003.gguf"), &split_kvs(0, 3, 2), &[]);
+        write_gguf(
+            &dir.join("m-00002-of-00003.gguf"),
+            &split_kvs(1, 3, 2),
+            &[("a.weight", &a)],
+        );
+        write_gguf(
+            &dir.join("m-00003-of-00003.gguf"),
+            &split_kvs(2, 3, 2),
+            &[("a.weight", &a)],
+        );
+
+        let err = open_err(dir.join("m-00001-of-00003.gguf"));
+        assert!(
+            err.contains("duplicate tensor a.weight"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_gguf_tensor_count_mismatch_is_an_error() {
+        let dir = split_dir("count");
+        let a = q8_tensor(4, 64, 0xC0);
+        // The set claims 5 tensors but carries 1.
+        write_gguf(&dir.join("m-00001-of-00002.gguf"), &split_kvs(0, 2, 5), &[]);
+        write_gguf(
+            &dir.join("m-00002-of-00002.gguf"),
+            &split_kvs(1, 2, 5),
+            &[("a.weight", &a)],
+        );
+        let err = open_err(dir.join("m-00001-of-00002.gguf"));
+        assert!(
+            err.contains(SPLIT_TENSORS_COUNT_KEY),
+            "unexpected error: {err}"
+        );
+
+        // Shards that disagree with each other about the total are refused too.
+        write_gguf(
+            &dir.join("m-00002-of-00002.gguf"),
+            &split_kvs(1, 2, 1),
+            &[("a.weight", &a)],
+        );
+        let err = open_err(dir.join("m-00001-of-00002.gguf"));
+        assert!(
+            err.contains("shard 1 of the set"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt tensor offset large enough that rebasing it to its shard-
+    /// absolute position would wrap u64 must fail with an error naming the
+    /// shard and tensor, not wrap into a bogus (and possibly in-bounds) read
+    /// position.
+    #[test]
+    fn split_gguf_overflowing_tensor_offset_is_an_error() {
+        let dir = split_dir("overflow");
+        let a = q8_tensor(4, 64, 0x0F);
+        write_gguf(&dir.join("m-00001-of-00002.gguf"), &split_kvs(0, 2, 1), &[]);
+        let shard2 = dir.join("m-00002-of-00002.gguf");
+        write_gguf(&shard2, &split_kvs(1, 2, 1), &[("a.weight", &a)]);
+        // Patch the written tensor's offset field to u64::MAX. GGUF v2 tensor
+        // info layout: name bytes, then u32 n_dims, n_dims × u64 dims (2 here),
+        // u32 dtype, u64 offset.
+        let mut bytes = std::fs::read(&shard2).unwrap();
+        let name = b"a.weight";
+        let at = bytes
+            .windows(name.len())
+            .position(|w| w == name)
+            .expect("tensor name appears in the shard's info table");
+        let off = at + name.len() + 4 + 2 * 8 + 4;
+        bytes[off..off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&shard2, &bytes).unwrap();
+
+        let err = open_err(dir.join("m-00001-of-00002.gguf"));
+        assert!(
+            err.contains("overflows u64") && err.contains("a.weight"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole-file accessors (`mmap_source`, the `path` handle) must refuse
+    /// a split GGUF loudly: shard 0 alone is not the checkpoint, and a caller
+    /// re-reading it by path (the drafter loaders' pattern) would silently get
+    /// wrong bytes. Single-file behavior stays identical.
+    #[test]
+    fn split_gguf_whole_file_accessors_panic() {
+        let dir = split_dir("wholefile");
+        let a = q8_tensor(4, 64, 0x77);
+        write_gguf(&dir.join("m-00001-of-00002.gguf"), &split_kvs(0, 2, 1), &[]);
+        write_gguf(
+            &dir.join("m-00002-of-00002.gguf"),
+            &split_kvs(1, 2, 1),
+            &[("a.weight", &a)],
+        );
+        let gguf = open(dir.join("m-00001-of-00002.gguf"), &Device::Cpu).unwrap();
+
+        let panic_msg = |r: std::thread::Result<()>| -> String {
+            let err = r.expect_err("whole-file access must panic on a split GGUF");
+            err.downcast_ref::<String>().cloned().unwrap_or_default()
+        };
+        let msg = panic_msg(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || {
+                let _ = gguf.mmap_source();
+            },
+        )));
+        assert!(msg.contains("mmap_sources"), "unexpected panic: {msg}");
+        let msg = panic_msg(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || {
+                let _ = gguf.path.to_path_buf();
+            },
+        )));
+        assert!(msg.contains("only shard 0"), "unexpected panic: {msg}");
+
+        // A single-file open still hands out its path and (one) mapping.
+        let solo = dir.join("solo.gguf");
+        write_gguf(&solo, &[], &[("a.weight", &a)]);
+        let gguf = open(&solo, &Device::Cpu).unwrap();
+        assert_eq!(&*gguf.path, solo.as_path());
+        assert!(gguf.mmap_source().is_none(), "no mapping on Cpu");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declared split.tensors.count is untrusted input until the shard
+    /// tables are read: two tiny shards claiming u64::MAX must produce the
+    /// count-mismatch error, not size an allocation.
+    #[test]
+    fn split_gguf_huge_declared_tensor_count_is_an_error() {
+        let dir = split_dir("huge");
+        let a = q8_tensor(4, 64, 0x81);
+        let kvs = |no: u16| {
+            vec![
+                (SPLIT_NO_KEY, Value::U16(no)),
+                (SPLIT_COUNT_KEY, Value::U16(2)),
+                (SPLIT_TENSORS_COUNT_KEY, Value::U64(u64::MAX)),
+            ]
+        };
+        write_gguf(&dir.join("m-00001-of-00002.gguf"), &kvs(0), &[]);
+        write_gguf(
+            &dir.join("m-00002-of-00002.gguf"),
+            &kvs(1),
+            &[("a.weight", &a)],
+        );
+        let err = open_err(dir.join("m-00001-of-00002.gguf"));
+        assert!(
+            err.contains(SPLIT_TENSORS_COUNT_KEY),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shard numbers in file names are 1-indexed members of the set the name
+    /// describes: a handed `-00000-` or `-99999-` file must be refused, not
+    /// silently swapped for the canonical siblings.
+    #[test]
+    fn split_gguf_out_of_range_name_number_is_an_error() {
+        let dir = split_dir("range");
+        // The canonical set exists and is valid on its own.
+        write_gguf(&dir.join("m-00001-of-00002.gguf"), &split_kvs(0, 2, 0), &[]);
+        write_gguf(&dir.join("m-00002-of-00002.gguf"), &split_kvs(1, 2, 0), &[]);
+        for stray in ["m-00000-of-00002.gguf", "m-99999-of-00002.gguf"] {
+            write_gguf(&dir.join(stray), &split_kvs(0, 2, 0), &[]);
+            let err = open_err(dir.join(stray));
+            assert!(err.contains("outside 1..=2"), "unexpected error: {err}");
+        }
+        // The canonical set itself still opens.
+        assert!(open(dir.join("m-00001-of-00002.gguf"), &Device::Cpu).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Partial split metadata is a hard error, never a silent single-file
+    /// open: a shard key without split.count, or a split.count = 1 claiming a
+    /// nonzero shard number, describes no file this loader should read whole.
+    /// A genuine one-shard export (split.count 1, split.no 0) stays a
+    /// complete single-file GGUF.
+    #[test]
+    fn partial_split_metadata_is_an_error() {
+        let dir = split_dir("partial");
+        let a = q8_tensor(4, 64, 0xAB);
+
+        let path = dir.join("no_count.gguf");
+        write_gguf(&path, &[(SPLIT_NO_KEY, Value::U16(1))], &[("a.weight", &a)]);
+        let err = open_err(path);
+        assert!(err.contains(SPLIT_COUNT_KEY), "unexpected error: {err}");
+
+        let path = dir.join("tensors_only.gguf");
+        write_gguf(
+            &path,
+            &[(SPLIT_TENSORS_COUNT_KEY, Value::I32(1))],
+            &[("a.weight", &a)],
+        );
+        let err = open_err(path);
+        assert!(err.contains(SPLIT_COUNT_KEY), "unexpected error: {err}");
+
+        let path = dir.join("count_one_no_one.gguf");
+        write_gguf(&path, &split_kvs(1, 1, 1), &[("a.weight", &a)]);
+        let err = open_err(path);
+        assert!(err.contains("one-shard export"), "unexpected error: {err}");
+
+        let path = dir.join("count_zero.gguf");
+        write_gguf(&path, &split_kvs(0, 0, 1), &[("a.weight", &a)]);
+        let err = open_err(path);
+        assert!(
+            err.contains("describes no shard set"),
+            "unexpected error: {err}"
+        );
+
+        let path = dir.join("one_shard_export.gguf");
+        write_gguf(&path, &split_kvs(0, 1, 1), &[("a.weight", &a)]);
+        let gguf = open(&path, &Device::Cpu).unwrap();
+        assert_eq!(gguf.content.tensor_infos.len(), 1);
+        assert_eq!(
+            dequant(&Weights::from_gguf(gguf).qtensor("a").unwrap()),
+            dequant(&a)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-first shards of real split files carry only the split.* trio, so
+    /// keys absent from later shards must stay legal (every other split test
+    /// and the real-shard smoke are that shape) — but a key present in TWO
+    /// shards with different values means the files are not shards of one
+    /// export and must be refused.
+    #[test]
+    fn split_gguf_conflicting_shard_metadata_is_an_error() {
+        let dir = split_dir("meta");
+        let a = q8_tensor(4, 64, 0x99);
+        let mut m1 = split_kvs(0, 2, 1);
+        m1.push(("general.name", Value::String("A".into())));
+        write_gguf(&dir.join("m-00001-of-00002.gguf"), &m1, &[]);
+        let mut m2 = split_kvs(1, 2, 1);
+        m2.push(("general.name", Value::String("B".into())));
+        write_gguf(&dir.join("m-00002-of-00002.gguf"), &m2, &[("a.weight", &a)]);
+        let err = open_err(dir.join("m-00001-of-00002.gguf"));
+        assert!(
+            err.contains("general.name") && err.contains("not shards of one split"),
+            "unexpected error: {err}"
+        );
+
+        // The same value in both shards is consistent, not a conflict.
+        m2.pop();
+        m2.push(("general.name", Value::String("A".into())));
+        write_gguf(&dir.join("m-00002-of-00002.gguf"), &m2, &[("a.weight", &a)]);
+        assert!(open(dir.join("m-00001-of-00002.gguf"), &Device::Cpu).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On the mmap alias load, a tensor from a non-first shard must alias its
+    /// OWN shard's mapping: the aliased f16 plane reads back bitwise identical
+    /// to the source weight even though the unified tensor table (offsets
+    /// rebased, tensor_data_offset 0) no longer matches any single file's
+    /// layout.
+    #[test]
+    fn split_gguf_mmap_alias_reads_the_right_shard() {
+        let device = metal_device().unwrap();
+        let dir = split_dir("mmap");
+        let (out_dim, in_dim) = (8usize, 64usize);
+        let plane_f32 = Tensor::from_vec(
+            fill(out_dim * in_dim, 0xF00D),
+            (out_dim, in_dim),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let plane = QTensor::quantize(&plane_f32, GgmlDType::F16).unwrap();
+        let w3 = q8_tensor(4, 64, 0xF33D);
+        write_gguf(&dir.join("m-00001-of-00003.gguf"), &split_kvs(0, 3, 2), &[]);
+        write_gguf(
+            &dir.join("m-00002-of-00003.gguf"),
+            &split_kvs(1, 3, 2),
+            &[("plane.weight", &plane)],
+        );
+        write_gguf(
+            &dir.join("m-00003-of-00003.gguf"),
+            &split_kvs(2, 3, 2),
+            &[("w.weight", &w3)],
+        );
+
+        let gguf = open(dir.join("m-00001-of-00003.gguf"), &device).unwrap();
+        let w = Weights::from_gguf(gguf.clone());
+        let aliased = w.dense_f16("plane").unwrap();
+        for src in gguf.mmap_sources() {
+            src.register_views();
+        }
+        assert_eq!(aliased.dims(), &[out_dim, in_dim]);
+        let got: Vec<half::f16> = aliased
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let want: Vec<half::f16> = plane
+            .dequantize_f16(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                e.to_bits(),
+                "aliased plane differs from its shard's bytes at element {i}"
+            );
+        }
+        // A quantized read from the third shard through the same logical file.
+        let loaded = w.qtensor("w").unwrap();
+        assert_eq!(
+            loaded
+                .dequantize(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            dequant(&w3)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Locates a real gguf-split first shard to smoke against, when one is
+    /// reachable: `XWEN_SPLIT_SMOKE_SHARD` names a `-00001-of-*.gguf` file
+    /// directly; otherwise the HF cache is scanned for the Unsloth
+    /// Qwen3.8-Flash-Next split. `None` skips the smoke.
+    fn real_first_shard() -> Option<PathBuf> {
+        if let Some(p) = std::env::var_os("XWEN_SPLIT_SMOKE_SHARD") {
+            let p = PathBuf::from(p);
+            return p.exists().then_some(p);
+        }
+        let hub = std::env::var_os("HF_HUB_CACHE")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/huggingface/hub"))
+            })?;
+        fn find(dir: &Path) -> Option<PathBuf> {
+            for entry in std::fs::read_dir(dir).ok()? {
+                let p = entry.ok()?.path();
+                if p.is_dir() {
+                    if let Some(hit) = find(&p) {
+                        return Some(hit);
+                    }
+                } else if p.extension().is_some_and(|e| e == "gguf")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains("-00001-of-"))
+                {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        find(&hub.join("models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots"))
+    }
+
+    /// Smoke against a real metadata-only first shard: its split keys parse at
+    /// the widths gguf-split writes, and opening it either assembles the full
+    /// set (siblings on disk) or names the first missing sibling. Passes
+    /// vacuously when no real shard is reachable (`real_first_shard`).
+    #[test]
+    fn real_split_first_shard_parses_and_demands_its_siblings() {
+        let Some(shard) = real_first_shard() else {
+            return;
+        };
+        let mut file = File::open(&shard).unwrap();
+        let content = Content::read(&mut file).unwrap();
+        assert_eq!(metadata_uint(&content, SPLIT_NO_KEY).unwrap(), Some(0));
+        let count = metadata_uint(&content, SPLIT_COUNT_KEY)
+            .unwrap()
+            .expect("a real first shard carries split.count");
+        assert!(count >= 2, "split.count {count}");
+        let total = metadata_uint(&content, SPLIT_TENSORS_COUNT_KEY)
+            .unwrap()
+            .expect("a real first shard carries split.tensors.count");
+        assert!(total > 0, "split.tensors.count {total}");
+        assert!(
+            content.tensor_infos.is_empty(),
+            "the Unsloth layout's first shard is metadata-only"
+        );
+
+        let (base, _, name_count) = split_name_parts(&shard).expect("split-shaped name");
+        assert_eq!(name_count as u64, count);
+        let dir = shard.parent().unwrap();
+        let siblings_present = (2..=name_count).all(|i| {
+            dir.join(format!("{base}-{i:05}-of-{name_count:05}.gguf"))
+                .exists()
+        });
+
+        if siblings_present {
+            let gguf = open(&shard, &Device::Cpu).unwrap();
+            assert_eq!(gguf.content.tensor_infos.len() as u64, total);
+        } else {
+            let err = open_err(shard);
+            assert!(err.contains("shard 2 of"), "unexpected error: {err}");
+        }
     }
 
     /// The alias-load mapping for `path`: reuse the GgufFile's own (default

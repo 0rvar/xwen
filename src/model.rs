@@ -140,9 +140,10 @@ pub struct XwenModel {
     /// f16 planes are plain `Tensor`s that cannot carry the mapping themselves,
     /// so dropping it while the model lives would leave their view buffers (and
     /// the GPU) reading unmapped pages (`gguf::MmapSource`'s lifetime
-    /// invariant; expert stacks additionally hold their own clones). `None` on
-    /// the classic copying load.
-    _weights_mmap: Option<Arc<crate::gguf::MmapSource>>,
+    /// invariant; expert stacks additionally hold their own clones). One
+    /// mapping per shard of a split GGUF — a tensor aliases whichever shard
+    /// holds it, so all must stay alive. Empty on the classic copying load.
+    _weights_mmap: Vec<Arc<crate::gguf::MmapSource>>,
     /// Identity of the checkpoint this model was loaded from, carried so that
     /// anything persisted from a running model (cache images) can be stamped with
     /// it and refused against a different one. The `GgufFile` it came from is
@@ -253,9 +254,9 @@ impl XwenModel {
         let (lm_head, lm_head_buffer, lm_head_dtype) = w.qlinear_with_buffer("output")?;
 
         // Batch-register every mmap weight view in candle's queue-attached
-        // residency set (one commit); MmapSource::drop unregisters them, so
-        // load→drop cycles are leak-free.
-        if let Some(src) = gguf.mmap_source() {
+        // residency set (one commit per shard mapping); MmapSource::drop
+        // unregisters them, so load→drop cycles are leak-free.
+        for src in gguf.mmap_sources() {
             src.register_views();
         }
         warn_if_over_budget(&gguf, &cfg, kv_slots, max_ctx);
@@ -282,7 +283,7 @@ impl XwenModel {
             keep_post_norm: false,
             post_norm_hidden: None,
             profile: crate::ops::stack_profile().then(crate::stack_profile::StackProfiler::new),
-            _weights_mmap: gguf.mmap_source().cloned(),
+            _weights_mmap: gguf.mmap_sources(),
             checkpoint: gguf.checkpoint_id(),
         })
     }
