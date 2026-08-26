@@ -1755,3 +1755,131 @@ carried.
   renders, so counts match generation); a client that needs per-request effort on 3.8
   uses the OpenAI or native dialect. Revisit only if Anthropic's API grows an effort
   field to mirror.
+
+## Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream)
+
+Alibaba's ModelScope countdown page
+(https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next) drops the model card
+~2026-08-26: an open-weight preview of the Qwen4 architecture. Teased specs from the
+since-trimmed model-card highlights: multimodal MoE, 125B main params + 51B additional
+n-gram embedding params ("fast local token lookups" — reportedly a hashed table read a
+few rows per token, never through a matmul), 6B active per token, built on "GDN and
+QSA" mechanisms, ~1/9th the training cost of Qwen3.7-Plus at comparable capability.
+Decision: we WILL port it, targeting Q4_K on this machine.
+
+- [ ] **Port Qwen3.8-Flash-Next.** A PORT, not a registry entry — QSA sparse attention
+  and the n-gram embedding subsystem are new; the transferable assets are the Gated
+  DeltaNet implementation (GDN) and the 35B-A3B MoE machinery (router / top-k renorm /
+  shared expert). Blocked on three things, in dependency order: (1) the actual model
+  card + transformers modeling code (drops ~2026-08-26); (2) llama.cpp arch support —
+  our ground-truth chain and parity oracle need it, and it will lag release; (3) a
+  GGUF path — ggml-org GGUF, or convert ourselves once llama.cpp's convert script
+  supports the arch.
+  - Capacity checked 2026-08-25: 128 GB RAM, 757 GB free disk. ~105 GB estimated at Q4
+    (~75 GB MoE + ~30 GB n-gram table); the n-gram table can stay file-backed/CPU-side
+    since it's sparse row lookups. Worst case (no day-one GGUF) is ~350 GB BF16
+    safetensors + self-conversion, which fits disk. The "one large model process at a
+    time" rule becomes absolute at this size.
+  - First moves when the card drops: read the modular_*.py modeling code + config.json
+    to turn "architectural upgrades" (attention/residual/embedding/optimization) into
+    a concrete delta list; watch llama.cpp for the arch PR; decide vision-tower
+    separability (expect to ignore it like mmproj-*).
+  - Research findings 2026-08-25: release timestamped 2026-08-26T15:00Z; planned
+    artifacts are safetensors + FP8 only, no GGUF planned; nothing in flight in
+    llama.cpp or transformers (closest precedent for the n-gram table: open unmerged
+    llama.cpp PR #19167, LongCat-Flash-Lite n-gram embeddings — ggml has no shipped op
+    for it either). The trimmed highlights (125B/51B/6B) survive only as forum
+    copy-pastes; "GDN and QSA" specifically is community paraphrase, so GDN carrying
+    over is NOT yet established. Planning assumption (2026-08-25): Unsloth publishes
+    within ~1 h of release — that covers weights/quants and their usual
+    tokenizer/template fixes, but an Unsloth GGUF still requires llama.cpp arch
+    support to exist first (GGUF is the container, not the graph), and xwen needs the
+    graph port regardless; a day-one GGUF would only hand us ground-truth authority
+    #2 (the tensor table) early and skip self-conversion. Whatever file we bless,
+    parity floors get calibrated to ITS quant mix — Unsloth dynamic mixes are not
+    ggml-org's Q4_K_M mix. Don't wait on llama.cpp to START the port: vLLM/SGLang
+    support is typically contributed by Qwen themselves and lands day-one (as it did
+    for Qwen3-Next), so their model code + the transformers modular file are the
+    executable references for the math in the llama.cpp gap — enough to write the
+    graph and float-level taps against, even though the GGUF-vs-GGUF parity oracle
+    still has to wait for a llama.cpp arch + blessed file.
+  - Architecture priors (researched 2026-08-25, pre-card — verify against the real
+    modeling code before building on any of this): QSA has no paper; the strongest
+    prior is DeepSeek-DSA-shaped (small-dim indexer, relu(k·q) scores, top-k kv
+    selection, sparse mask over ordinary attention) — our pinned llama.cpp clone
+    already carries three implementations (`ggml_lightning_indexer`,
+    `src/models/glm-dsa.cpp:343-383`), so that half would be cheap. The n-gram table
+    is almost certainly Engram-shaped (DeepSeek, arXiv 2601.07372, code published):
+    multiplicative-XOR hash over suffix bi/trigrams of NORMALIZED token ids (NFKC +
+    lowercase compression — a silent-garbage trap), K hash heads per order,
+    prime-sized tables, rows concatenated → projected → scalar-gated → added
+    residually at a couple of MID-STACK layers (not the input embedding). Indices
+    depend only on token ids → host-side precompute + get_rows + gated add; no new
+    GPU op needed, and the table is the one component where file-backed costs
+    nothing (Engram paper: 100B-param host-offloaded table = 2.8% throughput).
+    GDN = Gated DeltaNet, no published evolution — our DeltaNet path is the piece
+    most likely to survive unchanged. BIGGEST structural risk (low confidence, high
+    impact): "Residual" upgrades = hyper-connections (ggml `ggml_dsv4_hc_*`,
+    arXiv 2512.24880), which would invalidate the `x + f(norm(x))` skeleton.
+    llama.cpp precedent: qwen3-next took ~78 days release→merge (#15940/#16095);
+    expect a similar-or-longer tail here, and no day-one ggml-org GGUF (the convert
+    pipeline needs the arch first). Multimodal: Qwen practice is a separable
+    mmproj-* tower and one report says no vision exercised in this release — prior
+    ~80% we can ignore it as usual.
+  - CARD DROPPED 2026-08-26 — confirmed spec (from config.json, transformers
+    `modular_qwen4_exp.py` on main, and Unsloth's GGUF metadata; full digests in the
+    session that wrote this entry). Arch `qwen4_exp` (GGUF `qwen4exp`), 48 layers,
+    hidden 2560, 125B MoE + 51.2B PLE table + 4B MTP = 180B on disk, A6B, ctx 262144
+    (YaRN→1M). Same `(i+1)%4==0` attention cadence (12 attn / 36 GDN). BF16 repo:
+    131 shards, 360 GB, no trust_remote_code. Prior grades: GDN TRUE except the
+    gated-norm output gate is `sigmoid(z)` NOT `silu(z)` (`output_gate_type`) —
+    otherwise byte-identical geometry to our 27B DeltaNet (16K/48V, dim 128, inner
+    6144, conv 4, silu over fused stream, same tiled-vs-interleave converter rule).
+    QSA VARIANT of DSA: MQA indexer (4 q-heads, 1 k-head, dim 128, RMSNorm then
+    64-dim partial rope), scores relu(q·k).sum(heads)/√128 over 4-token mean-pooled
+    BLOCKS (fp32 pool, k_layernorm, rope at block-first position; keys cached RAW),
+    top-512 blocks = 2048-token budget, incomplete tail always visible, no sliding
+    window. Residual skeleton FALSE — hyper-connections: 4 streams (10240-wide
+    carrier), rank-320 read bottleneck silu(down/4)→sigmoid(up), per-stream mean
+    read, write gate 2·sigmoid(inject/4), write-back onto the UN-NORMED stream; NO
+    input_layernorm/post_attention_layernorm/final norm tensors exist (hc_norm =
+    grouped RMSNorm(group 2560) replaces all); tail `hyper_connection_mixer` then
+    lm_head. PLE (n-gram) Engram-VARIANT: orders {2,3}×8 heads, row dim 160, 16
+    prime tables (~20M rows each) as ONE padded [320001536,160] tensor (HF: 128
+    shard_N tensors; GGUF: single `per_layer_token_embd.weight`, IQ4_NL 28.8 GB),
+    splitmix64-derived odd multipliers SHIPPED as I64 buffers (read, don't
+    recompute), hash over RAW token ids (NO NFKC/lowercase), shift-right that never
+    crosses an eos boundary where eos = SCALAR 248044 (not 248046 — wrong id
+    silently corrupts lookups at turn boundaries), ONE layer (ple_layer_ids [2],
+    ONE-indexed → decoder idx 1, a GDN layer), injection = key_proj→4 streams +
+    value_proj, per-stream dot-product gate ÷√2560 with SIGNED SQRT then sigmoid,
+    plus depthwise conv k=4 DILATION 3 (state 9) — adds to the 10240 stream. A PLE
+    layer carries THREE recurrent states: GDN conv (10240×3), PLE conv (10240×9),
+    2-token raw history. MoE: 512 experts top-10, softmax-all-then-topk-then-renorm,
+    NO 6.1e-5 clamp (that's a 3.6-35B-only detail); shexp 640-wide with
+    `shared_expert_gate` shape [1,2560]. Attention/rope/tokenizer carry over:
+    double-width interleaved q/gate, QK-RMSNorm(256), sigmoid out-gate, theta 1e7,
+    n_rot 64, mrope [11,11,10] interleaved ≡ NEoX-64 for text; tokenizer =
+    Qwen3.8-27B's exactly (base hash-identical to vendored 3.6 + audio specials to
+    248076); template = near-3.8 dialect + vision items (vision in system raises);
+    stops [248046,248044] via generation_config. Sampling: thinking 1.0/0.95/20,
+    non-thinking 0.7/0.80/20 with PRESENCE_PENALTY 1.5 — our serve accepts-and-drops
+    penalties, now a real gap for this checkpoint. Vision separable: inline
+    `model.visual.*` ViT (no mmproj file), masked_scatter at image_pad 248056,
+    deepstack empty — text-only drop is clean. MTP head present (4B, QSA layer +
+    MoE, separate fc_embedding/fc_hidden projections NOT 3.8's concat eh_proj;
+    reuses target embd/lm_head) but transformers ships no MTP class — semantics
+    need vLLM/SGLang or the tech report. layer_types in config.json says
+    "full_attention" but the config class REWRITES it to qwen_sparse_attention —
+    trusting the file builds dense attention that runs and is silently worse.
+    Toolchain: NOT in llama.cpp master; open DRAFT PR #27742 (Unsloth; Qwen's
+    #27739 closed in its favor), zero new ggml ops, conversion moved to a
+    `conversion/` package upstream — our pinned oracle (e9fa0781) predates all of
+    it. No ggml-org GGUF repo. Unsloth GGUF: split-file (gguf-split, metadata-only
+    first shard, `split.*` keys, 1224 tensors), UD-IQ1_S up (72.5 GB), indexer BF16,
+    hc Q8_0, sampling keys baked into metadata, `general.name` "Qwen3.8 Flash
+    Next". xwen work, descending: hyper-connections; QSA; PLE; split-GGUF loader;
+    IQ4_NL dequant (table ships IQ4_NL even in Q4 mixes — self-converting the table
+    to Q4_K instead would dodge it); per-checkpoint sampling defaults + presence
+    penalty; registry/dialect entry. First testable milestone per Orvar: Unsloth
+    Q4-class file.
