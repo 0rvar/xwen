@@ -17,8 +17,10 @@ divergence is resolved at construction time.
 - Runnable weights: none locally yet. Unsloth `UD-IQ1_S` (72.5 GB) is up; waiting
   on a Q4-class file for first real testing. Metadata-only shard 1 (10.9 MB) is
   usable for loader dev today.
-- llama.cpp support: open DRAFT PR #27742 (unmerged, unreviewed). Not our oracle
-  yet.
+- llama.cpp support: open PR #27742 — no longer marked draft as of 2026-08-26,
+  but unmerged, unreviewed, pending Qwen's independent numeric check. Not our
+  oracle yet. Vendored read-only at reference/qwen4exp/ (pinned sha in its
+  PROVENANCE.md).
 
 ## The model in one paragraph
 
@@ -189,8 +191,11 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   **plus presence_penalty 1.5** — first checkpoint whose card demands a penalty.
   Our serve layer currently accepts-and-drops penalties (TODO.md 2026-08-19);
   for this checkpoint that's a correctness gap to close in P4. The GGUF also
-  bakes `general.sampling.{temperature,top_p,top_k}` keys — new, worth reading
-  as a cross-check but the card is authority.
+  bakes `general.sampling.{temp,top_p,top_k}` keys (note: `temp`, not
+  `temperature`) — generic converter heuristics off generation_config.json, worth
+  a cross-check but the card is authority. Converted GGUFs carry NO
+  presence-penalty key at all (the converter only knows repetition_penalty), so
+  the 1.5 must be hardcoded per checkpoint like the second stop id is.
 - `text_config.eos_token_id` (scalar) = 248044 and bos = 248044 with
   add_bos false; generation stop list unchanged [248046, 248044].
 
@@ -209,6 +214,57 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   BF16, norms/routers F32, table IQ4_NL. Expect the Q4-class file to be mostly
   Q4_K/Q5_K/Q6_K with IQ4_NL persisting on the table and possibly down_exps —
   IQ4_NL dequant is unavoidable for the Unsloth path.
+
+## Conversion-baked deltas (audit of the vendored PR converter, 2026-08-26)
+
+reference/qwen4exp/ vendors PR #27742 at the sha in PROVENANCE.md: `qwen4exp.cpp`
+(graph), `qwen4exp.py` (converter), `conversion-qwen-base.py` (the inherited
+Qwen3Next rules the converter subclasses — the +1/-exp/V-reorder logic lives
+there, NOT in the qwen4exp file), plus the gguf-py and core-C++ diffs.
+
+- **Norms**: every norm on the GGUF path is multiply-ready (converter bakes +1
+  into all `*norm.weight` incl. hc_norm/output_hc_norm/QK-norms/indexer
+  layernorms, and explicitly into the three `ple.norm_*`), with the usual
+  exemption of `ssm_norm` which was never zero-centered. Same end state as our
+  three checkpoints: multiply directly, never add 1.
+- **`ssm_a`** pre-negated to `-exp(A_log)`; **V-head order tiled** by the exact
+  inherited rule set we already implement (qkv V-rows, attn_gate, alpha/beta/
+  a/dt elements, conv1d V-channels, ssm_out COLUMNS). Plain repeat broadcast
+  stays correct.
+- **PLE table**: the 128 HF shards are streamed into one `[160, 320001536]`
+  `per_layer_token_embd.weight`; hash constants are read from the checkpoint's
+  I64 buffers (never recomputed — a lazy-cast bypass exists precisely because
+  base.py's f32 cast would round the 45-bit multipliers) and written as UINT64
+  metadata arrays. `ple.layers` in the GGUF is already 0-BASED (converter does
+  the 1-based→0-based shift) — the one-indexed trap applies to config.json only.
+- **Indexer** `index_qk_proj` split into `indexer.q_proj`/`k_proj`; kept
+  unquantized by the quantize-side skip list (hence BF16 in Unsloth's file).
+- **`ple_conv1d` quant is UNPINNED upstream**: not on the skip list, ne0=4 can't
+  take 32-block quants, lands F16 via a new fallback branch (the graph casts it
+  back to F32). If we self-convert, pin it F32 with `--tensor-type`.
+- **MTP skipped entirely** by the converter (no nextn keys); **vision emitted as
+  a separate mmproj**, never in the text file. Both match D6.
+- `attention.compress_ratios` is synthesized per layer from the raw
+  `layer_types` strings; `general.sampling.*` comes from generic
+  generation_config heuristics.
+
+### Known llama.cpp-impl divergences (PR quirks, not ground truth — expect them
+in oracle diffs, do not copy blindly)
+
+1. **QSA top-k width**: the PR always selects `top_k + ratio - 1` TOKEN slots
+   with the tail biased +1e9. When the tail is shorter than ratio-1, spare slots
+   partially admit the 513th-ranked block. Whether the HF reference does the
+   same needs a one-time check against `modular_qwen4_exp.py` before P1 fixes
+   our reference behavior.
+2. **Partially-filled non-tail blocks are hard-masked** (-inf) rather than
+   pooled over what exists — invisible on a contiguous cache, bites after
+   rewind/defrag. Our rollback machinery must not inherit this silently.
+3. **PLE gate**: PR clamps `|s|` to ≥1e-6 inside the signed sqrt; HF doesn't.
+   Sub-1e-6 difference only; will show in strict fixture comparisons.
+4. **MoE renorm clamp**: llama.cpp's shared `build_moe_ffn` applies the
+   6.103515625e-5 sum clamp unconditionally, including for qwen4exp — the HF
+   math has no clamp. Practically a no-op (top-10 softmax sums are far larger);
+   recorded so a future parity diff isn't a mystery.
 
 ## Traps checklist (all silent-failure class — each becomes a pinned test)
 
@@ -244,3 +300,7 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   transformers modular file, GGUF metadata — see TODO.md entry for the research
   trail). Doc created; P0 begun: split-GGUF loader, reuse-seams map, PR-file
   vendoring dispatched.
+- **2026-08-26**: reference/qwen4exp/ vendored (PR #27742 @ pinned sha, see
+  PROVENANCE.md); converter audited — conversion-baked deltas and four PR
+  quirks recorded above. Doc corrected: sampling key is `general.sampling.temp`,
+  no presence-penalty key exists in converted GGUFs, PR is open-not-draft.
