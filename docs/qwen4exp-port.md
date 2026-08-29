@@ -13,12 +13,11 @@ divergence is resolved at construction time.
 
 ## Status
 
-- Phase: **P0 COMPLETE (2026-08-26); arc RESUMED 2026-08-29.** Current step:
-  re-vendor the llama.cpp material at the merged `6fe749801` and download the
-  first runnable file (UD-Q4_K_XL, D12); then P1 = Rust reference
-  implementations of hyper-connections, PLE, and the QSA indexer against
-  tests/fixtures/qwen4exp/ (D5), plus the deferred registry entry (a Q4-class
-  file to name/size it now exists — D12).
+- Phase: **P0 and P1 COMPLETE (2026-08-26 / 2026-08-29). Current step: P2 in
+  progress (U2-U5 parallel).** P2 is graph assembly, correctness-first — the
+  plan, its four decisions (D14-D17) and the unit breakdown are in the "P2
+  plan" section below; the file:line map it rests on is docs/qwen4exp-p2-map.md.
+  U1 (registry entry) waits on the download.
 - Runnable weights: `UD-Q4_K_XL` (111.33 GB, 4 shards) downloading into the HF
   cache since 2026-08-29. Full published ladder surveyed below. Metadata-only
   shard 1 (10.9 MB) stays usable for loader dev.
@@ -26,7 +25,8 @@ divergence is resolved at construction time.
   `6c84c7d5d`, plus follow-up `6fe749801` on 08-28. D4's re-pin gate is met and
   the `reference/llama.cpp` submodule was bumped e9fa0781 → `6fe749801` on
   2026-08-29 — ONE oracle for all four checkpoints, no vendored copies. The
-  3.6/3.8 parity gate has NOT yet been re-run at the new pin (see D4 update).
+  parity gate was re-run at the new pin the same day: **3.6 pair ALL PASS**
+  (both checkpoints), 3.8-27B in progress (see D4 update and docs/parity.md).
 
 ## The model in one paragraph
 
@@ -75,10 +75,14 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   is bumped e9fa0781 → `6fe749801` and gates every checkpoint including
   qwen4exp; the five vendored files under `reference/qwen4exp/` are deleted
   (only PROVENANCE.md and UPSTREAM-DIFF-2026-08-29.md remain, as history). No
-  second clone, no `scripts/build-llamacpp.sh` target argument. **The 3.6/3.8
-  parity gate must be re-run at `6fe749801` before the bump is trusted — PENDING
-  as of 2026-08-29 (the disk is busy with the 111 GB download); until it passes,
-  every floor in docs/parity.md reads "measured at e9fa0781".**
+  second clone, no `scripts/build-llamacpp.sh` target argument. **Re-run gate:
+  the 3.6 pair PASSED at `6fe749801` on 2026-08-29** — 35B-A3B all six graded
+  checks (strict cos 1.000000, top5 5/5; mm cos 0.999631; decode 63/64, 63/64,
+  62/64 with 1/1/2 excused and zero mismatches; ppl Δnll 0.000791) and 27B all
+  of them clean (strict and mm cos 1.000000; decode 64/64 three times, nothing
+  excused; ppl Δnll 0.000243). The 3.8-27B run is still going; until it lands,
+  the bump is confirmed for the 3.6 pair only. Floors themselves are unchanged
+  and re-confirmed at the new pin for those two — docs/parity.md is the record.
   - **Update 2026-08-29 — the merge half of the gate is met.** PR #27742 merged
     into ggml-org/llama.cpp master 2026-08-27T19:32Z as squash `6c84c7d5d` (PR
     head `eaf9376557`, 65 commits); follow-up `6fe749801` "model: qwen4exp:
@@ -180,6 +184,19 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   What dtype the raw-key cache itself holds is a SEPARATE and still-open P2/P3
   choice; this decision only says there is no re-rounding after the f32 pool.
   Pinned by the header doc of `src/qwen4exp/ref_qsa.rs`.
+- **D14 (2026-08-29) Trunk seam: extend `XwenModel`, don't fork it.** An
+  `Option<Qwen4ExpParts>` field and a one-line `run_stack` dispatch; the qwen35
+  layer loop is not edited. Full text and rationale in "P2 plan" below.
+- **D15 (2026-08-29) New recurrent state stays out of `LayerCache` in P2.**
+  Indexer raw-key caches, PLE conv state and the 2-id history live in
+  `Qwen4ExpParts` with their own checkpoint/rollback; snapshots and the disk
+  tier refuse a qwen4exp target loudly, ledgered for P4. See "P2 plan".
+- **D16 (2026-08-29) QSA overlay contract.** `AttnBlock::forward` gains a
+  trailing `Option<&QsaSelection>` (`Dense` / `Mask` / `Rows`); the `None` path
+  is byte-identical for existing checkpoints. See "P2 plan".
+- **D17 (2026-08-29) PLE in P2 is host-hybrid.** Hash, row gather and IQ4_NL
+  dequant on the CPU; the projections on device; gate/conv on the host in f32.
+  A known P3 cost, taken for correctness first. See "P2 plan".
 - **D7 (2026-08-26) Phase plan.** P0 scaffold (split-GGUF loader, config parse,
   registry) → P1 CPU references + fixtures for the three new components → P2
   graph assembly, load a real file, greedy smoke, ppl sanity vs PR #27742's
@@ -689,6 +706,82 @@ layer: QSA attention with its own indexer + full MoE (experts, router, shexp)
 Config: `mtp.hybrid: true`, 1 layer, rope_theta 1e7. Card: "trained with
 multi-steps".
 
+## P2 plan (decided 2026-08-29; graph assembly, correctness-first)
+
+Facts this rests on: `docs/qwen4exp-p2-map.md` (current file:line map). Corrections
+to the 08-26 seams map: `Generator` has **87** call sites over 26 `XwenModel`
+methods (not ~25); `_weights_mmap` is already a Vec; `Arch::z_gate()` and
+`moe_sum_floor()` exist with zero consumers; `Qwen4ExpConfig`/`PleConfig`
+are complete; `Rope::rotate` is private and scalar-start-only.
+
+- **D14 Trunk seam: extend, don't fork.** `XwenModel` gains
+  `qwen4exp: Option<Qwen4ExpParts>` (hc reads/writes per layer, the output
+  mixer, per-attn-layer `QsaIndexer` + raw-key cache, the one `PleLayer` with
+  its conv state and 2-id history). `run_stack` dispatches in ONE line to
+  `qwen4exp::stack::run_stack_hc` when the parts are present; the qwen35 layer
+  loop is not edited. `load` branches on arch only around per-layer
+  construction (blocks are constructed identically; the branch additionally
+  loads hc/indexer/ple tensors and skips `attn_norm`/`ffn_norm`/
+  `output_norm`). Every cache/tap/phase method on `XwenModel` is reused
+  unchanged. `post_norm_hidden`'s qwen4exp analogue is the mixer output
+  (pre-lm_head [n,2560]); spec taps are not defined for qwen4exp in P2.
+  Rationale: 87 call sites of plumbing a 4-stream model needs identically;
+  no dynamic dispatch on the hot path; D1 holds (no qwen35 path edited).
+- **D15 New recurrent state stays out of `LayerCache` in P2.** Indexer raw-key
+  caches (`[max_ctx,128]` f32 per QSA layer, 4 MB at 8k), the PLE conv state
+  (`[10240,9]` f32) and the 2-id history live in `Qwen4ExpParts` with their own
+  `checkpoint/rollback/reset/truncate` mirroring `LayerCache`'s, called from
+  the existing `XwenModel::kv_checkpoint/kv_rollback/reset_cache` sites. Prefix
+  cache snapshots, host snapshots and the disk tier do NOT carry them yet: a
+  qwen4exp target refuses snapshot save/restore (loud error), ledgered for P4.
+  Rationale: decouples three parallel units from `kv_cache.rs`'s five enums.
+- **D16 QSA overlay contract.** `AttnBlock::forward` gains a trailing
+  `qsa: Option<&QsaSelection>` (existing callers pass `None`; the `None` path
+  is byte-identical). `enum QsaSelection { Dense, Mask(Tensor) /* [n_q,n_kv]
+  additive f32, 0 or -inf, already causal */, Rows(Tensor) /* u32 [n_sel],
+  decode */ }`. Prefill: `Mask` is merged into the `PrefillMask` path;
+  decode: `Rows` gathers the selected K/V rows into a packed view and runs
+  maskless sdpa (D11). Selection is computed on device with candle ops
+  (matmul, relu, sum, arg_sort) — top-k kernel is P3.
+- **D17 PLE in P2 is host-hybrid.** Hash (u64) and table row gather + IQ4_NL
+  row dequant run on the CPU from `MmapSource::bytes`; `key_proj`/`value_proj`
+  run on device; the per-stream gate, signed sqrt, dilated conv and silu run on
+  the host in f32 over a `[n,10240]` copy of the stream (40 KB/token; one
+  device→host sync per forward at layer 1). Known P3 cost; correctness first.
+- **Registry (U1, after the download):** `hub::Model::Qwen38FlashNext`, repo
+  `unsloth/Qwen3.8-Flash-Next-GGUF`, 4-shard path, full name from the file's
+  `general.name`; `Arch::Qwen4Exp.model()` returns it; `check_arch` refusal
+  removed; drafter kind None (MTP deferred, D6); sampling defaults per card.
+
+Units (U2-U5 parallel, then U6, then U7):
+- U2 `src/qwen4exp/hc.rs` — `HcRead::load(w, prefix, hc_count, hidden,
+  low_rank, with_inject)`, `read(stream [n,10240]) -> (mixed [n,2560],
+  Option<inject [n,4]>)`, `hc_write(stream, out, inject) -> stream'`; grouped
+  RMSNorm from candle primitives (normalize per group, multiply by full-width
+  weight, trap #16). Tests: device vs `ref_hc` on the fixture AND on random
+  weights at real geometry (f32 weights, tol 1e-5 rel).
+- U3 `src/qwen4exp/indexer.rs` + D16 in `attention.rs` — `QsaIndexer::load`,
+  `IndexerCache`, `select(x_normed, cache, pos) -> QsaSelection` (returns
+  `Dense` when every query's visible count ≤ budget); `Rope` gains a
+  positions-gather variant. Tests: selection sets vs `ref_qsa` on the fixture
+  and on random real-geometry inputs; below-budget prefill/decode outputs
+  byte-identical to `None`.
+- U4 `src/qwen4exp/{iq4nl,ple}.rs` — IQ4_NL row dequant pinned against
+  ggml's `kvalues_iq4nl` and block layout; `PleTable` over the mmap; `PleLayer`
+  reusing `ref_ple::PleHashRef`; `forward(tokens, stream) -> addend`. Tests:
+  vs `ref_ple` on the fixture; dequant vs a hand-built block.
+- U5 wiring of `ZGate` (`linear_attn.rs:360` + a sigmoid sibling of
+  `delta_gnorm` in `ops/delta.metal`) and `sum_floor` (`moe.rs:88,142`).
+  Tests: existing checkpoints' kernels bit-identical; sigmoid arm vs
+  `ref_hc::gated_rms_norm`.
+- U6 `src/qwen4exp/stack.rs` + `model.rs` load branch + `Qwen4ExpParts`
+  checkpoint plumbing + `warn_if_over_budget` term. Layer order per layer:
+  (PLE addend at layer 1) → hc_attn.read → attn/GDN block → hc_attn.write →
+  hc_ffn.read → MoE → hc_ffn.write; tail: output_hc mixer → lm_head.
+- U7 smoke on `UD-Q4_K_XL`: load, greedy 64 tokens, logits-dump vs the
+  submodule oracle at the pin (`qwen4exp` is in-tree now), ppl sanity vs
+  4.0068. Memory footprint recorded (`footprint`).
+
 ## Open questions (blocked, with what unblocks them)
 
 - MTP head forward semantics (fc_embedding/fc_hidden composition) — vLLM/SGLang
@@ -787,3 +880,15 @@ multi-steps".
   equivalence on both the QSA and the PLE side including a three-chunk state
   carry, a transposed `value_proj` guard, and per-stream hyper-connection
   injection. Traps #15 and #16 added.
+- **2026-08-29 (parity re-run + P2 opened)**: the 3.6 pair was re-graded
+  against the bumped oracle at `6fe749801` and **both checkpoints ALL PASS** —
+  35B-A3B six graded checks (strict cos 1.000000 / top5 5/5, mm cos 0.999631,
+  decode 63/64, 63/64, 62/64 with 1/1/2 excused and zero mismatches, ppl Δnll
+  0.000791) and 27B clean throughout (strict and mm cos 1.000000, decode 64/64
+  three times with nothing excused, ppl Δnll 0.000243). Logs stayed in the
+  scratchpad, uncommitted. The 3.8-27B run is still in flight, so the submodule
+  bump is confirmed for the 3.6 pair only. P2 then opened: the territory map
+  landed as docs/qwen4exp-p2-map.md, the plan and D14-D17 are recorded above,
+  and U2-U5 are running in parallel (hc, indexer+D16, IQ4_NL+PLE, ZGate and
+  sum_floor wiring), with U1 (registry) waiting on the download and U6/U7
+  after the parallel wave.

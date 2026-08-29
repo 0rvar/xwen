@@ -17,10 +17,19 @@ the pin shows up as a staged change the owner must approve. Only
 "model: qwen4exp: reduce number of graph splits (#27880)") — bumped 2026-08-29
 to get qwen4exp support into the one oracle. Previous pin
 `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` (2026-07-28, "model: Add
-Laguna-S-2.1 LLM_TYPE (#26233)"), cloned and built 2026-07-28: **every floor
-below was calibrated there and is NOT yet re-confirmed at the new pin.**
-Re-calibration against `6fe749801` is required before the next parity cycle and
-is PENDING as of 2026-08-29.
+Laguna-S-2.1 LLM_TYPE (#26233)"), cloned and built 2026-07-28, where every floor
+below was calibrated.
+
+Re-confirmation at the new pin, 2026-08-29 — **the floors hold for the 3.6
+pair; nothing was re-measured or moved.**
+
+- **Qwen3.6-35B-A3B: ALL PASS**, six graded checks. strict cos 1.000000, top5
+  5/5; mm cos 0.999631; decode 63/64, 63/64, 62/64 agreeing with 1/1/2 excused
+  and 0 mismatch; ppl Δnll 0.000791.
+- **Qwen3.6-27B: ALL PASS.** strict cos 1.000000; mm cos 1.000000; decode 64/64
+  three times, 0 excused; ppl Δnll 0.000243.
+- **Qwen3.8-27B: run in progress at time of writing — result not yet recorded.**
+  Until this line says otherwise, the bump is confirmed for the 3.6 pair only.
 
 ```bash
 just init                               # git submodule update --init --recursive
@@ -506,8 +515,9 @@ and run-to-run variation without accepting a real regression; the perplexity bou
 
 ### Calibration record — 2026-07-28, oracle `e9fa0781`, ggml-org Q4_K_M
 
-**Still the live record on 2026-08-29, and still an `e9fa0781` measurement**: the
-submodule was bumped to `6fe749801` that day and the re-run has not happened yet.
+**Still the live record, and still an `e9fa0781` measurement**: the submodule was
+bumped to `6fe749801` on 2026-08-29 and the 3.6 pair re-passed these floors
+unchanged there (see "The oracle"). The numbers below were not re-derived.
 
 **Measured with the REFERENCE DeltaNet scan on both sides**, before the fused delta
 kernels existed (`src/ops/delta.metal` postdates the last dump in this table by half
