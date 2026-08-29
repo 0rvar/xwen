@@ -1912,3 +1912,42 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     one unsupported down plane drops that layer's gate and up to per-token
     matvec too, which is the bulk of the cost. Measure before and after; the
     43-layer prefill penalty has not been quantified yet.
+  - **2026-08-29 — P4: the parity harness cannot run on qwen4exp (from U7).**
+    All four tiers of `scripts/parity-gate.ts` die on this checkpoint, because
+    every tier's reference side is `--moe-impl reference` and
+    `ReferenceExperts::forward` panics at `src/moe.rs:198` with "index out of
+    bounds: the len is 512 but the index is 1073971200". `1073971200` is
+    `0x40038000`, the f32 bit pattern of 2.0547 — so an f32 buffer of routing
+    data is reaching a `to_vec1::<u32>()` read as expert ids, on the 512-expert
+    / top-10 geometry. It reproduces identically through the fused router kernel
+    AND the candle `route_from_logits` chain, so it is downstream of the router
+    branch, not in either kernel. The FUSED runner is unaffected (U7's whole
+    measurement set ran on it). **One fix unblocks all four tiers**; nothing else
+    in the harness objected to this file. Alongside it: (a)
+    `observed_delta_path()` in `src/bin/logits-dump.rs` hard-bails when no gated
+    DeltaNet layer ran — latent, did not bite here, but it gates any layer-kind
+    change; (b) no reference-ppl fixture exists for Flash-Next (same gap as the
+    3.8-27B above); (c) split GGUFs work fine, but the gate's temp dir basename
+    carries the `-00001-of-00004` shard suffix — cosmetic; (d) the gate's floors
+    are global constants calibrated on the ggml-org Q4_K_M mix and this file is
+    unsloth UD-Q4_K_XL, so they need re-deriving for this checkpoint even once
+    the panic is fixed; (e) `tests/fixtures/ppl-corpus.txt` looks contaminated
+    for this checkpoint — 0.37 nats is PPL 1.45 on WikiText-2 test where the 3.6
+    pair scores 1.69 nats, and llama.cpp independently agrees, so it is the model
+    and not a bug, but it makes the frozen corpus a weak discriminator here. Pick
+    a fresh held-out corpus for flash-next and re-derive `PPL_NLL_DELTA_MAX`
+    against it.
+  - **2026-08-29 — P4/P3: Flash-Next prefill is 3.5x slower than llama.cpp
+    (from U7).** 203.5 tok/s against 713.4 at 530 prompt tokens on the identical
+    file in the same hour; 2.60 s reproduced to the centisecond across two
+    independent runs, so it is not first-forward Metal pipeline compilation.
+    Decode is within ~8% (37.7-38.1 vs 40.9-41.5 tok/s) and unremarkable. Two
+    known contributors to look at first: the 43 Q5_1-down layers prefill through
+    the per-token `mul_mv_id` fallback (D18 — the mm_id item above), and the
+    dense-FFN prefill gemm was this same shape of problem on the 27B (P8c) and
+    took a vendored kernel to close. Caveats on the absolutes: `lowpowermode 0`
+    with no high-power claim, shared machine, llama.cpp thermal-boosts harder —
+    the RATIO is the trustworthy part. Related: xwen dirties ~15 GB of private
+    memory where llama-server dirties 751 MB on the same file (64 GB vs 76 GB
+    clean mapped), i.e. ~15 GB of weights are materialized rather than aliased
+    from the mapping. Worth understanding under the one-large-process rule.

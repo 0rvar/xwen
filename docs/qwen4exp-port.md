@@ -13,12 +13,15 @@ divergence is resolved at construction time.
 
 ## Status
 
-- Phase: **P2 units U0-U6 LANDED 2026-08-29 — FIRST LIGHT on the real file.**
-  The model loads, prefills, decodes and stops cleanly on `UD-Q4_K_XL`. Next:
-  **U7** (logits parity against the llama.cpp oracle at `6fe749801`, plus a ppl
-  sanity check), then review fixes for U0-U6, then P3. The plan, its decisions
-  (D14-D18) and the unit breakdown are in the "P2 plan" section below; the
-  file:line map is docs/qwen4exp-p2-map.md.
+- Phase: **P2 units U0-U7 LANDED 2026-08-29 — FIRST LIGHT, and the graph agrees
+  with the oracle.** The model loads, prefills, decodes and stops cleanly on
+  `UD-Q4_K_XL`, and U7 graded it against llama.cpp at `6fe749801`: 189/192
+  forced-replay agreement with zero hard mismatches (see "P2 parity result"
+  below; full record in docs/qwen4exp-parity-2026-08-29.md). Next: review fixes
+  for U0-U6, then P3 — with two P4 items opened by U7 (the parity harness
+  cannot run on this geometry at all, and prefill is 3.5x off llama.cpp). The
+  plan, its decisions (D14-D18) and the unit breakdown are in the "P2 plan"
+  section below; the file:line map is docs/qwen4exp-p2-map.md.
 - Runnable weights: `UD-Q4_K_XL` (111.33 GB, 4 shards) in the HF cache and
   RUNNING as of 2026-08-29. Full published ladder surveyed below.
 - llama.cpp support: PR #27742 **MERGED** into master 2026-08-27 as squash
@@ -895,6 +898,89 @@ Units (U2-U5 parallel, then U6, then U7):
   submodule oracle at the pin (`qwen4exp` is in-tree now), ppl sanity vs
   4.0068. Memory footprint recorded (`footprint`).
 
+## P2 parity result (2026-08-29)
+
+Full record, with commands and artifacts: docs/qwen4exp-parity-2026-08-29.md.
+**Verdict: xwen's qwen4exp graph agrees with the llama.cpp oracle on this file.**
+
+**Method.** `scripts/parity-gate.ts` cannot run on this checkpoint at all (below),
+so U7 built the equivalent by hand. The oracle is `llama-server /completion` fed a
+**token-id array** — that bypasses both the chat template and llama.cpp's tokenizer,
+so both engines provably see the identical sequence — at `temperature 0, top_k 1,
+cache_prompt false`. xwen ran `logits-dump --moe-impl fused`, once free-run
+(`--greedy 64`) and once teacher-forced along the oracle's own trajectory
+(`--replay`), which is the decode tier's exact methodology with llama.cpp standing in
+for the blocked xwen reference runner. Tokenization was verified first: over the whole
+4218-token `tests/fixtures/ppl-corpus.txt`, llama.cpp's ids and xwen's embedded 3.6
+tokenizer are **byte-identical, first differing index −1** — so flash-next reuses the
+3.6 vocab and CLAUDE.md's embedded-tokenizer caveat does not bite this file.
+
+**Agreement.** Forced replay over three prompts (13 / 290 / 530 prompt tokens, 64
+steps each): **62/64, 64/64, 63/64 = 189/192, with 0 hard mismatches.** All three
+divergences are near-ties — margins of 0.2876, 0.0348 and 0.0097 logit, far inside the
+repo's `NEAR_TIE_MARGIN_Q8 = 1.0` excusal band — and in every one of them llama.cpp's
+pick was xwen's own rank-2. Free-run prefixes agreed 19/64, 64/64 and 39/64, which is
+the expected shape: a single near-tie forks the sequence and everything after it is
+uninformative, which is exactly why forced replay is the instrument.
+
+**Distribution** (stand-in for the blocked strict/mm cosine tiers): xwen's full
+248320-wide logits, log-softmaxed in f64, against the oracle's own `n_probs: 20`
+logprobs at the same position — **top-1 match and top-5 exact same order on both p2
+and p3**, max |Δlogprob| 0.49 / 0.19, mean 0.14 / 0.08. Ordering first differs at rank
+≥5, among tail entries at logprob −12 to −14.
+
+**Perplexity — NOT a like-for-like grade.** On `tests/fixtures/ppl-corpus.txt`,
+llama.cpp `-c 512 --chunks 8` gives 0.5413 nats (2048 positions scored, second halves
+of eight independent windows, KV reset each) while xwen `--ppl --max-ctx 5120` gives
+0.3697 nats (4217 positions, one continuous context, never reset). **Δ 0.17 nats is
+the protocol, not fidelity** — xwen scores with up to 4218 tokens of context where
+llama.cpp scores with at most 511 — and xwen's per-chunk curve falls exactly as that
+predicts. The real ppl tier (xwen-reference vs xwen-fused, graded at
+`PPL_NLL_DELTA_MAX = 0.002`) is blocked by the panic below. Separately worth knowing:
+0.37 nats is PPL 1.45 on WikiText-2 test where the 3.6 pair scores 1.69 nats on the
+identical corpus, and llama.cpp independently agrees the model is that good — so it is
+the model, not a bug, but it reads like test-split memorization and makes this corpus a
+weak discriminator for this checkpoint. A fresh held-out corpus (and a re-derived
+`PPL_NLL_DELTA_MAX`) is the right move before flash-next gets a real ppl floor.
+
+**The harness cannot run on qwen4exp (P4, ledgered in TODO.md).** Every one of the four
+tiers dies in the same place, because every tier's reference side is
+`--moe-impl reference`: `ReferenceExperts::forward` panics at `src/moe.rs:198` with
+"index out of bounds: the len is 512 but the index is 1073971200". That index is
+`0x40038000` — the f32 bit pattern of 2.0547 — so an f32 buffer of routing data is
+reaching a `to_vec1::<u32>()` read as expert ids. It reproduces identically through
+both the fused router kernel and the candle chain, so it is downstream of the router
+branch, in how `ids` is materialized for the 512-expert / top-10 geometry. **The fused
+runner is unaffected** — every number above ran on it — and one fix unblocks all four
+tiers. Three smaller gaps alongside it: `observed_delta_path()` in logits-dump is a
+latent bail on any layer-kind change (it did not bite here); there is no reference-ppl
+fixture for flash-next, the same gap the 3.8-27B has; and split GGUFs work fine in the
+harness, though the gate's temp dir name carries the shard suffix, which is cosmetic.
+One more thing that is not a bug but will matter: the gate's floors are global
+constants calibrated on the ggml-org Q4_K_M mix, and this is unsloth UD-Q4_K_XL — a
+different mix, so the floors need re-deriving for this checkpoint even after the panic
+is fixed.
+
+### Perf state — Qwen3.8-Flash-Next (2026-08-29, first measurements)
+
+Plain (`--no-draft`, no drafter exists for this checkpoint): **decode 37.5-38.1
+tok/s**, **prefill 138-204 tok/s**. Against llama.cpp on the same file in the same
+hour: **decode 40.9-41.5**, **prefill 713.4 @ 530 tokens**. Decode is within ~8% and
+unremarkable. **Prefill is 3.5x slower and that is a real finding** — 2.60 s
+reproduced to the centisecond across two independent runs, so it is not first-forward
+pipeline compilation. Two known contributors: the 43 Q5_1-down layers prefill through
+the per-token `mul_mv_id` fallback (D18), and the dense-FFN prefill gemm was exactly
+this shape of problem on the 27B (P8c) and needed a vendored kernel to close. Memory,
+by `footprint` mid-decode: xwen dirties **15 GB** (64 GB clean mapped, peak 17) where
+llama-server dirties **751 MB** on the identical file — both fit, but 15 GB of real
+pressure is worth understanding under the one-large-process-at-a-time rule.
+
+Standard caveats, all of which apply: `lowpowermode 0` and high-power mode is NOT
+positively confirmable on this machine, so it is not claimed; single runs; the machine
+was shared with other agents' builds throughout, which depresses both arms (the decode
+RATIO is the trustworthy part, the absolutes less so); llama.cpp thermal-boosts harder
+than xwen (−17% vs −5% settling), which flatters its numbers.
+
 ## Open questions (blocked, with what unblocks them)
 
 - MTP head forward semantics (fc_embedding/fc_hidden composition) — vLLM/SGLang
@@ -1101,3 +1187,20 @@ Units (U2-U5 parallel, then U6, then U7):
   gathering per head; worth reporting upstream.
   P2 remaining: **U7** (logits parity against the oracle at `6fe749801` plus a
   ppl sanity check) and review fixes across U0-U6.
+- **2026-08-29 (U7 — parity against the oracle)**: the graph agrees. Method and
+  every number are in docs/qwen4exp-parity-2026-08-29.md and summarized in "P2
+  parity result" above: byte-identical tokenization over the 4218-token corpus,
+  189/192 forced-replay agreement with 0 hard mismatches (3 excused near-ties at
+  0.2876 / 0.0348 / 0.0097 logit, llama.cpp's pick was xwen's rank-2 in all
+  three), and top-1 plus top-5 exact-order agreement on full-vocab logprobs.
+  The ppl comparison is protocol-limited (window vs continuous context) and is a
+  sanity check, not a grade. Two findings that become P4 work, both ledgered in
+  TODO.md: **the parity harness cannot run on this checkpoint at all** — all
+  four tiers die in `ReferenceExperts::forward` at `src/moe.rs:198` reading f32
+  routing data as u32 expert ids on the 512-expert / top-10 geometry, with the
+  fused runner unaffected — and **prefill is 3.5x slower than llama.cpp**
+  (203.5 vs 713.4 tok/s at 530 tokens, reproduced), where decode is within ~8%
+  (37.7-38.1 vs 40.9-41.5). Also recorded: xwen dirties 15 GB against
+  llama-server's 751 MB on the same file, and the frozen ppl corpus looks
+  contaminated for this checkpoint (PPL 1.45, both engines agreeing), so
+  flash-next wants a fresh corpus before it gets a real ppl floor.
