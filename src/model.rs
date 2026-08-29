@@ -411,13 +411,6 @@ impl XwenModel {
         self.attn_decode
     }
 
-    /// Run the transformer stack (embedding → 48 layers → final norm) and return
-    /// the post-final-norm hidden states `[seq, hidden]` for EVERY position,
-    /// together with the per-layer taps collected when capture is enabled.
-    /// Shared by `forward` (which narrows to the last position for the lm head)
-    /// and `forward_all_logits` (which keeps every position). Advances the KV
-    /// caches, so callers feeding chunks must pass a monotonically increasing
-    /// `pos`.
     /// Ask every PLE layer to fault in the n-gram table rows a LATER forward
     /// over `tokens` will gather, given the state each layer is in right now.
     ///
@@ -426,7 +419,11 @@ impl XwenModel {
     /// behind, so a caller can issue it for a token that an EOG or a rejected
     /// speculative block then discards. The gather it is running ahead of is
     /// 16 unrelated 90-byte reads over a 28.8 GB mapping, i.e. page faults
-    /// rather than arithmetic (`qwen4exp::ple::PlePrefetcher`).
+    /// rather than arithmetic (`qwen4exp::ple::PlePrefetcher`). The rows are
+    /// chosen from the token history alone and NEVER gated on the PLE gate
+    /// value — the gate is a mid-forward quantity, so waiting for it would put
+    /// the prefetch behind the gather it exists to run ahead of
+    /// (`qwen4exp::ple::PleLayer::prefetch`).
     ///
     /// Callers: the decode loop, the moment a token is sampled and before the
     /// forward that consumes it starts, and the qwen4exp prefill chunk.
@@ -441,6 +438,13 @@ impl XwenModel {
         }
     }
 
+    /// Run the transformer stack (embedding → 48 layers → final norm) and return
+    /// the post-final-norm hidden states `[seq, hidden]` for EVERY position,
+    /// together with the per-layer taps collected when capture is enabled.
+    /// Shared by `forward` (which narrows to the last position for the lm head)
+    /// and `forward_all_logits` (which keeps every position). Advances the KV
+    /// caches, so callers feeding chunks must pass a monotonically increasing
+    /// `pos`.
     fn run_stack(&mut self, tokens: &Tensor, pos: usize) -> Result<StackOutput> {
         // qwen4exp is a second graph over the same blocks (D14): a 4-stream
         // residual carrier, a QSA overlay on the attention layers and a PLE

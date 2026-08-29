@@ -311,9 +311,10 @@ mod tests {
             inject_w: inject_w_v,
         };
 
-        // Decode-shaped and prefill-shaped batches: the kernel's grid is one
-        // threadgroup per token, so a multi-token launch is a different shape of
-        // work than a single one.
+        // One token count per LAUNCH ARM, so both are graded against candle and
+        // the oracle here: n=5 is below HC_SPLIT_MAX_N and takes the split pair
+        // (one threadgroup per token AND stream, plus a separate injection
+        // kernel), n=64 takes the fused single-threadgroup-per-token kernel.
         for &n in &[5usize, 64] {
             let stream_v = pseudo_random(n * width, 0x85 + n as u64, -2.0, 2.0);
             let stream = t2(stream_v.clone(), n, width, &dev);
@@ -369,6 +370,12 @@ mod tests {
     /// K1 with no injection head — the tail mixer's shape — must produce the
     /// same normed carrier as the head-bearing arm and no injection tensor. The
     /// head is the only difference between the two gates.
+    ///
+    /// Both arms are PINNED to the fused kernel, so this is what covers its
+    /// `HAS_INJECT=false` specialization: leaving the launch shape to the token
+    /// count would put a small `n` on the split pair and never compile the
+    /// headless fused variant. The split pair's own head/no-head equality is
+    /// asserted in `split_matches_single_bitwise`.
     #[test]
     fn norm_without_inject_matches_the_inject_arm() {
         let dev = metal_device().unwrap();
@@ -386,9 +393,9 @@ mod tests {
         );
         let stream = t2(pseudo_random(n * width, 0x93, -2.0, 2.0), n, width, &dev);
 
-        let (with, inject) = hc_norm(&stream, &norm_w, Some(&inject_w), HC, HIDDEN, EPS).unwrap();
+        let (with, inject) = hc_norm_arm(false, &stream, &norm_w, Some(&inject_w), HC, HIDDEN);
         assert!(inject.is_some());
-        let (without, none) = hc_norm(&stream, &norm_w, None, HC, HIDDEN, EPS).unwrap();
+        let (without, none) = hc_norm_arm(false, &stream, &norm_w, None, HC, HIDDEN);
         assert!(none.is_none(), "the tail mixer has no injection head");
         assert_f32_bits_eq(&without, &with, "normed carrier, head vs no head");
     }
@@ -618,6 +625,19 @@ mod tests {
             assert!(none.is_none(), "the tail mixer has no injection head");
             let (f_bare, _) = hc_norm_arm(false, &stream, &norm_w, None, HC, HIDDEN);
             assert_f32_bits_eq(&s_bare, &f_bare, &format!("split normed, no head, n={n}"));
+
+            // Dropping the head changes only whether an injection comes back —
+            // the normed carrier is the same bits either way, on BOTH arms.
+            assert_f32_bits_eq(
+                &f_normed,
+                &f_bare,
+                &format!("single normed, head vs no head, n={n}"),
+            );
+            assert_f32_bits_eq(
+                &s_normed,
+                &s_bare,
+                &format!("split normed, head vs no head, n={n}"),
+            );
         }
     }
 

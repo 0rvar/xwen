@@ -182,7 +182,8 @@ pub fn ple_no_random() -> bool {
 /// thread, so every gather takes its own faults on the forward's own thread.
 ///
 /// The other half of the A/B: with it set the layer is exactly what it was
-/// before the prefetcher existed. Unset, the table spawns one thread on the
+/// before the prefetcher existed. Unset, each `PleTable` — i.e. each PLE layer,
+/// of which the shipped checkpoint has exactly one — spawns one thread on its
 /// first hint and never spawns another.
 ///
 /// PRESENCE-BASED and cached (read once), like the sibling switches: any value

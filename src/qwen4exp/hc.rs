@@ -334,14 +334,31 @@ impl HcRead {
     }
 
     /// Whether this gate takes the vendored kernels rather than the candle
-    /// chain: a Metal device, the kill-switch unset, and a geometry the norm
-    /// kernel's launch covers. The bounds are the kernel's, so a gate outside
-    /// them falls back rather than failing.
+    /// chain: a Metal device, the kill-switch unset, a geometry the norm
+    /// kernel's launch covers, and WEIGHTS the kernel can bind. The bounds are
+    /// the kernel's, so a gate outside them falls back rather than failing —
+    /// which means every condition `hc_norm` hard-errors on has to be asked
+    /// here, the operands included. The carrier alone is not enough: the norm
+    /// weight and the dense injection head are bound the same way and are the
+    /// two operands the constructor validates by shape but not by dtype,
+    /// contiguity, or device.
     fn fused(&self, stream: &Tensor) -> bool {
         !crate::ops::hc_classic()
             && stream.device().is_metal()
             && stream.is_contiguous()
             && crate::ops::hc_norm_supported(self.hc_count, self.hidden)
+            && Self::bindable(&self.norm_w, stream)
+            && self
+                .inject_dense
+                .as_ref()
+                .is_none_or(|head| Self::bindable(head, stream))
+    }
+
+    /// An operand `hc_norm` can bind: contiguous f32 on the carrier's own
+    /// device. Shape is not re-checked — the constructor pins it, and the
+    /// dispatch would catch a mismatch as an error rather than as garbage.
+    fn bindable(t: &Tensor, stream: &Tensor) -> bool {
+        t.dtype() == DType::F32 && t.is_contiguous() && stream.device().same_device(t.device())
     }
 
     /// [`read`](Self::read) through the vendored kernels: one threadgroup per

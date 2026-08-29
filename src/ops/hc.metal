@@ -108,7 +108,7 @@ static inline void hc_norm_body(
 
     // Per-stream sum of squares -> the stream's 1/sqrt(mean + eps).
     for (int s = 0; s < args.hc_count; ++s) {
-        const size_t base = row + (size_t) (s * args.hidden);
+        const size_t base = row + (size_t) s * (size_t) args.hidden;
         float acc = 0.0f;
         for (int j = (int) tid; j < args.hidden; j += (int) tcount) {
             const float v = x[base + (size_t) j];
@@ -141,17 +141,22 @@ static inline void hc_norm_body(
             acc_inj[o] = 0.0f;
         }
     }
+    // Every operand of an index product is widened BEFORE the multiply, here
+    // and in the split pair. `o * args.width` is a row offset into the
+    // injection head and the carrier row stride is `args.width`, both of which
+    // scale with the geometry, and a product computed in `int` and cast
+    // afterwards would already have wrapped by the time the cast sees it.
     for (int s = 0; s < args.hc_count; ++s) {
         const float scale = scales[s];
-        const int off = s * args.hidden;
+        const size_t off = (size_t) s * (size_t) args.hidden;
         for (int j = (int) tid; j < args.hidden; j += (int) tcount) {
-            const int i = off + j;
-            const float n = x[row + (size_t) i] * scale * w[i];
-            normed[row + (size_t) i] = n;
+            const size_t i = off + (size_t) j;
+            const float n = x[row + i] * scale * w[i];
+            normed[row + i] = n;
             if (HAS_INJECT) {
                 for (int o = 0; o < HC_MAX_STREAMS; ++o) {
                     if (o < args.hc_count) {
-                        acc_inj[o] += inj[(size_t) (o * args.width + i)] * n;
+                        acc_inj[o] += inj[(size_t) o * (size_t) args.width + i] * n;
                     }
                 }
             }
@@ -281,10 +286,10 @@ kernel void kernel_hc_mix(
     }
     const int j = (int) tid % args.hidden;
     const int t = (int) tid / args.hidden;
-    const size_t row = (size_t) t * (size_t) (args.hc_count * args.hidden);
+    const size_t row = (size_t) t * (size_t) args.hc_count * (size_t) args.hidden;
     float acc = 0.0f;
     for (int s = 0; s < args.hc_count; ++s) {
-        const size_t i = row + (size_t) (s * args.hidden + j);
+        const size_t i = row + (size_t) s * (size_t) args.hidden + (size_t) j;
         const float u = up[i];
         acc += (1.0f / (1.0f + exp(-u))) * normed[i];
     }
@@ -344,7 +349,7 @@ kernel void kernel_hc_write(
 // for the head. Both keep the SINGLE-threadgroup kernel's thread count and its
 // per-thread strided partition, so every reduction folds in the same
 // association order and both outputs are BIT-IDENTICAL to the fused kernel's
-// (`split_norm_matches_single_bitwise` pins that; the cost of getting it is
+// (`split_matches_single_bitwise` pins that; the cost of getting it is
 // nothing but writing the loops in the same order).
 // ---------------------------------------------------------------------------
 
@@ -374,8 +379,8 @@ kernel void kernel_hc_norm_split(
 
     const int s = (int) tgid.y;
     const size_t row = (size_t) tgid.x * (size_t) args.width;
-    const int off = s * args.hidden;
-    const size_t base = row + (size_t) off;
+    const size_t off = (size_t) s * (size_t) args.hidden;
+    const size_t base = row + off;
 
     float acc = 0.0f;
     for (int j = (int) tid; j < args.hidden; j += (int) tcount) {
@@ -398,8 +403,8 @@ kernel void kernel_hc_norm_split(
 
     const float scale = scale_tg[0];
     for (int j = (int) tid; j < args.hidden; j += (int) tcount) {
-        const int i = off + j;
-        normed[row + (size_t) i] = x[row + (size_t) i] * scale * w[i];
+        const size_t i = off + (size_t) j;
+        normed[row + i] = x[row + i] * scale * w[i];
     }
 }
 
@@ -434,10 +439,10 @@ kernel void kernel_hc_inject(
 
     float acc = 0.0f;
     for (int s = 0; s < args.hc_count; ++s) {
-        const int off = s * args.hidden;
+        const size_t off = (size_t) s * (size_t) args.hidden;
         for (int j = (int) tid; j < args.hidden; j += (int) tcount) {
-            const int i = off + j;
-            acc += inj[inj_row + (size_t) i] * normed[row + (size_t) i];
+            const size_t i = off + (size_t) j;
+            acc += inj[inj_row + i] * normed[row + i];
         }
     }
     const float lane_sum = simd_sum(acc);

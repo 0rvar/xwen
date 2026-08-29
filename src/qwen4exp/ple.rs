@@ -161,16 +161,36 @@ pub struct PleTable {
 
 impl PleTable {
     /// The general constructor: a byte source, the offset of row 0 inside it,
-    /// and the geometry. `from_source` is what a loader that parsed the tensor
-    /// table itself calls — including for IQ4_NL, which candle cannot name.
+    /// the geometry, and `bytes` — the length the tensor table declares for
+    /// this tensor, which the geometry must fill exactly. `from_source` is what
+    /// a loader that parsed the tensor table itself calls — including for
+    /// IQ4_NL, which candle cannot name.
     pub fn from_source(
         src: Arc<MmapSource>,
         base: usize,
         dtype: TableDtype,
         row_dim: usize,
         rows: u64,
+        bytes: usize,
     ) -> Result<Self> {
         let table = Self::build(TableBytes::Mapped(src.clone()), base, dtype, row_dim, rows)?;
+        // Checked, because this is the one table in the port whose row count is
+        // in the hundreds of millions: 320,001,536 rows at 90 bytes is 28.8 GB,
+        // three quarters of the way to a u32 overflow and comfortably inside a
+        // usize — but "comfortably inside" is a fact about today's file, not
+        // about the arithmetic, and the wrong answer here is a length check that
+        // passes on a wrapped product.
+        let total = table
+            .row_bytes
+            .checked_mul(rows as usize)
+            .with_context(|| {
+                format!("{rows} rows of {} bytes overflows a usize", table.row_bytes)
+            })?;
+        ensure!(
+            total == bytes,
+            "{rows} rows of {} bytes do not fill the tensor's {bytes} bytes",
+            table.row_bytes
+        );
         // `MADV_RANDOM` over THIS TENSOR's bytes and nothing else: the gather
         // reads 16 unrelated rows per token out of a table far larger than
         // memory, so readahead around one row is bandwidth spent on bytes
@@ -178,11 +198,10 @@ impl PleTable {
         // is — the weights around this tensor are read sequentially and want it.
         // Switchable (`XWEN_PLE_NO_RANDOM`) because "the pattern is random" is
         // an argument, and the `gather` figure under `XWEN_PLE_PROFILE` is the
-        // measurement.
-        if !crate::ops::ple_no_random()
-            && let Some(len) = table.row_bytes.checked_mul(rows as usize)
-        {
-            src.advise_random(base, len);
+        // measurement. It runs AFTER the length check, so a header whose
+        // geometry disagrees with the tensor never advises past the tensor.
+        if !crate::ops::ple_no_random() {
+            src.advise_random(base, total);
         }
         Ok(table)
     }
@@ -221,32 +240,15 @@ impl PleTable {
         let [rows, row_dim] = raw.shape[..] else {
             bail!("{name} is not a rank-2 table: {:?}", raw.shape);
         };
-        let table = Self::from_source(
+        Self::from_source(
             raw.src,
             raw.offset,
             TableDtype::from_stored(raw.dtype)?,
             row_dim,
             rows as u64,
-        )?;
-        // Checked, because this is the one table in the port whose row count is
-        // in the hundreds of millions: 320,001,536 rows at 90 bytes is 28.8 GB,
-        // three quarters of the way to a u32 overflow and comfortably inside a
-        // usize — but "comfortably inside" is a fact about today's file, not
-        // about the arithmetic, and the wrong answer here is a length check that
-        // passes on a wrapped product.
-        let total = table.row_bytes.checked_mul(rows).with_context(|| {
-            format!(
-                "{name}: {rows} rows of {} bytes overflows a usize",
-                table.row_bytes
-            )
-        })?;
-        ensure!(
-            total == raw.len,
-            "{name}: {rows} rows of {} bytes do not fill the tensor's {} bytes",
-            table.row_bytes,
-            raw.len
-        );
-        Ok(table)
+            raw.len,
+        )
+        .with_context(|| format!("the PLE table {name}"))
     }
 
     /// An in-memory table from already-dequantized rows, `[rows, row_dim]` flat.
