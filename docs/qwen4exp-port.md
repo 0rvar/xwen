@@ -143,6 +143,11 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   (3) Metal matmul kernels (mv_id/mm_id) — needed only if a matmul weight is
   IQ4_NL; DEFERRED, and D3's self-converted blessed file can choose Q4_K for
   the table + down_exps to avoid class 3 entirely.
+  - **Amended 2026-08-29 by D18.** Class 3 was never "all new matmul dtypes" —
+    it is IQ4_NL specifically, and IQ4_NL matmul stays deferred. `Q5_1` matmul
+    is now IN SCOPE, because the 640-column rule (below) puts Q5_1 on
+    UD-Q4_K_XL's `ffn_down_exps`. It needs no new parsing: `Q5_1` is a plain
+    ggml type candle already knows end to end.
 - **D9 (2026-08-26) DeltaNet z-gate as a construction-time enum.** `ZGate
   {Silu, Sigmoid}` on `LinearAttnBlock`: reference path branches at the one
   silu(z) line; fused path gets a `kernel_delta_gnorm_sigmoid` sibling selected
@@ -203,6 +208,35 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
 - **D17 (2026-08-29) PLE in P2 is host-hybrid.** Hash, row gather and IQ4_NL
   dequant on the CPU; the projections on device; gate/conv on the host in f32.
   A known P3 cost, taken for correctness first. See "P2 plan".
+- **D18 (2026-08-29) Q5_1 expert-down: runs in P2 on existing paths; kernels
+  are a P3 perf item.** The 640-column rule (see "Quant landscape" below) means
+  every Q4-class file carries a 32-block type on `ffn_down_exps`, and on our
+  D12 target that type is `Q5_1` (43 of 48 layers; the other 5 are Q8_0). The
+  Q5_1-free alternatives do not survive contact: an all-Q8_0 down plane is
+  UD-Q5_K_XL, whose trunk is 104 GB, and the IQ-ladder files that avoid it pair
+  it with gate/up types we have no kernels for at all (IQ3_S). So Q5_1 is not
+  optional on any file we would actually run — **but it is also not blocking**:
+  verified against current code, Q5_1 experts already run unmodified.
+  `ExpertStack` carries the dtype straight off each tensor's GGUF info with no
+  whitelist, and `FusedExperts::new` only cross-checks `n_expert`, never dtype —
+  so per-layer and per-plane dtype mixing is already legal. Decode falls
+  through `mv_vendored_supported` (Q4_K/Q5_K/Q6_K/Q8_0 only) to candle's baked
+  `kernel_mul_mv_id_q5_1_f32`, which is wired and correct. Prefill has no Q5_1
+  in `mm_kernel_name`, and `FusedExperts::use_mm` is all-or-nothing across the
+  three stacks, so a Q5_1 down drops the WHOLE layer — gate and up included —
+  to the per-token `mul_mv_id` path: correct, slower, and already a documented
+  fallback. Candle at our pin also has `kernel_mul_mm_id_q5_1_f32` plus full
+  Q5_1 in QTensor/QMatMul/get_rows/dequantize, so `ReferenceExperts` and the
+  fixtures need nothing. **P2 therefore ships on the existing paths.** The
+  P3 work is perf only and is ledgered in TODO.md: a Q5_1 arm in the vendored
+  `mv_id` fast path; Q5_1 in the vendored two-pass `mm_id` (or a second encode
+  path to candle's baked one) so those 43 layers regain grouped prefill; and
+  the question of whether `use_mm` should be per-stack rather than
+  all-or-nothing. D12 stands unchanged. Q5_1 block layout for whoever writes
+  the kernel: 24 bytes, 6 bpw — f16 `d`, f16 `m`, u32 `qh`, 16 B `qs`; dequant
+  is `x0 = (qs[j] & 0xF) | ((qh >> j) << 4 & 0x10)`,
+  `x1 = (qs[j] >> 4) | ((qh >> (j + 12)) & 0x10)`, `y[j] = x0·d + m`,
+  `y[j+16] = x1·d + m` — non-interleaved halves (ggml-quants.c).
 - **D7 (2026-08-26) Phase plan.** P0 scaffold (split-GGUF loader, config parse,
   registry) → P1 CPU references + fixtures for the three new components → P2
   graph assembly, load a real file, greedy smoke, ppl sanity vs PR #27742's
@@ -392,6 +426,48 @@ load) and the imatrix file.
   IQ1_S..IQ3_M (70-93 GB, still uploading as of 08-28); mradermacher a static
   and an i1 ladder. Nothing there beats UD-Q4_K_XL on the kernels-we-have axis.
 
+#### The 640-column rule (why no Q4-class file has a K-quant expert-down plane)
+
+`ffn_down_exps` is `[640, 2560, 512]` — ncols 640, and 640 % 256 = 128. That
+fails the 256-element block-size requirement of every K/IQ type, so llama.cpp's
+generic `tensor_type_fallback()` (src/llama-quant.cpp) demotes whatever the mix
+asked for to a 32-block type: Q4_K→**Q5_0**, Q5_K→**Q5_1**, Q6_K→**Q8_0**,
+Q2_K/Q3_K→**Q4_0**, IQ1/IQ2/IQ3/IQ4_XS→**IQ4_NL**. This is not a qwen4exp
+override and not an Unsloth rule — it is the generic fallback, so it holds for
+every publisher. `ffn_gate_exps`/`ffn_up_exps` are `[2560, 640, 512]` (ncols
+2560) and keep their K-quants. `per_layer_token_embd` is `[160, …]`, so the PLE
+table is 32-block-only forever too — IQ4_NL / Q4_0 / Q5_0 / Q8_0 / BF16 are the
+only things that ship there — with `--token-embedding-type` as its own escape
+hatch, which is how ggml-org shipped a Q8_0 trunk with a **Q4_0** PLE table.
+
+Measured per file (2026-08-29, from headers):
+
+| file | `ffn_down_exps` | gate/up | PLE table |
+| --- | --- | --- | --- |
+| unsloth UD-IQ3_XXS | IQ4_NL ×48 | IQ2_S ×47 + IQ3_S [2] | IQ4_NL |
+| unsloth UD-Q3_K_XL | IQ4_NL ×43 + Q8_0 [2,4,30,46,47] | IQ3_XXS ×47 + IQ4_XS [2] | IQ4_NL |
+| unsloth UD-IQ4_XS | IQ4_NL ×43 + Q8_0 ×5 (same layers) | IQ3_S ×47 + IQ4_XS [2] | IQ4_NL |
+| **unsloth UD-Q4_K_XL** | **Q5_1 ×43** + Q8_0 ×5 | Q4_K ×47 + Q5_K [2] | IQ4_NL |
+| unsloth UD-Q5_K_XL | Q8_0 ×48 | Q5_K ×47 + Q6_K [2] | Q8_0 |
+| unsloth Q8_0 | Q8_0 | Q8_0 | Q8_0 |
+| lmstudio Q4_K_M | Q8_0 ×24 + Q5_0 ×24 | Q4_K | Q5_0 |
+| lmstudio Q6_K | Q8_0 ×48 | Q6_K | Q8_0 |
+| bartowski IQ3_M | Q5_1 ×24 + IQ4_NL ×24 | IQ3_S | IQ4_NL |
+| ggml-org Q8_0 | Q8_0 | Q8_0 | **Q4_0** |
+
+lmstudio's Q4_K_M puts the higher type on layers [0-5, 8, 11, 14, …, 41,
+42-47]. On UD-Q4_K_XL, `token_embd` and `output` are both Q8_0. The consequence
+for xwen is D18.
+
+#### Tensor-table facts worth carrying (docs/qwen4exp-tensors.md)
+
+- `ple_conv1d.weight` ships **F32** — settled, so the upstream "unpinned, may
+  land F16" worry above is moot for the files we run.
+- `ffn_gate_inp_shexp.weight` is **1-D `[2560]`**, not `[1, 2560]`.
+- There is **no `output_hc_inject`** — the tail mixer reads and does not write.
+- UD-Q4_K_XL byte split: MoE 77.5 GB, PLE 28.8, attention 1.7, embed+head 1.35,
+  GDN 1.25, hyper-connections 0.7.
+
 ## Conversion-baked deltas (audit of the converter, 2026-08-26)
 
 Read upstream in the `reference/llama.cpp` submodule at its pin (`6fe749801`
@@ -558,6 +634,11 @@ reference/qwen4exp/UPSTREAM-DIFF-2026-08-29.md finding 3.)
     `hidden`. A `[hidden]`-wide load is wrong. The P1 fixtures settled this, and
     the references assert `x.len() == weight.len()`, which is what turns the
     mistake into a panic instead of streams 1.. silently coming out zero.
+17. **Expert dtype varies per LAYER and per PLANE on this file — never assume
+    uniform.** UD-Q4_K_XL is Q5_1 down on 43 layers and Q8_0 down on 5, with
+    Q4_K gate/up on 47 and Q5_K on layer 2. Any code that reads one layer's
+    dtype and applies it to the stack, or that assumes gate/up/down agree, is
+    wrong on every published qwen4exp file. (See the 640-column rule and D18.)
 
 ## Reuse-seams map (audited 2026-08-26; file:line refs from that audit)
 
@@ -923,3 +1004,19 @@ Units (U2-U5 parallel, then U6, then U7):
   and U2-U5 are running in parallel (hc, indexer+D16, IQ4_NL+PLE, ZGate and
   sum_floor wiring), with U1 (registry) waiting on the download and U6/U7
   after the parallel wave.
+- **2026-08-29 (quant landscape, second pass)**: parsed the headers of every
+  published qwen4exp file and found the 640-column rule — `ffn_down_exps` has
+  ncols 640, which fails every K/IQ type's 256-element block requirement, so
+  llama.cpp's generic `tensor_type_fallback()` demotes that plane to a 32-block
+  type on EVERY publisher's file. On our D12 target that means `Q5_1` down on
+  43 layers and Q8_0 on 5, against Q4_K/Q5_K gate and up. D18 taken: Q5_1 is
+  unavoidable but not blocking — verified against the current code that Q5_1
+  experts already run (per-tensor dtype in `ExpertStack`, no whitelist; decode
+  on candle's baked `kernel_mul_mv_id_q5_1_f32`; prefill dropping the layer to
+  per-token `mul_mv_id` because `use_mm` is all-or-nothing) — so P2 ships on
+  existing paths and the kernel work is a P3 perf item, ledgered. D8's "class 3
+  deferred" narrowed to IQ4_NL only. Trap #17 added (expert dtype varies per
+  layer AND per plane). Also folded in from docs/qwen4exp-tensors.md:
+  `ple_conv1d.weight` is F32 (settled), `ffn_gate_inp_shexp.weight` is 1-D
+  `[2560]`, there is no `output_hc_inject`, and UD-Q4_K_XL's byte split is
+  MoE 77.5 GB / PLE 28.8 / attention 1.7 / embed+head 1.35 / GDN 1.25 / hc 0.7.

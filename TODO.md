@@ -1897,3 +1897,18 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     file. Fix: `--regen-ppl-ref` against the 3.8 hub file, then grade ppl and
     record the floor in docs/parity.md beside the 3.6 pair's. Until then the
     3.8's parity coverage is 5 checks where the others get 6.
+  - **2026-08-29 — P3: Q5_1 expert kernels (from D18).** UD-Q4_K_XL carries
+    `Q5_1` on `ffn_down_exps` for 43 of 48 layers (the 640-column block-size
+    fallback; see docs/qwen4exp-port.md "The 640-column rule"). It RUNS today
+    with no code change — decode reaches candle's baked
+    `kernel_mul_mv_id_q5_1_f32`, and prefill falls back correctly — so this is
+    perf, not correctness, and it is not P2's problem. Three items:
+    (a) add a Q5_1 arm to the vendored `mv_id` fast path (`mv_vendored_supported`
+    is Q4_K/Q5_K/Q6_K/Q8_0 today, so every Q5_1 decode takes the slower baked
+    kernel); (b) add Q5_1 to the vendored two-pass `mm_id` — or give those
+    layers a second encode path to candle's baked `kernel_mul_mm_id_q5_1_f32` —
+    so the 43 affected layers regain grouped prefill; (c) decide whether
+    `FusedExperts::use_mm` should be per-stack instead of all-or-nothing: today
+    one unsupported down plane drops that layer's gate and up to per-token
+    matvec too, which is the bulk of the cost. Measure before and after; the
+    43-layer prefill penalty has not been quantified yet.
