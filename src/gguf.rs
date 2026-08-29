@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
-use candle_core::quantized::gguf_file::{Content, Value};
+use candle_core::quantized::gguf_file::{
+    Content, DEFAULT_ALIGNMENT, TensorInfo, Value, VersionedMagic,
+};
 use candle_core::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
-use candle_core::{DType, Device, MetalDevice, MetalStorage, Module, Storage, Tensor};
+use candle_core::{DType, Device, MetalDevice, MetalStorage, Module, Shape, Storage, Tensor};
 use candle_metal_kernels::metal::Buffer;
 use candle_nn::RmsNorm;
 
@@ -340,9 +342,24 @@ pub struct GgufFile {
     checkpoint: CheckpointId,
     /// The files backing `content`'s tensors, in shard order.
     shards: Vec<Shard>,
-    /// Tensor name → index into `shards`. Populated only for a split GGUF;
+    /// Tensor name → index into `shards`, covering BOTH halves of the table
+    /// (`content.tensor_infos` and `raw_of`). Populated only for a split GGUF;
     /// single-file lookups never consult it.
     shard_of: HashMap<String, usize>,
+    /// The other half of the tensor table: the tensors whose ggml type candle
+    /// has no `GgmlDType` for, and which are therefore absent from `content`
+    /// (see the tensor-table section above). Offsets are rebased exactly as
+    /// `content`'s are, so `content.tensor_data_offset + info.offset` is the
+    /// read position in the backing shard on both paths.
+    ///
+    /// Nothing here is ever uploaded to the device — candle could not, and the
+    /// one production member (the 28.8 GB PLE n-gram table) is deliberately
+    /// demand-paged on the host instead (docs/qwen4exp-port.md D2). That is why
+    /// these tensors stay OUT of `content.tensor_infos` and so out of
+    /// `model.rs`'s resident-weight budget: counting 28.8 GB of page cache as
+    /// resident VRAM would make every footprint line wrong. `raw_tensor_bytes`
+    /// reports them separately for anyone who does want the file-size total.
+    raw_of: HashMap<String, RawTensorInfo>,
 }
 
 /// One tensor's bytes as a location in a mapped shard rather than a loaded
@@ -355,7 +372,7 @@ pub(crate) struct RawTensor {
     pub offset: usize,
     /// The tensor's byte length in its stored dtype.
     pub len: usize,
-    pub dtype: GgmlDType,
+    pub dtype: StoredDtype,
     pub shape: Vec<usize>,
 }
 
@@ -408,17 +425,44 @@ impl GgufFile {
     /// classic (non-aliasing) open is refused here rather than silently
     /// reading through the file handle a row at a time.
     ///
-    /// The dtype comes from candle's parsed tensor table, so this covers the
-    /// dtypes candle can name. An IQ4_NL table (every Unsloth Q3/Q4 mix) is not
-    /// one of them — `Content::read` cannot parse such a file at all — and
-    /// reaches the reader through `qwen4exp::ple::PleTable::from_source`, which
-    /// takes the location directly from the loader that parsed it (D8 class 1).
+    /// It serves BOTH halves of the tensor table: a tensor candle named
+    /// resolves through `content.tensor_infos` exactly as before, and one it
+    /// could not (the IQ4_NL PLE table of every Unsloth Q3/Q4 mix) resolves
+    /// through `raw_of`. Either way the caller gets bytes plus a `StoredDtype`
+    /// and does its own dequant — `qwen4exp::ple::PleTable` is the reader
+    /// (docs/qwen4exp-port.md D8 class 1).
     pub(crate) fn raw_tensor(&self, name: &str) -> Result<RawTensor> {
-        let info = self
-            .content
-            .tensor_infos
-            .get(name)
-            .with_context(|| format!("tensor {name} not found"))?;
+        let (dtype, shape, offset, len) = match self.content.tensor_infos.get(name) {
+            Some(info) => {
+                let dtype = info.ggml_dtype;
+                let block = dtype.block_size();
+                let elems = info.shape.elem_count();
+                ensure!(
+                    elems.is_multiple_of(block),
+                    "{name}: {elems} elements is not a multiple of {dtype:?} block size {block}"
+                );
+                (
+                    StoredDtype::Ggml(dtype),
+                    info.shape.dims().to_vec(),
+                    info.offset,
+                    elems / block * dtype.type_size(),
+                )
+            }
+            None => {
+                let info = self
+                    .raw_of
+                    .get(name)
+                    .with_context(|| format!("tensor {name} not found"))?;
+                (
+                    StoredDtype::Raw(info.dtype),
+                    info.shape.clone(),
+                    info.offset,
+                    usize::try_from(info.byte_len).with_context(|| {
+                        format!("{name} is {} bytes, past usize", info.byte_len)
+                    })?,
+                )
+            }
+        };
         let src = self
             .shard_for(name)
             .mmap
@@ -430,20 +474,53 @@ impl GgufFile {
                 )
             })?
             .clone();
-        let dtype = info.ggml_dtype;
-        let block = dtype.block_size();
-        let elems = info.shape.elem_count();
-        ensure!(
-            elems.is_multiple_of(block),
-            "{name}: {elems} elements is not a multiple of {dtype:?} block size {block}"
-        );
         Ok(RawTensor {
             src,
-            offset: (self.content.tensor_data_offset + info.offset) as usize,
-            len: elems / block * dtype.type_size(),
+            offset: (self.content.tensor_data_offset + offset) as usize,
+            len,
             dtype,
-            shape: info.shape.dims().to_vec(),
+            shape,
         })
+    }
+
+    /// The dtype a tensor is STORED at, across both halves of the table — the
+    /// whole-file twin of `Weights::stored_dtype`, which can only answer for
+    /// the tensors candle named.
+    pub fn stored_dtype_of(&self, name: &str) -> Result<StoredDtype> {
+        if let Some(info) = self.content.tensor_infos.get(name) {
+            return Ok(StoredDtype::Ggml(info.ggml_dtype));
+        }
+        self.raw_of
+            .get(name)
+            .map(|info| StoredDtype::Raw(info.dtype))
+            .with_context(|| format!("tensor {name} not found"))
+    }
+
+    /// Whether `name` is in the tensor table at all, either half.
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.content.tensor_infos.contains_key(name) || self.raw_of.contains_key(name)
+    }
+
+    /// Total tensor count across both halves — what the file's header declared.
+    pub fn tensor_count(&self) -> usize {
+        self.content.tensor_infos.len() + self.raw_of.len()
+    }
+
+    /// Names and stored dtypes of the tensors candle could not name, for
+    /// diagnostics (`describe_file`) and for tests that assert which planes a
+    /// mix keeps outside candle's reach.
+    pub fn raw_tensor_names(&self) -> Vec<(&str, RawDtype)> {
+        self.raw_of
+            .iter()
+            .map(|(name, info)| (name.as_str(), info.dtype))
+            .collect()
+    }
+
+    /// Stored bytes of the raw half of the table. NOT part of the resident
+    /// weight footprint — see `raw_of` — but the number to reach for when
+    /// accounting for the file rather than for VRAM.
+    pub fn raw_tensor_bytes(&self) -> u64 {
+        self.raw_of.values().map(|i| i.byte_len).sum()
     }
 
     /// Identity of this checkpoint, computed once at `open`. Persisted artifacts
@@ -454,6 +531,530 @@ impl GgufFile {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The tensor table, parsed by xwen rather than by candle.
+//
+// candle's `Content::read` maps every tensor's ggml type id through
+// `GgmlDType::from_u32` and FAILS the whole file when one id has no `GgmlDType`
+// variant — and candle names none of the IQ* types. The Unsloth Q3/Q4 mixes of
+// Qwen3.8-Flash-Next hold `per_layer_token_embd.weight` (28.8 GB of n-gram
+// table) at IQ4_NL, so `Content::read` refuses those files outright with
+// "unknown dtype for tensor 20" even though every tensor the GPU ever sees is a
+// type candle knows.
+//
+// So xwen parses the header itself (docs/qwen4exp-port.md D8) and splits the
+// tensor table in two: everything candle can name goes into a `Content` built
+// exactly as `Content::read` would have built it — so `Weights`, `config.rs`
+// and every existing loader path are untouched — and everything else goes into
+// `GgufFile::raw_of`, reachable only through `raw_tensor`, which hands out a
+// byte location for an xwen-side reader (the PLE table's CPU row gather). The
+// pinned candle stays unpatched.
+// ---------------------------------------------------------------------------
+
+/// Block geometry of a ggml tensor type id: `(name, block_size, type_size)`,
+/// mirroring the `type_traits` table of `reference/llama.cpp/ggml/src/ggml.c`
+/// and the ids of `ggml/include/ggml.h`. A tensor's stored byte length is
+/// `elem_count / block_size * type_size`, so this table is what lets the loader
+/// size a tensor whose type candle has no variant for.
+///
+/// `None` is a type id ggml itself does not define: the removed Q4_3 (5) and
+/// Q4_0_4_4/4_8/8_8 (36-38) slots, or anything at or past `GGML_TYPE_COUNT`. A
+/// file carrying one is refused at open — the same outcome candle's parser gave
+/// for every unknown id, kept deliberately so a tensor is never silently
+/// dropped from the table.
+fn ggml_type_geometry(id: u32) -> Option<(&'static str, usize, usize)> {
+    Some(match id {
+        0 => ("F32", 1, 4),
+        1 => ("F16", 1, 2),
+        2 => ("Q4_0", 32, 18),
+        3 => ("Q4_1", 32, 20),
+        6 => ("Q5_0", 32, 22),
+        7 => ("Q5_1", 32, 24),
+        8 => ("Q8_0", 32, 34),
+        9 => ("Q8_1", 32, 36),
+        10 => ("Q2_K", 256, 84),
+        11 => ("Q3_K", 256, 110),
+        12 => ("Q4_K", 256, 144),
+        13 => ("Q5_K", 256, 176),
+        14 => ("Q6_K", 256, 210),
+        15 => ("Q8_K", 256, 292),
+        16 => ("IQ2_XXS", 256, 66),
+        17 => ("IQ2_XS", 256, 74),
+        18 => ("IQ3_XXS", 256, 98),
+        19 => ("IQ1_S", 256, 50),
+        20 => ("IQ4_NL", 32, 18),
+        21 => ("IQ3_S", 256, 110),
+        22 => ("IQ2_S", 256, 82),
+        23 => ("IQ4_XS", 256, 136),
+        24 => ("I8", 1, 1),
+        25 => ("I16", 1, 2),
+        26 => ("I32", 1, 4),
+        27 => ("I64", 1, 8),
+        28 => ("F64", 1, 8),
+        29 => ("IQ1_M", 256, 56),
+        30 => ("BF16", 1, 2),
+        34 => ("TQ1_0", 256, 54),
+        35 => ("TQ2_0", 256, 66),
+        39 => ("MXFP4", 32, 17),
+        40 => ("NVFP4", 64, 36),
+        41 => ("Q1_0", 128, 18),
+        42 => ("Q2_0", 64, 18),
+        _ => return None,
+    })
+}
+
+/// The ggml type ids candle's `GgmlDType` names — i.e. the ids whose tensors
+/// can be loaded, uploaded and dequantized through candle. Transcribed from
+/// `GgmlDType::from_u32`, which is `pub(crate)` and so not callable from here;
+/// `ggml_type_ids_agree_with_candle` pins the transcription against candle's
+/// own `block_size`/`type_size` so a candle bump cannot silently desync it.
+fn candle_dtype(id: u32) -> Option<GgmlDType> {
+    Some(match id {
+        0 => GgmlDType::F32,
+        1 => GgmlDType::F16,
+        2 => GgmlDType::Q4_0,
+        3 => GgmlDType::Q4_1,
+        6 => GgmlDType::Q5_0,
+        7 => GgmlDType::Q5_1,
+        8 => GgmlDType::Q8_0,
+        9 => GgmlDType::Q8_1,
+        10 => GgmlDType::Q2K,
+        11 => GgmlDType::Q3K,
+        12 => GgmlDType::Q4K,
+        13 => GgmlDType::Q5K,
+        14 => GgmlDType::Q6K,
+        15 => GgmlDType::Q8K,
+        30 => GgmlDType::BF16,
+        _ => return None,
+    })
+}
+
+/// A ggml tensor type that candle's `GgmlDType` has no variant for. Such a
+/// tensor is never uploaded, dequantized or matmul'd — nothing downstream of
+/// candle can touch it — so the only thing xwen does with one is hand out its
+/// bytes (`GgufFile::raw_tensor`) for a reader that knows the format itself.
+///
+/// IQ4_NL is the variant that exists for a reason: it is where every Unsloth
+/// Q3/Q4 mix keeps the Qwen3.8-Flash-Next PLE n-gram table. IQ4_XS is named
+/// because it is the other IQ type those mixes reach for. Everything else stays
+/// `Other`, sized from [`ggml_type_geometry`] like the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawDtype {
+    Iq4Nl,
+    Iq4Xs,
+    Other(u32),
+}
+
+impl RawDtype {
+    fn from_id(id: u32) -> Self {
+        match id {
+            20 => Self::Iq4Nl,
+            23 => Self::Iq4Xs,
+            other => Self::Other(other),
+        }
+    }
+
+    pub fn type_id(self) -> u32 {
+        match self {
+            Self::Iq4Nl => 20,
+            Self::Iq4Xs => 23,
+            Self::Other(id) => id,
+        }
+    }
+
+    /// The geometry, from the table. Infallible: a `RawDtype` only ever comes
+    /// from an id the table already accepted at open.
+    fn geometry(self) -> (&'static str, usize, usize) {
+        ggml_type_geometry(self.type_id())
+            .expect("RawDtype is only built from a known ggml type id")
+    }
+
+    pub fn name(self) -> &'static str {
+        self.geometry().0
+    }
+
+    pub fn block_size(self) -> usize {
+        self.geometry().1
+    }
+
+    pub fn type_size(self) -> usize {
+        self.geometry().2
+    }
+}
+
+/// The dtype a GGUF tensor is STORED at, across both halves of the split tensor
+/// table: the types candle names and can load, and the types only xwen's own
+/// parse names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredDtype {
+    Ggml(GgmlDType),
+    Raw(RawDtype),
+}
+
+impl StoredDtype {
+    pub fn block_size(self) -> usize {
+        match self {
+            Self::Ggml(d) => d.block_size(),
+            Self::Raw(d) => d.block_size(),
+        }
+    }
+
+    pub fn type_size(self) -> usize {
+        match self {
+            Self::Ggml(d) => d.type_size(),
+            Self::Raw(d) => d.type_size(),
+        }
+    }
+
+    /// The candle dtype, for a caller that needs to hand the tensor to candle;
+    /// `None` for a raw type, which candle cannot represent at all.
+    pub fn ggml(self) -> Option<GgmlDType> {
+        match self {
+            Self::Ggml(d) => Some(d),
+            Self::Raw(_) => None,
+        }
+    }
+}
+
+/// One tensor of the raw half of the table — the half candle's `Content` cannot
+/// hold. Mirrors candle's `TensorInfo` field for field, plus the byte length
+/// (which `TensorInfo` recomputes from the dtype and candle cannot here).
+///
+/// `offset` follows candle's convention exactly: it is relative to the owning
+/// `Content`'s `tensor_data_offset`, so a split open rebases it to
+/// shard-absolute alongside the candle-known infos and `tensor_data_offset`
+/// becomes 0 (see [`GgufFile::content`]).
+#[derive(Debug, Clone)]
+struct RawTensorInfo {
+    dtype: RawDtype,
+    shape: Vec<usize>,
+    offset: u64,
+    byte_len: u64,
+}
+
+/// A GGUF header as xwen parses it: candle's `Content` for the tensors candle
+/// can name, and the raw table for the rest.
+struct ParsedGguf {
+    content: Content,
+    raw: HashMap<String, RawTensorInfo>,
+}
+
+// Caps transcribed from candle's parser, which took them from
+// ggml-org/llama.cpp#19856 (GGUF_MAX_STRING_LENGTH, GGUF_MAX_ARRAY_ELEMENTS)
+// and GGML_MAX_DIMS. They bound what a corrupt or hostile header can make this
+// loader allocate, and the depth cap bounds recursion through nested arrays.
+const GGUF_MAX_STRING_LENGTH: u64 = 1 << 30;
+const GGUF_MAX_ARRAY_ELEMENTS: u64 = 1 << 30;
+const GGUF_MAX_TENSOR_DIMS: u32 = 4;
+const GGUF_MAX_VALUE_DEPTH: usize = 64;
+
+macro_rules! read_le {
+    ($name:ident, $t:ty, $n:literal) => {
+        fn $name<R: Read>(r: &mut R) -> Result<$t> {
+            let mut b = [0u8; $n];
+            r.read_exact(&mut b)?;
+            Ok(<$t>::from_le_bytes(b))
+        }
+    };
+}
+
+read_le!(read_u8, u8, 1);
+read_le!(read_i8, i8, 1);
+read_le!(read_u16, u16, 2);
+read_le!(read_i16, i16, 2);
+read_le!(read_u32, u32, 4);
+read_le!(read_i32, i32, 4);
+read_le!(read_u64, u64, 8);
+read_le!(read_i64, i64, 8);
+read_le!(read_f32, f32, 4);
+read_le!(read_f64, f64, 8);
+
+/// GGUF v1 length-prefixes strings and counts with u32, v2/v3 with u64.
+fn read_length<R: Read>(r: &mut R, magic: VersionedMagic) -> Result<u64> {
+    match magic {
+        VersionedMagic::GgufV1 => Ok(u64::from(read_u32(r)?)),
+        VersionedMagic::GgufV2 | VersionedMagic::GgufV3 => read_u64(r),
+    }
+}
+
+fn length_prefix_size(magic: VersionedMagic) -> u64 {
+    match magic {
+        VersionedMagic::GgufV1 => 4,
+        VersionedMagic::GgufV2 | VersionedMagic::GgufV3 => 8,
+    }
+}
+
+fn remaining_bytes<R: Seek>(r: &mut R, file_size: u64) -> Result<u64> {
+    Ok(file_size.saturating_sub(r.stream_position()?))
+}
+
+/// A length-prefixed GGUF string. Trailing NULs are stripped and invalid UTF-8
+/// is replaced rather than rejected — both are real in the wild, and candle's
+/// parser did the same, so keys and values reach `config.rs` unchanged.
+fn read_gguf_string<R: Read + Seek>(
+    r: &mut R,
+    magic: VersionedMagic,
+    file_size: u64,
+) -> Result<String> {
+    let len = read_length(r, magic)?;
+    ensure!(
+        len <= GGUF_MAX_STRING_LENGTH,
+        "gguf: string length {len} exceeds max {GGUF_MAX_STRING_LENGTH}"
+    );
+    let remaining = remaining_bytes(r, file_size)?;
+    ensure!(
+        len <= remaining,
+        "gguf: string length {len} exceeds remaining file bytes {remaining}"
+    );
+    let mut v = vec![0u8; len as usize];
+    r.read_exact(&mut v)?;
+    while let Some(0) = v.last() {
+        v.pop();
+    }
+    Ok(String::from_utf8_lossy(&v).into_owned())
+}
+
+/// Minimum on-disk size of one value of a given GGUF value type, used to reject
+/// an array length that cannot fit in the file before allocating for it.
+fn value_min_disk_size(value_type: u32, magic: VersionedMagic) -> u64 {
+    match value_type {
+        0 | 1 | 7 => 1,                     // U8, I8, Bool
+        2 | 3 => 2,                         // U16, I16
+        4..=6 => 4,                         // U32, I32, F32
+        10..=12 => 8,                       // U64, I64, F64
+        8 => length_prefix_size(magic),     // String
+        9 => 4 + length_prefix_size(magic), // Array
+        _ => 1,
+    }
+}
+
+/// One GGUF metadata value. Value-type ids are the GGUF spec's
+/// (0..=12, 9 = array), and the variants are candle's `Value` so `config.rs`
+/// and every other metadata consumer keeps the exact type it already reads.
+fn read_gguf_value<R: Read + Seek>(
+    r: &mut R,
+    value_type: u32,
+    magic: VersionedMagic,
+    depth: usize,
+    file_size: u64,
+) -> Result<Value> {
+    ensure!(
+        depth <= GGUF_MAX_VALUE_DEPTH,
+        "gguf: value nesting depth exceeds max {GGUF_MAX_VALUE_DEPTH}"
+    );
+    let v = match value_type {
+        0 => Value::U8(read_u8(r)?),
+        1 => Value::I8(read_i8(r)?),
+        2 => Value::U16(read_u16(r)?),
+        3 => Value::I16(read_i16(r)?),
+        4 => Value::U32(read_u32(r)?),
+        5 => Value::I32(read_i32(r)?),
+        6 => Value::F32(read_f32(r)?),
+        7 => match read_u8(r)? {
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            b => bail!("gguf: unexpected bool value {b}"),
+        },
+        8 => Value::String(read_gguf_string(r, magic, file_size)?),
+        9 => {
+            let elem_type = read_u32(r)?;
+            ensure!(
+                elem_type <= 12,
+                "gguf: unrecognized value-type {elem_type:#08x}"
+            );
+            let len = read_length(r, magic)?;
+            ensure!(
+                len <= GGUF_MAX_ARRAY_ELEMENTS,
+                "gguf: array length {len} exceeds max {GGUF_MAX_ARRAY_ELEMENTS}"
+            );
+            let needed = len.saturating_mul(value_min_disk_size(elem_type, magic));
+            let remaining = remaining_bytes(r, file_size)?;
+            ensure!(
+                needed <= remaining,
+                "gguf: array of {len} elements needs at least {needed} bytes, only {remaining} \
+                 remaining"
+            );
+            let mut vs = Vec::new();
+            for _ in 0..len {
+                vs.push(read_gguf_value(r, elem_type, magic, depth + 1, file_size)?);
+            }
+            Value::Array(vs)
+        }
+        10 => Value::U64(read_u64(r)?),
+        11 => Value::I64(read_i64(r)?),
+        12 => Value::F64(read_f64(r)?),
+        other => bail!("gguf: unrecognized value-type {other:#08x}"),
+    };
+    Ok(v)
+}
+
+/// Parses one GGUF file's header — magic, KV metadata, tensor table and the
+/// aligned tensor-data offset — leaving the reader positioned wherever the
+/// table ended.
+///
+/// Deliberately byte-for-byte equivalent to candle's `Content::read` for every
+/// file candle could read: same caps, same string handling, same
+/// `dimensions.reverse()` (so shapes stay row-major `[out_dim, in_dim]`), same
+/// `general.alignment` rule down to which integer widths it honors. That
+/// equivalence is load-bearing twice over — `CheckpointId` hashes the bytes up
+/// to `tensor_data_offset`, so a different alignment rule would invalidate
+/// every persisted cache image on disk, and `config.rs` reads the metadata map
+/// this produces.
+///
+/// The one difference is the point of the exercise: a tensor whose ggml type id
+/// candle cannot name lands in the raw table instead of failing the file.
+fn read_gguf_header(file: &mut File) -> Result<ParsedGguf> {
+    let mut r = BufReader::new(file);
+    let start = r.stream_position()?;
+    let file_size = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(start))?;
+
+    let magic_word = read_u32(&mut r)?;
+    ensure!(
+        matches!(magic_word, 0x4655_4747 | 0x4747_5546),
+        "gguf: unknown magic 0x{magic_word:08x}"
+    );
+    let version = read_u32(&mut r)?;
+    let magic = match version {
+        1 => VersionedMagic::GgufV1,
+        2 => VersionedMagic::GgufV2,
+        3 => VersionedMagic::GgufV3,
+        v => bail!("gguf: unsupported version {v}"),
+    };
+
+    let tensor_count = read_length(&mut r, magic)?;
+    let metadata_kv_count = read_length(&mut r, magic)?;
+    ensure!(
+        tensor_count <= GGUF_MAX_ARRAY_ELEMENTS,
+        "gguf: tensor_count {tensor_count} exceeds max {GGUF_MAX_ARRAY_ELEMENTS}"
+    );
+    ensure!(
+        metadata_kv_count <= GGUF_MAX_ARRAY_ELEMENTS,
+        "gguf: metadata_kv_count {metadata_kv_count} exceeds max {GGUF_MAX_ARRAY_ELEMENTS}"
+    );
+
+    // Reject header-declared counts that cannot fit in the file even at the
+    // minimum per-entry size, before any of them sizes an allocation.
+    let prefix = length_prefix_size(magic);
+    let needed = metadata_kv_count
+        .saturating_mul(prefix + 4 + 1)
+        .saturating_add(tensor_count.saturating_mul(prefix + 4 + 4 + 8));
+    let remaining = remaining_bytes(&mut r, file_size)?;
+    ensure!(
+        needed <= remaining,
+        "gguf: header declares {tensor_count} tensors and {metadata_kv_count} metadata entries, \
+         needs at least {needed} bytes, only {remaining} remaining"
+    );
+
+    let mut metadata = HashMap::new();
+    for _ in 0..metadata_kv_count {
+        let key = read_gguf_string(&mut r, magic, file_size)?;
+        let value_type = read_u32(&mut r)?;
+        let value = read_gguf_value(&mut r, value_type, magic, 0, file_size)?;
+        metadata.insert(key, value);
+    }
+
+    let mut tensor_infos: HashMap<String, TensorInfo> = HashMap::new();
+    let mut raw: HashMap<String, RawTensorInfo> = HashMap::new();
+    for _ in 0..tensor_count {
+        let name = read_gguf_string(&mut r, magic, file_size)?;
+        let n_dims = read_u32(&mut r)?;
+        ensure!(
+            n_dims <= GGUF_MAX_TENSOR_DIMS,
+            "gguf: tensor '{name}' has {n_dims} dimensions, max is {GGUF_MAX_TENSOR_DIMS}"
+        );
+        let mut dims: Vec<usize> = Vec::with_capacity(n_dims as usize);
+        for _ in 0..n_dims {
+            let d = match magic {
+                VersionedMagic::GgufV1 => u64::from(read_u32(&mut r)?),
+                VersionedMagic::GgufV2 | VersionedMagic::GgufV3 => read_u64(&mut r)?,
+            };
+            dims.push(usize::try_from(d).with_context(|| {
+                format!("gguf: tensor '{name}' declares a dimension of {d}, past usize")
+            })?);
+        }
+        // GGUF writes dimensions fastest-varying first; candle reverses them so
+        // a `{in_dim, out_dim}` weight reads as the row-major `[out_dim,
+        // in_dim]` every loader here indexes.
+        dims.reverse();
+        let type_id = read_u32(&mut r)?;
+        let offset = read_u64(&mut r)?;
+        let Some((type_name, block_size, type_size)) = ggml_type_geometry(type_id) else {
+            bail!(
+                "gguf: tensor '{name}' has ggml type id {type_id}, which is not a type ggml \
+                 defines"
+            );
+        };
+        let elems = dims
+            .iter()
+            .try_fold(1usize, |a, &d| a.checked_mul(d))
+            .with_context(|| {
+                format!("gguf: tensor '{name}' element count overflows usize: {dims:?}")
+            })?;
+        ensure!(
+            elems.is_multiple_of(block_size),
+            "gguf: tensor '{name}': {elems} elements is not a multiple of the {type_name} block \
+             size {block_size}"
+        );
+        let duplicate = match candle_dtype(type_id) {
+            Some(ggml_dtype) => tensor_infos
+                .insert(
+                    name.clone(),
+                    TensorInfo {
+                        ggml_dtype,
+                        shape: Shape::from(dims),
+                        offset,
+                    },
+                )
+                .is_some(),
+            None => raw
+                .insert(
+                    name.clone(),
+                    RawTensorInfo {
+                        dtype: RawDtype::from_id(type_id),
+                        shape: dims,
+                        offset,
+                        byte_len: (elems / block_size) as u64 * type_size as u64,
+                    },
+                )
+                .is_some(),
+        };
+        // candle's HashMap insert silently kept the last of a repeated name and
+        // left the file's declared tensor count disagreeing with the table.
+        ensure!(
+            !duplicate,
+            "gguf: tensor '{name}' appears twice in the tensor table"
+        );
+    }
+
+    let position = r.stream_position()?;
+    // candle's alignment rule, honored width for width: only the unsigned and
+    // non-negative signed 8/16/32-bit forms count, anything else (including a
+    // u64) falls back to 32. Reproduced rather than improved — see the doc
+    // comment on why the exact offset matters.
+    let alignment = match metadata.get("general.alignment") {
+        Some(Value::U8(v)) => u64::from(*v),
+        Some(Value::U16(v)) => u64::from(*v),
+        Some(Value::U32(v)) => u64::from(*v),
+        Some(Value::I8(v)) if *v >= 0 => *v as u64,
+        Some(Value::I16(v)) if *v >= 0 => *v as u64,
+        Some(Value::I32(v)) if *v >= 0 => *v as u64,
+        _ => DEFAULT_ALIGNMENT,
+    };
+    ensure!(alignment > 0, "gguf: general.alignment is 0");
+    let tensor_data_offset = position.div_ceil(alignment) * alignment;
+
+    Ok(ParsedGguf {
+        content: Content {
+            magic,
+            metadata,
+            tensor_infos,
+            tensor_data_offset,
+        },
+        raw,
+    })
+}
+
 pub fn metal_device() -> Result<Device> {
     Ok(Device::new_metal(0)?)
 }
@@ -461,8 +1062,8 @@ pub fn metal_device() -> Result<Device> {
 pub fn open(path: impl AsRef<Path>, device: &Device) -> Result<Arc<GgufFile>> {
     let path = path.as_ref();
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let content =
-        Content::read(&mut file).with_context(|| format!("parsing GGUF {}", path.display()))?;
+    let ParsedGguf { content, raw } =
+        read_gguf_header(&mut file).with_context(|| format!("parsing GGUF {}", path.display()))?;
     // A shard of a split GGUF (the gguf-split layout) hands the whole sibling
     // set to `open_split`. A self-contained split.count = 1 export (split.no
     // 0) is a complete single-file GGUF; any other partial or self-
@@ -519,6 +1120,7 @@ pub fn open(path: impl AsRef<Path>, device: &Device) -> Result<Arc<GgufFile>> {
             mmap,
         }],
         shard_of: HashMap::new(),
+        raw_of: raw,
     }))
 }
 
@@ -599,7 +1201,7 @@ fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<Gg
     let dir = handed.parent().map(Path::to_path_buf).unwrap_or_default();
     let count = name_count;
 
-    let mut parts: Vec<(PathBuf, File, Content)> = Vec::with_capacity(count);
+    let mut parts: Vec<(PathBuf, File, ParsedGguf)> = Vec::with_capacity(count);
     let mut expected_tensors = 0u64;
     for i in 1..=count {
         let path = dir.join(format!("{base}-{i:05}-of-{count:05}.gguf"));
@@ -610,10 +1212,11 @@ fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<Gg
                 path.display()
             )
         })?;
-        let content = Content::read(&mut file)
+        let parsed = read_gguf_header(&mut file)
             .with_context(|| format!("parsing GGUF shard {}", path.display()))?;
+        let content = &parsed.content;
         let key = |k: &'static str| {
-            metadata_uint(&content, k)?
+            metadata_uint(content, k)?
                 .with_context(|| format!("{}: shard carries no {k} key", path.display()))
         };
         let no = key(SPLIT_NO_KEY)?;
@@ -655,7 +1258,7 @@ fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<Gg
                 ) {
                     continue;
                 }
-                if let Some(first) = parts[0].2.metadata.get(k) {
+                if let Some(first) = parts[0].2.content.metadata.get(k) {
                     ensure!(
                         format!("{first:?}") == format!("{v:?}"),
                         "{}: metadata key {k} is {v:?} but shard 1 ({}) says {first:?} — these \
@@ -666,7 +1269,7 @@ fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<Gg
                 }
             }
         }
-        parts.push((path, file, content));
+        parts.push((path, file, parsed));
     }
 
     // The id chains the FNV fold over every shard's metadata section in shard
@@ -675,7 +1278,7 @@ fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<Gg
     // shard the set was opened through.
     let mut hash = CheckpointId::OFFSET_BASIS;
     let mut total_len = 0u64;
-    for (path, file, content) in &mut parts {
+    for (path, file, parsed) in &mut parts {
         let file_len = file
             .metadata()
             .with_context(|| format!("stat of shard {}", path.display()))?
@@ -683,7 +1286,7 @@ fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<Gg
         // A metadata-only shard may end exactly where its KV block does, short
         // of the aligned tensor-data offset no tensor data exists to occupy;
         // its metadata section is then the whole file.
-        let metadata_len = content.tensor_data_offset.min(file_len);
+        let metadata_len = parsed.content.tensor_data_offset.min(file_len);
         (hash, _) = CheckpointId::fold(file, metadata_len, hash)
             .with_context(|| format!("identifying GGUF shard {}", path.display()))?;
         total_len += file_len;
@@ -701,42 +1304,60 @@ fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<Gg
     // allocation here.
     let actual_tensors = parts
         .iter()
-        .try_fold(0usize, |acc, p| acc.checked_add(p.2.tensor_infos.len()))
+        .try_fold(0usize, |acc, p| {
+            acc.checked_add(p.2.content.tensor_infos.len())?
+                .checked_add(p.2.raw.len())
+        })
         .context("tensor count across shards overflows usize")?;
     let mut tensor_infos = HashMap::with_capacity(actual_tensors);
+    let mut raw_of: HashMap<String, RawTensorInfo> = HashMap::new();
     let mut shard_of = HashMap::with_capacity(actual_tensors);
     for idx in 0..parts.len() {
-        let data_offset = parts[idx].2.tensor_data_offset;
-        for (name, mut info) in std::mem::take(&mut parts[idx].2.tensor_infos) {
-            info.offset = info.offset.checked_add(data_offset).with_context(|| {
+        let shard_path = parts[idx].0.clone();
+        let data_offset = parts[idx].2.content.tensor_data_offset;
+        let known = std::mem::take(&mut parts[idx].2.content.tensor_infos);
+        let unknown = std::mem::take(&mut parts[idx].2.raw);
+        // `shard_of` is the duplicate check for BOTH halves at once: a name
+        // cannot repeat within one shard's table (`read_gguf_header` refuses
+        // that) and cannot land in both halves of one shard, so a collision
+        // here always means two shards claim the same tensor.
+        let mut rebase = |name: &str, offset: u64| -> Result<u64> {
+            let rebased = offset.checked_add(data_offset).with_context(|| {
                 format!(
-                    "shard {}: tensor {name}: offset {} + tensor data offset {data_offset} \
+                    "shard {}: tensor {name}: offset {offset} + tensor data offset {data_offset} \
                      overflows u64",
-                    parts[idx].0.display(),
-                    info.offset
+                    shard_path.display(),
                 )
             })?;
-            if let Some(prev) = shard_of.insert(name.clone(), idx) {
+            if let Some(prev) = shard_of.insert(name.to_string(), idx) {
                 bail!(
                     "duplicate tensor {name}: appears in both {} and {}",
                     parts[prev].0.display(),
-                    parts[idx].0.display()
+                    shard_path.display()
                 );
             }
+            Ok(rebased)
+        };
+        for (name, mut info) in known {
+            info.offset = rebase(&name, info.offset)?;
             tensor_infos.insert(name, info);
         }
+        for (name, mut info) in unknown {
+            info.offset = rebase(&name, info.offset)?;
+            raw_of.insert(name, info);
+        }
     }
+    let total_tensors = tensor_infos.len() + raw_of.len();
     ensure!(
-        tensor_infos.len() as u64 == expected_tensors,
-        "split GGUF {}: its shards carry {} tensors but {SPLIT_TENSORS_COUNT_KEY} says \
-         {expected_tensors}",
+        total_tensors as u64 == expected_tensors,
+        "split GGUF {}: its shards carry {total_tensors} tensors but {SPLIT_TENSORS_COUNT_KEY} \
+         says {expected_tensors}",
         handed.display(),
-        tensor_infos.len()
     );
 
     let content = Content {
-        magic: parts[0].2.magic,
-        metadata: std::mem::take(&mut parts[0].2.metadata),
+        magic: parts[0].2.content.magic,
+        metadata: std::mem::take(&mut parts[0].2.content.metadata),
         tensor_infos,
         tensor_data_offset: 0,
     };
@@ -764,6 +1385,7 @@ fn open_split(handed: &Path, device: &Device, split_count: u64) -> Result<Arc<Gg
         checkpoint,
         shards,
         shard_of,
+        raw_of,
     }))
 }
 
@@ -980,8 +1602,11 @@ impl Weights {
         &self.src.device
     }
 
+    /// Whether `<prefix>.<name>.weight` is in the tensor table — either half of
+    /// it, so a presence probe for an optional plane answers the same whether
+    /// or not candle can name the dtype it happens to be stored at.
     pub fn has(&self, name: &str) -> bool {
-        self.src.content.tensor_infos.contains_key(&self.name(name))
+        self.src.has_tensor(&self.name(name))
     }
 
     fn name(&self, n: &str) -> String {
@@ -1176,15 +1801,22 @@ impl Weights {
     /// whose projections upstream keeps off the quantizer's list) asks this
     /// rather than guessing from the file's `general.file_type`, which
     /// describes the mix and not any one tensor.
+    ///
+    /// Answers only for the dtypes candle names, because every caller's next
+    /// move is to load the tensor through candle. A tensor stored at a type
+    /// candle has no variant for (the IQ4_NL PLE table) is reported as such
+    /// rather than as missing — it is in the file, it is just not loadable this
+    /// way; `GgufFile::stored_dtype_of` is the accessor that spans both halves.
     pub fn stored_dtype(&self, name: &str) -> Result<GgmlDType> {
         let full = self.name(name);
-        Ok(self
-            .src
-            .content
-            .tensor_infos
-            .get(&full)
-            .with_context(|| format!("tensor {full} not found"))?
-            .ggml_dtype)
+        match self.src.stored_dtype_of(&full)? {
+            StoredDtype::Ggml(d) => Ok(d),
+            StoredDtype::Raw(d) => bail!(
+                "tensor {full} is stored as {}, which candle cannot represent — it is reachable \
+                 only through GgufFile::raw_tensor",
+                d.name()
+            ),
+        }
     }
 
     /// A rank-2 weight `[out_dim, in_dim]` stored BF16, as a dense bf16 tensor
@@ -1644,6 +2276,30 @@ pub fn describe(content: &Content) -> String {
             info.shape.dims(),
             info.ggml_dtype
         );
+    }
+    out
+}
+
+/// `describe` plus the half of the tensor table candle cannot name, which lives
+/// on the `GgufFile` rather than on the `Content`. The whole-file listing an
+/// `xwen inspect` wants: on an Unsloth Q3/Q4 Flash-Next mix, `describe` alone
+/// silently omits the 28.8 GB IQ4_NL PLE table.
+pub fn describe_file(gguf: &GgufFile) -> String {
+    let mut out = describe(&gguf.content);
+    let mut raw = gguf.raw_tensor_names();
+    if raw.is_empty() {
+        return out;
+    }
+    raw.sort_by(|a, b| a.0.cmp(b.0));
+    let _ = writeln!(
+        out,
+        "\n{} tensors candle cannot name ({:.1} GB, never uploaded):",
+        raw.len(),
+        gguf.raw_tensor_bytes() as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    for (name, dtype) in raw {
+        let info = &gguf.raw_of[name];
+        let _ = writeln!(out, "{name}  {:?}  {}", info.shape, dtype.name());
     }
     out
 }
@@ -2402,7 +3058,8 @@ mod tests {
             return;
         };
         let mut file = File::open(&shard).unwrap();
-        let content = Content::read(&mut file).unwrap();
+        let ParsedGguf { content, raw } = read_gguf_header(&mut file).unwrap();
+        assert!(raw.is_empty(), "the first shard is metadata-only");
         assert_eq!(metadata_uint(&content, SPLIT_NO_KEY).unwrap(), Some(0));
         let count = metadata_uint(&content, SPLIT_COUNT_KEY)
             .unwrap()
@@ -2427,7 +3084,10 @@ mod tests {
 
         if siblings_present {
             let gguf = open(&shard, &Device::Cpu).unwrap();
-            assert_eq!(gguf.content.tensor_infos.len() as u64, total);
+            // Both halves of the table: the Unsloth Q4_K_XL mix keeps
+            // `per_layer_token_embd.weight` at IQ4_NL, which candle's `Content`
+            // cannot hold, so `content.tensor_infos` alone is one short.
+            assert_eq!(gguf.tensor_count() as u64, total);
         } else {
             let err = open_err(shard);
             assert!(err.contains("shard 2 of"), "unexpected error: {err}");
@@ -2604,5 +3264,319 @@ mod tests {
         assert_bitwise(&got, &want, "mm_id");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // The xwen-owned tensor table (docs/qwen4exp-port.md D8)
+    // -----------------------------------------------------------------------
+
+    /// `ggml_type_geometry` and `candle_dtype` are hand-transcribed from ggml's
+    /// `type_traits` and candle's `pub(crate)` `GgmlDType::from_u32`, neither of
+    /// which xwen can call. Every id candle DOES name must therefore agree with
+    /// candle on both block size and type size, or a tensor would be sized with
+    /// one table and read with the other — a silent, byte-shifted load rather
+    /// than an error. This is the test that catches a candle bump changing one.
+    #[test]
+    fn ggml_type_ids_agree_with_candle() {
+        let mut named = 0;
+        for id in 0..64u32 {
+            let Some(dtype) = candle_dtype(id) else {
+                continue;
+            };
+            named += 1;
+            let (name, block, size) = ggml_type_geometry(id)
+                .unwrap_or_else(|| panic!("type id {id} ({dtype:?}) is missing from the table"));
+            assert_eq!(block, dtype.block_size(), "{name} (id {id}) block size");
+            assert_eq!(size, dtype.type_size(), "{name} (id {id}) type size");
+        }
+        assert_eq!(named, 15, "every GgmlDType variant is reachable by id");
+
+        // The IQ geometry the raw half exists for, from ggml-common.h's
+        // static_asserts at QK_K = 256 and QK4_NL = 32.
+        for (id, name, block, size) in [
+            (16u32, "IQ2_XXS", 256usize, 66usize),
+            (17, "IQ2_XS", 256, 74),
+            (18, "IQ3_XXS", 256, 98),
+            (19, "IQ1_S", 256, 50),
+            (20, "IQ4_NL", 32, 18),
+            (21, "IQ3_S", 256, 110),
+            (22, "IQ2_S", 256, 82),
+            (23, "IQ4_XS", 256, 136),
+            (29, "IQ1_M", 256, 56),
+        ] {
+            assert_eq!(ggml_type_geometry(id), Some((name, block, size)), "id {id}");
+            assert!(candle_dtype(id).is_none(), "{name} is not a candle dtype");
+        }
+
+        // A slot ggml removed, and one past GGML_TYPE_COUNT: both refused, so a
+        // tensor never disappears from the table without an error.
+        assert_eq!(ggml_type_geometry(5), None, "the removed Q4_3 slot");
+        assert_eq!(ggml_type_geometry(43), None, "past GGML_TYPE_COUNT");
+    }
+
+    /// Appends a GGUF length-prefixed string (v2/v3 widths).
+    fn gguf_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// One tensor-table entry, GGUF order: name, n_dims, dims (fastest-varying
+    /// first), ggml type id, offset into the tensor-data section.
+    fn gguf_tensor_entry(out: &mut Vec<u8>, name: &str, dims: &[u64], type_id: u32, offset: u64) {
+        gguf_str(out, name);
+        out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for d in dims {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        out.extend_from_slice(&type_id.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    /// One Q8_0 block: an f16 scale of 1.0 followed by 32 signed quants, so a
+    /// dequantized element is exactly its quant value.
+    fn q8_0_block(quants: impl Fn(usize) -> i8) -> Vec<u8> {
+        let mut b = half::f16::from_f32(1.0).to_le_bytes().to_vec();
+        b.extend((0..32).map(|i| quants(i) as u8));
+        b
+    }
+
+    /// One IQ4_NL block: an f16 scale, then 16 bytes whose low nibble is
+    /// element `j` and whose high nibble is element `j + 16` (ggml's split-half
+    /// interleave — see `qwen4exp::iq4nl`).
+    fn iq4_nl_block(scale: f32, nibble: impl Fn(usize) -> u8) -> Vec<u8> {
+        let mut b = half::f16::from_f32(scale).to_le_bytes().to_vec();
+        b.extend((0..16).map(|j| (nibble(j) & 0xf) | ((nibble(j + 16) & 0xf) << 4)));
+        b
+    }
+
+    /// A hand-built GGUF holding one Q8_0 tensor and one IQ4_NL tensor, which
+    /// is the shape of every Unsloth Q3/Q4 Flash-Next mix in miniature. candle's
+    /// `Content::read` refuses such a file outright ("unknown dtype for tensor
+    /// 20"), so this is written by hand rather than through candle's writer,
+    /// which cannot emit an IQ type either.
+    ///
+    /// Returns the file's path plus the byte offset of the tensor-data section,
+    /// so the test can pin absolute offsets and not merely self-consistency.
+    fn write_mixed_dtype_gguf(path: &Path) -> u64 {
+        let mut head = Vec::new();
+        head.extend_from_slice(b"GGUF");
+        head.extend_from_slice(&3u32.to_le_bytes()); // version
+        head.extend_from_slice(&2u64.to_le_bytes()); // tensor count
+        head.extend_from_slice(&1u64.to_le_bytes()); // metadata kv count
+        gguf_str(&mut head, "general.architecture");
+        head.extend_from_slice(&8u32.to_le_bytes()); // value type: string
+        gguf_str(&mut head, "qwen4exp");
+        // GGUF dims are fastest-varying first, so {64, 2} is candle's [2, 64].
+        gguf_tensor_entry(&mut head, "known.weight", &[64, 2], 8, 0);
+        // 4 rows of 160 IQ4_NL elements — the PLE table's row width, 5 blocks
+        // (90 bytes) per row. Placed after the Q8_0 tensor's 136 bytes, padded
+        // to the 32-byte tensor alignment.
+        gguf_tensor_entry(&mut head, "per_layer_token_embd.weight", &[160, 4], 20, 160);
+        let data_offset = (head.len() as u64).div_ceil(32) * 32;
+        head.resize(data_offset as usize, 0);
+
+        let mut data = Vec::new();
+        // 2 rows x 64 elements = 4 Q8_0 blocks; element i of the flat tensor
+        // dequantizes to (i % 127) - 63.
+        for blk in 0..4 {
+            data.extend(q8_0_block(|i| ((blk * 32 + i) % 127) as i8 - 63));
+        }
+        assert_eq!(data.len(), 136);
+        data.resize(160, 0); // pad to the declared IQ4_NL offset
+        // 4 rows x 5 blocks; block b of row r has scale (r + 1) and nibble
+        // pattern (j + b) % 16.
+        for r in 0..4u32 {
+            for b in 0..5usize {
+                data.extend(iq4_nl_block((r + 1) as f32, |j| ((j + b) % 16) as u8));
+            }
+        }
+        assert_eq!(data.len(), 160 + 4 * 5 * 18);
+
+        head.extend_from_slice(&data);
+        std::fs::write(path, &head).unwrap();
+        data_offset
+    }
+
+    /// The loader parses a tensor table candle cannot: the Q8_0 tensor lands in
+    /// `content` and loads through candle exactly as before, and the IQ4_NL one
+    /// lands in the raw half with the right dtype, shape, byte length and
+    /// absolute offset — and is reachable as a PLE table.
+    #[test]
+    fn mixed_dtype_gguf_splits_the_tensor_table() {
+        let device = metal_device().unwrap();
+        let path =
+            std::env::temp_dir().join(format!("xwen_mixed_dtype_{}.gguf", std::process::id()));
+        let data_offset = write_mixed_dtype_gguf(&path);
+
+        // The premise: candle's own parser cannot read this file at all.
+        let err = Content::read(&mut File::open(&path).unwrap())
+            .expect_err("candle must refuse the IQ4_NL tensor")
+            .to_string();
+        assert!(err.contains("unknown dtype"), "unexpected error: {err}");
+
+        let gguf = open(&path, &device).unwrap();
+        assert_eq!(gguf.content.tensor_data_offset, data_offset);
+        assert_eq!(gguf.tensor_count(), 2);
+        assert_eq!(
+            gguf.content.tensor_infos.len(),
+            1,
+            "one candle-known tensor"
+        );
+        assert_eq!(
+            gguf.raw_tensor_names(),
+            vec![("per_layer_token_embd.weight", RawDtype::Iq4Nl)]
+        );
+        assert_eq!(gguf.raw_tensor_bytes(), 360);
+        assert!(gguf.has_tensor("per_layer_token_embd.weight"));
+        assert_eq!(
+            gguf.stored_dtype_of("known.weight").unwrap(),
+            StoredDtype::Ggml(GgmlDType::Q8_0)
+        );
+        assert_eq!(
+            gguf.stored_dtype_of("per_layer_token_embd.weight").unwrap(),
+            StoredDtype::Raw(RawDtype::Iq4Nl)
+        );
+
+        // The candle-known tensor still loads through candle, values and all.
+        let w = Weights::from_gguf(gguf.clone());
+        assert!(w.has("known") && w.has("per_layer_token_embd"));
+        let qt = w.qtensor("known").unwrap();
+        assert_eq!(qt.shape().dims(), &[2, 64]);
+        let got = qt
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let want: Vec<f32> = (0..128).map(|i| ((i % 127) - 63) as f32).collect();
+        assert_eq!(
+            got, want,
+            "Q8_0 tensor loads unchanged alongside an IQ type"
+        );
+
+        // ...while `stored_dtype` still answers in candle's vocabulary, and says
+        // so plainly rather than "not found" for the tensor it cannot name.
+        assert_eq!(w.stored_dtype("known").unwrap(), GgmlDType::Q8_0);
+        let err = w
+            .stored_dtype("per_layer_token_embd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IQ4_NL"), "unexpected error: {err}");
+
+        if gguf.mmap_source().is_some() {
+            let raw = gguf.raw_tensor("per_layer_token_embd.weight").unwrap();
+            assert_eq!(raw.dtype, StoredDtype::Raw(RawDtype::Iq4Nl));
+            assert_eq!(raw.shape, vec![4, 160]);
+            assert_eq!(raw.len, 360);
+            assert_eq!(raw.offset as u64, data_offset + 160);
+
+            let table =
+                crate::qwen4exp::ple::PleTable::open(&gguf, "per_layer_token_embd.weight").unwrap();
+            assert_eq!(table.rows(), 4);
+            assert_eq!(table.row_dim(), 160);
+            let mut row = vec![0f32; 160];
+            table.row(3, &mut row).unwrap();
+            // Row 3's blocks carry scale 4.0 and nibble (j + b) % 16, so element
+            // 0 of block 0 is 4 * kvalues[0].
+            assert_eq!(
+                row[0],
+                4.0 * f32::from(crate::qwen4exp::iq4nl::KVALUES_IQ4NL[0])
+            );
+            assert!(row.iter().all(|v| v.is_finite()));
+            assert!(table.row(4, &mut row).is_err(), "row 4 is past the table");
+        }
+
+        let listing = describe_file(&gguf);
+        assert!(
+            listing.contains("per_layer_token_embd.weight") && listing.contains("IQ4_NL"),
+            "the raw half must show up in an inspect listing:\n{listing}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A tensor whose ggml type id ggml itself does not define fails the open
+    /// rather than vanishing from the table — the behaviour candle's parser had
+    /// for every id it did not know, kept for the ids nobody knows.
+    #[test]
+    fn undefined_ggml_type_id_is_an_error() {
+        let path = std::env::temp_dir().join(format!("xwen_bad_type_{}.gguf", std::process::id()));
+        let mut head = Vec::new();
+        head.extend_from_slice(b"GGUF");
+        head.extend_from_slice(&3u32.to_le_bytes());
+        head.extend_from_slice(&1u64.to_le_bytes());
+        head.extend_from_slice(&0u64.to_le_bytes());
+        gguf_tensor_entry(&mut head, "mystery.weight", &[32, 1], 99, 0);
+        head.resize(head.len().div_ceil(32) * 32 + 64, 0);
+        std::fs::write(&path, &head).unwrap();
+
+        let err = open_err(path.clone());
+        assert!(err.contains("ggml type id 99"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The real Unsloth Qwen3.8-Flash-Next split: 1224 tensors across its
+    /// shards, exactly one of which candle cannot name — the 28.8 GB IQ4_NL PLE
+    /// table — and that one reads as a table, at both ends of its 320-million
+    /// rows. Skips when the checkpoint is not in the cache.
+    #[test]
+    fn real_flash_next_iq4_nl_table_opens_and_reads() {
+        let Some(shard) = real_first_shard() else {
+            eprintln!("skipping: no Qwen3.8-Flash-Next shard in the HF cache");
+            return;
+        };
+        let (base, _, count) = split_name_parts(&shard).expect("split-shaped name");
+        let dir = shard.parent().unwrap();
+        if !(2..=count).all(|i| {
+            dir.join(format!("{base}-{i:05}-of-{count:05}.gguf"))
+                .exists()
+        }) {
+            eprintln!("skipping: {} is missing sibling shards", shard.display());
+            return;
+        }
+        let Ok(device) = metal_device() else {
+            eprintln!("skipping: no Metal device, so no file mapping to read rows from");
+            return;
+        };
+
+        let gguf = open(&shard, &device).unwrap();
+        assert_eq!(gguf.tensor_count(), 1224);
+        assert_eq!(
+            gguf.raw_tensor_names(),
+            vec![("per_layer_token_embd.weight", RawDtype::Iq4Nl)],
+            "exactly one tensor candle cannot name"
+        );
+        assert_eq!(gguf.raw_tensor_bytes(), 28_800_138_240);
+
+        let Some(_) = gguf.mmap_sources().first().cloned() else {
+            eprintln!("skipping the row reads: XWEN_LOAD_CLASSIC leaves the file unmapped");
+            return;
+        };
+        let raw = gguf.raw_tensor("per_layer_token_embd.weight").unwrap();
+        assert_eq!(raw.shape, vec![320_001_536, 160]);
+        assert_eq!(raw.len, 28_800_138_240);
+        assert_eq!(
+            raw.shape.iter().product::<usize>(),
+            51_200_245_760,
+            "elements"
+        );
+
+        let table =
+            crate::qwen4exp::ple::PleTable::open(&gguf, "per_layer_token_embd.weight").unwrap();
+        assert_eq!(table.rows(), 320_001_536);
+        assert_eq!(table.row_dim(), 160);
+        let mut row = vec![0f32; 160];
+        for r in [0u64, 320_001_535] {
+            table.row(r, &mut row).unwrap();
+            assert!(
+                row.iter().all(|v| v.is_finite()),
+                "row {r} dequantized to a non-finite value"
+            );
+        }
+        assert!(
+            table.row(320_001_536, &mut row).is_err(),
+            "one past the last row is out of bounds"
+        );
     }
 }

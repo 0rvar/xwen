@@ -1048,7 +1048,7 @@ fn main() -> Result<()> {
             let model = resolve_model(model, select.size())?;
             let device = candle_core::Device::Cpu;
             let gguf = gguf::open(&model, &device)?;
-            print!("{}", gguf::describe(&gguf.content));
+            print!("{}", gguf::describe_file(&gguf));
             let cfg = XwenConfig::from_gguf(&gguf.content)?;
             println!("\nparsed config: {cfg:#?}");
             Ok(())

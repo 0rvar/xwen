@@ -35,7 +35,7 @@ use super::iq4nl;
 use super::ref_hc::grouped_rms_norm;
 use super::ref_ple::{PleHashRef, gate_function_probe};
 use crate::config::XwenConfig;
-use crate::gguf::{GgufFile, MmapSource, QLinear, Weights};
+use crate::gguf::{GgufFile, MmapSource, QLinear, RawDtype, StoredDtype, Weights};
 
 /// The stored dtypes the n-gram table is read at.
 ///
@@ -72,21 +72,28 @@ impl TableDtype {
         }
     }
 
-    /// The dtype candle parsed for a tensor, when candle can name it. IQ4_NL
-    /// never arrives this way — candle's `GgmlDType` has no variant for it, so
-    /// a file containing one cannot be parsed by candle at all and reaches
-    /// [`PleTable::from_source`] from the xwen-owned loader instead
-    /// (docs/qwen4exp-port.md D8 class 1).
-    fn from_ggml(dtype: GgmlDType) -> Result<Self> {
-        Ok(match dtype {
-            GgmlDType::F32 => Self::F32,
-            GgmlDType::F16 => Self::F16,
-            GgmlDType::BF16 => Self::Bf16,
-            GgmlDType::Q8_0 => Self::Q8_0,
-            other => bail!(
-                "the PLE table is stored as {other:?}, which this reader does not dequantize \
+    /// The dtype the loader read out of the GGUF tensor table, mapped onto the
+    /// arms this reader dequantizes.
+    ///
+    /// IQ4_NL arrives as [`StoredDtype::Raw`]: candle's `GgmlDType` has no
+    /// variant for it, so the xwen-owned tensor-table parse is what names it
+    /// (docs/qwen4exp-port.md D8 class 1) and this reader is the only thing
+    /// that can read the bytes.
+    fn from_stored(dtype: StoredDtype) -> Result<Self> {
+        let unsupported = || {
+            anyhow::anyhow!(
+                "the PLE table is stored as {dtype:?}, which this reader does not dequantize \
                  (supported: IQ4_NL, Q8_0, F32, F16, BF16)"
-            ),
+            )
+        };
+        Ok(match dtype {
+            StoredDtype::Raw(RawDtype::Iq4Nl) => Self::Iq4Nl,
+            StoredDtype::Raw(_) => return Err(unsupported()),
+            StoredDtype::Ggml(GgmlDType::F32) => Self::F32,
+            StoredDtype::Ggml(GgmlDType::F16) => Self::F16,
+            StoredDtype::Ggml(GgmlDType::BF16) => Self::Bf16,
+            StoredDtype::Ggml(GgmlDType::Q8_0) => Self::Q8_0,
+            StoredDtype::Ggml(_) => return Err(unsupported()),
         })
     }
 }
@@ -181,7 +188,7 @@ impl PleTable {
         let table = Self::from_source(
             raw.src,
             raw.offset,
-            TableDtype::from_ggml(raw.dtype)?,
+            TableDtype::from_stored(raw.dtype)?,
             row_dim,
             rows as u64,
         )?;
