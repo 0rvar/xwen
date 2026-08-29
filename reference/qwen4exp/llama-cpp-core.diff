@@ -1,5 +1,21 @@
+# qwen4exp llama.cpp core hunks (all C++ outside src/models/qwen4exp.cpp)
+#
+# section 1: commit 6c84c7d5d (squash merge of PR #27742) vs parent 6fdd0ac8907
+#
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index c6df19f2e..8922dc12a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -31,6 +31,7 @@ add_library(llama
+             llama-memory.cpp
+             llama-memory-hybrid.cpp
+             llama-memory-hybrid-iswa.cpp
++            llama-memory-hybrid-idx.cpp
+             llama-memory-recurrent.cpp
+             llama-mmap.cpp
+             llama-model-loader.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index eecf444fcf3..3305f26837b 100644
+index 7a9f2f505..5e61f61f7 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -40,6 +40,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -28,7 +44,7 @@ index eecf444fcf3..3305f26837b 100644
  
      { LLM_KV_HASH_LAYER_COUNT,                       "%s.hash_layer_count"                       },
  
-@@ -500,12 +512,29 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+@@ -506,12 +518,29 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
      { LLM_TENSOR_HC_HEAD_FN,                             "output_hc_fn" },
      { LLM_TENSOR_HC_HEAD_BASE,                           "output_hc_base" },
      { LLM_TENSOR_HC_HEAD_SCALE,                          "output_hc_scale" },
@@ -58,7 +74,7 @@ index eecf444fcf3..3305f26837b 100644
      { LLM_TENSOR_ATTN_COMPRESSOR_WKV,                    "blk.%d.attn_compressor_kv" },
      { LLM_TENSOR_ATTN_COMPRESSOR_WGATE,                  "blk.%d.attn_compressor_gate" },
      { LLM_TENSOR_ATTN_COMPRESSOR_APE,                    "blk.%d.attn_compressor_ape" },
-@@ -704,12 +733,29 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+@@ -717,12 +746,29 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
      {LLM_TENSOR_HC_HEAD_FN,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
      {LLM_TENSOR_HC_HEAD_BASE,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
      {LLM_TENSOR_HC_HEAD_SCALE,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
@@ -88,7 +104,7 @@ index eecf444fcf3..3305f26837b 100644
      {LLM_TENSOR_ATTN_COMPRESSOR_WKV,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
      {LLM_TENSOR_ATTN_COMPRESSOR_WGATE,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
      {LLM_TENSOR_ATTN_COMPRESSOR_APE,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
-@@ -1009,6 +1055,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
+@@ -1029,6 +1075,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
          case LLM_ARCH_KIMI_K3:
          case LLM_ARCH_QWEN35:
          case LLM_ARCH_QWEN35MOE:
@@ -97,7 +113,7 @@ index eecf444fcf3..3305f26837b 100644
          case LLM_ARCH_MINIMAX_01:
              return true;
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index 7159e23bf7a..94cf08ae16e 100644
+index 43de4751e..ca7d55a5f 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
 @@ -45,6 +45,7 @@ enum llm_arch {
@@ -126,7 +142,7 @@ index 7159e23bf7a..94cf08ae16e 100644
  
      LLM_KV_HASH_LAYER_COUNT,
  
-@@ -565,12 +577,29 @@ enum llm_tensor {
+@@ -570,12 +582,29 @@ enum llm_tensor {
      LLM_TENSOR_HC_HEAD_FN,
      LLM_TENSOR_HC_HEAD_BASE,
      LLM_TENSOR_HC_HEAD_SCALE,
@@ -156,170 +172,36 @@ index 7159e23bf7a..94cf08ae16e 100644
      LLM_TENSOR_ATTN_COMPRESSOR_WKV,
      LLM_TENSOR_ATTN_COMPRESSOR_WGATE,
      LLM_TENSOR_ATTN_COMPRESSOR_APE,
-diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 8fca8e1bc0e..31832aa1444 100644
---- a/src/llama-graph.cpp
-+++ b/src/llama-graph.cpp
-@@ -2946,7 +2946,7 @@ ggml_tensor * llm_graph_context::build_attn(
- }
- 
- ggml_tensor * llm_graph_context::build_attn(
--        llm_graph_input_attn_k_dsa * inp,
-+        llm_graph_input_attn_kv * inp,
-         ggml_tensor * wo,
-         ggml_tensor * wo_b,
-         ggml_tensor * wo_s,
-@@ -2959,6 +2959,9 @@ ggml_tensor * llm_graph_context::build_attn(
-         ggml_tensor * top_k,
-             float     kq_scale,
-             int       il) const {
-+    GGML_ASSERT(v_mla == nullptr);
-+    GGML_ASSERT(inp->self_k_rot == nullptr && inp->self_v_rot == nullptr);
-+
-     // these nodes are added to the graph together so that they are not reordered
-     // by doing so, the number of splits in the graph is reduced
-     // expand k later to enable rope fusion which directly writes into k-v cache
-@@ -2966,17 +2969,42 @@ ggml_tensor * llm_graph_context::build_attn(
-     ggml_build_forward_expand(gf, v_cur);
-     ggml_build_forward_expand(gf, k_cur);
- 
--    const auto * mctx_cur = inp->mctx->get_mla();
-+    const auto * mctx_cur = inp->mctx;
- 
-     // store to KV cache
-     {
--        const auto & k_idxs = inp->get_k_idxs_mla();
-+        const auto & k_idxs = inp->get_k_idxs();
-+        const auto & v_idxs = inp->get_v_idxs();
- 
-         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-     }
- 
--    const auto & kq_mask = inp->get_kq_mask_mla();
-+    ggml_tensor * kq_mask = build_attn_mask_top_k(inp->get_kq_mask(), top_k);
-+
-+    ggml_tensor * q = q_cur;
-+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-+
-+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
-+    cb(cur, "kqv_out", il);
-+
-+    if (wo) {
-+        cur = build_lora_mm(wo, cur, wo_s);
-+    }
-+
-+    if (wo_b) {
-+        cur = ggml_add(ctx0, cur, wo_b);
-+    }
-+
-+    return cur;
-+}
- 
-+// Restrict a KQ mask to the positions named by top_k. Lifted verbatim from the DSA
-+// build_attn below so non-MLA sparse architectures can share it; node sequence unchanged.
-+ggml_tensor * llm_graph_context::build_attn_mask_top_k(
-+        ggml_tensor * kq_mask,
-+        ggml_tensor * top_k) const {
-     // prepare new kq mask - starts filled with -INFINITY
-     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
- 
-@@ -3001,7 +3029,42 @@ ggml_tensor * llm_graph_context::build_attn(
-     kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
- 
-     // combine with the original kq mask
--    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-+    return ggml_add(ctx0, kq_mask_top_k, kq_mask);
-+}
-+
-+ggml_tensor * llm_graph_context::build_attn(
-+        llm_graph_input_attn_k_dsa * inp,
-+        ggml_tensor * wo,
-+        ggml_tensor * wo_b,
-+        ggml_tensor * wo_s,
-+        ggml_tensor * q_cur,
-+        ggml_tensor * k_cur,
-+        ggml_tensor * v_cur,
-+        ggml_tensor * kq_b,
-+        ggml_tensor * sinks,
-+        ggml_tensor * v_mla,
-+        ggml_tensor * top_k,
-+            float     kq_scale,
-+            int       il) const {
-+    // these nodes are added to the graph together so that they are not reordered
-+    // by doing so, the number of splits in the graph is reduced
-+    // expand k later to enable rope fusion which directly writes into k-v cache
-+    ggml_build_forward_expand(gf, q_cur);
-+    ggml_build_forward_expand(gf, v_cur);
-+    ggml_build_forward_expand(gf, k_cur);
-+
-+    const auto * mctx_cur = inp->mctx->get_mla();
-+
-+    // store to KV cache
-+    {
-+        const auto & k_idxs = inp->get_k_idxs_mla();
-+
-+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-+    }
-+
-+    const auto & kq_mask = inp->get_kq_mask_mla();
-+
-+    ggml_tensor * kq_mask_top_k = build_attn_mask_top_k(kq_mask, top_k);
- 
-     ggml_tensor * q = q_cur;
-     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-diff --git a/src/llama-graph.h b/src/llama-graph.h
-index b388e028cb5..deb0bd444d3 100644
---- a/src/llama-graph.h
-+++ b/src/llama-graph.h
-@@ -1206,6 +1206,27 @@ struct llm_graph_context {
-                   float   kq_scale,
-                     int   il) const;
- 
-+    // as above, but attending only to positions named by top_k; for sparse attention
-+    // architectures that are plain GQA rather than MLA
-+    ggml_tensor * build_attn(
-+            llm_graph_input_attn_kv * inp,
-+            ggml_tensor * wo,
-+            ggml_tensor * wo_b,
-+            ggml_tensor * wo_s,
-+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
-+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
-+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-+            ggml_tensor * kq_b,
-+            ggml_tensor * sinks, // [n_head_q]
-+            ggml_tensor * v_mla,
-+            ggml_tensor * top_k, // [n_top_k, n_tokens]
-+                  float   kq_scale,
-+                    int   il) const;
-+
-+    ggml_tensor * build_attn_mask_top_k(
-+            ggml_tensor * kq_mask,
-+            ggml_tensor * top_k) const;
-+
-     llm_graph_input_attn_k  * build_attn_inp_k() const;
- 
-     ggml_tensor * build_attn(
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 22c6522f1..fb88919f9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2301,6 +2301,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         model.arch == LLM_ARCH_BAILINGMOE3 ||
+         model.arch == LLM_ARCH_QWEN35 ||
+         model.arch == LLM_ARCH_QWEN35MOE ||
++        model.arch == LLM_ARCH_QWEN4EXP ||
+         model.arch == LLM_ARCH_DEEPSEEK4 ||
+         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
+         model.arch == LLM_ARCH_NANBEIGE ||
 diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
-index cbe31134ff4..14f80436d2b 100644
+index cbe31134f..6a820c61c 100644
 --- a/src/llama-hparams.cpp
 +++ b/src/llama-hparams.cpp
-@@ -201,7 +201,12 @@ uint32_t llama_hparams::n_embd_r() const {
+@@ -201,7 +201,11 @@ uint32_t llama_hparams::n_embd_r() const {
      // TODO: maybe support other convolution strides than 1
      // NOTE: since the first column of the conv_state is shifted out each time, it's not actually needed
      // Corresponds to Mamba's conv_states size
 -    return (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 +    const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 +
-+    // qwen4exp puts a PLE module on a delta-net layer, so the row carries a second
-+    // dilated conv state. Rows are uniform, so every recurrent layer reserves it;
-+    // ple_n_heads is 0 elsewhere, leaving n_conv alone.
-+    return n_conv + ple_conv_state();
++    // PLE conv history needs its own row: Meta splits cache_r_l by head, so a history packed behind the first is unaddressable
++    // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module
++    return n_conv;
  }
  
  uint32_t llama_hparams::n_embd_s() const {
-@@ -236,6 +241,23 @@ bool llama_hparams::is_recr(uint32_t il) const {
+@@ -236,6 +240,23 @@ bool llama_hparams::is_recr(uint32_t il) const {
      GGML_ABORT("%s: il (%u) out of bounds (n_layer_all: %u)\n", __func__, il, n_layer_all);
  }
  
@@ -344,10 +226,17 @@ index cbe31134ff4..14f80436d2b 100644
      return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
  }
 diff --git a/src/llama-hparams.h b/src/llama-hparams.h
-index c3c14292c32..a3e30754b2e 100644
+index 1bad6c093..1411692a8 100644
 --- a/src/llama-hparams.h
 +++ b/src/llama-hparams.h
-@@ -9,6 +9,8 @@
+@@ -3,12 +3,15 @@
+ #include "llama.h"
+ 
+ #include <array>
++#include <bitset>
+ #include <cassert>
+ #include <cmath>
+ 
  // bump if necessary
  #define LLAMA_MAX_LAYERS  512
  #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
@@ -356,7 +245,7 @@ index c3c14292c32..a3e30754b2e 100644
  
  enum llama_expert_gating_func_type {
      LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
-@@ -270,6 +272,28 @@ struct llama_hparams {
+@@ -276,6 +279,30 @@ struct llama_hparams {
      float    dsv4_hc_eps               = 0.0f;
      std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
  
@@ -369,13 +258,15 @@ index c3c14292c32..a3e30754b2e 100644
 +    uint32_t ple_n_heads         = 0;   // (ngram_size - 1) * heads_per_ngram
 +    uint32_t ple_head_dim        = 0;
 +    uint32_t ple_eos_token_id    = 0;
-+    // placeholder the PLE hash sees where an image chunk is spliced in; 0 means the
-+    // file predates this key and the loader falls back to EOS
++    // the id the PLE hash stands in at image positions; 0 makes the loader fall back to EOS
 +    uint32_t ple_image_token_id  = 0;
-+    std::array<uint32_t, LLAMA_MAX_LAYERS> is_ple_impl;
++    // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
++    std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
++    // the hash multipliers reach ~2e13 and have to stay 64-bit
 +    std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>  ple_layer_multipliers;
-+    std::array<uint64_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets;
-+    std::array<uint64_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes;
++    // head offsets and vocab sizes are token-space indices; the gather truncates them to int32 anyway
++    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets;
++    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes;
 +
 +    bool is_ple(uint32_t il) const;
 +
@@ -386,21 +277,707 @@ index c3c14292c32..a3e30754b2e 100644
      // When parsed from GGUF, this implies the first N layers consume the first
      // N deepstack embeddings. Use deepstack_mapping_arr if you need a more
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index ec0f5a75314..0da038f4e5c 100644
+index 383bf8319..8fafcd153 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1787,6 +1787,109 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+@@ -6,6 +6,7 @@
+ #include "llama-context.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+@@ -78,7 +79,8 @@ llama_kv_cache::llama_kv_cache(
+            llama_memory_t   mem_other,
+     const layer_filter_cb & filter,
+     const  layer_reuse_cb & reuse,
+-    const  layer_share_cb & share) :
++    const  layer_share_cb & share,
++             const char *   name_tag) :
+     model(model), hparams(hparams), v_trans(v_trans),
+     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+     other(static_cast<llama_kv_cache *>(mem_other)),
+@@ -232,8 +234,8 @@ llama_kv_cache::llama_kv_cache(
+         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+ 
+-        has_k && ggml_format_name(k, "cache_k_l%d", il);
+-        has_v && ggml_format_name(v, "cache_v_l%d", il);
++        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
++        has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+ 
+         std::vector<ggml_tensor *> k_stream;
+         std::vector<ggml_tensor *> v_stream;
+@@ -1129,7 +1131,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+ 
+             cells.pos_set(idx, ubatch.pos[i]);
+ 
+-            if (ubatch.is_pos_2d() || ubatch.token) {
++            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
+                 llama_kv_cell_ext ext;
+ 
+                 if (ubatch.is_pos_2d()) {
+@@ -1139,6 +1141,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+ 
+                 if (ubatch.token) {
+                     ext.tok = ubatch.token[i];
++                } else if (hparams.ple_n_heads > 0) {
++                    // embd batch (multimodal input) has no token ids, need to pad it with the correct ID for PLE layers
++                    // TODO @ngxson : check if we can do the same as gemma 3n / gemma 4
++                    ext.tok = hparams.ple_image_token_id != 0
++                        ? (llama_token) hparams.ple_image_token_id
++                        : (llama_token) hparams.ple_eos_token_id;
+                 }
+ 
+                 cells.ext_set(idx, ext);
+@@ -1814,7 +1822,8 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+ }
+ 
+ bool llama_kv_cache::has_cell_ext() const {
+-    return hparams.n_pos_per_embd() > 1;
++    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
++    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+ }
+ 
+ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+@@ -1843,6 +1852,8 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
+         seqs.set(ubatch.seq_id_unq[s]);
+     }
+ 
++    const llama_pos w0 = p_min - (llama_pos) n;
++
+     // (seq_id, pos) -> token, for every cell that could be a predecessor of a ubatch token
+     std::unordered_map<uint64_t, llama_token> hist;
+ 
+@@ -1850,28 +1861,71 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
+         return ((uint64_t) seq_id << 32) | (uint32_t) pos;
+     };
+ 
++    // handle M-RoPE gaps: multiple tokens share the same temporal pos
++    // TODO @ngxson : improve this in the future
++    std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
++    below.fill({ -1, LLAMA_TOKEN_NULL });
++
+     for (uint32_t s = 0; s < n_stream; ++s) {
+-        v_cells[s].for_each_token_in(seqs, p_min - (llama_pos) n, p_max,
++        // p_max inclusive: an embd token looks up cells at its own (shared) position
++        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
+             [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
+-                hist[key(seq_id, pos)] = tok;
++                if (pos >= w0) {
++                    hist[key(seq_id, pos)] = tok;
++                } else if (pos > below[seq_id].first) {
++                    below[seq_id] = { pos, tok };
++                }
+             });
+     }
+ 
++    // the token at pos p, or the nearest earlier one when p falls in an M-RoPE gap
++    const auto lookup = [&](llama_seq_id seq_id, llama_pos p) -> llama_token {
++        for (llama_pos q = p; q >= w0; --q) {
++            const auto it = hist.find(key(seq_id, q));
++            if (it != hist.end()) {
++                return it->second;
++            }
++        }
++        return below[seq_id].second;
++    };
++
++    // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
++    // do not encode the token order; resolve its predecessors by ubatch order instead
++    std::vector<uint32_t> ord; // index among the ubatch tokens of the same seq
++    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
++
++    if (!ubatch.token) {
++        ord.resize(n_tokens);
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            auto & v = seq_idx[ubatch.seq_id[i][0]];
++            ord[i] = v.size();
++            v.push_back(i);
++        }
++    }
++
+     for (uint32_t i = 0; i < n_tokens; ++i) {
+         // TODO: a token that belongs to more than one sequence has an ambiguous history.
+         //       the n-gram architectures have to reject such batches
+         const llama_seq_id seq_id = ubatch.seq_id[i][0];
+ 
+         for (uint32_t j = 0; j < n; ++j) {
+-            const llama_pos p = ubatch.pos[i] - (llama_pos) (n - j);
++            const llama_pos d = (llama_pos) (n - j);
++
++            llama_pos p;
++            if (!ubatch.token) {
++                const auto & v = seq_idx[seq_id];
++                const int64_t k = (int64_t) ord[i] - d;
++                // k >= 0: an earlier token of this very ubatch; k < 0: before the chunk
++                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
++            } else {
++                p = ubatch.pos[i] - d;
++            }
++
+             if (p < 0) {
+                 continue;
+             }
+ 
+-            const auto it = hist.find(key(seq_id, p));
+-            if (it != hist.end()) {
+-                res[i*n + j] = it->second;
+-            }
++            res[i*n + j] = lookup(seq_id, p);
+         }
+     }
+ }
+@@ -2108,6 +2162,15 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+ }
+ 
+ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
++    state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
++}
++
++void llama_kv_cache::state_read_sinfo(
++        llama_io_read_i & io,
++           llama_seq_id   seq_id,
++  llama_state_seq_flags   flags,
++      slot_info_vec_t *   sinfos_out,
++const slot_info_vec_t *   sinfos_in) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+@@ -2118,17 +2181,35 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
+     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
+     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+ 
++    if (sinfos_out) {
++        sinfos_out->assign(n_stream, slot_info{});
++    }
++
++    if (sinfos_in && sinfos_in->size() != n_stream) {
++        throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
++    }
++
+     uint32_t n_stream_cur;
+     io.read(&n_stream_cur, sizeof(n_stream_cur));
+     if (n_stream_cur != n_stream) {
+         throw std::runtime_error("n_stream mismatch");
+     }
+ 
++    // a whole-context restore replaces every stream, so the cache is emptied once here
++    // clear() resets all streams at once, so doing it per stream below would keep only the last one
++    if (seq_id == -1) {
++        clear(true);
++    }
++
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         uint32_t cell_count;
+         io.read(&cell_count, sizeof(cell_count));
+ 
+         if (cell_count == 0) {
++            // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
++            if (sinfos_in && !(*sinfos_in)[s].empty()) {
++                throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
++            }
+             continue;
+         }
+ 
+@@ -2137,7 +2218,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
+         slot_info sinfo;
+ 
+         bool res = true;
+-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
++        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+ 
+         try {
+             res = res && state_read_data(io, strm, cell_count, sinfo);
+@@ -2153,6 +2234,10 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
+             }
+             throw std::runtime_error("failed to restore kv cache");
+         }
++
++        if (sinfos_out) {
++            (*sinfos_out)[s] = sinfo;
++        }
      }
  }
  
-+void llama_kv_cache::set_input_qsa(
+@@ -2288,7 +2373,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
+     }
+ }
+ 
+-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
++bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+     auto & cells = v_cells[strm];
+     auto & head  = v_heads[strm];
+ 
+@@ -2338,10 +2423,37 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+             ubatch.seq_id[i]   = &dest_seq_id;
+         }
+ 
+-        sinfo = find_slot(ubatch, false);
+-        if (sinfo.empty()) {
+-            LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
+-            return false;
++        if (sinfo_in) {
++            // this cache mirrors another one, so it takes that cache's layout instead of searching for its own cells
++            if (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count) {
++                LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
++                        sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);
++                return false;
++            }
++
++            sinfo = *sinfo_in;
++
++            // the layout is cell indices, so it means the same in both caches only while their streams line up
++            sinfo.s0 = strm;
++            sinfo.s1 = strm;
++            sinfo.strm[0] = strm;
++
++            // seq_rm above freed exactly the cells this sequence held
++            // anything else in the way is a cache that had already drifted, which this restore must not hide
++            for (uint32_t i = 0; i < cell_count; ++i) {
++                const uint32_t idx = sinfo.idxs[0][i];
++
++                if (idx >= cells.size() || !cells.is_empty(idx)) {
++                    LLAMA_LOG_ERROR("%s: cell %u of the mirrored slot layout is not free\n", __func__, idx);
++                    return false;
++                }
++            }
++        } else {
++            sinfo = find_slot(ubatch, false);
++            if (sinfo.empty()) {
++                LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
++                return false;
++            }
+         }
+ 
+         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
+@@ -2367,7 +2479,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+             return false;
+         }
+ 
+-        clear(true);
++        // the cells go in from 0, so a mirrored cache lands on the same ones as long as it restores the same count. the layout itself carries no more information here
++        if (sinfo_in && (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count)) {
++            LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
++                    sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);
++            return false;
++        }
+ 
+         for (uint32_t i = 0; i < cell_count; ++i) {
+             llama_pos pos;
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 9b225fae3..c4d8699de 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -112,7 +112,9 @@ public:
+                llama_memory_t   mem_other,
+         const layer_filter_cb & filter,
+         const  layer_reuse_cb & reuse,
+-        const  layer_share_cb & share);
++        const  layer_share_cb & share,
++        // a model can hold more than one cache, so the tensor names have to stay unique
++                 const char *   name_tag = "");
+ 
+     ~llama_kv_cache() = default;
+ 
+@@ -166,6 +168,17 @@ public:
+ 
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+ 
++    // state_read, plus the cells the restored tokens were placed in
++    // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
++    //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
++    //   sinfos_in : if set, the layout to use instead of searching. one entry per stream, cell count must match the blob
++    void state_read_sinfo(
++            llama_io_read_i & io,
++               llama_seq_id   seq_id,
++      llama_state_seq_flags   flags,
++          slot_info_vec_t *   sinfos_out,
++    const slot_info_vec_t *   sinfos_in);
++
+     //
+     // graph_build API
+     //
+@@ -223,7 +236,10 @@ public:
+     bool has_cell_ext() const;
+ 
+     // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
+-    // entries with no matching cell are set to LLAMA_TOKEN_NULL
++    // example for M-RoPE image case: tokens A B X X X C, where X is a 3-token image at pos 2 spanning positions 2..4:
++    //   tok: A B X X X C
++    //   pos: 0 1 2 2 2 5
++    //   prev, n=2: A -> [NULL, NULL], B -> [NULL, A], 3rd X -> [X, X], C -> [X, X]
+     // note: used by n-gram input embeddings
+     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+ 
+@@ -326,7 +342,8 @@ private:
+     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
+     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+ 
+-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
++    // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
++    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
+     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+ };
+ 
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+new file mode 100644
+index 000000000..d4e59d77e
+--- /dev/null
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -0,0 +1,465 @@
++#include "llama-memory-hybrid-idx.h"
++
++#include "llama-impl.h"
++#include "llama-batch.h"
++#include "llama-io.h"
++#include "llama-model.h"
++
++#include <algorithm>
++#include <cassert>
++#include <cmath>
++#include <iterator>
++#include <stdexcept>
++
++//
++// llama_memory_hybrid_idx
++//
++
++llama_memory_hybrid_idx::llama_memory_hybrid_idx(
++        const llama_model & model,
++                            /* attn */
++                ggml_type   type_k,
++                ggml_type   type_v,
++                     bool   v_trans,
++                 uint32_t   kv_size,
++                 uint32_t   n_pad,
++                 uint32_t   n_swa,
++           llama_swa_type   swa_type,
++                            /* recurrent */
++                ggml_type   type_r,
++                ggml_type   type_s,
++                 uint32_t   rs_size,
++                            /* common */
++                 uint32_t   n_seq_max,
++                 uint32_t   n_rs_seq,
++                     bool   offload,
++                     bool   unified,
++                            /* layer filters */
++    const layer_filter_cb & filter_attn,
++    const layer_filter_cb & filter_recr,
++    const layer_filter_cb & filter_idx) :
++    llama_memory_hybrid(
++        model,
++        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
++        type_r, type_s, rs_size,
++        n_seq_max, n_rs_seq, offload, unified,
++        filter_attn, filter_recr),
++    hparams_idx(model.hparams),
++    mem_idx(filter_idx == nullptr ? nullptr : [&] {
++        // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
++        std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
++        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
++
++        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
++
++        return new llama_kv_cache(
++            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
++            kv_size, n_seq_max, n_pad, n_swa, swa_type,
++            nullptr, filter_idx, nullptr, nullptr, "idx_");
++    }()) {}
++
++llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
++    // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
++    do {
++        balloc.split_reset();
++
++        // follow the recurrent pattern for creating the ubatch splits
++        std::vector<llama_ubatch> ubatches;
++
++        while (true) {
++            llama_ubatch ubatch;
++
++            if (embd_all) {
++                // if all tokens are output, split by sequence
++                ubatch = balloc.split_seq(n_ubatch);
++            } else {
++                // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
++                const bool unified = (get_mem_attn()->get_n_stream() == 1);
++
++                // [TAG_RECURRENT_ROLLBACK_SPLITS]
++                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
++                //   so that the rollback snapshots remain valid
++                const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
++
++                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
++            }
++
++            if (ubatch.n_tokens == 0) {
++                break;
++            }
++
++            ubatches.push_back(std::move(ubatch)); // NOLINT
++        }
++
++        if (balloc.get_n_used() < balloc.get_n_tokens()) {
++            // failed to find a suitable split
++            break;
++        }
++
++        // prepare the recurrent batches first
++        if (!get_mem_recr()->prepare(ubatches)) {
++            // TODO: will the recurrent cache be in an undefined context at this point?
++            LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
++            return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
++        }
++
++        // prepare the attention cache
++        auto heads_attn = get_mem_attn()->prepare(ubatches);
++        if (heads_attn.empty()) {
++            LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
++            return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
++        }
++
++        // the indexer uses the attention cache's slot layout; a separate one can drift from it
++        llama_kv_cache::slot_info_vec_t heads_idx;
++        if (mem_idx) {
++            heads_idx = heads_attn;
++        }
++
++        return std::make_unique<llama_memory_hybrid_idx_context>(
++                this, std::move(heads_attn), std::move(heads_idx), std::move(ubatches));
++    } while(false);
++
++    return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
++}
++
++llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
++    return std::make_unique<llama_memory_hybrid_idx_context>(this);
++}
++
++llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
++    return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
++}
++
++void llama_memory_hybrid_idx::clear(bool data) {
++    llama_memory_hybrid::clear(data);
++
++    if (mem_idx) {
++        mem_idx->clear(data);
++    }
++}
++
++bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
++    // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
++    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
++        return false;
++    }
++
++    if (mem_idx) {
++        mem_idx->seq_rm(seq_id, p0, p1);
++    }
++
++    return get_mem_attn()->seq_rm(seq_id, p0, p1);
++}
++
++void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
++    llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
++
++    if (mem_idx) {
++        mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
++    }
++}
++
++void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
++    llama_memory_hybrid::seq_keep(seq_id);
++
++    if (mem_idx) {
++        mem_idx->seq_keep(seq_id);
++    }
++}
++
++void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
++    llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
++
++    if (mem_idx) {
++        mem_idx->seq_add(seq_id, p0, p1, shift);
++    }
++}
++
++void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
++    llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
++
++    if (mem_idx) {
++        mem_idx->seq_div(seq_id, p0, p1, d);
++    }
++}
++
++std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
++    std::map<ggml_backend_buffer_type_t, size_t> mb = llama_memory_hybrid::memory_breakdown();
++
++    if (mem_idx) {
++        for (const auto & buft_size : mem_idx->memory_breakdown()) {
++            mb[buft_size.first] += buft_size.second;
++        }
++    }
++
++    return mb;
++}
++
++void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
++    llama_memory_hybrid::state_write(io, seq_id, flags);
++
++    // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
++    // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
++    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
++        if (mem_idx) {
++            mem_idx->state_write(io, seq_id, flags);
++        }
++    }
++
++}
++
++void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
++    // note: repeats llama_memory_hybrid::state_read
++    // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
++
++    // [TAG_HYBRID_IDX_SINFO]
++    // the indexer restore adopts the attention cache's layout instead of searching for cells of its own
++    // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
++    llama_kv_cache::slot_info_vec_t sinfos_attn;
++
++    try {
++        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
++            get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
++        }
++
++        get_mem_recr()->state_read(io, seq_id, flags);
++
++        // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
++        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
++            if (mem_idx) {
++                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
++            }
++        }
++
++    } catch (...) {
++        // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
++        // drop what was being restored from all of them, which is a state they do agree on.
++        state_drop(seq_id);
++
++        throw;
++    }
++}
++
++void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
++    // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
++    if (seq_id < 0) {
++        clear(true);
++
++        return;
++    }
++
++    get_mem_attn()->seq_rm(seq_id, -1, -1);
++    get_mem_recr()->seq_rm(seq_id, -1, -1);
++
++    if (mem_idx) {
++        mem_idx->seq_rm(seq_id, -1, -1);
++    }
++}
++
++llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
++    return mem_idx.get();
++}
++
++//
++// llama_memory_hybrid_idx_context
++//
++
++// streams in each ubatch's slot info, matching get_k/get_v's `ns`
++static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
++    std::vector<uint32_t> res;
++    res.reserve(sinfos.size());
++
++    for (const auto & sinfo : sinfos) {
++        res.push_back(sinfo.s1 - sinfo.s0 + 1);
++    }
++
++    return res;
++}
++
++llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
++    llama_memory_hybrid_context(status) {}
++
++llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
++    llama_memory_hybrid_context(mem),
++    mem(mem),
++    // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
++    // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
++    ns_ubatch(mem->get_mem_idx() == nullptr ?
++        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
++    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
++        new llama_kv_cache_context(mem->get_mem_idx())) {}
++
++llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
++        llama_memory_hybrid_idx * mem,
++                  llama_context * lctx,
++                           bool   optimize) :
++    llama_memory_hybrid_context(mem, lctx, optimize),
++    mem(mem) {}
++
++llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
++        llama_memory_hybrid_idx * mem,
++                slot_info_vec_t   sinfos_attn,
++                slot_info_vec_t   sinfos_idx,
++      std::vector<llama_ubatch>   ubatches) :
++    // note: the base copies the ubatches; ctx_idx gets a copy of its own
++    llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
++    mem(mem),
++    ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
++    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
++        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
++
++bool llama_memory_hybrid_idx_context::next() {
++    if (ctx_idx) {
++        ctx_idx->next();
++    }
++
++    ++i_cur;
++
++    return llama_memory_hybrid_context::next();
++}
++
++bool llama_memory_hybrid_idx_context::apply() {
++    bool res = llama_memory_hybrid_context::apply();
++
++    if (ctx_idx) {
++        res = res & ctx_idx->apply();
++    }
++
++    return res;
++}
++
++const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
++    return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
++}
++
++uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
++    GGML_ASSERT(i_cur < ns_ubatch.size());
++
++    return ns_ubatch[i_cur];
++}
++
++void llama_memory_hybrid_idx_context::set_input_qsa(
 +        ggml_tensor * cell_blk,
 +        ggml_tensor * blk_cells,
 +        ggml_tensor * blk_pos,
 +        ggml_tensor * bias,
 +        const llama_ubatch * ubatch,
-+        uint32_t ratio) const {
++        uint32_t ratio,
++        bool blk_bias) const {
 +    GGML_ASSERT(ratio > 0);
++    GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 +
 +    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
 +
@@ -418,8 +995,8 @@ index ec0f5a75314..0da038f4e5c 100644
 +    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
 +    float   * dst_bias      = (float   *) bias->data;
 +
-+    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio. All three
-+    // mrope sections carry it: exact for text, approximate for images. Positions repeat per stream.
++    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
++    // all mrope sections carry it: exact for text, approximate for images
 +    for (int64_t sec = 0; sec < 4; ++sec) {
 +        for (int64_t s = 0; s < n_ns; ++s) {
 +            for (int64_t b = 0; b < n_blocks; ++b) {
@@ -428,24 +1005,27 @@ index ec0f5a75314..0da038f4e5c 100644
 +        }
 +    }
 +
-+    // One pass per stream: cell j is a different token in each, so no mapping is shared.
-+    // n_ns == 1 is the single-stream behaviour this replaced.
++    // one pass per stream: cell j is a different token in each, so no mapping is shared
 +    std::vector<int32_t> blk_of(n_kv);
 +    std::vector<int32_t> filled(n_blocks);
 +
 +    for (int64_t s = 0; s < n_ns; ++s) {
 +        // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
 +        const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-+        const auto & cells = v_cells[seq_to_stream[seq_of_stream]];
++        const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
 +
 +        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
 +        int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
 +
-+        // an incomplete block cannot be pooled: those tail cells are forced in by the bias
-+        // below, so block 0 only keeps the gather in range. -1 = no usable block.
++        // an incomplete block cannot be pooled; the bias below forces those tail cells in
++        // -1 means no usable block, and block 0 only keeps the gather in range
 +        std::fill(blk_of.begin(),  blk_of.end(),  -1);
 +        std::fill(filled.begin(),  filled.end(),   0);
 +        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
++
++        // a cell no block covers needs its own -inf, which a per-block bias cannot carry
++        // every cache path keeps the position below the cell window, so this stays false
++        bool oor = false;
 +
 +        for (int64_t j = 0; j < n_kv; ++j) {
 +            if (cells.is_empty(j)) {
@@ -456,6 +1036,7 @@ index ec0f5a75314..0da038f4e5c 100644
 +            const int64_t   b = p/r;
 +
 +            if (b >= n_blocks) {
++                oor = true;
 +                continue;
 +            }
 +
@@ -464,8 +1045,12 @@ index ec0f5a75314..0da038f4e5c 100644
 +            filled[b]++;
 +        }
 +
++        GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
++
++        // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
++        // per-cell mode carries that -inf itself and only needs the gather in range
 +        for (int64_t j = 0; j < n_kv; ++j) {
-+            if (blk_of[j] >= 0 && filled[blk_of[j]] < r) {
++            if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
 +                blk_of[j] = -1;
 +            }
 +            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
@@ -476,9 +1061,21 @@ index ec0f5a75314..0da038f4e5c 100644
 +            const llama_seq_id seq_id = ubatch->seq_id[i][0];
 +            const llama_pos    q      = ubatch->pos[i];
 +
-+            // the rest is an incomplete block, always attended to, which is what lands the
-+            // selection on block boundaries like the reference
++            // the tail is an incomplete block and is always visible, as in the reference
 +            const llama_pos tail_start = (q + 1)/r*r;
++
++            if (blk_bias) {
++                // a block sits wholly inside or outside the tail, so one value covers it
++                // the caller adds the attention mask, which drops empty, foreign and future cells
++                float * cur_blk_bias = dst_bias + i*n_blocks;
++
++                for (int64_t b = 0; b < n_blocks; ++b) {
++                    // finite, so it can never meet a -inf and produce a nan
++                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
++                }
++
++                continue;
++            }
 +
 +            float * cur_bias = dst_bias + i*n_kv;
 +
@@ -495,287 +1092,321 @@ index ec0f5a75314..0da038f4e5c 100644
 +        }
 +    }
 +}
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+new file mode 100644
+index 000000000..e3472646d
+--- /dev/null
++++ b/src/llama-memory-hybrid-idx.h
+@@ -0,0 +1,156 @@
++#pragma once
 +
- void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
-     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
- 
-@@ -2585,6 +2688,11 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
-     return n_kv;
- }
- 
-+uint32_t llama_kv_cache_context::get_n_stream() const {
-+    // streams in the current slot info, matching get_k/get_v's `ns`. 1 if unified.
-+    return sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
-+}
++#include "llama-memory-hybrid.h"
 +
- ggml_type llama_kv_cache_context::type_k() const {
-     return kv->type_k();
- }
-@@ -2645,6 +2753,16 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
-     kv->set_input_pos_bucket(dst, ubatch);
- }
- 
-+void llama_kv_cache_context::set_input_qsa(
-+        ggml_tensor * cell_blk,
-+        ggml_tensor * blk_cells,
-+        ggml_tensor * blk_pos,
-+        ggml_tensor * bias,
-+        const llama_ubatch * ubatch,
-+        uint32_t ratio) const {
-+    kv->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio);
-+}
++#include <memory>
++#include <vector>
 +
- void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
-     kv->set_input_k_rot(dst);
- }
-diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 6cb6dbd2f98..29391724ea2 100644
---- a/src/llama-kv-cache.h
-+++ b/src/llama-kv-cache.h
-@@ -216,6 +216,15 @@ class llama_kv_cache : public llama_memory_i {
-     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
- 
-+    // block-compressed sparse attention (qwen4exp QSA) over this cache's cells. Blocks
-+    // cut the *position* line, not the cell array, so nothing assumes contiguous layout:
-+    //   cell_blk  I32 [n_kv]           block each cell belongs to
-+    //   blk_cells I32 [ratio*n_blocks] cells making up each block
-+    //   blk_pos   I32 [4*n_blocks]     mrope position rows of each block's first token
-+    //   bias      F32 [n_kv, n_tokens] -inf where invisible, large where always visible
-+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio) const;
++//
++// llama_memory_hybrid_idx
++//
 +
-     void set_input_k_rot(ggml_tensor * dst) const;
-     void set_input_v_rot(ggml_tensor * dst) const;
- 
-@@ -366,6 +375,9 @@ class llama_kv_cache_context : public llama_memory_context_i {
- 
-     uint32_t get_n_kv() const;
- 
-+    // streams in the current slot info; 1 for a unified cache
-+    uint32_t get_n_stream() const;
++// llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
++// the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 +
-     ggml_type type_k() const;
-     ggml_type type_v() const;
- 
-@@ -398,6 +410,9 @@ class llama_kv_cache_context : public llama_memory_context_i {
-     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
- 
-+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio) const;
-+
-     void set_input_k_rot(ggml_tensor * dst) const;
-     void set_input_v_rot(ggml_tensor * dst) const;
- 
-diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
-index 42c7381a9e6..1e48c30ec41 100644
---- a/src/llama-memory-hybrid.cpp
-+++ b/src/llama-memory-hybrid.cpp
-@@ -29,8 +29,10 @@ llama_memory_hybrid::llama_memory_hybrid(
-                      bool   unified,
-                             /* layer filters */
-     const layer_filter_cb & filter_attn,
--    const layer_filter_cb & filter_recr) :
++class llama_memory_hybrid_idx : public llama_memory_hybrid {
++public:
++    llama_memory_hybrid_idx(
++        const llama_model & model,
++                            /* attn */
++                ggml_type   type_k,
++                ggml_type   type_v,
++                     bool   v_trans,
++                 uint32_t   kv_size,
++                 uint32_t   n_pad,
++                 uint32_t   n_swa,
++           llama_swa_type   swa_type,
++                            /* recurrent */
++                ggml_type   type_r,
++                ggml_type   type_s,
++                 uint32_t   rs_size,
++                            /* common */
++                 uint32_t   n_seq_max,
++                 uint32_t   n_rs_seq,
++                     bool   offload,
++                     bool   unified,
++                            /* layer filters */
++    const layer_filter_cb & filter_attn,
 +    const layer_filter_cb & filter_recr,
-+    const layer_filter_cb & filter_idx) :
-     hparams(model.hparams),
-+    hparams_idx(model.hparams),
-     mem_attn(new llama_kv_cache(
-         model,
-         model.hparams,
-@@ -62,7 +64,19 @@ llama_memory_hybrid::llama_memory_hybrid(
-         filter_recr == nullptr ?
-             [&](int32_t il) { return hparams.is_recr(il); }
-             : filter_recr
--    )) {}
-+    )),
-+    mem_idx(filter_idx == nullptr ? nullptr : [&] {
-+        // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
-+        std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
-+        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
++                            /* the indexer cache exists only if this is given */
++    const layer_filter_cb & filter_idx);
 +
-+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
++    ~llama_memory_hybrid_idx() = default;
 +
-+        return new llama_kv_cache(
-+            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-+            kv_size, n_seq_max, n_pad, n_swa, swa_type,
-+            nullptr, filter_idx, nullptr, nullptr);
-+    }()) {}
- 
- llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-     do {
-@@ -115,8 +129,17 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
-             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
-         }
- 
-+        // The indexer cache is a side buffer addressed by the attention cache's cells, so it
-+        // takes that slot layout rather than finding its own. Allocating separately let the
-+        // two drift once context was rewritten between turns, pointing QSA top-k at the
-+        // wrong cells.
-+        llama_kv_cache::slot_info_vec_t heads_idx;
-+        if (mem_idx) {
-+            heads_idx = heads_attn;
-+        }
++    //
++    // llama_memory_i
++    //
 +
-         return std::make_unique<llama_memory_hybrid_context>(
--                this, std::move(heads_attn), std::move(ubatches));
-+                this, std::move(heads_attn), std::move(heads_idx), std::move(ubatches));
-     } while(false);
- 
-     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
-@@ -137,6 +160,7 @@ bool llama_memory_hybrid::get_can_shift() const {
- 
- void llama_memory_hybrid::clear(bool data) {
-     mem_attn->clear(data);
-+    if (mem_idx) mem_idx->clear(data);
-     mem_recr->clear(data);
- }
- 
-@@ -146,26 +170,31 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
-     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
-         return false;
-     }
-+    if (mem_idx) mem_idx->seq_rm(seq_id, p0, p1);
-     return mem_attn->seq_rm(seq_id, p0, p1);
- }
- 
- void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
-+    if (mem_idx) mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
-     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
- }
- 
- void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
-     mem_attn->seq_keep(seq_id);
-+    if (mem_idx) mem_idx->seq_keep(seq_id);
-     mem_recr->seq_keep(seq_id);
- }
- 
- void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-     mem_attn->seq_add(seq_id, p0, p1, shift);
-+    if (mem_idx) mem_idx->seq_add(seq_id, p0, p1, shift);
-     mem_recr->seq_add(seq_id, p0, p1, shift);
- }
- 
- void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-     mem_attn->seq_div(seq_id, p0, p1, d);
-+    if (mem_idx) mem_idx->seq_div(seq_id, p0, p1, d);
-     mem_recr->seq_div(seq_id, p0, p1, d);
- }
- 
-@@ -205,6 +234,10 @@ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
-     return mem_attn.get();
- }
- 
-+llama_kv_cache * llama_memory_hybrid::get_mem_idx() const {
-+    return mem_idx.get();
-+}
++    llama_memory_context_ptr init_batch(
++            llama_batch_allocr & balloc,
++            uint32_t n_ubatch,
++            bool embd_all) override;
 +
- llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
-     return mem_recr.get();
- }
-@@ -229,11 +262,14 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
- llama_memory_hybrid_context::llama_memory_hybrid_context(
-               llama_memory_hybrid * mem,
-                   slot_info_vec_t   sinfos_attn,
-+                  slot_info_vec_t   sinfos_idx,
-         std::vector<llama_ubatch>   ubatches) :
-     ubatches(std::move(ubatches)),
-     // note: here we copy the ubatches. not sure if this is ideal
-     ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
-     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
-+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-+        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), this->ubatches)),
-     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
- }
- 
-@@ -242,6 +278,7 @@ bool llama_memory_hybrid_context::next() {
- 
-     ctx_attn->next();
-     ctx_recr->next();
-+    if (ctx_idx) ctx_idx->next();
- 
-     if (++i_next >= ubatches.size()) {
-         return false;
-@@ -257,6 +294,7 @@ bool llama_memory_hybrid_context::apply() {
- 
-     res = res & ctx_attn->apply();
-     res = res & ctx_recr->apply();
-+    if (ctx_idx) res = res & ctx_idx->apply();
- 
-     return res;
- }
-@@ -277,3 +315,7 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
- const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
-     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
- }
++    llama_memory_context_ptr init_full() override;
 +
-+const llama_kv_cache_context * llama_memory_hybrid_context::get_idx() const {
-+    return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
-+}
-diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
-index 484eafb7499..5a167fef183 100644
---- a/src/llama-memory-hybrid.h
-+++ b/src/llama-memory-hybrid.h
-@@ -39,7 +39,12 @@ class llama_memory_hybrid : public llama_memory_i {
-                      bool   unified,
-                             /* layer filters */
-     const layer_filter_cb & filter_attn = nullptr,
--    const layer_filter_cb & filter_recr = nullptr);
-+    const layer_filter_cb & filter_recr = nullptr,
-+                            /* optional per-token indexer key cache, for hybrid
-+                               models whose attention layers are sparse. absent
-+                               unless filter_idx is given, so every existing
-+                               architecture is unaffected. */
-+    const layer_filter_cb & filter_idx  = nullptr);
- 
-     ~llama_memory_hybrid() = default;
- 
-@@ -82,12 +87,17 @@ class llama_memory_hybrid : public llama_memory_i {
- 
-     llama_kv_cache * get_mem_attn() const;
-     llama_memory_recurrent * get_mem_recr() const;
-+    llama_kv_cache * get_mem_idx()  const;   // nullptr when the model has no indexer
- 
- private:
-     const llama_hparams & hparams;
- 
-+    // indexer cache geometry: MQA, one key head of indexer_head_size, as in llama_kv_cache_dsa
++    llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
++
++    void clear(bool data) override;
++
++    bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
++    void seq_keep(llama_seq_id seq_id)                                                          override;
++    void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
++    void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
++
++    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
++
++    // state write/load
++
++    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
++    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
++
++    //
++    // llama_memory_hybrid_idx specific API
++    //
++
++    llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
++
++private:
++    // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
++    // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
++    void state_drop(llama_seq_id seq_id);
++
++    // the indexer cache holds one key head per layer, so it needs its own hparams:
++    // llama_kv_cache keeps a reference to what it is given
 +    llama_hparams hparams_idx;
 +
-     const std::unique_ptr<llama_kv_cache> mem_attn;
-     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 +    const std::unique_ptr<llama_kv_cache> mem_idx;
- };
++};
++
++class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
++public:
++    using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
++
++    // used for errors
++    explicit llama_memory_hybrid_idx_context(llama_memory_status status);
++
++    // used to create a full-cache context
++    explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
++
++    // used to create an update context
++    llama_memory_hybrid_idx_context(
++            llama_memory_hybrid_idx * mem,
++                      llama_context * lctx,
++                               bool   optimize);
++
++    // used to create a batch processing context from a batch
++    llama_memory_hybrid_idx_context(
++            llama_memory_hybrid_idx * mem,
++                    slot_info_vec_t   sinfos_attn,
++                    slot_info_vec_t   sinfos_idx,
++          std::vector<llama_ubatch>   ubatches);
++
++    ~llama_memory_hybrid_idx_context() = default;
++
++    //
++    // llama_memory_context_i
++    //
++
++    bool next()  override;
++    bool apply() override;
++
++    //
++    // llama_memory_hybrid_idx_context specific API
++    //
++
++    // nullptr with no indexer, and for the update context, which builds no sparse graph
++    const llama_kv_cache_context * get_idx() const;
++
++    // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
++    uint32_t get_n_stream() const;
++
++    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
++    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
++    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
++    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
++    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
++    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
++    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
++    // the caller then adds the attention mask, the only part of the bias that varies within a block
++    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
++                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
++                       bool blk_bias) const;
++
++private:
++    const llama_memory_hybrid_idx * mem = nullptr;
++
++    // streams per ubatch, read from the slot infos before ctx_idx takes them
++    // declared first, so it is initialised while sinfos_idx is still intact
++    const std::vector<uint32_t> ns_ubatch;
++
++    // null unless the model has an indexer and this is a batch or full context
++    const llama_memory_context_ptr ctx_idx;
++
++    // mirrors the base class's ubatch cursor, which is private there
++    size_t i_cur = 0;
++};
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index e2990972e..57919accf 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -51,7 +51,8 @@ llama_memory_recurrent::llama_memory_recurrent(
+         auto it = ctx_map.find(buft);
+         if (it == ctx_map.end()) {
+             ggml_init_params params = {
+-                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
++                // r and s per layer, plus the separate PLE conv row where the model has one
++                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                 /*.mem_buffer =*/ NULL,
+                 /*.no_alloc   =*/ true,
+             };
+@@ -71,6 +72,7 @@ llama_memory_recurrent::llama_memory_recurrent(
  
- class llama_memory_hybrid_context : public llama_memory_context_i {
-@@ -110,6 +120,7 @@ class llama_memory_hybrid_context : public llama_memory_context_i {
-     llama_memory_hybrid_context(
-               llama_memory_hybrid * mem,
-                   slot_info_vec_t   sinfos_attn,
-+                  slot_info_vec_t   sinfos_idx,
-         std::vector<llama_ubatch>   ubatches);
+     r_l.resize(n_layer);
+     s_l.resize(n_layer);
++    p_l.resize(n_layer);
  
-     ~llama_memory_hybrid_context() = default;
-@@ -126,6 +137,7 @@ class llama_memory_hybrid_context : public llama_memory_context_i {
+     for (int i = 0; i < n_layer; i++) {
+         if (filter && !filter(i)) {
+@@ -103,6 +105,13 @@ llama_memory_recurrent::llama_memory_recurrent(
+         ggml_format_name(s, "cache_s_l%d", i);
+         r_l[i] = r;
+         s_l[i] = s;
++
++        // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
++        if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
++            ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
++            ggml_format_name(p, "cache_ple_r_l%d", i);
++            p_l[i] = p;
++        }
+     }
  
-     const llama_kv_cache_context * get_attn() const;
-     const llama_memory_recurrent_context * get_recr() const;
-+    const llama_kv_cache_context * get_idx()  const;   // nullptr without an indexer
+     // allocate tensors and initialize the buffers to avoid NaNs in the padding
+@@ -119,11 +128,13 @@ llama_memory_recurrent::llama_memory_recurrent(
+     {
+         const size_t memory_size_r = size_r_bytes();
+         const size_t memory_size_s = size_s_bytes();
++        const size_t memory_size_p = size_p_bytes();
+ 
+-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
+-                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
++        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
++                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
+-                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
++                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
++                ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
+     }
+ }
+ 
+@@ -740,6 +751,18 @@ size_t llama_memory_recurrent::size_s_bytes() const {
+     return size_s_bytes;
+ }
+ 
++size_t llama_memory_recurrent::size_p_bytes() const {
++    size_t size_p_bytes = 0;
++
++    for (const auto & p : p_l) {
++        if (p != nullptr) {
++            size_p_bytes += ggml_nbytes(p);
++        }
++    }
++
++    return size_p_bytes;
++}
++
+ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+     GGML_UNUSED(flags);
+ 
+@@ -899,6 +922,17 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
+             const size_t buf_size = range_size * r_size_row;
+             io.write_tensor(r_l[il], range.first * r_size_row, buf_size);
+         }
++
++        // the PLE conv history is a second recurrent row, so it has to travel with the first
++        if (p_l[il] != nullptr) {
++            const uint64_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
++            io.write(&p_size_row, sizeof(p_size_row));
++
++            for (const auto & range : cell_ranges) {
++                const size_t range_size = range.second - range.first;
++                io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
++            }
++        }
+     }
+ 
+     if (!s_trans) {
+@@ -1097,6 +1131,20 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+             // Read and set the keys for the whole cell range
+             io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+         }
++
++        if (p_l[il] != nullptr) {
++            uint64_t p_size_row_ref;
++            io.read(&p_size_row_ref, sizeof(p_size_row_ref));
++            const size_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
++            if (p_size_row != p_size_row_ref) {
++                LLAMA_LOG_ERROR("%s: mismatched ple row size (%zu != %zu, layer %d)\n", __func__, p_size_row, (size_t) p_size_row_ref, il);
++                return false;
++            }
++
++            if (cell_count) {
++                io.read_tensor(p_l[il], head * p_size_row, cell_count * p_size_row);
++            }
++        }
+     }
+ 
+     if (!s_trans) {
+@@ -1251,6 +1299,10 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
+     return mem->s_l[il];
+ }
+ 
++ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
++    return mem->p_l[il];
++}
++
+ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     const uint32_t cell_idx = i + mem->head;
+     const int32_t  src0     = mem->cells[cell_idx].src0;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index b13b7b748..4abb3f5cf 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -111,6 +111,8 @@ public:
+     // per layer
+     std::vector<ggml_tensor *> r_l;
+     std::vector<ggml_tensor *> s_l;
++    // a second conv history that must stay replicated across devices, so it cannot share the r row
++    std::vector<ggml_tensor *> p_l;
  
  private:
-     // the index of the next ubatch to process
-@@ -135,6 +147,7 @@ class llama_memory_hybrid_context : public llama_memory_context_i {
+     //const llama_model & model;
+@@ -125,6 +127,7 @@ private:
  
-     const llama_memory_context_ptr ctx_attn;
-     const llama_memory_context_ptr ctx_recr;
-+    const llama_memory_context_ptr ctx_idx;   // null unless the model has an indexer
+     size_t size_r_bytes() const;
+     size_t size_s_bytes() const;
++    size_t size_p_bytes() const;
  
-     const llama_memory_status status;
- };
+     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
+     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+@@ -170,6 +173,7 @@ public:
+ 
+     ggml_tensor * get_r_l(int32_t il) const;
+     ggml_tensor * get_s_l(int32_t il) const;
++    ggml_tensor * get_p_l(int32_t il) const;
+ 
+     int32_t s_copy(int i) const;
+ 
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 9b22cb05f29..5071556a1f6 100644
+index 36df0e359..d9241022c 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -321,10 +321,11 @@ namespace GGUFMeta {
@@ -815,7 +1446,7 @@ index 9b22cb05f29..5071556a1f6 100644
      template<typename T>
      bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
 diff --git a/src/llama-model-saver.cpp b/src/llama-model-saver.cpp
-index 9adaa93f62e..8860bd3f434 100644
+index 9adaa93f6..8860bd3f4 100644
 --- a/src/llama-model-saver.cpp
 +++ b/src/llama-model-saver.cpp
 @@ -60,6 +60,10 @@ void llama_model_saver::add_kv(const enum llm_kv key, const int32_t value) {
@@ -891,7 +1522,7 @@ index 9adaa93f62e..8860bd3f434 100644
      for (const struct llama_layer & layer : model->layers) {
          for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
 diff --git a/src/llama-model-saver.h b/src/llama-model-saver.h
-index 36a715e2b6b..95e19e666e7 100644
+index 36a715e2b..95e19e666 100644
 --- a/src/llama-model-saver.h
 +++ b/src/llama-model-saver.h
 @@ -21,6 +21,7 @@ struct llama_model_saver {
@@ -903,10 +1534,18 @@ index 36a715e2b6b..95e19e666e7 100644
      void add_kv(enum llm_kv key, bool         value);
      void add_kv(enum llm_kv key, const char * value);
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index c34700ff563..1b058d82bc2 100644
+index 8ab17eb5e..fc83658dd 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -319,6 +319,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+@@ -16,6 +16,7 @@
+ #include "llama-kv-cache-dsv4.h"
+ #include "llama-memory-hybrid.h"
+ #include "llama-memory-hybrid-iswa.h"
++#include "llama-memory-hybrid-idx.h"
+ #include "llama-memory-recurrent.h"
+ 
+ #include "llama.h"
+@@ -319,6 +320,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
              return new llama_model_qwen35(params);
          case LLM_ARCH_QWEN35MOE:
              return new llama_model_qwen35moe(params);
@@ -915,7 +1554,60 @@ index c34700ff563..1b058d82bc2 100644
          case LLM_ARCH_MISTRAL3:
              return new llama_model_mistral3(params);
          case LLM_ARCH_EAGLE3:
-@@ -927,6 +929,7 @@ const char * llm_type_name(llm_type type) {
+@@ -376,6 +379,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
+     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
+     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
++    static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
+     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
+     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
+     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
+@@ -391,6 +395,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
+     static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
+     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
++    static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
+     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
+     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
+@@ -488,6 +493,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+             }
+         }
+ 
++        // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
++        if (std::regex_match(tensor_name, pattern_idx_cache)) {
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++        }
++
++        // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
++        if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
++            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++        }
++
+         // standard attention
+         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+@@ -576,7 +591,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     };
+ 
+     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+-        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
++        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
++                ud->model->arch == LLM_ARCH_QWEN4EXP) {
+             const int64_t head_k_dim = hparams.ssm_d_state;
+             const int64_t head_v_dim = hparams.ssm_d_state;
+             const int64_t n_k_heads  = hparams.ssm_n_group;
+@@ -714,7 +730,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+             if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
+                 GGML_ASSERT(segments.size() == 1);
+                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
+-                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
++                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
++                        ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                     return {std::lcm(2*n_embd_q, blck_size_perf)};
+                 }
+                 return {granularity_q};
+@@ -927,6 +944,7 @@ const char * llm_type_name(llm_type type) {
          case LLM_TYPE_35B_A3B:       return "35B.A3B";
          case LLM_TYPE_48B_A3B:       return "48B.A3B";
          case LLM_TYPE_80B_A3B:       return "80B.A3B";
@@ -923,17 +1615,18 @@ index c34700ff563..1b058d82bc2 100644
          case LLM_TYPE_100B_A6B:      return "100B.A6B";
          case LLM_TYPE_102B_A12B:     return "102B.A12B";
          case LLM_TYPE_106B_A12B:     return "106B.A12B";
-@@ -2431,6 +2434,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2431,6 +2449,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      // layer filters, so pick the right one here
                      llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                      llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-+                    // null for every architecture but the sparse-attention ones, which is what keeps
-+                    // the indexer cache from existing
++                    // only the sparse-attention architectures use llama_memory_hybrid_idx
++                    // a null filter_idx means the GGUF has no indexer tensors
 +                    llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
++                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                      if (arch == LLM_ARCH_FALCON_H1) {
                          filter_attn = [&](uint32_t) { return true; };
                          filter_recr = [&](uint32_t) { return true; };
-@@ -2441,13 +2447,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2441,13 +2463,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                          filter_recr = [&](uint32_t il) {
                              return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                          };
@@ -955,17 +1648,35 @@ index c34700ff563..1b058d82bc2 100644
                      }
  
                      if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-@@ -2488,7 +2501,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                             /* offload           */ cparams.offload_kqv,
+@@ -2470,6 +2499,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
--                            /* filter_recr       */ std::move(filter_recr));
+                             /* filter_recr       */ std::move(filter_recr));
++                    } else if (needs_mem_idx) {
++                        // sparse attention over a per-token indexer cache, in its own memory type
++                        res = new llama_memory_hybrid_idx(
++                            /* model             */ *this,
++                            /* attn_type_k       */ params.type_k,
++                            /* attn_type_v       */ params.type_v,
++                            /* attn_v_trans      */ !cparams.flash_attn,
++                            /* attn_kv_size      */ cparams.n_ctx_seq,
++                            /* attn_n_pad        */ 1,
++                            /* attn_n_swa        */ hparams.n_swa,
++                            /* attn_swa_type     */ hparams.swa_type,
++                            /* recurrent_type_k  */ GGML_TYPE_F32,
++                            /* recurrent_type_v  */ GGML_TYPE_F32,
++                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
++                            /* n_seq_max         */ cparams.n_seq_max,
++                            /* n_rs_seq          */ cparams.n_rs_seq,
++                            /* offload           */ cparams.offload_kqv,
++                            /* unified           */ cparams.kv_unified,
++                            /* filter_attn       */ std::move(filter_attn),
 +                            /* filter_recr       */ std::move(filter_recr),
 +                            /* filter_idx        */ std::move(filter_idx));
-                     }
-                 } else {
-                     llama_kv_cache::layer_filter_cb filter = nullptr;
-@@ -2891,6 +2905,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+                     } else {
+                         res = new llama_memory_hybrid(
+                             /* model             */ *this,
+@@ -2900,6 +2950,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
          case LLM_ARCH_QWEN3VLMOE:
          case LLM_ARCH_QWEN35:
          case LLM_ARCH_QWEN35MOE:
@@ -974,7 +1685,7 @@ index c34700ff563..1b058d82bc2 100644
              return LLAMA_ROPE_TYPE_IMROPE;
  
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 44bd9675754..a2c25c63813 100644
+index b85fb23cd..0d7352ac5 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -129,6 +129,7 @@ enum llm_type {
@@ -985,7 +1696,7 @@ index 44bd9675754..a2c25c63813 100644
      LLM_TYPE_100B_A6B,
      LLM_TYPE_102B_A12B, // Solar-Open
      LLM_TYPE_106B_A12B, // GLM-4.5-Air
-@@ -555,6 +556,22 @@ struct llama_layer {
+@@ -560,6 +561,22 @@ struct llama_layer {
      struct ggml_tensor * index_q_norm = nullptr;
      struct ggml_tensor * index_k_norm = nullptr;
  
@@ -1008,7 +1719,7 @@ index 44bd9675754..a2c25c63813 100644
      // gemma4 layer output scale, reused for talkie embedding skip scale
      struct ggml_tensor * out_scale = nullptr;
  
-@@ -635,6 +652,10 @@ struct llama_model {
+@@ -640,6 +657,10 @@ struct llama_model {
      struct ggml_tensor * altup_proj           = nullptr;
      struct ggml_tensor * altup_unembd_proj    = nullptr;
      struct ggml_tensor * per_layer_tok_embd   = nullptr;
@@ -1020,34 +1731,29 @@ index 44bd9675754..a2c25c63813 100644
      struct ggml_tensor * per_layer_proj_norm  = nullptr;
  
 diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
-index 20252815d5c..a9611bdaf2e 100644
+index 49e1dd0c7..c414caa17 100644
 --- a/src/llama-quant.cpp
 +++ b/src/llama-quant.cpp
-@@ -401,6 +401,15 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
+@@ -399,6 +399,12 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
              case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
              case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
              default:
 +                if (qk_k <= 32) {
 +                    // the target is already a 32-block type, so there is no smaller block to demote to
-+                    // and the shape is simply not representable; the check below turns it into F16, the
-+                    // same answer 256-block types reach when their fallback does not fit. Getting here
-+                    // means ncols is not a multiple of 32, e.g. a conv kernel a recipe forgot to pin;
-+                    // throwing gave no tensor name or message, making a recipe gap look like corruption.
++                    // the check below turns it into F16, as a 256-block type does when its fallback does not fit
 +                    return_type = target_type;
 +                    break;
 +                }
                  throw std::runtime_error(format("no tensor type fallback is defined for type %s",
                                                  ggml_type_name(target_type)));
          }
-@@ -681,7 +690,23 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
+@@ -679,7 +685,21 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
          return tensor->type;
      }
      if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
 -        return params->token_embedding_type;
-+        // per_layer_token_embd shares this category with token_embd.weight and follows
-+        // --token-embedding-type by default. But it is a separate table and far from a
-+        // rounding error: qwen4exp's is ~46% of a 4-bit file. Let an explicit --tensor-type
-+        // name it; nothing changes unless such a pattern is passed.
++        // per_layer_token_embd follows --token-embedding-type by default, but it is a large
++        // separate table, so let an explicit --tensor-type name it
 +        bool named = false;
 +        if (std::strcmp(tensor->name, "per_layer_token_embd.weight") == 0) {
 +            const std::string tensor_name(tensor->name);
@@ -1064,51 +1770,29 @@ index 20252815d5c..a9611bdaf2e 100644
      }
      if (params->output_tensor_type < GGML_TYPE_COUNT && tm.category == tensor_category::OUTPUT) {
          return params->output_tensor_type;
-@@ -1241,8 +1266,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
-                 LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
-                 fflush(stdout);
- 
--                if (work.size() < (size_t)nelements * 4) {
--                    work.resize(nelements * 4); // upper bound on size
-+                // Exact output size: ggml_row_size(new_type, ne0) per row, ne1 rows, ne2 slices --
-+                // what the loop writes, what new_size sums to, and what the GGUF metadata is
-+                // asserted against. The previous `nelements * 4` was a loose upper bound, invisible
-+                // on a normal model but 205 GB of dead address space on Qwen3.8-Flash-Next's 51.2 G
-+                // element PLE table -- about half of what OOMed a 2 TB machine at five-wide.
-+                const size_t out_size =
-+                    ggml_row_size(new_type, tensor->ne[0]) * tensor->ne[1] * tensor->ne[2];
-+                if (work.size() < out_size) {
-+                    work.resize(out_size);
-                 }
-                 new_data = work.data();
- 
 diff --git a/src/models/models.h b/src/models/models.h
-index 969429e3b6f..b952790e8c0 100644
+index 969429e3b..af60764c2 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
-@@ -6,6 +6,7 @@
+@@ -6,6 +6,9 @@
  
  // note: almost all graphs require at least sqrtf, so include cmath globally
  #include <cmath>
 +#include <map>
++
++class llama_memory_hybrid_idx_context;
  
  //
  // base classes
-@@ -2272,6 +2273,100 @@ struct llama_model_qwen35 : public llama_model_base {
+@@ -2272,6 +2275,108 @@ struct llama_model_qwen35 : public llama_model_base {
  };
  
  
 +struct llama_model_qwen4exp : public llama_model_base {
 +    llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 +
-+    // PLE predecessors are absent from a decode ubatch, so remember them here
-+    // (vLLM's ngram_context). next_pos guards it: a mismatch means the sequence
-+    // was reset or rewound, and the hash falls back to EOS padding.
-+    struct ple_history {
-+        llama_pos                next_pos = -1;
-+        std::vector<llama_token> toks;
-+    };
-+    mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
++    class llm_graph_input_qsa;
++
 +    void load_arch_hparams(llama_model_loader & ml) override;
 +    void load_arch_tensors(llama_model_loader & ml) override;
 +
@@ -1132,18 +1816,33 @@ index 969429e3b6f..b952790e8c0 100644
 +                            int   il);
 +
 +        ggml_tensor * build_layer_attn(
-+        llm_graph_input_attn_kv * inp_attn,
-+  const llama_kv_cache_context * mctx_idx,
++              llm_graph_input_attn_kv * inp_attn,
++  const llama_memory_hybrid_idx_context * mctx_hyb,
 +                    ggml_tensor * cur,
 +                    ggml_tensor * inp_pos,
 +                            int * sections,
 +                            int   il);
 +
++        // dense self-attention restricted to the cells that top_k names
++        ggml_tensor * build_attn_qsa(
++        llm_graph_input_attn_kv * inp,
++                    ggml_tensor * q_cur,
++                    ggml_tensor * k_cur,
++                    ggml_tensor * v_cur,
++                    ggml_tensor * top_k,
++                          float   kq_scale,
++                            int   il);
++
++        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
++        // so the layers sharing a ratio share one input set
++        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
++
 +        // QSA: token indices this layer's queries may attend to, or nullptr for dense
 +        ggml_tensor * build_qsa_top_k(
-+  const llama_kv_cache_context * mctx_idx,
++  const llama_memory_hybrid_idx_context * mctx_hyb,
 +                    ggml_tensor * cur,
 +                    ggml_tensor * inp_pos,
++                    ggml_tensor * kq_mask,
 +                            int * sections,
 +                            int   il);
 +
@@ -1162,22 +1861,21 @@ index 969429e3b6f..b952790e8c0 100644
 +                    ggml_tensor * gate,
 +                            int   layer);
 +
-+        // build_rs writes the state tensor in place, so run it at most once per
-+        // layer; both convolutions share this gather.
-+        std::map<int, ggml_tensor *> rs_rows;
++        // build_rs writes the state tensor in place, so one gather per cache tensor is reused
++        std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 +
-+        // conv history at an explicit offset: delta-net and PLE share the row
++        // one conv history per cache tensor: delta-net and PLE each have their own
 +        ggml_tensor * build_conv_state_at(
 +             llm_graph_input_rs * inp,
 +                    ggml_tensor * conv_states_all,
 +                    ggml_tensor * x,
 +                        int64_t   state_cols,
 +                        int64_t   channels,
-+                        int64_t   row_offset,
 +                            int   il);
 +
 +        ggml_tensor * build_ple(
 +             llm_graph_input_rs * inp,
++  const llama_memory_hybrid_idx_context * mctx_hyb,
 +                    ggml_tensor * hidden,
 +                            int   il);
 +
@@ -1196,7 +1894,7 @@ index 969429e3b6f..b952790e8c0 100644
      llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}
      void load_arch_hparams(llama_model_loader & ml) override;
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index b8fd66ccae5..8263c79581a 100644
+index b8fd66cca..d58d90952 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -249,8 +249,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
@@ -1235,3 +1933,34 @@ index b8fd66ccae5..8263c79581a 100644
          case LLM_ARCH_PHIMOE:
          case LLM_ARCH_DBRX:
          case LLM_ARCH_OLMOE:
+@@ -507,7 +517,7 @@ static bool arch_supported(const llm_arch arch) {
+     }
+     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
+ #ifdef GGML_USE_WEBGPU
+-    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_DOTS3NOTE) {
++    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_QWEN4EXP) {
+         return false;
+     }
+ #endif // GGML_USE_WEBGPU
+
+# section 2: follow-up commit 6fe74980162af0ed5e559870d5deccafaa034e7c
+#   'model: qwen4exp: reduce number of graph splits (#27880)' vs its parent b387ddfd84
+#
+diff --git a/src/models/models.h b/src/models/models.h
+index af60764c2..9b87a40d5 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2360,9 +2360,12 @@ struct llama_model_qwen4exp : public llama_model_base {
+                         int64_t   channels,
+                             int   il);
+ 
++        ggml_tensor * build_inp_ple(
++  const llama_memory_hybrid_idx_context * mctx_hyb);
++
+         ggml_tensor * build_ple(
+              llm_graph_input_rs * inp,
+-  const llama_memory_hybrid_idx_context * mctx_hyb,
++                    ggml_tensor * emb,
+                     ggml_tensor * hidden,
+                             int   il);
+ 

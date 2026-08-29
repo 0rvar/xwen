@@ -73,8 +73,9 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
     into ggml-org/llama.cpp master 2026-08-27T19:32Z as squash `6c84c7d5d` (PR
     head `eaf9376557`, 65 commits); follow-up `6fe749801` "model: qwen4exp:
     reduce number of graph splits (#27880)" landed 08-28; master was
-    `17252c769` at survey time. Our vendored `bea3b12d` is being re-vendored at
-    `6fe749801` (separate unit, in progress). The other half — Qwen's
+    `17252c769` at survey time. Our `bea3b12d` snapshot HAS been re-vendored at
+    `6fe749801` (done 2026-08-29; the full semantic diff of that move is
+    reference/qwen4exp/UPSTREAM-DIFF-2026-08-29.md). The other half — Qwen's
     independent numeric check — was NEVER posted; what we have is the PR body's
     own numerics: wikitext-2 ppl 4.0068±0.0227 vs 4.0126 reference, top-1
     agreement 98.0%, QSA bit-identical to dense below the 2048 budget on
@@ -86,7 +87,13 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
     tensors, and it is blind to the GDN fused-QKV segmentation convention
     (three plausible segmentations, one correct). Fixes that landed in-thread
     before merge: Hadamard rotation for quantized KV in QSA (q8_0 KV then
-    matches f16), a raised `graph_max_nodes` budget, a multi-slot
+    matches f16 — the `bea3b12d` snapshot's `build_attn` hard-asserted
+    `self_k_rot == nullptr && self_v_rot == nullptr`, i.e. QSA REFUSED rotated
+    KV; the merged arch-local `build_attn_qsa` instead rotates q/k by
+    `self_k_rot` and v by `self_v_rot` AFTER the indexer has scored, and
+    un-rotates the output. Both rot tensors are null on an f32/f16 run, so the
+    numerical effect there is none; this matters to us only if we ever quantize
+    the QSA KV cache), a raised `graph_max_nodes` budget, a multi-slot
     indexer/attention desync via the server prompt cache, and "bias the QSA
     selection per block, not per cell". PLE is implemented Gemma-3n-style as
     one host-side get_rows gather table, CPU-resident on CUDA automatically,
@@ -336,7 +343,10 @@ load) and the imatrix file.
 
 ## Conversion-baked deltas (audit of the vendored PR converter, 2026-08-26)
 
-reference/qwen4exp/ vendors PR #27742 at the sha in PROVENANCE.md: `qwen4exp.cpp`
+reference/qwen4exp/ vendors qwen4exp support at the sha in PROVENANCE.md
+(`6fe749801` since 2026-08-29; this audit was written against the pre-merge
+`bea3b12d` snapshot and re-checked against the new pin — see the zero-change
+bullet at the end of this section): `qwen4exp.cpp`
 (graph), `qwen4exp.py` (converter), `conversion-qwen-base.py` (the inherited
 Qwen3Next rules the converter subclasses — the +1/-exp/V-reorder logic lives
 there, NOT in the qwen4exp file), plus the gguf-py and core-C++ diffs.
@@ -366,6 +376,25 @@ there, NOT in the qwen4exp file), plus the gguf-py and core-C++ diffs.
 - `attention.compress_ratios` is synthesized per layer from the raw
   `layer_types` strings; `general.sampling.*` comes from generic
   generation_config heuristics.
+- **Re-checked at the `6fe749801` pin (2026-08-29): the converter and GGUF
+  surface changed by ZERO between `bea3b12d` and the new pin.** Not one key
+  literal, tensor name, `MODEL_TENSORS` entry, hparam read or tensor-math line
+  differs, so everything above stands as audited. The only two deltas are a
+  Python class rename (`class PLE:` → `class PerLayerEmbedding:`; every
+  `{arch}.ple.*` key string identical) and a memory-strategy swap in PLE table
+  assembly (`np.memmap` scratch file → a `gguf.LazyChunkedTensor` of per-shard
+  load closures, quantized and written one row-chunk at a time — same row
+  order, same dtype, same bytes, bounded RSS). Two converter behaviour changes
+  that don't alter what a well-formed checkpoint writes: `_image_token_id()`
+  lost its config.json fallback (a self-converted text-only file will likely
+  carry no `ple.image_token_id` and silently fall back to EOS — harmless for
+  us, worth reporting upstream), and `_eos_token_id()` now raises instead of
+  crashing on a missing id. The `ple_conv1d`-is-unpinned bullet above was
+  re-verified: still off the quantize skip list, F16 fallback branch still
+  there. One gap: the vendored `gguf-py.diff` predates `b19cbe925` "convert:
+  prevent ndarray conversion in LazyChunkedTensor" (#27869), a real corruption
+  fix that landed after the merge. Full reading:
+  reference/qwen4exp/UPSTREAM-DIFF-2026-08-29.md.
 
 ### Known llama.cpp-impl divergences (PR quirks, not ground truth — expect them
 in oracle diffs, do not copy blindly)
@@ -381,6 +410,19 @@ in oracle diffs, do not copy blindly)
 2. **Partially-filled non-tail blocks are hard-masked** (-inf) rather than
    pooled over what exists — invisible on a contiguous cache, bites after
    rewind/defrag. Our rollback machinery must not inherit this silently.
+   Mechanism as of the `6fe749801` pin: there are now TWO bias paths. The
+   original per-cell one is byte-identical; the new `blk_bias` one (chosen when
+   the kq_mask shape matches and the run is plain causal, no alibi) uploads
+   `n_blocks` floats per query, adds them to the score BEFORE the block→cell
+   expansion, and lets the ordinary `kq_mask` mask the empty / foreign-sequence
+   / future cells the host bias used to. Checked equivalent, not assumed:
+   `tail_start` is a multiple of the ratio so a block sits wholly in or out of
+   the tail; partial blocks deliberately keep their block id in `blk_bias` mode
+   so their −INF still reaches their cells through the expansion; a per-block
+   constant added before or after a `get_rows` expansion is the same number.
+   `width = min(n_kv, indexer_top_k + r - 1)` and `tail_start` are unchanged, so
+   **the divergence from HF stands** — but our rollback/defrag concern now has
+   two upstream code paths to compare against.
 3. ~~PLE gate clamp~~ RETRACTED 2026-08-26: HF DOES clamp `|s| ≥ 1e-6` inside
    the signed sqrt (modular line 770, pinned by the fixture gate probe). No
    divergence; implement the clamp.
@@ -389,12 +431,32 @@ in oracle diffs, do not copy blindly)
    math has no clamp. Practically a no-op (top-10 softmax sums are far larger);
    recorded so a future parity diff isn't a mystery.
 
+**Watch item (2026-08-29) — the UNMERGED `tmp-q4` branch converges on HF.**
+`origin/tmp-q4`, head `f91123d2d` (2026-08-28, ~1450 lines, not on master and
+not vendored) replaces the QSA input signature wholesale and reworks selection
+into: pack VISIBLE tokens into whole blocks in TOKEN order (a hole in the cache
+shifts the packing instead of voiding a block), tail = the packing remainder
+(`visible.size() % ratio`) rather than the positional remainder, budget
+expressed in whole blocks (`block_topk`) with a collapse to fully dense when
+`n_complete <= block_topk`, and pooled keys roped at the first member token's
+REAL M-RoPE position rather than the synthetic `b*r` the merged code broadcasts
+to all sections. That is the HF semantics our fixtures already pin — divergence
+#1 would go away and #2's mechanism would change again. **P1's target is
+unchanged: the fixtures, not the oracle.** If `tmp-q4` merges, re-vendor and
+re-read every QSA entry in this section. (Details in
+reference/qwen4exp/UPSTREAM-DIFF-2026-08-29.md finding 3.)
+
 ## Traps checklist (all silent-failure class — each becomes a pinned test)
 
 1. GDN z-gate `sigmoid`, not `silu`.
 2. PLE eos = 248044 (not 248046) for segmenting; shift never crosses it.
 3. PLE hash over raw ids; multipliers/primes/offsets read from metadata.
-4. `ple_layer_ids` one-indexed.
+   (Footnote, `6fe749801`: upstream now reads head offsets and vocab sizes as
+   `uint64` and narrows them with an `INT32_MAX` range check on offset, size
+   AND their sum; multipliers stay 64-bit. Our u64 accessors already match.)
+4. `ple_layer_ids` one-indexed. (Footnote, `6fe749801`: upstream now
+   hard-asserts `n_ple == 1` and turns an out-of-range layer id, n-gram size or
+   head count into a `runtime_error` rather than an assert.)
 5. `layer_types` "full_attention" means QSA (config-class rewrite).
 6. Hyper-connection write-back onto the un-normed stream; `/4` inside both
    sigmoid args; `2·sigmoid` on inject; mean (not sum) over streams on read.
@@ -405,7 +467,10 @@ in oracle diffs, do not copy blindly)
    on indexer q at own position, 64 of 128 dims. Precision (fixture-pinned):
    when `visible mod ratio == 0` there IS no tail — the query's own complete
    block competes in top-k and can lose, masking the query's own token. Whole
-   blocks + tail, never a fixed token count (see divergence #1).
+   blocks + tail, never a fixed token count (see divergence #1). (Footnote,
+   `6fe749801`: upstream still omits the `1/√128` divisor this formula carries.
+   It is monotone, so top-k selection is unaffected — but a numeric tap
+   comparison against the oracle differs by exactly that factor.)
 10. Residual stream seeded by repeat×4 of the embedding; final mixer before
     lm_head (no output_norm tensor).
 11. `general.name` has spaces; don't let "Qwen3.8" substring-collide with
@@ -415,6 +480,16 @@ in oracle diffs, do not copy blindly)
 12. candle's sdpa vector kernel (q_seq==1) is compiled WITHOUT mask support and
     silently ignores a passed mask — a masked QSA decode through stock sdpa
     runs dense attention with no error. See D11.
+13. **PLE projection widths**: merged upstream bakes
+    `ple_head_dim * ple_n_heads == n_embd` into the `ple_key` / `ple_value`
+    shapes. That holds by coincidence for the shipped file (16 × 160 = 2560),
+    and the unmerged `tmp-q4` sizes both from a derived `ple_dim` instead. Size
+    these projections from `ple_dim`, NEVER from `n_embd`.
+14. **`head_v_dim == head_k_dim` is now ASSERTED upstream for GDN** (both
+    `ssm_d_state` = 128, where the old code derived `head_v_dim = d_inner /
+    num_v_heads`). Same value for every checkpoint we ship, so no math changes —
+    but don't generalize the assert into an assumption that the two dims are
+    the same thing.
 
 ## Reuse-seams map (audited 2026-08-26; file:line refs from that audit)
 
@@ -526,10 +601,18 @@ the session that ran P0)
   at ~3B active (~1.7 GB/token → ~3.4 GB/token), lands around ~50 tok/s
   decode. Memory: ~70-75 GB wired trunk + ~29 GB file-backed table on 128 GB.
   One-process-at-a-time becomes absolute.
-- **State-allocation note**: llama.cpp's PR adds `ple_conv_state()` into
+- **State-allocation note** — ~~llama.cpp's PR adds `ple_conv_state()` into
   `n_embd_r()` for EVERY recurrent layer — 36 layers × 9 × 10240 floats of
-  dead state on this checkpoint (only layer 1 has PLE). We allocate PLE state
-  per-layer, only where a PLE layer exists.
+  dead state on this checkpoint (only layer 1 has PLE).~~ **CORRECTED
+  2026-08-29** against the `6fe749801` pin: upstream no longer does this.
+  `n_embd_r()` dropped `ple_conv_state()` and `llama_memory_recurrent` grew a
+  third tensor vector `p_l`, allocated only where `is_ple(i)` (named
+  `cache_ple_r_l%d`, with its own `size_p_bytes()`, its own state read/write
+  rows and its own `pattern_ple_r_cache`); `build_ple` reads
+  `inp->mctx->get_p_l(il)` instead of slicing an offset out of `get_r_l(il)`.
+  Output-identical upstream. Our plan stands unchanged — PLE state per-layer,
+  only where a PLE layer exists — it is now a convergence with upstream rather
+  than a divergence from it.
 - **Card sampling details beyond the doc's main bullet**: min_p 0.0 and
   repetition_penalty 1.0 in both modes; recommended output budgets 262144
   reasoning / 131072 final. (Mode-keyed temp/top_p/top_k match 3.6/3.8
@@ -582,8 +665,9 @@ multi-steps".
   transformers modular file, GGUF metadata — see TODO.md entry for the research
   trail). Doc created; P0 begun: split-GGUF loader, reuse-seams map, PR-file
   vendoring dispatched.
-- **2026-08-26**: reference/qwen4exp/ vendored (PR #27742 @ pinned sha, see
-  PROVENANCE.md); converter audited — conversion-baked deltas and four PR
+- **2026-08-26**: reference/qwen4exp/ vendored (PR #27742 @ `bea3b12d`;
+  re-pinned to `6fe749801` on 2026-08-29 — see PROVENANCE.md); converter
+  audited — conversion-baked deltas and four PR
   quirks recorded above. Doc corrected: sampling key is `general.sampling.temp`,
   no presence-penalty key exists in converted GGUFs, PR is open-not-draft.
 - **2026-08-26**: Reuse-seams audit complete — blocks compose unchanged,
@@ -625,4 +709,13 @@ multi-steps".
   re-vendored at `6fe749801` as a second, buildable oracle clone while
   `reference/llama.cpp` stays frozen at e9fa0781 for 3.6/3.8. Qwen's promised
   independent numeric check never appeared; the PR body's own numbers stand in.
-  Next: finish re-vendor + download, then P1.
+  Re-vendor DONE the same day: reference/qwen4exp/ now pinned at `6fe749801`
+  (merged PR `6c84c7d5d`, pre-PR base `6fdd0ac8`), with the full semantic diff
+  of the move kept at reference/qwen4exp/UPSTREAM-DIFF-2026-08-29.md. What it
+  moved in this doc: divergence #2 rebuilt around the new `blk_bias` path
+  (numerically equivalent, divergence stands), the P0-pause state-allocation
+  note corrected (upstream now gives PLE conv state its own `p_l` row), the
+  Hadamard-refusal assumption corrected in D4, footnotes on traps 3/4/9, two
+  new traps (PLE projection widths, GDN `head_v_dim` assert), a zero-change
+  finding for the converter/GGUF surface, and a watch item on the unmerged
+  `tmp-q4` QSA rework. Next: download, then P1.

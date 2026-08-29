@@ -1,8 +1,14 @@
+# qwen4exp converter + gguf-py hunks
+# commit 6c84c7d5d8833c6e0df69628f75a0f599797934e (squash merge of PR #27742)
+#   vs its parent 6fdd0ac8907fd973a42b876357823ad2124cd8ed (pre-PR master)
+# NOTE: conversion/qwen4exp.py is vendored verbatim as qwen4exp.py and excluded here.
+# NOTE: conversion/qwen.py was in the pathspec but this PR does not touch it (see conversion-qwen-base.py).
+#
 diff --git a/conversion/__init__.py b/conversion/__init__.py
-index 8de97e95969..74bd96fd59d 100644
+index ab6cacbc7..a5632fcc4 100644
 --- a/conversion/__init__.py
 +++ b/conversion/__init__.py
-@@ -235,6 +235,8 @@
+@@ -236,6 +236,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
      "Qwen3_5ForConditionalGeneration": "qwen",
      "Qwen3_5MoeForCausalLM": "qwen",
      "Qwen3_5MoeForConditionalGeneration": "qwen",
@@ -11,7 +17,7 @@ index 8de97e95969..74bd96fd59d 100644
      "RND1": "qwen",
      "RWForCausalLM": "falcon",
      "RWKV6Qwen2ForCausalLM": "rwkv",
-@@ -332,6 +334,7 @@
+@@ -333,6 +335,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
      "Qwen3VLMoeForConditionalGeneration": "qwen3vl",
      "Qwen3_5ForConditionalGeneration": "qwen3vl",
      "Qwen3_5MoeForConditionalGeneration": "qwen3vl",
@@ -19,18 +25,41 @@ index 8de97e95969..74bd96fd59d 100644
      "RADIOModel": "nemotron",
      "Sarashina2VisionForCausalLM": "sarashina2",
      "SmolVLMForConditionalGeneration": "smolvlm",
+diff --git a/conversion/base.py b/conversion/base.py
+index 56547ace0..daae28e92 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -1006,12 +1006,16 @@ class ModelBase:
+                     else:
+                         raise ValueError(f"Unknown file type: {self.ftype.name}")
+ 
++                # a chunked tensor quantizes as one chunk at a time, while it is written
++                quantize = data.quantize if isinstance(data, gguf.LazyChunkedTensor) else (
++                    lambda qtype, d=data: gguf.quants.quantize(d, qtype))
++
+                 try:
+-                    data = gguf.quants.quantize(data, data_qtype)
++                    data = quantize(data_qtype)
+                 except gguf.QuantError as e:
+                     logger.warning("%s, %s", e, "falling back to F16")
+                     data_qtype = gguf.GGMLQuantizationType.F16
+-                    data = gguf.quants.quantize(data, data_qtype)
++                    data = quantize(data_qtype)
+ 
+                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
+ 
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
-index f236a5d2c98..60ddeb55406 100644
+index 0a223831d..fffbd6745 100644
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
-@@ -225,6 +225,19 @@ class HyperConnection:
+@@ -229,6 +229,19 @@ class Keys:
          COUNT                = "{arch}.hyper_connection.count"
          SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"
          EPSILON              = "{arch}.hyper_connection.epsilon"
 +        # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
 +        LOW_RANK             = "{arch}.hyper_connection.low_rank"
 +
-+    class PLE:
++    class PerLayerEmbedding:
 +        LAYERS             = "{arch}.ple.layers"
 +        NGRAM_SIZE         = "{arch}.ple.ngram_size"
 +        HEADS_PER_NGRAM    = "{arch}.ple.heads_per_ngram"
@@ -43,7 +72,7 @@ index f236a5d2c98..60ddeb55406 100644
  
      class Rope:
          DIMENSION_COUNT           = "{arch}.rope.dimension_count"
-@@ -494,6 +507,7 @@ class MODEL_ARCH(IntEnum):
+@@ -498,6 +511,7 @@ class MODEL_ARCH(IntEnum):
      QWEN3VLMOE       = auto()
      QWEN35           = auto()
      QWEN35MOE        = auto()
@@ -51,7 +80,7 @@ index f236a5d2c98..60ddeb55406 100644
      PHI2             = auto()
      PHI3             = auto()
      PHIMOE           = auto()
-@@ -636,6 +650,9 @@ class MODEL_TENSOR(IntEnum):
+@@ -640,6 +654,9 @@ class MODEL_TENSOR(IntEnum):
      HC_HEAD_FN           = auto()
      HC_HEAD_BASE         = auto()
      HC_HEAD_SCALE        = auto()
@@ -61,7 +90,7 @@ index f236a5d2c98..60ddeb55406 100644
      ROPE_FREQS           = auto()
      ROPE_FACTORS_LONG    = auto()
      ROPE_FACTORS_SHORT   = auto()
-@@ -780,6 +797,20 @@ class MODEL_TENSOR(IntEnum):
+@@ -784,6 +801,20 @@ class MODEL_TENSOR(IntEnum):
      HC_FFN_FN            = auto()
      HC_FFN_BASE          = auto()
      HC_FFN_SCALE         = auto()
@@ -82,7 +111,7 @@ index f236a5d2c98..60ddeb55406 100644
      ATTN_COMPRESSOR_WKV  = auto()
      ATTN_COMPRESSOR_WGATE = auto()
      ATTN_COMPRESSOR_APE  = auto()
-@@ -1217,6 +1248,7 @@ class MODEL_TENSOR(IntEnum):
+@@ -1228,6 +1259,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
      MODEL_ARCH.QWEN3VLMOE:       "qwen3vlmoe",
      MODEL_ARCH.QWEN35:           "qwen35",
      MODEL_ARCH.QWEN35MOE:        "qwen35moe",
@@ -90,7 +119,7 @@ index f236a5d2c98..60ddeb55406 100644
      MODEL_ARCH.PHI2:             "phi2",
      MODEL_ARCH.PHI3:             "phi3",
      MODEL_ARCH.PHIMOE:           "phimoe",
-@@ -1358,6 +1390,9 @@ class MODEL_TENSOR(IntEnum):
+@@ -1369,6 +1401,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
      MODEL_TENSOR.HC_HEAD_FN:                "output_hc_fn",
      MODEL_TENSOR.HC_HEAD_BASE:              "output_hc_base",
      MODEL_TENSOR.HC_HEAD_SCALE:             "output_hc_scale",
@@ -100,7 +129,7 @@ index f236a5d2c98..60ddeb55406 100644
      MODEL_TENSOR.ROPE_FREQS:                "rope_freqs",
      MODEL_TENSOR.ROPE_FACTORS_LONG:         "rope_factors_long",
      MODEL_TENSOR.ROPE_FACTORS_SHORT:        "rope_factors_short",
-@@ -1502,6 +1537,20 @@ class MODEL_TENSOR(IntEnum):
+@@ -1513,6 +1548,20 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
      MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
      MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
      MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
@@ -121,7 +150,7 @@ index f236a5d2c98..60ddeb55406 100644
      MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_kv",
      MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_gate",
      MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
-@@ -2795,6 +2844,58 @@ class MODEL_TENSOR(IntEnum):
+@@ -2813,6 +2862,58 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
          MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
          MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
      ],
@@ -181,10 +210,10 @@ index f236a5d2c98..60ddeb55406 100644
          MODEL_TENSOR.TOKEN_EMBD,
          MODEL_TENSOR.OUTPUT_NORM,
 diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
-index d8a96a27bdd..32b8154de5c 100644
+index fb6602a35..b1d161bcb 100644
 --- a/gguf-py/gguf/gguf_writer.py
 +++ b/gguf-py/gguf/gguf_writer.py
-@@ -1029,6 +1029,40 @@ def add_hyper_connection_sinkhorn_iterations(self, count: int) -> None:
+@@ -1041,6 +1041,40 @@ class GGUFWriter:
      def add_hyper_connection_epsilon(self, value: float) -> None:
          self.add_float32(Keys.HyperConnection.EPSILON.format(arch=self.arch), value)
  
@@ -192,44 +221,113 @@ index d8a96a27bdd..32b8154de5c 100644
 +        self.add_uint32(Keys.HyperConnection.LOW_RANK.format(arch=self.arch), value)
 +
 +    def add_ple_layers(self, values: Sequence[int]) -> None:
-+        self.add_array(Keys.PLE.LAYERS.format(arch=self.arch), values)
++        self.add_array(Keys.PerLayerEmbedding.LAYERS.format(arch=self.arch), values)
 +
 +    def add_ple_ngram_size(self, value: int) -> None:
-+        self.add_uint32(Keys.PLE.NGRAM_SIZE.format(arch=self.arch), value)
++        self.add_uint32(Keys.PerLayerEmbedding.NGRAM_SIZE.format(arch=self.arch), value)
 +
 +    def add_ple_heads_per_ngram(self, value: int) -> None:
-+        self.add_uint32(Keys.PLE.HEADS_PER_NGRAM.format(arch=self.arch), value)
++        self.add_uint32(Keys.PerLayerEmbedding.HEADS_PER_NGRAM.format(arch=self.arch), value)
 +
 +    def add_ple_conv_kernel(self, value: int) -> None:
-+        self.add_uint32(Keys.PLE.CONV_KERNEL.format(arch=self.arch), value)
++        self.add_uint32(Keys.PerLayerEmbedding.CONV_KERNEL.format(arch=self.arch), value)
 +
 +    # multipliers reach ~2.4e13; default INT32 inference would truncate them
 +    def _add_u64_array(self, key: str, values: Sequence[int]) -> None:
 +        self.add_key_value(key, list(values), GGUFValueType.ARRAY, GGUFValueType.UINT64)
 +
 +    def add_ple_layer_multipliers(self, values: Sequence[int]) -> None:
-+        self._add_u64_array(Keys.PLE.LAYER_MULTIPLIERS.format(arch=self.arch), values)
++        self._add_u64_array(Keys.PerLayerEmbedding.LAYER_MULTIPLIERS.format(arch=self.arch), values)
 +
 +    def add_ple_head_offsets(self, values: Sequence[int]) -> None:
-+        self._add_u64_array(Keys.PLE.HEAD_OFFSETS.format(arch=self.arch), values)
++        self._add_u64_array(Keys.PerLayerEmbedding.HEAD_OFFSETS.format(arch=self.arch), values)
 +
 +    def add_ple_head_vocab_sizes(self, values: Sequence[int]) -> None:
-+        self._add_u64_array(Keys.PLE.HEAD_VOCAB_SIZES.format(arch=self.arch), values)
++        self._add_u64_array(Keys.PerLayerEmbedding.HEAD_VOCAB_SIZES.format(arch=self.arch), values)
 +
 +    def add_ple_eos_token_id(self, value: int) -> None:
-+        self.add_uint32(Keys.PLE.EOS_TOKEN_ID.format(arch=self.arch), value)
++        self.add_uint32(Keys.PerLayerEmbedding.EOS_TOKEN_ID.format(arch=self.arch), value)
 +
 +    def add_ple_image_token_id(self, value: int) -> None:
-+        self.add_uint32(Keys.PLE.IMAGE_TOKEN_ID.format(arch=self.arch), value)
++        self.add_uint32(Keys.PerLayerEmbedding.IMAGE_TOKEN_ID.format(arch=self.arch), value)
 +
      def add_attention_scale(self, value: float) -> None:
          self.add_float32(Keys.Attention.SCALE.format(arch=self.arch), value)
  
+diff --git a/gguf-py/gguf/lazy.py b/gguf-py/gguf/lazy.py
+index acbc79258..6a0aee881 100644
+--- a/gguf-py/gguf/lazy.py
++++ b/gguf-py/gguf/lazy.py
+@@ -226,3 +226,64 @@ class LazyNumpyTensor(LazyBase):
+         return eager.tofile(*args, **kwargs)
+ 
+     # TODO: __array_function__
++
++
++# Tensor written to file one row-chunk at a time
++class LazyChunkedTensor:
++
++    def __init__(
++        self, chunks: list[Callable[[], np.ndarray]], shape: tuple[int, ...], dtype: DTypeLike,
++        qtype: Any = None, byteswap: bool = False,
++    ):
++        self._chunks = chunks
++        self._qtype = qtype
++        self._byteswap = byteswap
++        self.shape = tuple(shape)
++        self.dtype = np.dtype(dtype)
++
++    @property
++    def nbytes(self) -> int:
++        n = self.dtype.itemsize
++        for d in self.shape:
++            n *= d
++        return n
++
++    def numpy(self) -> LazyChunkedTensor:
++        return self
++
++    def quantize(self, qtype: Any) -> LazyChunkedTensor:
++        from .constants import GGMLQuantizationType
++        from .quants import QuantError, quant_shape_to_byte_shape
++
++        if qtype == GGMLQuantizationType.F32:
++            shape, dtype = self.shape, np.dtype(np.float32)
++        elif qtype == GGMLQuantizationType.F16:
++            shape, dtype = self.shape, np.dtype(np.float16)
++        else:
++            try:
++                shape, dtype = quant_shape_to_byte_shape(self.shape, qtype), np.dtype(np.uint8)
++            except ValueError as e:
++                # raised here and not per chunk, so callers can still fall back to F16
++                raise QuantError(str(e)) from e
++        return LazyChunkedTensor(self._chunks, shape, dtype, qtype, self._byteswap)
++
++    def byteswap(self, inplace: bool = False) -> LazyChunkedTensor:
++        if inplace:
++            raise NotImplementedError("a chunked tensor cannot be byteswapped in place")
++        return LazyChunkedTensor(self._chunks, self.shape, self.dtype, self._qtype, not self._byteswap)
++
++    def tofile(self, *args, **kwargs) -> None:
++        from .quants import quantize
++
++        written = 0
++        for load_chunk in self._chunks:
++            chunk = load_chunk()
++            if self._qtype is not None:
++                # exact only because chunks split on rows, and blocks never cross one
++                chunk = quantize(chunk, self._qtype)
++            if self._byteswap:
++                chunk = chunk.byteswap(inplace=False)
++            chunk.tofile(*args, **kwargs)
++            written += chunk.nbytes
++            del chunk
++        assert written == self.nbytes, f"chunked tensor wrote {written} bytes, expected {self.nbytes}"
 diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
-index ef580518e97..7adcac41834 100644
+index c42a7154a..861acfe18 100644
 --- a/gguf-py/gguf/tensor_mapping.py
 +++ b/gguf-py/gguf/tensor_mapping.py
-@@ -2680,6 +2680,65 @@ class TensorNameMap:
+@@ -2708,6 +2708,65 @@ class TensorNameMap:
                  "model.layers.{bid}.post_attention_layernorm",
              ),
          },
