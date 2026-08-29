@@ -17,11 +17,13 @@ divergence is resolved at construction time.
   with the oracle.** The model loads, prefills, decodes and stops cleanly on
   `UD-Q4_K_XL`, and U7 graded it against llama.cpp at `6fe749801`: 189/192
   forced-replay agreement with zero hard mismatches (see "P2 parity result"
-  below; full record in docs/qwen4exp-parity-2026-08-29.md). Next: review fixes
-  for U0-U6, then P3 — with two P4 items opened by U7 (the parity harness
-  cannot run on this geometry at all, and prefill is 3.5x off llama.cpp). The
-  plan, its decisions (D14-D18) and the unit breakdown are in the "P2 plan"
-  section below; the file:line map is docs/qwen4exp-p2-map.md.
+  below; full record in docs/qwen4exp-parity-2026-08-29.md). **The review round
+  is CLOSED** — 21 items from the Claude/Qwen/Fable rounds fixed in 643a411,
+  suite 977/977. **P2 is done; the arc pauses here.** Next is P3, with two P4
+  items opened by U7 (the parity harness cannot run on this geometry at all, and
+  prefill is 3.5x off llama.cpp) and serve refused until the snapshot work
+  lands. The plan, its decisions (D14-D18) and the unit breakdown are in the
+  "P2 plan" section below; the file:line map is docs/qwen4exp-p2-map.md.
 - Runnable weights: `UD-Q4_K_XL` (111.33 GB, 4 shards) in the HF cache and
   RUNNING as of 2026-08-29. Full published ladder surveyed below.
 - llama.cpp support: PR #27742 **MERGED** into master 2026-08-27 as squash
@@ -216,9 +218,17 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   Indexer raw-key caches, PLE conv state and the 2-id history live in
   `Qwen4ExpParts` with their own checkpoint/rollback; snapshots and the disk
   tier refuse a qwen4exp target loudly, ledgered for P4. See "P2 plan".
+  **Amended by the review round (643a411)**: the first cut's rollback ignored
+  `commit`, so a rewind after a commit restored the wrong PLE state. It now
+  keeps a per-token trail bounded by the checkpoint span, mirroring
+  `LayerCache::Linear`, and `Qwen4ExpCheckpoint` is stamped `(len0, span)` and
+  verified on use. Tests pin commits 0..3 bitwise on probe logits.
 - **D16 (2026-08-29) QSA overlay contract.** `AttnBlock::forward` gains a
   trailing `Option<&QsaSelection>` (`Dense` / `Mask` / `Rows`); the `None` path
-  is byte-identical for existing checkpoints. See "P2 plan".
+  is byte-identical for existing checkpoints. See "P2 plan". **Amended by the
+  review round (643a411)**: the overlay grew guards, and separately prefill
+  masks became one f16 plane broadcast across heads on ALL checkpoints — a
+  layout change, not a math change, worth ~800 MB/layer at 4k on the 27B.
 - **D17 (2026-08-29) PLE in P2 is host-hybrid.** Hash, row gather and IQ4_NL
   dequant on the CPU; the projections on device; gate/conv on the host in f32.
   A known P3 cost, taken for correctness first. See "P2 plan".
@@ -1209,3 +1219,28 @@ than xwen (−17% vs −5% settling), which flatters its numbers.
   llama-server's 751 MB on the same file, and the frozen ppl corpus looks
   contaminated for this checkpoint (PPL 1.45, both engines agreeing), so
   flash-next wants a fresh corpus before it gets a real ppl floor.
+- **2026-08-29 (review round closed — 643a411)**: 21 items from the Claude,
+  Qwen and Fable reviews fixed (Codex was out of credits); suite 977/977. The
+  ones that were real bugs rather than hardening: **PLE state rollback ignored
+  `commit`** — it now keeps a per-token trail bounded by the checkpoint span,
+  mirroring `LayerCache::Linear`, with `Qwen4ExpCheckpoint` stamped `(len0,
+  span)` and verified on use, and tests pinning commits 0..3 bitwise on probe
+  logits (D15); and **identification folded spaces too eagerly**, so folding now
+  applies only on the exact-name pass — the consequence, deliberate and matching
+  the existing rule for "Qwen3.6 27B MyFinetune", is that a name like
+  "Qwen3.8 Flash Next (imatrix)" identifies as NOTHING rather than as this
+  checkpoint. **Flash-Next is now CLI-only by construction**: `Model::servable()`
+  is false, so `xwen serve` refuses at startup both for the registry entry and
+  for a custom qwen4exp GGUF, the model is never listed, and a request naming it
+  is a 400; `Model::auto_fetch()` is false; `Model::supports_drafting()` is false
+  so `--draft` is refused rather than silently ignored. Hardening and coverage:
+  QSA overlay guards; **prefill masks are now one f16 plane broadcast across
+  heads on ALL checkpoints** — a layout change only, ~800 MB/layer saved at 4k on
+  the 27B (parity gate re-run to confirm no math moved: RESULT PENDING, fill this
+  line); indexer KV plane sized at 30 KiB/token; a differential GGUF-header test
+  against candle on all three blessed files; a shard-rebase byte check; IQ4_NL
+  and Q8_0 literal tests; a new `Fixture::Mixed` tiny GGUF (BF16 indexer, Q8_0
+  planes, Q4_K/Q5_K/Q5_1 experts and a real IQ4_NL table via `raw_of`) that runs
+  the stack tests, which is what makes the per-layer/per-plane dtype mixing of
+  trap #17 actually covered; checked PLE row math; a conv-orientation pin; and
+  budget/ratio validation.

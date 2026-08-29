@@ -1976,16 +1976,23 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     serializes the lookup and kills the prefetch, and unconditional retrieval is
     cheap. Test `madvise(MADV_RANDOM)` on the table mapping (default readahead
     turns a 90-160 B row into a large window) and MEASURE cold vs warm fault cost
-    rather than assuming the page cache wins; **(7)** QSA mask memory — the
-    prefill overlay materializes a `[n_q, n_kv]` mask; **(8)** `IndexerCache`
+    rather than assuming the page cache wins; **(7)** ~~QSA mask memory — the
+    prefill overlay materializes a `[n_q, n_kv]` mask~~ **CLOSED 2026-08-29 in
+    the review round (643a411)**: prefill masks are now one f16 plane broadcast
+    across heads on ALL checkpoints, a layout change with no math change, worth
+    ~800 MB/layer at 4k on the 27B; **(8)** `IndexerCache`
     allocates at `max_ctx` with no growth path, ~1.6 GB across the 12 QSA layers
     at the checkpoint's 262144 ctx, paid whether or not the conversation gets
     there; **(9)** the ~50 tok/s decode figure in the port doc's P0-pause notes
     was a SCALING GUESS from the 35B-A3B, never a measurement — the real first
     number is 37.5-38.1, so either close the gap or retire the guess.
   - **2026-08-29 — P4 ledger for Flash-Next (what "experimental" currently
-    means).** **Serve is REFUSED for this checkpoint**, not merely untested: a
-    qwen4exp target would 500 on the snapshot path, because prefix-cache
+    means).** **Serve is REFUSED for this checkpoint** — as of 643a411 that
+    refusal is enforced in code (`Model::servable()` false: startup refusal for
+    both the registry entry and a custom qwen4exp GGUF, never listed, 400 on a
+    request naming it; `auto_fetch()` and `supports_drafting()` false too), so
+    this bullet is now the P4 STARTING POINT rather than a warning. A qwen4exp
+    target would 500 on the snapshot path, because prefix-cache
     snapshots, host snapshots and the disk tier do not carry the new recurrent
     state (indexer raw-key caches, PLE conv window, the 2-id token history) — D15
     took that decoupling deliberately in P2. Closing it means teaching

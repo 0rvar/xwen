@@ -39,8 +39,9 @@ struct Cli {
 struct ModelArgs {
     /// Which official checkpoint to run: the dense Qwen3.6-27B, the
     /// Qwen3.6-35B-A3B MoE (the default), the dense Qwen3.8-27B, or
-    /// Qwen3.8-Flash-Next (`flash-next` — the qwen4exp trunk, whose graph is
-    /// not wired yet). Each checkpoint's full name works here too. A
+    /// Qwen3.8-Flash-Next (`flash-next` — experimental, CLI-only: `xwen serve`
+    /// refuses it until snapshot support lands). Each checkpoint's full name
+    /// works here too. A
     /// `--model <gguf>` path
     /// overrides the target file outright; for the one-shot commands this flag
     /// still selects the family (and so the drafter sidecar), while

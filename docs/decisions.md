@@ -2035,6 +2035,25 @@ warned about: they were useful for sizing the work and worthless as ground truth
 one of them was re-derived from `config.json`, the transformers modular file and the
 shipped GGUF headers before a line was written (2026-08-25, graded 2026-08-26).
 
+**Flash-Next is CLI-only until P4, by construction rather than by convention.**
+`Model::servable()` is false for this checkpoint, so `xwen serve` refuses it at startup
+— both the registry entry and a custom qwen4exp GGUF — never lists it, and 400s a
+request that names it. `Model::auto_fetch()` is false and `Model::supports_drafting()`
+is false, so `--draft` is refused rather than silently ignored. Why refusal rather than
+partial support: serve's snapshot, page-out and rewind paths require state the qwen4exp
+parts cannot snapshot yet — the indexer raw-key caches, the PLE conv window and the 2-id
+token history all live outside `LayerCache` by decision, and the disk tier has no tags
+for them. A server that accepted the checkpoint would 500 on the first page-out, which
+is a worse failure than a startup refusal (2026-08-29).
+
+**Space→hyphen folding applies to the exact-name comparison only.** The file calls
+itself "Qwen3.8 Flash Next" where the official name is `Qwen3.8-Flash-Next`, so
+identification folds the two spellings — but only on the exact-name pass, not on the
+containment pass. The consequence is deliberate: a name like "Qwen3.8 Flash Next
+(imatrix)" identifies as NOTHING rather than as this checkpoint, which is exactly the
+existing rule that stops "Qwen3.6 27B MyFinetune" from claiming to be the official 27B.
+A file that identifies as nothing still runs, under its own file name (2026-08-29).
+
 **Phased, correctness before speed.** P0 scaffold (split-GGUF loader, config parse,
 registry) → P1 CPU references and fixtures → P2 graph assembly, real file, greedy smoke,
 oracle agreement → P3 Metal and perf → P4 serve, sampling defaults, harness extension.
