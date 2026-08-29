@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::RmsNorm;
 
@@ -35,10 +35,18 @@ const MEMORY_WARN_BYTES: u64 = 90 * 1024 * 1024 * 1024;
 /// across the 35B's 10 (20 KiB/token).
 const KV_INITIAL_CTX: usize = 8192;
 
+/// What a stack run hands back: the pre-lm_head hidden states `[seq, hidden]`
+/// for every position, the named parity taps collected when capture is on, and
+/// the `(layer, l_out)` spec-decode taps the drafter reads.
+pub(crate) type StackOutput = (Tensor, Vec<(String, Tensor)>, Vec<(usize, Tensor)>);
+
 /// The per-layer FFN: a plain SwiGLU MLP on the dense checkpoint, the
-/// softmax-routed MoE block (routed experts + gated shared expert) on the MoE
-/// one. Whole-model, not per-layer — neither checkpoint mixes the two.
-enum Ffn {
+/// softmax-routed MoE block (routed experts + gated shared expert) on both MoE
+/// ones. Whole-model, not per-layer — no checkpoint mixes the two.
+///
+/// `pub(crate)` because `qwen4exp::stack` runs the same blocks through a
+/// different residual (D14) and therefore has to match on this.
+pub(crate) enum Ffn {
     Dense(DenseMlp),
     Moe(MoeBlock),
 }
@@ -46,7 +54,7 @@ enum Ffn {
 /// The per-layer sequence mixer: softmax attention over a KV cache on the
 /// `(il + 1) % 4 == 0` layers, gated DeltaNet over a recurrent state on the
 /// other three in four.
-enum Mixer {
+pub(crate) enum Mixer {
     Full(AttnBlock),
     Linear(LinearAttnBlock),
 }
@@ -57,11 +65,16 @@ enum Mixer {
 /// `ffn_norm` is loaded from `post_attention_norm` — there is no `ffn_norm`
 /// tensor, and despite the name it is the PRE-MLP norm (HF semantics), not a
 /// Gemma-style post-norm.
-struct Layer {
-    attn_norm: RmsNorm,
-    mixer: Mixer,
-    ffn_norm: RmsNorm,
-    ffn: Ffn,
+///
+/// Both norms are `None` on qwen4exp, whose file carries neither: there the
+/// normalization lives inside the hyper-connection gate that reads the residual
+/// carrier, and `qwen4exp::stack::run_stack_hc` — the only code that runs those
+/// layers — never looks at these fields.
+pub(crate) struct Layer {
+    attn_norm: Option<RmsNorm>,
+    pub(crate) mixer: Mixer,
+    ffn_norm: Option<RmsNorm>,
+    pub(crate) ffn: Ffn,
 }
 
 /// The assembled model: embeddings, the layer stack (attention/DeltaNet +
@@ -69,14 +82,21 @@ struct Layer {
 /// caches; batch=1 by design. Exposes per-layer residual taps for the parity
 /// harness and the DFlash drafter.
 pub struct XwenModel {
-    cfg: XwenConfig,
-    device: Device,
+    pub(crate) cfg: XwenConfig,
+    pub(crate) device: Device,
     /// Dequantized token embeddings `[vocab, hidden]`, f16 on Metal (halves the
     /// 1.2GB f32 footprint) or f32 elsewhere. Rows are gathered per forward.
     embed: Tensor,
-    layers: Vec<Layer>,
-    caches: Vec<LayerCache>,
-    output_norm: RmsNorm,
+    pub(crate) layers: Vec<Layer>,
+    pub(crate) caches: Vec<LayerCache>,
+    /// The qwen4exp subsystems: per-layer hyper-connection gates, QSA indexers
+    /// with their raw-key caches, the PLE layer with its own recurrent state,
+    /// and the tail mixer. `Some` exactly on `Arch::Qwen4Exp`, and its presence
+    /// is what routes `run_stack` to the second graph (D14).
+    pub(crate) qwen4exp: Option<crate::qwen4exp::stack::Qwen4ExpParts>,
+    /// `None` on qwen4exp, which has no `output_norm` tensor — its tail mixer
+    /// (`Qwen4ExpParts::output_hc`) is the final normalization.
+    output_norm: Option<RmsNorm>,
     lm_head: QLinear,
     /// Retained handle to the lm_head weight's Metal buffer, shared with
     /// `lm_head`'s QTensor (zero-copy). Present only on Metal for the vendored
@@ -105,12 +125,12 @@ pub struct XwenModel {
     /// f16-attention checkpoint like the retired original, or a q8_0 file under
     /// XWEN_ATTN_DEQUANT).
     attn_decode: &'static str,
-    max_ctx: usize,
+    pub(crate) max_ctx: usize,
     /// Positions every full-attention layer currently has allocated — the lazy
     /// KV allocation's high-water mark, `KV_INITIAL_CTX` at load and grown in
     /// lockstep by `grow_kv_capacity` up to the `max_ctx` ceiling.
     kv_slots: usize,
-    tap_enabled: bool,
+    pub(crate) tap_enabled: bool,
     taps: Vec<(String, Tensor)>,
     /// DFlash spec-decode residual-stream taps: the `l_out` layer indices the
     /// drafter reads (e.g. `[1,10,19,29,38,47]`), or `None` (default). Separate
@@ -124,17 +144,17 @@ pub struct XwenModel {
     /// Whether to retain the post-final-norm hidden for the MTP draft head.
     /// Off by default: a forward that nobody is drafting from should not hold a
     /// `[seq, hidden]` handle alive past its own scope.
-    keep_post_norm: bool,
+    pub(crate) keep_post_norm: bool,
     /// The most recent forward's post-final-norm hidden `[seq, hidden]` f32,
     /// drained by `take_post_norm_hidden`. This is what the MTP head's `h` input
     /// is — NOT the pre-norm residual `spec_taps` carries.
-    post_norm_hidden: Option<Tensor>,
+    pub(crate) post_norm_hidden: Option<Tensor>,
     /// Per-stage forward timing, present only under `XWEN_STACK_PROFILE`
     /// (`ops::stack_profile`). `None` — the normal case — costs one `Option`
     /// check per instrumented site; `Some` brackets every stage with device
     /// syncs, which serializes the pipeline and makes the run's throughput
     /// meaningless. Diagnosis only: no arithmetic depends on it.
-    profile: Option<crate::stack_profile::StackProfiler>,
+    pub(crate) profile: Option<crate::stack_profile::StackProfiler>,
     /// Keeps the GGUF mapping (and its Metal view buffers' residency set) alive
     /// for the model's lifetime on the mmap alias load: the aliased attention
     /// f16 planes are plain `Tensor`s that cannot carry the mapping themselves,
@@ -152,24 +172,29 @@ pub struct XwenModel {
 }
 
 impl XwenModel {
-    /// The qwen4exp trunk (hyper-connection carrier, QSA, PLE) is its own
-    /// graph module, not this stack (docs/qwen4exp-port.md D1): `load` refuses
-    /// it here, before the rope table and the ~1.2 GB token-embedding dequant
-    /// materialize anything, rather than building a wrong graph.
+    /// Preconditions this stack cannot recover from, checked on the parsed
+    /// config before the rope table and the ~1.2 GB token-embedding dequant
+    /// materialize anything.
     ///
-    /// Qwen3.8-Flash-Next is a registry checkpoint now, so a plain `xwen
-    /// --model-size flash-next` reaches this point with a real file in hand.
-    /// What it must NOT reach is the qwen35 stack below, which shares the
-    /// attention and DeltaNet blocks with qwen4exp and would therefore build
-    /// something that runs and emits noise. Hence a refusal that names the
-    /// unit the wiring is waiting on rather than a generic one.
+    /// Only one such precondition exists: a qwen4exp file whose metadata carries
+    /// no `qwen4exp` config section. Every hyper-connection gate, indexer and
+    /// PLE layer is sized from that section, so its absence is a broken
+    /// conversion rather than a checkpoint variant — and failing here rather
+    /// than at the first `HcRead::load` keeps the ~1.2 GB dequant out of a run
+    /// that cannot finish.
     fn check_arch(cfg: &XwenConfig) -> Result<()> {
         match cfg.arch {
             Arch::Dense | Arch::Moe => Ok(()),
-            Arch::Qwen4Exp => anyhow::bail!(
-                "qwen4exp graph assembly not yet wired (P2 U6): XwenModel builds the \
-                 qwen35/qwen35moe stack only, and this checkpoint's trunk is not that stack"
-            ),
+            Arch::Qwen4Exp => {
+                ensure!(
+                    cfg.qwen4exp.is_some(),
+                    "this file declares architecture qwen4exp but carries no \
+                     qwen4exp.hyper_connection.* metadata: the residual carrier, the QSA \
+                     indexers and the PLE table are all sized from it, so the graph cannot \
+                     be built"
+                );
+                Ok(())
+            }
         }
     }
 
@@ -228,6 +253,14 @@ impl XwenModel {
             embed.to_dtype(DType::F32)?
         };
 
+        // qwen4exp shares every block with qwen35moe and differs only in what
+        // sits BETWEEN them: a 4-stream residual carrier instead of a single
+        // one, which is why its file has no `attn_norm`, no
+        // `post_attention_norm` and no `output_norm` (D14). So the block
+        // construction below is not branched — only the norms are, and the
+        // gates/indexers/PLE are loaded alongside afterwards.
+        let hc = cfg.arch == Arch::Qwen4Exp;
+
         let kv_slots = max_ctx.min(KV_INITIAL_CTX);
         let mut layers = Vec::with_capacity(cfg.n_layer);
         let mut caches = Vec::with_capacity(cfg.n_layer);
@@ -241,24 +274,38 @@ impl XwenModel {
             };
             let ffn = match cfg.arch {
                 Arch::Dense => Ffn::Dense(DenseMlp::new(&lw)?),
-                Arch::Moe => Ffn::Moe(MoeBlock::new(&lw, &cfg, runner)?),
-                // Refused by `check_arch` at the top of `load`, before any
-                // tensor materialized; this arm only keeps the match
-                // exhaustive.
-                Arch::Qwen4Exp => {
-                    unreachable!("qwen4exp is refused at the top of XwenModel::load")
-                }
+                Arch::Moe | Arch::Qwen4Exp => Ffn::Moe(MoeBlock::new(&lw, &cfg, runner)?),
             };
             layers.push(Layer {
-                attn_norm: lw.rms_norm("attn_norm", cfg.rms_eps)?,
+                attn_norm: if hc {
+                    None
+                } else {
+                    Some(lw.rms_norm("attn_norm", cfg.rms_eps)?)
+                },
                 mixer,
                 // There is no `ffn_norm` tensor; `post_attention_norm` is the
                 // pre-MLP norm.
-                ffn_norm: lw.rms_norm("post_attention_norm", cfg.rms_eps)?,
+                ffn_norm: if hc {
+                    None
+                } else {
+                    Some(lw.rms_norm("post_attention_norm", cfg.rms_eps)?)
+                },
                 ffn,
             });
             caches.push(LayerCache::new(&cfg, il, kv_slots, &device)?);
         }
+
+        // The hyper-connection gates, the per-attention-layer QSA indexers with
+        // their raw-key caches, and the one PLE layer with its conv window and
+        // n-gram history. Their presence is what routes `run_stack` to the
+        // second graph.
+        let qwen4exp = if hc {
+            Some(crate::qwen4exp::stack::Qwen4ExpParts::load(
+                &w, &gguf, &cfg, &rope, max_ctx, &device,
+            )?)
+        } else {
+            None
+        };
 
         // Attention decode-projection path, for dump provenance. XWEN_ATTN_F32
         // routes the whole block through the dequant-f32 QMatMul ("f32-bypass",
@@ -278,7 +325,14 @@ impl XwenModel {
             "f16"
         };
 
-        let output_norm = w.rms_norm("output_norm", cfg.rms_eps)?;
+        // No `output_norm` on qwen4exp: `Qwen4ExpParts::output_hc` is its final
+        // normalization, and reading a tensor that does not exist would fail
+        // the load of a perfectly good file.
+        let output_norm = if hc {
+            None
+        } else {
+            Some(w.rms_norm("output_norm", cfg.rms_eps)?)
+        };
         let (lm_head, lm_head_buffer, lm_head_dtype) = w.qlinear_with_buffer("output")?;
 
         // Batch-register every mmap weight view in candle's queue-attached
@@ -295,6 +349,7 @@ impl XwenModel {
             embed,
             layers,
             caches,
+            qwen4exp,
             output_norm,
             lm_head,
             lm_head_buffer,
@@ -363,11 +418,14 @@ impl XwenModel {
     /// and `forward_all_logits` (which keeps every position). Advances the KV
     /// caches, so callers feeding chunks must pass a monotonically increasing
     /// `pos`.
-    fn run_stack(
-        &mut self,
-        tokens: &Tensor,
-        pos: usize,
-    ) -> Result<(Tensor, Vec<(String, Tensor)>, Vec<(usize, Tensor)>)> {
+    fn run_stack(&mut self, tokens: &Tensor, pos: usize) -> Result<StackOutput> {
+        // qwen4exp is a second graph over the same blocks (D14): a 4-stream
+        // residual carrier, a QSA overlay on the attention layers and a PLE
+        // injection, none of which fit as a branch inside the loop below.
+        if self.qwen4exp.is_some() {
+            return crate::qwen4exp::stack::run_stack_hc(self, tokens, pos);
+        }
+
         let seq = tokens.elem_count();
         ensure!(
             pos + seq <= self.max_ctx,
@@ -435,7 +493,10 @@ impl XwenModel {
             let layer = &self.layers[il];
             let cache = &mut self.caches[il];
 
-            let normed = stage!(Stage::AttnNorm, layer.attn_norm.forward(&x)?);
+            let normed = stage!(
+                Stage::AttnNorm,
+                norm_of(&layer.attn_norm, "attn_norm")?.forward(&x)?
+            );
             tap!("attn_norm", il, normed);
 
             // x += mixer(attn_norm(x)) — post-o_proj for an attention layer,
@@ -453,7 +514,10 @@ impl XwenModel {
             let ffn_inp = stage!(Stage::ResidualAttn, (&x + &attn)?);
             tap!("ffn_inp", il, ffn_inp);
 
-            let ffn_normed = stage!(Stage::FfnNorm, layer.ffn_norm.forward(&ffn_inp)?);
+            let ffn_normed = stage!(
+                Stage::FfnNorm,
+                norm_of(&layer.ffn_norm, "post_attention_norm")?.forward(&ffn_inp)?
+            );
             tap!("ffn_norm", il, ffn_normed);
 
             // x += ffn(ffn_norm(x)).
@@ -481,7 +545,10 @@ impl XwenModel {
             taps.push(("h_nextn".to_string(), x.clone()));
         }
 
-        let normed = stage!(Stage::FinalNorm, self.output_norm.forward(&x)?); // [seq, hidden]
+        let normed = stage!(
+            Stage::FinalNorm,
+            norm_of(&self.output_norm, "output_norm")?.forward(&x)?
+        ); // [seq, hidden]
         // The MTP draft head consumes the POST-final-norm hidden, per position —
         // deliberately not the pre-norm residual the DFlash taps above capture.
         // A handle clone when armed, an `Option` check when not; the tensor is
@@ -496,7 +563,7 @@ impl XwenModel {
     /// Build the hoisted prefill mask, splitting the CPU fill from the upload so
     /// the profiler can charge them to separate stages. The tensors are what
     /// `PrefillMask::build` produces either way.
-    fn build_prefill_mask(
+    pub(crate) fn build_prefill_mask(
         &mut self,
         n_head: usize,
         seq: usize,
@@ -708,7 +775,7 @@ impl XwenModel {
     }
 
     /// The embedding lookup `run_stack` uses: gather rows and upcast to f32.
-    fn embed_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
+    pub(crate) fn embed_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
         let tokens = tokens.to_dtype(DType::U32)?;
         Ok(self.embed.index_select(&tokens, 0)?.to_dtype(DType::F32)?)
     }
@@ -777,6 +844,12 @@ impl XwenModel {
             .iter_mut()
             .map(|c| c.checkpoint(span))
             .collect::<Result<_>>()?;
+        // The qwen4exp indexer caches and PLE state arm alongside, and are
+        // rolled back from `kv_rollback` — they are not carried in
+        // `KvCheckpoint` because `kv_cache.rs` stays out of P2 (D15).
+        if let Some(parts) = self.qwen4exp.as_mut() {
+            parts.checkpoint(span)?;
+        }
         Ok(KvCheckpoint::new(len0, span, layers))
     }
 
@@ -806,6 +879,9 @@ impl XwenModel {
         for (cache, lc) in self.caches.iter_mut().zip(&ckpt.layers) {
             cache.rollback(lc, ckpt.len0, ckpt.span, commit)?;
         }
+        if let Some(parts) = self.qwen4exp.as_mut() {
+            parts.rollback(ckpt.len0, ckpt.span, commit)?;
+        }
         Ok(())
     }
 
@@ -820,6 +896,7 @@ impl XwenModel {
     /// rings (~72 MiB on the shipped checkpoint, independent of context length);
     /// full-attention layers need no data, their positions keep their slots.
     pub fn take_cache_snapshot(&self) -> Result<CacheSnapshot> {
+        self.refuse_state_transfer("take_cache_snapshot")?;
         let layers: Vec<LayerSnapshot> = self
             .caches
             .iter()
@@ -835,6 +912,7 @@ impl XwenModel {
     /// positions `[0, pos)` with a different token sequence since. Callers that
     /// diverge inside the snapshot's prefix must reset the cache instead.
     pub fn restore_cache_snapshot(&mut self, snapshot: &CacheSnapshot) -> Result<()> {
+        self.refuse_state_transfer("restore_cache_snapshot")?;
         ensure!(
             snapshot.layers().len() == self.caches.len(),
             "restore_cache_snapshot: snapshot covers {} layers, model has {}",
@@ -862,6 +940,7 @@ impl XwenModel {
     /// `HostFullKv::byte_len`) plus the device-to-host copy; unlike a snapshot it
     /// scales with context length.
     pub fn export_full_kv(&self) -> Result<HostFullKv> {
+        self.refuse_state_transfer("export_full_kv")?;
         crate::kv_cache::export_full_kv_from(&self.caches)
     }
 
@@ -880,6 +959,7 @@ impl XwenModel {
         rings: &HostSnapshot,
         pos: usize,
     ) -> Result<()> {
+        self.refuse_state_transfer("check_importable")?;
         ensure!(
             pos <= self.max_ctx,
             "check_importable: pos {pos} exceeds max_ctx {}",
@@ -903,6 +983,7 @@ impl XwenModel {
     /// keys. Importing establishes exactly that, which is why a snapshot restore
     /// is sound after another conversation has run over those slots.
     pub fn import_full_kv(&mut self, image: &HostFullKv, pos: usize) -> Result<()> {
+        self.refuse_state_transfer("import_full_kv")?;
         // Only the positions actually being imported have to fit: an image longer
         // than this model's context is still a valid source for a shorter resume
         // (an on-disk record written by a larger-context server, say).
@@ -921,6 +1002,9 @@ impl XwenModel {
         for cache in &mut self.caches {
             cache.reset()?;
         }
+        if let Some(parts) = self.qwen4exp.as_mut() {
+            parts.reset();
+        }
         Ok(())
     }
 
@@ -937,7 +1021,7 @@ impl XwenModel {
     /// layer's own `ensure_full_capacity` re-checks its real allocation and is
     /// idempotent, so a retried forward re-runs the growth and converges —
     /// already-grown layers no-op, the failed one retries.
-    fn grow_kv_capacity(&mut self, needed: usize) -> Result<()> {
+    pub(crate) fn grow_kv_capacity(&mut self, needed: usize) -> Result<()> {
         if needed <= self.kv_slots {
             return Ok(());
         }
@@ -964,9 +1048,40 @@ impl XwenModel {
         Ok(())
     }
 
+    /// Refuse the cache-image paths on qwen4exp, by name.
+    ///
+    /// Snapshots, host images and the disk tier all move a conversation's whole
+    /// state somewhere else and back. On qwen4exp that state includes three
+    /// things none of those formats carry: the QSA indexers' raw-key planes, the
+    /// PLE conv window and the PLE n-gram token history. Restoring without them
+    /// would produce a model that runs, answers, and quietly attends to the
+    /// wrong tokens — so the transfer is refused rather than silently partial.
+    /// Ledgered for P4 (docs/qwen4exp-port.md D15).
+    fn refuse_state_transfer(&self, what: &str) -> Result<()> {
+        ensure!(
+            self.qwen4exp.is_none(),
+            "{what}: qwen4exp recurrent extras not snapshot-able yet (P4) — the QSA raw-key \
+             caches, the PLE conv window and its n-gram token history are not carried by any \
+             cache image, and a restore without them attends to the wrong tokens"
+        );
+        Ok(())
+    }
+
     pub fn device(&self) -> &Device {
         &self.device
     }
+}
+
+/// The norm a qwen35/qwen35moe layer must have.
+///
+/// These three tensors exist on every architecture this stack runs and on none
+/// that `run_stack_hc` runs, so the `Option` never fails here — it is what lets
+/// one `Layer` type carry both graphs' layers. An error rather than an unwrap so
+/// a future architecture that reaches the wrong loop says which tensor it was
+/// missing instead of panicking mid-forward.
+fn norm_of<'a>(norm: &'a Option<RmsNorm>, name: &str) -> Result<&'a RmsNorm> {
+    norm.as_ref()
+        .with_context(|| format!("this layer carries no {name}: it belongs to the qwen4exp graph"))
 }
 
 /// Reorder the forward's loop-captured `(layer, l_out)` spec taps (captured in
@@ -1003,16 +1118,24 @@ fn gb(bytes: u64) -> f64 {
 /// (`grow_kv_capacity`), so what is resident at load is the initial allocation;
 /// `max_ctx` is the ceiling a long conversation can grow it to.
 fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_ctx: usize) {
-    let weight_bytes: u64 = gguf
+    let tensor_bytes = |info: &candle_core::quantized::gguf_file::TensorInfo| -> u64 {
+        let elems = info.shape.elem_count() as u64;
+        let dt = info.ggml_dtype;
+        elems / dt.block_size() as u64 * dt.type_size() as u64
+    };
+    let weight_bytes: u64 = gguf.content.tensor_infos.values().map(tensor_bytes).sum();
+
+    // The PLE n-gram table is the one weight nothing uploads: its rows are
+    // hashed and gathered from the host mapping, sixteen per token (D17). At
+    // 28.8 GB on the shipped file it would dominate — and misreport — a
+    // "resident" figure, so it is reported as what it is.
+    let ple_table_bytes = gguf
         .content
         .tensor_infos
-        .values()
-        .map(|info| {
-            let elems = info.shape.elem_count() as u64;
-            let dt = info.ggml_dtype;
-            elems / dt.block_size() as u64 * dt.type_size() as u64
-        })
-        .sum();
+        .get("per_layer_token_embd.weight")
+        .map(tensor_bytes)
+        .unwrap_or(0);
+    let weight_bytes = weight_bytes - ple_table_bytes;
 
     // Conv window + delta state, f32, per DeltaNet layer — context-independent.
     let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
@@ -1021,7 +1144,10 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_c
     let state_bytes = n_linear
         * 4
         * ((cfg.conv_kernel as u64 - 1) * cfg.conv_dim() as u64
-            + cfg.linear_v_heads as u64 * hd * hd);
+            + cfg.linear_v_heads as u64 * hd * hd)
+        // qwen4exp only: the QSA raw-key planes (allocated at max_ctx, not
+        // grown) and the PLE conv window. Zero on the other checkpoints.
+        + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx);
 
     let total = weight_bytes + kv_bytes(cfg, kv_slots) + state_bytes;
     let ceiling = weight_bytes + kv_bytes(cfg, max_ctx) + state_bytes;
@@ -1034,6 +1160,13 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_c
         gb(total),
         gb(kv_bytes(cfg, max_ctx)),
     ));
+    if ple_table_bytes > 0 {
+        crate::host_log::host_line(format!(
+            "xwen: PLE n-gram table {:.1}GB mapped, read from the host per token — not \
+             uploaded, and not counted above",
+            gb(ple_table_bytes)
+        ));
+    }
     if ceiling > MEMORY_WARN_BYTES {
         crate::host_log::host_line(format!(
             "xwen: WARNING footprint can reach {:.1}GB at full context, over the {:.0}GB budget",
@@ -1048,11 +1181,12 @@ mod tests {
     use super::*;
     use crate::config::RopeKind;
 
-    /// The qwen4exp arch is refused up front: `load` runs `check_arch` on the
-    /// parsed config before the rope table and the token-embedding dequant, so
-    /// the refusal materializes no tensors.
+    /// A qwen4exp file with no `qwen4exp.*` metadata is refused up front:
+    /// `load` runs `check_arch` on the parsed config before the rope table and
+    /// the token-embedding dequant, so the refusal materializes no tensors. A
+    /// file that carries the section passes, as do both qwen35 arms.
     #[test]
-    fn qwen4exp_arch_is_refused_before_any_tensor_work() {
+    fn qwen4exp_without_its_config_section_is_refused_before_any_tensor_work() {
         let cfg = |arch: Arch| XwenConfig {
             arch,
             general_name: None,
@@ -1084,11 +1218,24 @@ mod tests {
         let err = XwenModel::check_arch(&cfg(Arch::Qwen4Exp))
             .unwrap_err()
             .to_string();
-        // The message names the unit the wiring waits on: this is a
-        // not-yet-built path, not a file the engine should reject forever.
-        assert!(err.contains("not yet wired (P2 U6)"), "{err}");
+        // The message names what the file is missing, so the operator can tell
+        // a broken conversion from an unsupported checkpoint.
+        assert!(err.contains("qwen4exp.hyper_connection"), "{err}");
         assert!(XwenModel::check_arch(&cfg(Arch::Dense)).is_ok());
         assert!(XwenModel::check_arch(&cfg(Arch::Moe)).is_ok());
+
+        // With the section present the arch is built, not refused.
+        let mut ok = cfg(Arch::Qwen4Exp);
+        ok.qwen4exp = Some(crate::config::Qwen4ExpConfig {
+            hc_count: 4,
+            hc_low_rank: 320,
+            indexer_heads: 4,
+            indexer_head_dim: 128,
+            indexer_top_k: 2048,
+            indexer_compress_ratio: 4,
+            ple: None,
+        });
+        assert!(XwenModel::check_arch(&ok).is_ok());
     }
 
     fn probe(id: usize) -> Tensor {

@@ -15,3 +15,6 @@ pub mod indexer;
 pub mod iq4nl;
 pub mod ple;
 pub mod stack;
+
+#[cfg(test)]
+pub mod tiny_gguf;
