@@ -48,7 +48,7 @@ rank-2 near-tie; `docs/qwen4exp-parity-2026-08-29.md`). It is not finished: **`x
 REFUSES this checkpoint until P4**, because snapshots and the prefix cache cannot carry
 its recurrent state; there is no drafter; and it has no parity harness or perplexity
 floor of its own. It is, however, fast: after the P3 kernel pass it runs **prefill
-795.7 tok/s and decode 43.1 tok/s** where llama.cpp on the same file in the same hour
+795.7 tok/s and decode 44.5-45.8 tok/s (43.1 before the PLE row prefetch)** where llama.cpp on the same file in the same hour
 runs 789 and 41.4 — plain, no drafter, 530-token prompt, four interleaved rounds,
 medians, `powermode 0` with no high-power claim. See `docs/qwen4exp-port.md`.
 

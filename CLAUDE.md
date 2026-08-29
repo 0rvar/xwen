@@ -215,7 +215,7 @@ do not difference them against a drafted number from another session — the 27B
 between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 reads
 36.5-37.6 in today's own 0.3 arm.
 Qwen3.8-Flash-Next (EXPERIMENTAL, CLI-only), 2026-08-29 after the P3 kernel pass,
-plain because no drafter exists for it: **prefill ~796 tok/s @530, decode ~43**,
+plain because no drafter exists for it: **prefill ~796 tok/s @530, decode ~45 (43 before the PLE row prefetch)**,
 against llama.cpp's 789 / 41.4 on the same file in the same hour (four interleaved
 rounds, medians; `pmset -g` said `powermode 0` that session — still no high-power
 claim). Its decode is bimodal round over round (~42 vs ~44) and unexplained, and

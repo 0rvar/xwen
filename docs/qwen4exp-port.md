@@ -18,7 +18,7 @@ divergence is resolved at construction time.
   vendored `mm_id` (8112733), four fused hyper-connection kernels (8aeed73) and
   a split norm launch below 32 tokens (2c8d3b3), plus PLE row prefetch
   (ac40526) and the review polish (188ba73). At a 530-token prompt, interleaved:
-  **prefill 239 → 796 tok/s** against llama.cpp's 789, **decode 37.8 → 43.1**
+  **prefill 239 → 796 tok/s** against llama.cpp's 789, **decode 37.8 → 43.1 → 45 with the PLE prefetch**
   against 41.4. Graded by forced replay at 186/192 with 0 hard mismatches, and the shipped checkpoints
   re-gated (35B and 27B ALL PASS at fd46c7a). Decisions D19-D25. **P3 pauses
   here with its ledger open**: the PLE gate/conv are still on the host, QSA
@@ -1050,6 +1050,7 @@ decoded tokens, arms interleaved, four rounds, medians:
 | arm | prefill tok/s | decode tok/s |
 | --- | --- | --- |
 | shipped (fused hc, split below 32, Q5_1 `mm_id`) | **795.7** | **43.1** |
+| + PLE row prefetch (ac40526), cold prompt per arm | 774.7-797.9 | **44.5-45.8** |
 | `XWEN_HC_SPLIT_MAX_N=0` (fused, single kernel) | 793.5 | 35.1 |
 | `XWEN_HC_CLASSIC=1` (candle chains, Q5_1 arm still on) | 438.0 | 37.8 |
 | llama.cpp, same file, same hour | 789 | 41.4 |

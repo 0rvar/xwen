@@ -4,7 +4,7 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-08-29 (P3, later the same day) — Flash-Next prefill 239 → 796 tok/s and decode 37.8 → 43.1: a Q5_1 `mm_id` arm, four fused hyper-connection kernels, and a norm split across streams below 32 tokens
+## 2026-08-29 (P3, later the same day) — Flash-Next prefill 239 → 796 tok/s and decode 37.8 → 45: a Q5_1 `mm_id` arm, four fused hyper-connection kernels, and a norm split across streams below 32 tokens
 
 **Context.** P2 closed hours earlier with the graph correct and prefill 3.3-3.5x behind
 llama.cpp on the identical file. P3 opened on that gap. Everything below is the
@@ -126,7 +126,7 @@ planes that only ever feed `QMatMul`, grow the indexer planes on demand, and gat
 `token_embd` rows from the quantized tensor instead of materializing the whole table.
 
 **End state, against llama.cpp on the same file in the same hour.** Prefill **795.7 vs
-789**, decode **43.1 vs 41.4** — 1.01x and 1.04x, from 0.30x and 0.91x this morning.
+789**, decode **43.1 vs 41.4** before the PLE prefetch and 44.5-45.8 after — 1.01x and 1.04-1.10x, from 0.30x and 0.91x this morning.
 Four rounds of interleaved medians at a 530-token prompt and 128 decoded tokens;
 `powermode 0`, no high-power claim. Decode is **bimodal round over round** (42 vs 44
 tok/s for the split path, 34 vs 36 for the unsplit one) with no explanation yet, which is
