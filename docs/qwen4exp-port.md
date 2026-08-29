@@ -143,6 +143,12 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   (3) Metal matmul kernels (mv_id/mm_id) — needed only if a matmul weight is
   IQ4_NL; DEFERRED, and D3's self-converted blessed file can choose Q4_K for
   the table + down_exps to avoid class 3 entirely.
+  - **Status correction 2026-08-29: class 1 was DECIDED in P0, not
+    IMPLEMENTED.** `gguf::open` on the real UD-Q4_K_XL still fails with "unknown
+    dtype for tensor 20" — the loader never grew the IQ-aware tensor-table
+    parsing D8 assigned it, so nothing can open the file yet. Being built now as
+    unit **U0**. Worth flagging because the P0 close read as if the loader work
+    were finished; the split-GGUF half was, the dtype half was not.
   - **Amended 2026-08-29 by D18.** Class 3 was never "all new matmul dtypes" —
     it is IQ4_NL specifically, and IQ4_NL matmul stays deferred. `Q5_1` matmul
     is now IN SCOPE, because the 640-column rule (below) puts Q5_1 on
@@ -348,6 +354,22 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   full name: `Qwen3.8-Flash-Next`. `identify()` must match both spellings;
   check containment against existing full names both directions (rule from
   hub.rs — a name matching two checkpoints identifies as neither).
+- **The registry entry LANDED 2026-08-29 (857e49e).** `Model::Qwen38FlashNext`,
+  full name `Qwen3.8-Flash-Next`, CLI aliases `flash-next` and `3.8-flash-next`
+  (full names only on the wire, as for every other checkpoint). Identification
+  folds spaces against hyphens, which is what makes the file's "Qwen3.8 Flash
+  Next" resolve. Checkpoints now carry a shard list, since this is the first
+  split file in the registry. Chat dialect: `Qwen38`.
+- **Chat-template verdict (2026-08-29): the embedded template is
+  Unsloth-modified, and it does not matter for plain chat.** Against
+  `reference/chat_template-qwen38.jinja` the file's template adds a developer
+  role, merges leading system messages, aliases effort `high` → `xhigh`,
+  validates tool_calls more strictly, and drops the "No user query" exception.
+  Rendered prompts are nevertheless **BYTE-IDENTICAL** for plain chat and
+  thinking — no tools, no developer role, at most one leading system message.
+  Divergences appear only with tools, a developer role, multiple system
+  messages, or `effort=high`. So the `Qwen38` dialect is the right call for P2;
+  the divergent paths are a P4 concern.
 - Card sampling: thinking 1.0/0.95/20 (unchanged); non-thinking 0.7/0.80/20
   **plus presence_penalty 1.5** — first checkpoint whose card demands a penalty.
   Our serve layer currently accepts-and-drops penalties (TODO.md 2026-08-19);
@@ -357,6 +379,10 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   a cross-check but the card is authority. Converted GGUFs carry NO
   presence-penalty key at all (the converter only knows repetition_penalty), so
   the 1.5 must be hardcoded per checkpoint like the second stop id is.
+  As of 2026-08-29 that hardcoding exists — `Model::recommended_presence_penalty
+  (thinking)` returns 1.5 for (Qwen3.8-Flash-Next, non-thinking) and 0.0
+  everywhere else — but **nothing consumes it yet**; see the Open question for
+  what threading it to the sampler costs.
 - `text_config.eos_token_id` (scalar) = 248044 and bos = 248044 with
   add_bos false; generation stop list unchanged [248046, 248044].
 
@@ -1020,3 +1046,19 @@ Units (U2-U5 parallel, then U6, then U7):
   `ple_conv1d.weight` is F32 (settled), `ffn_gate_inp_shexp.weight` is 1-D
   `[2560]`, there is no `output_hc_inject`, and UD-Q4_K_XL's byte split is
   MoE 77.5 GB / PLE 28.8 / attention 1.7 / embed+head 1.35 / GDN 1.25 / hc 0.7.
+- **2026-08-29 (registry + template verdict + U0 opened)**: the registry entry
+  landed (857e49e) — `Model::Qwen38FlashNext`, full name `Qwen3.8-Flash-Next`,
+  CLI `flash-next` / `3.8-flash-next`, space↔hyphen folding in identification
+  so the file's "Qwen3.8 Flash Next" resolves, a shard list on checkpoints (the
+  first split file in the registry), dialect `Qwen38`. The embedded chat
+  template was diffed against `reference/chat_template-qwen38.jinja`: it is
+  Unsloth-modified (developer role, merged leading system messages, effort
+  `high` → `xhigh`, stricter tool_call validation, no "No user query"
+  exception) but renders BYTE-IDENTICAL prompts for plain chat and thinking, so
+  the dialect choice is safe and the divergences are P4's problem.
+  `Model::recommended_presence_penalty(thinking)` exists (1.5 for the
+  non-thinking Flash-Next arm, 0.0 elsewhere) with no consumer yet — P4.
+  And a status correction: D8's class 1 was decided in P0 but never
+  implemented — `gguf::open` on the real file still fails with "unknown dtype
+  for tensor 20" (IQ4_NL), so opening UD-Q4_K_XL is blocked until unit **U0**
+  lands the IQ-aware tensor-table parsing.
