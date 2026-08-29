@@ -1,7 +1,8 @@
 # xwen
 
 Pure-Rust, Metal-only inference engine for **Qwen3.6-27B**, **Qwen3.6-35B-A3B** and
-**Qwen3.8-27B** (GGUF), optimized for a single Apple Silicon machine (M5 Max). Manual fork of the
+**Qwen3.8-27B** (GGUF), with **Qwen3.8-Flash-Next** in progress, optimized for a single
+Apple Silicon machine (M5 Max). Manual fork of the
 laguna/maxuna engine: candle-based, mmap no-copy weight loading, vendored Metal
 kernels, speculative decoding, and an HTTP server speaking Anthropic Messages and
 OpenAI Chat Completions.
@@ -27,14 +28,24 @@ SDK — see flake.nix). `cargo build --release`. Ops tests need a Metal device.
 
 ## Models
 
-Three checkpoints, all Q4_K_M, resolved through the HF cache and downloaded on first
-use:
+Three shipped checkpoints, all Q4_K_M, plus one in progress — all resolved through the
+HF cache and downloaded on first use:
 
 | Full name | Repo | `--model-size` | Drafter |
 | --- | --- | --- | --- |
 | `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash block drafter, 3.5 GB |
 | `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` (default) | DFlash block drafter, 0.8 GB |
 | `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | MTP head, 3.2 GB |
+| `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` | none |
+
+**Qwen3.8-Flash-Next is EXPERIMENTAL (P2, 2026-08-29)** — unlike Qwen3.8-27B this one is
+a whole second architecture rather than a registry entry over an existing graph: sparse
+attention, hyper-connections and a 51B n-gram embedding table on top of the familiar
+gated DeltaNet and MoE. It loads, generates and stops correctly,
+but it is not finished: **no drafter, no snapshot or prefix-cache support (both refuse
+loudly), and no serve validation yet**, and it has not been graded against the parity
+oracle. Its perplexity and throughput are not yet characterized. See
+`docs/qwen4exp-port.md`.
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full
 names); the HTTP APIs take the **full names only**. Qwen3.8-27B (added 2026-08-14) runs

@@ -13,14 +13,14 @@ divergence is resolved at construction time.
 
 ## Status
 
-- Phase: **P0 and P1 COMPLETE (2026-08-26 / 2026-08-29). Current step: P2 in
-  progress (U2-U5 parallel).** P2 is graph assembly, correctness-first — the
-  plan, its four decisions (D14-D17) and the unit breakdown are in the "P2
-  plan" section below; the file:line map it rests on is docs/qwen4exp-p2-map.md.
-  U1 (registry entry) waits on the download.
-- Runnable weights: `UD-Q4_K_XL` (111.33 GB, 4 shards) downloading into the HF
-  cache since 2026-08-29. Full published ladder surveyed below. Metadata-only
-  shard 1 (10.9 MB) stays usable for loader dev.
+- Phase: **P2 units U0-U6 LANDED 2026-08-29 — FIRST LIGHT on the real file.**
+  The model loads, prefills, decodes and stops cleanly on `UD-Q4_K_XL`. Next:
+  **U7** (logits parity against the llama.cpp oracle at `6fe749801`, plus a ppl
+  sanity check), then review fixes for U0-U6, then P3. The plan, its decisions
+  (D14-D18) and the unit breakdown are in the "P2 plan" section below; the
+  file:line map is docs/qwen4exp-p2-map.md.
+- Runnable weights: `UD-Q4_K_XL` (111.33 GB, 4 shards) in the HF cache and
+  RUNNING as of 2026-08-29. Full published ladder surveyed below.
 - llama.cpp support: PR #27742 **MERGED** into master 2026-08-27 as squash
   `6c84c7d5d`, plus follow-up `6fe749801` on 08-28. D4's re-pin gate is met and
   the `reference/llama.cpp` submodule was bumped e9fa0781 → `6fe749801` on
@@ -927,6 +927,15 @@ Units (U2-U5 parallel, then U6, then U7):
   the final say on. `the_qwen4exp_figures_count_its_indexer_and_ple_state`
   pins both with their arithmetic so a disagreement surfaces as a test failure.
   The PLE block's 2-id n-gram history is state too and is not counted (8 bytes).
+- **`IndexerCache` allocates at `max_ctx` with no growth path** (U3, 2026-08-29).
+  Every QSA layer holds a raw-key plane sized for the full context up front, so
+  the 12 attention layers cost ~1.6 GB at the checkpoint's 262144 ctx — paid
+  whether or not the conversation ever gets there. Fine at the max_ctx values
+  P2 runs at; a P3 question of whether it grows on demand instead.
+- **A qwen4exp load is Metal-only** (2026-08-29). `PleTable` reads the table
+  straight out of the mmap, so there is no CPU-device fallback path for this
+  checkpoint the way there nominally is elsewhere. Not a problem on this
+  machine — recorded so it is not discovered as a mystery on another.
 - ~~Where the qwen4exp oracle clone lives~~ ANSWERED 2026-08-29: there is no
   second clone. The one `reference/llama.cpp` submodule is bumped to
   `6fe749801` and `scripts/build-llamacpp.sh` is unchanged (D4). Follow-on, not
@@ -1062,3 +1071,25 @@ Units (U2-U5 parallel, then U6, then U7):
   implemented — `gguf::open` on the real file still fails with "unknown dtype
   for tensor 20" (IQ4_NL), so opening UD-Q4_K_XL is blocked until unit **U0**
   lands the IQ-aware tensor-table parsing.
+- **2026-08-29 (P2 U0-U6 landed; FIRST LIGHT)**: the graph is assembled and the
+  real file runs. Commits, in landing order: 3b58f92 (U5 — `ZGate` and
+  `sum_floor` wiring), f703c2a (U2 — device hyper-connection read/write and
+  stream seeding), 9a1f08a (U4 — PLE and IQ4_NL row dequant), 857e49e (U1 —
+  registry), 55ae948 (U3 — QSA indexer plus the D16 attention overlay),
+  d09e36b (U0 — loader-owned GGUF header parse; the real file opens, 1223
+  candle tensors plus one raw IQ4_NL plane), 76e678f (U6 — the stack:
+  `Qwen4ExpParts`, `run_stack_hc`, layer order mirroring `qwen4exp.cpp:322-388`,
+  the qwen35 path's three norms becoming `Option`, and snapshot/export refusing
+  a qwen4exp target with a P4 error). Full lib suite 957/957.
+  **First smoke** (greedy, `--no-think`, `--no-draft`, max_ctx 2048): "The
+  capital of France is **Paris**." with a clean stop. Load 36.7 s; 76.9 GB of
+  weights plus 0.1 GB of state resident, the PLE table host-mmap'd and excluded
+  from that; prefill 17 tokens in 0.36 s (47 tok/s, cold) and decode 8 tokens
+  in 0.22 s (35.7 tok/s). **Those are a tiny sample from one cold run, not a
+  perf claim, and the power mode is not confirmed** — the real numbers come
+  after U7 and P3.
+  One upstream-worthy find from U3: candle's Metal `index_select` is **silently
+  wrong on strided sources** — no error, just wrong rows. Worked around by
+  gathering per head; worth reporting upstream.
+  P2 remaining: **U7** (logits parity against the oracle at `6fe749801` plus a
+  ppl sanity check) and review fixes across U0-U6.
