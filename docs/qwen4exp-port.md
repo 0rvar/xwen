@@ -161,6 +161,25 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   if it doesn't fit comfortably: D3's self-converted mix. Download started
   2026-08-29 into the HF cache (repo `unsloth/Qwen3.8-Flash-Next-GGUF`, path
   `UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000N-of-00004.gguf`).
+- **D13 (2026-08-29) QSA pooled keys stay f32; no cache-dtype round-back.**
+  The block key is mean-pooled in f32 and goes straight into the k-norm and the
+  rope. HF rounds it back to the raw-key cache dtype first
+  (`key_groups.float().mean(dim=1).to(raw_keys.dtype)`, modular:437), which at
+  the real checkpoint's BF16 indexer cache strips the pooled key to 8 mantissa
+  bits before it is ever scored; llama.cpp pools through `ggml_get_rows` into
+  f32 and never rounds back (`qwen4exp.cpp:547-556`). We follow llama.cpp,
+  because llama.cpp is this port's parity oracle — the same rule that settles
+  every other divergence in the 3.6/3.8 graphs.
+  The price, recorded so it is not rediscovered as a bug in P2: **exact
+  index-set parity against an HF tap at real geometry is not attainable and is
+  not a goal.** Measured at real geometry (128 dims, 4 heads, relu-sum,
+  top-512, unit-RMS random keys, 20 trials): the bf16 round-back perturbs
+  scores by ~1.2e-2 against a top-k cut margin of ~2e-3, so ~0.5 of the 512
+  selected blocks per query differ at 1k-4k blocks — at every context length
+  above budget. Grade the Metal path against the f32 oracle, not against HF.
+  What dtype the raw-key cache itself holds is a SEPARATE and still-open P2/P3
+  choice; this decision only says there is no re-rounding after the f32 pool.
+  Pinned by the header doc of `src/qwen4exp/ref_qsa.rs`.
 - **D7 (2026-08-26) Phase plan.** P0 scaffold (split-GGUF loader, config parse,
   registry) → P1 CPU references + fixtures for the three new components → P2
   graph assembly, load a real file, greedy smoke, ppl sanity vs PR #27742's
@@ -501,6 +520,21 @@ reference/qwen4exp/UPSTREAM-DIFF-2026-08-29.md finding 3.)
     num_v_heads`). Same value for every checkpoint we ship, so no math changes —
     but don't generalize the assert into an assumption that the two dims are
     the same thing.
+15. **Carrier seeding is `repeat`, not `repeat_interleave`.**
+    `hidden_states.repeat(1, 1, hc_count)` (modular:1019) TILES the embedding:
+    the carrier is `[x, x, x, x]`, so stream *s* starts as the whole token
+    embedding for every *s*. `repeat_interleave` over the last dim would give
+    `[x0,x0,x0,x0, x1,x1,x1,x1, …]` — a completely different carrier that runs,
+    keeps every shape, and produces plausible garbage. This repo has been burned
+    by the same tiled-vs-interleaved distinction once already (the GGUF V-head
+    ordering rule in CLAUDE.md). Nothing pins it today: it is graph-level, above
+    the P1 references. **Pin it in P2 with a test.**
+16. **`hc_*_norm` weights are FULL-WIDTH.** Every hyper-connection norm weight
+    (and all three PLE norm weights) spans `hc_count * hidden` = 10240 — one
+    value per element of the carrier; only the STATISTICS are per group of
+    `hidden`. A `[hidden]`-wide load is wrong. The P1 fixtures settled this, and
+    the references assert `x.len() == weight.len()`, which is what turns the
+    mistake into a panic instead of streams 1.. silently coming out zero.
 
 ## Reuse-seams map (audited 2026-08-26; file:line refs from that audit)
 
@@ -738,3 +772,18 @@ multi-steps".
   question closed. OUTSTANDING: the 3.6/3.8 parity gate has not been re-run at
   `6fe749801`, so the docs/parity.md floors are still e9fa0781 measurements.
   Next: parity re-run once the disk frees up, download, then P1.
+  **P1 references landed the same day**: `src/qwen4exp/{ref_hc,ref_ple,ref_qsa}.rs`
+  — three frozen CPU f32 oracles (hyper-connections plus the two norm flavours,
+  the PLE n-gram hash plus its injection layer, the QSA indexer) graded against
+  the five golden fixtures, 38 tests. Reviewed by Claude, Codex and Qwen; the
+  consolidated fixes are applied. D13 taken and written down; the grouped norm
+  now accumulates in f64 like ggml's CPU path and is the single shared
+  implementation (ref_ple and ref_qsa call it instead of carrying near-copies
+  with weaker asserts); every matvec asserts its full shape; the PLE conv
+  dilation is derived from `ngram_size` rather than loaded; the PLE gate
+  propagates NaN; `QsaIndexerRef` asserts MQA. The new tests pin what the
+  fixtures could not: positions reaching the rope (scalar-path cross-check,
+  RoPE's shift invariance, per-block first positions), chunked-prefill
+  equivalence on both the QSA and the PLE side including a three-chunk state
+  carry, a transposed `value_proj` guard, and per-stream hyper-connection
+  injection. Traps #15 and #16 added.
