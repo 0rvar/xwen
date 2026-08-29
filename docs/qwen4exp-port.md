@@ -13,18 +13,19 @@ divergence is resolved at construction time.
 
 ## Status
 
-- Phase: **P0 COMPLETE (2026-08-26); arc PAUSED by Orvar's request before P1.**
-  Resume point: P1 = Rust reference implementations of hyper-connections, PLE,
-  and the QSA indexer against tests/fixtures/qwen4exp/ (D5), plus the deferred
-  registry entry (waiting on a Q4-class file to name/size it — see Open
-  questions). Everything below this line was accurate at pause time.
-- Runnable weights: none locally yet. Unsloth `UD-IQ1_S` (72.5 GB) is up; waiting
-  on a Q4-class file for first real testing. Metadata-only shard 1 (10.9 MB) is
-  usable for loader dev today.
-- llama.cpp support: open PR #27742 — no longer marked draft as of 2026-08-26,
-  but unmerged, unreviewed, pending Qwen's independent numeric check. Not our
-  oracle yet. Vendored read-only at reference/qwen4exp/ (pinned sha in its
-  PROVENANCE.md).
+- Phase: **P0 COMPLETE (2026-08-26); arc RESUMED 2026-08-29.** Current step:
+  re-vendor the llama.cpp material at the merged `6fe749801` and download the
+  first runnable file (UD-Q4_K_XL, D12); then P1 = Rust reference
+  implementations of hyper-connections, PLE, and the QSA indexer against
+  tests/fixtures/qwen4exp/ (D5), plus the deferred registry entry (a Q4-class
+  file to name/size it now exists — D12).
+- Runnable weights: `UD-Q4_K_XL` (111.33 GB, 4 shards) downloading into the HF
+  cache since 2026-08-29. Full published ladder surveyed below. Metadata-only
+  shard 1 (10.9 MB) stays usable for loader dev.
+- llama.cpp support: PR #27742 **MERGED** into master 2026-08-27 as squash
+  `6c84c7d5d`, plus follow-up `6fe749801` on 08-28. D4's re-pin gate is met;
+  `reference/llama.cpp` (e9fa0781) stays frozen for 3.6/3.8 and a second clone
+  at `6fe749801` becomes the qwen4exp oracle (see D4 update).
 
 ## The model in one paragraph
 
@@ -68,6 +69,33 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   executable comparison, and re-pinning the main oracle waits for the PR to merge
   plus Qwen's promised independent numeric check. An unreviewed AI-drafted branch
   is not a frozen correctness oracle.
+  - **Update 2026-08-29 — the merge half of the gate is met.** PR #27742 merged
+    into ggml-org/llama.cpp master 2026-08-27T19:32Z as squash `6c84c7d5d` (PR
+    head `eaf9376557`, 65 commits); follow-up `6fe749801` "model: qwen4exp:
+    reduce number of graph splits (#27880)" landed 08-28; master was
+    `17252c769` at survey time. Our vendored `bea3b12d` is being re-vendored at
+    `6fe749801` (separate unit, in progress). The other half — Qwen's
+    independent numeric check — was NEVER posted; what we have is the PR body's
+    own numerics: wikitext-2 ppl 4.0068±0.0227 vs 4.0126 reference, top-1
+    agreement 98.0%, QSA bit-identical to dense below the 2048 budget on
+    BF16/F32 (max logit delta 0.0 over 2051 rows) and diverging at ~3% of
+    positions at 8192, indexer selection 0.975 mean Jaccard against a 0.991
+    precision floor. Author caveats to carry: quantized models are NOT
+    bit-identical across the QSA boundary (UD-IQ1_S max logit delta 2.84e-3),
+    and `test-llama-archs -a qwen4exp` is weak — its synthetic model has no PLE
+    tensors, and it is blind to the GDN fused-QKV segmentation convention
+    (three plausible segmentations, one correct). Fixes that landed in-thread
+    before merge: Hadamard rotation for quantized KV in QSA (q8_0 KV then
+    matches f16), a raised `graph_max_nodes` budget, a multi-slot
+    indexer/attention desync via the server prompt cache, and "bias the QSA
+    selection per block, not per cell". PLE is implemented Gemma-3n-style as
+    one host-side get_rows gather table, CPU-resident on CUDA automatically,
+    mmap-backed — independent confirmation of D2. Reported perf, DGX Spark GB10,
+    UD-Q4_K_XL: 24-25 tok/s decode, 70-99 tok/s prefill, 27.5 GB CPU + 78 GB
+    CUDA buffer. Oracle layout after the re-pin: `reference/llama.cpp`
+    (e9fa0781) STAYS frozen for the 3.6/3.8 parity cycles, and a SECOND clone
+    at `6fe749801` is the qwen4exp oracle — where it lives and whether
+    `scripts/build-llamacpp.sh` grows a target argument are Open questions.
 - **D5 (2026-08-26) Reference-first for every new component.** Hyper-connections,
   the QSA indexer, and PLE each get a frozen CPU f32 reference implementation
   with fixture tests before any Metal work, mirroring the ReferenceExperts
@@ -107,6 +135,16 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   in profiles. Prefill overlays the QSA mask via the existing
   `Option<&PrefillMask>` argument — needs only a device-side mask constructor
   (today's masks are host-built).
+- **D12 (2026-08-29) First target file: `UD-Q4_K_XL`.** The only Q4-class trunk
+  whose quant types are ones xwen already has kernels for — Q4_K / Q8_0 / F32,
+  with IQ4_NL confined to the PLE table (D8 class 2: CPU row dequant only, no
+  matmul). `UD-IQ4_XS` would be roomier on 128 GiB (64.88 GB trunk vs 82.53) but
+  needs IQ4_XS matmul kernels we don't have — D8 class 3, deferred. 82.53 GB of
+  wired trunk plus a demand-paged PLE table plus KV is tight, but it is the same
+  file llama.cpp reported 24-25 tok/s decode on for a 128 GB DGX Spark. Fallback
+  if it doesn't fit comfortably: D3's self-converted mix. Download started
+  2026-08-29 into the HF cache (repo `unsloth/Qwen3.8-Flash-Next-GGUF`, path
+  `UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000N-of-00004.gguf`).
 - **D7 (2026-08-26) Phase plan.** P0 scaffold (split-GGUF loader, config parse,
   registry) → P1 CPU references + fixtures for the three new components → P2
   graph assembly, load a real file, greedy smoke, ppl sanity vs PR #27742's
@@ -245,6 +283,56 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   BF16, norms/routers F32, table IQ4_NL. Expect the Q4-class file to be mostly
   Q4_K/Q5_K/Q6_K with IQ4_NL persisting on the table and possibly down_exps —
   IQ4_NL dequant is unavoidable for the Unsloth path.
+
+### Quant landscape (2026-08-29 — every published GGUF, read from headers)
+
+Qwen published no GGUF. `unsloth/Qwen3.8-Flash-Next-GGUF` is the only full
+ladder; all UD variants are imatrix quants (926 entries;
+`imatrix_unsloth.gguf_file` sits in the repo). Naming is
+`<folder>/Qwen3.8-Flash-Next-<VARIANT>-000NN-of-000MM.gguf`, shards ~50 GB. The
+PLE tensor `per_layer_token_embd.weight` is `[160, 320001536]` =
+51,200,245,760 elements, so its size is exact per type and the trunk column is
+just total minus PLE. Sizes decimal GB.
+
+| variant | shards | total GB | PLE type / GB | trunk GB | note |
+| --- | --- | --- | --- | --- | --- |
+| UD-IQ1_S | 3 | 72.55 | IQ4_NL / 28.80 | 43.75 | token_embd Q4_K |
+| UD-IQ1_M | 3 | 74.54 | IQ4_NL / 28.80 | 45.74 | |
+| UD-Q2_K_XL | 3 | 78.87 | IQ4_NL / 28.80 | 50.07 | token_embd Q5_K |
+| UD-IQ3_XXS | 3 | 81.96 | IQ4_NL / 28.80 | 53.16 | token_embd Q6_K |
+| UD-Q3_K_XL | 3 | 89.99 | IQ4_NL / 28.80 | 61.19 | |
+| UD-IQ4_XS | 3 | 93.68 | IQ4_NL / 28.80 | 64.88 | needs IQ4_XS matmul (D8 class 3) |
+| **UD-Q4_K_XL** | 4 | 111.33 | IQ4_NL / 28.80 | **82.53** | file_type 15; de-facto default; D12 target |
+| UD-Q5_K_XL | 6 | 158.29 | Q8_0 / 54.40 | 103.89 | |
+| UD-Q6_K_XL | 6 | 169.17 | Q8_0 / 54.40 | 114.77 | |
+| Q8_0 | 6 | 188.23 | Q8_0 / 54.40 | 133.83 | |
+| BF16 | 8 | 354.03 | BF16 / 102.40 | 251.63 | shard 3 is the PLE tensor alone |
+
+The repo also carries `mmproj-BF16` / `mmproj-F16` (the vision tower — never
+load) and the imatrix file.
+
+- **UD-Q4_K_XL precision policy** (measured, not inferred): `output.weight`,
+  `token_embd`, every `attn_output`, `ple_key`, `ple_value` and the
+  hyper-connection up/down projections are Q8_0; all norms and `ple_conv1d` are
+  F32; the routed experts carry the low bits. Unsloth's docs say the PLE table
+  is held at "4-bit minimum" because of its random-access pattern — which is why
+  IQ4_NL persists on the table even in the Q4 and Q3 mixes (D8 class 2 is
+  unavoidable on the Unsloth path, exactly as D3 predicted).
+- **Selected KV from UD-Q4_K_XL shard 1** (cross-check of the spec above, all
+  confirming): `general.architecture` qwen4exp, `size_label` "512x56B", 48
+  blocks, hidden 2560, 24 Q / 2 KV heads, key/value length 256, 512 experts
+  top-10, expert FFN 640, `full_attention_interval` 4, rope theta 1e7,
+  `dimension_sections` [11,11,10,0], `rope.dimension_count` 64,
+  `hyper_connection.count` 4 / `low_rank` 320, `attention.indexer.{head_count 4,
+  key_length 128, top_k 2048}`, `ple.{layers [1], ngram_size 3, heads_per_ngram
+  8, conv_kernel 4}` with 16 PLE head vocab slices ~20,000,0xx each,
+  `embedding_length_per_layer_input` 160, context 262144, tokenizer pre
+  `qwen35`, eos 248046, no BOS, `general.sampling.{temp 1.0, top_p 0.95, top_k
+  20}`.
+- **Other publishers**: ggml-org has Q8_0 only (2 shards, 162.62 GB, + mmproj);
+  lmstudio-community Q4_K_M 119.15 / Q6_K 167.63 / Q8_0 188.21; bartowski
+  IQ1_S..IQ3_M (70-93 GB, still uploading as of 08-28); mradermacher a static
+  and an i1 ladder. Nothing there beats UD-Q4_K_XL on the kernels-we-have axis.
 
 ## Conversion-baked deltas (audit of the vendored PR converter, 2026-08-26)
 
@@ -443,10 +531,16 @@ multi-steps".
 
 - MTP head forward semantics (fc_embedding/fc_hidden composition) — vLLM/SGLang
   source or the tech report (github.com/QwenLM/Qwen3.8-Flash-Next tech_report.pdf).
-- Exact Q4-class quant mix — the file appearing on unsloth/Qwen3.8-Flash-Next-GGUF.
-- Whether PR #27742 merges as-is (watch: JJJYmmm's numeric check) — decides when
-  the oracle re-pin happens and whether `conversion/qwen4exp.py` is stable
-  enough to build our self-converted blessed file.
+- ~~Exact Q4-class quant mix~~ ANSWERED 2026-08-29: the whole ladder is
+  surveyed above; UD-Q4_K_XL is the first target (D12).
+- ~~Whether PR #27742 merges as-is~~ ANSWERED 2026-08-29: merged 08-27 as
+  `6c84c7d5d` (D4 update). The numeric check Qwen promised was never posted, so
+  `conversion/qwen4exp.py`'s stability for a self-converted blessed file rests
+  on the PR body's own ppl-vs-reference.
+- Where the qwen4exp oracle clone lives. `reference/llama.cpp` (e9fa0781) stays
+  frozen for the 3.6/3.8 cycles, so the qwen4exp oracle is a SECOND clone at
+  `6fe749801`. Candidate path `reference/llama.cpp-qwen4exp`; open whether
+  `scripts/build-llamacpp.sh` grows a target argument or gets a sibling.
 
 ## Progress log
 
@@ -489,3 +583,12 @@ multi-steps".
   (both-stops eog guarantee, now commented), 1 rejected (cadence validation
   against the file's declaration is by design). Full lib suite 872/872 at
   close. **P0 done; arc paused before P1.**
+- **2026-08-29**: Arc resumed. Surveyed every published qwen4exp GGUF from its
+  headers (section "Quant landscape" above) and took D12: UD-Q4_K_XL is the
+  first target file, download started into the HF cache. Upstream landed too —
+  PR #27742 merged 08-27 as `6c84c7d5d` with a graph-splits follow-up 08-28
+  (`6fe749801`), so D4's merge gate is met and the vendored material is being
+  re-vendored at `6fe749801` as a second, buildable oracle clone while
+  `reference/llama.cpp` stays frozen at e9fa0781 for 3.6/3.8. Qwen's promised
+  independent numeric check never appeared; the PR body's own numbers stand in.
+  Next: finish re-vendor + download, then P1.
