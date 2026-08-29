@@ -487,6 +487,40 @@ the session that ran P0)
   computed mid-forward; acting on it serializes the lookup and kills the
   prefetch; unconditional retrieval is cheap). Wired-GPU cost of the table:
   zero — hash+gather+dequant host-side, ship 2560 floats/token to the graph.
+- **Third-party evidence for the PLE runtime plan (2026-08-29)**: someone has
+  already built the streaming version of D2, on other hardware.
+  - `garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream` (HF, 2026-08-27;
+    runtime github.com/garnermccloud/sglang-ssd-stream, SGLang-only, Blackwell
+    CUDA) repackages RadixArk's NVFP4 with the PLE table pulled out as ONE flat
+    FP8 sidecar — 51,200,245,760 bytes = 320,001,536 rows × 160 B, one byte per
+    element — streamed from SSD per step with io_uring. Experts are NOT
+    streamed. Self-reported on an RTX PRO 6000: 164.7 tok/s streamed vs
+    148.5-156.2 resident (which reads as a slow baseline, not fast SSD), and
+    126-137 on adversarial random rows. No quality numbers at all (the weights
+    are unaltered). **Not a perf citation** — a design citation.
+  - What transfers is the SIZING: 16 rows × 160 B = 2.5 KiB/token of payload,
+    ≤ ~64 KiB/token in 4 KiB pages after dedup; one decoder block of overlap
+    hides it. On unified memory there is no host→device staging at all, so
+    "touch the pages early" is the whole mechanism.
+  - Design lesson, negative: they built NO cache and no eviction (fixed 64 MiB
+    pools). Deterministic 16 rows/token with poor reuse is better served by
+    issuing the exact page reads early than by an LRU. They also explicitly
+    avoid mmap readahead amplification — our analogue to test in P3 is
+    `madvise(MADV_RANDOM)` on the PLE mapping, since default readahead would
+    turn a 90-160 B row into a large window.
+  - **PLE precision precedent**: every CUDA-world artifact keeps the PLE at
+    FP8/BF16 — SGLang official BF16; primitive-ai's mixed NVFP4/FP8 keeps
+    PLE + embeddings + lm_head + shared experts + routers + norms + indexers at
+    BF16 with experts NVFP4 g16 and attention/GDN FP8 (claims ±1.0 parity over
+    1,370 items); Baekpica's SSD-PLE-GGUF uses Q5_K/Q6_K experts with Q8_0 MTP
+    and always-active matrices. Unsloth's UD ladder is the ONLY 4-bit PLE
+    (IQ4_NL: a 160-element row is 5 blocks × 18 B = 90 B, row-aligned). Action
+    for D3 grading: run a PLE-plane-specific ppl check (IQ4_NL table vs Q8_0
+    table, same trunk) before trusting the 4-bit table.
+  - Better citation for the access pattern itself: LMSYS's day-0 blog
+    https://www.lmsys.org/blog/2026-08-26-qwen-flash-next (16 rows × 160 →
+    2560-dim concat, overlapped with decoder block 0, −0.07% throughput when
+    offloaded).
 - **Perf expectation (scaling guess, NOT a measurement)**: 6B active at
   Q4-class on this machine, scaled from the 35B-A3B's measured 104-107 tok/s
   at ~3B active (~1.7 GB/token → ~3.4 GB/token), lands around ~50 tok/s
