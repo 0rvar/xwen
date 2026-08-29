@@ -38,14 +38,16 @@ HF cache and downloaded on first use:
 | `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | MTP head, 3.2 GB |
 | `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` | none |
 
-**Qwen3.8-Flash-Next is EXPERIMENTAL (P2, 2026-08-29)** — unlike Qwen3.8-27B this one is
-a whole second architecture rather than a registry entry over an existing graph: sparse
-attention, hyper-connections and a 51B n-gram embedding table on top of the familiar
-gated DeltaNet and MoE. It loads, generates and stops correctly,
-but it is not finished: **no drafter, no snapshot or prefix-cache support (both refuse
-loudly), and no serve validation yet**, and it has not been graded against the parity
-oracle. Its perplexity and throughput are not yet characterized. See
-`docs/qwen4exp-port.md`.
+**Qwen3.8-Flash-Next is EXPERIMENTAL and CLI-ONLY (P2, 2026-08-29)** — unlike
+Qwen3.8-27B this one is a whole second architecture rather than a registry entry over an
+existing graph: sparse attention, hyper-connections and a 51B n-gram embedding table on
+top of the familiar gated DeltaNet and MoE. It loads, generates and stops correctly, and
+its graph agrees with upstream llama.cpp (189/192 forced-replay steps, zero hard
+mismatches — `docs/qwen4exp-parity-2026-08-29.md`). It is not finished: **`xwen serve`
+REFUSES this checkpoint until P4**, because snapshots and the prefix cache cannot carry
+its recurrent state; there is no drafter; and it has no parity harness or perplexity
+floor of its own. Decode is 37.5-38.1 tok/s and prefill is 3.5x behind llama.cpp, both
+first measurements with the usual caveats. See `docs/qwen4exp-port.md`.
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full
 names); the HTTP APIs take the **full names only**. Qwen3.8-27B (added 2026-08-14) runs

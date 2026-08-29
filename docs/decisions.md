@@ -1872,6 +1872,175 @@ rate a fully plain run would have exhibited, which a real `--no-draft` A/B still
 The per-round averages it replaced divided by all rounds and inverted the reading of a
 mostly-paused run; `draft` now divides by the rounds that actually drafted (2026-08-09).
 
+## Qwen3.8-Flash-Next (qwen4exp)
+
+The fourth checkpoint and the first that is a genuine second architecture rather than a
+registry entry over an existing graph: 48 layers of gated DeltaNet and sparse attention
+carried on a 4-stream hyper-connection residual, every layer MoE (512 experts, top-10),
+plus a 51.2B n-gram embedding table. `docs/qwen4exp-port.md` is the arc's detailed
+working doc — spec, traps, phase plan, running log — and stays that. **This section is
+the authority for the decisions themselves**; the port doc's own Decisions list is
+retained as the record of what was decided when, and points here.
+
+**Third arch, composition over forking.** `Arch::Qwen4Exp` gets its own graph module;
+shared blocks (DeltaNet, attention internals, MoE glue, rope) are reused by composition
+and parameterized only where the math actually differs. The qwen35/qwen35moe forward
+paths are not edited. Why: the existing three checkpoints keep their throughput BY
+CONSTRUCTION — their code is untouched — and a divergent copy of DeltaNet would rot.
+The parameterizations that came out of it are deliberately tiny: a `ZGate {Silu,
+Sigmoid}` enum on `LinearAttnBlock` resolved at construction (qwen4exp's gated norm
+gates on `sigmoid(z)`, ours on `silu(z)`, a silent-garbage difference), and MoE's renorm
+clamp becoming a `sum_floor` field (existing checkpoints keep 6.103515625e-5, qwen4exp
+passes 0.0 — the clamp is a 3.6-35B detail, not universal). The trunk seam is the same
+principle one level up: `XwenModel` gained an `Option<Qwen4ExpParts>` and a one-line
+dispatch in `run_stack` rather than a second model type, because `Generator` holds a
+concrete `XwenModel` across 87 call sites over 26 methods, all of which a 4-stream model
+needs identically (2026-08-26, seam widened 2026-08-29).
+
+**The PLE table lives on the CPU side.** The `[320001536, 160]` n-gram table is mmap'd
+file-backed; hashing, the 16-row gather and row dequant happen host-side per token, and
+the result (2560 floats/token) feeds the GPU graph. Why: it is pure `get_rows` — no
+matmul ever touches it — row addresses depend only on token ids and so are
+prefetchable, and the page cache handles hot/cold better than any policy we would write.
+GPU residency stays reserved for the ~80 GB trunk. Independently confirmed twice since:
+llama.cpp implements it Gemma-3n-style as one host-side gather table, CPU-resident on
+CUDA automatically; and LMSYS measured −0.07% throughput offloading it (2026-08-26).
+
+**Refuted: building a cache or eviction policy for the PLE table.**
+`garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream` ships the streaming version of that
+design — the table pulled out as a flat FP8 sidecar, streamed per step with io_uring —
+and it deliberately has NO cache and NO eviction, just fixed 64 MiB pools. That is the
+right shape: 16 deterministic rows per token with poor reuse are better served by
+issuing the exact page reads early than by an LRU, and on unified memory there is no
+host→device staging at all, so "touch the pages early" is the whole mechanism. What
+transfers is the sizing (2.5 KiB/token of payload, ≤ ~64 KiB/token in 4 KiB pages after
+dedup, hidden by one decoder block of overlap) and one negative: they avoid mmap
+readahead amplification, so `madvise(MADV_RANDOM)` on our mapping is the thing to test —
+default readahead would turn a 90-160 B row into a large window. Their throughput
+numbers are not a citation for anything; the baseline looks slow rather than the SSD
+fast (2026-08-29).
+
+**Reference-first for every new component.** Hyper-connections, the QSA indexer and PLE
+each got a frozen CPU f32 reference with fixture tests before any device work, mirroring
+the `ReferenceExperts` pattern; fixtures come from the transformers modeling code, the
+one executable ground truth that existed at the time. It earned its keep immediately —
+the fixtures settled the QSA whole-blocks-plus-tail question against llama.cpp, retracted
+a wrong "PLE gate clamp" divergence we had recorded, and caught that a tail-0 context can
+mask the query's own token (2026-08-26).
+
+**Text-only; MTP deferred; serve after CLI.** Vision is dropped (masked_scatter
+injection, empty deepstack — a clean cut, and mrope collapses to NEoX-64 for text
+exactly as on 3.6/3.8). The MTP head has no transformers implementation and its forward
+semantics are unconfirmed (separate `fc_embedding`/`fc_hidden` projections, NOT 3.8's
+concat `eh_proj`), so it waits for vLLM/SGLang or the tech report rather than being
+guessed at. Serve integration follows CLI bring-up — and as of the P2 review it is not
+merely deferred but actively refused: a qwen4exp target would 500 on the snapshot path,
+so `xwen serve` rejects the checkpoint until P4 (2026-08-26, sharpened 2026-08-29).
+
+**Weights: Unsloth first, and `UD-Q4_K_XL` specifically.** Dev and first testing run
+against Unsloth's Q4-class UD file; a self-converted file with a mix we control remains
+the eventual parity target, because floors are calibrated per quant mix and the UD mixes
+are per-layer heterogeneous. `UD-Q4_K_XL` is the chosen first target: it is the only
+Q4-class trunk whose quant types are ones xwen already has kernels for (Q4_K / Q8_0 /
+F32, with IQ4_NL confined to the PLE table). `UD-IQ4_XS` would be roomier — 64.9 GB
+trunk against 82.5 — but needs IQ4_XS matmul kernels we do not have. 82.5 GB of wired
+trunk plus a demand-paged table plus KV is tight on 128 GiB, but it is the same file
+llama.cpp reported 24-25 tok/s decode on for a 128 GB DGX Spark (2026-08-29).
+
+**The 640-column rule, and why Q5_1 became unavoidable.** `ffn_down_exps` is
+`[640, 2560, 512]`, and 640 % 256 = 128, so it fails every K/IQ type's block-size
+requirement and llama.cpp's generic `tensor_type_fallback()` demotes that plane to a
+32-block type on EVERY publisher's file: Q4_K→Q5_0, Q5_K→Q5_1, Q6_K→Q8_0, IQ*→IQ4_NL.
+`ffn_gate_exps`/`ffn_up_exps` (ncols 2560) keep their K-quants; `per_layer_token_embd`
+(ncols 160) is 32-block-only forever, which is how ggml-org shipped a Q8_0 trunk with a
+Q4_0 table. On our target that means Q5_1 down on 43 layers and Q8_0 on 5, against Q4_K
+gate/up on 47 and Q5_K on layer 2. **Q5_1 support is therefore not optional and also not
+blocking**: `ExpertStack` carries dtype per tensor with no whitelist, `FusedExperts::new`
+never compares dtypes across planes or layers, decode falls through to candle's baked
+`kernel_mul_mv_id_q5_1_f32`, and prefill drops the affected layer to per-token
+`mul_mv_id`. So it runs correctly today and the kernel work is reclassified as P3 perf,
+not P2 scope. The `IQ4_NL` matmul deferral stands unchanged — that was always about
+IQ4_NL specifically, not about new matmul dtypes generally (2026-08-29).
+
+**One oracle, no vendored copies.** `reference/llama.cpp` is a single submodule, bumped
+e9fa0781 → `6fe749801` once PR #27742 merged, and it gates every checkpoint including
+qwen4exp. Why this reversed: while the PR was unmerged, its files were vendored
+read-only under `reference/qwen4exp/` as reading material, on the reasoning that an
+unreviewed AI-drafted branch is not a frozen correctness oracle. The merge settled that,
+and a proposed SECOND clone (so the 3.6/3.8 floors could stay frozen at the old pin) was
+refuted in favour of moving the one pin and re-confirming: all three existing checkpoints
+re-passed at `6fe749801` the same day, floors unchanged and not re-derived, so there was
+nothing for a second clone to protect. `scripts/build-llamacpp.sh` needs no target
+argument. Only `PROVENANCE.md` and the semantic `bea3b12d` → `6fe749801` diff survive in
+`reference/qwen4exp/`, as history (2026-08-26, reversed 2026-08-29).
+
+**The loader owns GGUF tensor-table parsing.** candle's `GgmlDType` cannot even PARSE a
+file containing an IQ tensor — `Content::read` fails on the unknown dtype before any
+kernel question arises — so the split-GGUF loader, already xwen-owned code, also owns
+the tensor-table and dtype parsing, and the pinned candle stays unpatched. IQ4_NL work
+splits three ways: metadata visibility (loader), CPU row dequant (needed only for the
+PLE table), and Metal matmul kernels (needed only if a matmul weight is IQ4_NL —
+deferred). Worth recording that this was DECIDED in P0 and not implemented until P2:
+`gguf::open` on the real file failed with "unknown dtype for tensor 20" right up until
+unit U0 landed it (2026-08-26, implemented 2026-08-29).
+
+**QSA rides the existing attention block through an overlay, and decodes by row
+gather.** `AttnBlock::forward` gained a trailing `Option<&QsaSelection>` whose `None`
+path is byte-identical for existing checkpoints; prefill merges a `Mask` into the
+existing `PrefillMask` path, decode passes `Rows` and gathers the selected K/V rows into
+a packed contiguous view for a maskless sdpa. The gather exists because candle's sdpa
+VECTOR kernel — the `seq == 1` route — is compiled WITHOUT mask support and SILENTLY
+IGNORES a mask tensor, so a masked decode through stock sdpa would run dense attention
+with no error at all (2026-08-26).
+
+**QSA pooled keys stay f32; no round-back to the cache dtype.** The block key is
+mean-pooled in f32 and goes straight into the k-norm and rope. HF rounds it back to the
+raw-key cache dtype first, which at a BF16 indexer cache strips the pooled key to 8
+mantissa bits before it is ever scored; llama.cpp pools through `ggml_get_rows` into f32
+and never rounds back. We follow llama.cpp, because llama.cpp is this port's parity
+oracle — the same rule that settles every other divergence in the 3.6/3.8 graphs. **The
+consequence is recorded so it is not rediscovered as a bug: exact index-set parity
+against an HF tap at real geometry is not attainable and is not a goal.** Measured at
+real geometry, the bf16 round-back perturbs scores by ~1.2e-2 against a top-k cut margin
+of ~2e-3, so roughly 0.5 of the 512 selected blocks per query differ at every context
+length above budget. Grade the Metal path against the f32 oracle, not against HF
+(2026-08-29).
+
+**P2 keeps the new recurrent state out of `LayerCache`, and refuses what it cannot
+carry.** Indexer raw-key caches, the PLE conv state and the 2-id token history live in
+`Qwen4ExpParts` with their own checkpoint/rollback mirroring `LayerCache`'s, rather than
+growing a fourth variant across five enums and ~15 match sites. Prefix-cache snapshots,
+host snapshots and the disk tier do not carry them: a qwen4exp target refuses
+snapshot save and restore with a loud error. Why: it decoupled three parallel units from
+`kv_cache.rs` entirely. The cost is honest and now scheduled — it is exactly why serve
+is refused until P4 (2026-08-29).
+
+**PLE in P2 is host-hybrid, knowingly.** Hash, table row gather and IQ4_NL row dequant
+run on the CPU from `MmapSource::bytes`; `key_proj`/`value_proj` run on device; the
+per-stream gate, signed sqrt, dilated conv and silu run on the host in f32 over a
+`[n, 10240]` copy of the stream — 40 KB/token and one device→host sync per forward at
+layer 1. A known P3 cost taken deliberately for correctness first (2026-08-29).
+
+**Refuted: the pre-release architecture priors.** The port was planned five days before
+the card dropped, from a trimmed model-card and forum copy-pastes. Grading them against
+the real config: GDN carried over (true, and byte-identical in geometry to our 27B
+block, except the gated norm's z-gate is `sigmoid` not `silu`); the n-gram table is
+Engram-shaped (true in structure, wrong in three details — raw token ids with NO
+NFKC/lowercasing, ONE layer not "a couple of mid-stack layers", and a per-stream
+dot-product gate rather than Engram's scalar one); hyper-connections were flagged as the
+biggest structural risk at LOW confidence and are in fact present in every layer, which
+is the single largest structural difference from anything we ship; and QSA being
+DeepSeek-DSA-shaped was right in outline. The lesson is the one the priors themselves
+warned about: they were useful for sizing the work and worthless as ground truth — every
+one of them was re-derived from `config.json`, the transformers modular file and the
+shipped GGUF headers before a line was written (2026-08-25, graded 2026-08-26).
+
+**Phased, correctness before speed.** P0 scaffold (split-GGUF loader, config parse,
+registry) → P1 CPU references and fixtures → P2 graph assembly, real file, greedy smoke,
+oracle agreement → P3 Metal and perf → P4 serve, sampling defaults, harness extension.
+P2 closed 2026-08-29 with the graph agreeing with the llama.cpp oracle at 189/192
+forced-replay steps and zero hard mismatches (2026-08-26).
+
 ## Process
 
 Inherited unchanged: multi-reviewer review with external model families on evidence

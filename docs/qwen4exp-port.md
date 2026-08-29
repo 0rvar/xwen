@@ -44,7 +44,12 @@ Residual skeleton is hyper-connections (4 streams). Tokenizer is exactly
 Qwen3.8-27B's; chat template is a near-clone of the 3.8 dialect plus vision
 items. Vision is an inline ViT, cleanly droppable for text-only.
 
-## Decisions (numbered, dated; migrate to decisions.md when the arc ships)
+## Decisions (numbered, dated)
+
+> **docs/decisions.md "Qwen3.8-Flash-Next (qwen4exp)" is now the authority for these
+> decisions** (migrated 2026-08-29). The list below is kept as the record of what was
+> decided when, and as the numbering D1-D18 that the rest of this doc cites.
+
 
 - **D1 (2026-08-26) Third arch, composition over forking.** `Arch::Qwen4Exp` gets
   its own graph module. Shared blocks (DeltaNet, attention internals, MoE glue,

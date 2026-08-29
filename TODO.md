@@ -1910,8 +1910,10 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     so the 43 affected layers regain grouped prefill; (c) decide whether
     `FusedExperts::use_mm` should be per-stack instead of all-or-nothing: today
     one unsupported down plane drops that layer's gate and up to per-token
-    matvec too, which is the bulk of the cost. Measure before and after; the
-    43-layer prefill penalty has not been quantified yet.
+    matvec too, which is the bulk of the cost. Measure before and after.
+    **Quantified 2026-08-29 by U7**: prefill is 3.5x behind llama.cpp on this
+    file (203.5 vs 713.4 tok/s at 530 tokens), and this is suspect number one.
+    Grouped with the rest of the deferred perf work in the P3 ledger below.
   - **2026-08-29 — P4: the parity harness cannot run on qwen4exp (from U7).**
     All four tiers of `scripts/parity-gate.ts` die on this checkpoint, because
     every tier's reference side is `--moe-impl reference` and
@@ -1936,7 +1938,8 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     pair scores 1.69 nats, and llama.cpp independently agrees, so it is the model
     and not a bug, but it makes the frozen corpus a weak discriminator here. Pick
     a fresh held-out corpus for flash-next and re-derive `PPL_NLL_DELTA_MAX`
-    against it.
+    against it. (Part of what "experimental" means for this checkpoint — see the
+    P4 ledger below for the full set.)
   - **2026-08-29 — P4/P3: Flash-Next prefill is 3.5x slower than llama.cpp
     (from U7).** 203.5 tok/s against 713.4 at 530 prompt tokens on the identical
     file in the same hour; 2.60 s reproduced to the centisecond across two
@@ -1951,3 +1954,71 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     memory where llama-server dirties 751 MB on the same file (64 GB vs 76 GB
     clean mapped), i.e. ~15 GB of weights are materialized rather than aliased
     from the mapping. Worth understanding under the one-large-process rule.
+  - **2026-08-29 — P3 perf ledger for Flash-Next (everything deferred from P2).**
+    P2 was correctness-first by decision (decisions.md), so every one of these is
+    a known cost taken deliberately, not a discovery. In rough order of expected
+    payoff: **(1)** the Q5_1 expert kernels and per-stack `use_mm` — its own
+    bullet above, and the first thing to try against the prefill gap; **(2)**
+    **prefill is 3.5x behind llama.cpp** — its own bullet above; **(3)** a fused
+    `hc_mix` kernel: the hyper-connection read/write is ~15 dispatches per
+    layer-pair built from candle primitives, across all 48 layers, and was
+    flagged as the top fusion candidate before any of it was written; **(4)**
+    QSA top-k runs on the host via `arg_sort` — a device partial-top-k kernel is
+    the intended replacement (D16 says selection is computed with candle ops in
+    P2 explicitly "top-k kernel is P3"); **(5)** the PLE gate, signed sqrt,
+    dilated conv and silu run on the HOST in f32 over a `[n,10240]` copy of the
+    stream, 40 KB/token plus one device→host sync per forward at layer 1 (D17) —
+    move them to device; **(6)** PLE prefetch: at prefill every row address is
+    computable from token ids before layer 0 runs (hash, dedupe, batch-fault on a
+    background thread), and at decode the moment token t is sampled position
+    t+1's ~16 rows are known — touch them while the trunk runs. Never gate the
+    fetch on the PLE gate value: it is computed mid-forward, acting on it
+    serializes the lookup and kills the prefetch, and unconditional retrieval is
+    cheap. Test `madvise(MADV_RANDOM)` on the table mapping (default readahead
+    turns a 90-160 B row into a large window) and MEASURE cold vs warm fault cost
+    rather than assuming the page cache wins; **(7)** QSA mask memory — the
+    prefill overlay materializes a `[n_q, n_kv]` mask; **(8)** `IndexerCache`
+    allocates at `max_ctx` with no growth path, ~1.6 GB across the 12 QSA layers
+    at the checkpoint's 262144 ctx, paid whether or not the conversation gets
+    there; **(9)** the ~50 tok/s decode figure in the port doc's P0-pause notes
+    was a SCALING GUESS from the 35B-A3B, never a measurement — the real first
+    number is 37.5-38.1, so either close the gap or retire the guess.
+  - **2026-08-29 — P4 ledger for Flash-Next (what "experimental" currently
+    means).** **Serve is REFUSED for this checkpoint**, not merely untested: a
+    qwen4exp target would 500 on the snapshot path, because prefix-cache
+    snapshots, host snapshots and the disk tier do not carry the new recurrent
+    state (indexer raw-key caches, PLE conv window, the 2-id token history) — D15
+    took that decoupling deliberately in P2. Closing it means teaching
+    snapshot/page-out/rewind about all three, INCLUDING new disk LAYER_* tags
+    that correctly reject on old readers, and the 2-id history is sequence-level
+    (store beside `CacheSnapshot::pos`, not per layer) and is u32 in an all-f32
+    plane world, so it needs its own plane type and validator. Also P4:
+    `Model::recommended_presence_penalty()` returns the card's 1.5 for
+    non-thinking Flash-Next and **nothing consumes it** — threading the request's
+    resolved checkpoint through openai/native/anthropic prepare is the same
+    wiring needed to stop accept-and-dropping request penalties (2026-08-19
+    item); the parity-harness fixes and the MTP drafter arc have their own
+    bullets above; the embedded chat template is Unsloth-modified and diverges
+    from `reference/chat_template-qwen38.jinja` for **tool calls, the developer
+    role, multiple leading system messages and `effort=high`** (plain chat and
+    thinking render byte-identical, which is why P2 could ship on it); and the
+    checkpoint's tokenizer adds seven audio/TTS specials at 248070-248076 that
+    the embedded 3.6 tokenizer does not carry — harmless for text, unhandled.
+  - **2026-08-29 — Upstream reports owed (three, none filed).** **(1) candle
+    Metal `index_select` is silently wrong on strided sources** — no error, just
+    wrong rows; found in U3 and worked around by gathering per head. This is a
+    correctness bug in a dependency and is the most valuable of the three to
+    file. **(2) llama.cpp's QSA top-k width diverges from HF**: the PR fills
+    `top_k + ratio - 1` tokens unconditionally where HF selects whole top-k
+    blocks plus the raw tail, so they differ whenever `visible mod ratio ≠
+    ratio−1` above budget. We follow HF (fixture-pinned); worth reporting, with
+    the caveat below. **(3) the converter lost its `image_token_id` config.json
+    fallback**, so a self-converted text-only file will likely carry no
+    `ple.image_token_id` and silently fall back to EOS — harmless for us, looks
+    like a regression. WATCH ITEM alongside these: the unmerged `origin/tmp-q4`
+    branch (`f91123d2d`) reworks QSA to pack visible tokens into whole blocks in
+    token order with the budget in whole blocks and pooled keys roped at the
+    first member's real position — i.e. it converges on the HF semantics our
+    fixtures already pin, which would retire report (2). If it merges: re-vendor,
+    re-read every QSA entry in the port doc, and re-check the divergence list
+    before filing anything.
