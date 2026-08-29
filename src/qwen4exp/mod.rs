@@ -9,3 +9,9 @@
 pub mod ref_hc;
 pub mod ref_ple;
 pub mod ref_qsa;
+
+pub mod hc;
+pub mod indexer;
+pub mod iq4nl;
+pub mod ple;
+pub mod stack;
