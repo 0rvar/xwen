@@ -3919,6 +3919,432 @@ fn check_flash_kv(
     Ok((n_kv, len, stride[0]))
 }
 
+// ---------------------------------------------------------------------------
+// Hyper-connections (qwen4exp carrier read/write) — see src/ops/hc.metal.
+// ---------------------------------------------------------------------------
+
+/// The widest carrier `hc.metal` sizes its per-thread injection accumulators for
+/// (`HC_MAX_STREAMS` there). The shipped geometry is 4; the two numbers are
+/// spelled out in both languages, so keep them in step.
+pub(crate) const HC_MAX_STREAMS: usize = 8;
+
+/// Threadgroup width for `kernel_hc_norm`: the largest multiple of the simd
+/// width up to 256 that DIVIDES `hidden`. Dividing is what keeps each thread's
+/// strided walk inside a single stream, which is what makes the `hc_count`
+/// sum-of-squares reductions disjoint; the multiple-of-32 keeps `simd_sum`
+/// folding over full simdgroups. `None` when no such width exists — the caller
+/// falls back to the candle chain rather than failing.
+fn hc_norm_threads(hidden: usize) -> Option<usize> {
+    if hidden == 0 {
+        // Every width divides zero; a zero-wide stream has no launch at all.
+        return None;
+    }
+    (1..=8)
+        .rev()
+        .map(|m| m * DELTA_SIMD_WIDTH)
+        .find(|w| hidden.is_multiple_of(*w))
+}
+
+/// Whether the fused hyper-connection read kernels cover this geometry. The
+/// bounds are the kernel's, so a gate outside them keeps the candle chain
+/// instead of failing (the tiny fixture geometries are inside it; a `hidden`
+/// under 32, or not a multiple of it, is not).
+pub(crate) fn hc_norm_supported(hc_count: usize, hidden: usize) -> bool {
+    hc_count > 0 && hc_count <= HC_MAX_STREAMS && hc_norm_threads(hidden).is_some()
+}
+
+/// Matches the Metal `hc_norm_args` struct (src/ops/hc.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HcNormArgs {
+    hc_count: i32,
+    hidden: i32,
+    width: i32,
+    eps: f32,
+    inv_hc: f32,
+}
+
+/// Matches the Metal `hc_silu_args` struct (src/ops/hc.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HcSiluArgs {
+    n: i32,
+    scale: f32,
+}
+
+/// Matches the Metal `hc_mix_args` struct (src/ops/hc.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HcMixArgs {
+    n: i32,
+    hc_count: i32,
+    hidden: i32,
+    inv_hc: f32,
+}
+
+/// Matches the Metal `hc_write_args` struct (src/ops/hc.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HcWriteArgs {
+    n: i32,
+    hc_count: i32,
+    hidden: i32,
+}
+
+/// The carrier's grouped RMS norm — per-stream statistics, FULL-width weight —
+/// against `kernel_hc_norm` (hc.metal), plus, when `inject_w` is present, the
+/// injection head's `hc_count` full-row dot products and their
+/// `2*sigmoid(./hc_count)` folded into the same threadgroup.
+///
+/// `stream` is the raw carrier `[n, hc_count * hidden]` f32, `norm_w` the
+/// `[hc_count * hidden]` multiply-ready norm weight, `inject_w` the dense
+/// `[hc_count, hc_count * hidden]` head (`None` on the tail mixer). Returns the
+/// normed carrier `[n, hc_count * hidden]` and, with a head, the write
+/// strengths `[n, hc_count]`.
+pub(crate) fn run_hc_norm(
+    stream: &Tensor,
+    norm_w: &Tensor,
+    inject_w: Option<&Tensor>,
+    hc_count: usize,
+    hidden: usize,
+    eps: f32,
+) -> Result<(Tensor, Option<Tensor>)> {
+    let cdev = stream.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("hc_norm requires the carrier on a Metal device");
+    };
+
+    if hc_count == 0 || hc_count > HC_MAX_STREAMS {
+        bail!("hc_norm hc_count ({hc_count}) must be in 1..={HC_MAX_STREAMS}");
+    }
+    let width = checked_elems(&[hc_count, hidden], "hc_norm carrier width")?;
+    let Some(threads) = hc_norm_threads(hidden) else {
+        bail!(
+            "hc_norm hidden ({hidden}) must be a multiple of {DELTA_SIMD_WIDTH} so the \
+             per-stream reduction tiles whole simdgroups"
+        );
+    };
+    let (n, row) = stream
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("the carrier must be rank-2 [n, hc_count * hidden]: {e}"))?;
+    if n == 0 {
+        bail!("hc_norm needs at least one token");
+    }
+    if row != width {
+        bail!("the carrier is {row} wide, expected hc_count * hidden = {width}");
+    }
+    check_f32(stream, &[n, width], "carrier")?;
+    check_f32(norm_w, &[width], "hc norm weight")?;
+    if let Some(inject_w) = inject_w {
+        check_f32(inject_w, &[hc_count, width], "hc injection head")?;
+    }
+    for (name, t) in [
+        Some(("hc norm weight", norm_w)),
+        inject_w.map(|t| ("hc injection head", t)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !stream.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as the carrier");
+        }
+    }
+    let n_normed = checked_elems(&[n, width], "hc_norm")?;
+    glue_index_fits_i32(n_normed)?;
+    let n_inject = checked_elems(&[n, hc_count], "hc_norm injection")?;
+
+    let kernel = if inject_w.is_some() {
+        "kernel_hc_norm_inject"
+    } else {
+        "kernel_hc_norm"
+    };
+    let pipeline = pipelines::hc_pipeline(mdev.device(), kernel)?;
+    if pipeline.max_total_threads_per_threadgroup() < threads {
+        bail!(
+            "hc_norm needs {threads} threads per threadgroup, the pipeline allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    // Same 32-wide-simdgroup assumption the delta kernels make, checked at
+    // pipeline setup so it fails at load rather than silently at dispatch.
+    check_delta_simd_width(&pipeline, kernel)?;
+
+    let normed = mdev.new_buffer(n_normed, DType::F32, "hc_norm")?;
+    // Allocated whether or not there is a head: the kernel takes both output
+    // bindings, and the no-head arm never writes through this one.
+    let inject = mdev.new_buffer(
+        if inject_w.is_some() { n_inject } else { 1 },
+        DType::F32,
+        "hc_inject",
+    )?;
+
+    let (x_guard, x_layout) = stream.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("the carrier is not on a Metal device");
+    };
+    let (w_guard, w_layout) = norm_w.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("the hc norm weight is not on a Metal device");
+    };
+    let inj_parts = inject_w.map(|t| t.storage_and_layout());
+
+    let args = HcNormArgs {
+        hc_count: hc_count as i32,
+        hidden: hidden as i32,
+        width: width as i32,
+        eps,
+        // The classic chain scales by candle's `affine(1/hc_count, 0)`, a
+        // MULTIPLY; matching it keeps the two paths' rounding identical where
+        // 1/hc_count is not exact.
+        inv_hc: (1.0 / hc_count as f64) as f32,
+    };
+    {
+        // The unused-head arm binds the norm weight into the injection slot:
+        // the kernel never dereferences it, and a bound buffer keeps the
+        // argument table uniform across both specializations.
+        let (inj_buf, inj_off) = match &inj_parts {
+            Some((guard, layout)) => {
+                let Storage::Metal(storage) = &**guard else {
+                    bail!("the hc injection head is not on a Metal device");
+                };
+                (storage.buffer(), f32_off(layout))
+            }
+            None => (w_storage.buffer(), f32_off(w_layout)),
+        };
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
+        encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
+        encoder.set_input_buffer(3, Some(inj_buf), inj_off);
+        encoder.set_output_buffer(4, Some(&normed), 0);
+        encoder.set_output_buffer(5, Some(&inject), 0);
+        encoder.dispatch_thread_groups(mtl_size!(n, 1, 1), mtl_size!(threads, 1, 1));
+    }
+    drop(x_guard);
+    drop(w_guard);
+    drop(inj_parts);
+
+    let normed = output_tensor(normed, mdev, n_normed, (n, width));
+    let inject = inject_w.map(|_| output_tensor(inject, mdev, n_inject, (n, hc_count)));
+    Ok((normed, inject))
+}
+
+/// The bottleneck activation `silu(x / hc_count)` against
+/// `kernel_hc_silu_quarter` (hc.metal), replacing candle's affine + silu pair.
+/// `x` is the down projection's output, any shape, f32 contiguous; the result
+/// keeps that shape. Bit-identical to the pair it replaces.
+pub(crate) fn run_hc_silu_quarter(x: &Tensor, hc_count: usize) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("hc_silu_quarter requires its input on a Metal device");
+    };
+    if hc_count == 0 {
+        bail!("hc_silu_quarter hc_count must be positive");
+    }
+    if x.dtype() != DType::F32 {
+        bail!("hc_silu_quarter input must be f32, got {:?}", x.dtype());
+    }
+    if !x.is_contiguous() {
+        bail!("hc_silu_quarter input must be contiguous");
+    }
+    let shape = x.shape().clone();
+    let n = checked_elems(shape.dims(), "hc_silu_quarter")?;
+    if n == 0 {
+        bail!("hc_silu_quarter needs at least one element");
+    }
+    glue_index_fits_i32(n)?;
+
+    let pipeline = pipelines::hc_pipeline(mdev.device(), "kernel_hc_silu_quarter")?;
+    let dst = mdev.new_buffer(n, DType::F32, "hc_silu_quarter")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("hc_silu_quarter input is not on a Metal device");
+    };
+
+    let args = HcSiluArgs {
+        n: n as i32,
+        scale: (1.0 / hc_count as f64) as f32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
+        encoder.set_output_buffer(2, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(x_guard);
+
+    Ok(output_tensor(dst, mdev, n, shape))
+}
+
+/// The stream mix and collapse against `kernel_hc_mix` (hc.metal):
+/// `mixed[j] = mean_s sigmoid(up[s * hidden + j]) * normed[s * hidden + j]`.
+/// `up` is the up projection's RAW pre-sigmoid logits `[n, hc_count * hidden]`
+/// and `normed` the normed carrier of the same shape; returns `[n, hidden]`.
+pub(crate) fn run_hc_mix(
+    up: &Tensor,
+    normed: &Tensor,
+    hc_count: usize,
+    hidden: usize,
+) -> Result<Tensor> {
+    let cdev = up.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("hc_mix requires its input on a Metal device");
+    };
+    if hc_count == 0 || hidden == 0 {
+        bail!("hc_mix geometry must be positive, got hc_count {hc_count}, hidden {hidden}");
+    }
+    let width = checked_elems(&[hc_count, hidden], "hc_mix carrier width")?;
+    let (n, row) = up
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("hc_mix up must be rank-2 [n, hc_count * hidden]: {e}"))?;
+    if n == 0 {
+        bail!("hc_mix needs at least one token");
+    }
+    if row != width {
+        bail!("hc_mix up is {row} wide, expected hc_count * hidden = {width}");
+    }
+    check_f32(up, &[n, width], "hc_mix up")?;
+    check_f32(normed, &[n, width], "hc_mix normed")?;
+    if !up.device().same_device(normed.device()) {
+        bail!("hc_mix operands must live on the same Metal device");
+    }
+    let n_out = checked_elems(&[n, hidden], "hc_mix")?;
+    glue_index_fits_i32(checked_elems(&[n, width], "hc_mix input")?)?;
+
+    let pipeline = pipelines::hc_pipeline(mdev.device(), "kernel_hc_mix")?;
+    let dst = mdev.new_buffer(n_out, DType::F32, "hc_mix")?;
+
+    let (up_guard, up_layout) = up.storage_and_layout();
+    let Storage::Metal(up_storage) = &*up_guard else {
+        bail!("hc_mix up is not on a Metal device");
+    };
+    let (nm_guard, nm_layout) = normed.storage_and_layout();
+    let Storage::Metal(nm_storage) = &*nm_guard else {
+        bail!("hc_mix normed is not on a Metal device");
+    };
+
+    let args = HcMixArgs {
+        n: n_out as i32,
+        hc_count: hc_count as i32,
+        hidden: hidden as i32,
+        inv_hc: (1.0 / hc_count as f64) as f32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(up_storage.buffer()), f32_off(up_layout));
+        encoder.set_input_buffer(2, Some(nm_storage.buffer()), f32_off(nm_layout));
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n_out);
+    }
+    drop(up_guard);
+    drop(nm_guard);
+
+    Ok(output_tensor(dst, mdev, n_out, (n, hidden)))
+}
+
+/// The write-back against `kernel_hc_write` (hc.metal):
+/// `new[s * hidden + j] = stream[s * hidden + j] + block_out[j] * inject[s]`,
+/// onto the RAW carrier and OUT OF PLACE. `stream` is `[n, hc_count * hidden]`,
+/// `block_out` `[n, hidden]`, `inject` `[n, hc_count]`, all f32 contiguous.
+/// Bit-identical to the candle broadcast-multiply-then-add chain it replaces.
+pub(crate) fn run_hc_write(stream: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tensor> {
+    let cdev = stream.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("hc_write requires the carrier on a Metal device");
+    };
+
+    let (n, width) = stream
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("the carrier must be rank-2 [n, hc_count * hidden]: {e}"))?;
+    let (n_out, hidden) = block_out
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("the block output must be rank-2 [n, hidden]: {e}"))?;
+    let (n_inj, hc_count) = inject
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("the injection must be rank-2 [n, hc_count]: {e}"))?;
+    if n == 0 {
+        bail!("hc_write needs at least one token");
+    }
+    if n != n_out || n != n_inj {
+        bail!("row counts differ: carrier {n}, block output {n_out}, injection {n_inj}");
+    }
+    if hc_count == 0 || hidden == 0 {
+        bail!("hc_write geometry must be positive, got hc_count {hc_count}, hidden {hidden}");
+    }
+    if checked_elems(&[hc_count, hidden], "hc_write carrier width")? != width {
+        bail!(
+            "the carrier is {width} wide but the block output ({hidden}) times the stream \
+             count ({hc_count}) is {}",
+            hc_count * hidden
+        );
+    }
+    check_f32(stream, &[n, width], "carrier")?;
+    check_f32(block_out, &[n, hidden], "block output")?;
+    check_f32(inject, &[n, hc_count], "injection")?;
+    for (name, t) in [("block output", block_out), ("injection", inject)] {
+        if !stream.device().same_device(t.device()) {
+            bail!("the {name} must live on the same Metal device as the carrier");
+        }
+    }
+    let n_elems = checked_elems(&[n, width], "hc_write")?;
+    glue_index_fits_i32(n_elems)?;
+
+    let pipeline = pipelines::hc_pipeline(mdev.device(), "kernel_hc_write")?;
+    let dst = mdev.new_buffer(n_elems, DType::F32, "hc_write")?;
+
+    let (x_guard, x_layout) = stream.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("the carrier is not on a Metal device");
+    };
+    let (b_guard, b_layout) = block_out.storage_and_layout();
+    let Storage::Metal(b_storage) = &*b_guard else {
+        bail!("the block output is not on a Metal device");
+    };
+    let (i_guard, i_layout) = inject.storage_and_layout();
+    let Storage::Metal(i_storage) = &*i_guard else {
+        bail!("the injection is not on a Metal device");
+    };
+
+    let args = HcWriteArgs {
+        n: n_elems as i32,
+        hc_count: hc_count as i32,
+        hidden: hidden as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
+        encoder.set_input_buffer(2, Some(b_storage.buffer()), f32_off(b_layout));
+        encoder.set_input_buffer(3, Some(i_storage.buffer()), f32_off(i_layout));
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n_elems);
+    }
+    drop(x_guard);
+    drop(b_guard);
+    drop(i_guard);
+
+    Ok(output_tensor(dst, mdev, n_elems, (n, width)))
+}
+
 #[cfg(test)]
 mod combine_guard_tests {
     use super::{combine_index_fits_i32, combine_reduction_width};

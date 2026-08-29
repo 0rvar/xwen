@@ -6,6 +6,7 @@ pub mod dense_mm;
 mod dispatch;
 pub mod f16;
 pub mod flash;
+pub mod hc;
 pub mod mm_id;
 pub mod moe_glue;
 pub mod mv_ext;
@@ -25,6 +26,7 @@ pub use dense_mm::{dense_mm_supported, matmul_dense_q};
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
 pub use flash::flash_attn;
+pub use hc::{hc_mix, hc_norm, hc_norm_supported, hc_silu_quarter, hc_write};
 pub use mm_id::mul_mm_id;
 pub use moe_glue::{moe_epilogue, moe_router, moe_router_supported};
 pub use mv_ext::{matmul_mv_ext, mv_ext_supported};
@@ -350,6 +352,26 @@ pub fn moe_dual() -> bool {
 pub fn attn_glue_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_ATTN_GLUE_CLASSIC").is_some())
+}
+
+/// `XWEN_HC_CLASSIC=1` reverts the qwen4exp hyper-connection gates — the
+/// carrier's grouped norm and injection head (`ops::hc_norm`), the bottleneck
+/// activation (`ops::hc_silu_quarter`), the stream mix (`ops::hc_mix`) and the
+/// write-back (`ops::hc_write`) — to the candle chains they replace. ONE switch
+/// covers all four, because they are one fused read gate and its write side.
+///
+/// The activation and the write-back are bit-identical to their chains by
+/// construction; the norm and the mix partition reductions those chains run in
+/// one order, so they are bounded rather than bitwise (hc.metal, and the
+/// tolerances the hc.rs tests grade at). The two Q8_0 bottleneck matmuls are
+/// outside the switch — both paths run the same `QLinear`.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`combine_classic`, `attn_glue_classic`): any value enables it — only leaving
+/// it unset keeps the fused path.
+pub fn hc_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_HC_CLASSIC").is_some())
 }
 
 /// `XWEN_FLASH_CLASSIC=1` reverts the prefill (seq > 1) attention from the

@@ -14,9 +14,18 @@
 //! `build_hc_combine` (`reference/llama.cpp/src/models/qwen4exp.cpp`) is the
 //! executable ground truth both follow.
 //!
-//! Correctness first — this is P2. Every step here is a plain candle op, so the
-//! read costs three dispatched matmuls plus a handful of elementwise passes per
-//! block; fusing the norm + bottleneck into one kernel is P3 work.
+//! Two implementations live here. The CLASSIC one is a plain candle op per
+//! step — three dispatched matmuls plus a dozen elementwise passes per read,
+//! three more per write — and is kept verbatim as the `XWEN_HC_CLASSIC`
+//! kill-switch and provenance anchor. The DEFAULT one keeps the two Q8_0
+//! bottleneck matmuls on `QLinear` and replaces everything around them with the
+//! four vendored kernels in `src/ops/hc.metal`: the grouped norm and the
+//! injection head in one threadgroup per token, the bottleneck activation, the
+//! mix-and-collapse, and the write-back. Four gates per layer over 48 layers is
+//! why: the candle chain is 34% of prefill wall.
+//!
+//! The fused path is taken only for a geometry the kernels cover
+//! (`ops::hc_norm_supported`); anything else falls back rather than failing.
 
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::{DType, Tensor};
@@ -50,6 +59,16 @@ pub struct HcRead {
     up: QLinear,
     /// `[hc_count, hc_count * hidden]`; absent on the tail mixer.
     inject: Option<QLinear>,
+    /// The same injection head as a dense f32 `[hc_count, hc_count * hidden]`
+    /// tensor, which is what the fused norm kernel contracts against (it reads
+    /// raw f32 rows, not a `QMatMul`). Present exactly when `inject` is.
+    ///
+    /// A deliberate duplicate rather than a replacement: the classic path must
+    /// keep the exact `QLinear` chain it was blessed with, whatever the file
+    /// stored the head at. The head is the smallest weight in the gate —
+    /// `hc_count * hc_count * hidden` f32, 160 KiB at the real geometry, ~16 MiB
+    /// across the whole stack.
+    inject_dense: Option<Tensor>,
     /// RMS epsilon, the model-wide `rms_norm_eps`.
     eps: f64,
 }
@@ -89,6 +108,13 @@ impl HcRead {
         } else {
             None
         };
+        // Same tensor name the `QLinear` above resolved, dequantized once for
+        // the fused kernel. `dense_f32` yields f32 whatever the file stored.
+        let inject_dense = if with_inject {
+            Some(w.dense_f32(&format!("{prefix}_inject"))?)
+        } else {
+            None
+        };
 
         Self::assemble(
             hc_count,
@@ -99,6 +125,7 @@ impl HcRead {
             down,
             up,
             inject,
+            inject_dense,
         )
     }
 
@@ -131,6 +158,9 @@ impl HcRead {
             QLinear::from_qtensor(std::sync::Arc::new(qt))
         };
         let inject = inject_w.map(lin).transpose()?;
+        let inject_dense = inject_w
+            .map(|t| t.to_dtype(DType::F32)?.contiguous())
+            .transpose()?;
         Self::assemble(
             hc_count,
             hidden,
@@ -140,6 +170,7 @@ impl HcRead {
             lin(down_w)?,
             lin(up_w)?,
             inject,
+            inject_dense,
         )
     }
 
@@ -153,6 +184,7 @@ impl HcRead {
         down: QLinear,
         up: QLinear,
         inject: Option<QLinear>,
+        inject_dense: Option<Tensor>,
     ) -> Result<Self> {
         ensure!(
             hc_count > 0 && hidden > 0 && low_rank > 0,
@@ -189,6 +221,17 @@ impl HcRead {
                 inject.in_dim
             );
         }
+        ensure!(
+            inject.is_some() == inject_dense.is_some(),
+            "the injection head and its dense copy must be present together"
+        );
+        if let Some(dense) = &inject_dense {
+            ensure!(
+                dense.dims() == [hc_count, width],
+                "the dense injection head is {:?}, expected [{hc_count}, {width}]",
+                dense.dims()
+            );
+        }
         Ok(Self {
             hc_count,
             hidden,
@@ -197,6 +240,7 @@ impl HcRead {
             down,
             up,
             inject,
+            inject_dense,
             eps,
         })
     }
@@ -254,6 +298,9 @@ impl HcRead {
             stream.dtype()
         );
         let (n, _) = stream.dims2()?;
+        if self.fused(stream) {
+            return self.read_fused(stream);
+        }
         let normed = self.grouped_norm(stream)?;
 
         // Low-rank bottleneck. The 1/hc_count scale is on the bottleneck
@@ -283,6 +330,37 @@ impl HcRead {
             ),
             None => None,
         };
+        Ok((mixed, inject))
+    }
+
+    /// Whether this gate takes the vendored kernels rather than the candle
+    /// chain: a Metal device, the kill-switch unset, and a geometry the norm
+    /// kernel's launch covers. The bounds are the kernel's, so a gate outside
+    /// them falls back rather than failing.
+    fn fused(&self, stream: &Tensor) -> bool {
+        !crate::ops::hc_classic()
+            && stream.device().is_metal()
+            && stream.is_contiguous()
+            && crate::ops::hc_norm_supported(self.hc_count, self.hidden)
+    }
+
+    /// [`read`](Self::read) through the vendored kernels: one threadgroup per
+    /// token does the grouped norm and the injection head together, the
+    /// bottleneck keeps its two `QLinear` matmuls, and the mix-and-collapse is
+    /// one pass over the up projection's RAW logits (the sigmoid is folded into
+    /// it, so no full-width sigmoid pass is materialized).
+    fn read_fused(&self, stream: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
+        let (normed, inject) = crate::ops::hc_norm(
+            stream,
+            &self.norm_w,
+            self.inject_dense.as_ref(),
+            self.hc_count,
+            self.hidden,
+            self.eps as f32,
+        )?;
+        let low = crate::ops::hc_silu_quarter(&self.down.forward(&normed)?, self.hc_count)?;
+        let up = self.up.forward(&low)?;
+        let mixed = crate::ops::hc_mix(&up, &normed, self.hc_count, self.hidden)?;
         Ok((mixed, inject))
     }
 
@@ -321,6 +399,17 @@ pub fn hc_write(stream: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<
          count ({hc_count}) is {}",
         hc_count * hidden
     );
+    // One pass, out of place, bit-identical to the chain below. The kernel
+    // takes contiguous f32 operands only; anything else keeps the chain rather
+    // than failing.
+    if !crate::ops::hc_classic()
+        && stream.device().is_metal()
+        && [stream, block_out, inject]
+            .iter()
+            .all(|t| t.dtype() == DType::F32 && t.is_contiguous())
+    {
+        return crate::ops::hc_write(stream, block_out, inject);
+    }
     let scaled = block_out
         .reshape((n, 1, hidden))?
         .broadcast_mul(&inject.reshape((n, hc_count, 1))?)?;
@@ -652,6 +741,106 @@ mod tests {
             "tail mixer rel_l2 {} > 1e-5",
             rel_l2(&got_tail, &want_tail)
         );
+    }
+
+    /// The live read path against the candle chain it replaces, at the real
+    /// geometry and over the same gate weights.
+    ///
+    /// The chain here is spelled out rather than called, so that an edit to
+    /// either implementation shows up as a failure instead of silently moving
+    /// the target. Under `XWEN_HC_CLASSIC` the two sides are the same code and
+    /// this only re-proves the transcription; under the default it is what pins
+    /// the vendored kernels to the chain. The norm and the mix partition
+    /// reductions the chain runs in one order, so it grades at 1e-6 rather than
+    /// bitwise.
+    #[test]
+    fn read_matches_the_candle_chain() {
+        let dev = dev();
+        let (hc_count, hidden, low_rank, n) = (4usize, 2560usize, 320usize, 5usize);
+        let width = hc_count * hidden;
+        let eps = 1e-6f64;
+
+        let norm_w: Vec<f32> = seeded(width, 111).iter().map(|v| 1.0 + 0.1 * v).collect();
+        let gate = HcRead::from_tensors(
+            hc_count,
+            hidden,
+            low_rank,
+            eps,
+            Tensor::from_slice(&norm_w, width, &dev).unwrap(),
+            &tensor2(&seeded(low_rank * width, 222), low_rank, width, &dev),
+            &tensor2(&seeded(width * low_rank, 333), width, low_rank, &dev),
+            Some(&tensor2(
+                &seeded(hc_count * width, 444),
+                hc_count,
+                width,
+                &dev,
+            )),
+        )
+        .unwrap();
+        let stream = tensor2(&seeded(n * width, 555), n, width, &dev);
+
+        let (mixed, inject) = gate.read(&stream).unwrap();
+        let inject = inject.expect("a block gate has an injection head");
+
+        let inv_hc = 1.0 / hc_count as f64;
+        let normed = gate.grouped_norm(&stream).unwrap();
+        let low = silu(
+            &gate
+                .down
+                .forward(&normed)
+                .unwrap()
+                .affine(inv_hc, 0.0)
+                .unwrap(),
+        )
+        .unwrap();
+        let mix = sigmoid(&gate.up.forward(&low).unwrap()).unwrap();
+        let want_mixed = (mix * &normed)
+            .unwrap()
+            .reshape((n, hc_count, hidden))
+            .unwrap()
+            .sum(1)
+            .unwrap()
+            .affine(inv_hc, 0.0)
+            .unwrap();
+        let want_inject = sigmoid(
+            &gate
+                .inject
+                .as_ref()
+                .unwrap()
+                .forward(&normed)
+                .unwrap()
+                .affine(inv_hc, 0.0)
+                .unwrap(),
+        )
+        .unwrap()
+        .affine(2.0, 0.0)
+        .unwrap();
+
+        let e = rel_l2(&flat(&mixed), &flat(&want_mixed));
+        assert!(e <= 1e-6, "mixed vs the candle chain: rel_l2 {e} > 1e-6");
+        let e = rel_l2(&flat(&inject), &flat(&want_inject));
+        assert!(e <= 1e-6, "inject vs the candle chain: rel_l2 {e} > 1e-6");
+
+        // The write-back is a multiply and an add in a fixed order on both
+        // paths, so it is held to bits, not a tolerance.
+        let block_out = tensor2(&seeded(n * hidden, 666), n, hidden, &dev);
+        let got = hc_write(&stream, &block_out, &inject).unwrap();
+        let scaled = block_out
+            .reshape((n, 1, hidden))
+            .unwrap()
+            .broadcast_mul(&inject.reshape((n, hc_count, 1)).unwrap())
+            .unwrap();
+        let want = (stream.reshape((n, hc_count, hidden)).unwrap() + scaled)
+            .unwrap()
+            .reshape((n, width))
+            .unwrap();
+        for (i, (g, w)) in flat(&got).iter().zip(flat(&want).iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "hc_write element {i} differs (got {g:?}, want {w:?})"
+            );
+        }
     }
 
     /// The carrier is seeded by TILING the embedding — `[x, x, x, x]` — not by

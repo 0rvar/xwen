@@ -121,6 +121,15 @@ const FLASH_SOURCE: &str = include_str!("flash.metal");
 /// reduction across threads — and the scan stays free to contract (see
 /// delta.metal).
 const DELTA_SOURCE: &str = include_str!("delta.metal");
+/// Vendored fused hyper-connection kernels (the qwen4exp carrier's grouped norm
+/// with its injection head, the bottleneck activation, the stream mix and the
+/// write-back). Own library (no Metal-4 dependency). Its FP pragmas are at BLOCK
+/// scope: the activation and the write-back pin contraction/reassociation off to
+/// stay bit-identical to the candle chains they replace, while the norm and the
+/// mix are bounded instead — each partitions a reduction the reference runs in
+/// one order (see hc.metal). Under the `XWEN_HC_CLASSIC` kill-switch nothing
+/// asks for this library, so it never compiles.
+const HC_SOURCE: &str = include_str!("hc.metal");
 
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
@@ -303,4 +312,10 @@ pub(crate) fn flash_pipeline(device: &Device, name: &str) -> Result<ComputePipel
 /// Pipeline for a `delta.metal` kernel (vendored fused gated-DeltaNet ops).
 pub(crate) fn delta_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, DELTA_SOURCE, "delta", name)
+}
+
+/// Pipeline for an `hc.metal` kernel (vendored fused hyper-connection gates).
+/// Its own library, compiled lazily on the first carrier read or write.
+pub(crate) fn hc_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, HC_SOURCE, "hc", name)
 }
