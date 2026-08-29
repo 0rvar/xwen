@@ -129,10 +129,12 @@ fn mv_kernel_name(dt: GgmlDType) -> Result<&'static str> {
 }
 
 /// The vendored two-pass `kernel_mul_mm_id_<dtype>_f32` (src/ops/mm_id.metal)
-/// is only instantiated for the dtypes the tests and the production Q4_K_M
-/// experts use; other dtypes stay on the mv_id path.
+/// is only instantiated for the dtypes the tests and the shipped checkpoints'
+/// experts use (q5_1 is Qwen3.8-Flash-Next's `ffn_down_exps` dtype on most of its
+/// layers); other dtypes stay on the mv_id path.
 pub(crate) fn mm_kernel_name(dt: GgmlDType) -> Result<&'static str> {
     let n = match dt {
+        GgmlDType::Q5_1 => "kernel_mul_mm_id_q5_1_f32",
         GgmlDType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
         GgmlDType::Q4K => "kernel_mul_mm_id_q4_K_f32",
         GgmlDType::Q5K => "kernel_mul_mm_id_q5_K_f32",
@@ -144,7 +146,7 @@ pub(crate) fn mm_kernel_name(dt: GgmlDType) -> Result<&'static str> {
 
 /// Whether the vendored `kernel_mul_mm_id_<dtype>_f32<variant-suffix>` kernel is
 /// actually instantiated in mm_id.metal for this (dtype, variant) pair. The base
-/// dtype matrix (q8_0/q4_K/q5_K/q6_K) is `mm_kernel_name`; ON TOP of that, the
+/// dtype matrix (q5_1/q8_0/q4_K/q5_K/q6_K) is `mm_kernel_name`; ON TOP of that, the
 /// `_t_hp` (`TensorHp`) variant is instantiated ONLY for q4_K/q6_K (covers the
 /// current official file's all-q4_K experts; q6_K was the retired original's
 /// expert-down dtype) — the other three variants cover the full base matrix. A combo outside

@@ -35,6 +35,7 @@ using namespace metal;
 
 #define QK_K 256
 #define K_SCALE_SIZE 12
+#define QK5_1 32
 #define QK8_0 32
 #define QK_NL 16
 
@@ -42,6 +43,13 @@ using namespace metal;
 
 // ---- Quantized block layouts (flattened from ggml-common.h; the aggregate
 // unions there do not change the byte layout) --------------------------------
+
+typedef struct {
+    half    d;             // delta
+    half    m;             // min
+    uint8_t qh[4];         // 5-th bit of quants
+    uint8_t qs[QK5_1 / 2]; // nibbles / quants
+} block_q5_1;
 
 typedef struct {
     half   d;          // delta
@@ -71,6 +79,38 @@ typedef struct {
 } block_q6_K;
 
 // ---- Dequantize functions (verbatim from the fork) --------------------------
+
+template <typename type4x4>
+void dequantize_q5_1(device const block_q5_1 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * qs = ((device const uint16_t *)xb + 4);
+    const float d = xb->d;
+    const float m = xb->m;
+    const ushort mask = il ? 0x00F0 : 0x000F;
+
+    const uint32_t qh = *((device const uint32_t *)xb->qh);
+
+    const int x_mv = il ? 4 : 0;
+
+    const int gh_mv = il ? 12 : 0;
+    const int gh_bk = il ?  0 : 4;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; i++) {
+        // extract the 5-th bits for x0 and x1
+        const uint8_t xh_0 = ((qh >> (gh_mv + 2*i  )) << gh_bk) & 0x10;
+        const uint8_t xh_1 = ((qh >> (gh_mv + 2*i+1)) << gh_bk) & 0x10;
+
+        // combine the 4-bits from qs with the 5th bit
+        const int32_t x0 = ((((qs[i]     ) & mask) >> x_mv) | xh_0);
+        const int32_t x1 = ((((qs[i] >> 8) & mask) >> x_mv) | xh_1);
+
+        reg_f[i/2][2*(i%2) + 0] = d * x0 + m;
+        reg_f[i/2][2*(i%2) + 1] = d * x1 + m;
+    }
+
+    reg = (type4x4) reg_f;
+}
 
 template <typename type4x4>
 void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg) {
@@ -467,6 +507,7 @@ typedef decltype(kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x
 // the fork's prefill precision. Fork-equivalent parity but no faster than the
 // f32 tiles here (mm_id is dequant-bound), so kept only as an A/B knob.
 template [[host_name("kernel_mul_mm_id_q8_0_f32")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q5_1_f32")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_1, 2,     dequantize_q5_1, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f32")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f32")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f32")]] kernel mul_mm_id kernel_mul_mm_id<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
@@ -477,6 +518,7 @@ template [[host_name("kernel_mul_mm_id_q6_K_f32")]] kernel mul_mm_id kernel_mul_
 // (8192 -> 12288 B) and no measured throughput cost. Same kernel body; only the
 // tile element type changes.
 template [[host_name("kernel_mul_mm_id_q8_0_f32_hp")]] kernel mul_mm_id kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q5_1_f32_hp")]] kernel mul_mm_id kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q5_1, 2,     dequantize_q5_1, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f32_hp")]] kernel mul_mm_id kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f32_hp")]] kernel mul_mm_id kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f32_hp")]] kernel mul_mm_id kernel_mul_mm_id<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
@@ -642,6 +684,7 @@ typedef decltype(kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half
 // operand tiles only (matmul2d's fork instantiation). Fork-exact numerics, so
 // judged under the mm parity tier.
 template [[host_name("kernel_mul_mm_id_q8_0_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q5_1_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_1, 2,     dequantize_q5_1, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;

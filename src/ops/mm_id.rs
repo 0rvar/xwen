@@ -58,6 +58,7 @@ mod tests {
     use candle_core::quantized::GgmlDType;
 
     const DTYPES: &[(GgmlDType, &str)] = &[
+        (GgmlDType::Q5_1, "Q5_1"),
         (GgmlDType::Q8_0, "Q8_0"),
         (GgmlDType::Q4K, "Q4K"),
         (GgmlDType::Q5K, "Q5K"),
@@ -358,9 +359,10 @@ mod tests {
             MmVariant::ClassicHp,
             MmVariant::ClassicF16,
         ];
-        // The four base dtypes the mm path knows, plus dtypes with no mm kernel at
+        // The five base dtypes the mm path knows, plus dtypes with no mm kernel at
         // all (to assert the matrix denies them under every variant).
         const DTYPES: &[GgmlDType] = &[
+            GgmlDType::Q5_1,
             GgmlDType::Q8_0,
             GgmlDType::Q4K,
             GgmlDType::Q5K,
