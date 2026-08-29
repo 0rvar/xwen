@@ -20,16 +20,22 @@ to get qwen4exp support into the one oracle. Previous pin
 Laguna-S-2.1 LLM_TYPE (#26233)"), cloned and built 2026-07-28, where every floor
 below was calibrated.
 
-Re-confirmation at the new pin, 2026-08-29 — **the floors hold for the 3.6
-pair; nothing was re-measured or moved.**
+Re-confirmation at the new pin, 2026-08-29 — **the floors hold for all three
+checkpoints; nothing was re-measured or moved.**
 
 - **Qwen3.6-35B-A3B: ALL PASS**, six graded checks. strict cos 1.000000, top5
   5/5; mm cos 0.999631; decode 63/64, 63/64, 62/64 agreeing with 1/1/2 excused
   and 0 mismatch; ppl Δnll 0.000791.
 - **Qwen3.6-27B: ALL PASS.** strict cos 1.000000; mm cos 1.000000; decode 64/64
   three times, 0 excused; ppl Δnll 0.000243.
-- **Qwen3.8-27B: run in progress at time of writing — result not yet recorded.**
-  Until this line says otherwise, the bump is confirmed for the 3.6 pair only.
+- **Qwen3.8-27B: ALL PASS**, five graded checks — re-run via `--model <hub file>`
+  with `--tiers strict,mm,decode`. strict cos 1.000000, top5 5/5; mm cos
+  1.000000, top5 5/5; decode 64/64 agreeing on code-short, text-mixed and
+  long-mixed, 0 excused, 0 mismatch. **The ppl tier was SKIPPED, not failed**:
+  `tests/fixtures/reference-ppl-Qwen3.8-27B-Q4_K_M.json` does not exist and never
+  has — the 3.8 checkpoint was never given one, and the first run bailed with
+  "ppl reference fixture missing". A known gap, not a regression (TODO.md); the
+  fix is `--regen-ppl-ref` against the 3.8 file, then a ppl grade.
 
 ```bash
 just init                               # git submodule update --init --recursive

@@ -1887,3 +1887,13 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     to Q4_K instead would dodge it); per-checkpoint sampling defaults + presence
     penalty; registry/dialect entry. First testable milestone per Orvar: Unsloth
     Q4-class file.
+  - **2026-08-29 — no ppl reference fixture for Qwen3.8-27B.** Re-grading the
+    oracle bump (e9fa0781 → `6fe749801`) turned this up: the 3.8-27B parity run
+    can only grade strict/mm/decode, because
+    `tests/fixtures/reference-ppl-Qwen3.8-27B-Q4_K_M.json` does not exist and
+    never has — a full-tier run bails with "ppl reference fixture missing", so
+    the checkpoint has been shipping without a perplexity floor since it was
+    added. Nothing regressed; the tier was simply never calibrated for this
+    file. Fix: `--regen-ppl-ref` against the 3.8 hub file, then grade ppl and
+    record the floor in docs/parity.md beside the 3.6 pair's. Until then the
+    3.8's parity coverage is 5 checks where the others get 6.

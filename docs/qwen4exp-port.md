@@ -25,8 +25,9 @@ divergence is resolved at construction time.
   `6c84c7d5d`, plus follow-up `6fe749801` on 08-28. D4's re-pin gate is met and
   the `reference/llama.cpp` submodule was bumped e9fa0781 → `6fe749801` on
   2026-08-29 — ONE oracle for all four checkpoints, no vendored copies. The
-  parity gate was re-run at the new pin the same day: **3.6 pair ALL PASS**
-  (both checkpoints), 3.8-27B in progress (see D4 update and docs/parity.md).
+  parity gate was re-run at the new pin the same day: **ALL PASS on all three
+  checkpoints** (the 3.8-27B's ppl tier was skipped for a missing reference
+  fixture — a known gap, ledgered; see D4 update and docs/parity.md).
 
 ## The model in one paragraph
 
@@ -80,9 +81,14 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   checks (strict cos 1.000000, top5 5/5; mm cos 0.999631; decode 63/64, 63/64,
   62/64 with 1/1/2 excused and zero mismatches; ppl Δnll 0.000791) and 27B all
   of them clean (strict and mm cos 1.000000; decode 64/64 three times, nothing
-  excused; ppl Δnll 0.000243). The 3.8-27B run is still going; until it lands,
-  the bump is confirmed for the 3.6 pair only. Floors themselves are unchanged
-  and re-confirmed at the new pin for those two — docs/parity.md is the record.
+  excused; ppl Δnll 0.000243). **The 3.8-27B passed too** — five graded checks
+  over `--tiers strict,mm,decode` (strict and mm cos 1.000000 with top5 5/5;
+  decode 64/64 on all three prompts, nothing excused, nothing mismatched); its
+  ppl tier was SKIPPED because
+  `tests/fixtures/reference-ppl-Qwen3.8-27B-Q4_K_M.json` has never existed for
+  that checkpoint, which is a fixture gap (ledgered in TODO.md, fix is
+  `--regen-ppl-ref`), not a failure. So the bump is confirmed for all three
+  checkpoints, floors unchanged — docs/parity.md is the record.
   - **Update 2026-08-29 — the merge half of the gate is met.** PR #27742 merged
     into ggml-org/llama.cpp master 2026-08-27T19:32Z as squash `6c84c7d5d` (PR
     head `eaf9376557`, 65 commits); follow-up `6fe749801` "model: qwen4exp:
@@ -792,6 +798,28 @@ Units (U2-U5 parallel, then U6, then U7):
   `6c84c7d5d` (D4 update). The numeric check Qwen promised was never posted, so
   `conversion/qwen4exp.py`'s stability for a self-converted blessed file rests
   on the PR body's own ppl-vs-reference.
+- **presence_penalty 1.5 is recorded in the registry but nothing applies it**
+  (P4). `Model::recommended_presence_penalty()` (hub.rs) carries the card's
+  non-thinking value per checkpoint — 1.5 on Qwen3.8-Flash-Next, 0.0 on the
+  other three — the way the second stop id is hardcoded, since converted GGUFs
+  carry no presence-penalty key. It is NOT on `SamplerOptions` and the sampler
+  does not apply it: `SamplerOptions::recommended(thinking)` has no checkpoint
+  in hand, and no dialect call site resolves one before building its sampling,
+  so making the field live means threading the request's resolved checkpoint
+  through openai/native/anthropic prepare — the same wiring P4 needs anyway to
+  stop accept-and-dropping request penalties (TODO.md 2026-08-19). Doing it in
+  the registry unit would have added a field that reads 0.0 at every
+  construction site in ten files. Until P4: a Flash-Next non-thinking reply
+  samples without the penalty the card asks for.
+- **The qwen4exp cache figures assume dtypes the graph units have not fixed**
+  (U3/U4). `Model::kv_bytes_per_token` counts the QSA indexer's per-token key
+  plane (4 heads x 128, assumed f16 like the trunk's KV rows — 12 KiB/token of
+  the checkpoint's 36) and `snapshot_bytes` counts the PLE conv window (9
+  columns x 10240, assumed f32 like the DeltaNet conv). Shapes are from the
+  GGUF's own metadata; the dtypes are guesses that the QSA and PLE blocks get
+  the final say on. `the_qwen4exp_figures_count_its_indexer_and_ple_state`
+  pins both with their arithmetic so a disagreement surfaces as a test failure.
+  The PLE block's 2-id n-gram history is state too and is not counted (8 bytes).
 - ~~Where the qwen4exp oracle clone lives~~ ANSWERED 2026-08-29: there is no
   second clone. The one `reference/llama.cpp` submodule is bumped to
   `6fe749801` and `scripts/build-llamacpp.sh` is unchanged (D4). Follow-on, not
@@ -886,8 +914,11 @@ Units (U2-U5 parallel, then U6, then U7):
   decode 63/64, 63/64, 62/64 with 1/1/2 excused and zero mismatches, ppl Δnll
   0.000791) and 27B clean throughout (strict and mm cos 1.000000, decode 64/64
   three times with nothing excused, ppl Δnll 0.000243). Logs stayed in the
-  scratchpad, uncommitted. The 3.8-27B run is still in flight, so the submodule
-  bump is confirmed for the 3.6 pair only. P2 then opened: the territory map
+  scratchpad, uncommitted. The 3.8-27B then passed as well (strict and mm cos
+  1.000000 top5 5/5, decode 64/64 on all three prompts, 0 excused, 0 mismatch),
+  with its ppl tier skipped for a never-created reference fixture — ledgered,
+  not a regression — so the submodule bump is confirmed for all three
+  checkpoints. P2 then opened: the territory map
   landed as docs/qwen4exp-p2-map.md, the plan and D14-D17 are recorded above,
   and U2-U5 are running in parallel (hc, indexer+D16, IQ4_NL+PLE, ZGate and
   sum_floor wiring), with U1 (registry) waiting on the download and U6/U7
