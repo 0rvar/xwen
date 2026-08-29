@@ -38,14 +38,16 @@ struct Cli {
 #[derive(Parser)]
 struct ModelArgs {
     /// Which official checkpoint to run: the dense Qwen3.6-27B, the
-    /// Qwen3.6-35B-A3B MoE (the default), or the dense Qwen3.8-27B. Each
-    /// checkpoint's full name works here too. A `--model <gguf>` path
+    /// Qwen3.6-35B-A3B MoE (the default), the dense Qwen3.8-27B, or
+    /// Qwen3.8-Flash-Next (`flash-next` — the qwen4exp trunk, whose graph is
+    /// not wired yet). Each checkpoint's full name works here too. A
+    /// `--model <gguf>` path
     /// overrides the target file outright; for the one-shot commands this flag
     /// still selects the family (and so the drafter sidecar), while
     /// `xwen serve` reads the family from the GGUF itself and uses the flag
     /// only to pick the default file when nothing else names one — or to break
     /// the tie when a custom dense GGUF does not say which release it is.
-    #[arg(long, value_name = "27b|35b|3.8-27b")]
+    #[arg(long, value_name = "27b|35b|3.8-27b|flash-next")]
     model_size: Option<Model>,
 }
 
@@ -749,10 +751,18 @@ fn resolve_model(model: Option<PathBuf>, size: Model) -> Result<PathBuf> {
         Some(path) => Ok(path),
         None => {
             if xwen::hub::cached_model(size).is_none() {
+                // A split checkpoint needs every shard beside the one the
+                // loader opens, and the size quoted is the whole set's — so
+                // say how many files that is rather than name one and leave
+                // the figure looking like its size.
+                let what = match size.files() {
+                    [one] => one.to_string(),
+                    shards => format!("{} ({} shards)", shards[0], shards.len()),
+                };
                 eprintln!(
                     "xwen: {}/{} is not in the Hugging Face cache; downloading ({}, resumes in place)",
                     size.repo(),
-                    size.file(),
+                    what,
                     size.size(),
                 );
             }

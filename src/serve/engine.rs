@@ -6716,6 +6716,7 @@ mod tests {
     fn the_drafting_floor_follows_the_loaded_checkpoint_unless_pinned() {
         let mut settings = crate::serve::testutil::settings();
         settings.draft_p_min = None;
+        settings.draft_max = None;
         assert_eq!(
             Some(resolved_p_min(&settings, hub::Model::Qwen27B)),
             hub::Model::Qwen27B.draft_p_min_default()
@@ -6728,20 +6729,22 @@ mod tests {
             Some(resolved_p_min(&settings, hub::Model::Qwen3827B)),
             hub::Model::Qwen3827B.draft_p_min_default()
         );
-        // Every shipped checkpoint now carries a fitted floor, so the shared
-        // base behind them is reachable only the one way its doc describes: a
-        // custom `draft.path` attached to a checkpoint that ships no sidecar of
-        // its own. There is no such checkpoint to name here.
-        assert!(
-            hub::MODELS
-                .iter()
-                .all(|m| m.draft_p_min_default().is_some()),
-            "a checkpoint without a fitted floor needs the base-fallback arm covered again"
+        // The shared base behind the fitted floors is live again: a checkpoint
+        // that ships no sidecar of its own has nothing to fit a floor with, so
+        // an operator's custom `draft.path` on it drafts at the base.
+        assert_eq!(hub::Model::Qwen38FlashNext.draft_p_min_default(), None);
+        assert_eq!(
+            resolved_p_min(&settings, hub::Model::Qwen38FlashNext),
+            SpecParams::default().draft_p_min
+        );
+        assert_eq!(
+            resolved_draft_max(&settings, hub::Model::Qwen38FlashNext),
+            SpecParams::default().draft_max
         );
         settings.draft_p_min = Some(0.42);
-        assert_eq!(resolved_p_min(&settings, hub::Model::Qwen27B), 0.42);
-        assert_eq!(resolved_p_min(&settings, hub::Model::Qwen35BA3B), 0.42);
-        assert_eq!(resolved_p_min(&settings, hub::Model::Qwen3827B), 0.42);
+        for model in hub::MODELS {
+            assert_eq!(resolved_p_min(&settings, model), 0.42, "{model:?}");
+        }
     }
 
     /// The ceiling grows with both the prompt and the reply budget, so spans

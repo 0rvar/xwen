@@ -1412,7 +1412,12 @@ mod tests {
     fn the_model_listing_names_each_checkpoint_once() {
         assert_eq!(
             listed_models("Qwen3.6-35B-A3B"),
-            ["Qwen3.6-35B-A3B", "Qwen3.6-27B", "Qwen3.8-27B"],
+            [
+                "Qwen3.6-35B-A3B",
+                "Qwen3.6-27B",
+                "Qwen3.8-27B",
+                "Qwen3.8-Flash-Next"
+            ],
             "the served checkpoint leads and appears once"
         );
         // A custom GGUF is none of them, so it leads under its own name and

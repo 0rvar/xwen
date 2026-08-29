@@ -81,16 +81,21 @@ impl Arch {
     /// The checkpoint to assume for this architecture when nothing else
     /// identifies the file. Unambiguous for `qwen35moe`, which only one official
     /// checkpoint ships; a coin-flip for `qwen35`, which the Qwen3.6-27B and
-    /// Qwen3.8-27B releases share graph-for-graph; `None` for `qwen4exp`, which
-    /// has no registry checkpoint until a blessed file exists. Ask
+    /// Qwen3.8-27B releases share graph-for-graph; and unambiguous again for
+    /// `qwen4exp`, whose one registry checkpoint is Qwen3.8-Flash-Next. Ask
     /// [`XwenConfig::checkpoint`] first — it reads what the file says about
     /// itself — and reach for this only when that comes back `None`, which is a
     /// conversion that names no checkpoint, and say so when you do.
+    ///
+    /// Still an `Option`: the answer is a fact about the registry, and an
+    /// architecture with no checkpoint in it is a state this has been in and
+    /// will be again (`qwen4exp` was exactly that until the Unsloth file was
+    /// entered).
     pub fn model(&self) -> Option<crate::hub::Model> {
         match self {
             Arch::Dense => Some(crate::hub::Model::Qwen27B),
             Arch::Moe => Some(crate::hub::Model::Qwen35BA3B),
-            Arch::Qwen4Exp => None,
+            Arch::Qwen4Exp => Some(crate::hub::Model::Qwen38FlashNext),
         }
     }
 
@@ -1265,7 +1270,10 @@ mod tests {
         assert_eq!(Arch::Moe.moe_sum_floor(), 6.103515625e-5);
         assert_eq!(Arch::Qwen4Exp.moe_sum_floor(), 0.0);
         assert_eq!(Arch::Qwen4Exp.key(), "qwen4exp");
-        assert!(Arch::Qwen4Exp.model().is_none());
+        assert_eq!(
+            Arch::Qwen4Exp.model(),
+            Some(crate::hub::Model::Qwen38FlashNext)
+        );
         assert!(Arch::Dense.model().is_some() && Arch::Moe.model().is_some());
     }
 }

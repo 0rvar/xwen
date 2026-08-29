@@ -156,10 +156,20 @@ impl XwenModel {
     /// graph module, not this stack (docs/qwen4exp-port.md D1): `load` refuses
     /// it here, before the rope table and the ~1.2 GB token-embedding dequant
     /// materialize anything, rather than building a wrong graph.
+    ///
+    /// Qwen3.8-Flash-Next is a registry checkpoint now, so a plain `xwen
+    /// --model-size flash-next` reaches this point with a real file in hand.
+    /// What it must NOT reach is the qwen35 stack below, which shares the
+    /// attention and DeltaNet blocks with qwen4exp and would therefore build
+    /// something that runs and emits noise. Hence a refusal that names the
+    /// unit the wiring is waiting on rather than a generic one.
     fn check_arch(cfg: &XwenConfig) -> Result<()> {
         match cfg.arch {
             Arch::Dense | Arch::Moe => Ok(()),
-            Arch::Qwen4Exp => anyhow::bail!("the qwen4exp graph is not built by XwenModel"),
+            Arch::Qwen4Exp => anyhow::bail!(
+                "qwen4exp graph assembly not yet wired (P2 U6): XwenModel builds the \
+                 qwen35/qwen35moe stack only, and this checkpoint's trunk is not that stack"
+            ),
         }
     }
 
@@ -433,7 +443,7 @@ impl XwenModel {
             let attn = match &layer.mixer {
                 Mixer::Full(block) => stage!(
                     Stage::MixerFullAttn,
-                    block.forward(&normed, cache, pos, full_mask.as_ref())?
+                    block.forward(&normed, cache, pos, full_mask.as_ref(), None)?
                 ),
                 Mixer::Linear(block) => {
                     stage!(Stage::MixerDelta, block.forward(&normed, cache)?)
@@ -1071,8 +1081,12 @@ mod tests {
             eog_tokens: vec![248046, 248044],
             qwen4exp: None,
         };
-        let err = XwenModel::check_arch(&cfg(Arch::Qwen4Exp)).unwrap_err();
-        assert!(err.to_string().contains("not built by XwenModel"));
+        let err = XwenModel::check_arch(&cfg(Arch::Qwen4Exp))
+            .unwrap_err()
+            .to_string();
+        // The message names the unit the wiring waits on: this is a
+        // not-yet-built path, not a file the engine should reject forever.
+        assert!(err.contains("not yet wired (P2 U6)"), "{err}");
         assert!(XwenModel::check_arch(&cfg(Arch::Dense)).is_ok());
         assert!(XwenModel::check_arch(&cfg(Arch::Moe)).is_ok());
     }
