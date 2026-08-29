@@ -49,8 +49,8 @@ as ground truth, never used to grade a parity tier.
 |---|---|---|---|
 | `qwen4exp.cpp` | `src/models/qwen4exp.cpp` | new file, verbatim @ `6fe749801` | `1fe800a11543d2af7aef898f75e6ee6ffb1f27f1486b4810cb926d94fc77e148` |
 | `qwen4exp.py` | `conversion/qwen4exp.py` | new file, verbatim @ `6fe749801` (HF→GGUF converter) | `12a0a5aea7877fbb8fe35af041a9c34f8b57b05278871b22c24c650b9760dfc3` |
-| `gguf-py.diff` | `conversion/{__init__,base}.py`, `gguf-py/gguf/{constants,gguf_writer,lazy,tensor_mapping}.py` | unified diff of the merged PR's hunks | `9ab1af23b4bb6244e153a82b4dbe81610060d9e9672fb97299806ba98c71b20a` |
-| `llama-cpp-core.diff` | `src/CMakeLists.txt`, `src/llama-{arch,context,hparams,kv-cache,memory-hybrid-idx,memory-recurrent,model-loader,model-saver,model,quant}.{h,cpp}`, `src/models/models.h`, `tests/test-llama-archs.cpp` | unified diff, two sections (merged PR, then the graph-split follow-up); all C++ outside `qwen4exp.cpp` | `05e887b46d5dfdbab0f3870b315bf328ab62d8d85de162d715f22191be2a8af9` |
+| `gguf-py.diff` | `conversion/{__init__,base}.py`, `gguf-py/gguf/{constants,gguf_writer,lazy,tensor_mapping}.py` | unified diff, two per-commit sections spanning base → pin | `164a06dec988f825f65b8a16c07d5158f8a08f4aa46e30343ab1b7048766e58a` |
+| `llama-cpp-core.diff` | `src/CMakeLists.txt`, `src/llama-{arch,context,hparams,kv-cache,memory-hybrid-idx,memory-recurrent,model-loader,model-saver,model,quant}.{h,cpp}`, `src/models/models.h`, `tests/test-llama-archs.cpp` | unified diff, three per-commit sections spanning base → pin; all C++ outside `qwen4exp.cpp` | `5e5f58939042ea372cc16c6ae814bd943eec44dc16fdce0c3fb9ea7a18105d8c` |
 | `conversion-qwen-base.py` | `conversion/qwen.py` | **NOT part of the PR diff** — unchanged file at the same sha, vendored because `Qwen4ExpTextModel` is a thin subclass and the norm/+1, `-exp(A_log)` and V-head-reorder rules all live here | `3e3ea6be268c65915f8f5b8419edc15c291f0adf374b97216f436191d23456b4` |
 
 Notes on what moved between the two vendored generations:
@@ -67,34 +67,57 @@ Notes on what moved between the two vendored generations:
 
 ## Re-fetch recipe
 
+Both `.diff` files span the FULL base → pin range, not just the squash merge. They are
+built as per-commit sections in chronological order (so they apply in order) rather than
+as one `6fdd0ac89..6fe749801` range diff, because 17 unrelated master commits land in that
+range and several touch the same files. `git log 6fdd0ac89..6fe749801 -- <paths>` is what
+enumerates the candidates; the sections below are the ones whose hunks are qwen4exp's.
+
 ```
 git clone --filter=blob:none https://github.com/ggml-org/llama.cpp llamacpp-master
 cd llamacpp-master && git checkout 6fe749801
 
+# verbatim files: only 6c84c7d5d and 6fe749801 touch qwen4exp.cpp, and nothing in the
+# range touches conversion/qwen4exp.py at all, so a plain read at the pin is already the
+# full-range state
 git show 6fe749801:src/models/qwen4exp.cpp  > qwen4exp.cpp
 git show 6fe749801:conversion/qwen4exp.py   > qwen4exp.py
 git show 6fe749801:conversion/qwen.py       > conversion-qwen-base.py
 
-# gguf-py.diff: the merged PR's converter/gguf-py hunks (the follow-up touches none)
+# gguf-py.diff  — section 1: the merged PR
 git show --format='' 6c84c7d5d -- conversion/__init__.py conversion/base.py \
     conversion/qwen.py gguf-py/gguf/constants.py gguf-py/gguf/gguf_writer.py \
     gguf-py/gguf/lazy.py gguf-py/gguf/tensor_mapping.py
+# gguf-py.diff  — section 2: the post-merge LazyChunkedTensor corruption fix (#27869)
+git show --format='' b19cbe925 -- gguf-py/gguf/lazy.py gguf-py/gguf/gguf_writer.py
 
-# llama-cpp-core.diff: section 1 = merged PR, section 2 = the follow-up
+# llama-cpp-core.diff — section 1: the merged PR
 git show --format='' 6c84c7d5d -- src/CMakeLists.txt src/llama-arch.h src/llama-arch.cpp \
     src/llama-context.cpp src/llama-hparams.h src/llama-hparams.cpp src/llama-kv-cache.h \
     src/llama-kv-cache.cpp src/llama-memory-hybrid-idx.h src/llama-memory-hybrid-idx.cpp \
     src/llama-memory-recurrent.h src/llama-memory-recurrent.cpp src/llama-model-loader.cpp \
     src/llama-model-saver.h src/llama-model-saver.cpp src/llama-model.h src/llama-model.cpp \
     src/llama-quant.cpp src/models/models.h tests/test-llama-archs.cpp
+# llama-cpp-core.diff — section 2: the synthetic qwen4exp arch-test retune (#27755)
+git show --format='' 4e97ac86e -- tests/test-llama-archs.cpp
+# llama-cpp-core.diff — section 3: the graph-split follow-up (#27880)
 git show --format='' 6fe749801 -- src/models/models.h
 ```
 
-The two core sections are concatenated rather than taken as one
-`6fdd0ac89..6fe749801` range diff, because 17 unrelated master commits land in that
-range and several of them (`ca3d5a3e1` DSpark, `866322481` GDN/LID op gating,
-`18443257a` ctx-per-slot, `4e97ac86e` test-save-load-state) touch the same files.
-`git show` per qwen4exp commit keeps the diff to the qwen4exp additions only.
+### Deliberately excluded from the diffs
+
+Two in-range commits touch the same paths with hunks that are **not** qwen4exp's, and are
+left out rather than hand-edited away:
+
+- **`ca3d5a3e1` "model: add DSpark support for Nemotron3.5 (#27804)"** — all of its
+  `conversion/qwen.py`, `constants.py`, `gguf_writer.py`, `llama-arch`, `llama-model` and
+  `models.h` hunks are DSpark/DFlash work. It is also the entire reason
+  `conversion-qwen-base.py` differs from the previously vendored copy.
+- **`866322481` "context : disable non-fused GDN and LID ops (#27877)"** — a one-hunk
+  global default flip in `llama-context.cpp`, `cparams.auto_fgdn`/`auto_flid` `true` →
+  `false` (`fused_gdn_ar`/`fused_gdn_ch`/`fused_lid` stay `true`). Not a qwen4exp change,
+  but worth knowing, because `build_layer_attn_linear` reads `cparams.fused_gdn_ar` and
+  `fused_gdn_ch` to decide whether to `repeat` K-heads up to V-heads.
 
 Note: the shell here is zsh, which does not word-split unquoted variables — pass
 those pathspecs literally, not through a `$VAR`.

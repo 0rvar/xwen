@@ -1,6 +1,7 @@
 # qwen4exp llama.cpp core hunks (all C++ outside src/models/qwen4exp.cpp)
+# base 6fdd0ac8907 -> pin 6fe749801. Sections are per commit, chronological; apply in order.
 #
-# section 1: commit 6c84c7d5d (squash merge of PR #27742) vs parent 6fdd0ac8907
+# section 1: 6c84c7d5d 'model: add Qwen3.8-Flash-Next (qwen4exp) (#27742)' (squash merge)
 #
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index c6df19f2e..8922dc12a 100644
@@ -1943,8 +1944,60 @@ index b8fd66cca..d58d90952 100644
      }
  #endif // GGML_USE_WEBGPU
 
-# section 2: follow-up commit 6fe74980162af0ed5e559870d5deccafaa034e7c
-#   'model: qwen4exp: reduce number of graph splits (#27880)' vs its parent b387ddfd84
+# section 2: 4e97ac86e 'tests : run test-save-load-state across all architectures (#27755)'
+#   retunes the synthetic qwen4exp arch test: n_ctx 128->256, indexer head count 1->64
+#   for non-minimax archs, indexer key length 64->128 (qwen4exp still pinned to n_embd_head).
+#
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index d58d90952..35a3286e4 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -65,7 +65,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+ }
+ 
+ static void usage(char ** argv) {
+-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
++    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help]\n", argv[0]);
+ }
+ 
+ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
+@@ -82,7 +82,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
+ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+     gguf_context_ptr ret(gguf_init_empty());
+     llama_model_saver ms(arch, ret.get());
+-    const uint32_t n_ctx = 128;
++    const uint32_t n_ctx = 256;
+ 
+     uint32_t n_vocab = 128;
+     uint32_t n_embd  = 256;
+@@ -256,10 +256,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+     }
+ 
+-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_DEEPSEEK4 ? n_head : uint32_t(1));
++    // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
++    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(64));
+     // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
+-              arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(64));
++              arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
++
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
+@@ -762,6 +764,10 @@ int main(int argc, char ** argv) {
+     std::string out;
+ 
+     for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
++            usage(argv);
++            return 0;
++        }
+         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
+             if (i + 1 < argc) {
+                 const std::string arch_name = argv[++i];
+
+# section 3: 6fe749801 'model: qwen4exp: reduce number of graph splits (#27880)'
 #
 diff --git a/src/models/models.h b/src/models/models.h
 index af60764c2..9b87a40d5 100644

@@ -1,8 +1,8 @@
-# qwen4exp converter + gguf-py hunks
-# commit 6c84c7d5d8833c6e0df69628f75a0f599797934e (squash merge of PR #27742)
-#   vs its parent 6fdd0ac8907fd973a42b876357823ad2124cd8ed (pre-PR master)
-# NOTE: conversion/qwen4exp.py is vendored verbatim as qwen4exp.py and excluded here.
-# NOTE: conversion/qwen.py was in the pathspec but this PR does not touch it (see conversion-qwen-base.py).
+# qwen4exp converter + gguf-py hunks, base 6fdd0ac8907 -> pin 6fe749801
+# Sections are per commit, in chronological order; apply in order.
+# conversion/qwen4exp.py is vendored verbatim as qwen4exp.py and excluded here.
+#
+# section 1: 6c84c7d5d 'model: add Qwen3.8-Flash-Next (qwen4exp) (#27742)' (squash merge)
 #
 diff --git a/conversion/__init__.py b/conversion/__init__.py
 index ab6cacbc7..a5632fcc4 100644
@@ -393,3 +393,45 @@ index c42a7154a..861acfe18 100644
      }
  
      mapping: dict[str, tuple[MODEL_TENSOR, str]]
+
+# section 2: b19cbe925 'convert: prevent ndarray conversion in LazyChunkedTensor (#27869)'
+#   post-merge corruption fix on the PLE table writer: LazyChunkedTensor.__array__ now
+#   raises TypeError (numpy would otherwise wrap the object and write 8 bytes), plus a
+#   short-write check in gguf_writer's tensor loop.
+#
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index 1f309ad2e..d95fe9b1a 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -467,10 +467,15 @@ class GGUFWriter:
+                     shard_bar.reset(total=(total if total > 0 else None))
+ 
+                 # relying on the fact that Python dicts preserve insertion order (since 3.7)
+-                for ti in tensors.values():
++                for name, ti in tensors.items():
+                     assert ti.tensor is not None  # can only iterate once over the tensors
+                     assert ti.tensor.nbytes == ti.nbytes
++                    start = fout.tell()
+                     ti.tensor.tofile(fout)
++                    # a short write here would only surface as a corrupt file at load time
++                    if fout.tell() - start != ti.nbytes:
++                        raise ValueError(
++                            f"tensor {name!r} wrote {fout.tell() - start} bytes, expected {ti.nbytes}")
+                     if shard_bar is not None:
+                         shard_bar.update(ti.nbytes)
+                     if bar is not None:
+diff --git a/gguf-py/gguf/lazy.py b/gguf-py/gguf/lazy.py
+index 6a0aee881..a39f22321 100644
+--- a/gguf-py/gguf/lazy.py
++++ b/gguf-py/gguf/lazy.py
+@@ -251,6 +251,10 @@ class LazyChunkedTensor:
+     def numpy(self) -> LazyChunkedTensor:
+         return self
+ 
++    def __array__(self, *args, **kwargs):
++        # numpy would otherwise make a 1-element object array of self, and write 8 bytes
++        raise TypeError("LazyChunkedTensor cannot become an ndarray, it is written in chunks")
++
+     def quantize(self, qtype: Any) -> LazyChunkedTensor:
+         from .constants import GGMLQuantizationType
+         from .quants import QuantError, quant_shape_to_byte_shape
