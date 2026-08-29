@@ -402,6 +402,38 @@ pub fn hc_classic() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_HC_CLASSIC").is_some())
 }
 
+/// Token count the carrier's grouped norm must be BELOW for `ops::hc_norm` to
+/// take the split launch — `kernel_hc_norm_split` plus, on a gated block,
+/// `kernel_hc_inject`, one threadgroup per (token, stream) each — instead of
+/// the single-threadgroup-per-token `kernel_hc_norm[_inject]`.
+///
+/// The single kernel reads the carrier once and folds every reduction in one
+/// threadgroup, which is the cheaper shape as soon as the token grid alone
+/// fills the machine. Below that it leaves the GPU idle: a decode step is 97
+/// launches of ONE 256-thread threadgroup, each walking a 10240-wide carrier
+/// twice and, on a gated block, the whole [hc_count, width] injection head.
+/// The split pair costs an extra read of `normed` and buys `hc_count` times the
+/// parallelism.
+///
+/// Exclusive, and both arms compute the same bits, so this is purely a launch
+/// -shape choice — moving it can never change a result.
+pub const HC_SPLIT_MAX_N: usize = 32;
+
+/// Effective split-launch ceiling: `XWEN_HC_SPLIT_MAX_N=<n>` overrides the
+/// default (an A/B knob for the threshold — 0 pins every batch to the single
+/// kernel, a large value pins every batch to the split pair). Value-parsed,
+/// read once and cached; unset or unparsable falls back to
+/// [`HC_SPLIT_MAX_N`].
+pub fn hc_split_max_n() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_HC_SPLIT_MAX_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(HC_SPLIT_MAX_N)
+    })
+}
+
 /// `XWEN_FLASH_CLASSIC=1` reverts the prefill (seq > 1) attention from the
 /// vendored flash kernel (`ops::flash_attn` — in-kernel masking, no
 /// materialized mask tensor) back to the candle sdpa chain (f16 cast +

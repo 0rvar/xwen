@@ -28,7 +28,7 @@ pub fn hc_norm_supported(hc_count: usize, hidden: usize) -> bool {
 
 /// The carrier's grouped RMS norm — statistics per stream, weight over the FULL
 /// `hc_count * hidden` width — plus, when `inject_w` is given, the injection
-/// head folded into the same threadgroup.
+/// head.
 ///
 /// `stream` is the raw carrier `[n, hc_count * hidden]` f32, `norm_w` the
 /// `[hc_count * hidden]` multiply-ready norm weight and `inject_w` the dense
@@ -36,9 +36,14 @@ pub fn hc_norm_supported(hc_count: usize, hidden: usize) -> bool {
 /// none). Returns the normed carrier and, with a head, the per-stream write
 /// strengths `2·sigmoid((I·n)/hc_count)` as `[n, hc_count]`.
 ///
-/// One threadgroup per token: the `hc_count` sum-of-squares reductions and the
-/// head's `hc_count` full-row dot products all fold there, so the carrier is
-/// read once for a step the candle chain spends a dozen dispatches on.
+/// TWO launch shapes over the same arithmetic, picked by token count
+/// ([`crate::ops::hc_split_max_n`]). At prefill one threadgroup takes a whole
+/// token, folding the `hc_count` sum-of-squares reductions and the head's
+/// `hc_count` full-row dot products together, so the carrier is read once for a
+/// step the candle chain spends a dozen dispatches on. Below the threshold —
+/// decode, where that one threadgroup is the whole launch — the work splits
+/// over an `n * hc_count` grid instead, and the head becomes its own dispatch.
+/// The two agree BIT-FOR-BIT (`split_matches_single_bitwise`).
 pub fn hc_norm(
     stream: &Tensor,
     norm_w: &Tensor,
@@ -544,5 +549,305 @@ mod tests {
         assert!(hc_write(&z2(2, 4 * 64), &z2(2, 64), &z2(2, 3)).is_err());
         assert!(hc_write(&z2(2, 4 * 64), &z2(2, 63), &z2(2, 4)).is_err());
         assert!(hc_write(&z2(0, 4 * 64), &z2(0, 64), &z2(0, 4)).is_err());
+    }
+
+    /// [`hc_norm`] with the launch shape pinned rather than picked by token
+    /// count, so a test can put both arms on the same input.
+    fn hc_norm_arm(
+        split: bool,
+        stream: &Tensor,
+        norm_w: &Tensor,
+        inject_w: Option<&Tensor>,
+        hc_count: usize,
+        hidden: usize,
+    ) -> (Tensor, Option<Tensor>) {
+        dispatch::run_hc_norm_with(stream, norm_w, inject_w, hc_count, hidden, EPS, Some(split))
+            .unwrap()
+    }
+
+    /// The split launch (one threadgroup per token AND stream, plus a separate
+    /// injection kernel) must produce EXACTLY the single-threadgroup kernel's
+    /// bits — not merely a close answer. Both arms give a thread the same
+    /// strided slice of the same stream and fold the same simd_sum and the same
+    /// serial pass over the simdgroup partials, so no reduction reassociates
+    /// between them; the injection dot deliberately walks the carrier
+    /// stream-major for the same reason. That identity is what lets the host
+    /// pick an arm by token count without the choice being visible in a result,
+    /// so a divergence here is a bug in the split kernels, never a tolerance to
+    /// relax.
+    #[test]
+    fn split_matches_single_bitwise() {
+        let dev = metal_device().unwrap();
+        let width = HC * HIDDEN;
+        let norm_w = Tensor::from_vec(pseudo_random(width, 0xB1, 0.9, 1.1), width, &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let inject_w = t2(
+            pseudo_random(HC * width, 0xB2, -0.02, 0.02),
+            HC,
+            width,
+            &dev,
+        );
+
+        // A decode step, a small speculative batch, and the token right below
+        // the shipped threshold.
+        for &n in &[1usize, 5, 31] {
+            let stream = t2(
+                pseudo_random(n * width, 0xB3 + n as u64, -2.0, 2.0),
+                n,
+                width,
+                &dev,
+            );
+
+            let (s_normed, s_inject) =
+                hc_norm_arm(true, &stream, &norm_w, Some(&inject_w), HC, HIDDEN);
+            let (f_normed, f_inject) =
+                hc_norm_arm(false, &stream, &norm_w, Some(&inject_w), HC, HIDDEN);
+            assert_eq!(s_normed.dims(), &[n, width]);
+            assert_f32_bits_eq(&s_normed, &f_normed, &format!("split normed n={n}"));
+            assert_f32_bits_eq(
+                &s_inject.unwrap(),
+                &f_inject.unwrap(),
+                &format!("split inject n={n}"),
+            );
+
+            // The headless (tail mixer) arm takes the same split norm kernel
+            // with no second launch behind it.
+            let (s_bare, none) = hc_norm_arm(true, &stream, &norm_w, None, HC, HIDDEN);
+            assert!(none.is_none(), "the tail mixer has no injection head");
+            let (f_bare, _) = hc_norm_arm(false, &stream, &norm_w, None, HC, HIDDEN);
+            assert_f32_bits_eq(&s_bare, &f_bare, &format!("split normed, no head, n={n}"));
+        }
+    }
+
+    /// The split arm graded against the frozen CPU oracle, not just against the
+    /// other kernel: two arms agreeing bit-for-bit would still both be wrong if
+    /// the split kernels indexed the full-width norm weight or the injection
+    /// head's rows by the stream slice instead of the carrier.
+    #[test]
+    fn split_matches_reference() {
+        let dev = metal_device().unwrap();
+        let width = HC * HIDDEN;
+        let norm_w_v: Vec<f32> = pseudo_random(width, 0xC1, -0.5, 0.5)
+            .iter()
+            .map(|v| 1.0 + 0.1 * v)
+            .collect();
+        let down_w_v = pseudo_random(LOW_RANK * width, 0xC2, -0.03, 0.03);
+        let up_w_v = pseudo_random(width * LOW_RANK, 0xC3, -0.05, 0.05);
+        let inject_w_v = pseudo_random(HC * width, 0xC4, -0.02, 0.02);
+
+        let norm_w = Tensor::from_vec(norm_w_v.clone(), width, &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let down_t = t2(down_w_v.clone(), LOW_RANK, width, &dev)
+            .t()
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let up_t = t2(up_w_v.clone(), width, LOW_RANK, &dev)
+            .t()
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let inject_w = t2(inject_w_v.clone(), HC, width, &dev);
+
+        let reference = GatedResidualRef {
+            hc_count: HC,
+            hidden: HIDDEN,
+            low_rank: LOW_RANK,
+            norm_w: norm_w_v.clone(),
+            down_w: down_w_v,
+            up_w: up_w_v,
+            inject_w: inject_w_v,
+        };
+
+        for &n in &[1usize, 5] {
+            let stream_v = pseudo_random(n * width, 0xC5 + n as u64, -2.0, 2.0);
+            let stream = t2(stream_v.clone(), n, width, &dev);
+
+            let (normed, inject) = hc_norm_arm(true, &stream, &norm_w, Some(&inject_w), HC, HIDDEN);
+            let inject = inject.expect("a gate with an injection head returns one");
+            let low = hc_silu_quarter(&normed.matmul(&down_t).unwrap(), HC).unwrap();
+            let mixed = hc_mix(&low.matmul(&up_t).unwrap(), &normed, HC, HIDDEN).unwrap();
+
+            let r_normed = grouped_rms_norm_batch(&stream_v, &norm_w_v, HIDDEN, EPS);
+            assert_rel_l2(&normed, &r_normed, 1e-5, &format!("split normed n={n}"));
+            let (r_mixed, r_inject) = reference.read_batch(&stream_v, EPS);
+            assert_rel_l2(&inject, &r_inject, 1e-5, &format!("split inject n={n}"));
+            assert_rel_l2(&mixed, &r_mixed, 1e-5, &format!("split mixed n={n}"));
+        }
+    }
+
+    /// The split launch must honour a carrier that starts at a nonzero storage
+    /// offset, the same way the single-threadgroup kernel does. Its norm
+    /// dispatch binds the carrier at `f32_off` while its injection dispatch
+    /// reads the freshly written `normed` at offset zero, so the two launches
+    /// disagree about offsets if either binding is wrong.
+    #[test]
+    fn split_honours_offset_views() {
+        let dev = metal_device().unwrap();
+        let (hc_count, hidden, n, skip) = (4usize, 64usize, 3usize, 2usize);
+        let width = hc_count * hidden;
+        let rows = n + skip + 1;
+
+        let big = t2(
+            pseudo_random(rows * width, 0xD1, -2.0, 2.0),
+            rows,
+            width,
+            &dev,
+        );
+        let norm_w = Tensor::from_vec(pseudo_random(width, 0xD2, 0.9, 1.1), width, &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let inject_w = t2(
+            pseudo_random(hc_count * width, 0xD3, -0.05, 0.05),
+            hc_count,
+            width,
+            &dev,
+        );
+
+        let view = big.narrow(0, skip, n).unwrap();
+        assert_ne!(
+            view.layout().start_offset(),
+            0,
+            "the narrowed view must actually carry an offset"
+        );
+        let copy = t2(flat(&view), n, width, &dev);
+
+        let (v_normed, v_inject) =
+            hc_norm_arm(true, &view, &norm_w, Some(&inject_w), hc_count, hidden);
+        let (c_normed, c_inject) =
+            hc_norm_arm(true, &copy, &norm_w, Some(&inject_w), hc_count, hidden);
+        let v_inject = v_inject.unwrap();
+        let c_inject = c_inject.unwrap();
+        assert_f32_bits_eq(&v_normed, &c_normed, "split hc_norm over an offset carrier");
+        assert_f32_bits_eq(
+            &v_inject,
+            &c_inject,
+            "split hc_inject over an offset carrier",
+        );
+
+        // ... and it must still be the single kernel's answer on that view.
+        let (f_normed, f_inject) =
+            hc_norm_arm(false, &view, &norm_w, Some(&inject_w), hc_count, hidden);
+        assert_f32_bits_eq(
+            &v_normed,
+            &f_normed,
+            "split vs single over an offset carrier",
+        );
+        assert_f32_bits_eq(
+            &v_inject,
+            &f_inject.unwrap(),
+            "split vs single inject over an offset carrier",
+        );
+    }
+
+    /// `HC_MAX_STREAMS` is spelled out in BOTH languages — a `#define` sizing
+    /// the kernel's per-thread injection accumulator array, and the host bound
+    /// that refuses a wider carrier. Nothing links them, and raising only the
+    /// host one would let a carrier index past the array with no diagnostic, so
+    /// this test is the link. (Same shape as `mm_id.rs`'s
+    /// `instantiation_matrix_matches_metal`: read the Metal source, parse the
+    /// value, compare.)
+    #[test]
+    fn hc_max_streams_matches_metal() {
+        const SRC: &str = include_str!("hc.metal");
+        let mut found = None;
+        for line in SRC.lines() {
+            if let Some(rest) = line.trim().strip_prefix("#define HC_MAX_STREAMS") {
+                assert!(
+                    found.is_none(),
+                    "hc.metal defines HC_MAX_STREAMS more than once"
+                );
+                found = Some(
+                    rest.trim()
+                        .parse::<usize>()
+                        .expect("HC_MAX_STREAMS must be a plain integer literal"),
+                );
+            }
+        }
+        let metal = found.expect("hc.metal must #define HC_MAX_STREAMS");
+        assert_eq!(
+            metal,
+            dispatch::HC_MAX_STREAMS,
+            "hc.metal's HC_MAX_STREAMS ({metal}) and dispatch.rs's ({}) must agree — the host \
+             bound is what keeps a carrier inside the kernel's accumulator array",
+            dispatch::HC_MAX_STREAMS,
+        );
+    }
+
+    /// The widest carrier the host admits. The shipped geometry is 4 streams,
+    /// so 5..=8 is exercised nowhere else — and 8 is exactly where the kernel's
+    /// `HC_MAX_STREAMS`-bounded accumulator loop runs to its last slot, which
+    /// is the index a fencepost error would walk off. Both launch arms, graded
+    /// against the frozen oracle.
+    #[test]
+    fn eight_streams_match_reference() {
+        let dev = metal_device().unwrap();
+        let (hc_count, hidden, low_rank, n) = (8usize, 64usize, 32usize, 3usize);
+        let width = hc_count * hidden;
+        assert!(hc_norm_supported(hc_count, hidden));
+
+        let norm_w_v: Vec<f32> = pseudo_random(width, 0xE1, -0.5, 0.5)
+            .iter()
+            .map(|v| 1.0 + 0.1 * v)
+            .collect();
+        let down_w_v = pseudo_random(low_rank * width, 0xE2, -0.03, 0.03);
+        let up_w_v = pseudo_random(width * low_rank, 0xE3, -0.05, 0.05);
+        let inject_w_v = pseudo_random(hc_count * width, 0xE4, -0.02, 0.02);
+
+        let norm_w = Tensor::from_vec(norm_w_v.clone(), width, &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let down_t = t2(down_w_v.clone(), low_rank, width, &dev)
+            .t()
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let up_t = t2(up_w_v.clone(), width, low_rank, &dev)
+            .t()
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let inject_w = t2(inject_w_v.clone(), hc_count, width, &dev);
+
+        let reference = GatedResidualRef {
+            hc_count,
+            hidden,
+            low_rank,
+            norm_w: norm_w_v.clone(),
+            down_w: down_w_v,
+            up_w: up_w_v,
+            inject_w: inject_w_v,
+        };
+        let stream_v = pseudo_random(n * width, 0xE5, -2.0, 2.0);
+        let stream = t2(stream_v.clone(), n, width, &dev);
+        let r_normed = grouped_rms_norm_batch(&stream_v, &norm_w_v, hidden, EPS);
+        let (r_mixed, r_inject) = reference.read_batch(&stream_v, EPS);
+
+        for split in [true, false] {
+            let (normed, inject) =
+                hc_norm_arm(split, &stream, &norm_w, Some(&inject_w), hc_count, hidden);
+            let inject = inject.expect("a gate with an injection head returns one");
+            let low = hc_silu_quarter(&normed.matmul(&down_t).unwrap(), hc_count).unwrap();
+            let mixed = hc_mix(&low.matmul(&up_t).unwrap(), &normed, hc_count, hidden).unwrap();
+            assert_rel_l2(
+                &normed,
+                &r_normed,
+                1e-5,
+                &format!("hc=8 normed split={split}"),
+            );
+            assert_rel_l2(
+                &inject,
+                &r_inject,
+                1e-5,
+                &format!("hc=8 inject split={split}"),
+            );
+            assert_rel_l2(&mixed, &r_mixed, 1e-5, &format!("hc=8 mixed split={split}"));
+        }
     }
 }

@@ -16,6 +16,11 @@
 //                           2*sigmoid(./hc_count) into the same threadgroup —
 //                           one templated body, the arm chosen by name at
 //                           dispatch (the tail mixer has no injection head).
+//                           kernel_hc_norm_split and kernel_hc_inject are the
+//                           same two steps as separate launches over an
+//                           n * hc_count grid, for batches too small to fill
+//                           the machine one-threadgroup-per-token (bottom of
+//                           this file; bit-identical, not merely equivalent).
 //   kernel_hc_silu_quarter  silu(d / hc_count) on the bottleneck activation.
 //   kernel_hc_mix           sigmoid(up_out) * normed, meaned over streams.
 //   kernel_hc_write         stream + block_out (x) inject, out of place.
@@ -321,4 +326,132 @@ kernel void kernel_hc_write(
         block_out[(size_t) t * (size_t) args.hidden + (size_t) j] *
         inject[(size_t) t * (size_t) args.hc_count + (size_t) s];
     dst[tid] = x[tid] + scaled;
+}
+
+// ---------------------------------------------------------------------------
+// The small-batch split path.
+//
+// kernel_hc_norm[_inject] puts ONE threadgroup on a whole token: at decode
+// (n = 1) that is 97 launches per forward each running a two-pass read of a
+// 10240-wide carrier — plus, on the gated arm, the whole [hc_count, width]
+// injection head — on a single 256-thread threadgroup, with the rest of the GPU
+// idle. It is the right shape at prefill, where the token grid fills the machine
+// on its own, and the wrong one below a handful of tokens (dispatch.rs
+// HC_SPLIT_MAX_N picks between them).
+//
+// The split pair spreads the same work over an `n * hc_count` grid: one
+// threadgroup per (token, stream) for the norm, one per (token, injection row)
+// for the head. Both keep the SINGLE-threadgroup kernel's thread count and its
+// per-thread strided partition, so every reduction folds in the same
+// association order and both outputs are BIT-IDENTICAL to the fused kernel's
+// (`split_norm_matches_single_bitwise` pins that; the cost of getting it is
+// nothing but writing the loops in the same order).
+// ---------------------------------------------------------------------------
+
+// One threadgroup per (token, stream): the stream's own sum of squares, then
+// its `hidden`-wide slice of the normed carrier. The weight is still indexed at
+// FULL width (`s * hidden + j`) — it is one value per carrier element, not per
+// stream element.
+kernel void kernel_hc_norm_split(
+        constant hc_norm_args & args [[buffer(0)]],
+        device const float * x       [[buffer(1)]],
+        device const float * w       [[buffer(2)]],
+        device       float * normed  [[buffer(3)]],
+        uint2 tgid  [[threadgroup_position_in_grid]],
+        uint2 tpos  [[thread_position_in_threadgroup]],
+        uint sgid   [[simdgroup_index_in_threadgroup]],
+        uint lane   [[thread_index_in_simdgroup]],
+        uint sgcount [[simdgroups_per_threadgroup]],
+        uint2 tdim  [[threads_per_threadgroup]]) {
+    // The launch is `threads x 1`, so the row component is the whole partition.
+    const uint tid = tpos.x;
+    const uint tcount = tdim.x;
+    threadgroup float partial[32];
+    // A one-slot array rather than a scalar: the barrier below is what makes
+    // the write visible, which the compiler's uninitialized-use warning cannot
+    // see through on a plain threadgroup scalar.
+    threadgroup float scale_tg[1];
+
+    const int s = (int) tgid.y;
+    const size_t row = (size_t) tgid.x * (size_t) args.width;
+    const int off = s * args.hidden;
+    const size_t base = row + (size_t) off;
+
+    float acc = 0.0f;
+    for (int j = (int) tid; j < args.hidden; j += (int) tcount) {
+        const float v = x[base + (size_t) j];
+        acc += v * v;
+    }
+    const float lane_sum = simd_sum(acc);
+    if (lane == 0) {
+        partial[sgid] = lane_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint u = 0; u < sgcount; ++u) {
+            total += partial[u];
+        }
+        scale_tg[0] = 1.0f / sqrt(total / (float) args.hidden + args.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = scale_tg[0];
+    for (int j = (int) tid; j < args.hidden; j += (int) tcount) {
+        const int i = off + j;
+        normed[row + (size_t) i] = x[row + (size_t) i] * scale * w[i];
+    }
+}
+
+// One threadgroup per (token, injection row): `2*sigmoid(dot(I[o], normed[t]) /
+// hc_count)`, the same gate kernel_hc_norm_inject folds into its second pass.
+//
+// The dot walks the carrier STREAM-MAJOR with the same `tcount` stride the
+// fused kernel's accumulators saw — outer loop over streams, inner strided walk
+// inside each — so each thread's partial sum, and therefore the simd_sum and
+// the serial fold over `partial`, land on exactly the fused kernel's bits.
+// Reading `normed` back from device memory rather than recomputing it costs one
+// extra full-width read and is what lets the norm above stay a separate launch.
+kernel void kernel_hc_inject(
+        constant hc_norm_args & args [[buffer(0)]],
+        device const float * inj     [[buffer(1)]],
+        device const float * normed  [[buffer(2)]],
+        device       float * inject  [[buffer(3)]],
+        uint2 tgid  [[threadgroup_position_in_grid]],
+        uint2 tpos  [[thread_position_in_threadgroup]],
+        uint sgid   [[simdgroup_index_in_threadgroup]],
+        uint lane   [[thread_index_in_simdgroup]],
+        uint sgcount [[simdgroups_per_threadgroup]],
+        uint2 tdim  [[threads_per_threadgroup]]) {
+    // The launch is `threads x 1`, so the row component is the whole partition.
+    const uint tid = tpos.x;
+    const uint tcount = tdim.x;
+    threadgroup float partial[32];
+
+    const int o = (int) tgid.y;
+    const size_t row = (size_t) tgid.x * (size_t) args.width;
+    const size_t inj_row = (size_t) o * (size_t) args.width;
+
+    float acc = 0.0f;
+    for (int s = 0; s < args.hc_count; ++s) {
+        const int off = s * args.hidden;
+        for (int j = (int) tid; j < args.hidden; j += (int) tcount) {
+            const int i = off + j;
+            acc += inj[inj_row + (size_t) i] * normed[row + (size_t) i];
+        }
+    }
+    const float lane_sum = simd_sum(acc);
+    if (lane == 0) {
+        partial[sgid] = lane_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint u = 0; u < sgcount; ++u) {
+            total += partial[u];
+        }
+        const float z = total * args.inv_hc;
+        inject[(size_t) tgid.x * (size_t) args.hc_count + (size_t) o] =
+            2.0f * (1.0f / (1.0f + exp(-z)));
+    }
 }

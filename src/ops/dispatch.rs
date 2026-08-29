@@ -3992,15 +3992,21 @@ struct HcWriteArgs {
 }
 
 /// The carrier's grouped RMS norm — per-stream statistics, FULL-width weight —
-/// against `kernel_hc_norm` (hc.metal), plus, when `inject_w` is present, the
-/// injection head's `hc_count` full-row dot products and their
-/// `2*sigmoid(./hc_count)` folded into the same threadgroup.
+/// plus, when `inject_w` is present, the injection head's `hc_count` full-row
+/// dot products and their `2*sigmoid(./hc_count)`.
 ///
 /// `stream` is the raw carrier `[n, hc_count * hidden]` f32, `norm_w` the
 /// `[hc_count * hidden]` multiply-ready norm weight, `inject_w` the dense
 /// `[hc_count, hc_count * hidden]` head (`None` on the tail mixer). Returns the
 /// normed carrier `[n, hc_count * hidden]` and, with a head, the write
 /// strengths `[n, hc_count]`.
+///
+/// TWO launch shapes over identical arithmetic, chosen by token count:
+/// `kernel_hc_norm[_inject]` puts one threadgroup on a whole token and folds
+/// every reduction there, which fills the machine only when the token grid is
+/// wide; the `kernel_hc_norm_split` + `kernel_hc_inject` pair spreads the same
+/// work over `n * hc_count` threadgroups, which is what a decode step (n = 1)
+/// needs. [`run_hc_norm_with`] is the switch.
 pub(crate) fn run_hc_norm(
     stream: &Tensor,
     norm_w: &Tensor,
@@ -4008,6 +4014,26 @@ pub(crate) fn run_hc_norm(
     hc_count: usize,
     hidden: usize,
     eps: f32,
+) -> Result<(Tensor, Option<Tensor>)> {
+    run_hc_norm_with(stream, norm_w, inject_w, hc_count, hidden, eps, None)
+}
+
+/// [`run_hc_norm`] with the launch shape pinned: `Some(true)` forces the split
+/// pair, `Some(false)` the single-threadgroup kernel, `None` picks by token
+/// count (`n < crate::ops::hc_split_max_n()` takes the split pair).
+///
+/// Only the tests pin it. The two arms are required to agree BIT-FOR-BIT —
+/// same thread count, same per-thread strided partition, so every reduction
+/// folds in the same association order — and `split_matches_single_bitwise` is
+/// what holds them to that.
+pub(crate) fn run_hc_norm_with(
+    stream: &Tensor,
+    norm_w: &Tensor,
+    inject_w: Option<&Tensor>,
+    hc_count: usize,
+    hidden: usize,
+    eps: f32,
+    split: Option<bool>,
 ) -> Result<(Tensor, Option<Tensor>)> {
     let cdev = stream.device().clone();
     let Device::Metal(mdev) = &cdev else {
@@ -4053,25 +4079,34 @@ pub(crate) fn run_hc_norm(
     glue_index_fits_i32(n_normed)?;
     let n_inject = checked_elems(&[n, hc_count], "hc_norm injection")?;
 
-    let kernel = if inject_w.is_some() {
-        "kernel_hc_norm_inject"
-    } else {
-        "kernel_hc_norm"
+    let split = split.unwrap_or(n < crate::ops::hc_split_max_n());
+    // The split arm runs the injection head as its own launch where the single
+    // arm folds it into the norm's second pass, so which kernels are needed
+    // depends on both switches.
+    let kernels: &[&str] = match (split, inject_w.is_some()) {
+        (true, true) => &["kernel_hc_norm_split", "kernel_hc_inject"],
+        (true, false) => &["kernel_hc_norm_split"],
+        (false, true) => &["kernel_hc_norm_inject"],
+        (false, false) => &["kernel_hc_norm"],
     };
-    let pipeline = pipelines::hc_pipeline(mdev.device(), kernel)?;
-    if pipeline.max_total_threads_per_threadgroup() < threads {
-        bail!(
-            "hc_norm needs {threads} threads per threadgroup, the pipeline allows {}",
-            pipeline.max_total_threads_per_threadgroup()
-        );
+    let mut pipes = Vec::with_capacity(kernels.len());
+    for kernel in kernels {
+        let pipeline = pipelines::hc_pipeline(mdev.device(), kernel)?;
+        if pipeline.max_total_threads_per_threadgroup() < threads {
+            bail!(
+                "{kernel} needs {threads} threads per threadgroup, the pipeline allows {}",
+                pipeline.max_total_threads_per_threadgroup()
+            );
+        }
+        // Same 32-wide-simdgroup assumption the delta kernels make, checked at
+        // pipeline setup so it fails at load rather than silently at dispatch.
+        check_delta_simd_width(&pipeline, kernel)?;
+        pipes.push(pipeline);
     }
-    // Same 32-wide-simdgroup assumption the delta kernels make, checked at
-    // pipeline setup so it fails at load rather than silently at dispatch.
-    check_delta_simd_width(&pipeline, kernel)?;
 
     let normed = mdev.new_buffer(n_normed, DType::F32, "hc_norm")?;
-    // Allocated whether or not there is a head: the kernel takes both output
-    // bindings, and the no-head arm never writes through this one.
+    // Allocated whether or not there is a head: the single kernel takes both
+    // output bindings, and its no-head arm never writes through this one.
     let inject = mdev.new_buffer(
         if inject_w.is_some() { n_inject } else { 1 },
         DType::F32,
@@ -4099,30 +4134,54 @@ pub(crate) fn run_hc_norm(
         inv_hc: (1.0 / hc_count as f64) as f32,
     };
     {
-        // The unused-head arm binds the norm weight into the injection slot:
-        // the kernel never dereferences it, and a bound buffer keeps the
-        // argument table uniform across both specializations.
-        let (inj_buf, inj_off) = match &inj_parts {
+        let inj_bind = match &inj_parts {
             Some((guard, layout)) => {
                 let Storage::Metal(storage) = &**guard else {
                     bail!("the hc injection head is not on a Metal device");
                 };
-                (storage.buffer(), f32_off(layout))
+                Some((storage.buffer(), f32_off(layout)))
             }
-            None => (w_storage.buffer(), f32_off(w_layout)),
+            None => None,
         };
         let cmd = mdev.command_encoder()?;
         let ep = &cmd;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_bytes(0, &args);
-        encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
-        encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
-        encoder.set_input_buffer(3, Some(inj_buf), inj_off);
-        encoder.set_output_buffer(4, Some(&normed), 0);
-        encoder.set_output_buffer(5, Some(&inject), 0);
-        encoder.dispatch_thread_groups(mtl_size!(n, 1, 1), mtl_size!(threads, 1, 1));
+        let tg = mtl_size!(threads, 1, 1);
+        if split {
+            // One threadgroup per (token, stream) for the norm, and — with a
+            // head — one per (token, injection row) for the gate. The gate
+            // reads `normed` back, which candle's concurrent encoder turns into
+            // a barrier on its own: it tracks that buffer as the preceding
+            // dispatch's output.
+            encoder.set_compute_pipeline_state(&pipes[0]);
+            encoder.set_bytes(0, &args);
+            encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
+            encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
+            encoder.set_output_buffer(3, Some(&normed), 0);
+            encoder.dispatch_thread_groups(mtl_size!(n, hc_count, 1), tg);
+            if let Some((inj_buf, inj_off)) = inj_bind {
+                encoder.set_compute_pipeline_state(&pipes[1]);
+                encoder.set_bytes(0, &args);
+                encoder.set_input_buffer(1, Some(inj_buf), inj_off);
+                encoder.set_input_buffer(2, Some(&normed), 0);
+                encoder.set_output_buffer(3, Some(&inject), 0);
+                encoder.dispatch_thread_groups(mtl_size!(n, hc_count, 1), tg);
+            }
+        } else {
+            // The unused-head arm binds the norm weight into the injection
+            // slot: the kernel never dereferences it, and a bound buffer keeps
+            // the argument table uniform across both specializations.
+            let (inj_buf, inj_off) = inj_bind.unwrap_or((w_storage.buffer(), f32_off(w_layout)));
+            encoder.set_compute_pipeline_state(&pipes[0]);
+            encoder.set_bytes(0, &args);
+            encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
+            encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
+            encoder.set_input_buffer(3, Some(inj_buf), inj_off);
+            encoder.set_output_buffer(4, Some(&normed), 0);
+            encoder.set_output_buffer(5, Some(&inject), 0);
+            encoder.dispatch_thread_groups(mtl_size!(n, 1, 1), tg);
+        }
     }
     drop(x_guard);
     drop(w_guard);
