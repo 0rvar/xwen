@@ -10,8 +10,13 @@ use crate::gguf::{ExpertStack, QLinear, QuantPlane, Weights};
 use crate::ops::{ExpertRunner, mm_id, mv_id};
 
 /// F16's smallest positive normal, the denominator floor llama.cpp clamps the
-/// routing-weight sum to before normalizing (`ffn_moe_weights_sum_clamped`).
-pub(crate) const WEIGHTS_SUM_FLOOR: f64 = 6.103_515_625e-5;
+/// routing-weight sum to before normalizing (`ffn_moe_weights_sum_clamped`), at
+/// f64 width for the tests that grade the router chains against it.
+///
+/// What a block actually routes with is `Arch::moe_sum_floor`, whose
+/// qwen35/qwen35moe arm is exactly this number and whose qwen4exp arm is 0.0.
+#[cfg(test)]
+pub(crate) const WEIGHTS_SUM_FLOOR: f64 = crate::config::MOE_SUM_FLOOR as f64;
 
 /// Runs the selected experts' SwiGLU FFNs.
 /// x: [seq, hidden] f32; ids: [seq, top_k] u32 on-device; weights: [seq, top_k] f32.
@@ -46,6 +51,10 @@ pub struct MoeBlock {
     shared: SharedExpert,
     n_expert: usize,
     n_expert_used: usize,
+    /// The floor the renormalized top-k weight sum is clamped to, from
+    /// `Arch::moe_sum_floor`: llama.cpp's [`WEIGHTS_SUM_FLOOR`] on
+    /// qwen35moe, 0.0 (no clamp) on qwen4exp, whose HF math has none.
+    sum_floor: f32,
 }
 
 impl MoeBlock {
@@ -64,6 +73,7 @@ impl MoeBlock {
             shared,
             n_expert,
             n_expert_used: cfg.n_expert_used,
+            sum_floor: cfg.arch.moe_sum_floor(),
         })
     }
 
@@ -85,9 +95,9 @@ impl MoeBlock {
         if self.glue_fused(x_normed) {
             // One kernel for softmax + arg-sort + gather + sum + clamp + divide,
             // bit-identical to the candle chain below (ops::moe_glue).
-            return crate::ops::moe_router(&logits, self.n_expert_used, WEIGHTS_SUM_FLOOR as f32);
+            return crate::ops::moe_router(&logits, self.n_expert_used, self.sum_floor);
         }
-        route_from_logits(&logits, self.n_expert_used)
+        route_from_logits(&logits, self.n_expert_used, self.sum_floor)
     }
 
     pub fn forward(&self, x_normed: &Tensor) -> Result<Tensor> {
@@ -127,8 +137,14 @@ fn route_logits(router_t: &Tensor, x: &Tensor) -> Result<Tensor> {
 /// The softmax runs over ALL experts BEFORE the top-k, so a selected expert's
 /// weight depends on the whole distribution and not only on its k peers; the
 /// gathered weights are then renormalized to sum to 1, with the denominator
-/// floored at f16's smallest normal.
-fn route_from_logits(logits: &Tensor, n_expert_used: usize) -> Result<(Tensor, Tensor)> {
+/// floored at `sum_floor` — f16's smallest normal on the qwen35moe graph, 0.0
+/// on qwen4exp, where the floor is a no-op over a non-negative softmax sum and
+/// the clamp stays in the chain so both arms round identically.
+fn route_from_logits(
+    logits: &Tensor,
+    n_expert_used: usize,
+    sum_floor: f32,
+) -> Result<(Tensor, Tensor)> {
     let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?; // [seq, n_expert]
 
     // Descending arg-sort is stable on CPU (std slice sort), so ties resolve to
@@ -137,9 +153,7 @@ fn route_from_logits(logits: &Tensor, n_expert_used: usize) -> Result<(Tensor, T
     let ids = order.narrow(1, 0, n_expert_used)?.contiguous()?; // [seq, top_k] u32
 
     let weights = probs.gather(&ids, 1)?;
-    let sum = weights
-        .sum_keepdim(1)?
-        .clamp(WEIGHTS_SUM_FLOOR as f32, f32::INFINITY)?;
+    let sum = weights.sum_keepdim(1)?.clamp(sum_floor, f32::INFINITY)?;
     Ok((ids, weights.broadcast_div(&sum)?))
 }
 
@@ -592,7 +606,7 @@ mod tests {
     /// any per-expert sigmoid.
     #[test]
     fn routing_softmaxes_before_the_top_k() {
-        let (ids, weights) = route_from_logits(&logits_row(), 3).unwrap();
+        let (ids, weights) = route_from_logits(&logits_row(), 3, WEIGHTS_SUM_FLOOR as f32).unwrap();
 
         let ids_v: Vec<u32> = ids.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(ids_v, vec![5, 0, 3], "the three largest logits, in order");
@@ -619,7 +633,7 @@ mod tests {
     #[test]
     fn routing_ties_pick_lowest_indices() {
         let logits = Tensor::zeros((1, 8), DType::F32, &Device::Cpu).unwrap();
-        let (ids, _) = route_from_logits(&logits, 3).unwrap();
+        let (ids, _) = route_from_logits(&logits, 3, WEIGHTS_SUM_FLOOR as f32).unwrap();
         let ids_v: Vec<u32> = ids.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(ids_v, vec![0, 1, 2]);
     }
@@ -637,6 +651,75 @@ mod tests {
             .unwrap();
         let got: Vec<f32> = sum.flatten_all().unwrap().to_vec1().unwrap();
         assert_close(got[0] as f64, WEIGHTS_SUM_FLOOR, 0.0);
+    }
+
+    /// The floor is a PARAMETER of the routing decision, threaded from
+    /// `Arch::moe_sum_floor`, not a constant baked into the chain: llama.cpp's
+    /// f16 smallest normal on qwen35/qwen35moe, 0.0 on qwen4exp, whose HF math
+    /// has no clamp at all.
+    ///
+    /// On a real softmax row the two SHIPPED floors are indistinguishable, and
+    /// not by luck: the gathered weights are the LARGEST of `n_expert`
+    /// probabilities, so their sum is at least `top_k / n_expert` — 8/256 on
+    /// the 35B-A3B, 10/512 on qwen4exp — three orders of magnitude above
+    /// 6.1e-5. That is exactly why carrying the divergence is safe, and it is
+    /// also why agreement between the two alone would prove nothing about the
+    /// wiring. So the parameter is graded twice: the shipped pair must agree bit
+    /// for bit, and a floor large enough to bite must change the answer.
+    #[test]
+    fn routing_floor_is_a_parameter_not_a_constant() {
+        let logits = logits_row();
+        let vals = |t: &Tensor| -> Vec<f32> { t.flatten_all().unwrap().to_vec1().unwrap() };
+
+        let (_, shipped) = route_from_logits(&logits, 3, WEIGHTS_SUM_FLOOR as f32).unwrap();
+        let (_, unfloored) = route_from_logits(&logits, 3, 0.0).unwrap();
+        let (shipped, unfloored) = (vals(&shipped), vals(&unfloored));
+        for (i, (a, b)) in shipped.iter().zip(&unfloored).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "weight {i} moved when the floor went to 0.0: {a} vs {b}"
+            );
+        }
+
+        // A floor above the row's own weight sum divides by the floor instead,
+        // scaling every weight by the same factor below one. Nothing else in
+        // the chain can produce that, so the value provably reaches the divide.
+        let (_, floored) = route_from_logits(&logits, 3, 4.0).unwrap();
+        let floored = vals(&floored);
+        let ratios: Vec<f64> = floored
+            .iter()
+            .zip(&shipped)
+            .map(|(f, s)| *f as f64 / *s as f64)
+            .collect();
+        assert!(
+            ratios[0] < 0.99,
+            "a floor of 4.0 left the weights unscaled (ratio {})",
+            ratios[0]
+        );
+        for (i, r) in ratios.iter().enumerate() {
+            assert!(
+                (r - ratios[0]).abs() < 1e-6,
+                "weight {i} scaled by {r}, weight 0 by {}: the floor must scale the \
+                 whole row uniformly",
+                ratios[0]
+            );
+        }
+    }
+
+    /// The per-arch floor table, which is what a `MoeBlock` reads at
+    /// construction. The qwen35/qwen35moe arm must stay llama.cpp's value to
+    /// the bit — existing checkpoints route through this number — and qwen4exp's
+    /// must be a true zero, not a small epsilon standing in for one.
+    #[test]
+    fn sum_floor_matches_the_arch_table() {
+        use crate::config::Arch;
+        assert_eq!(Arch::Dense.moe_sum_floor(), WEIGHTS_SUM_FLOOR as f32);
+        assert_eq!(Arch::Moe.moe_sum_floor(), WEIGHTS_SUM_FLOOR as f32);
+        // 2^-14, so the f64 constant narrows to f32 exactly and the equalities
+        // above are bit comparisons rather than near-misses.
+        assert_eq!(WEIGHTS_SUM_FLOOR, f64::from(2.0f32.powi(-14)));
+        assert_eq!(Arch::Qwen4Exp.moe_sum_floor(), 0.0);
     }
 
     /// The router matmul followed by the routing decision agrees with feeding
@@ -907,6 +990,7 @@ mod tests {
             shared,
             n_expert,
             n_expert_used: top_k,
+            sum_floor: WEIGHTS_SUM_FLOOR as f32,
         };
         assert!(
             crate::ops::moe_router_supported(n_expert, top_k),
@@ -921,7 +1005,7 @@ mod tests {
         // Reference: the candle routing chain, the candle broadcast/sum combine,
         // the candle silu+mul shared expert, then routed + shared.
         let logits = route_logits(&block.router_t, &x).unwrap();
-        let (ids, weights) = route_from_logits(&logits, top_k).unwrap();
+        let (ids, weights) = route_from_logits(&logits, top_k, WEIGHTS_SUM_FLOOR as f32).unwrap();
         let down = block.experts.project(&x, &ids).unwrap().unwrap();
         let routed = down
             .broadcast_mul(&weights.reshape((seq, top_k, 1)).unwrap())
@@ -1290,6 +1374,7 @@ mod tests {
                 shared,
                 n_expert: N_EXPERT,
                 n_expert_used: TOP_K,
+                sum_floor: WEIGHTS_SUM_FLOOR as f32,
             };
             (norm(HIDDEN, s + 30, dev), block)
         }

@@ -20,7 +20,8 @@
 //! beta   = sigmoid(ssm_beta(x))              [v_heads]
 //! g      = ssm_a * softplus(ssm_alpha(x) + ssm_dt_bias)      [v_heads], <= 0
 //! S     *= exp(g);  d = (v - k·S) * beta;  S += k (x) d;  o = q·S / sqrt(d_k)
-//! o      = rms_norm(o) * ssm_norm_w * silu(attn_gate(x))
+//! o      = rms_norm(o) * ssm_norm_w * zgate(attn_gate(x))   silu, or sigmoid
+//!                                                            on qwen4exp
 //! out    = ssm_out(o)
 //! ```
 //!
@@ -36,7 +37,7 @@ use candle_core::Tensor;
 use candle_nn::ops::{sigmoid, silu};
 
 use crate::attention::{AttnWeights, Proj};
-use crate::config::XwenConfig;
+use crate::config::{XwenConfig, ZGate};
 use crate::gguf::Weights;
 use crate::kv_cache::{LayerCache, materialize};
 
@@ -107,6 +108,11 @@ pub struct LinearAttnBlock {
     dt_bias: Tensor,
     /// `ssm_norm.weight`, `[head_dim]` f32.
     norm_w: Tensor,
+    /// The activation the output norm gates with: `silu(z)` on the Qwen 3.6/3.8
+    /// graphs, `sigmoid(z)` on qwen4exp. Resolved from the architecture once at
+    /// load — swapping the two yields a layer that runs and produces garbage,
+    /// so it must never be a per-token decision or a guess.
+    z_gate: ZGate,
     k_heads: usize,
     v_heads: usize,
     head_dim: usize,
@@ -170,6 +176,7 @@ impl LinearAttnBlock {
             ssm_a: w.dense_f32_any("ssm_a")?.flatten_all()?,
             dt_bias: w.dense_f32_any("ssm_dt")?.flatten_all()?,
             norm_w: w.dense_f32("ssm_norm")?.flatten_all()?,
+            z_gate: cfg.arch.z_gate(),
             k_heads,
             v_heads,
             head_dim,
@@ -261,6 +268,7 @@ impl LinearAttnBlock {
             &z.reshape((seq, self.v_heads, self.head_dim))?,
             &self.norm_w,
             self.rms_eps as f32,
+            self.z_gate,
         )?;
         self.out_proj.forward(&o.reshape((seq, v_dim))?)
     }
@@ -350,14 +358,18 @@ impl LinearAttnBlock {
         cache.advance_linear(seq, states)?;
 
         // Gated RMSNorm: normalize over the head dim, scale by ssm_norm.weight,
-        // and only THEN multiply by silu(z). The gate is outside the norm, so it
-        // does not affect the statistic.
+        // and only THEN multiply by the activated gate. The gate is outside the
+        // norm, so it does not affect the statistic.
         let o = Tensor::cat(&outs, 0)?; // [seq, v_heads, hd]
         let ms = (o.sqr()?.sum_keepdim(2)? / hd as f64)?;
         let o = o
             .broadcast_div(&(ms + self.rms_eps)?.sqrt()?)?
             .broadcast_mul(&self.norm_w.reshape((1, 1, hd))?)?;
-        let o = (o * silu(&z)?.reshape((seq, vh, hd))?)?;
+        let gated_z = match self.z_gate {
+            ZGate::Silu => silu(&z)?,
+            ZGate::Sigmoid => sigmoid(&z)?,
+        };
+        let o = (o * gated_z.reshape((seq, vh, hd))?)?;
         self.out_proj.forward(&o.reshape((seq, v_dim))?)
     }
 }
@@ -707,6 +719,88 @@ mod tests {
                 got[0][d]
             );
         }
+    }
+
+    /// The z-gate activation comes from the ARCHITECTURE, not from a constant:
+    /// qwen4exp gates the output norm with `sigmoid(z)` where the Qwen 3.6/3.8
+    /// graphs gate with `silu(z)` (HF `output_gate_type`). Everything else in
+    /// the layer is identical, so the same weights and the same input must give
+    /// two different outputs, each matching its own hand-computed gate.
+    ///
+    /// A swap here is silent — both activations are smooth, bounded-ish and
+    /// produce a layer that runs and generates plausible-looking garbage — which
+    /// is why the choice is resolved once at load and pinned here.
+    #[test]
+    fn z_gate_activation_follows_the_architecture() {
+        let _guard = path_lock();
+        let (hd, kh, vh) = (2usize, 1usize, 1usize);
+        let hidden = 6;
+        let base = cfg_for(kh, vh, hd, hidden);
+
+        let mut raw = passthrough(&base, hidden);
+        raw.norm = t1(vec![0.5, 2.0]);
+        let mut gate = vec![0f32; base.linear_v_dim() * hidden];
+        gate[0] = 1.0; // channel 0: z = x[0]
+        gate[hidden] = -3.0; // channel 1: z = -3 * x[0]
+        raw.gate = t2(gate, base.linear_v_dim(), hidden);
+
+        let row = [1.0f64, 0.0, 1.0, 0.0, 2.0, 3.0];
+        let x = t2(row.iter().map(|v| *v as f32).collect(), 1, hidden);
+
+        // The recurrence up to the gate, copied from
+        // `gated_norm_applies_weight_before_the_gate` — one token, so
+        // S = k (x) (beta * v) with beta = sigmoid(0) = 0.5.
+        let act: Vec<f64> = row.iter().map(|v| silu_f64(*v)).collect();
+        let n = |a: f64, b: f64| (a * a + b * b).sqrt().max(1e-6);
+        let q = [act[0] / n(act[0], act[1]), act[1] / n(act[0], act[1])];
+        let k = [act[2] / n(act[2], act[3]), act[3] / n(act[2], act[3])];
+        let d = [act[4] * 0.5, act[5] * 0.5];
+        let scale = 1.0 / (hd as f64).sqrt();
+        let o = [
+            (k[0] * d[0] * q[0] + k[1] * d[0] * q[1]) * scale,
+            (k[0] * d[1] * q[0] + k[1] * d[1] * q[1]) * scale,
+        ];
+        let inv = 1.0 / ((o[0] * o[0] + o[1] * o[1]) / 2.0 + 1e-6).sqrt();
+        let w = [0.5f64, 2.0];
+        let z = [1.0f64, -3.0];
+
+        let mut outs = Vec::new();
+        for arch in [Arch::Moe, Arch::Qwen4Exp] {
+            // Only `arch` differs. The qwen4exp sub-config stays `None`: a
+            // DeltaNet layer reads nothing from it, and this test is about the
+            // one field it does read.
+            let cfg = XwenConfig {
+                arch,
+                ..cfg_for(kh, vh, hd, hidden)
+            };
+            assert_eq!(cfg.arch.z_gate(), arch.z_gate());
+            let block = build(&raw, &cfg);
+            let mut cache = cache_for(&cfg);
+            let got = to_vec2(&block.forward(&x, &mut cache).unwrap());
+
+            let gate_of = |v: f64| match arch.z_gate() {
+                ZGate::Silu => silu_f64(v),
+                ZGate::Sigmoid => 1.0 / (1.0 + (-v).exp()),
+            };
+            for dim in 0..hd {
+                let want = o[dim] * inv * w[dim] * gate_of(z[dim]);
+                assert!(
+                    (got[0][dim] as f64 - want).abs() < 2e-5,
+                    "{arch:?} dim {dim}: got {} want {want}",
+                    got[0][dim]
+                );
+            }
+            outs.push(got[0].clone());
+        }
+        // silu(z) and sigmoid(z) are far apart at these gate logits, so the two
+        // architectures cannot be producing the same layer.
+        assert!(
+            outs[0]
+                .iter()
+                .zip(&outs[1])
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "the two architectures gated identically"
+        );
     }
 
     /// The conv window and the delta state carried in the cache make a
@@ -1218,7 +1312,7 @@ mod tests {
                 crate::ops::delta_ba(&ba, &ssm_a, &dt_bias).unwrap();
             });
             let t_gnorm = bench(&mut || {
-                crate::ops::delta_gnorm(&o, &z, &norm_w, 1e-6).unwrap();
+                crate::ops::delta_gnorm(&o, &z, &norm_w, 1e-6, ZGate::Silu).unwrap();
             });
 
             // A real forward issues all 48 DeltaNet layers back to back, so the
@@ -1245,6 +1339,7 @@ mod tests {
                         &z.reshape((t, V_HEADS, HD)).unwrap(),
                         &norm_w,
                         1e-6,
+                        ZGate::Silu,
                     )
                     .unwrap();
                     keep.push(

@@ -9,6 +9,7 @@
 use anyhow::Result;
 use candle_core::Tensor;
 
+use crate::config::ZGate;
 use crate::ops::dispatch;
 
 /// The head dim the scan kernel is specialized to — the production geometry of
@@ -39,12 +40,15 @@ pub fn delta_ba(ba: &Tensor, ssm_a: &Tensor, dt_bias: &Tensor) -> Result<(Tensor
     dispatch::run_delta_ba(ba, ssm_a, dt_bias)
 }
 
-/// Gated output RMSNorm: `rms_norm(o, eps) * ssm_norm_weight * silu(z)` per
+/// Gated output RMSNorm: `rms_norm(o, eps) * ssm_norm_weight * gate(z)` per
 /// head, one pass. `o` and `z` are `[seq, v_heads, head_dim]` f32 contiguous,
 /// `w` is `[head_dim]`. The gate multiplies AFTER the weight and outside the
 /// norm, so it never enters the statistic.
-pub fn delta_gnorm(o: &Tensor, z: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
-    dispatch::run_delta_gnorm(o, z, w, eps)
+///
+/// `gate` is the checkpoint's z-gate activation ([`ZGate`], from
+/// `Arch::z_gate`): silu on qwen35/qwen35moe, sigmoid on qwen4exp.
+pub fn delta_gnorm(o: &Tensor, z: &Tensor, w: &Tensor, eps: f32, gate: ZGate) -> Result<Tensor> {
+    dispatch::run_delta_gnorm(o, z, w, eps, gate)
 }
 
 /// The q/k L2 clamp-norm, `x / max(||x||, eps)`, over the leading
@@ -309,7 +313,7 @@ mod tests {
                 );
                 let w = on_device(pseudo_random(HD, seed + 2, 0.2, 2.0), HD, &device);
 
-                let got = delta_gnorm(&o, &z, &w, EPS as f32).unwrap();
+                let got = delta_gnorm(&o, &z, &w, EPS as f32, ZGate::Silu).unwrap();
 
                 let ms = (o.sqr().unwrap().sum_keepdim(2).unwrap() / HD as f64).unwrap();
                 let want = o
@@ -320,6 +324,59 @@ mod tests {
                 let want = (want * silu(&z).unwrap()).unwrap();
 
                 assert_close(&got, &want, 2e-6, &format!("gnorm v={v_heads} seq={seq}"));
+            }
+        }
+    }
+
+    /// UNIT 3a: the qwen4exp arm gates the same norm with `sigmoid(z)` instead
+    /// of `silu(z)`, and `ZGate` is what selects between the two kernels.
+    ///
+    /// Both arms are graded against `ref_hc::gated_rms_norm_batch`, the frozen
+    /// f32 oracle the transformers fixture pins — a second, independent
+    /// reference for the silu arm as well as the first one for sigmoid. Same
+    /// bound as the candle comparison above and for the same reason: only the
+    /// 128-term sum of squares reassociates.
+    ///
+    /// The arms must also disagree grossly on the same inputs. Without that,
+    /// a dispatch that resolved every request to one kernel name would satisfy
+    /// every bound in this file.
+    #[test]
+    fn gnorm_sigmoid_arm_matches_reference() {
+        use crate::qwen4exp::ref_hc::{ZGateRef, gated_rms_norm_batch};
+
+        let device = metal_device().unwrap();
+        for (ki, &(_, v_heads)) in GEOMETRIES.iter().enumerate() {
+            for &seq in &[1usize, 17, 512] {
+                let seed = 0x3500 + ki as u64 * 71 + seq as u64;
+                let n = seq * v_heads * HD;
+                let o_h = pseudo_random(n, seed, -6.0, 6.0);
+                let z_h = pseudo_random(n, seed + 1, -8.0, 8.0);
+                let w_h = pseudo_random(HD, seed + 2, 0.2, 2.0);
+                let o = on_device(o_h.clone(), (seq, v_heads, HD), &device);
+                let z = on_device(z_h.clone(), (seq, v_heads, HD), &device);
+                let w = on_device(w_h.clone(), HD, &device);
+
+                let mut arms = Vec::new();
+                for (gate, gate_ref, name) in [
+                    (ZGate::Sigmoid, ZGateRef::Sigmoid, "sigmoid"),
+                    (ZGate::Silu, ZGateRef::Silu, "silu"),
+                ] {
+                    let got = delta_gnorm(&o, &z, &w, EPS as f32, gate).unwrap();
+                    let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+                    let want = gated_rms_norm_batch(&o_h, &w_h, &z_h, gate_ref, EPS as f32);
+                    let r = rel_l2(&g, &want);
+                    assert!(
+                        r < 2e-6,
+                        "gnorm {name} v={v_heads} seq={seq}: relative l2 {r:e} exceeds 2e-6"
+                    );
+                    arms.push(g);
+                }
+                let spread = rel_l2(&arms[0], &arms[1]);
+                assert!(
+                    spread > 0.1,
+                    "the sigmoid and silu arms agree to {spread:e} at v={v_heads} seq={seq}; \
+                     one kernel is serving both"
+                );
             }
         }
     }
@@ -768,11 +825,12 @@ mod tests {
                 &z3((2, 3, 40)),
                 &z3((2, 3, 40)),
                 &Tensor::zeros(40usize, DType::F32, &device).unwrap(),
-                1e-6
+                1e-6,
+                ZGate::Silu
             )
             .is_err()
         );
-        assert!(delta_gnorm(&z3((2, 3, HD)), &z3((2, 4, HD)), &w128, 1e-6).is_err());
+        assert!(delta_gnorm(&z3((2, 3, HD)), &z3((2, 4, HD)), &w128, 1e-6, ZGate::Silu).is_err());
 
         // l2norm: the conv row must be wide enough to hold the q|k planes it is
         // asked to normalize.
@@ -793,9 +851,9 @@ mod tests {
         // refuses it.
         assert!(delta_conv(&z1((3, 64)), &z1((0, 64)), &w).is_err());
         assert!(delta_ba(&z1((0, 8)), &a, &a).is_err());
-        assert!(delta_gnorm(&z3((0, 3, HD)), &z3((0, 3, HD)), &w128, 1e-6).is_err());
+        assert!(delta_gnorm(&z3((0, 3, HD)), &z3((0, 3, HD)), &w128, 1e-6, ZGate::Silu).is_err());
         assert!(delta_l2norm(&z1((0, 2 * 16 * HD)), 16, 1e-6).is_err());
-        assert!(delta_gnorm(&z3((2, 0, HD)), &z3((2, 0, HD)), &w128, 1e-6).is_err());
+        assert!(delta_gnorm(&z3((2, 0, HD)), &z3((2, 0, HD)), &w128, 1e-6, ZGate::Silu).is_err());
         assert!(
             delta_scan(
                 &z1((0, (2 * 16 + 32) * HD)),
@@ -1053,7 +1111,7 @@ mod tests {
             .unwrap();
         let w_big = on_device(pseudo_random(HD + 3, 0x700c, 0.2, 2.0), HD + 3, &device);
         let nw = w_big.narrow(0, 3, HD).unwrap();
-        let got = delta_gnorm(&o_view, &z_view, &nw, EPS as f32).unwrap();
+        let got = delta_gnorm(&o_view, &z_view, &nw, EPS as f32, ZGate::Silu).unwrap();
         let ms = (o_view.sqr().unwrap().sum_keepdim(2).unwrap() / HD as f64).unwrap();
         let want = (o_view
             .broadcast_div(&(ms + EPS).unwrap().sqrt().unwrap())

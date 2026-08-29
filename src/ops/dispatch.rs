@@ -15,6 +15,7 @@ use candle_metal_kernels::metal::{Buffer, ComputeCommandEncoder, ComputePipeline
 use candle_metal_kernels::source::Source;
 use candle_metal_kernels::utils::EncoderProvider;
 
+use crate::config::ZGate;
 use crate::gguf::ExpertStack;
 use crate::ops::{MmVariant, pipelines};
 
@@ -3256,11 +3257,21 @@ pub(crate) fn run_delta_ba(
 }
 
 /// Fused gated output RMSNorm against `kernel_delta_gnorm` (delta.metal):
-/// `rms_norm(o, eps) * ssm_norm_weight * silu(z)` per head, in one pass. `o` is
+/// `rms_norm(o, eps) * ssm_norm_weight * gate(z)` per head, in one pass. `o` is
 /// `[seq, v_heads, head_dim]` f32, `z` the gate projection output in the same
 /// element order, `w` the `[head_dim]` weight. The gate is applied AFTER the
 /// weight and outside the norm, so it does not enter the statistic.
-pub(crate) fn run_delta_gnorm(o: &Tensor, z: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
+///
+/// `gate` selects the activation, and with it the kernel: `silu(z)` on the
+/// qwen35/qwen35moe graphs, `sigmoid(z)` on qwen4exp. The two kernels share one
+/// templated body, so the silu arm is the same instruction stream it always was.
+pub(crate) fn run_delta_gnorm(
+    o: &Tensor,
+    z: &Tensor,
+    w: &Tensor,
+    eps: f32,
+    gate: ZGate,
+) -> Result<Tensor> {
     let cdev = o.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("delta_gnorm requires o on a Metal device");
@@ -3289,14 +3300,18 @@ pub(crate) fn run_delta_gnorm(o: &Tensor, z: &Tensor, w: &Tensor, eps: f32) -> R
     let n = checked_elems(&[seq, v_heads, head_dim], "delta_gnorm")?;
     glue_index_fits_i32(n)?;
 
-    let pipeline = pipelines::delta_pipeline(mdev.device(), "kernel_delta_gnorm")?;
+    let kernel = match gate {
+        ZGate::Silu => "kernel_delta_gnorm",
+        ZGate::Sigmoid => "kernel_delta_gnorm_sigmoid",
+    };
+    let pipeline = pipelines::delta_pipeline(mdev.device(), kernel)?;
     if pipeline.max_total_threads_per_threadgroup() < head_dim {
         bail!(
             "delta_gnorm needs {head_dim} threads per threadgroup, the pipeline allows {}",
             pipeline.max_total_threads_per_threadgroup()
         );
     }
-    check_delta_simd_width(&pipeline, "kernel_delta_gnorm")?;
+    check_delta_simd_width(&pipeline, kernel)?;
     let dst = mdev.new_buffer(n, DType::F32, "delta_gnorm")?;
 
     let (o_guard, o_layout) = o.storage_and_layout();

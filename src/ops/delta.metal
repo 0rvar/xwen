@@ -14,7 +14,9 @@
 //                        entire scan: one dispatch per layer per chunk. It folds
 //                        the q/k L2 clamp-norm into its own load stage.
 //   kernel_delta_gnorm   the gated output RMSNorm (rms -> ssm_norm.weight ->
-//                        silu(z)).
+//                        silu(z)), with kernel_delta_gnorm_sigmoid its
+//                        sigmoid(z) sibling for the qwen4exp graph — one
+//                        templated body, the arm chosen by name at dispatch.
 //
 // A layer therefore costs eight dispatches at any sequence length. The
 // kill-switch back to the reference scan is XWEN_DELTA_CLASSIC.
@@ -188,26 +190,35 @@ typedef struct {
 } delta_gnorm_args;
 
 // Gated output RMSNorm: normalize over the head dim, scale by
-// ssm_norm.weight, and only THEN multiply by silu(z). The gate is outside the
-// norm, so it does not affect the statistic.
+// ssm_norm.weight, and only THEN multiply by the activated gate. The gate is
+// outside the norm, so it does not affect the statistic.
+//
+// The activation is the checkpoint's: `silu(z)` on the qwen35/qwen35moe
+// graphs, `sigmoid(z)` on qwen4exp (config::ZGate). One body, two kernels —
+// the branch is a template parameter so each specialization compiles to the
+// same straight-line arithmetic a hand-written kernel would, and the silu
+// arm's instruction stream is unchanged by the sigmoid arm's existence.
 //
 // One threadgroup per (token, head), `head_dim` threads wide; the sum of
 // squares folds through simd_sum and one threadgroup-memory pass.
-kernel void kernel_delta_gnorm(
-        constant delta_gnorm_args & args [[buffer(0)]],
-        device const float * o           [[buffer(1)]],
-        device const float * z           [[buffer(2)]],
-        device const float * w           [[buffer(3)]],
-        device       float * dst         [[buffer(4)]],
-        uint tgid [[threadgroup_position_in_grid]],
-        uint tid  [[thread_position_in_threadgroup]],
-        uint sgid [[simdgroup_index_in_threadgroup]],
-        uint lane [[thread_index_in_simdgroup]],
-        uint sgcount [[simdgroups_per_threadgroup]]) {
+//
+// `partial` is passed in rather than declared here: MSL allows threadgroup
+// variables only at a kernel function's own scope.
+template <bool SIGMOID_GATE>
+static inline void delta_gnorm_body(
+        constant delta_gnorm_args & args,
+        device const float * o,
+        device const float * z,
+        device const float * w,
+        device       float * dst,
+        threadgroup  float * partial,
+        uint tgid,
+        uint tid,
+        uint sgid,
+        uint lane,
+        uint sgcount) {
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
-    threadgroup float partial[32];
-
     const int d = (int) tid;
     const size_t idx = (size_t) tgid * args.head_dim + d;
     const float x = o[idx];
@@ -225,9 +236,41 @@ kernel void kernel_delta_gnorm(
     const float ms = total / (float) args.head_dim;
     const float den = sqrt(ms + args.eps);
     const float zv = z[idx];
-    // candle's usilu on the gate, applied after the weight (see the ordering
-    // test in linear_attn.rs).
-    dst[idx] = ((x / den) * w[d]) * (zv / (1 + exp(-zv)));
+    // candle's usilu / usigmoid on the gate, applied after the weight (see the
+    // ordering test in linear_attn.rs).
+    const float gate = SIGMOID_GATE ? (1 / (1 + exp(-zv))) : (zv / (1 + exp(-zv)));
+    dst[idx] = ((x / den) * w[d]) * gate;
+}
+
+kernel void kernel_delta_gnorm(
+        constant delta_gnorm_args & args [[buffer(0)]],
+        device const float * o           [[buffer(1)]],
+        device const float * z           [[buffer(2)]],
+        device const float * w           [[buffer(3)]],
+        device       float * dst         [[buffer(4)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint tid  [[thread_position_in_threadgroup]],
+        uint sgid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sgcount [[simdgroups_per_threadgroup]]) {
+    threadgroup float partial[32];
+    delta_gnorm_body<false>(args, o, z, w, dst, partial, tgid, tid, sgid, lane, sgcount);
+}
+
+// The sigmoid-gated sibling (qwen4exp). Identical but for the activation.
+kernel void kernel_delta_gnorm_sigmoid(
+        constant delta_gnorm_args & args [[buffer(0)]],
+        device const float * o           [[buffer(1)]],
+        device const float * z           [[buffer(2)]],
+        device const float * w           [[buffer(3)]],
+        device       float * dst         [[buffer(4)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint tid  [[thread_position_in_threadgroup]],
+        uint sgid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sgcount [[simdgroups_per_threadgroup]]) {
+    threadgroup float partial[32];
+    delta_gnorm_body<true>(args, o, z, w, dst, partial, tgid, tid, sgid, lane, sgcount);
 }
 
 // The scan kernels' fixed head dim. Both checkpoints run gated DeltaNet at 128
