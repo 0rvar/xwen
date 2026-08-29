@@ -1557,7 +1557,7 @@ fn bf16_alias_tensor(
 /// the official drafter: 24,125 of 1.11e9 weights (2.2e-5, all |w| ≲ 1e-5)
 /// sit in that range — far below spec-verify's noise floor. Parallel scan,
 /// memory-bandwidth bound (~2.2GB total for the official drafter).
-fn ensure_bf16_fits_f16(bytes: &[u8], name: &str) -> Result<()> {
+pub(crate) fn ensure_bf16_fits_f16(bytes: &[u8], name: &str) -> Result<()> {
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)

@@ -393,6 +393,7 @@ impl MtpDrafter {
             &mut self.cache,
             pos,
             mask.as_ref(),
+            None,
         )?;
         let x = (&inp_sa + attn_out)?;
 

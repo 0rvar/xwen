@@ -6,6 +6,7 @@ use candle_core::{DType, Device, Module, Tensor};
 use crate::config::XwenConfig;
 use crate::gguf::{AttnQ8, QLinear, Weights};
 use crate::kv_cache::{LayerCache, MaskKind};
+use crate::qwen4exp::indexer::QsaSelection;
 use crate::rope::Rope;
 
 /// Token count up to and including which a q8_0-stored attention projection
@@ -59,7 +60,15 @@ impl PrefillMask {
         n_head: usize,
         device: &Device,
     ) -> Result<Self> {
-        let raw = crate::kv_cache::mask_tensor(host, device)?;
+        Self::from_raw(crate::kv_cache::mask_tensor(host, device)?, n_head)
+    }
+
+    /// The same materialization over an additive `[seq, k_seq]` f32 mask a
+    /// caller built itself. The QSA indexer is that caller: its per-query block
+    /// selection already carries causality, so its mask REPLACES the causal one
+    /// rather than composing with it, and it reaches sdpa through exactly this
+    /// broadcast-to-f16 path.
+    pub fn from_raw(raw: Tensor, n_head: usize) -> Result<Self> {
         let (s, kk) = raw.dims2()?;
         let sdpa = raw
             .reshape((1, 1, s, kk))?
@@ -302,12 +311,19 @@ impl AttnBlock {
     /// x_normed: [seq, hidden] f32 (already attn_norm'ed by the caller).
     /// `mask` is the pre-built, hoisted mask for this layer's kind (None for a
     /// single decode token). Returns [seq, hidden] f32.
+    ///
+    /// `qsa` is the sparse-attention overlay for a `qwen4exp` QSA layer (D16).
+    /// `None` and `QsaSelection::Dense` are the same path, byte for byte: every
+    /// other architecture passes `None`, and a below-budget QSA layer passes
+    /// `Dense`, which is not an approximation of dense attention but literally
+    /// is it.
     pub fn forward(
         &self,
         x_normed: &Tensor,
         cache: &mut LayerCache,
         pos: usize,
         mask: Option<&PrefillMask>,
+        qsa: Option<&QsaSelection>,
     ) -> Result<Tensor> {
         let (seq, _hidden) = x_normed.dims2()?;
 
@@ -413,6 +429,29 @@ impl AttnBlock {
         };
         let (k_all, v_all) = cache.append(&k16, &v16)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+
+        // The QSA overlay (D16), in its own two branches so the four seq==1
+        // shortcuts above and below stay exactly as they were.
+        //
+        //  - `Rows` is the decode shape: gather the selected K/V rows into
+        //    packed contiguous planes and attend over those with NO mask.
+        //    candle's vector sdpa (seq == 1) silently IGNORES a mask, so
+        //    masking is not available on this route — the gather is what makes
+        //    the selection real (D11).
+        //  - `Mask` is the prefill shape: an additive per-query mask that
+        //    already includes causality, so it replaces the hoisted causal one
+        //    instead of being added to it.
+        let (k_all, v_all) = match qsa {
+            Some(QsaSelection::Rows(rows)) => {
+                (gather_rows(&k_all, rows)?, gather_rows(&v_all, rows)?)
+            }
+            _ => (k_all, v_all),
+        };
+        let qsa_mask = match qsa {
+            Some(QsaSelection::Mask(m)) => Some(PrefillMask::from_raw(m.clone(), self.n_head)?),
+            _ => None,
+        };
+        let mask = qsa_mask.as_ref().or(mask);
 
         // Attention proper. The vendored flash kernel is NOT a route here: it is
         // compiled at head dim 128 (flash.metal's `BD == 128`) and this
@@ -578,6 +617,33 @@ impl AttnBlock {
     }
 }
 
+/// Pack the cache rows `rows` names out of a `[heads, len, head_dim]` cache
+/// view into a contiguous `[heads, n_sel, head_dim]` plane — the decode half of
+/// the QSA overlay.
+///
+/// One `index_select` per head, deliberately, rather than one call over the
+/// whole rank-3 view. A cache view is a `narrow` of a `max_ctx`-slot buffer, so
+/// it is strided across the head axis, and candle's Metal `index_select`
+/// MIS-HANDLES a strided source at the pinned rev: `call_index_select` passes
+/// the indexed dimension's SIZE where the kernel's `get_strided_index` expects
+/// the tensor's RANK (candle-metal-kernels indexing.metal), so every gathered
+/// element is read from a garbage offset — silently, with the right shape. A
+/// single head's slice IS contiguous by candle's own rule (a leading axis of
+/// extent 1 is skipped when checking strides), which puts each of these
+/// dispatches on the kernel's correct contiguous path. Head counts here are 2-4,
+/// so this is a handful of dispatches, not a loop that matters.
+fn gather_rows(t: &Tensor, rows: &Tensor) -> Result<Tensor> {
+    let (heads, len, head_dim) = t.dims3()?;
+    let mut packed = Vec::with_capacity(heads);
+    for h in 0..heads {
+        packed.push(
+            t.narrow(0, h, 1)?
+                .reshape((len, head_dim))?
+                .index_select(rows, 0)?,
+        );
+    }
+    Ok(Tensor::stack(&packed, 0)?)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,12 +913,12 @@ mod tests {
         let mask = block.prefill_mask(&cache, 4, 0).unwrap();
         let mut got = vec![
             block
-                .forward(&prefill, &mut cache, 0, mask.as_ref())
+                .forward(&prefill, &mut cache, 0, mask.as_ref(), None)
                 .unwrap(),
         ];
         for t in 4..total {
             let row = x.narrow(0, t, 1).unwrap().contiguous().unwrap();
-            got.push(block.forward(&row, &mut cache, t, None).unwrap());
+            got.push(block.forward(&row, &mut cache, t, None, None).unwrap());
         }
         let got = Tensor::cat(&got, 0).unwrap();
 
@@ -899,7 +965,7 @@ mod tests {
         let mut row = vec![0f32; hidden];
         row[0] = 1.0;
         let x = Tensor::from_vec(row, (1, hidden), &dev).unwrap();
-        let out = block.forward(&x, &mut cache, 0, None).unwrap();
+        let out = block.forward(&x, &mut cache, 0, None, None).unwrap();
 
         let want = naive_forward(&w, &rope, &x, n_head, n_kv, hd);
         assert!(
@@ -947,10 +1013,10 @@ mod tests {
         let m_metal = b_metal.prefill_mask(&c_metal, 5, 0).unwrap();
 
         let out_cpu = b_cpu
-            .forward(&x_cpu, &mut c_cpu, 0, m_cpu.as_ref())
+            .forward(&x_cpu, &mut c_cpu, 0, m_cpu.as_ref(), None)
             .unwrap();
         let out_metal = b_metal
-            .forward(&x_metal, &mut c_metal, 0, m_metal.as_ref())
+            .forward(&x_metal, &mut c_metal, 0, m_metal.as_ref(), None)
             .unwrap()
             .to_device(&cpu)
             .unwrap();
@@ -1332,5 +1398,143 @@ mod tests {
                 sums[3]
             );
         }
+    }
+
+    // ---- the QSA overlay (D16) ----
+
+    /// A `qwen4exp`-shaped attention block: head dim 256 (so the vendored flash
+    /// kernel, compiled at 128, is not a route) and GQA, on Metal.
+    use crate::gguf::metal_device;
+
+    fn qsa_block(dev: &Device) -> (AttnBlock, XwenConfig, RawWeights) {
+        let (n_head, n_kv, hd, hidden) = (4usize, 2usize, 256usize, 512usize);
+        let cfg = test_cfg(n_head, n_kv, hd, hidden, 64);
+        let rope = Arc::new(Rope::new(cfg.rope(), 256, dev).unwrap());
+        let w = raw_weights(n_head, n_kv, hd, hidden, dev);
+        let block = build_block(&w, &cfg, 0, rope, dev, AttnWeights::DequantF32);
+        (block, cfg, w)
+    }
+
+    /// `QsaSelection::Dense` is not an approximation of the unoverlaid path —
+    /// it IS that path, which is what makes a below-budget QSA layer a free
+    /// correctness check against a run with no indexer at all.
+    #[test]
+    fn dense_selection_is_bit_identical_to_no_overlay() {
+        let dev = metal_device().unwrap();
+        let (block, cfg, _) = qsa_block(&dev);
+        let x = dense(64, cfg.hidden, 91, &dev);
+
+        let run = |qsa: Option<&QsaSelection>| {
+            let mut cache = LayerCache::new(&cfg, 0, 128, &dev).unwrap();
+            let mask = block.prefill_mask(&cache, 64, 0).unwrap();
+            block
+                .forward(&x, &mut cache, 0, mask.as_ref(), qsa)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_eq!(run(None), run(Some(&QsaSelection::Dense)));
+    }
+
+    /// A decode step whose `Rows` names EVERY cached position must equal the
+    /// unoverlaid decode: the gather packs the cache's strided per-head views
+    /// into contiguous planes, and packing must not change the answer.
+    ///
+    /// The second half is the falsifiability half — a `Rows` naming a strict
+    /// subset has to actually move the output, or the gather could be a no-op
+    /// and the first assertion would prove nothing.
+    #[test]
+    fn decode_rows_gather_selects_the_named_positions() {
+        let dev = metal_device().unwrap();
+        let (block, cfg, _) = qsa_block(&dev);
+        let prefill = dense(64, cfg.hidden, 92, &dev);
+        let step = dense(1, cfg.hidden, 93, &dev);
+
+        let run = |rows: Option<Vec<u32>>| {
+            let mut cache = LayerCache::new(&cfg, 0, 128, &dev).unwrap();
+            let mask = block.prefill_mask(&cache, 64, 0).unwrap();
+            block
+                .forward(&prefill, &mut cache, 0, mask.as_ref(), None)
+                .unwrap();
+            let sel = rows
+                .map(|r| QsaSelection::Rows(Tensor::from_vec(r.clone(), r.len(), &dev).unwrap()));
+            block
+                .forward(&step, &mut cache, 64, None, sel.as_ref())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+
+        let plain = run(None);
+        let all = run(Some((0..65).collect()));
+        let diff = plain
+            .iter()
+            .zip(&all)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            diff < 1e-5,
+            "gathering every row changed the output by {diff}"
+        );
+
+        // Half the prefix plus the query's own token: a different attention
+        // distribution, so a different answer.
+        let subset = run(Some((0..32).chain(std::iter::once(64)).collect()));
+        let moved = plain
+            .iter()
+            .zip(&subset)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            moved > 1e-4,
+            "restricting the rows to half the prefix left the output unchanged ({moved}): \
+             the gather is not reaching sdpa"
+        );
+    }
+
+    /// A prefill `Mask` replaces the causal mask rather than composing with it,
+    /// so an all-visible-below-the-diagonal QSA mask reproduces the ordinary
+    /// causal prefill.
+    #[test]
+    fn prefill_mask_overlay_reproduces_causal_when_nothing_is_masked() {
+        let dev = metal_device().unwrap();
+        let (block, cfg, _) = qsa_block(&dev);
+        let seq = 64usize;
+        let x = dense(seq, cfg.hidden, 94, &dev);
+
+        let mut causal = vec![f32::NEG_INFINITY; seq * seq];
+        for (q, row) in causal.chunks_mut(seq).enumerate() {
+            for slot in row.iter_mut().take(q + 1) {
+                *slot = 0.0;
+            }
+        }
+        let overlay = QsaSelection::Mask(Tensor::from_vec(causal, (seq, seq), &dev).unwrap());
+
+        let run = |qsa: Option<&QsaSelection>| {
+            let mut cache = LayerCache::new(&cfg, 0, 128, &dev).unwrap();
+            let mask = block.prefill_mask(&cache, seq, 0).unwrap();
+            block
+                .forward(&x, &mut cache, 0, mask.as_ref(), qsa)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let plain = run(None);
+        let overlaid = run(Some(&overlay));
+        let diff = plain
+            .iter()
+            .zip(&overlaid)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            diff < 1e-5,
+            "a fully causal overlay moved the output by {diff}"
+        );
     }
 }

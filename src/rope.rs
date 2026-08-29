@@ -125,12 +125,8 @@ impl Rope {
     /// always run it. (Fused-glue callers are the only ones that request f16;
     /// the chain still honors it — via a trailing candle cast, the same
     /// rounding — so the choice of path stays invisible.)
-    fn rotate(&self, x: &Tensor, pos: usize, out_dtype: DType) -> Result<Tensor> {
-        // F32/F16 is the contract on BOTH paths (the fused kernel enforces it;
-        // the chain must not silently accept more just because to_dtype can).
-        if !matches!(out_dtype, DType::F32 | DType::F16) {
-            anyhow::bail!("rope: out_dtype must be F32 or F16, got {out_dtype:?}");
-        }
+    pub(crate) fn rotate(&self, x: &Tensor, pos: usize, out_dtype: DType) -> Result<Tensor> {
+        check_out_dtype(out_dtype)?;
         // (The fused kernel wants a contiguous input; AttnBlock always provides
         // one. A strided caller falls through to the chain, which narrows and
         // copies — the two paths are bit-identical, so the choice is invisible.)
@@ -140,15 +136,57 @@ impl Rope {
         {
             return crate::ops::rope_neox(x, &self.cos, &self.sin, pos, self.n_rot, out_dtype);
         }
-        let (_, seq, head_dim) = x.dims3()?;
+        let seq = x.dim(1)?;
         let cos = self.cos.narrow(0, pos, seq)?;
         let sin = self.sin.narrow(0, pos, seq)?;
+        self.rotate_with_tables(x, &cos, &sin, out_dtype)
+    }
+
+    /// `rotate` for tokens whose positions are NOT a consecutive run from a
+    /// scalar start: `positions` is a u32 `[seq]` tensor naming each row's rope
+    /// position, gathered out of the same `cos`/`sin` tables.
+    ///
+    /// The QSA indexer is the caller that needs it. Its pooled block keys are
+    /// roped at the position of each block's FIRST member token — stride
+    /// `compress_ratio` through the sequence — which no scalar start describes.
+    /// The fused single-pass kernel takes a scalar `pos`, so this variant always
+    /// runs the candle chain; `rotate` proves the two are bit-identical, and the
+    /// gathered rows are the same table rows a consecutive run would narrow to.
+    pub(crate) fn rotate_at(
+        &self,
+        x: &Tensor,
+        positions: &Tensor,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        check_out_dtype(out_dtype)?;
+        let seq = x.dim(1)?;
+        anyhow::ensure!(
+            positions.dims1()? == seq,
+            "rope: {} positions for {seq} rows",
+            positions.dims1()?
+        );
+        let cos = self.cos.index_select(positions, 0)?;
+        let sin = self.sin.index_select(positions, 0)?;
+        self.rotate_with_tables(x, &cos, &sin, out_dtype)
+    }
+
+    /// The candle rope chain over already-selected `[seq, n_rot/2]` cos/sin
+    /// rows: rotate the first `n_rot` dims of `x` `[heads, seq, head_dim]`,
+    /// pass the rest through, store as `out_dtype`.
+    fn rotate_with_tables(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        let (_, _, head_dim) = x.dims3()?;
 
         // candle's rope kernel wants a batch dim and pairs the two contiguous
         // halves of its input, so feed it exactly the rotated block.
         let x = x.unsqueeze(0)?;
         let rotated =
-            candle_nn::rotary_emb::rope(&x.narrow(3, 0, self.n_rot)?.contiguous()?, &cos, &sin)?;
+            candle_nn::rotary_emb::rope(&x.narrow(3, 0, self.n_rot)?.contiguous()?, cos, sin)?;
         let out = if self.n_rot < head_dim {
             let pass = x.narrow(3, self.n_rot, head_dim - self.n_rot)?;
             Tensor::cat(&[&rotated, &pass], 3)?
@@ -163,6 +201,16 @@ impl Rope {
             out.to_dtype(out_dtype)?
         })
     }
+}
+
+/// F32/F16 is the contract on every rope path (the fused kernel enforces it;
+/// the chain must not silently accept more just because to_dtype can).
+fn check_out_dtype(out_dtype: DType) -> Result<()> {
+    anyhow::ensure!(
+        matches!(out_dtype, DType::F32 | DType::F16),
+        "rope: out_dtype must be F32 or F16, got {out_dtype:?}"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -376,6 +424,75 @@ mod tests {
         assert!(
             (theta_yarn - theta_plain).abs() > 1e-3,
             "yarn scaling must change the angle"
+        );
+    }
+
+    /// `rotate_at` over a consecutive run is exactly `rotate` from that start:
+    /// it gathers the same table rows the scalar-start path narrows to.
+    #[test]
+    fn rotate_at_matches_rotate_on_a_consecutive_run() {
+        let dev = Device::Cpu;
+        let rope = Rope::new(&laguna_yarn(), 64, &dev).unwrap();
+        let (n_head, seq, head_dim) = (3usize, 7usize, 128usize);
+        let data: Vec<f32> = (0..n_head * seq * head_dim)
+            .map(|i| ((i * 13 % 29) as f32) * 0.07 - 1.0)
+            .collect();
+        let x = Tensor::from_vec(data, (n_head, seq, head_dim), &dev).unwrap();
+
+        let pos = 11usize;
+        let want = rope.rotate(&x, pos, DType::F32).unwrap();
+        let positions = Tensor::from_vec(
+            (0..seq).map(|t| (pos + t) as u32).collect::<Vec<_>>(),
+            seq,
+            &dev,
+        )
+        .unwrap();
+        let got = rope.rotate_at(&x, &positions, DType::F32).unwrap();
+
+        let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+        let w: Vec<f32> = want.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(g, w, "a consecutive gather must reproduce the scalar start");
+    }
+
+    /// Each row is roped at the position `positions` names for it, and at
+    /// nothing else — pinned with a scrambled, non-monotonic set, which is the
+    /// shape the QSA indexer's block-first positions take.
+    #[test]
+    fn rotate_at_ropes_every_row_at_its_own_position() {
+        let dev = Device::Cpu;
+        let rope = Rope::new(&laguna_yarn(), 256, &dev).unwrap();
+        let (n_head, seq, head_dim) = (2usize, 5usize, 128usize);
+        let data: Vec<f32> = (0..n_head * seq * head_dim)
+            .map(|i| ((i * 7 % 17) as f32) * 0.11 - 0.8)
+            .collect();
+        let x = Tensor::from_vec(data, (n_head, seq, head_dim), &dev).unwrap();
+
+        let scrambled = [200usize, 4, 91, 0, 137];
+        let positions = Tensor::from_vec(
+            scrambled.iter().map(|&p| p as u32).collect::<Vec<_>>(),
+            seq,
+            &dev,
+        )
+        .unwrap();
+        let got = rope.rotate_at(&x, &positions, DType::F32).unwrap();
+
+        for (t, &p) in scrambled.iter().enumerate() {
+            let row = x.narrow(1, t, 1).unwrap().contiguous().unwrap();
+            let want = rope.rotate(&row, p, DType::F32).unwrap();
+            let want: Vec<f32> = want.flatten_all().unwrap().to_vec1().unwrap();
+            let one = got.narrow(1, t, 1).unwrap().contiguous().unwrap();
+            let one: Vec<f32> = one.flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(one, want, "row {t} at position {p}");
+        }
+
+        // And the gather is actually consulted: the default `b * ratio`-style
+        // consecutive run gives a different answer.
+        let plain = rope.rotate(&x, 0, DType::F32).unwrap();
+        let plain: Vec<f32> = plain.flatten_all().unwrap().to_vec1().unwrap();
+        let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            g.iter().zip(&plain).any(|(a, b)| (a - b).abs() > 1e-5),
+            "scrambling the positions changed nothing — the gather is ignored"
         );
     }
 }
