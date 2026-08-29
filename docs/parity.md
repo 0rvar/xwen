@@ -13,8 +13,14 @@ checkout lives at `reference/llama.cpp` as a git SUBMODULE (shallow; see
 the pin shows up as a staged change the owner must approve. Only
 `reference/llama.cpp/build` is gitignored.
 
-**Pinned commit: `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0`** (2026-07-28,
-"model: Add Laguna-S-2.1 LLM_TYPE (#26233)"), cloned and built 2026-07-28.
+**Pinned commit: `6fe74980162af0ed5e559870d5deccafaa034e7c`** (2026-08-28,
+"model: qwen4exp: reduce number of graph splits (#27880)") — bumped 2026-08-29
+to get qwen4exp support into the one oracle. Previous pin
+`e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` (2026-07-28, "model: Add
+Laguna-S-2.1 LLM_TYPE (#26233)"), cloned and built 2026-07-28: **every floor
+below was calibrated there and is NOT yet re-confirmed at the new pin.**
+Re-calibration against `6fe749801` is required before the next parity cycle and
+is PENDING as of 2026-08-29.
 
 ```bash
 just init                               # git submodule update --init --recursive
@@ -499,6 +505,9 @@ and run-to-run variation without accepting a real regression; the perplexity bou
 `max(3 x |measured delta|, 0.002)` nats.
 
 ### Calibration record — 2026-07-28, oracle `e9fa0781`, ggml-org Q4_K_M
+
+**Still the live record on 2026-08-29, and still an `e9fa0781` measurement**: the
+submodule was bumped to `6fe749801` that day and the re-run has not happened yet.
 
 **Measured with the REFERENCE DeltaNet scan on both sides**, before the fused delta
 kernels existed (`src/ops/delta.metal` postdates the last dump in this table by half

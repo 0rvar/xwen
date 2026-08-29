@@ -23,9 +23,10 @@ divergence is resolved at construction time.
   cache since 2026-08-29. Full published ladder surveyed below. Metadata-only
   shard 1 (10.9 MB) stays usable for loader dev.
 - llama.cpp support: PR #27742 **MERGED** into master 2026-08-27 as squash
-  `6c84c7d5d`, plus follow-up `6fe749801` on 08-28. D4's re-pin gate is met;
-  `reference/llama.cpp` (e9fa0781) stays frozen for 3.6/3.8 and a second clone
-  at `6fe749801` becomes the qwen4exp oracle (see D4 update).
+  `6c84c7d5d`, plus follow-up `6fe749801` on 08-28. D4's re-pin gate is met and
+  the `reference/llama.cpp` submodule was bumped e9fa0781 → `6fe749801` on
+  2026-08-29 — ONE oracle for all four checkpoints, no vendored copies. The
+  3.6/3.8 parity gate has NOT yet been re-run at the new pin (see D4 update).
 
 ## The model in one paragraph
 
@@ -62,13 +63,22 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   control (candidate: Q4_K/Q6_K/Q8_0 trunk + Q4_K or IQ4_NL table), because
   parity floors are calibrated per quant mix and Unsloth's UD mixes are
   per-layer heterogeneous (IQ1..IQ4 spread in the IQ1_S file).
-- **D4 (2026-08-26) Oracle policy.** `reference/llama.cpp` (pinned e9fa0781)
-  stays frozen — it gates the 3.6/3.8 parity cycles. PR #27742's qwen4exp files
-  are vendored read-only under `reference/qwen4exp/` with provenance, as reading
-  material. A separate buildable clone of the PR branch comes only when we need
-  executable comparison, and re-pinning the main oracle waits for the PR to merge
-  plus Qwen's promised independent numeric check. An unreviewed AI-drafted branch
-  is not a frozen correctness oracle.
+- **D4 (2026-08-26, superseded 2026-08-29) Oracle policy.** ~~`reference/llama.cpp`
+  (pinned e9fa0781) stays frozen — it gates the 3.6/3.8 parity cycles. PR
+  #27742's qwen4exp files are vendored read-only under `reference/qwen4exp/`
+  with provenance, as reading material. A separate buildable clone of the PR
+  branch comes only when we need executable comparison, and re-pinning the main
+  oracle waits for the PR to merge plus Qwen's promised independent numeric
+  check.~~ An unreviewed AI-drafted branch is not a frozen correctness oracle —
+  that reasoning stands; the merge settled it. **Revised 2026-08-29 (Orvar's
+  call): ONE oracle, no vendored copies.** The `reference/llama.cpp` submodule
+  is bumped e9fa0781 → `6fe749801` and gates every checkpoint including
+  qwen4exp; the five vendored files under `reference/qwen4exp/` are deleted
+  (only PROVENANCE.md and UPSTREAM-DIFF-2026-08-29.md remain, as history). No
+  second clone, no `scripts/build-llamacpp.sh` target argument. **The 3.6/3.8
+  parity gate must be re-run at `6fe749801` before the bump is trusted — PENDING
+  as of 2026-08-29 (the disk is busy with the 111 GB download); until it passes,
+  every floor in docs/parity.md reads "measured at e9fa0781".**
   - **Update 2026-08-29 — the merge half of the gate is met.** PR #27742 merged
     into ggml-org/llama.cpp master 2026-08-27T19:32Z as squash `6c84c7d5d` (PR
     head `eaf9376557`, 65 commits); follow-up `6fe749801` "model: qwen4exp:
@@ -99,10 +109,9 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
     one host-side get_rows gather table, CPU-resident on CUDA automatically,
     mmap-backed — independent confirmation of D2. Reported perf, DGX Spark GB10,
     UD-Q4_K_XL: 24-25 tok/s decode, 70-99 tok/s prefill, 27.5 GB CPU + 78 GB
-    CUDA buffer. Oracle layout after the re-pin: `reference/llama.cpp`
-    (e9fa0781) STAYS frozen for the 3.6/3.8 parity cycles, and a SECOND clone
-    at `6fe749801` is the qwen4exp oracle — where it lives and whether
-    `scripts/build-llamacpp.sh` grows a target argument are Open questions.
+    CUDA buffer. Oracle layout after the re-pin (settled 2026-08-29): ONE
+    submodule, `reference/llama.cpp`, bumped to `6fe749801` and gating all four
+    checkpoints. Re-running the 3.6/3.8 parity gate at that pin is PENDING.
 - **D5 (2026-08-26) Reference-first for every new component.** Hyper-connections,
   the QSA indexer, and PLE each get a frozen CPU f32 reference implementation
   with fixture tests before any Metal work, mirroring the ReferenceExperts
@@ -341,15 +350,16 @@ load) and the imatrix file.
   IQ1_S..IQ3_M (70-93 GB, still uploading as of 08-28); mradermacher a static
   and an i1 ladder. Nothing there beats UD-Q4_K_XL on the kernels-we-have axis.
 
-## Conversion-baked deltas (audit of the vendored PR converter, 2026-08-26)
+## Conversion-baked deltas (audit of the converter, 2026-08-26)
 
-reference/qwen4exp/ vendors qwen4exp support at the sha in PROVENANCE.md
-(`6fe749801` since 2026-08-29; this audit was written against the pre-merge
-`bea3b12d` snapshot and re-checked against the new pin — see the zero-change
-bullet at the end of this section): `qwen4exp.cpp`
-(graph), `qwen4exp.py` (converter), `conversion-qwen-base.py` (the inherited
-Qwen3Next rules the converter subclasses — the +1/-exp/V-reorder logic lives
-there, NOT in the qwen4exp file), plus the gguf-py and core-C++ diffs.
+Read upstream in the `reference/llama.cpp` submodule at its pin (`6fe749801`
+since 2026-08-29): `reference/llama.cpp/conversion/qwen4exp.py` (the converter),
+`reference/llama.cpp/conversion/qwen.py` (the inherited Qwen3Next rules it
+subclasses — the +1/-exp/V-reorder logic lives there, NOT in the qwen4exp file),
+`reference/llama.cpp/src/models/qwen4exp.cpp` (graph) and
+`reference/llama.cpp/gguf-py/gguf/`. This audit was written against the
+pre-merge `bea3b12d` snapshot and re-checked against the pin — see the
+zero-change bullet at the end of this section.
 
 - **Norms**: every norm on the GGUF path is multiply-ready (converter bakes +1
   into all `*norm.weight` incl. hc_norm/output_hc_norm/QK-norms/indexer
@@ -391,9 +401,10 @@ there, NOT in the qwen4exp file), plus the gguf-py and core-C++ diffs.
   us, worth reporting upstream), and `_eos_token_id()` now raises instead of
   crashing on a missing id. The `ple_conv1d`-is-unpinned bullet above was
   re-verified: still off the quantize skip list, F16 fallback branch still
-  there. One gap: the vendored `gguf-py.diff` predates `b19cbe925` "convert:
-  prevent ndarray conversion in LazyChunkedTensor" (#27869), a real corruption
-  fix that landed after the merge. Full reading:
+  there. (One gap that mattered while copies were vendored and no longer does:
+  the vendored `gguf-py.diff` predated `b19cbe925` "convert: prevent ndarray
+  conversion in LazyChunkedTensor" (#27869), a real corruption fix that landed
+  after the merge. The submodule at `6fe749801` carries it.) Full reading:
   reference/qwen4exp/UPSTREAM-DIFF-2026-08-29.md.
 
 ### Known llama.cpp-impl divergences (PR quirks, not ground truth — expect them
@@ -654,10 +665,10 @@ multi-steps".
   `6c84c7d5d` (D4 update). The numeric check Qwen promised was never posted, so
   `conversion/qwen4exp.py`'s stability for a self-converted blessed file rests
   on the PR body's own ppl-vs-reference.
-- Where the qwen4exp oracle clone lives. `reference/llama.cpp` (e9fa0781) stays
-  frozen for the 3.6/3.8 cycles, so the qwen4exp oracle is a SECOND clone at
-  `6fe749801`. Candidate path `reference/llama.cpp-qwen4exp`; open whether
-  `scripts/build-llamacpp.sh` grows a target argument or gets a sibling.
+- ~~Where the qwen4exp oracle clone lives~~ ANSWERED 2026-08-29: there is no
+  second clone. The one `reference/llama.cpp` submodule is bumped to
+  `6fe749801` and `scripts/build-llamacpp.sh` is unchanged (D4). Follow-on, not
+  a question: re-run the 3.6/3.8 parity gate at the new pin.
 
 ## Progress log
 
@@ -718,4 +729,12 @@ multi-steps".
   Hadamard-refusal assumption corrected in D4, footnotes on traps 3/4/9, two
   new traps (PLE projection widths, GDN `head_v_dim` assert), a zero-change
   finding for the converter/GGUF surface, and a watch item on the unmerged
-  `tmp-q4` QSA rework. Next: download, then P1.
+  `tmp-q4` QSA rework. **Then superseded the same day (Orvar's call): no
+  vendored llama.cpp copies at all.** The `reference/llama.cpp` submodule is
+  bumped e9fa0781 → `6fe749801` — one oracle for all four checkpoints — and the
+  five vendored files under `reference/qwen4exp/` are removed, leaving
+  PROVENANCE.md (rewritten to point at the submodule) and
+  UPSTREAM-DIFF-2026-08-29.md as history. D4 revised, the second-clone Open
+  question closed. OUTSTANDING: the 3.6/3.8 parity gate has not been re-run at
+  `6fe749801`, so the docs/parity.md floors are still e9fa0781 measurements.
+  Next: parity re-run once the disk frees up, download, then P1.
