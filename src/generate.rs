@@ -3028,6 +3028,13 @@ impl Generator {
                 force: tc.force,
             };
             let token = self.sampler.sample_controlled(&logits, &ctl)?;
+            // The earliest moment position `pos + 1`'s PLE table rows are
+            // knowable, and the next forward is still several host steps away —
+            // so hint them now and let the fault happen on the prefetch thread
+            // while this one streams the token and enqueues the embed. A no-op
+            // off qwen4exp, and harmless on the paths below that break out of
+            // the loop without ever running that forward.
+            self.model.ple_prefetch(&[token]);
             self.think.on_committed(decoded, token);
             if self.sampler.is_eog(token) {
                 hit_eog = true;

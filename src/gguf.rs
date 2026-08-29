@@ -182,6 +182,24 @@ impl MmapSource {
         Ok(&self.map[abs_off..abs_off + len])
     }
 
+    /// `madvise(MADV_RANDOM)` over `[abs_off, abs_off + len)` of the mapping.
+    ///
+    /// A HINT, so failure is silently ignored — the caller has nothing to do
+    /// with the error and the mapping reads correctly either way. The one
+    /// caller is the PLE n-gram table (`qwen4exp::ple`), whose access pattern is
+    /// 16 unrelated 90-byte rows per token over 28.8 GB: the default readahead
+    /// turns each of those into a large sequential window that nothing else in
+    /// the row will ever be read from. The whole-file `WillNeed` in `open`
+    /// deliberately stays — it is for the weights, which ARE read sequentially.
+    pub(crate) fn advise_random(&self, abs_off: usize, len: usize) {
+        if abs_off
+            .checked_add(len)
+            .is_some_and(|end| end <= self.map.len())
+        {
+            let _ = self.map.advise_range(memmap2::Advice::Random, abs_off, len);
+        }
+    }
+
     /// Registers every not-yet-registered view in the device's queue-attached
     /// residency set, one batch + one commit. XwenModel::load calls this
     /// once after all weights are built; Drop unregisters everything this
@@ -193,6 +211,13 @@ impl MmapSource {
             .register_buffers(pending.iter().map(|b| b.as_ref()));
         registered.append(&mut pending);
     }
+}
+
+/// Mach's page size (16384 on Apple silicon), read at runtime rather than
+/// hardcoded — the same global `MmapSource::view` aligns against. Used by the
+/// PLE prefetcher to collapse a row list to the distinct pages behind it.
+pub(crate) fn host_page_size() -> usize {
+    vm_page_size
 }
 
 /// Identity of the checkpoint a persisted artifact (a cache image) was produced

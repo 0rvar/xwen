@@ -21,13 +21,24 @@
 //! ([`crate::ops::ple_profile`]) splits one forward into its sub-steps and says
 //! which half of that hybrid the layer's `stack_profile` figure actually is.
 //!
+//! The gather's cost is not arithmetic, it is page faults — 16 unrelated
+//! 90-byte rows per token over a table far larger than memory — so
+//! [`PlePrefetcher`] runs those faults on a background thread ahead of the
+//! forward that needs them, off addresses that are known one position early
+//! (`XWEN_PLE_NO_PREFETCH` / `XWEN_PLE_NO_RANDOM` turn the two halves of that
+//! off for an A/B).
+//!
 //! The reuse here is deliberate and not an accident of convenience: the hash
 //! ([`super::ref_ple::PleHashRef`]) and the grouped RMS norm
 //! ([`super::ref_hc::grouped_rms_norm`]) are called, not reimplemented, so the
 //! host half of the hybrid IS the oracle rather than a second transcription of
 //! it. The references are frozen, so nothing can drift underneath.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -38,7 +49,7 @@ use super::iq4nl;
 use super::ref_hc::grouped_rms_norm;
 use super::ref_ple::{PleHashRef, gate_function_probe};
 use crate::config::XwenConfig;
-use crate::gguf::{GgufFile, MmapSource, QLinear, RawDtype, StoredDtype, Weights};
+use crate::gguf::{GgufFile, MmapSource, QLinear, RawDtype, StoredDtype, Weights, host_page_size};
 use crate::host_log::host_line;
 
 /// The stored dtypes the n-gram table is read at.
@@ -133,13 +144,19 @@ impl TableBytes {
 /// dequantized whole; it is demand-paged by the kernel and touched 16 rows per
 /// token (docs/qwen4exp-port.md D2).
 pub struct PleTable {
-    bytes: TableBytes,
+    bytes: Arc<TableBytes>,
     /// Byte offset of row 0 within `bytes`.
     base: usize,
     dtype: TableDtype,
     row_dim: usize,
     rows: u64,
     row_bytes: usize,
+    /// The background page-toucher, built on the first hint and never rebuilt.
+    /// `None` inside the `OnceLock` means prefetching is switched off
+    /// (`XWEN_PLE_NO_PREFETCH`); an untouched `OnceLock` means no caller has
+    /// asked for a prefetch yet, which is every table a test builds and never
+    /// hints — those spawn no thread at all.
+    prefetch: OnceLock<Option<PlePrefetcher>>,
 }
 
 impl PleTable {
@@ -153,7 +170,21 @@ impl PleTable {
         row_dim: usize,
         rows: u64,
     ) -> Result<Self> {
-        Self::build(TableBytes::Mapped(src), base, dtype, row_dim, rows)
+        let table = Self::build(TableBytes::Mapped(src.clone()), base, dtype, row_dim, rows)?;
+        // `MADV_RANDOM` over THIS TENSOR's bytes and nothing else: the gather
+        // reads 16 unrelated rows per token out of a table far larger than
+        // memory, so readahead around one row is bandwidth spent on bytes
+        // nothing will ask for. The mapping's whole-file `WillNeed` stays as it
+        // is — the weights around this tensor are read sequentially and want it.
+        // Switchable (`XWEN_PLE_NO_RANDOM`) because "the pattern is random" is
+        // an argument, and the `gather` figure under `XWEN_PLE_PROFILE` is the
+        // measurement.
+        if !crate::ops::ple_no_random()
+            && let Some(len) = table.row_bytes.checked_mul(rows as usize)
+        {
+            src.advise_random(base, len);
+        }
+        Ok(table)
     }
 
     fn build(
@@ -167,12 +198,13 @@ impl PleTable {
         ensure!(rows > 0, "the PLE table has no rows");
         let row_bytes = dtype.row_bytes(row_dim)?;
         Ok(Self {
-            bytes,
+            bytes: Arc::new(bytes),
             base,
             dtype,
             row_dim,
             rows,
             row_bytes,
+            prefetch: OnceLock::new(),
         })
     }
 
@@ -256,7 +288,12 @@ impl PleTable {
         self.dtype
     }
 
-    /// Dequantizes row `r` into `out`, which must be exactly `row_dim` wide.
+    /// Byte offset of row `r` inside the table's byte source.
+    ///
+    /// The ONE place a row index becomes an address. Both readers go through
+    /// it — [`row`](Self::row), which dequantizes, and
+    /// [`prefetch`](Self::prefetch), which only faults the page in — so the
+    /// prefetcher can never name a different byte than the gather will read.
     ///
     /// The bounds check is not defensive decoration: the row index is
     /// `hash mod head_vocab_size + head_offset` over attacker-visible token
@@ -264,13 +301,7 @@ impl PleTable {
     /// so a metadata misread (an offset array truncated, a vocab size read at
     /// the wrong width) produces an index that is plausible, out of range, and
     /// would otherwise read whatever the mapping holds next.
-    pub fn row(&self, r: u64, out: &mut [f32]) -> Result<()> {
-        ensure!(
-            out.len() == self.row_dim,
-            "PLE row buffer is {} wide, not {}",
-            out.len(),
-            self.row_dim
-        );
+    fn row_offset(&self, r: u64) -> Result<usize> {
         ensure!(
             r < self.rows,
             "PLE row {r} is past the table's {} rows",
@@ -281,7 +312,7 @@ impl PleTable {
         // passed `open` — and an offset that wrapped would name a valid-looking
         // in-bounds slice of somebody else's tensor, which `slice` would hand
         // back without complaint.
-        let off = (r as usize)
+        (r as usize)
             .checked_mul(self.row_bytes)
             .and_then(|o| o.checked_add(self.base))
             .with_context(|| {
@@ -289,7 +320,63 @@ impl PleTable {
                     "PLE row {r} at {} bytes per row overflows the mapping offset",
                     self.row_bytes
                 )
-            })?;
+            })
+    }
+
+    /// The prefetch thread, spawned on the first hint. `None` when the switch
+    /// is set, and the `OnceLock` stays empty until somebody actually hints, so
+    /// a table nothing prefetches from costs no thread.
+    fn prefetcher(&self) -> Option<&PlePrefetcher> {
+        self.prefetch
+            .get_or_init(|| {
+                (!crate::ops::ple_no_prefetch())
+                    .then(|| PlePrefetcher::spawn(self.bytes.clone(), self.row_bytes))
+            })
+            .as_ref()
+    }
+
+    /// Ask the background thread to fault in the pages behind `rows`.
+    ///
+    /// PURELY ADVISORY: it moves no state, returns nothing, and every failure
+    /// mode — a full queue, an out-of-range index, a dead thread — degrades to
+    /// the gather taking the fault itself, which is what it did before. That is
+    /// what makes it safe across a speculative rollback: a prefetch for a
+    /// position that never happens costs one wasted page touch.
+    pub(crate) fn prefetch(&self, rows: &[u64]) {
+        let Some(pf) = self.prefetcher() else { return };
+        let mut offs = Vec::with_capacity(rows.len());
+        for &r in rows {
+            // An out-of-range row is dropped rather than reported: `row` will
+            // raise on the same index moments later, with the context this
+            // call site does not have.
+            if let Ok(off) = self.row_offset(r) {
+                offs.push(off);
+            }
+        }
+        pf.hint(offs);
+    }
+
+    /// `(pages touched, hints dropped)` since load, or `None` if no prefetch
+    /// thread was ever started. Non-initializing on purpose — reading the
+    /// counters must not be what spawns the thread.
+    fn prefetch_stats(&self) -> Option<(u64, u64)> {
+        let pf = self.prefetch.get()?.as_ref()?;
+        Some((
+            pf.pages.load(Ordering::Relaxed),
+            pf.dropped.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Dequantizes row `r` into `out`, which must be exactly `row_dim` wide.
+    /// The index is bounds-checked by [`row_offset`](Self::row_offset).
+    pub fn row(&self, r: u64, out: &mut [f32]) -> Result<()> {
+        ensure!(
+            out.len() == self.row_dim,
+            "PLE row buffer is {} wide, not {}",
+            out.len(),
+            self.row_dim
+        );
+        let off = self.row_offset(r)?;
         let src = self.bytes.slice(off, self.row_bytes)?;
         match self.dtype {
             TableDtype::Iq4Nl => iq4nl::dequant_row(src, out),
@@ -312,6 +399,161 @@ impl PleTable {
         }
         Ok(())
     }
+}
+
+/// A background thread that faults in the table pages a future gather will read.
+///
+/// The gather is not arithmetic, it is page faults: 16 unrelated 90-byte rows
+/// per token scattered over a 28.8 GB mapping, measured at 1.0-1.2 ms median
+/// with 6.5 ms spikes at decode and FLAT over 128 tokens (4.7% of rows hit the
+/// page cache — the table is far larger than memory, so it never warms up).
+/// Every one of those addresses is knowable BEFORE the forward that needs them:
+/// at decode, the moment token `t` is sampled, position `t + 1`'s 16 rows are
+/// determined; at prefill the whole chunk's are determined before layer 0 runs.
+/// This thread takes those faults in parallel with the trunk instead of in
+/// series with it.
+///
+/// It is a HINT and nothing else. It returns no value, touches no state, and
+/// every failure path — a full queue, a bad index, a hint for a position a
+/// speculative rollback then discards — costs at most one wasted page touch.
+/// That is why it needs no interaction with checkpoint or rollback, and why the
+/// fetch must NEVER be gated on the PLE gate value (TODO.md P3 (6)): the gate
+/// is computed mid-forward, so consulting it would serialize the lookup behind
+/// the very forward the prefetch exists to run ahead of.
+struct PlePrefetcher {
+    /// Row byte offsets to touch. Bounded and `try_send`: a hint that cannot be
+    /// delivered immediately is DROPPED, because a queued hint is a hint that
+    /// arrives after the gather it was meant to precede.
+    tx: Option<SyncSender<Vec<usize>>>,
+    /// Asks the worker to stop between rows, so dropping the table does not
+    /// wait out a whole prefill chunk's worth of faults.
+    stop: Arc<AtomicBool>,
+    /// Distinct pages touched, for the `XWEN_PLE_PROFILE` line.
+    pages: Arc<AtomicU64>,
+    /// Hints refused because the queue was full — the signal that the prefetch
+    /// is running behind the forward rather than ahead of it.
+    dropped: Arc<AtomicU64>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl PlePrefetcher {
+    /// Queue depth. Two: one batch in flight plus one waiting is already a hint
+    /// arriving a whole forward late, and anything deeper only delays the batch
+    /// that actually matters.
+    const QUEUE: usize = 2;
+
+    /// Rows per stop-flag check inside a batch. A decode hint is 16 rows and
+    /// never reaches it; a prefill chunk's is thousands, and without the check
+    /// a dropped table's thread would run to the end of it.
+    const STOP_EVERY: usize = 64;
+
+    fn spawn(bytes: Arc<TableBytes>, row_bytes: usize) -> Self {
+        let (tx, rx) = sync_channel::<Vec<usize>>(Self::QUEUE);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pages = Arc::new(AtomicU64::new(0));
+        let (w_stop, w_pages) = (stop.clone(), pages.clone());
+        let join = std::thread::Builder::new()
+            .name("xwen-ple-prefetch".into())
+            .spawn(move || worker(&bytes, row_bytes, &rx, &w_stop, &w_pages))
+            .ok();
+        Self {
+            // A thread that failed to spawn drops its sender, so every later
+            // hint is a no-op: prefetching is an optimization, and refusing to
+            // load a model over it would be the wrong trade.
+            tx: join.is_some().then_some(tx),
+            stop,
+            pages,
+            dropped: Arc::new(AtomicU64::new(0)),
+            join,
+        }
+    }
+
+    fn hint(&self, offsets: Vec<usize>) {
+        if offsets.is_empty() {
+            return;
+        }
+        let Some(tx) = self.tx.as_ref() else { return };
+        if tx.try_send(offsets).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Block until the worker has drained everything hinted so far, or until
+    /// `timeout` passes. Only the tests need it — a forward never waits on a
+    /// hint, which is the entire point — but they need it to assert on `pages`
+    /// at all.
+    #[cfg(test)]
+    fn quiesce(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let Some(tx) = self.tx.as_ref() else { return };
+        // A round trip through the same bounded queue: once the worker has
+        // taken QUEUE + 1 further batches, every batch sent before them has
+        // been processed. The empty batches are no-ops on the worker side.
+        for _ in 0..=Self::QUEUE {
+            while Instant::now() < deadline && tx.try_send(Vec::new()).is_err() {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+impl Drop for PlePrefetcher {
+    fn drop(&mut self) {
+        // Order matters: raise the flag first so a worker mid-batch bails, THEN
+        // drop the sender so its `recv` returns. Joining is what keeps the
+        // thread from outliving the `Arc<TableBytes>` it reads — which on the
+        // mapped arm is the file mapping itself.
+        self.stop.store(true, Ordering::Relaxed);
+        self.tx = None;
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// The prefetch thread body: touch one byte of every distinct page behind the
+/// hinted rows.
+///
+/// A row is 90 bytes at the shipped geometry and a page is 16 KB, so a row can
+/// straddle a boundary — both ends are probed. Pages are deduplicated within a
+/// batch (a prefill chunk names thousands of rows, and n-gram heads collide
+/// often enough to matter) in FIRST-TOUCH order rather than sorted, so the
+/// thread stays ahead of a gather walking the same list.
+fn worker(
+    bytes: &TableBytes,
+    row_bytes: usize,
+    rx: &Receiver<Vec<usize>>,
+    stop: &AtomicBool,
+    pages: &AtomicU64,
+) {
+    let page = host_page_size().max(1);
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut sink = 0u8;
+    while let Ok(batch) = rx.recv() {
+        seen.clear();
+        for (i, off) in batch.iter().enumerate() {
+            if i.is_multiple_of(PlePrefetcher::STOP_EVERY) && stop.load(Ordering::Relaxed) {
+                break;
+            }
+            for probe in [*off, off + row_bytes.saturating_sub(1)] {
+                if !seen.insert(probe / page) {
+                    continue;
+                }
+                let Ok(b) = bytes.slice(probe, 1) else {
+                    continue;
+                };
+                // Volatile so the read cannot be optimized away: the VALUE is
+                // worthless and the page fault it takes is the entire point.
+                // SAFETY: `slice` bounds-checked the byte against the mapping.
+                sink ^= unsafe { std::ptr::read_volatile(b.as_ptr()) };
+                pages.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    std::hint::black_box(sink);
 }
 
 /// The PLE layer's recurrent state: everything a forward carries across a chunk
@@ -722,6 +964,39 @@ impl PleLayer {
             .broadcast_mul(&self.key_norm_w)?)
     }
 
+    /// The table rows this layer gathers for `tokens` continuing `history`,
+    /// flat with an `n_heads` stride.
+    ///
+    /// The ONE place the layer asks the hash for row indices. Both callers go
+    /// through it — [`forward`](Self::forward), which gathers them, and
+    /// [`prefetch`](Self::prefetch), which faults them in ahead of a later
+    /// forward — so the prefetch cannot drift from the gather it is meant to
+    /// precede. The hash itself is the frozen oracle's
+    /// ([`PleHashRef::rows`]), called rather than reimplemented.
+    fn gather_rows(&self, history: &[u32], tokens: &[u32]) -> Vec<u64> {
+        self.hash.rows(history, tokens)
+    }
+
+    /// Hand the table's prefetch thread the rows a LATER forward over `tokens`
+    /// will gather, given the n-gram `history` that will be in force then.
+    ///
+    /// `history` is the live [`PleState::history`] — at decode, after token `t`
+    /// has been forwarded and `t + 1` sampled, that state's history is exactly
+    /// what the next forward hashes `t + 1` against, so a caller passes it
+    /// straight through. At prefill the same call names the whole chunk.
+    ///
+    /// Advisory in every direction: no state moves, nothing is returned, and a
+    /// hint for a position that a rollback or an EOG then discards costs one
+    /// wasted page touch. Never gate this on the PLE gate value (TODO.md P3
+    /// (6)) — the gate is a mid-forward quantity, and waiting for it would put
+    /// the lookup back on the critical path it is being lifted off.
+    pub fn prefetch(&self, history: &[u32], tokens: &[u32]) {
+        if tokens.is_empty() {
+            return;
+        }
+        self.table.prefetch(&self.gather_rows(history, tokens));
+    }
+
     /// One forward over `tokens`, whose carrier rows are `stream` `[n, width]`.
     ///
     /// Returns the ADDEND, `[n, width]` — what the caller adds to the carrier
@@ -752,7 +1027,7 @@ impl PleLayer {
         let mut prof = FwdProfile::start(&self.device)?;
 
         // --- host: hash, then gather and dequantize 16 table rows per token.
-        let rows = self.hash.rows(&state.history, tokens);
+        let rows = self.gather_rows(&state.history, tokens);
         ple_step(&mut prof, "hash");
         let emb_dim = self.n_heads * self.head_dim;
         let mut emb = vec![0.0f32; n * emb_dim];
@@ -885,7 +1160,7 @@ impl PleLayer {
         state.history = self.hash.next_history(&state.history, tokens);
         let addend = Tensor::from_vec(out, (n, width), &self.device)?;
         ple_step_device(&mut prof, &self.device, "out_upload")?;
-        ple_report(&prof, n, &rows);
+        ple_report(&prof, n, &rows, self.table.prefetch_stats());
         Ok(addend)
     }
 }
@@ -944,7 +1219,7 @@ fn ple_step_device(p: &mut Option<FwdProfile>, device: &Device, name: &'static s
 /// Print the bracket. `rows` is the table row set this forward gathered; its
 /// distinct count is computed here and only here, so an unprofiled forward
 /// never builds the set.
-fn ple_report(p: &Option<FwdProfile>, n: usize, rows: &[u64]) {
+fn ple_report(p: &Option<FwdProfile>, n: usize, rows: &[u64], prefetch: Option<(u64, u64)>) {
     let Some(p) = p.as_ref() else { return };
     let distinct: std::collections::HashSet<u64> = rows.iter().copied().collect();
     let total: Duration = p.steps.iter().map(|(_, d)| *d).sum();
@@ -957,6 +1232,14 @@ fn ple_report(p: &Option<FwdProfile>, n: usize, rows: &[u64]) {
     );
     for (name, d) in &p.steps {
         line.push_str(&format!(" {name}={:.3}", ms(*d)));
+    }
+    // Cumulative since load, not per forward: `pf_pages` is what the prefetch
+    // thread has faulted in and `pf_dropped` the hints it was too far behind to
+    // accept. A `gather` that is still slow while `pf_dropped` climbs means the
+    // prefetch is running behind the forward, not that prefetching does not
+    // help. Absent entirely when no hint was ever issued.
+    if let Some((pages, dropped)) = prefetch {
+        line.push_str(&format!(" pf_pages={pages} pf_dropped={dropped}"));
     }
     host_line(line);
 }
@@ -1629,6 +1912,113 @@ mod tests {
             state.rollback(&snap, 2, 1).is_err(),
             "one checkpoint answers one rollback"
         );
+    }
+
+    /// The rows the prefetcher names for the next position are exactly the
+    /// rows that position's forward goes on to gather.
+    ///
+    /// Structurally the two share [`PleLayer::gather_rows`], so what is
+    /// actually under test is the STATE the decode call site feeds it: after
+    /// forwarding a prefix, the live `PleState`'s n-gram history has to produce
+    /// the same rows a single-shot run over the whole sequence produces at
+    /// those positions. Get that wrong — hand it the history from before the
+    /// prefix, say — and the prefetch silently warms 16 pages the gather never
+    /// reads, which costs nothing and helps nothing, and no other test would
+    /// notice.
+    #[test]
+    fn prefetch_names_the_rows_the_next_forward_gathers() {
+        let Ok(device) = crate::gguf::metal_device() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let j = fixture();
+        let l = layer(&j, &device);
+        let c = &j["layer_case"];
+        let toks = vec_u32(&c["input_ids"]);
+        let width = l.width();
+        let stream_h = flat_f32(&c["hidden_stream_in"]);
+        let stream = Tensor::from_slice(&stream_h, (toks.len(), width), &device).unwrap();
+
+        // The shared accessor is the frozen oracle's hash and nothing else.
+        let single = hasher(&j).rows(&[], &toks);
+        assert_eq!(l.gather_rows(&[], &toks), single);
+
+        let split = 3usize;
+        assert!(toks.len() > split);
+        let head = stream.narrow(0, 0, split).unwrap().contiguous().unwrap();
+        let mut state = l.new_state();
+        l.forward(&toks[..split], &head, &mut state).unwrap();
+
+        // Exactly what the decode call site passes: the live history, and the
+        // tokens the next forward will consume.
+        let predicted = l.gather_rows(state.history(), &toks[split..]);
+        assert_eq!(
+            predicted.as_slice(),
+            &single[split * l.n_heads..],
+            "the prefetch and the next gather disagree about the rows"
+        );
+
+        // And the hint itself is inert: no state moves, nothing is returned,
+        // and the following forward still reproduces the fixture.
+        l.prefetch(state.history(), &toks[split..]);
+        l.prefetch(state.history(), &[]);
+        let tail = stream
+            .narrow(0, split, toks.len() - split)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let got = host(&l.forward(&toks[split..], &tail, &mut state).unwrap());
+        let want = &flat_f32(&c["output"])[split * width..];
+        assert!(max_abs(&got, want) <= 3e-5);
+    }
+
+    /// The prefetch thread touches one byte of every distinct page behind the
+    /// rows it was handed — no more (pages repeat across heads and tokens) and
+    /// no fewer (a 90-byte row can straddle a page boundary, so both ends are
+    /// probed).
+    ///
+    /// The table is 32 pages wide so "distinct pages" is a real quantity here;
+    /// on the fixture's own table every row shares one page and the assertion
+    /// would hold for a worker that touched nothing but the first address.
+    #[test]
+    fn the_prefetch_thread_touches_every_distinct_page_once() {
+        let page = crate::gguf::host_page_size();
+        let (row_dim, n_rows) = (32usize, 4096usize);
+        let table = PleTable::from_f32(&vec![0.5f32; row_dim * n_rows], row_dim).unwrap();
+        assert!(
+            table.row_bytes * n_rows > 8 * page,
+            "the test table has to span many pages or it proves nothing"
+        );
+
+        let Some(pf) = table.prefetcher() else {
+            eprintln!("XWEN_PLE_NO_PREFETCH is set; skipping");
+            return;
+        };
+        // Deliberately repetitive: a duplicated row, and two rows that share a
+        // page, so a worker that skipped its dedup would over-count.
+        let rows: Vec<u64> = vec![0, 1, 200, 200, (n_rows - 1) as u64, 0];
+        let mut want: HashSet<usize> = HashSet::new();
+        for &r in &rows {
+            let off = table.row_offset(r).unwrap();
+            want.insert(off / page);
+            want.insert((off + table.row_bytes - 1) / page);
+        }
+
+        table.prefetch(&rows);
+        pf.quiesce(Duration::from_secs(5));
+        assert_eq!(
+            table.prefetch_stats(),
+            Some((want.len() as u64, 0)),
+            "pages touched (expected the {} distinct pages behind {} rows)",
+            want.len(),
+            rows.len()
+        );
+
+        // An index past the end is dropped by the hint rather than raised, and
+        // costs the worker nothing.
+        table.prefetch(&[n_rows as u64, (n_rows + 99) as u64]);
+        pf.quiesce(Duration::from_secs(5));
+        assert_eq!(table.prefetch_stats(), Some((want.len() as u64, 0)));
     }
 
     /// A table read through the IQ4_NL path returns what the quantizer put in.

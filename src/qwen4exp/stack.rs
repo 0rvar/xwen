@@ -364,6 +364,17 @@ pub fn run_stack_hc(
         Vec::new()
     };
 
+    // PLE prefetch, prefill only (TODO.md P3 (6)). Every row address this
+    // chunk will gather is a pure function of the ids that just came back, so
+    // hand them to the table's background thread here and let its page faults
+    // overlap the embed, layer 0 and this chunk's own gather. Skipped at
+    // `seq == 1`: the decode gather is one layer away by the time this runs, far
+    // too late to help, and generate.rs hints position t + 1 the moment t is
+    // sampled instead.
+    if seq > 1 && !token_ids.is_empty() {
+        model.ple_prefetch(&token_ids);
+    }
+
     let mut taps: Vec<(String, Tensor)> = Vec::new();
     macro_rules! tap {
         ($name:expr, $il:expr, $t:expr) => {

@@ -418,6 +418,29 @@ impl XwenModel {
     /// and `forward_all_logits` (which keeps every position). Advances the KV
     /// caches, so callers feeding chunks must pass a monotonically increasing
     /// `pos`.
+    /// Ask every PLE layer to fault in the n-gram table rows a LATER forward
+    /// over `tokens` will gather, given the state each layer is in right now.
+    ///
+    /// A no-op on every architecture but qwen4exp, and advisory even there: the
+    /// hint moves no state and is dropped outright if the prefetch thread is
+    /// behind, so a caller can issue it for a token that an EOG or a rejected
+    /// speculative block then discards. The gather it is running ahead of is
+    /// 16 unrelated 90-byte reads over a 28.8 GB mapping, i.e. page faults
+    /// rather than arithmetic (`qwen4exp::ple::PlePrefetcher`).
+    ///
+    /// Callers: the decode loop, the moment a token is sampled and before the
+    /// forward that consumes it starts, and the qwen4exp prefill chunk.
+    pub fn ple_prefetch(&self, tokens: &[u32]) {
+        let Some(parts) = self.qwen4exp.as_ref() else {
+            return;
+        };
+        for layer in &parts.layers {
+            if let (Some(ple), Some(state)) = (layer.ple.as_ref(), layer.ple_state.as_ref()) {
+                ple.prefetch(state.history(), tokens);
+            }
+        }
+    }
+
     fn run_stack(&mut self, tokens: &Tensor, pos: usize) -> Result<StackOutput> {
         // qwen4exp is a second graph over the same blocks (D14): a 4-stream
         // residual carrier, a QSA overlay on the attention layers and a PLE

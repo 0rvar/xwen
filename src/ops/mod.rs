@@ -160,6 +160,38 @@ pub fn ple_profile() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_PLE_PROFILE").is_some())
 }
 
+/// `XWEN_PLE_NO_RANDOM` keeps the PLE n-gram table's byte range on the
+/// mapping's default (sequential-ish) readahead instead of tagging it
+/// `MADV_RANDOM`.
+///
+/// The A/B knob for that hint, and the reason it is a knob: the table is read
+/// 16 unrelated 90-byte rows per token over 28.8 GB, which is the textbook case
+/// for `MADV_RANDOM` — but readahead that misses is only wasted bandwidth,
+/// while readahead that hits is a fault the gather never takes, and the two
+/// cannot be told apart without measuring. Set this and compare the `gather`
+/// figure under `XWEN_PLE_PROFILE`.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches: any value
+/// enables it.
+pub fn ple_no_random() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_PLE_NO_RANDOM").is_some())
+}
+
+/// `XWEN_PLE_NO_PREFETCH` disables the PLE table's background page-touching
+/// thread, so every gather takes its own faults on the forward's own thread.
+///
+/// The other half of the A/B: with it set the layer is exactly what it was
+/// before the prefetcher existed. Unset, the table spawns one thread on the
+/// first hint and never spawns another.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches: any value
+/// enables it.
+pub fn ple_no_prefetch() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_PLE_NO_PREFETCH").is_some())
+}
+
 /// `XWEN_CHUNK_SYNC` makes the plain prefill loop wait for each chunk's forward
 /// to complete before enqueueing the next, instead of letting the chunks
 /// pipeline.
