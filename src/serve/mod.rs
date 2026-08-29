@@ -249,15 +249,47 @@ fn model_id(settings: &ServeSettings, served: &crate::serve::types::Target) -> S
         .unwrap_or_else(|| "xwen".to_string())
 }
 
-/// The ids `/v1/models` lists: every checkpoint by full name, led by whatever
-/// this server is serving. `served` is already a full name when the served GGUF
-/// is one of them, which is what keeps it from being listed twice — under its
-/// own name and again in the roster.
+/// Whether a request on this server may select `model`.
+///
+/// Two conditions, and they refuse for different reasons.
+///
+/// [`crate::hub::Model::servable`] is about the engine: a qwen4exp checkpoint
+/// snapshots, rewinds and pages out on the server's ordinary path and refuses
+/// every one of those moves until P4, so serving it would fail nearly every
+/// request. Startup already refuses to SERVE such a file; this is what keeps a
+/// server running something else from loading one on the side.
+///
+/// [`crate::hub::Model::auto_fetch`] is about the download: a checkpoint whose
+/// fetch is over 100 GB is not started in the middle of a request that then
+/// blocks on it, so one of those is selectable only once it is really cached.
+///
+/// The same predicate governs the listing and the resolver on purpose: every id
+/// `/v1/models` shows must be one a request can select, and every id it hides
+/// must be one a request is refused. Splitting them is how a listing starts
+/// advertising something unusable.
+pub(crate) fn checkpoint_selectable(model: crate::hub::Model) -> bool {
+    model.servable() && (model.auto_fetch() || crate::hub::cached_model(model).is_some())
+}
+
+/// The ids `/v1/models` lists: every selectable checkpoint by full name, led by
+/// whatever this server is serving. `served` is already a full name when the
+/// served GGUF is one of them, which is what keeps it from being listed twice —
+/// under its own name and again in the roster.
+///
+/// The served file leads unconditionally, whatever [`checkpoint_selectable`]
+/// says about its checkpoint: it is open on disk, so the download half of the
+/// predicate does not apply to it — and the engine half was settled at startup,
+/// which refuses to serve an unservable file at all.
 fn listed_models(served: &str) -> Vec<String> {
+    listed_models_with(served, &checkpoint_selectable)
+}
+
+fn listed_models_with(served: &str, selectable: &dyn Fn(crate::hub::Model) -> bool) -> Vec<String> {
     let mut ids = vec![served.to_string()];
     ids.extend(
         crate::hub::MODELS
             .iter()
+            .filter(|model| selectable(**model))
             .map(|model| model.full_name().to_string())
             .filter(|name| name != served),
     );
@@ -279,10 +311,24 @@ fn listed_models(served: &str) -> Vec<String> {
 /// Resolve BEFORE each dialect's `prepare`, which substitutes the served id for
 /// an absent field: a file someone named `35b.gguf` must not route model-less
 /// requests by its name.
+///
+/// A correctly spelled checkpoint that this server may not fetch on demand and
+/// does not have cached is refused too, with a message saying how to get it
+/// ([`checkpoint_selectable`]). That is a 400 rather than a 60-minute download
+/// nobody asked for.
 pub(crate) fn resolve_requested_model(
     requested: Option<&str>,
     served: crate::serve::types::Target,
     served_id: &str,
+) -> Result<(crate::serve::types::Target, String), String> {
+    resolve_requested_model_with(requested, served, served_id, &checkpoint_selectable)
+}
+
+fn resolve_requested_model_with(
+    requested: Option<&str>,
+    served: crate::serve::types::Target,
+    served_id: &str,
+    selectable: &dyn Fn(crate::hub::Model) -> bool,
 ) -> Result<(crate::serve::types::Target, String), String> {
     let name = match requested.map(str::trim) {
         None | Some("") => return Ok((served, served_id.to_string())),
@@ -291,14 +337,38 @@ pub(crate) fn resolve_requested_model(
     if name.eq_ignore_ascii_case(served_id) {
         return Ok((served, served_id.to_string()));
     }
-    crate::hub::Model::from_api_name(name)
-        .map(|model| {
-            (
-                crate::serve::types::Target::official(model),
-                model.full_name().to_string(),
-            )
-        })
-        .ok_or_else(|| unknown_model_message(name))
+    let model =
+        crate::hub::Model::from_api_name(name).ok_or_else(|| unknown_model_message(name))?;
+    if !selectable(model) {
+        return Err(unselectable_model_message(model));
+    }
+    Ok((
+        crate::serve::types::Target::official(model),
+        model.full_name().to_string(),
+    ))
+}
+
+/// The 400 for a checkpoint that IS one of ours and spelled correctly, but that
+/// this server will not run. Two reasons, and the message says which, because
+/// the operator's next move is different for each: one is a `xwen fetch` away,
+/// the other is not available on this surface at all.
+pub(crate) fn unselectable_model_message(model: crate::hub::Model) -> String {
+    if !model.servable() {
+        return model.unservable_message();
+    }
+    uncached_model_message(model)
+}
+
+/// The 400 for a checkpoint that is simply not on this disk — where fetching it
+/// inside the request is the thing we will not do. It names the one command that
+/// does fetch it, because "not available" without that is a dead end.
+pub(crate) fn uncached_model_message(model: crate::hub::Model) -> String {
+    format!(
+        "model {:?} is not in the Hugging Face cache, and at {} it is not downloaded \
+         to satisfy a request; fetch it first with `xwen fetch --model-size {model}`",
+        model.full_name(),
+        model.size(),
+    )
 }
 
 /// The 400 an API answers a `model` it does not know with. Names every valid
@@ -1405,13 +1475,19 @@ mod tests {
         );
     }
 
-    /// One entry per checkpoint, the served one first, and no id listed twice —
-    /// a listing is what a client picks a `model` string from, so two ids for
-    /// one model is two ways to ask for the same thing.
+    /// Every checkpoint a request could select, the served one first, and no id
+    /// listed twice — a listing is what a client picks a `model` string from, so
+    /// two ids for one model is two ways to ask for the same thing.
+    ///
+    /// The predicate is injected rather than read off this machine's hub cache:
+    /// whether Qwen3.8-Flash-Next happens to be downloaded here is not what this
+    /// test is about, and a test that changed answer when someone fetched a
+    /// checkpoint would be worse than no test.
     #[test]
     fn the_model_listing_names_each_checkpoint_once() {
+        let all = |_| true;
         assert_eq!(
-            listed_models("Qwen3.6-35B-A3B"),
+            listed_models_with("Qwen3.6-35B-A3B", &all),
             [
                 "Qwen3.6-35B-A3B",
                 "Qwen3.6-27B",
@@ -1422,7 +1498,7 @@ mod tests {
         );
         // A custom GGUF is none of them, so it leads under its own name and
         // every official checkpoint still follows.
-        let custom = listed_models("laguna-s-2.1-Q4_K_M");
+        let custom = listed_models_with("laguna-s-2.1-Q4_K_M", &all);
         assert_eq!(custom.len(), crate::hub::MODELS.len() + 1);
         assert_eq!(custom[0], "laguna-s-2.1-Q4_K_M");
 
@@ -1430,30 +1506,131 @@ mod tests {
         // included — that is the whole point of a listing, and the property the
         // old one broke by mixing aliases in with a file stem. The served entry
         // is checked through the resolver rather than against the checkpoint
-        // table, because a custom GGUF's id is in no table.
-        for (served, target) in [
-            (
-                "Qwen3.8-27B",
-                types::Target::official(crate::hub::Model::Qwen3827B),
-            ),
-            (
-                "laguna-s-2.1-Q4_K_M",
-                types::Target::served(crate::hub::Model::Qwen35BA3B),
-            ),
+        // table, because a custom GGUF's id is in no table. Run under BOTH
+        // availability answers: the listing and the resolver share one
+        // predicate, so hiding a checkpoint must never hide a selectable one and
+        // never leave an unselectable one listed.
+        let nothing_cached = |model: crate::hub::Model| model.auto_fetch();
+        for selectable in [
+            &all as &dyn Fn(crate::hub::Model) -> bool,
+            &nothing_cached as &dyn Fn(crate::hub::Model) -> bool,
         ] {
-            let ids = listed_models(served);
-            for id in &ids {
-                assert!(
-                    resolve_requested_model(Some(id), target, served).is_ok(),
-                    "a listed id must be selectable: {id}"
+            for (served, target) in [
+                (
+                    "Qwen3.8-27B",
+                    types::Target::official(crate::hub::Model::Qwen3827B),
+                ),
+                (
+                    "laguna-s-2.1-Q4_K_M",
+                    types::Target::served(crate::hub::Model::Qwen35BA3B),
+                ),
+            ] {
+                let ids = listed_models_with(served, selectable);
+                for id in &ids {
+                    assert!(
+                        resolve_requested_model_with(Some(id), target, served, selectable).is_ok(),
+                        "a listed id must be selectable: {id}"
+                    );
+                }
+                assert_eq!(
+                    ids.iter().collect::<std::collections::HashSet<_>>().len(),
+                    ids.len(),
+                    "no id is listed twice"
                 );
             }
-            assert_eq!(
-                ids.iter().collect::<std::collections::HashSet<_>>().len(),
-                ids.len(),
-                "no id is listed twice"
-            );
         }
+    }
+
+    /// A checkpoint the engine cannot run is never offered and never selected,
+    /// however available its file is.
+    ///
+    /// Qwen3.8-Flash-Next is the case: the server snapshots, rewinds and pages
+    /// conversations out on its ordinary path, and qwen4exp refuses every one of
+    /// those until P4, so a request naming it would fail somewhere in the middle
+    /// rather than up front. The 400 says so and points at the CLI, which runs
+    /// it fine.
+    ///
+    /// The predicate is checked directly rather than injected here: `servable`
+    /// is a property of the build, not of this machine's hub cache, so there is
+    /// nothing to vary.
+    #[test]
+    fn an_unservable_checkpoint_is_never_listed_or_selected() {
+        use crate::hub::Model;
+        let served = types::Target::official(Model::Qwen3827B);
+        let served_id = "Qwen3.8-27B";
+
+        assert!(!checkpoint_selectable(Model::Qwen38FlashNext));
+        for model in [Model::Qwen27B, Model::Qwen35BA3B, Model::Qwen3827B] {
+            assert!(checkpoint_selectable(model), "{model}");
+        }
+
+        let ids = listed_models(served_id);
+        assert!(!ids.iter().any(|id| id == "Qwen3.8-Flash-Next"), "{ids:?}");
+        assert!(ids.iter().any(|id| id == "Qwen3.6-27B"), "{ids:?}");
+
+        let err =
+            resolve_requested_model(Some("Qwen3.8-Flash-Next"), served, served_id).unwrap_err();
+        assert!(err.contains("cannot be served yet"), "{err}");
+        assert!(err.contains("xwen chat"), "{err}");
+        // Not the fetch message: this is not a download away.
+        assert!(!err.contains("xwen fetch"), "{err}");
+    }
+
+    /// A checkpoint too large to download inside a request is listed and
+    /// selectable exactly when it is already on disk, and refused with the
+    /// command that fetches it when it is not. The alternative — resolving it
+    /// and letting `checkpoint_paths` fetch — is a client's typo starting a
+    /// 111 GB download.
+    ///
+    /// Driven through an injected predicate because the only checkpoint that is
+    /// explicit-only today is also unservable, so the shipped table cannot
+    /// exhibit this half on its own. The rule is the one under test, not which
+    /// checkpoint happens to hit it.
+    #[test]
+    fn an_explicit_only_checkpoint_is_offered_only_once_it_is_cached() {
+        use crate::hub::Model;
+        let served = types::Target::official(Model::Qwen3827B);
+        let served_id = "Qwen3.8-27B";
+        // Stand-ins for the two cache answers, over a checkpoint that IS
+        // servable so this test measures the download rule alone.
+        let cached = |_| true;
+        let uncached = |model: Model| model != Model::Qwen27B;
+
+        let ids = listed_models_with(served_id, &uncached);
+        assert!(!ids.iter().any(|id| id == "Qwen3.6-27B"), "{ids:?}");
+        let err = resolve_requested_model_with(Some("Qwen3.6-27B"), served, served_id, &uncached)
+            .unwrap_err();
+        assert!(err.contains("xwen fetch --model-size 27b"), "{err}");
+        assert!(err.contains("Qwen3.6-27B"), "{err}");
+        // Its neighbours are unaffected by the same predicate.
+        assert!(ids.iter().any(|id| id == "Qwen3.6-35B-A3B"), "{ids:?}");
+
+        // Cached: listed and selectable like any other.
+        let ids = listed_models_with(served_id, &cached);
+        assert!(ids.iter().any(|id| id == "Qwen3.6-27B"), "{ids:?}");
+        assert_eq!(
+            resolve_requested_model_with(Some("Qwen3.6-27B"), served, served_id, &cached),
+            Ok((
+                types::Target::official(Model::Qwen27B),
+                "Qwen3.6-27B".to_string()
+            ))
+        );
+
+        // The served file answers for itself under its own id whatever the
+        // predicate says — the file is open, so the question does not apply.
+        assert!(
+            resolve_requested_model_with(
+                Some("Qwen3.6-27B"),
+                types::Target::served(Model::Qwen27B),
+                "Qwen3.6-27B",
+                &uncached
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            listed_models_with("Qwen3.6-27B", &uncached)[0],
+            "Qwen3.6-27B"
+        );
     }
 
     /// One resolution rule for both compat dialects: a full name selects (in any

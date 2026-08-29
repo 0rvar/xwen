@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use candle_core::{DType, Device, Module, Tensor};
 
 use crate::config::XwenConfig;
@@ -68,13 +68,27 @@ impl PrefillMask {
     /// selection already carries causality, so its mask REPLACES the causal one
     /// rather than composing with it, and it reaches sdpa through exactly this
     /// broadcast-to-f16 path.
+    /// The f16 copy is ONE `[1, 1, s, kk]` plane, broadcast to `[1, n_head, s,
+    /// kk]` as a view — the head axis carries stride 0 and no bytes.
+    ///
+    /// Every mask that reaches here is head-uniform (each is built from a
+    /// `[seq, k_seq]` host mask), and candle's Metal sdpa takes the mask's
+    /// strides rather than assuming it contiguous: `call_sdpa_full` forwards
+    /// `M_strides[0..3]` (batch, head, query — the key stride is fixed at 1) and
+    /// `scaled_dot_product_attention.metal:1940` advances the mask pointer by
+    /// `head * M_strides[1]`, so a zero there hands every head the same row.
+    /// Only the shape check is strict, and a broadcast view has the shape.
+    ///
+    /// Materializing the copy instead costs `n_head` times as much for nothing:
+    /// 232 MB per QSA layer at 2200 tokens on the qwen4exp geometry, and
+    /// 800 MB per layer at a 4k dense prefill on the 27B.
     pub fn from_raw(raw: Tensor, n_head: usize) -> Result<Self> {
         let (s, kk) = raw.dims2()?;
         let sdpa = raw
             .reshape((1, 1, s, kk))?
-            .broadcast_as((1, n_head, s, kk))?
             .to_dtype(DType::F16)?
-            .contiguous()?;
+            .contiguous()?
+            .broadcast_as((1, n_head, s, kk))?;
         Ok(Self { raw, sdpa })
     }
 }
@@ -441,14 +455,41 @@ impl AttnBlock {
         //  - `Mask` is the prefill shape: an additive per-query mask that
         //    already includes causality, so it replaces the hoisted causal one
         //    instead of being added to it.
+        //
+        // Each arm is checked against the shape it is FOR, because getting it
+        // wrong is silent rather than loud: a `Mask` at `seq == 1` reaches
+        // candle's vector sdpa, which ignores the mask argument entirely and
+        // returns dense attention over the whole prefix — the right shape, the
+        // wrong answer, no error anywhere. `Rows` at `seq > 1` is the mirror
+        // image: the gather is not per-query, so every query would attend over
+        // one query's selection, and dropping the caller's causal mask along
+        // with it lets a token see its own future.
         let (k_all, v_all) = match qsa {
             Some(QsaSelection::Rows(rows)) => {
+                ensure!(
+                    seq == 1,
+                    "QsaSelection::Rows is the decode overlay and selects one query's rows; \
+                     got seq {seq}"
+                );
+                ensure!(
+                    mask.is_none(),
+                    "QsaSelection::Rows attends over gathered rows with NO mask (candle's \
+                     vector sdpa ignores one), so a caller-supplied mask would be silently \
+                     dropped"
+                );
                 (gather_rows(&k_all, rows)?, gather_rows(&v_all, rows)?)
             }
             _ => (k_all, v_all),
         };
         let qsa_mask = match qsa {
-            Some(QsaSelection::Mask(m)) => Some(PrefillMask::from_raw(m.clone(), self.n_head)?),
+            Some(QsaSelection::Mask(m)) => {
+                ensure!(
+                    seq > 1,
+                    "QsaSelection::Mask is the prefill overlay; at seq 1 candle's vector sdpa \
+                     ignores the mask and attends densely instead — use Rows"
+                );
+                Some(PrefillMask::from_raw(m.clone(), self.n_head)?)
+            }
             _ => None,
         };
         let mask = qsa_mask.as_ref().or(mask);
@@ -784,6 +825,13 @@ mod tests {
     /// q/gate split, QK-norm, partial rope, the f16 KV round-trip and the
     /// elementwise sigmoid gate, written out independently of the block.
     /// Returns [total, hidden].
+    ///
+    /// `last_row_keys`, when given, restricts the FINAL query row to exactly the
+    /// named key positions instead of the whole causal prefix — the reference
+    /// for a decode step under a QSA `Rows` selection. Every other row keeps its
+    /// ordinary causal visibility. Masking the dropped columns with -inf is
+    /// exactly slicing them out: softmax gives them weight 0 and the surviving
+    /// weights renormalize over the same sum a sliced K/V would produce.
     fn naive_forward(
         w: &RawWeights,
         rope: &Rope,
@@ -791,6 +839,7 @@ mod tests {
         n_head: usize,
         n_kv: usize,
         hd: usize,
+        last_row_keys: Option<&[u32]>,
     ) -> Tensor {
         let dev = x.device();
         let (total, _hidden) = x.dims2().unwrap();
@@ -860,6 +909,17 @@ mod tests {
                 }
             }
         }
+        if let Some(keys) = last_row_keys {
+            let last = (total - 1) * total;
+            mask[last..].fill(f32::NEG_INFINITY);
+            for &k in keys {
+                assert!(
+                    (k as usize) < total,
+                    "key position {k} is beyond the {total}-token sequence"
+                );
+                mask[last + k as usize] = 0.0;
+            }
+        }
         let mask = Tensor::from_vec(mask, (1, 1, total, total), dev).unwrap();
         let scores = scores.broadcast_add(&mask).unwrap();
         let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
@@ -905,7 +965,7 @@ mod tests {
 
         let total = 6usize;
         let x = dense(total, hidden, 42, &dev);
-        let want = naive_forward(&w, &rope, &x, n_head, n_kv, hd);
+        let want = naive_forward(&w, &rope, &x, n_head, n_kv, hd, None);
 
         // Prefill the first 4 tokens, then decode the last 2 one at a time.
         let mut cache = LayerCache::new(&cfg, 0, 32, &dev).unwrap();
@@ -967,7 +1027,7 @@ mod tests {
         let x = Tensor::from_vec(row, (1, hidden), &dev).unwrap();
         let out = block.forward(&x, &mut cache, 0, None, None).unwrap();
 
-        let want = naive_forward(&w, &rope, &x, n_head, n_kv, hd);
+        let want = naive_forward(&w, &rope, &x, n_head, n_kv, hd, None);
         assert!(
             max_abs_diff(&out, &want) < 1e-4,
             "interleaved gate split disagrees with the reference"
@@ -976,7 +1036,7 @@ mod tests {
         // half-and-half split of the row would have read a zero weight here.
         let got: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
         let attn_only: Vec<f32> = {
-            let v = naive_forward(&w, &rope, &x, n_head, n_kv, hd);
+            let v = naive_forward(&w, &rope, &x, n_head, n_kv, hd, None);
             v.flatten_all().unwrap().to_vec1().unwrap()
         };
         assert_eq!(got.len(), attn_only.len());
@@ -1442,13 +1502,19 @@ mod tests {
     /// unoverlaid decode: the gather packs the cache's strided per-head views
     /// into contiguous planes, and packing must not change the answer.
     ///
-    /// The second half is the falsifiability half — a `Rows` naming a strict
-    /// subset has to actually move the output, or the gather could be a no-op
-    /// and the first assertion would prove nothing.
+    /// The second half is the subset half, and it pins WHICH rows were used:
+    /// the output has to equal the naive reference restricted to exactly those
+    /// key positions, so an off-by-one in the gather, a reversed index order or
+    /// a selection that quietly kept the whole prefix all fail. The "moved"
+    /// assertion is kept beside it as the falsifiability guard — without it, an
+    /// equality that happened to hold because the subset barely differs from the
+    /// full prefix would read as a pass.
     #[test]
     fn decode_rows_gather_selects_the_named_positions() {
         let dev = metal_device().unwrap();
-        let (block, cfg, _) = qsa_block(&dev);
+        let (block, cfg, w) = qsa_block(&dev);
+        // The same rope `qsa_block` handed the block, rebuilt for the reference.
+        let rope = Rope::new(cfg.rope(), 256, &dev).unwrap();
         let prefill = dense(64, cfg.hidden, 92, &dev);
         let step = dense(1, cfg.hidden, 93, &dev);
 
@@ -1483,7 +1549,8 @@ mod tests {
 
         // Half the prefix plus the query's own token: a different attention
         // distribution, so a different answer.
-        let subset = run(Some((0..32).chain(std::iter::once(64)).collect()));
+        let rows: Vec<u32> = (0..32).chain(std::iter::once(64)).collect();
+        let subset = run(Some(rows.clone()));
         let moved = plain
             .iter()
             .zip(&subset)
@@ -1493,6 +1560,49 @@ mod tests {
             moved > 1e-4,
             "restricting the rows to half the prefix left the output unchanged ({moved}): \
              the gather is not reaching sdpa"
+        );
+
+        // And it moved to the RIGHT place: the naive f32 reference over the
+        // whole 65-token sequence, with the final query row's visibility cut
+        // down to exactly `rows`.
+        let x = Tensor::cat(&[&prefill, &step], 0).unwrap();
+        let want = naive_forward(
+            &w,
+            &rope,
+            &x,
+            cfg.n_head[0],
+            cfg.n_kv_head,
+            cfg.head_dim,
+            Some(&rows),
+        );
+        let want: Vec<f32> = want
+            .narrow(0, 64, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let err = subset
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        // RELATIVE, unlike the 1e-5 above. That comparison differences two runs
+        // of the same kernel chain, which agree to well under one ulp of these
+        // values; this one differences the Metal sdpa kernel against a
+        // broadcast_matmul/softmax chain reading the same f16 KV rows, and this
+        // block's random weights put the o_proj output around 1e4, where f32's
+        // own relative step is already ~1e-3 in absolute terms. 1e-4 relative
+        // sits 4x above the ~2.5e-5 the two paths actually differ by, and 5x
+        // below the ~4.9e-4 that the smallest interesting defect produces —
+        // measured by sliding the reference's key window one position, i.e. an
+        // off-by-one in the gather. Coarser failures (the selection quietly
+        // keeping the whole prefix) are order-1 relative and nowhere near this.
+        let mag = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(
+            err < 1e-4 * mag,
+            "the row-restricted decode diverged from the naive reference by {err} \
+             on values of magnitude {mag}"
         );
     }
 
@@ -1535,6 +1645,137 @@ mod tests {
         assert!(
             diff < 1e-5,
             "a fully causal overlay moved the output by {diff}"
+        );
+    }
+
+    /// Each overlay arm is refused outside the shape it is for. Both mistakes
+    /// are otherwise SILENT: a `Mask` at seq 1 reaches candle's vector sdpa,
+    /// which ignores the mask argument and returns dense attention over the
+    /// whole prefix; a `Rows` at seq > 1 gathers one selection for every query
+    /// and drops the causal mask with it. Neither produces a wrong shape, so
+    /// nothing downstream would notice.
+    #[test]
+    fn an_overlay_used_at_the_wrong_shape_is_refused() {
+        let dev = metal_device().unwrap();
+        let (block, cfg, _) = qsa_block(&dev);
+        let seq = 8usize;
+        let prefill = dense(seq, cfg.hidden, 95, &dev);
+        let step = dense(1, cfg.hidden, 96, &dev);
+
+        // A prefill mask handed to a decode step.
+        let mut cache = LayerCache::new(&cfg, 0, 128, &dev).unwrap();
+        let mask = block.prefill_mask(&cache, seq, 0).unwrap();
+        block
+            .forward(&prefill, &mut cache, 0, mask.as_ref(), None)
+            .unwrap();
+        let one_row = QsaSelection::Mask(Tensor::zeros((1, seq + 1), DType::F32, &dev).unwrap());
+        let err = block
+            .forward(&step, &mut cache, seq, None, Some(&one_row))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prefill overlay"), "{err}");
+
+        // A decode gather handed a whole prefill chunk.
+        let mut cache = LayerCache::new(&cfg, 0, 128, &dev).unwrap();
+        let mask = block.prefill_mask(&cache, seq, 0).unwrap();
+        let rows = QsaSelection::Rows(Tensor::from_vec(vec![0u32, 1, 2], 3, &dev).unwrap());
+        let err = block
+            .forward(&prefill, &mut cache, 0, mask.as_ref(), Some(&rows))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decode overlay"), "{err}");
+
+        // A decode gather WITH a mask: the gather route runs maskless, so the
+        // mask would be dropped without a word.
+        let mut cache = LayerCache::new(&cfg, 0, 128, &dev).unwrap();
+        block
+            .forward(&prefill, &mut cache, 0, mask.as_ref(), None)
+            .unwrap();
+        let decode_mask = PrefillMask::from_raw(
+            Tensor::zeros((1, seq + 1), DType::F32, &dev).unwrap(),
+            cfg.n_head(0),
+        )
+        .unwrap();
+        let err = block
+            .forward(&step, &mut cache, seq, Some(&decode_mask), Some(&rows))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("silently dropped"), "{err}");
+    }
+
+    /// The sdpa mask is ONE head-uniform plane broadcast across the head axis,
+    /// not `n_head` copies of it. Pinned at the qwen4exp geometry (24 query
+    /// heads, 2 KV, head dim 256) and a QSA-sized 2200-token prefill, where the
+    /// difference is 9.7 MB against 232 MB per layer.
+    ///
+    /// The property under test is candle's, not ours: its Metal sdpa forwards
+    /// the mask's strides to the kernel rather than assuming the mask
+    /// contiguous, so a stride-0 head axis feeds every head the same row. If a
+    /// future candle bump stops honoring that, this test says so — either by
+    /// failing the shape check outright or by disagreeing with the materialized
+    /// mask it is compared against.
+    #[test]
+    fn the_sdpa_mask_is_one_plane_broadcast_across_the_heads() {
+        let dev = metal_device().unwrap();
+        let (n_head, n_kv, hd, seq) = (24usize, 2usize, 256usize, 2200usize);
+
+        let mut causal = vec![f32::NEG_INFINITY; seq * seq];
+        for (q, row) in causal.chunks_mut(seq).enumerate() {
+            // A QSA-shaped selection: the query's own token plus a strided
+            // sample of its prefix, so most of the plane really is masked.
+            for (k, slot) in row.iter_mut().enumerate().take(q + 1) {
+                if k == q || k % 4 == 0 {
+                    *slot = 0.0;
+                }
+            }
+        }
+        let raw = Tensor::from_vec(causal, (seq, seq), &dev).unwrap();
+        let mask = PrefillMask::from_raw(raw, n_head).unwrap();
+
+        // One plane's worth of storage, viewed as n_head.
+        assert_eq!(mask.sdpa.dims(), [1, n_head, seq, seq]);
+        assert_eq!(
+            mask.sdpa.stride()[1],
+            0,
+            "the head axis must carry no bytes"
+        );
+
+        let q = dense(n_head * seq, hd, 97, &dev)
+            .reshape((1, n_head, seq, hd))
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let k = dense(n_kv * seq, hd, 98, &dev)
+            .reshape((1, n_kv, seq, hd))
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let v = dense(n_kv * seq, hd, 99, &dev)
+            .reshape((1, n_kv, seq, hd))
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        let run = |m: &Tensor| {
+            candle_nn::ops::sdpa(&q, &k, &v, Some(m), false, scale, 1.0)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let materialized = mask.sdpa.contiguous().unwrap();
+        let diff = run(&mask.sdpa)
+            .iter()
+            .zip(&run(&materialized))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            diff < 1e-5,
+            "the broadcast mask disagreed with the materialized one by {diff}"
         );
     }
 }

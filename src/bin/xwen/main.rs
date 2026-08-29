@@ -686,6 +686,12 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     // official checkpoint. Injected into the CLI side of the merge (rather than
     // inside `resolve`) so config resolution itself stays pure and testable.
     let selected = args.select.model_size;
+    // Before anything is resolved or fetched: a `--model-size` naming a
+    // checkpoint the server cannot run is refused here rather than after a
+    // 111 GB download and a load that fails every request.
+    if !args.select.size().servable() {
+        bail!("{}", args.select.size().unservable_message());
+    }
     let mut overrides = args.overrides();
     if overrides.model.is_none() && file.model.is_none() {
         overrides.model = Some(resolve_model(None, args.select.size())?);
@@ -698,6 +704,22 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     if !settings.model.is_file() {
         bail!("model {} does not exist", settings.model.display());
     }
+
+    // The served FILE decides, not the name: someone's own conversion onto the
+    // qwen4exp graph is as unservable as the official checkpoint is, for the
+    // same reason, and it identifies as no checkpoint at all — `identify_
+    // checkpoint` falls it back to `Arch::model()`, which is the qwen4exp
+    // checkpoint, which is unservable. Read once here and reused by the drafter
+    // prefetch below.
+    let served_cfg =
+        XwenConfig::from_gguf(&gguf::open(&settings.model, &candle_core::Device::Cpu)?.content)
+            .with_context(|| format!("reading {}", settings.model.display()))?;
+    let (served_target, _) =
+        xwen::serve::engine::identify_checkpoint(&settings, &served_cfg, selected)?;
+    if !served_target.model.servable() {
+        bail!("{}", served_target.model.unservable_message());
+    }
+
     match &settings.draft {
         DraftMode::Off => {}
         DraftMode::Custom(path) => {
@@ -715,12 +737,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // checkpoint and serving another, and would report a checkpoint the
             // server is about to refuse (a `--model-size` that contradicts the
             // file is an error, raised here rather than after the notice).
-            let cfg = XwenConfig::from_gguf(
-                &gguf::open(&settings.model, &candle_core::Device::Cpu)?.content,
-            )
-            .with_context(|| format!("reading {}", settings.model.display()))?;
-            let (target, _) = xwen::serve::engine::identify_checkpoint(&settings, &cfg, selected)?;
-            let served = target.model;
+            let served = served_target.model;
             // `--draft official` is a request by name and cannot be honored for
             // a checkpoint that ships no sidecar; the opt-out default asked for
             // nothing and degrades with a line, since drafting is otherwise on
@@ -776,6 +793,15 @@ fn resolve_model(model: Option<PathBuf>, size: Model) -> Result<PathBuf> {
 /// the model itself. `None` when that checkpoint ships no sidecar — decoding
 /// then runs plain, which is the only thing it could do.
 fn resolve_draft(path: &std::path::Path, size: Model, explicit: bool) -> Result<Option<PathBuf>> {
+    // A checkpoint whose graph has no verify seam cannot be drafted for by any
+    // sidecar, so a custom `--draft <gguf>` is refused here rather than loaded
+    // and rejected later by `attach_drafter`. The opt-out default asked for
+    // nothing and degrades to plain decoding with a line, as it does for a
+    // checkpoint that merely ships no sidecar.
+    if !size.supports_drafting() {
+        ensure!(!explicit, "{}", size.no_drafting_message());
+        return Ok(None);
+    }
     if path != std::path::Path::new("official") {
         return Ok(Some(path.to_path_buf()));
     }
@@ -1317,6 +1343,44 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use xwen::chat::ChatDialect;
+
+    /// A checkpoint whose graph has no speculative verify seam refuses a drafter
+    /// it was ASKED for, and quietly decodes plain when it was not.
+    ///
+    /// The refusal has to happen at the flag, not at load: a custom sidecar
+    /// would otherwise be fetched, opened and classified before
+    /// `attach_drafter` rejected it, and the error would name a mismatch rather
+    /// than the fact that this target cannot be drafted for at all.
+    #[test]
+    fn a_checkpoint_with_no_verify_seam_refuses_a_drafter_it_was_asked_for() {
+        let official = std::path::Path::new("official");
+        let custom = std::path::Path::new("/somebody/sidecar.gguf");
+
+        // Asked by name, either spelling: an error naming the target.
+        for path in [official, custom] {
+            let err = resolve_draft(path, Model::Qwen38FlashNext, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no drafter kind is supported"), "{err}");
+            assert!(err.contains("Qwen3.8-Flash-Next"), "{err}");
+        }
+
+        // Not asked (the opt-out default): no drafter, no error — the caller
+        // prints the "decoding without speculation" line.
+        assert!(
+            resolve_draft(official, Model::Qwen38FlashNext, false)
+                .unwrap()
+                .is_none()
+        );
+
+        // The drafting checkpoints are untouched by the same call: a custom
+        // path is handed straight back, and `official` resolves to the sidecar.
+        assert_eq!(
+            resolve_draft(custom, Model::Qwen27B, true).unwrap(),
+            Some(custom.to_path_buf())
+        );
+        assert!(Model::Qwen27B.supports_drafting());
+    }
 
     // Unset sampling flags resolve to the recommended set for the run's
     // thinking mode — 1.0/20/0.95 thinking, 0.7/20/0.80 with --no-think — and

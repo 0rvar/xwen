@@ -3520,6 +3520,30 @@ mod tests {
     /// shards, exactly one of which candle cannot name — the 28.8 GB IQ4_NL PLE
     /// table — and that one reads as a table, at both ends of its 320-million
     /// rows. Skips when the checkpoint is not in the cache.
+    ///
+    /// The tail differences the two POPULATIONS the split loader rebases
+    /// separately (`open_split`'s `known` and `unknown` loops): a candle-known
+    /// Q8_0 tensor that physically lives in shard 2 must yield the same stored
+    /// bytes through the raw/mmap route (`raw_tensor` → `MmapSource::bytes`,
+    /// which resolves `shard_for(name).mmap` and reads at the rebased absolute
+    /// offset) as through candle's own route (`Weights::qtensor` →
+    /// `Content::tensor`, which seeks `shard_for(name).file` at
+    /// `content.tensor_data_offset + info.offset`). Those are the only two ways
+    /// a tensor's bytes are ever reached, they share no code below the tensor
+    /// table, and both depend on the rebase being right — so if a future change
+    /// to `open_split` rebased one half and not the other, or paired a tensor
+    /// with the wrong shard, this fails where nothing else would: a wrong
+    /// offset inside a 50 GB shard reads plausible quantized garbage, and the
+    /// only tensor that is currently read from a real split at all is the
+    /// IQ4_NL one, which exercises the `unknown` loop alone.
+    ///
+    /// `raw_tensor` serves both halves, so it is the raw side for either
+    /// population; the candle side has no equivalent for IQ4_NL (that is why
+    /// `raw_of` exists), which is why the pairing has to be made on a
+    /// candle-known tensor. `output_hc_down.weight` is the pick: Q8_0, in shard
+    /// 2, 3.5 MB — small enough that `QTensor::data()`'s device readback is
+    /// free, while sitting ~675 MB into the shard, far past anything shard 1
+    /// (10 MB, metadata-only) could satisfy.
     #[test]
     fn real_flash_next_iq4_nl_table_opens_and_reads() {
         let Some(shard) = real_first_shard() else {
@@ -3578,5 +3602,131 @@ mod tests {
             table.row(320_001_536, &mut row).is_err(),
             "one past the last row is out of bounds"
         );
+
+        // The candle-known half of the same shard, differenced against the raw
+        // half (see the doc comment).
+        let known = "output_hc_down.weight";
+        assert_eq!(
+            gguf.stored_dtype_of(known).unwrap(),
+            StoredDtype::Ggml(GgmlDType::Q8_0),
+            "{known} is the shard-2 pick because it is a small Q8_0 plane"
+        );
+        let known_raw = gguf.raw_tensor(known).unwrap();
+        assert!(
+            Arc::ptr_eq(&known_raw.src, &raw.src),
+            "{known} and the PLE table both live in shard 2, so they must alias \
+             the same mapping"
+        );
+        let mapped = known_raw.src.bytes(known_raw.offset, 64).unwrap().to_vec();
+
+        let loaded = Weights::from_gguf(gguf.clone())
+            .qtensor("output_hc_down")
+            .unwrap();
+        assert_eq!(loaded.dtype(), GgmlDType::Q8_0);
+        assert_eq!(
+            loaded.storage_size_in_bytes(),
+            known_raw.len,
+            "the two routes must agree on how many bytes {known} occupies"
+        );
+        let via_candle = loaded.data().unwrap();
+        assert_eq!(
+            &via_candle[..64],
+            &mapped[..],
+            "the mmap route and candle's file route disagree on {known}'s first \
+             block: one of the two rebases is off"
+        );
+        // Not a slab of padding zeros that would match anywhere in the file: a
+        // Q8_0 block is a f16 scale plus 32 signed bytes, and real weights fill
+        // both.
+        assert!(
+            mapped.iter().any(|&b| b != 0),
+            "{known}'s first 64 bytes are all zero, so the comparison is vacuous"
+        );
+    }
+
+    /// The header parser is a REPLACEMENT for candle's `Content::read`, not a
+    /// variant of it: `CheckpointId` hashes the bytes up to
+    /// `tensor_data_offset`, so a drift in the alignment rule silently
+    /// invalidates every persisted cache image on disk, and `config.rs` reads
+    /// the metadata map this produces. The only intended difference is the one
+    /// the rewrite exists for — a tensor whose ggml type id candle cannot name
+    /// goes to the raw table instead of failing the file.
+    ///
+    /// So this asserts equivalence against candle itself, on the real blessed
+    /// files rather than on a fixture the same author wrote both sides of. Any
+    /// official checkpoint absent from the hub cache is skipped with a line
+    /// saying so; nothing is downloaded. Qwen3.8-Flash-Next is deliberately not
+    /// in the list — it is the file candle CANNOT read (IQ4_NL
+    /// `per_layer_token_embd`), and the test above covers it instead.
+    #[test]
+    fn the_header_parser_agrees_with_candle_on_every_blessed_file() {
+        use crate::hub::Model;
+
+        let mut checked = 0;
+        for model in [Model::Qwen35BA3B, Model::Qwen27B, Model::Qwen3827B] {
+            let Some(path) = crate::hub::cached_model(model) else {
+                eprintln!("skipping {model}: not in the Hugging Face cache");
+                continue;
+            };
+            checked += 1;
+
+            let mut file = File::open(&path).unwrap();
+            let ours = read_gguf_header(&mut file).unwrap();
+            assert!(
+                ours.raw.is_empty(),
+                "{model}: candle can name every tensor in this file, so nothing belongs \
+                 in the raw table"
+            );
+            let mut file = File::open(&path).unwrap();
+            let theirs = gguf_file::Content::read(&mut file).unwrap();
+
+            // The offset every persisted cache image is keyed against.
+            assert_eq!(
+                ours.content.tensor_data_offset, theirs.tensor_data_offset,
+                "{model}: tensor_data_offset"
+            );
+            assert_eq!(
+                format!("{:?}", ours.content.magic),
+                format!("{:?}", theirs.magic),
+                "{model}: magic"
+            );
+
+            // Metadata: the same keys, each carrying the same typed value.
+            // Compared per key rather than as whole maps because `HashMap`'s
+            // Debug order is not stable, and by Debug rather than by value
+            // because candle's `Value` has no `PartialEq` — Debug distinguishes
+            // both the variant and the payload, which is what is at stake.
+            let ours_keys: std::collections::BTreeSet<&String> =
+                ours.content.metadata.keys().collect();
+            let theirs_keys: std::collections::BTreeSet<&String> = theirs.metadata.keys().collect();
+            assert_eq!(ours_keys, theirs_keys, "{model}: metadata keys");
+            for key in ours_keys {
+                assert_eq!(
+                    format!("{:?}", ours.content.metadata[key]),
+                    format!("{:?}", theirs.metadata[key]),
+                    "{model}: metadata value for {key}"
+                );
+            }
+
+            // The tensor table: same names, and for each the same dtype, shape
+            // and offset. The shape check is what pins `dimensions.reverse()` —
+            // a parser that dropped it would produce transposed weights that
+            // load and multiply and are simply wrong.
+            let ours_names: std::collections::BTreeSet<&String> =
+                ours.content.tensor_infos.keys().collect();
+            let theirs_names: std::collections::BTreeSet<&String> =
+                theirs.tensor_infos.keys().collect();
+            assert_eq!(ours_names, theirs_names, "{model}: tensor names");
+            for name in ours_names {
+                let a = &ours.content.tensor_infos[name];
+                let b = &theirs.tensor_infos[name];
+                assert_eq!(a.ggml_dtype, b.ggml_dtype, "{model}: dtype of {name}");
+                assert_eq!(a.shape.dims(), b.shape.dims(), "{model}: shape of {name}");
+                assert_eq!(a.offset, b.offset, "{model}: offset of {name}");
+            }
+        }
+        if checked == 0 {
+            eprintln!("no official checkpoint is cached; the parser was not differenced");
+        }
     }
 }

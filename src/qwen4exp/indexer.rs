@@ -30,9 +30,13 @@
 //!    anyway, so the round trip buys the assembly for free.
 //!
 //! The cost is real and known: at 2200 tokens the readback is ~5 MB and the
-//! mask upload ~19 MB, per QSA layer per forward. A partial top-k kernel plus a
-//! device-side block→token expansion is the P3 replacement (TODO.md); the
-//! selection sets it must reproduce are pinned by the tests below.
+//! mask upload ~19 MB (the f32 `[n_q, n_kv]` plane), per QSA layer per forward,
+//! plus the ~9.7 MB f16 copy `PrefillMask::from_raw` makes of it for sdpa. That
+//! f16 copy is ONE plane broadcast across the heads, not one per head — see
+//! `from_raw`, where materializing it would be 232 MB at this length. A partial
+//! top-k kernel plus a device-side block→token expansion is the P3 replacement
+//! (TODO.md); the selection sets it must reproduce are pinned by the tests
+//! below.
 //!
 //! # Blocks are query-independent
 //!
@@ -211,6 +215,20 @@ impl QsaIndexer {
     fn check_shapes(&self) -> Result<()> {
         ensure!(self.ratio > 0, "indexer compress ratio is 0");
         ensure!(self.n_heads > 0, "indexer head count is 0");
+        // Selection keeps WHOLE blocks, so the budget is spent in units of
+        // `ratio` tokens: `keep_max = budget / ratio`. A budget under one block
+        // truncates to keeping nothing, and one that is not a whole number of
+        // blocks quietly grants fewer tokens than the file asked for — 2049 at
+        // ratio 4 buys the same 512 blocks as 2048. Neither shows up as an
+        // error later; the selection is simply smaller than the checkpoint was
+        // trained with.
+        ensure!(
+            self.budget >= self.ratio && self.budget.is_multiple_of(self.ratio),
+            "indexer top_k {} is not a whole number of {}-token blocks: selection keeps whole \
+             blocks, so this budget would silently round down",
+            self.budget,
+            self.ratio
+        );
         let (q_out, q_in) = self.q_proj.dims()?;
         let (k_out, k_in) = self.k_proj.dims()?;
         ensure!(
@@ -429,6 +447,24 @@ impl QsaIndexer {
 pub struct IndexerCache {
     raw: Tensor,
     len: usize,
+}
+
+/// Bytes one more position of context costs in ONE QSA layer's indexer key
+/// plane.
+///
+/// Two things about that plane make the obvious arithmetic wrong, which is why
+/// this is a function every caller shares rather than a formula each restates.
+/// It is MQA — exactly ONE key head, whatever the query head count is (4 on the
+/// shipped checkpoint) — and [`IndexerCache::new`] allocates it f32, not the
+/// f16 the trunk's KV rows use. 512 bytes per token per QSA layer here, where
+/// reasoning from the query heads and the trunk's dtype gives 1024.
+///
+/// Both the size an operator is told to budget for
+/// (`Model::kv_bytes_per_token`) and the size actually allocated
+/// (`super::stack::extra_state_bytes`) come from here, so the two cannot drift.
+pub const fn indexer_bytes_per_token(head_dim: usize) -> usize {
+    // One key head x head_dim x size_of::<f32>().
+    head_dim * 4
 }
 
 /// [`IndexerCache::checkpoint`]'s output. Carries nothing, for the same reason
@@ -980,5 +1016,52 @@ mod tests {
         let x = Tensor::from_vec(x, (n, hidden), &device).unwrap();
         let mut cache = ix.new_cache(64, &device).unwrap();
         assert!(ix.select(&x, &mut cache, 3).is_err());
+    }
+
+    /// The token budget is spent in whole blocks (`keep_max = budget / ratio`),
+    /// so a budget that is not a whole number of blocks is refused at load
+    /// rather than rounded down in silence. A file asking for 2049 tokens at
+    /// ratio 4 gets the same 512 blocks as one asking for 2048, and a file
+    /// asking for fewer than `ratio` gets nothing at all — neither reads as an
+    /// error anywhere downstream, they just make the selection smaller than the
+    /// checkpoint was trained with.
+    #[test]
+    fn a_budget_that_is_not_whole_blocks_is_refused() {
+        let device = metal_device().unwrap();
+        let (heads, hd, hidden) = (2usize, 8usize, 16usize);
+        let rope = Arc::new(
+            Rope::new(
+                &RopeKind::Plain {
+                    freq_base: THETA,
+                    n_rot: 4,
+                },
+                64,
+                &device,
+            )
+            .unwrap(),
+        );
+        let build = |budget: usize, ratio: usize| {
+            QsaIndexer::from_tensors(
+                Tensor::zeros((heads * hd, hidden), DType::F32, &device).unwrap(),
+                Tensor::zeros((hd, hidden), DType::F32, &device).unwrap(),
+                Tensor::ones(hd, DType::F32, &device).unwrap(),
+                Tensor::ones(hd, DType::F32, &device).unwrap(),
+                rope.clone(),
+                heads,
+                hd,
+                budget,
+                ratio,
+                EPS,
+            )
+        };
+
+        assert!(build(2048, 4).is_ok(), "the shipped geometry");
+        assert!(build(4, 4).is_ok(), "exactly one block is a legal budget");
+
+        let err = build(2049, 4).err().unwrap().to_string();
+        assert!(err.contains("whole number"), "{err}");
+        assert!(build(2, 4).is_err(), "a budget under one block");
+        assert!(build(0, 4).is_err(), "a zero budget");
+        assert!(build(2048, 0).is_err(), "a zero ratio");
     }
 }

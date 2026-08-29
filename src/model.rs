@@ -848,7 +848,7 @@ impl XwenModel {
         // rolled back from `kv_rollback` — they are not carried in
         // `KvCheckpoint` because `kv_cache.rs` stays out of P2 (D15).
         if let Some(parts) = self.qwen4exp.as_mut() {
-            parts.checkpoint(span)?;
+            parts.checkpoint(len0, span)?;
         }
         Ok(KvCheckpoint::new(len0, span, layers))
     }

@@ -417,6 +417,17 @@ fn checkpoint_paths(
     let model = if local {
         settings.model.clone()
     } else {
+        // Backstop, not the gate: every API surface already refused a
+        // checkpoint this server will not run (`super::checkpoint_selectable`),
+        // and the served file came from the CLI, where startup refused an
+        // unservable one. What is left is a future caller that reaches here
+        // without passing either — which must not become a 111 GB download
+        // nobody asked for, or a load that then fails every request.
+        ensure!(
+            super::checkpoint_selectable(size),
+            "{}",
+            super::unselectable_model_message(size)
+        );
         if hub::cached_model(size).is_none() {
             logger.log(ServeLog::CheckpointDownloading {
                 repo: size.repo(),

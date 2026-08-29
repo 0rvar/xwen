@@ -192,8 +192,20 @@ impl PleTable {
             row_dim,
             rows as u64,
         )?;
+        // Checked, because this is the one table in the port whose row count is
+        // in the hundreds of millions: 320,001,536 rows at 90 bytes is 28.8 GB,
+        // three quarters of the way to a u32 overflow and comfortably inside a
+        // usize — but "comfortably inside" is a fact about today's file, not
+        // about the arithmetic, and the wrong answer here is a length check that
+        // passes on a wrapped product.
+        let total = table.row_bytes.checked_mul(rows).with_context(|| {
+            format!(
+                "{name}: {rows} rows of {} bytes overflows a usize",
+                table.row_bytes
+            )
+        })?;
         ensure!(
-            table.row_bytes * rows == raw.len,
+            total == raw.len,
             "{name}: {rows} rows of {} bytes do not fill the tensor's {} bytes",
             table.row_bytes,
             raw.len
@@ -260,7 +272,20 @@ impl PleTable {
             "PLE row {r} is past the table's {} rows",
             self.rows
         );
-        let off = self.base + r as usize * self.row_bytes;
+        // Checked for the same reason `open`'s length check is: `r` is bounded
+        // by `self.rows` just above, so this cannot overflow on a table that
+        // passed `open` — and an offset that wrapped would name a valid-looking
+        // in-bounds slice of somebody else's tensor, which `slice` would hand
+        // back without complaint.
+        let off = (r as usize)
+            .checked_mul(self.row_bytes)
+            .and_then(|o| o.checked_add(self.base))
+            .with_context(|| {
+                format!(
+                    "PLE row {r} at {} bytes per row overflows the mapping offset",
+                    self.row_bytes
+                )
+            })?;
         let src = self.bytes.slice(off, self.row_bytes)?;
         match self.dtype {
             TableDtype::Iq4Nl => iq4nl::dequant_row(src, out),
@@ -304,13 +329,37 @@ pub struct PleState {
     /// `(k - 1) * dilation`, kept so the state can validate itself against a
     /// layer without carrying a reference to one.
     state_len: usize,
+    /// The state after EACH token stepped since [`checkpoint`](Self::checkpoint)
+    /// armed this state, in token order — `(history, conv window)` per token.
+    ///
+    /// Same shape and same reason as a DeltaNet layer's trail
+    /// (`kv_cache::LayerCache::Linear`): both halves of this state are
+    /// overwritten by every step, so no image of a single moment reconstructs an
+    /// intermediate one. A partial accept — which is EVERY speculative round,
+    /// since a verify keeps at least one token — needs the state after the
+    /// accepted prefix, and that is only recoverable if the forward recorded it
+    /// on the way past.
+    ///
+    /// Empty and unrecorded when `armed` is `None`, which is every ordinary
+    /// prefill: a 2200-token chunk would otherwise cost 2200 × 360 KB for
+    /// something nothing will read.
+    trail: Vec<(Vec<u32>, Vec<f32>)>,
+    /// Tokens the live checkpoint reserved room for, or `None` when unarmed.
+    armed: Option<usize>,
 }
 
-/// A copy of [`PleState`] taken before speculative tokens are appended, to be
-/// restored when they are rejected. Clone-based: the state is 10240 × 9 f32
-/// (360 KB) plus two token ids, which is small next to a KV checkpoint.
+/// The PLE state at the moment [`PleState::checkpoint`] was taken — the commit-0
+/// answer, and only that. Every other commit comes from the trail the armed
+/// state records as the verify forward runs, exactly as a DeltaNet layer's
+/// `LayerCheckpoint::Linear` carries only its base.
+///
+/// The two halves are cloned rather than referenced: 10240 × 9 f32 (360 KB) plus
+/// two token ids is small next to a KV checkpoint.
 #[derive(Clone)]
-pub struct PleSnapshot(PleState);
+pub struct PleSnapshot {
+    history: Vec<u32>,
+    conv: Vec<f32>,
+}
 
 impl PleState {
     /// Whether the tail of a sequence can be dropped without replaying it.
@@ -331,20 +380,99 @@ impl PleState {
             history: Vec::new(),
             conv: vec![0.0; width * state_len],
             state_len,
+            trail: Vec::new(),
+            armed: None,
         }
     }
 
     pub fn reset(&mut self) {
         self.history.clear();
         self.conv.fill(0.0);
+        self.trail.clear();
+        self.armed = None;
     }
 
-    pub fn checkpoint(&self) -> PleSnapshot {
-        PleSnapshot(self.clone())
+    /// Arm a rollback over the next `span` tokens and return the commit-0 state.
+    ///
+    /// Takes `&mut self` for the same reason `LayerCache::checkpoint` does: a
+    /// recurrent state cannot be checkpointed by copying one moment, so the
+    /// checkpoint arms the state and the verify forward records each token's as
+    /// it goes.
+    pub fn checkpoint(&mut self, span: usize) -> PleSnapshot {
+        self.trail.clear();
+        self.armed = Some(span);
+        PleSnapshot {
+            history: self.history.clone(),
+            conv: self.conv.clone(),
+        }
     }
 
-    pub fn rollback(&mut self, snap: PleSnapshot) {
-        *self = snap.0;
+    /// Whether a live checkpoint needs this state's per-token trail. The PLE
+    /// forward asks before recording, so an unarmed prefill keeps only the final
+    /// state and lets every intermediate one drop.
+    pub fn trail_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    /// Record the state after one stepped token. Called by [`PleLayer::forward`]
+    /// once per token, in token order, and only while armed.
+    pub fn record(&mut self, history: Vec<u32>, conv: Vec<f32>) -> Result<()> {
+        let Some(span) = self.armed else {
+            bail!("PleState::record on an unarmed state");
+        };
+        ensure!(
+            self.trail.len() < span,
+            "PleState::record: one more token overruns the {span}-token checkpoint span \
+             ({} already recorded)",
+            self.trail.len()
+        );
+        ensure!(
+            conv.len() == self.conv.len(),
+            "PleState::record: conv window is {} wide, not {}",
+            conv.len(),
+            self.conv.len()
+        );
+        self.trail.push((history, conv));
+        Ok(())
+    }
+
+    /// Roll a verify forward back to the state after `commit` accepted tokens.
+    ///
+    /// `commit == 0` is the checkpoint's own state; `commit == n` is the state
+    /// after the nth accepted token, which the trail holds at `n - 1`. This is
+    /// the whole point of the trail: restoring `snap` unconditionally would
+    /// rewind the conv window and the n-gram history FURTHER than the KV cache,
+    /// the indexer and `n_past`, and every subsequent token would be conditioned
+    /// on a history that never happened.
+    ///
+    /// `span` is the checkpoint's, and the trail must cover it: a state that was
+    /// not stepped through every reserved token cannot answer for an arbitrary
+    /// commit within it. Same refusal as the DeltaNet arm.
+    pub fn rollback(&mut self, snap: &PleSnapshot, span: usize, commit: usize) -> Result<()> {
+        ensure!(
+            commit <= span,
+            "PleState::rollback: commit {commit} exceeds span {span}"
+        );
+        ensure!(
+            self.trail.len() == span,
+            "PleState::rollback: the verify forward recorded {} of {span} states; the PLE state \
+             cannot be rolled back to a token it never stepped through",
+            self.trail.len()
+        );
+        match commit {
+            0 => {
+                self.history.clone_from(&snap.history);
+                self.conv.clone_from(&snap.conv);
+            }
+            n => {
+                let (history, conv) = &self.trail[n - 1];
+                self.history.clone_from(history);
+                self.conv.clone_from(conv);
+            }
+        }
+        self.trail.clear();
+        self.armed = None;
+        Ok(())
     }
 
     /// Always an error — see [`SUPPORTS_TRUNCATE`](Self::SUPPORTS_TRUNCATE).
@@ -714,6 +842,27 @@ impl PleLayer {
                 .copy_from_slice(&line[line_len - state_len..]);
         }
 
+        // While a checkpoint is armed, record the state after each token so a
+        // partial accept can land between them. `padded` still holds the whole
+        // line — the carried state followed by this chunk — so token `t`'s
+        // window is the `state_len` columns ending at `state_len + t`, and the
+        // last one is the same slice the loop above just committed.
+        if state.trail_armed() {
+            let history_before = state.history.clone();
+            for t in 0..n {
+                let mut window = vec![0.0f32; width * state_len];
+                for c in 0..width {
+                    let line = &padded[c * line_len..(c + 1) * line_len];
+                    window[c * state_len..(c + 1) * state_len]
+                        .copy_from_slice(&line[t + 1..t + 1 + state_len]);
+                }
+                state.record(
+                    self.hash.next_history(&history_before, &tokens[..=t]),
+                    window,
+                )?;
+            }
+        }
+
         state.history = self.hash.next_history(&state.history, tokens);
         Ok(Tensor::from_vec(out, (n, width), &self.device)?)
     }
@@ -893,6 +1042,70 @@ mod tests {
         let want = flat_f32(&c["output"]);
         let d = max_abs(&got, &want);
         assert!(d <= 3e-5, "PLE addend: max abs {d:e} exceeds 3e-5");
+    }
+
+    /// `ple_conv1d` is `[width, conv_kernel]` — channel-major, so channel `c`'s
+    /// taps are `conv_w[c * k .. (c + 1) * k]`. The transposed reading is the
+    /// silent one: `[conv_kernel, width]` has the SAME element count, so the
+    /// length check in `from_parts` passes, every shape downstream is right,
+    /// and each channel simply convolves with four weights belonging to four
+    /// other channels. This asserts the fixture rejects that reading, the way
+    /// `value_proj`'s row width rejects its own transpose.
+    #[test]
+    fn a_transposed_conv_weight_does_not_match_the_fixture() {
+        let Ok(device) = crate::gguf::metal_device() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let j = fixture();
+        let r = reference(&j);
+        let (width, k) = (r.width(), r.k);
+        let emb_dim = r.n_heads * r.head_dim;
+
+        // Read the same bytes as `[conv_kernel, width]` instead.
+        let conv_w = &r.conv_w;
+        let transposed: Vec<f32> = (0..width)
+            .flat_map(|c| (0..k).map(move |t| conv_w[t * width + c]))
+            .collect();
+        assert_eq!(transposed.len(), r.conv_w.len());
+        assert_ne!(
+            transposed, r.conv_w,
+            "the fixture's conv weights are transpose-symmetric, so this test proves nothing"
+        );
+
+        let l = PleLayer::from_parts(
+            PleParts {
+                hash: hasher(&j),
+                table: PleTable::from_f32(&r.table, r.head_dim).unwrap(),
+                key_proj: exact_linear(&r.key_w, width, emb_dim, &device),
+                value_proj: exact_linear(&r.value_w, r.hidden, emb_dim, &device),
+                key_norm_w: r.key_norm_w.clone(),
+                query_norm_w: r.query_norm_w.clone(),
+                conv_norm_w: r.conv_norm_w.clone(),
+                conv_w: transposed,
+                hidden: r.hidden,
+                hc_count: r.hc_count,
+                head_dim: r.head_dim,
+                conv_kernel: r.k,
+                eps: r.eps,
+            },
+            &device,
+        )
+        .unwrap();
+
+        let c = &j["layer_case"];
+        let toks = vec_u32(&c["input_ids"]);
+        let stream_h = flat_f32(&c["hidden_stream_in"]);
+        let stream = Tensor::from_slice(&stream_h, (toks.len(), width), &device).unwrap();
+        let mut state = l.new_state();
+        let got = host(&l.forward(&toks, &stream, &mut state).unwrap());
+
+        let d = max_abs(&got, &flat_f32(&c["output"]));
+        assert!(
+            d > 3e-5,
+            "a transposed ple_conv1d reproduced the fixture to {d:e}: the orientation is not \
+             pinned by this fixture"
+        );
     }
 
     /// The same run against the frozen oracle rather than the fixture, which
@@ -1167,19 +1380,16 @@ mod tests {
         let first = stream.narrow(0, 0, 2).unwrap().contiguous().unwrap();
         l.forward(&toks[..2], &first, &mut state).unwrap();
 
-        let snap = state.checkpoint();
+        let span = toks.len() - 2;
+        let snap = state.checkpoint(span);
         let want_hist = state.history().to_vec();
         let want_conv = state.conv_window().to_vec();
 
-        let rest = stream
-            .narrow(0, 2, toks.len() - 2)
-            .unwrap()
-            .contiguous()
-            .unwrap();
+        let rest = stream.narrow(0, 2, span).unwrap().contiguous().unwrap();
         l.forward(&toks[2..], &rest, &mut state).unwrap();
         assert_ne!(state.conv_window(), want_conv.as_slice());
 
-        state.rollback(snap);
+        state.rollback(&snap, span, 0).unwrap();
         assert_eq!(state.history(), want_hist.as_slice());
         assert_eq!(state.conv_window(), want_conv.as_slice());
 
@@ -1188,6 +1398,144 @@ mod tests {
         state.reset();
         assert!(state.history().is_empty());
         assert!(state.conv_window().iter().all(|v| *v == 0.0));
+    }
+
+    /// A PARTIAL accept lands between two tokens, and the state has to land
+    /// there with it.
+    ///
+    /// This is the whole reason the trail exists. Restoring the checkpoint
+    /// unconditionally — which is what a snapshot-only rollback does — rewinds
+    /// the conv window and the n-gram history all the way to the pre-verify
+    /// moment while the KV cache, the indexer and `n_past` keep the accepted
+    /// tokens. Nothing errors; the PLE layer simply conditions every later token
+    /// on a history that never happened, for the rest of the generation.
+    ///
+    /// Graded against the straight-line run: after `rollback(commit = k)` the
+    /// state must match a run that only ever stepped the first `k` tokens of the
+    /// span. The n-gram history is compared exactly (it is token ids); the conv
+    /// window to 1e-5, the same bound and for the same reason as
+    /// `chunked_forward_matches_single_shot` — the two runs batch the device
+    /// projections differently, so they differ in the last ulps before the host
+    /// half sees them.
+    ///
+    /// The final assertion is the negative control that gives that bound
+    /// meaning: rewinding to the CHECKPOINT instead of to the accepted prefix —
+    /// the bug this trail exists to fix — moves the window by orders of
+    /// magnitude more than 1e-5.
+    #[test]
+    fn a_partial_commit_rolls_back_to_the_state_after_the_accepted_tokens() {
+        let Ok(device) = crate::gguf::metal_device() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let j = fixture();
+        let l = layer(&j, &device);
+        let c = &j["layer_case"];
+        let toks = vec_u32(&c["input_ids"]);
+        let width = l.width();
+        let stream_h = flat_f32(&c["hidden_stream_in"]);
+        let stream = Tensor::from_slice(&stream_h, (toks.len(), width), &device).unwrap();
+
+        // Two committed tokens, then a `span`-token speculative block.
+        let base = 2usize;
+        let span = 3usize;
+        assert!(toks.len() >= base + span);
+        let prefix = stream.narrow(0, 0, base).unwrap().contiguous().unwrap();
+        let block = stream.narrow(0, base, span).unwrap().contiguous().unwrap();
+
+        for commit in 0..=span {
+            // The straight-line reference: step the prefix, then only the
+            // accepted tokens, with no checkpoint anywhere.
+            let mut want = l.new_state();
+            l.forward(&toks[..base], &prefix, &mut want).unwrap();
+            if commit > 0 {
+                let accepted = block.narrow(0, 0, commit).unwrap().contiguous().unwrap();
+                l.forward(&toks[base..base + commit], &accepted, &mut want)
+                    .unwrap();
+            }
+
+            // The speculative run: step the whole block, then roll back.
+            let mut got = l.new_state();
+            l.forward(&toks[..base], &prefix, &mut got).unwrap();
+            let snap = got.checkpoint(span);
+            l.forward(&toks[base..base + span], &block, &mut got)
+                .unwrap();
+            got.rollback(&snap, span, commit).unwrap();
+
+            assert_eq!(
+                got.history(),
+                want.history(),
+                "commit {commit}: n-gram history"
+            );
+            let d = max_abs(got.conv_window(), want.conv_window());
+            assert!(d <= 1e-5, "commit {commit}: conv window max abs {d:e}");
+        }
+
+        // The negative control. A rollback that restores the checkpoint whatever
+        // the commit is — the snapshot-only behavior this trail replaced — puts
+        // the state a whole accepted token behind, which is nothing like 1e-5.
+        let mut pre = l.new_state();
+        l.forward(&toks[..base], &prefix, &mut pre).unwrap();
+        let checkpoint_window = pre.conv_window().to_vec();
+
+        let mut after_one = l.new_state();
+        l.forward(&toks[..base], &prefix, &mut after_one).unwrap();
+        let one = block.narrow(0, 0, 1).unwrap().contiguous().unwrap();
+        l.forward(&toks[base..base + 1], &one, &mut after_one)
+            .unwrap();
+
+        let d = max_abs(&checkpoint_window, after_one.conv_window());
+        assert!(
+            d > 1e-3,
+            "the checkpoint's window and the after-one-token window differ by only {d:e}: \
+             this fixture cannot tell a correct partial rollback from a full one"
+        );
+    }
+
+    /// The trail is recorded only while a checkpoint is armed, and a rollback
+    /// that cannot be answered from it is refused rather than guessed at.
+    #[test]
+    fn the_trail_is_armed_by_a_checkpoint_and_must_cover_the_span() {
+        let Ok(device) = crate::gguf::metal_device() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let j = fixture();
+        let l = layer(&j, &device);
+        let c = &j["layer_case"];
+        let toks = vec_u32(&c["input_ids"]);
+        let width = l.width();
+        let stream_h = flat_f32(&c["hidden_stream_in"]);
+        let stream = Tensor::from_slice(&stream_h, (toks.len(), width), &device).unwrap();
+
+        let mut state = l.new_state();
+        assert!(!state.trail_armed(), "a fresh state records nothing");
+        let snap = state.checkpoint(3);
+        assert!(state.trail_armed());
+
+        // Stepped two of the three reserved tokens: commit 3 names a token this
+        // state never took, and commit 0 is no safer — the trail is short, so
+        // nothing here can be trusted to answer any commit.
+        let two = stream.narrow(0, 0, 2).unwrap().contiguous().unwrap();
+        l.forward(&toks[..2], &two, &mut state).unwrap();
+        assert!(state.rollback(&snap, 3, 2).is_err());
+        assert!(state.rollback(&snap, 3, 0).is_err());
+
+        // Overrunning the reserved span is refused as it happens, not later.
+        let rest = stream.narrow(0, 2, 4).unwrap().contiguous().unwrap();
+        assert!(l.forward(&toks[2..6], &rest, &mut state).is_err());
+
+        // A rollback disarms, so the next forward records nothing again.
+        let mut state = l.new_state();
+        let snap = state.checkpoint(2);
+        let two = stream.narrow(0, 0, 2).unwrap().contiguous().unwrap();
+        l.forward(&toks[..2], &two, &mut state).unwrap();
+        state.rollback(&snap, 2, 1).unwrap();
+        assert!(!state.trail_armed());
+        assert!(
+            state.rollback(&snap, 2, 1).is_err(),
+            "one checkpoint answers one rollback"
+        );
     }
 
     /// A table read through the IQ4_NL path returns what the quantizer put in.

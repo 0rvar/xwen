@@ -129,17 +129,17 @@ struct CacheGeometry {
 /// layer's dilated conv window (fixed-size recurrent state, so it rides in a
 /// snapshot alongside the DeltaNet state).
 ///
-/// PROVISIONAL, and deliberately visible rather than silently omitted: the
-/// shapes are read off the GGUF's own metadata and docs/qwen4exp-port.md, but
-/// the DTYPES assumed here (f16 for the indexer keys, matching the trunk's KV
-/// rows; f32 for the conv window, matching the DeltaNet conv) are the graph
-/// units' call to make, not this table's. Correct these when the QSA and PLE
-/// blocks land — an operator sizing a serve config reads what they say.
+/// Shapes only. Neither figure's DTYPE is decided here — the indexer plane is
+/// sized by [`crate::qwen4exp::indexer::indexer_bytes_per_token`] and the conv
+/// window by the f32 the PLE block allocates — because the graph units own that
+/// and this table got it wrong once by assuming (f16 keys, matching the trunk's
+/// KV rows; they are f32, and MQA besides).
 struct Qwen4ExpCaches {
-    /// Lightning-indexer heads and key dim per full-attention layer
-    /// (`attention.indexer.{head_count, key_length}` = 4 x 128). Keys only:
-    /// the indexer scores positions, it does not attend over values.
-    indexer_heads: usize,
+    /// Lightning-indexer key dim per full-attention layer
+    /// (`attention.indexer.key_length` = 128). Keys only, and one head only:
+    /// the indexer is MQA and it scores positions, it does not attend over
+    /// values — so its 4 query heads (`head_count`) cost nothing per token and
+    /// are not recorded here.
     indexer_head_dim: usize,
     /// Layers carrying a PLE block (`ple.layers` — a single layer today).
     ple_layers: usize,
@@ -272,7 +272,6 @@ const QWEN_38_FLASH_NEXT: Checkpoint = Checkpoint {
         linear_head_dim: 128,
         conv_kernel: 4,
         extras: Some(Qwen4ExpCaches {
-            indexer_heads: 4,
             indexer_head_dim: 128,
             ple_layers: 1,
             ple_conv_cols: 9,
@@ -388,6 +387,93 @@ impl Model {
         self.checkpoint().model_size
     }
 
+    /// Whether this checkpoint may be downloaded as a side effect of something
+    /// else — a serve request that names it, say — or only when an operator
+    /// asked for it in so many words.
+    ///
+    /// True for every checkpoint but Qwen3.8-Flash-Next. The rule is a size one:
+    /// a fetch over 100 GB is explicit-only. The three ~20 GB files are a
+    /// download someone can absorb inside a request that stalls for a few
+    /// minutes; 111 GB across four shards is not — it is most of a disk and the
+    /// better part of an hour, started by a client that only misspelled which
+    /// model it wanted. `xwen fetch` and the CLI one-shots still fetch it,
+    /// because there the operator named it.
+    ///
+    /// Not a per-checkpoint policy knob and not read from the table's size
+    /// string: it is spelled out here so that adding a big checkpoint is a
+    /// decision someone makes rather than one they inherit.
+    pub const fn auto_fetch(self) -> bool {
+        match self {
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B => true,
+            Model::Qwen38FlashNext => false,
+        }
+    }
+
+    /// Whether `xwen serve` can run this checkpoint at all.
+    ///
+    /// False for Qwen3.8-Flash-Next, and not as a policy choice: the serve
+    /// engine moves a conversation's whole cache state around on its ORDINARY
+    /// path, and qwen4exp refuses every one of those moves until P4. A planned
+    /// snapshot stop takes `take_cache_snapshot` after almost every first
+    /// prefill (`serve/engine.rs`), a shared-prefix rewind takes
+    /// `restore_cache_snapshot`, and a second conversation arriving pages the
+    /// live one out with `export_full_kv`. All three are
+    /// `XwenModel::refuse_state_transfer` errors on qwen4exp, because the QSA
+    /// raw-key planes, the PLE conv window and its n-gram history are carried by
+    /// no cache image. So a served qwen4exp file would not be slow or degraded,
+    /// it would fail nearly every request — which is worth refusing at startup
+    /// rather than per request.
+    ///
+    /// The CLI one-shots (`generate`, `chat`, `batch`) run the checkpoint fine:
+    /// they never move cache state. This gates the server only.
+    pub const fn servable(self) -> bool {
+        match self {
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B => true,
+            Model::Qwen38FlashNext => false,
+        }
+    }
+
+    /// The one sentence every surface says when it refuses an unservable
+    /// checkpoint, so the CLI and the APIs cannot drift into two explanations.
+    pub fn unservable_message(self) -> String {
+        format!(
+            "{} cannot be served yet: the qwen4exp recurrent state (the QSA raw-key caches, \
+             the PLE conv window and its n-gram token history) is not carried by any cache \
+             image, and the server snapshots, rewinds and pages conversations out on its \
+             ordinary path. Use the CLI for now — `xwen generate`, `xwen chat` or \
+             `xwen batch` — which never move cache state",
+            self.full_name()
+        )
+    }
+
+    /// Whether this checkpoint's graph can be drafted for at all — by its own
+    /// sidecar or by anyone's.
+    ///
+    /// Distinct from [`Model::drafter_kind`] being `None`, which only says the
+    /// release ships no sidecar; a checkpoint like that could still be handed a
+    /// drafter GGUF of someone's own, and `--draft <path>` is the flag for it.
+    /// This is about the TARGET side: qwen4exp has no verify seam wired yet
+    /// (D6), so no sidecar of any kind could be attached to it, and a run that
+    /// asked for one is told so instead of being handed a file that will not
+    /// load.
+    pub const fn supports_drafting(self) -> bool {
+        match self {
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B => true,
+            Model::Qwen38FlashNext => false,
+        }
+    }
+
+    /// The one sentence every surface says when a run asks a checkpoint that
+    /// cannot be drafted for to draft.
+    pub fn no_drafting_message(self) -> String {
+        format!(
+            "no drafter kind is supported for {} yet: its graph has no speculative verify \
+             seam, so neither an official sidecar nor a drafter GGUF of your own can be \
+             attached. Decode plain — drop the flag, or pass --no-draft",
+            self.full_name()
+        )
+    }
+
     /// Human-readable download size of the drafter, for the fetch notice.
     pub const fn drafter_size(self) -> Option<&'static str> {
         match &self.checkpoint().drafter {
@@ -430,6 +516,17 @@ impl Model {
     /// ambiguity to go wrong. Both would answer an official name with weights
     /// nobody checked, which is the one thing this function exists to prevent.
     ///
+    /// The two passes compare differently, and deliberately. The EXACT pass
+    /// folds spaces to hyphens (`hyphenate`) so that the space spelling a GGUF
+    /// carries — "Qwen3.8 Flash Next" — still names the checkpoint the repo and
+    /// the API hyphenate. The SUBSTRING pass does not fold: it asks whether the
+    /// name literally spells a checkpoint. Folding it too would make
+    /// "Qwen3.6 27B MyFinetune" — a finetune that says whose 27B it started from
+    /// and is not that checkpoint — identify as the official Qwen3.6-27B, which
+    /// is the failure the whole-name requirement exists to prevent. A file whose
+    /// name really is the checkpoint plus a suffix spells it with hyphens,
+    /// because that is how the release spells it.
+    ///
     /// A name that matches more than one checkpoint identifies as none of them
     /// rather than as whichever the table lists first — an ambiguous name is
     /// exactly the case where guessing is worst.
@@ -457,16 +554,16 @@ impl Model {
             if name.is_empty() {
                 return None;
             }
-            let name = hyphenate(name);
+            let folded = hyphenate(name);
             sole(
                 candidates()
-                    .filter(|model| hyphenate(model.full_name()) == name)
+                    .filter(|model| hyphenate(model.full_name()) == folded)
                     .collect(),
             )
             .or_else(|| {
                 sole(
                     candidates()
-                        .filter(|model| name.contains(&hyphenate(model.full_name())))
+                        .filter(|model| contains_ignore_ascii_case(name, model.full_name()))
                         .collect(),
                 )
             })
@@ -558,15 +655,21 @@ impl Model {
     ///
     /// A qwen4exp checkpoint's full-attention layers carry a SECOND per-token
     /// plane: the QSA lightning indexer's raw keys, which have to be kept for
-    /// every position because that is what the indexer scores. Four heads at
-    /// 128 against the trunk's two at 256 is half again as much per token, so
-    /// leaving it out would under-size an operator's context budget by a third
-    /// (see [`Qwen4ExpCaches`] for what is still assumed rather than measured).
+    /// every position because that is what the indexer scores. It is one MQA
+    /// key head at 128, held f32 — 512 B/token/layer against the trunk's 2048,
+    /// so leaving it out would under-size an operator's context budget by a
+    /// fifth. The per-token figure comes from
+    /// [`crate::qwen4exp::indexer::indexer_bytes_per_token`], the same function
+    /// the allocation itself is sized with, rather than being restated here:
+    /// the head count and the dtype are both easy to get wrong from the outside
+    /// (4 query heads and the trunk's f16 would give 1024).
     pub const fn kv_bytes_per_token(self) -> usize {
         let g = &self.checkpoint().geometry;
         let trunk = g.n_kv_head * g.head_dim * 2 * 2;
         let indexer = match &g.extras {
-            Some(extras) => extras.indexer_heads * extras.indexer_head_dim * 2,
+            Some(extras) => {
+                crate::qwen4exp::indexer::indexer_bytes_per_token(extras.indexer_head_dim)
+            }
             None => 0,
         };
         g.full_attn_layers * (trunk + indexer)
@@ -670,16 +773,24 @@ impl std::str::FromStr for Model {
     }
 }
 
-/// The form names are compared in: ASCII-lowercased, with spaces folded onto
-/// the hyphens the canonical spellings use. Every checkpoint name is ASCII, and
-/// a file that spells one in another case is still spelling it.
+/// Case-insensitive substring, ASCII — every checkpoint name is ASCII, and a
+/// file name that spells one in another case is still spelling it.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.to_ascii_lowercase();
+    haystack.contains(&needle.to_ascii_lowercase())
+}
+
+/// The form the EXACT name comparison in [`Model::identify`] runs in:
+/// ASCII-lowercased, with spaces folded onto the hyphens the canonical spellings
+/// use. Every checkpoint name is ASCII, and a file that spells one in another
+/// case is still spelling it.
 ///
 /// The space fold is what lets one entry answer to both of its spellings, which
 /// Qwen3.8-Flash-Next needs: the repo and the API name hyphenate it, but the
-/// GGUF's own `general.name` is "Qwen3.8 Flash Next". It is a fold, not a
-/// loosening — a WHOLE checkpoint name must still appear, so a bare release
-/// series ("3.8", "Flash") identifies nothing, and no two checkpoint names
-/// become each other under it.
+/// GGUF's own `general.name` is "Qwen3.8 Flash Next". Only the whole-name
+/// comparison folds — the substring pass stays literal, so a name that merely
+/// mentions a checkpoint in prose ("Qwen3.6 27B MyFinetune") is not that
+/// checkpoint. See [`Model::identify`] for why the two passes differ.
 fn hyphenate(s: &str) -> String {
     s.trim()
         .chars()
@@ -845,21 +956,31 @@ mod tests {
     }
 
     /// The qwen4exp checkpoint's figures, which carry two terms no other
-    /// checkpoint has. Pinned with their arithmetic because both are
-    /// PROVISIONAL on a dtype the QSA and PLE units have yet to fix (see
-    /// [`Qwen4ExpCaches`]) — when one of them lands and disagrees, this test is
-    /// where the disagreement should surface.
+    /// checkpoint has.
+    ///
+    /// The indexer term is asserted against the function the ALLOCATION is
+    /// sized with, not against a formula restated here. A restated formula is
+    /// how this figure was wrong in the first place — it read the 4 query heads
+    /// and the trunk's f16 off the table and got 1024 B/token/layer for a plane
+    /// that is one MQA head at f32, four times over.
     #[test]
     fn the_qwen4exp_figures_count_its_indexer_and_ple_state() {
+        use crate::qwen4exp::indexer::indexer_bytes_per_token;
+
         // 12 full-attn layers x (2 KV heads x 256 head_dim x K-and-V x 2 bytes
-        // f16 = 2048, plus 4 indexer heads x 128 x 2 bytes f16 = 1024).
-        assert_eq!(Model::Qwen38FlashNext.kv_bytes_per_token(), 36 * 1024);
-        // The indexer plane is half again the trunk's rows, not a rounding
-        // error: dropping it would under-size a context budget by a third.
+        // f16 = 2048, plus the indexer's one 128-wide f32 key row = 512).
+        assert_eq!(Model::Qwen38FlashNext.kv_bytes_per_token(), 30 * 1024);
         let trunk_only = 12 * 2 * 256 * 2 * 2;
         assert_eq!(
             Model::Qwen38FlashNext.kv_bytes_per_token(),
-            trunk_only + 12 * 4 * 128 * 2
+            trunk_only + 12 * indexer_bytes_per_token(128)
+        );
+        // A quarter more than the trunk's rows, not a rounding error: dropping
+        // it would under-size a context budget by a fifth.
+        assert_eq!(indexer_bytes_per_token(128), 512);
+        assert_eq!(
+            trunk_only * 5 / 4,
+            Model::Qwen38FlashNext.kv_bytes_per_token()
         );
 
         // 36 DeltaNet layers x (3 x 10240 conv + 48 x 128 x 128 delta) x 4
@@ -870,6 +991,38 @@ mod tests {
             delta_net + 9 * 10240 * 4
         );
         assert_eq!(Model::Qwen38FlashNext.snapshot_bytes(), 118_038_528);
+    }
+
+    /// The three P2 capability gates on the qwen4exp checkpoint, and the fact
+    /// that they are gates rather than the table's shape: every other checkpoint
+    /// answers yes to all three, so a predicate that stopped consulting `self`
+    /// would still pass the rest of the suite.
+    ///
+    /// Each is a different limitation with a different lifetime, which is why
+    /// they are three predicates and not one "experimental" flag:
+    /// `auto_fetch` is about a 111 GB download and would stay false even after
+    /// the graph is finished; `servable` is P4's cache-image work; and
+    /// `supports_drafting` is D6's missing verify seam.
+    #[test]
+    fn the_qwen4exp_checkpoint_is_gated_out_of_fetching_serving_and_drafting() {
+        assert!(!Model::Qwen38FlashNext.auto_fetch());
+        assert!(!Model::Qwen38FlashNext.servable());
+        assert!(!Model::Qwen38FlashNext.supports_drafting());
+
+        for model in [Model::Qwen27B, Model::Qwen35BA3B, Model::Qwen3827B] {
+            assert!(model.auto_fetch(), "{model}");
+            assert!(model.servable(), "{model}");
+            assert!(model.supports_drafting(), "{model}");
+        }
+
+        // The messages name the checkpoint and point somewhere the operator can
+        // actually go — a message that only says "no" is a dead end.
+        let unservable = Model::Qwen38FlashNext.unservable_message();
+        assert!(unservable.contains("Qwen3.8-Flash-Next"), "{unservable}");
+        assert!(unservable.contains("xwen chat"), "{unservable}");
+        let undraftable = Model::Qwen38FlashNext.no_drafting_message();
+        assert!(undraftable.contains("Qwen3.8-Flash-Next"), "{undraftable}");
+        assert!(undraftable.contains("--no-draft"), "{undraftable}");
     }
 
     /// The drafter cache figure, pinned for the same reason as the target's: it is
@@ -1271,10 +1424,19 @@ mod tests {
             );
         }
         // A re-quantizer that kept the whole name inside its own still
-        // identifies, which is what the substring pass exists for.
+        // identifies, which is what the substring pass exists for — spelled the
+        // way the release spells it, with hyphens.
+        assert_eq!(
+            Model::identify(Arch::Qwen4Exp, Some("Qwen3.8-Flash-Next (imatrix)"), None),
+            Some(Model::Qwen38FlashNext)
+        );
+        // The SPACE spelling plus a suffix is not the same thing: only the
+        // whole-name comparison folds spaces, so this reads as prose mentioning
+        // the checkpoint rather than as the checkpoint. Deliberate — the
+        // alternative makes "Qwen3.6 27B MyFinetune" the official 27B.
         assert_eq!(
             Model::identify(Arch::Qwen4Exp, Some("Qwen3.8 Flash Next (imatrix)"), None),
-            Some(Model::Qwen38FlashNext)
+            None
         );
 
         // The arch narrows first, so the qwen4exp name never lands on a dense
@@ -1290,6 +1452,55 @@ mod tests {
         // A qwen4exp file that names nothing identifies as nothing; the caller
         // falls back to `Arch::model` with a warning.
         assert_eq!(Model::identify(Arch::Qwen4Exp, Some("mymodel"), None), None);
+    }
+
+    /// Only the WHOLE-name comparison folds spaces onto hyphens. The substring
+    /// pass stays literal, so a name that merely mentions the checkpoint it was
+    /// derived from — spelled the way prose spells it, with spaces — is not that
+    /// checkpoint. Folding both passes would hand every "<official> <suffix>"
+    /// finetune an official identity, which is the failure the whole-name
+    /// requirement exists to prevent.
+    #[test]
+    fn the_space_fold_applies_to_the_whole_name_comparison_only() {
+        use std::path::Path;
+
+        // Space-spelled prose around a checkpoint name: a mention, not a claim.
+        for stray in [
+            "Qwen3.6 27B MyFinetune",
+            "Qwen3.8 27B Coder",
+            "distilled from Qwen3.6 27B",
+        ] {
+            assert_eq!(
+                Model::identify(Arch::Dense, Some(stray), None),
+                None,
+                "{stray}"
+            );
+            let file = format!("{stray}.gguf");
+            assert_eq!(
+                Model::identify(Arch::Dense, None, Some(Path::new(&file))),
+                None,
+                "{stray}"
+            );
+        }
+
+        // The fold still does its one job: the qwen4exp GGUF's space-spelled
+        // `general.name` is the checkpoint's name exactly, so it identifies.
+        assert_eq!(
+            Model::identify(Arch::Qwen4Exp, Some("Qwen3.8 Flash Next"), None),
+            Some(Model::Qwen38FlashNext)
+        );
+        // And a real file name — which spells the release the way the release
+        // spells it, with hyphens — identifies through the literal pass.
+        assert_eq!(
+            Model::identify(
+                Arch::Qwen4Exp,
+                None,
+                Some(Path::new(
+                    "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+                ))
+            ),
+            Some(Model::Qwen38FlashNext)
+        );
     }
 
     fn scratch(label: &str) -> PathBuf {

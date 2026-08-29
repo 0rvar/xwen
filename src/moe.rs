@@ -52,7 +52,7 @@ pub struct MoeBlock {
     n_expert: usize,
     n_expert_used: usize,
     /// The floor the renormalized top-k weight sum is clamped to, from
-    /// `Arch::moe_sum_floor`: llama.cpp's [`WEIGHTS_SUM_FLOOR`] on
+    /// `Arch::moe_sum_floor`: llama.cpp's [`crate::config::MOE_SUM_FLOOR`] on
     /// qwen35moe, 0.0 (no clamp) on qwen4exp, whose HF math has none.
     sum_floor: f32,
 }
@@ -720,6 +720,83 @@ mod tests {
         // above are bit comparisons rather than near-misses.
         assert_eq!(WEIGHTS_SUM_FLOOR, f64::from(2.0f32.powi(-14)));
         assert_eq!(Arch::Qwen4Exp.moe_sum_floor(), 0.0);
+    }
+
+    /// A fresh directory for the tiny-GGUF fixture, wiped on the way in and on
+    /// the way out so a panicking run leaves nothing behind for the next one.
+    struct FixtureDir(std::path::PathBuf);
+
+    impl FixtureDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("xwen_moe_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("creating the fixture directory");
+            Self(p)
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The loading constructor's per-arch dispatch: `MoeBlock::new` must read
+    /// its floor out of `cfg.arch`, so a qwen4exp block routes unclamped and a
+    /// qwen35moe block routes with llama.cpp's f16 floor.
+    ///
+    /// That wiring is what is under test, not the arithmetic — the divide is
+    /// `routing_floor_is_a_parameter_not_a_constant`'s, and the table itself is
+    /// `sum_floor_matches_the_arch_table`'s. Neither reaches `new`: the other
+    /// floor tests build their `MoeBlock` by struct literal, so a `new` that
+    /// ignored the config and baked in one constant would leave all of them
+    /// green while every qwen4exp block silently clamped a denominator its HF
+    /// math never clamps. Going through the real constructor off a real file is
+    /// what closes that.
+    ///
+    /// One fixture serves both arms: the tiny qwen4exp GGUF is the synthetic
+    /// file a `MoeBlock` loads from, and `new` reads nothing else from the
+    /// config but `n_expert_used`, so the qwen35moe arm is those same weights
+    /// under a config whose arch says `Moe`. That isolates the dispatch from
+    /// everything else the file says about itself.
+    #[test]
+    fn moe_block_takes_its_sum_floor_from_the_config_arch() {
+        use crate::config::Arch;
+        use crate::qwen4exp::tiny_gguf::{TinyGeometry, write_tiny_qwen4exp};
+
+        let dir = FixtureDir::new("sum_floor");
+        let path = dir.0.join("tiny-qwen4exp.gguf");
+        write_tiny_qwen4exp(&path, &TinyGeometry::default()).expect("writing the tiny GGUF");
+
+        // Metal is the production device; CPU keeps the dispatch gradable on a
+        // machine without one.
+        let device = crate::gguf::metal_device().unwrap_or(Device::Cpu);
+        let gguf = crate::gguf::open(&path, &device).expect("opening the tiny GGUF");
+        let parsed = XwenConfig::from_gguf(&gguf.content).expect("parsing the tiny config");
+        assert_eq!(
+            parsed.arch,
+            Arch::Qwen4Exp,
+            "the fixture is a qwen4exp file"
+        );
+        let w = Weights::from_gguf(gguf);
+
+        for (arch, want) in [
+            (Arch::Qwen4Exp, 0.0_f32),
+            (Arch::Moe, crate::config::MOE_SUM_FLOOR),
+        ] {
+            let cfg = XwenConfig {
+                arch,
+                ..parsed.clone()
+            };
+            let block = MoeBlock::new(&w.pp("blk.0"), &cfg, ExpertRunner::Reference)
+                .expect("loading the fixture's MoE block");
+            assert_eq!(
+                block.sum_floor.to_bits(),
+                want.to_bits(),
+                "a {arch:?} block loaded with floor {}, not {want}",
+                block.sum_floor
+            );
+        }
     }
 
     /// The router matmul followed by the routing decision agrees with feeding

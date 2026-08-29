@@ -213,6 +213,93 @@ mod tests {
         }
     }
 
+    /// The codebook itself, against LITERAL floats rather than through
+    /// [`KVALUES_IQ4NL`].
+    ///
+    /// Every other test in this module asserts `out == d * KVALUES_IQ4NL[i]`,
+    /// which makes them self-consistent and nothing more: a transposed digit in
+    /// the table satisfies all of them, and the model that results is merely
+    /// worse, never broken. The numbers below are a SECOND transcription of
+    /// `reference/llama.cpp/ggml/src/ggml-common.h:1121` (`kvalues_iq4nl`), so
+    /// the two agree only by both being right.
+    ///
+    /// The signs are the load-bearing part. The table is asymmetric on purpose
+    /// — it runs -127..113 and its ninth entry is +1, not 0 — so a codebook
+    /// centred on zero, mirrored about it, or off by one level would still
+    /// dequantize to plausible embeddings.
+    #[test]
+    fn a_hand_built_block_dequantizes_to_the_literal_ggml_levels() {
+        const LEVELS: [f32; 16] = [
+            -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
+            69.0, 89.0, 113.0,
+        ];
+        assert_eq!(
+            KVALUES_IQ4NL.map(f32::from),
+            LEVELS,
+            "the module's codebook disagrees with kvalues_iq4nl as transcribed here"
+        );
+
+        // Byte j carries index j low and index 15-j high, so the block spells
+        // the codebook forwards in elements 0..16 and backwards in 16..32 —
+        // which is also what makes the nibble order visible in the literals.
+        let idx: [u8; 32] = std::array::from_fn(|i| if i < 16 { i as u8 } else { 31 - i as u8 });
+        let mut out = [0.0f32; 32];
+        dequant_row(&pack_block(f16::ONE, &idx), &mut out);
+        assert_eq!(
+            out,
+            [
+                -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0,
+                53.0, 69.0, 89.0, 113.0, // low nibbles: the codebook in order
+                113.0, 89.0, 69.0, 53.0, 38.0, 25.0, 13.0, 1.0, -10.0, -22.0, -35.0, -49.0, -65.0,
+                -83.0, -104.0, -127.0, // high nibbles: reversed
+            ]
+        );
+
+        // And with a scale, including its sign: every level is multiplied, none
+        // is clamped, and a negative scale inverts the whole block.
+        let mut out = [0.0f32; 32];
+        dequant_row(&pack_block(f16::from_f32(-0.5), &idx), &mut out);
+        assert_eq!(
+            out,
+            [
+                63.5, 52.0, 41.5, 32.5, 24.5, 17.5, 11.0, 5.0, -0.5, -6.5, -12.5, -19.0, -26.5,
+                -34.5, -44.5, -56.5, -56.5, -44.5, -34.5, -26.5, -19.0, -12.5, -6.5, -0.5, 5.0,
+                11.0, 17.5, 24.5, 32.5, 41.5, 52.0, 63.5,
+            ]
+        );
+    }
+
+    /// Q8_0 against literal floats, for the same reason: the quant's own
+    /// arithmetic is trivial, and the one thing that can go wrong silently is
+    /// the SIGN — the stored byte is `i8`, and reading it as `u8` turns every
+    /// negative weight into a large positive one without changing a shape.
+    #[test]
+    fn q8_0_dequantizes_a_hand_built_block_to_literal_floats() {
+        // Scale 0.5 over the quants -16..=15, so every expectation is an exact
+        // half-integer and written as one.
+        let mut bytes = f16::from_f32(0.5).to_le_bytes().to_vec();
+        bytes.extend((0..32).map(|i| ((i as i8) - 16) as u8));
+        let mut out = [0.0f32; 32];
+        dequant_row_q8_0(&bytes, &mut out);
+        assert_eq!(
+            out,
+            [
+                -8.0, -7.5, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5, -3.0, -2.5, -2.0, -1.5,
+                -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5,
+                7.0, 7.5,
+            ]
+        );
+
+        // The ends of the i8 range, which the run above never reaches: 0x80 is
+        // -128 and 0xff is -1. Read as `u8` they would be +128 and +255.
+        let mut bytes = f16::from_f32(0.5).to_le_bytes().to_vec();
+        bytes.extend([0x80u8, 0xff, 0x00, 0x01, 0x7f]);
+        bytes.extend([0u8; 27]);
+        let mut out = [0.0f32; 32];
+        dequant_row_q8_0(&bytes, &mut out);
+        assert_eq!(out[..5], [-64.0, -0.5, 0.0, 0.5, 63.5]);
+    }
+
     #[test]
     fn q8_0_round_trips_a_hand_built_block() {
         let mut bytes = f16::from_f32(0.25).to_le_bytes().to_vec();

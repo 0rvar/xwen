@@ -99,6 +99,17 @@ struct Qwen4ExpCheckpoint {
     indexer: Vec<Option<IndexerCheckpoint>>,
     /// One entry per model layer; `Some` on the PLE layer.
     ple: Vec<Option<PleSnapshot>>,
+    /// The `(len0, span)` the matching [`crate::kv_cache::KvCheckpoint`] was
+    /// taken at, so a rollback can prove the two are the same checkpoint.
+    ///
+    /// These parts are armed and rolled back BESIDE the `KvCheckpoint` rather
+    /// than inside it (D15 keeps `kv_cache.rs` out of P2), which means nothing
+    /// in the type system ties one to the other: a caller holding two
+    /// checkpoints could roll the KV back against one and these against the
+    /// other, and every state would be self-consistently wrong. Stamping the
+    /// pair and checking it turns that into a loud error.
+    len0: usize,
+    span: usize,
 }
 
 impl Qwen4ExpParts {
@@ -168,9 +179,9 @@ impl Qwen4ExpParts {
         self.hc_count * self.hidden
     }
 
-    /// Arm a rollback over the next `span` tokens, alongside
-    /// `LayerCache::checkpoint`.
-    pub fn checkpoint(&mut self, span: usize) -> Result<()> {
+    /// Arm a rollback over the next `span` tokens starting at cache length
+    /// `len0`, alongside `LayerCache::checkpoint`.
+    pub fn checkpoint(&mut self, len0: usize, span: usize) -> Result<()> {
         let mut indexer = Vec::with_capacity(self.layers.len());
         let mut ple = Vec::with_capacity(self.layers.len());
         for layer in &mut self.layers {
@@ -178,22 +189,50 @@ impl Qwen4ExpParts {
                 Some(c) => Some(c.checkpoint(span)?),
                 None => None,
             });
-            ple.push(layer.ple_state.as_ref().map(PleState::checkpoint));
+            ple.push(layer.ple_state.as_mut().map(|s| s.checkpoint(span)));
         }
-        self.pending = Some(Qwen4ExpCheckpoint { indexer, ple });
+        self.pending = Some(Qwen4ExpCheckpoint {
+            indexer,
+            ple,
+            len0,
+            span,
+        });
         Ok(())
     }
 
     /// Roll back to `len0 + commit`, alongside `LayerCache::rollback`.
     ///
-    /// The checkpoint is kept rather than taken: the KV path lets a caller roll
-    /// one `KvCheckpoint` back more than once, and these two must not disagree
-    /// about how many rollbacks a checkpoint survives.
+    /// The checkpoint is TAKEN, not kept, because one is all it is good for: a
+    /// PLE state and a DeltaNet layer both answer a partial accept from a trail
+    /// their checkpoint armed, and both clear that trail as they roll back. A
+    /// second rollback against the same `KvCheckpoint` already fails in
+    /// `kv_cache.rs` for exactly that reason, so keeping `pending` alive would
+    /// only mean these parts silently accepted a call the KV path refuses.
+    ///
+    /// `len0` and `span` are checked against the ones the checkpoint was armed
+    /// with. Nothing else enforces that pairing: these parts are armed beside
+    /// the `KvCheckpoint` rather than inside it (D15), so a caller holding two
+    /// checkpoints could roll the KV back against one and these against the
+    /// other, and every state would be self-consistently wrong.
     pub fn rollback(&mut self, len0: usize, span: usize, commit: usize) -> Result<()> {
-        let ckpt = self.pending.as_ref().context(
-            "qwen4exp rollback without a checkpoint: the indexer caches and the \
-                          PLE state are only recoverable through kv_checkpoint",
-        )?;
+        // Validated before the checkpoint is consumed, so a caller that named
+        // the wrong one has changed nothing and can still name the right one.
+        match self.pending.as_ref() {
+            None => bail!(
+                "qwen4exp rollback without a checkpoint: the indexer caches and the PLE \
+                 state are only recoverable through kv_checkpoint, and one checkpoint \
+                 answers one rollback"
+            ),
+            Some(ckpt) => ensure!(
+                ckpt.len0 == len0 && ckpt.span == span,
+                "qwen4exp rollback against the wrong checkpoint: these parts were armed at \
+                 len0 {} span {}, the KV checkpoint being rolled back is len0 {len0} \
+                 span {span}",
+                ckpt.len0,
+                ckpt.span
+            ),
+        }
+        let ckpt = self.pending.take().expect("checked just above");
         for (il, layer) in self.layers.iter_mut().enumerate() {
             if let (Some(cache), Some(c)) =
                 (layer.indexer_cache.as_mut(), ckpt.indexer[il].as_ref())
@@ -201,7 +240,7 @@ impl Qwen4ExpParts {
                 cache.rollback(c, len0, span, commit)?;
             }
             if let (Some(state), Some(snap)) = (layer.ple_state.as_mut(), ckpt.ple[il].as_ref()) {
-                state.rollback(snap.clone());
+                state.rollback(snap, span, commit)?;
             }
         }
         Ok(())
@@ -246,7 +285,9 @@ pub fn extra_state_bytes(cfg: &XwenConfig, max_ctx: usize) -> u64 {
         return 0;
     };
     let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
-    let indexer = n_full * max_ctx as u64 * q4.indexer_head_dim as u64 * 4;
+    let indexer = n_full
+        * max_ctx as u64
+        * super::indexer::indexer_bytes_per_token(q4.indexer_head_dim) as u64;
     let ple = match q4.ple.as_ref() {
         // conv window: `[hc_count * hidden, (kernel - 1) * ngram_size]` f32.
         Some(p) => {
@@ -461,11 +502,56 @@ mod tests {
         dir
     }
 
+    /// Which synthetic file a test runs against.
+    ///
+    /// `Exact` stores every tensor F32, so the fixture introduces no rounding of
+    /// its own and a failure is the graph's. `Mixed` stores the REAL file's
+    /// dtype spread — BF16 indexer projections, Q8_0 planes, Q4_K/Q5_K experts,
+    /// Q5_1 and Q8_0 `down_exps`, and the IQ4_NL PLE table that candle cannot
+    /// name at all. The graph tests below run on both, because every one of
+    /// those is a separate load-time dispatch arm and the exact fixture reaches
+    /// none of them.
+    #[derive(Clone, Copy, Debug)]
+    enum Fixture {
+        Exact,
+        Mixed,
+    }
+
+    impl Fixture {
+        fn label(self) -> &'static str {
+            match self {
+                Fixture::Exact => "f32",
+                Fixture::Mixed => "mixed",
+            }
+        }
+    }
+
     /// Build the tiny qwen4exp model, at `max_ctx` positions.
     fn tiny_model(tag: &str, device: &Device, max_ctx: usize) -> (XwenModel, PathBuf) {
-        let dir = fixture_dir(tag);
+        tiny_model_of(Fixture::Exact, tag, device, max_ctx)
+    }
+
+    fn tiny_model_of(
+        fixture: Fixture,
+        tag: &str,
+        device: &Device,
+        max_ctx: usize,
+    ) -> (XwenModel, PathBuf) {
+        let dir = fixture_dir(&format!("{tag}_{}", fixture.label()));
         let path = dir.join("tiny-qwen4exp.gguf");
-        write_tiny_qwen4exp(&path, &TinyGeometry::default()).unwrap();
+        match fixture {
+            Fixture::Exact => write_tiny_qwen4exp(&path, &TinyGeometry::default()).unwrap(),
+            // The quantizable geometry, not the default: ggml quantizes along
+            // the row, so every quantized plane's row has to be a whole number
+            // of blocks (see `TinyGeometry::quantizable`).
+            Fixture::Mixed => {
+                super::super::tiny_gguf::write_tiny_qwen4exp_mixed(
+                    &path,
+                    &TinyGeometry::quantizable(),
+                )
+                .unwrap();
+            }
+        }
         let gguf = crate::gguf::open(&path, device).unwrap();
         let model = XwenModel::load(gguf, ExpertRunner::Reference, max_ctx).unwrap();
         (model, dir)
@@ -523,9 +609,9 @@ mod tests {
 
         // `dense` removes the indexers, so the arm exercises the identical
         // graph with plain causal attention.
-        let split = |tag: &str, dense: bool| -> f64 {
-            let (mut one_shot, dir_a) = tiny_model(tag, &device, 128);
-            let (mut chunked, dir_b) = tiny_model(tag, &device, 128);
+        let split = |fixture: Fixture, tag: &str, dense: bool| -> f64 {
+            let (mut one_shot, dir_a) = tiny_model_of(fixture, tag, &device, 128);
+            let (mut chunked, dir_b) = tiny_model_of(fixture, &format!("{tag}_b"), &device, 128);
             if dense {
                 one_shot.qwen4exp.as_mut().unwrap().force_dense_qsa();
                 chunked.qwen4exp.as_mut().unwrap().force_dense_qsa();
@@ -542,15 +628,27 @@ mod tests {
             rel_l2(&got, &want)
         };
 
-        let qsa = split("chunk_qsa", false);
-        let dense = split("chunk_dense", true);
+        // Run on both fixtures: the mixed one is the only thing in the suite
+        // that puts a BF16 indexer projection, a Q4_K expert or an IQ4_NL PLE
+        // table through a whole forward.
+        for fixture in [Fixture::Exact, Fixture::Mixed] {
+            let qsa = split(fixture, "chunk_qsa", false);
+            let dense = split(fixture, "chunk_dense", true);
+            assert_chunking_agrees(fixture, qsa, dense);
+        }
+    }
 
+    /// The two bounds `chunked_prefill_and_decode_match_a_single_prefill`
+    /// applies, factored out so both fixtures are graded by exactly the same
+    /// rule rather than by two copies of it that could drift.
+    fn assert_chunking_agrees(fixture: Fixture, qsa: f64, dense: f64) {
+        let what = fixture.label();
         // The absolute bound: an order of magnitude above the measured floor,
         // and far below anything a wrong carried state produces (a dropped PLE
         // history or a chunk-local block cut moves this into the 1e-1 range).
         assert!(
             qsa < 2e-3,
-            "chunked decode diverged from one-shot prefill: rel_l2 {qsa}"
+            "{what}: chunked decode diverged from one-shot prefill: rel_l2 {qsa}"
         );
         // The claim that is actually about this graph: running the sparse
         // overlay across a chunk boundary costs nothing over running dense
@@ -558,7 +656,7 @@ mod tests {
         // the same blocks.
         assert!(
             qsa <= dense * 1.5,
-            "the QSA overlay chunked worse than dense attention did \
+            "{what}: the QSA overlay chunked worse than dense attention did \
              (qsa {qsa} vs dense {dense}): the two partitions are selecting \
              different key blocks"
         );
@@ -579,26 +677,145 @@ mod tests {
         else {
             return;
         };
-        let (mut model, dir) = tiny_model("rollback", &device, 128);
+        for fixture in [Fixture::Exact, Fixture::Mixed] {
+            let what = fixture.label();
+            let (mut model, dir) = tiny_model_of(fixture, "rollback", &device, 128);
 
-        model.forward(&ids(&device, &SEQ[..10]), 0).unwrap();
+            model.forward(&ids(&device, &SEQ[..10]), 0).unwrap();
 
-        let mut first = Vec::new();
-        let ckpt = model.kv_checkpoint(2).unwrap();
-        for (i, &tok) in SEQ[10..12].iter().enumerate() {
-            first = host(&model.forward(&ids(&device, &[tok]), 10 + i).unwrap());
+            let mut first = Vec::new();
+            let ckpt = model.kv_checkpoint(2).unwrap();
+            for (i, &tok) in SEQ[10..12].iter().enumerate() {
+                first = host(&model.forward(&ids(&device, &[tok]), 10 + i).unwrap());
+            }
+            model.kv_rollback(&ckpt, 0).unwrap();
+            assert_eq!(
+                model.cache_len(),
+                10,
+                "{what}: rollback did not restore the length"
+            );
+
+            let mut second = Vec::new();
+            for (i, &tok) in SEQ[10..12].iter().enumerate() {
+                second = host(&model.forward(&ids(&device, &[tok]), 10 + i).unwrap());
+            }
+            assert_eq!(
+                first, second,
+                "{what}: a rolled-back span replayed to different logits"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        model.kv_rollback(&ckpt, 0).unwrap();
-        assert_eq!(model.cache_len(), 10, "rollback did not restore the length");
+    }
 
-        let mut second = Vec::new();
-        for (i, &tok) in SEQ[10..12].iter().enumerate() {
-            second = host(&model.forward(&ids(&device, &[tok]), 10 + i).unwrap());
+    /// A PARTIAL accept is the ordinary case, not the edge one: every
+    /// speculative round keeps at least one token, so `commit > 0` is what a
+    /// generation actually runs. Every piece of qwen4exp state has to land on
+    /// the accepted prefix — the QSA raw-key caches, and the PLE conv window and
+    /// n-gram history, which rewind through a per-token trail rather than to the
+    /// checkpoint.
+    ///
+    /// Graded against the straight line: decode `span` tokens under a
+    /// checkpoint, roll back to `commit`, and the next token's logits must be
+    /// the ones a run that only ever decoded those `commit` tokens produces.
+    /// A state that rewound too far does not error anywhere — it just keeps
+    /// conditioning on a history that never happened, for the rest of the
+    /// generation — so this comparison is the only thing that sees it.
+    #[test]
+    fn a_partial_commit_leaves_every_state_on_the_accepted_prefix() {
+        let Some(device) =
+            device_or_skip("a_partial_commit_leaves_every_state_on_the_accepted_prefix")
+        else {
+            return;
+        };
+
+        let base = 10usize;
+        let span = 3usize;
+        // The token decoded AFTER the rollback. Its logits depend on every
+        // carried state, which is what makes them the probe.
+        let probe = SEQ[14];
+
+        for commit in 0..=span {
+            // Straight line: prefill, decode only the accepted tokens, probe.
+            let (mut want_model, dir_a) = tiny_model("commit_want", &device, 128);
+            want_model.forward(&ids(&device, &SEQ[..base]), 0).unwrap();
+            for (i, &tok) in SEQ[base..base + commit].iter().enumerate() {
+                want_model.forward(&ids(&device, &[tok]), base + i).unwrap();
+            }
+            let want = host(
+                &want_model
+                    .forward(&ids(&device, &[probe]), base + commit)
+                    .unwrap(),
+            );
+
+            // Speculative: prefill, checkpoint, decode the whole span, roll back
+            // to `commit`, probe.
+            let (mut got_model, dir_b) = tiny_model("commit_got", &device, 128);
+            got_model.forward(&ids(&device, &SEQ[..base]), 0).unwrap();
+            let ckpt = got_model.kv_checkpoint(span).unwrap();
+            for (i, &tok) in SEQ[base..base + span].iter().enumerate() {
+                got_model.forward(&ids(&device, &[tok]), base + i).unwrap();
+            }
+            got_model.kv_rollback(&ckpt, commit).unwrap();
+            assert_eq!(
+                got_model.cache_len(),
+                base + commit,
+                "commit {commit}: rollback did not restore the length"
+            );
+            let got = host(
+                &got_model
+                    .forward(&ids(&device, &[probe]), base + commit)
+                    .unwrap(),
+            );
+
+            // Bitwise: both sides reach the probe by the same one-token decode
+            // route over states that were written by the same one-token decodes,
+            // so there is no cross-partition rounding to allow for here.
+            assert_eq!(got, want, "commit {commit}: the probe token's logits");
+
+            let _ = std::fs::remove_dir_all(&dir_a);
+            let _ = std::fs::remove_dir_all(&dir_b);
         }
-        assert_eq!(
-            first, second,
-            "a rolled-back span replayed to different logits"
-        );
+    }
+
+    /// One checkpoint answers one rollback, and only the rollback it was armed
+    /// for. The qwen4exp parts are armed BESIDE the `KvCheckpoint` rather than
+    /// inside it (D15), so nothing in the type system pairs them — a caller
+    /// holding two checkpoints could roll the KV back against one and these
+    /// against the other, and every state would be self-consistently wrong.
+    #[test]
+    fn a_rollback_is_refused_against_a_checkpoint_it_was_not_armed_for() {
+        let Some(device) =
+            device_or_skip("a_rollback_is_refused_against_a_checkpoint_it_was_not_armed_for")
+        else {
+            return;
+        };
+        let (mut model, dir) = tiny_model("ckpt_pairing", &device, 128);
+        model.forward(&ids(&device, &SEQ[..8]), 0).unwrap();
+
+        // Driven directly rather than through `XwenModel::kv_rollback`, because
+        // that rolls the KV caches FIRST: by the time these parts saw a
+        // mismatched checkpoint the caches would already have acted on it, and
+        // the test would be measuring the order of two loops rather than the
+        // guard. Both refusals below happen before anything is touched.
+        model.qwen4exp.as_mut().unwrap().checkpoint(8, 2).unwrap();
+        // Step the reserved span, so the trails can answer a rollback at all and
+        // the only thing left to refuse is the checkpoint's identity.
+        for (i, &tok) in SEQ[8..10].iter().enumerate() {
+            model.forward(&ids(&device, &[tok]), 8 + i).unwrap();
+        }
+        let parts = model.qwen4exp.as_mut().unwrap();
+
+        // A checkpoint armed at a different length answers nothing.
+        let err = parts.rollback(9, 2, 0).unwrap_err().to_string();
+        assert!(err.contains("wrong checkpoint"), "{err}");
+        let err = parts.rollback(8, 3, 0).unwrap_err().to_string();
+        assert!(err.contains("wrong checkpoint"), "{err}");
+
+        // Refusing left it armed, so the right call still works — once.
+        parts.rollback(8, 2, 0).unwrap();
+        let err = parts.rollback(8, 2, 0).unwrap_err().to_string();
+        assert!(err.contains("without a checkpoint"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -618,20 +835,24 @@ mod tests {
         // The fixture's budget is 8 tokens; 8 is the last length that fits.
         let below = &SEQ[..8];
 
-        let (mut sparse, dir_a) = tiny_model("qsa", &device, 128);
-        let with_indexer = host(&sparse.forward(&ids(&device, below), 0).unwrap());
+        for fixture in [Fixture::Exact, Fixture::Mixed] {
+            let (mut sparse, dir_a) = tiny_model_of(fixture, "qsa", &device, 128);
+            let with_indexer = host(&sparse.forward(&ids(&device, below), 0).unwrap());
 
-        let (mut dense, dir_b) = tiny_model("dense", &device, 128);
-        dense.qwen4exp.as_mut().unwrap().force_dense_qsa();
-        let without_indexer = host(&dense.forward(&ids(&device, below), 0).unwrap());
+            let (mut dense, dir_b) = tiny_model_of(fixture, "dense", &device, 128);
+            dense.qwen4exp.as_mut().unwrap().force_dense_qsa();
+            let without_indexer = host(&dense.forward(&ids(&device, below), 0).unwrap());
 
-        assert_eq!(
-            with_indexer, without_indexer,
-            "a below-budget QSA prefill differs from the same model with no indexer"
-        );
+            assert_eq!(
+                with_indexer,
+                without_indexer,
+                "{}: a below-budget QSA prefill differs from the same model with no indexer",
+                fixture.label()
+            );
 
-        let _ = std::fs::remove_dir_all(&dir_a);
-        let _ = std::fs::remove_dir_all(&dir_b);
+            let _ = std::fs::remove_dir_all(&dir_a);
+            let _ = std::fs::remove_dir_all(&dir_b);
+        }
     }
 
     /// The real Qwen3.8-Flash-Next file: it loads, reports the geometry the port

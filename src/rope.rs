@@ -454,6 +454,47 @@ mod tests {
         assert_eq!(g, w, "a consecutive gather must reproduce the scalar start");
     }
 
+    /// The same consecutive-run identity on Metal, where the two calls take
+    /// GENUINELY DIFFERENT routes: `rotate` on a contiguous Metal input runs the
+    /// fused single-pass `ops::rope_neox` kernel, while `rotate_at` always runs
+    /// the candle chain. So this pins the cross-path claim `rotate_at`'s doc
+    /// comment makes — that the gathered table rows and the fused kernel's
+    /// narrowed ones produce the same bits — at the shape the QSA indexer
+    /// actually uses (4 heads, head_dim 128, f32 out). A rounding difference
+    /// between the two routes would show up here as scored blocks drifting from
+    /// what a dense run would have selected, which no output-level test would
+    /// name.
+    #[test]
+    fn rotate_at_matches_rotate_on_metal_at_the_indexer_shape() {
+        let Ok(dev) = crate::gguf::metal_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let rope = Rope::new(&laguna_yarn(), 512, &dev).unwrap();
+        let (n_head, seq, head_dim) = (4usize, 37usize, 128usize);
+        let data: Vec<f32> = (0..n_head * seq * head_dim)
+            .map(|i| ((i * 13 % 29) as f32) * 0.07 - 1.0)
+            .collect();
+        let x = Tensor::from_vec(data, (n_head, seq, head_dim), &dev).unwrap();
+
+        let pos = 128usize;
+        let want = rope.rotate(&x, pos, DType::F32).unwrap();
+        let positions = Tensor::from_vec(
+            (0..seq).map(|t| (pos + t) as u32).collect::<Vec<_>>(),
+            seq,
+            &dev,
+        )
+        .unwrap();
+        let got = rope.rotate_at(&x, &positions, DType::F32).unwrap();
+
+        let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+        let w: Vec<f32> = want.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(
+            g, w,
+            "the gathered chain and the fused kernel must agree bit for bit"
+        );
+    }
+
     /// Each row is roped at the position `positions` names for it, and at
     /// nothing else — pinned with a scrambled, non-monotonic set, which is the
     /// shape the QSA indexer's block-first positions take.
