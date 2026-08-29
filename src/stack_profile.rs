@@ -22,6 +22,12 @@
 //! bucket: either a kernel stage costing more in situ than on the bench, or
 //! `inter_stage_host` carrying real per-token cost.
 //!
+//! The stage set spans every architecture the binary runs, so a dump only ever
+//! prints the stages that actually ran: `mixer_delta` is absent from a chunk
+//! with no DeltaNet layer, and `ple`, `qsa_select` and `token_readback` — the
+//! qwen4exp-only stages — are absent from a qwen35 dump entirely. Nothing on the
+//! qwen35 path calls them.
+//!
 //! Which phase a chunk belongs to is DECLARED by the generation loop
 //! (`XwenModel::set_phase`), not inferred: a prompt's last prefill chunk can hold
 //! a single token, and a speculative verify forward feeds a whole span while
@@ -53,15 +59,30 @@ use crate::host_log::host_line;
 /// forward runs them; the dump prints them in this order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
-    /// Embedding gather + f32 upcast.
+    /// Embedding gather + f32 upcast. On qwen4exp it also covers the
+    /// hyper-connection carrier seed (the `[x, x, x, x]` tile of that
+    /// embedding), which is the same one-shot per-chunk device work and would
+    /// otherwise be charged to whichever stage's sync happened to drain it.
     Embed,
+    /// Reading this chunk's token ids back off the device, which the qwen4exp
+    /// PLE hash needs on the host. Once per forward, and only on a checkpoint
+    /// that carries a PLE layer.
+    TokenReadback,
     /// The CPU-side `Vec<f32>` fill of the prefill attention mask (host work —
     /// timed without a device sync).
     MaskFillHost,
     /// Uploading that mask and materializing the broadcast f16 sdpa copy.
     MaskUploadAndBroadcast,
+    /// A qwen4exp PLE layer's per-token embedding lookup and its add onto the
+    /// carrier. Host/device hybrid: the n-gram hash runs on the CPU over the
+    /// ids [`Stage::TokenReadback`] fetched.
+    Ple,
     /// Per-layer pre-mixer RMSNorm.
     AttnNorm,
+    /// A qwen4exp QSA layer's index selection: the indexer's own projections,
+    /// the raw-key append, and the top-k that picks the attended set. Runs
+    /// before the mixer it feeds, at the same position the K/V append uses.
+    QsaSelect,
     /// A full-attention layer's whole mixer call (projections, rope, sdpa,
     /// output gate, o_proj).
     MixerFullAttn,
@@ -94,11 +115,14 @@ pub enum Stage {
     InterStageHost,
 }
 
-const STAGES: [Stage; 13] = [
+const STAGES: [Stage; 16] = [
     Stage::Embed,
+    Stage::TokenReadback,
     Stage::MaskFillHost,
     Stage::MaskUploadAndBroadcast,
+    Stage::Ple,
     Stage::AttnNorm,
+    Stage::QsaSelect,
     Stage::MixerFullAttn,
     Stage::MixerDelta,
     Stage::ResidualAttn,
@@ -114,27 +138,33 @@ impl Stage {
     fn index(self) -> usize {
         match self {
             Stage::Embed => 0,
-            Stage::MaskFillHost => 1,
-            Stage::MaskUploadAndBroadcast => 2,
-            Stage::AttnNorm => 3,
-            Stage::MixerFullAttn => 4,
-            Stage::MixerDelta => 5,
-            Stage::ResidualAttn => 6,
-            Stage::FfnNorm => 7,
-            Stage::Ffn => 8,
-            Stage::ResidualFfn => 9,
-            Stage::FinalNorm => 10,
-            Stage::LmHead => 11,
-            Stage::InterStageHost => 12,
+            Stage::TokenReadback => 1,
+            Stage::MaskFillHost => 2,
+            Stage::MaskUploadAndBroadcast => 3,
+            Stage::Ple => 4,
+            Stage::AttnNorm => 5,
+            Stage::QsaSelect => 6,
+            Stage::MixerFullAttn => 7,
+            Stage::MixerDelta => 8,
+            Stage::ResidualAttn => 9,
+            Stage::FfnNorm => 10,
+            Stage::Ffn => 11,
+            Stage::ResidualFfn => 12,
+            Stage::FinalNorm => 13,
+            Stage::LmHead => 14,
+            Stage::InterStageHost => 15,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
             Stage::Embed => "embed",
+            Stage::TokenReadback => "token_readback",
             Stage::MaskFillHost => "mask_fill_host",
             Stage::MaskUploadAndBroadcast => "mask_upload",
+            Stage::Ple => "ple",
             Stage::AttnNorm => "attn_norm",
+            Stage::QsaSelect => "qsa_select",
             Stage::MixerFullAttn => "mixer_full_attn",
             Stage::MixerDelta => "mixer_delta",
             Stage::ResidualAttn => "residual_attn",

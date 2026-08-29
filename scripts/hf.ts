@@ -28,6 +28,22 @@ export const CHECKPOINTS = {
     model: "Qwen3.8-27B-Q4_K_M.gguf",
     drafter: "mtp-Qwen3.8-27B-Q8_0.gguf",
   },
+  // The one SPLIT checkpoint: four shards, and `model` is shard 1 because that
+  // is what every consumer passes on a command line — the loader (and
+  // llama.cpp) walk to the siblings from there. `shards` lists all four so a
+  // cache check can insist on the whole set rather than on the entry point.
+  // No drafter: the release ships an MTP head xwen does not load (hub.rs).
+  "flash-next": {
+    repo: "unsloth/Qwen3.8-Flash-Next-GGUF",
+    model: "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+    shards: [
+      "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+      "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+      "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf",
+      "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
+    ],
+    drafter: null,
+  },
 } as const;
 
 export type ModelSize = keyof typeof CHECKPOINTS;

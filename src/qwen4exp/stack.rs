@@ -343,7 +343,10 @@ pub fn run_stack_hc(
     // The carrier is seeded by TILING the embedding, `[x, x, x, x]` — not
     // interleaving it (port-doc trap #15).
     let embedded = stage!(Stage::Embed, model.embed_tokens(tokens)?); // [seq, hidden] f32
-    let mut stream = seed_stream(&embedded, hc_count)?; // [seq, hc_count * hidden]
+    // The carrier seed shares the `Embed` bucket: it is the same one-shot
+    // per-chunk device work, and left unbracketed its kernels would drain into
+    // whichever later stage's sync caught them.
+    let mut stream = stage!(Stage::Embed, seed_stream(&embedded, hc_count)?); // [seq, hc_count * hidden]
 
     // The PLE hash runs on raw token ids on the host, so this chunk's ids have
     // to come back off the device — once per forward, and only when the
@@ -353,7 +356,10 @@ pub fn run_stack_hc(
         .as_ref()
         .is_some_and(|p| p.layers.iter().any(|l| l.ple.is_some()));
     let token_ids: Vec<u32> = if wants_ids {
-        tokens.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?
+        stage!(
+            Stage::TokenReadback,
+            tokens.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?
+        )
     } else {
         Vec::new()
     };
@@ -395,12 +401,14 @@ pub fn run_stack_hc(
         let p = &mut parts.layers[il];
 
         // PLE injection, onto the carrier and BEFORE the attention gate reads
-        // it (qwen4exp.cpp:332-334). Not bracketed as its own profiler stage:
-        // it is a host hybrid in P2 and would need a Stage variant of its own
-        // to be reported honestly, so its cost shows up in `InterStageHost`.
+        // it (qwen4exp.cpp:332-334). Bracketed as `Stage::Ple`, which covers
+        // both halves of the hybrid: the host-side n-gram hash and the device
+        // work that follows it.
         if let (Some(ple), Some(state)) = (p.ple.as_ref(), p.ple_state.as_mut()) {
-            let addend = ple.forward(&token_ids, &stream, state)?;
-            stream = (&stream + &addend)?;
+            stream = stage!(Stage::Ple, {
+                let addend = ple.forward(&token_ids, &stream, state)?;
+                (&stream + &addend)?
+            });
         }
 
         // --- attention half.
@@ -413,7 +421,9 @@ pub fn run_stack_hc(
                 // Selection first: it appends this chunk's raw indexer keys, so
                 // it must run at the same `pos` the K/V append below does.
                 let qsa = match (p.indexer.as_ref(), p.indexer_cache.as_mut()) {
-                    (Some(idx), Some(cache)) => Some(idx.select(&x, cache, pos)?),
+                    (Some(idx), Some(cache)) => {
+                        Some(stage!(Stage::QsaSelect, idx.select(&x, cache, pos)?))
+                    }
                     _ => None,
                 };
                 stage!(
