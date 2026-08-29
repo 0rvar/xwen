@@ -37,6 +37,10 @@ checkpoints; nothing was re-measured or moved.**
   "ppl reference fixture missing". A known gap, not a regression (TODO.md); the
   fix is `--regen-ppl-ref` against the 3.8 file, then a ppl grade.
 
+All three **re-passed again at xwen 643a411**, after the prefill-mask layout change
+(one f16 plane broadcast across heads, on every checkpoint) and the rest of that fix
+round — 35B-A3B and 27B six graded checks each, 3.8-27B five with the same ppl skip.
+
 ```bash
 just init                               # git submodule update --init --recursive
 bash scripts/build-llamacpp.sh          # cmake from an ephemeral nix shell, system CLT SDK

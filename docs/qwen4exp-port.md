@@ -1236,8 +1236,10 @@ than xwen (−17% vs −5% settling), which flatters its numbers.
   so `--draft` is refused rather than silently ignored. Hardening and coverage:
   QSA overlay guards; **prefill masks are now one f16 plane broadcast across
   heads on ALL checkpoints** — a layout change only, ~800 MB/layer saved at 4k on
-  the 27B (parity gate re-run to confirm no math moved: RESULT PENDING, fill this
-  line); indexer KV plane sized at 30 KiB/token; a differential GGUF-header test
+  the 27B (parity gate re-run at 643a411 to confirm no math moved: **all three
+  checkpoints ALL PASS** — 35B-A3B and 27B six graded checks each, 3.8-27B five
+  with its ppl tier skipped as before); indexer KV plane sized at 30 KiB/token;
+  a differential GGUF-header test
   against candle on all three blessed files; a shard-rebase byte check; IQ4_NL
   and Q8_0 literal tests; a new `Fixture::Mixed` tiny GGUF (BF16 indexer, Q8_0
   planes, Q4_K/Q5_K/Q5_1 experts and a real IQ4_NL table via `raw_of`) that runs
