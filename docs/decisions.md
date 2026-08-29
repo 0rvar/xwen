@@ -2054,11 +2054,123 @@ containment pass. The consequence is deliberate: a name like "Qwen3.8 Flash Next
 existing rule that stops "Qwen3.6 27B MyFinetune" from claiming to be the official 27B.
 A file that identifies as nothing still runs, under its own file name (2026-08-29).
 
+**Every Flash-Next-only cost gets its own profiler stage, and profiled decode numbers are
+not timings.** `XWEN_STACK_PROFILE` let the PLE layer, QSA selection and the token
+readback fall into `inter_stage_host`, which made the three costs unique to this
+checkpoint the three the profiler could not see; each now has its own bracket and the
+qwen35 path emits none of them. The rule that came with it: **the profiler's per-stage
+syncs inflate decode, so profiled decode figures rank stages and nothing more** — quote
+only unprofiled tok/s. PLE decode measured 6.4 ms/token profiled against ~2.1 ms real,
+which is a 3x error and was briefly believed. Prefill is not affected the same way (the
+stages are large and already synchronised), and the prefill attribution it produced is
+what P3 was planned from: ffn 51%, hyper-connection glue 34%, `mixer_delta` 8%, PLE 2%
+(2026-08-29).
+
+**Q5_1 in the vendored `mm_id`, copied verbatim from the pinned llama.cpp.** `block_q5_1`
+and `dequantize_q5_1` are transcribed from `reference/llama.cpp` rather than re-derived,
+the same rule the other vendored dtype arms follow — the tile loader was already 32-block
+generic through Q8_0, so the arm is a dequant helper and an instantiation. It is
+instantiated for the classic, `_hp` and `_t` families and **deliberately NOT for `_t_hp`**:
+nothing routes a Q5_1 plane there, and an unused instantiation is compile time and a
+kernel-cache entry for a path no file exercises. Q5_1 joins the oracle test dtypes so the
+arm is graded, not assumed. This is D18's item (b); items (a) — a Q5_1 arm in the vendored
+`mv_id` decode path — and (c) — per-stack `use_mm` — stay open, and the reason (a) did not
+follow (b) automatically is that `mm` is now the prefill path for those 43 layers, while
+decode still takes candle's baked `kernel_mul_mv_id_q5_1_f32` and did not move at all in
+the A/B (2026-08-29).
+
+**The hyper-connection glue is fused; the two Q8_0 gemms are not.** `low_rank` is 320, not
+8, so the down and up projections are real gemms moving ~0.7 GB of weights per token —
+library work, and they stay on `QLinear`/`QMatMul`. What gets fused is everything around
+them: **K1** `hc_norm` (grouped statistics per `hidden`, full-width weight, and the
+injection gemv `2·sigmoid((I·n)/hc_count)` folded into the same pass), **K2**
+`hc_silu_quarter`, **K3** `hc_mix` (the mean over streams of `sigmoid(u)·n`), **K4**
+`hc_write` (a single out-of-place FMA where the candle chain made three full-carrier
+passes). 5+1 dispatches per layer-pair against 20+2, roughly 2128 → 600 hc dispatches per
+forward. The precedent is the fused DeltaNet gated norm, and so is the rounding contract:
+**K2 and K4 are bit-identical to the chains they replace and K1 and K3 are bounded**, each
+partitioning across threads a reduction the reference runs in one order — the split is
+recorded per kernel in `src/ops/hc.rs` because it decides which of them a bitwise test can
+pin and which need the f32 oracle. One deliberate duplication: the injection head is kept
+BOTH as a `QLinear` and as a dense f32 `[hc_count, hc_count·hidden]` copy, because the
+fused kernel wants raw f32 rows and the classic path must keep working — 160 KiB, and a
+replacement rather than a duplicate would have made `XWEN_HC_CLASSIC` a different
+computation instead of the same one. A gate outside the kernels' geometry bounds (at most
+`HC_MAX_STREAMS` streams, `hidden` a multiple of the simdgroup width that 256 divides)
+keeps the candle chain rather than failing (2026-08-29).
+
+**Below 32 tokens the hc norm splits across streams, and it is the same arithmetic.** The
+fused `hc_norm` at `n == 1` ran ONE threadgroup per token, walking a 10240-wide row and the
+injection head on that one threadgroup — measured as a 6% decode LOSS against the candle chain it
+replaced, which is the fusion paying off at prefill and costing at decode. Below
+`HC_SPLIT_MAX_N` (32, `XWEN_HC_SPLIT_MAX_N`) the norm runs one threadgroup per (token,
+stream) and the injection dot becomes a second kernel over the same grid. **The two launch
+shapes are bit-identical, not merely close**: same thread count and same partition for the
+statistics, stream-major walk for the dot, pinned by `split_matches_single_bitwise` and
+confirmed end to end as byte-identical generated text over 128 tokens. That is what makes
+the threshold a free tuning knob rather than a second numeric path to grade: moving it
+can never change a result, so `XWEN_HC_SPLIT_MAX_N` is an A/B knob and not a kill switch.
+Why a threshold rather than always splitting — the single kernel reads the carrier once
+and folds every reduction in one threadgroup, which is the cheaper shape as soon as the
+token grid alone fills the machine; the split pair costs an extra read of the normed
+carrier and buys `hc_count` times the parallelism, which only pays while the machine is
+otherwise idle (2026-08-29).
+
+**PLE rows are prefetched, advisorily, and never gated on the gate.** The decode cost of
+the PLE layer is page faults on the 16 IQ4_NL rows a token hashes to — flat per token,
+~4.7% page-cache hits, i.e. essentially no reuse — not driver overhead, which is what the
+sync-inflated profile had suggested. Since row addresses depend only on token ids, a
+background thread per `PleTable` touches one byte per distinct page for the position about
+to be forwarded: hinted at sample time for decode, before layer 0 for a prefill chunk. Three
+rules the design turns on. It is **advisory** — a dropped or late hint costs a fault it
+would have taken anyway, so the prefetcher never blocks and never owns correctness. It is
+**never gated on the PLE gate value**, which is computed mid-forward; acting on it would
+serialize the lookup behind the thing the lookup feeds, and unconditional retrieval is
+cheap. And the row math is **single-sourced** (`PleTable::row_offset`, `PleLayer::gather_rows`
+over the frozen hash), because a prefetcher computing addresses a second way would fault the
+wrong pages and show up only as an absent speedup. `MADV_RANDOM` is applied to the TABLE's
+byte range only — a 90-160 B row must not pull a readahead window — while the whole-file
+`WillNeed` stays for the weights, which are read densely and want exactly the opposite
+advice. `XWEN_PLE_NO_PREFETCH` and `XWEN_PLE_NO_RANDOM` exist so both halves stay
+measurable. Measured effect: `measured 2026-08-29 with one cold prompt per arm (the same-prompt design is invalid — greedy decode hashes every arm to the same rows, so arm k warms arm k+1): median decode gather 0.002 ms with prefetch vs 0.97-1.02 ms without, PLE total 1.05 vs 2.03 ms per token, decode 45.0 vs 43.2 tok/s, pf_dropped 0; MADV_RANDOM is neutral either way (0.002 vs 0.002 with prefetch, 0.97 vs 1.02 without) and stays on only because it is harmless and switchable` (2026-08-29).
+
+**Refuted: the ~15 GB of private memory is a leak.** Flash-Next dirties ~15 GB where
+llama-server dirties 751 MB on the identical file, which read as a bug worth chasing. An
+audit accounts for ~11.4 GB of it as deliberate design, all of it shared with the three
+shipped checkpoints: attention and GDN projections dequantized to f16 planes for the
+prefill gemm (~5.35 GB, ~6.14 after candle's power-of-two buffer rounding), `token_embd`
+dequantized whole to f16 (1.27 → 2.15 GB plus a ~2.5 GB f32 transient), non-aliased Q8_0
+copies for lm_head, the hc bottleneck projections, the shared expert and the PLE k/v
+(~1.65 GB), transposed router weights at 8 MiB granularity across 48 layers (0.40),
+indexer raw-key planes sized at `max_ctx` (0.81 at the 131072 default), delta state (0.15).
+What should be aliased is aliased: the 77.5 GB expert stacks, the 28.8 GB PLE table and the
+BF16 indexer projections never leave the mapping. So the gap against llama.cpp is a
+different memory strategy — materialize for the gemm you want — and not a lifetime bug.
+Three shrinks stay open and ledgered rather than taken now: alias the Q8_0 planes that only
+ever feed `QMatMul`, grow the indexer planes on demand, and gather `token_embd` rows from
+the quantized tensor instead of materializing the whole table (2026-08-29).
+
+**Forced replay against llama.cpp is Flash-Next's math gate while the harness panics, and
+free-run text is not a grade.** Every change to this checkpoint's math is graded by
+teacher-forcing xwen along the oracle's own greedy trajectory and counting agreement —
+186/192 with 0 hard mismatches and 0 non-finite after the Q5_1 arm and the fused hc, against
+U7's pre-P3 189/192 on the same instrument. The difference is six rank-2 near-ties (margins
+0.009-0.30 logit) changing sides, which is what a bounded kernel change looks like and what
+the near-tie band exists for. **Free-run greedy output is explicitly NOT the instrument
+here**: it forks at token 2 on a 0.0817-logit near-tie and everything after that is
+incomparable, so "the text changed" carries no information about this checkpoint and must
+not be reported as a regression — the same reasoning that makes the shipped checkpoints'
+decode tier teacher-forced. This stands in until the `ReferenceExperts` panic on the
+512-expert geometry is fixed and the real four-tier gate can run (2026-08-29).
+
 **Phased, correctness before speed.** P0 scaffold (split-GGUF loader, config parse,
 registry) → P1 CPU references and fixtures → P2 graph assembly, real file, greedy smoke,
 oracle agreement → P3 Metal and perf → P4 serve, sampling defaults, harness extension.
 P2 closed 2026-08-29 with the graph agreeing with the llama.cpp oracle at 189/192
-forced-replay steps and zero hard mismatches (2026-08-26).
+forced-replay steps and zero hard mismatches; P3's first pass closed the prefill gap and
+took decode past llama.cpp the same day (1.01x prefill, 1.04x decode at a 530-token
+prompt, 186/192 forced replay), with the device-side PLE gate/conv and the QSA top-k
+kernel still ledgered (2026-08-26, P3 pass 2026-08-29).
 
 ## Process
 

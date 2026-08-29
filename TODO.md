@@ -1914,6 +1914,22 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     **Quantified 2026-08-29 by U7**: prefill is 3.5x behind llama.cpp on this
     file (203.5 vs 713.4 tok/s at 530 tokens), and this is suspect number one.
     Grouped with the rest of the deferred perf work in the P3 ledger below.
+    **(b) SHIPPED 2026-08-29 in 8112733** (D20): `block_q5_1`/`dequantize_q5_1`
+    copied verbatim from the pinned llama.cpp into the vendored two-pass
+    `mm_id`, instantiated for the classic, `_hp` and `_t` families and
+    deliberately NOT `_t_hp` (nothing routes a Q5_1 plane there); Q5_1 joined
+    the `mm_id` oracle test dtypes, 9/9 on GPU. Measured alone, interleaved at a
+    530-token prompt: **prefill 239 → 443 tok/s** (1.85x; 250 → 490 at 880), the
+    `ffn` stage 2887 → 1031 µs/token, the gap to llama.cpp 3.30x → 1.78x.
+    **(a) and (c) STAY OPEN**, and (a) did not follow from (b): `mm` is now the
+    prefill path for those 43 layers, but **decode still takes candle's baked
+    `kernel_mul_mv_id_q5_1_f32`** and did not move at all in the A/B (37.7
+    before and after), so a Q5_1 arm in the vendored `mv_id` fast path is still
+    unmeasured upside. (c) per-stack `use_mm` matters less now that the mm path
+    covers the plane that was forcing the fallback, but the all-or-nothing rule
+    is unchanged. Note for whoever benchmarks this: `XWEN_NO_MM_ID=1` is NOT the
+    before-arm — it forces mv on all three planes and reads 225 tok/s, below the
+    real baseline.
   - **2026-08-29 — P4: the parity harness cannot run on qwen4exp (from U7).**
     All four tiers of `scripts/parity-gate.ts` die on this checkpoint, because
     every tier's reference side is `--moe-impl reference` and
@@ -1950,25 +1966,81 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     dense-FFN prefill gemm was this same shape of problem on the 27B (P8c) and
     took a vendored kernel to close. Caveats on the absolutes: `lowpowermode 0`
     with no high-power claim, shared machine, llama.cpp thermal-boosts harder —
-    the RATIO is the trustworthy part. Related: xwen dirties ~15 GB of private
+    the RATIO is the trustworthy part.
+    **CLOSED 2026-08-29 (P3).** Prefill **795.7 tok/s against llama.cpp's 789**
+    in the same hour, 1.01x, at the same 530-token prompt over four interleaved
+    rounds; decode came along too at **43.1 vs 41.4**, 1.04x. Three commits:
+    8112733 (the Q5_1 `mm_id` arm, 239 → 443), 8aeed73 (four fused
+    hyper-connection kernels, 443 → 765-781) and 2c8d3b3 (the split norm launch,
+    decode 37.8 → 43.1). Of the two suspects named above, the first was worth
+    1.85x on its own and the second was **wrong in its specifics** — the other
+    third of the prefill wall was the hyper-connection GLUE, not a gemm. What
+    stays open is in the P3 ledger below, not here.
+    Related: xwen dirties ~15 GB of private
     memory where llama-server dirties 751 MB on the same file (64 GB vs 76 GB
     clean mapped), i.e. ~15 GB of weights are materialized rather than aliased
     from the mapping. Worth understanding under the one-large-process rule.
+    **AUDITED 2026-08-29 — this is design, not a bug (D24), and stays as three
+    follow-ups rather than an investigation.** A code-reading audit accounts for
+    ~11.4 GB of the 15: attention and GDN projections dequantized to f16 planes
+    for the prefill gemm (~5.35 GB raw, ~6.14 after candle's power-of-two buffer
+    rounding — `attn_proj` → `dense_f16` → `dequantize_f16`, gguf.rs:1790, a CPU
+    round-trip in candle); `token_embd` dequantized whole to f16 (model.rs:249-254,
+    1.27 → 2.15 GB, plus a ~2.5 GB f32 transient); Q8_0 copies that are NOT
+    aliased — lm_head 0.68, hc down/up 0.68, shexp 0.25, PLE k/v 0.04; the
+    transposed `ffn_gate_inp` at 8 MiB bucketing ×48 = 0.40; indexer raw-key
+    planes at `max_ctx` 131072 = 0.81; delta state 0.15. Every one of those is a
+    pattern the three shipped checkpoints already run, and what should be aliased
+    IS: the 77.5 GB expert stacks, the 28.8 GB PLE table (never uploaded) and the
+    BF16 indexer projections. So the "15 GB leak" reading is refuted. Three
+    shrinks, in rough order of payoff: **(i)** alias the Q8_0 planes that only
+    ever feed `QMatMul` (hc, lm_head, shexp) through the q8 alias path — ~1.6 GB;
+    **(ii)** grow the indexer planes on demand instead of allocating at `max_ctx`
+    (the separate ledger item below); **(iii)** gather `token_embd` rows from the
+    quantized tensor instead of materializing the whole table in f16.
   - **2026-08-29 — P3 perf ledger for Flash-Next (everything deferred from P2).**
     P2 was correctness-first by decision (decisions.md), so every one of these is
-    a known cost taken deliberately, not a discovery. In rough order of expected
+    a known cost taken deliberately, not a discovery.
+    **STATUS after P3's first pass (2026-08-29): (1) partly, (2), (3) and (6)
+    done; (4), (5), (8) untouched; (7) closed earlier; (9) retired; (10)-(13)
+    added.** In rough order of expected
     payoff: **(1)** the Q5_1 expert kernels and per-stack `use_mm` — its own
-    bullet above, and the first thing to try against the prefill gap; **(2)**
-    **prefill is 3.5x behind llama.cpp** — its own bullet above; **(3)** a fused
+    bullet above, and the first thing to try against the prefill gap
+    (**item (b) SHIPPED 8112733**; (a) and (c) still open); **(2)**
+    **prefill is 3.5x behind llama.cpp** — its own bullet above, **CLOSED
+    2026-08-29** at 795.7 vs 789 tok/s; **(3)** a fused
     `hc_mix` kernel: the hyper-connection read/write is ~15 dispatches per
     layer-pair built from candle primitives, across all 48 layers, and was
-    flagged as the top fusion candidate before any of it was written; **(4)**
+    flagged as the top fusion candidate before any of it was written —
+    **SHIPPED 2026-08-29 in 8aeed73 (four kernels, D21) plus 2c8d3b3 (the split
+    launch below 32 tokens, D22)**. It was 34.3% of prefill wall as measured, not
+    a guess: read 20 candle dispatches (17 of them glue around two Q8_0 gemms),
+    write three full-carrier passes for one FMA, twice per layer over 48 layers.
+    Now 5+1 dispatches per layer-pair, ~2128 → ~600 hc dispatches per forward;
+    prefill 443 → 765-781 tok/s, `attn_norm` 726 → 209 and `ffn_norm` 726 → 227
+    µs/token, residual writes 325 → 105, prefill wall 2105 → 1279 ms. The fusion
+    initially COST 6% of decode (one threadgroup per token at `n == 1`), which
+    2c8d3b3 turned into a 14% gain over the classic chains — decode 43.1.
+    Three follow-ups, none blocking: **(a)** `hc_write` is out-of-place; an
+    in-place FMA would drop a full-carrier write per layer-pair; **(b)** at
+    decode the two Q8_0 bottleneck gemms go through `QMatMul`, which has **no
+    `mv_ext` plane** at the `hc.rs` qlinear site (gguf.rs:1631-1648) — try
+    xwen's own vendored mv path there, the same move that paid on the 27B's
+    projections; **(c)** decode is BIMODAL round over round and unexplained (its
+    own item below); **(4)**
     QSA top-k runs on the host via `arg_sort` — a device partial-top-k kernel is
     the intended replacement (D16 says selection is computed with candle ops in
     P2 explicitly "top-k kernel is P3"); **(5)** the PLE gate, signed sqrt,
     dilated conv and silu run on the HOST in f32 over a `[n,10240]` copy of the
     stream, 40 KB/token plus one device→host sync per forward at layer 1 (D17) —
-    move them to device; **(6)** PLE prefetch: at prefill every row address is
+    move them to device. **STILL OPEN, now QUANTIFIED (2026-08-29,
+    `XWEN_PLE_PROFILE`)**: at prefill the host gate plus conv are **~40 ms of a
+    512-token chunk**, which is the biggest single reason to do this; at decode
+    the layer's fixed floor is **~0.85 ms**, of which the three device→host
+    readbacks are 0.50 and the projections 0.33. **Collapsing the three readbacks
+    into one is the cheap first step** and is worth taking before the full
+    device port. Note the rest of the decode cost is NOT this — it is table page
+    faults, item (6); **(6)** PLE prefetch: at prefill every row address is
     computable from token ids before layer 0 runs (hash, dedupe, batch-fault on a
     background thread), and at decode the moment token t is sampled position
     t+1's ~16 rows are known — touch them while the trunk runs. Never gate the
@@ -1976,7 +2048,22 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     serializes the lookup and kills the prefetch, and unconditional retrieval is
     cheap. Test `madvise(MADV_RANDOM)` on the table mapping (default readahead
     turns a 90-160 B row into a large window) and MEASURE cold vs warm fault cost
-    rather than assuming the page cache wins; **(7)** ~~QSA mask memory — the
+    rather than assuming the page cache wins. **SHIPPED 2026-08-29 in ac40526
+    (D23)**, and the measurement came first: the decode gather is page faults,
+    per token, flat over a run — median ~1.1 ms with 6.5 ms spikes and only
+    **4.7% page-cache hits**, so there is essentially no reuse to cache. A
+    background thread per `PleTable` now touches one byte per distinct page for
+    the position about to be forwarded (hinted at sample time for decode, before
+    layer 0 for a prefill chunk), advisory and never gated on the gate value,
+    with the row math single-sourced through `PleTable::row_offset` /
+    `PleLayer::gather_rows` and `MADV_RANDOM` on the table's byte range only.
+    `XWEN_PLE_NO_PREFETCH` / `XWEN_PLE_NO_RANDOM` for the A/B; `ple-profile`
+    lines report `pf_pages` and `pf_dropped`. **A/B result: `measured 2026-08-29 with one cold prompt per arm (the same-prompt design is invalid — greedy decode hashes every arm to the same rows, so arm k warms arm k+1): median decode gather 0.002 ms with prefetch vs 0.97-1.02 ms without, PLE total 1.05 vs 2.03 ms per token, decode 45.0 vs 43.2 tok/s, pf_dropped 0; MADV_RANDOM is neutral either way (0.002 vs 0.002 with prefetch, 0.97 vs 1.02 without) and stays on only because it is harmless and switchable`.**
+    Prefill is a different regime and was already fine (a warm chunk gathers
+    8192 rows in 2 ms; the cold first chunk takes 439 ms). Follow-up if the A/B
+    shows the overlap window is too short: the 16 faults inside a single gather
+    are taken serially on one thread — parallelize them across the window rather
+    than deepening the lookahead; **(7)** ~~QSA mask memory — the
     prefill overlay materializes a `[n_q, n_kv]` mask~~ **CLOSED 2026-08-29 in
     the review round (643a411)**: prefill masks are now one f16 plane broadcast
     across heads on ALL checkpoints, a layout change with no math change, worth
@@ -1986,6 +2073,48 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     there; **(9)** the ~50 tok/s decode figure in the port doc's P0-pause notes
     was a SCALING GUESS from the 35B-A3B, never a measurement — the real first
     number is 37.5-38.1, so either close the gap or retire the guess.
+    **RETIRED 2026-08-29**: decode is **43.1 tok/s measured** (530-token prompt,
+    128 decoded, four interleaved rounds, medians) against llama.cpp's 41.4 on
+    the same file in the same hour. The guess is not a target any more and
+    should not be quoted; the port doc's Perf state carries the real number.
+    **(10) NEW 2026-08-29 — decode is BIMODAL round over round and nobody knows
+    why.** Across four interleaved rounds at fixed settings the shipped arm reads
+    44.0 / 42.1 / 44.1 / 42.3 tok/s and the `XWEN_HC_SPLIT_MAX_N=0` arm reads the
+    same two-level pattern one step down (34 vs 36). It is not thermal drift (it
+    alternates rather than decays), not the split path (both arms do it), and not
+    contention as far as the runs could tell — one classic-arm outlier (34.1 in
+    round 4) WAS concurrent unit tests, which is a different and identifiable
+    signature. ~4% is enough to swamp a small A/B, so it matters for how the next
+    perf change gets graded: until it is understood, quote medians of four or more
+    interleaved rounds and never a two-round difference. First places to look: a
+    two-state allocator or command-buffer reuse pattern, and per-round residency
+    set churn. **(11) NEW 2026-08-29 (Opus-2 review #5) — the PLE prefetcher
+    spawns one thread per `PleTable`.** Harmless on every published qwen4exp file,
+    because upstream hard-asserts `n_ple == 1`, but the code does not depend on
+    that assert: a checkpoint with several PLE layers would get a prefetch thread
+    each, all faulting the same table. If a multi-PLE file ever appears, share one
+    prefetcher across tables rather than one per layer. **(12) NEW 2026-08-29 —
+    `scripts/hf.ts`'s flash-next entry widens what `--model-size` the parity gate
+    accepts, with nothing behind it.** The entry exists so `bench.ts` can resolve
+    the checkpoint (b54046b), but the gate reads the same table, so
+    `parity-gate.ts --model-size flash-next` is now spellable and will fail deep
+    rather than at argument validation — the harness cannot run on this checkpoint
+    at all and there are no fixtures for it. Low priority precisely because the run
+    fails either way; fix by gating the gate's accepted set on fixture existence.
+    Same entry: its **`shards` key is dead** — nothing reads it, the loader finds
+    the shard set from any one file. Delete it or make it load-bearing. **(13) NEW
+    2026-08-29 — two review-noted low items in the fused hc path, knowingly not
+    fixed.** `n == 0` is not bailed on in every fused entry point — no zero-token
+    forward is reachable from the stack today, so this is defensive only. And the
+    bit-identity assertions compare RAW BIT PATTERNS (`f32::to_bits`), which makes
+    `-0.0` and `+0.0` different values: a reordered FMA that yields `-0.0` where
+    the candle chain yielded `+0.0` would fail `split_matches_single_bitwise` and
+    the write/activation bitwise tests as a mismatch, with nothing numerically
+    wrong. That strictness is the right default — it is what makes "bit-identical"
+    mean something — but if one of those tests ever fails on a zero, read the bit
+    patterns before assuming a real divergence. Neither item is a live defect;
+    both are recorded so the next person does not have to re-derive that they
+    were seen and judged.
   - **2026-08-29 — P4 ledger for Flash-Next (what "experimental" currently
     means).** **Serve is REFUSED for this checkpoint** — as of 643a411 that
     refusal is enforced in code (`Model::servable()` false: startup refusal for

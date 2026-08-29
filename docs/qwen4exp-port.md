@@ -13,17 +13,30 @@ divergence is resolved at construction time.
 
 ## Status
 
-- Phase: **P2 units U0-U7 LANDED 2026-08-29 — FIRST LIGHT, and the graph agrees
-  with the oracle.** The model loads, prefills, decodes and stops cleanly on
-  `UD-Q4_K_XL`, and U7 graded it against llama.cpp at `6fe749801`: 189/192
-  forced-replay agreement with zero hard mismatches (see "P2 parity result"
-  below; full record in docs/qwen4exp-parity-2026-08-29.md). **The review round
-  is CLOSED** — 21 items from the Claude/Qwen/Fable rounds fixed in 643a411,
-  suite 977/977. **P2 is done; the arc pauses here.** Next is P3, with two P4
-  items opened by U7 (the parity harness cannot run on this geometry at all, and
-  prefill is 3.5x off llama.cpp) and serve refused until the snapshot work
-  lands. The plan, its decisions (D14-D18) and the unit breakdown are in the
-  "P2 plan" section below; the file:line map is docs/qwen4exp-p2-map.md.
+- Phase: **P3 (perf) FIRST PASS LANDED 2026-08-29 — prefill and decode both now
+  edge llama.cpp on the same file.** Three changes did it: a Q5_1 arm in the
+  vendored `mm_id` (8112733), four fused hyper-connection kernels (8aeed73) and
+  a split norm launch below 32 tokens (2c8d3b3), plus PLE row prefetch
+  (ac40526) and the review polish (188ba73). At a 530-token prompt, interleaved:
+  **prefill 239 → 796 tok/s** against llama.cpp's 789, **decode 37.8 → 43.1**
+  against 41.4. Graded by forced replay at 186/192 with 0 hard mismatches, and the shipped checkpoints
+  re-gated (35B and 27B ALL PASS at fd46c7a). Decisions D19-D25. **P3 pauses
+  here with its ledger open**: the PLE gate/conv are still on the host, QSA
+  top-k is still on the host, decode is bimodal for no known reason, and the
+  PLE prefetch A/B is not yet measured. See "Perf state" below and TODO.md's P3
+  ledger.
+- Phase before it: **P2 units U0-U7 LANDED 2026-08-29 — FIRST LIGHT, and the
+  graph agrees with the oracle.** The model loads, prefills, decodes and stops
+  cleanly on `UD-Q4_K_XL`, and U7 graded it against llama.cpp at `6fe749801`:
+  189/192 forced-replay agreement with zero hard mismatches (see "P2 parity
+  result" below; full record in docs/qwen4exp-parity-2026-08-29.md). **The
+  review round is CLOSED** — 21 items from the Claude/Qwen/Fable rounds fixed in
+  643a411, suite 977/977. Two P4 items were opened by U7 (the parity harness
+  cannot run on this geometry at all, and prefill was 3.5x off llama.cpp — the
+  second of those closed by P3), and serve stays refused until the snapshot work
+  lands.
+  The plan, its decisions (D14-D18) and the unit breakdown are in the "P2 plan"
+  section below; the file:line map is docs/qwen4exp-p2-map.md.
 - Runnable weights: `UD-Q4_K_XL` (111.33 GB, 4 shards) in the HF cache and
   RUNNING as of 2026-08-29. Full published ladder surveyed below.
 - llama.cpp support: PR #27742 **MERGED** into master 2026-08-27 as squash
@@ -50,7 +63,7 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
 
 > **docs/decisions.md "Qwen3.8-Flash-Next (qwen4exp)" is now the authority for these
 > decisions** (migrated 2026-08-29). The list below is kept as the record of what was
-> decided when, and as the numbering D1-D18 that the rest of this doc cites.
+> decided when, and as the numbering D1-D25 that the rest of this doc cites.
 
 
 - **D1 (2026-08-26) Third arch, composition over forking.** `Arch::Qwen4Exp` gets
@@ -261,6 +274,35 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   is `x0 = (qs[j] & 0xF) | ((qh >> j) << 4 & 0x10)`,
   `x1 = (qs[j] >> 4) | ((qh >> (j + 12)) & 0x10)`, `y[j] = x0·d + m`,
   `y[j+16] = x1·d + m` — non-interleaved halves (ggml-quants.c).
+- **D19 (2026-08-29) Every Flash-Next-only cost gets a profiler stage, and profiled
+  decode numbers are NOT timings.** PLE, QSA selection and the token readback had
+  been falling into `inter_stage_host`. Quote unprofiled tok/s for anything
+  headline: the profiler's per-stage syncs put PLE decode at 6.4 ms/token where
+  the real figure is ~2.1. Full text in decisions.md.
+- **D20 (2026-08-29) Q5_1 `mm_id` arm, copied verbatim from the pinned
+  llama.cpp; `_t_hp` deliberately not instantiated.** D18's item (b), landed
+  8112733. Items (a) (`mv_id` decode arm) and (c) (per-stack `use_mm`) stay
+  open. Full text in decisions.md.
+- **D21 (2026-08-29) The hyper-connection GLUE is fused (K1-K4); the two Q8_0
+  bottleneck gemms stay `QMatMul`.** `low_rank` is 320, so those are real gemms.
+  K2/K4 bit-identical, K1/K3 bounded; the injection head is duplicated as a
+  dense f32 copy so `XWEN_HC_CLASSIC` stays the same computation. Full text in
+  decisions.md.
+- **D22 (2026-08-29) Below `HC_SPLIT_MAX_N` (32) the hc norm splits across
+  streams, bit-identically.** Fixes the 6% decode loss the fusion cost at
+  `n == 1`. Both launch shapes compute the same bits, so
+  `XWEN_HC_SPLIT_MAX_N` is an A/B knob, not a kill switch. Full text in
+  decisions.md.
+- **D23 (2026-08-29) PLE rows are prefetched advisorily, never gated on the PLE
+  gate value, with the row math single-sourced and `MADV_RANDOM` on the table
+  range only.** Full text in decisions.md; measured effect
+  `measured 2026-08-29 with one cold prompt per arm (the same-prompt design is invalid — greedy decode hashes every arm to the same rows, so arm k warms arm k+1): median decode gather 0.002 ms with prefetch vs 0.97-1.02 ms without, PLE total 1.05 vs 2.03 ms per token, decode 45.0 vs 43.2 tok/s, pf_dropped 0; MADV_RANDOM is neutral either way (0.002 vs 0.002 with prefetch, 0.97 vs 1.02 without) and stays on only because it is harmless and switchable`.
+- **D24 (2026-08-29) Refuted: the ~15 GB of private memory is a leak.** ~11.4 GB
+  is accounted for as deliberate design shared with the shipped checkpoints;
+  three shrinks are ledgered. Full text in decisions.md.
+- **D25 (2026-08-29) Forced replay against llama.cpp is this checkpoint's math
+  gate while the harness panics; free-run text is not a grade.** It forks on
+  near-ties at token 2. Full text in decisions.md.
 - **D7 (2026-08-26) Phase plan.** P0 scaffold (split-GGUF loader, config parse,
   registry) → P1 CPU references + fixtures for the three new components → P2
   graph assembly, load a real file, greedy smoke, ppl sanity vs PR #27742's
@@ -683,6 +725,30 @@ reference/qwen4exp/UPSTREAM-DIFF-2026-08-29.md finding 3.)
     Q4_K gate/up on 47 and Q5_K on layer 2. Any code that reads one layer's
     dtype and applies it to the stack, or that assumes gate/up/down agree, is
     wrong on every published qwen4exp file. (See the 640-column rule and D18.)
+18. **`XWEN_STACK_PROFILE` decode numbers are SYNC-INFLATED — they rank stages,
+    they are not timings.** The per-stage syncs drain the pipeline at `n == 1`,
+    so a profiled decode step reads far above the real one and the inflation is
+    not evenly spread: the PLE layer profiled at 6.4 ms/token (a fixed ~6 ms per
+    forward plus ~44 µs/token, a shape that reads exactly like driver overhead)
+    where the real cost is ~2.1 ms, dominated by per-token page faults. Take
+    every decode headline from an UNPROFILED run and use the profile only for
+    ordering. Prefill does not have this problem — the stages are large and
+    already synchronised (D19).
+19. **Free-run greedy text FORKS on near-ties, so a text diff is not a grade on
+    this checkpoint.** Two builds that differ only in a bounded kernel diverge
+    at the first near-tie and stay diverged — measured at token 2 on a
+    0.0817-logit margin — after which every later token is uninformative. Grade
+    by FORCED REPLAY against llama.cpp (`logits-dump --replay`), which is what
+    the shipped checkpoints' decode tier does and what U7 built by hand here
+    (D25). A changed sample is evidence of nothing; a dropped replay agreement
+    with a hard mismatch is.
+20. **`git diff | git apply` drops untracked NEW files when landing a
+    worktree's work.** A diff taken that way carries modifications to tracked
+    files only, so a change that introduces new files lands silently
+    incomplete and fails to build in a way that looks like a merge problem.
+    It cost `hc.metal` and `hc.rs` once during P3. Land a worktree branch with
+    git (cherry-pick, merge, or `git -C <worktree> format-patch`), or at minimum
+    check `git status` in the source worktree for untracked files first.
 
 ## Reuse-seams map (audited 2026-08-26; file:line refs from that audit)
 
@@ -976,25 +1042,69 @@ constants calibrated on the ggml-org Q4_K_M mix, and this is unsloth UD-Q4_K_XL 
 different mix, so the floors need re-deriving for this checkpoint even after the panic
 is fixed.
 
-### Perf state — Qwen3.8-Flash-Next (2026-08-29, first measurements)
+### Perf state — Qwen3.8-Flash-Next (2026-08-29, after P3's first pass)
 
-Plain (`--no-draft`, no drafter exists for this checkpoint): **decode 37.5-38.1
-tok/s**, **prefill 138-204 tok/s**. Against llama.cpp on the same file in the same
-hour: **decode 40.9-41.5**, **prefill 713.4 @ 530 tokens**. Decode is within ~8% and
-unremarkable. **Prefill is 3.5x slower and that is a real finding** — 2.60 s
-reproduced to the centisecond across two independent runs, so it is not first-forward
-pipeline compilation. Two known contributors: the 43 Q5_1-down layers prefill through
-the per-token `mul_mv_id` fallback (D18), and the dense-FFN prefill gemm was exactly
-this shape of problem on the 27B (P8c) and needed a vendored kernel to close. Memory,
-by `footprint` mid-decode: xwen dirties **15 GB** (64 GB clean mapped, peak 17) where
-llama-server dirties **751 MB** on the identical file — both fit, but 15 GB of real
-pressure is worth understanding under the one-large-process-at-a-time rule.
+Plain (`--no-draft`; no drafter exists for this checkpoint). 530-token prompt, 128
+decoded tokens, arms interleaved, four rounds, medians:
 
-Standard caveats, all of which apply: `lowpowermode 0` and high-power mode is NOT
-positively confirmable on this machine, so it is not claimed; single runs; the machine
-was shared with other agents' builds throughout, which depresses both arms (the decode
-RATIO is the trustworthy part, the absolutes less so); llama.cpp thermal-boosts harder
-than xwen (−17% vs −5% settling), which flatters its numbers.
+| arm | prefill tok/s | decode tok/s |
+| --- | --- | --- |
+| shipped (fused hc, split below 32, Q5_1 `mm_id`) | **795.7** | **43.1** |
+| `XWEN_HC_SPLIT_MAX_N=0` (fused, single kernel) | 793.5 | 35.1 |
+| `XWEN_HC_CLASSIC=1` (candle chains, Q5_1 arm still on) | 438.0 | 37.8 |
+| llama.cpp, same file, same hour | 789 | 41.4 |
+
+**1.01x llama.cpp on prefill and 1.04x on decode**, from 0.30x and 0.91x at the P2
+close. Net of the two hc commits against the classic chains: +82% prefill, +14%
+decode. The three arms produce byte-identical text over 128 tokens, so the split is a
+launch shape and nothing else (D22).
+
+Where P3's prefill came from, at 530 tokens (`XWEN_STACK_PROFILE`, prefill stages only
+— profiled DECODE numbers are sync-inflated and rank stages only, trap #18):
+
+| stage | share of prefill wall, before | after |
+| --- | --- | --- |
+| `ffn` | 51.0% | ffn stage 2887 → 1031 µs/token (Q5_1 `mm_id` arm) |
+| hc glue (`hc_*.read` ×2 + `hc_write` ×2) | 34.3% | `attn_norm` 726 → 209, `ffn_norm` 726 → 227, residuals 325 → 105 µs/token |
+| `mixer_delta` | 8.4% | untouched |
+| `mixer_full_attn` | 3.7% | untouched |
+| `ple` | 1.9% | untouched (prefetch is not a prefill win — a warm chunk gathers 8192 rows in 2 ms) |
+| `qsa_select` | 0.3% | untouched |
+
+Unaccounted was 0 at both 530 and 880 tokens; at 880 the shape is the same with ffn at
+54%. Prefill wall 2105 → 1279 ms across the hc change alone. `XWEN_CHUNK_SYNC` moves
+prefill by under 0.5%, so nothing accumulates across chunks.
+
+Decode, per the PLE sub-step profile (`XWEN_PLE_PROFILE`): the PLE layer costs ~2.1 ms
+of a ~28 ms step, of which ~0.85 ms is a fixed floor (projections 0.33, three
+readbacks 0.50) and the rest is page faults on the 16 IQ4_NL table rows a token hashes
+to — flat per token, median ~1.1 ms with 6.5 ms spikes, only 4.7% page-cache hits. The
+host gate and conv are ~40 ms of a 512-token prefill chunk. Cold first chunk gathers in
+439 ms.
+
+Memory, by `footprint` mid-decode: xwen dirties **15 GB** (64 GB clean mapped, peak 17)
+where llama-server dirties **751 MB** on the identical file. The audit (D24) accounts
+for ~11.4 GB of that as deliberate design shared with the shipped checkpoints — f16
+dequant planes for the prefill gemm, a whole-table f16 `token_embd`, non-aliased Q8_0
+copies — so it is a strategy difference, not a leak. Three shrinks are ledgered.
+
+Caveats that apply to every number here: `pmset -g` reported `powermode 0` this session
+(no `lowpowermode` key today) and high-power mode is NOT positively confirmable on this
+machine, so it is not claimed; the machine was shared with other agents' builds
+throughout, which depresses both arms; llama.cpp thermal-boosts harder than xwen (−17%
+vs −5% settling), which flatters its numbers. **Decode is bimodal round over round** —
+42 vs 44 tok/s on the shipped arm, 34 vs 36 on the unsplit one — and unexplained
+(TODO.md).
+
+**Superseded — the P2 first measurements (2026-08-29, earlier the same day)**, kept
+because the gap they recorded is what P3 was aimed at: decode 37.5-38.1 tok/s, prefill
+138-204, against llama.cpp's 40.9-41.5 and 713.4 @ 530 tokens. Prefill was 3.5x slower,
+2.60 s reproduced to the centisecond across two independent runs, so never pipeline
+compilation. Of the two contributors named then, only the first survived: the 43
+Q5_1-down layers prefilling through the per-token `mul_mv_id` fallback (D18) was worth
+1.85x on its own, while the second — a dense-FFN-shaped gemm problem by analogy with the
+27B's P8c — was wrong. The other third of the prefill wall was the hyper-connection
+GLUE, which is dispatch count rather than a gemm.
 
 ## Open questions (blocked, with what unblocks them)
 
@@ -1246,3 +1356,44 @@ than xwen (−17% vs −5% settling), which flatters its numbers.
   the stack tests, which is what makes the per-layer/per-plane dtype mixing of
   trap #17 actually covered; checked PLE row math; a conv-orientation pin; and
   budget/ratio validation.
+
+- **2026-08-29 (P3 first pass — the prefill gap closes and decode passes
+  llama.cpp)**: profiler first. `XWEN_STACK_PROFILE` had been folding PLE, QSA
+  selection and the token readback into `inter_stage_host`, so b54046b gave each
+  its own bracket (and `scripts/hf.ts` learned the flash-next checkpoint so
+  `bench.ts` can resolve it). The attribution at 530 tokens was unambiguous —
+  ffn 51%, hyper-connection glue 34%, `mixer_delta` 8%, PLE 2%, unaccounted 0 —
+  and it ruled out cross-chunk accumulation on the way (`XWEN_CHUNK_SYNC` moves
+  prefill under 0.5%). Then three commits, each A/B'd interleaved against its own
+  before-arm: **8112733** a Q5_1 arm in the vendored `mm_id` (D20) — prefill 239
+  → 443 tok/s, the ffn stage 2887 → 1031 µs/token, decode unmoved at 37.7 because
+  decode still takes candle's baked `mv_id`; **8aeed73** four fused
+  hyper-connection kernels (D21) — prefill 443 → 765-781 against llama.cpp's
+  788-790 in the same hour, but decode DOWN 6% to 35.8, because the fused norm
+  ran one threadgroup per token at `n == 1`; **2c8d3b3** the split norm launch
+  below 32 tokens (D22) — decode 37.8 → 43.1, bit-identical to the single kernel
+  and to the pre-split build over 128 tokens of generated text. End state at a
+  530-token prompt, four interleaved rounds: **prefill 795.7 vs llama.cpp's 789,
+  decode 43.1 vs 41.4.** Separately, fd46c7a instrumented the PLE layer's
+  sub-steps and refuted the driver-overhead reading of its decode cost: it is
+  per-token page faults on the 16 IQ4_NL rows a token hashes to (4.7% cache
+  hits), ~2.1 ms of a ~28 ms step rather than the profiled 6.4, which is what
+  trap #18 is about. ac40526 acted on that with an advisory prefetch thread plus
+  `MADV_RANDOM` on the table range (D23); its A/B is `measured 2026-08-29 with one cold prompt per arm (the same-prompt design is invalid — greedy decode hashes every arm to the same rows, so arm k warms arm k+1): median decode gather 0.002 ms with prefetch vs 0.97-1.02 ms without, PLE total 1.05 vs 2.03 ms per token, decode 45.0 vs 43.2 tok/s, pf_dropped 0; MADV_RANDOM is neutral either way (0.002 vs 0.002 with prefetch, 0.97 vs 1.02 without) and stays on only because it is harmless and switchable`.
+  Correctness: forced replay against llama.cpp with both kernel changes active
+  is **186/192, 0 hard mismatches, 0 non-finite**, the six divergences all rank-2
+  near-ties at 0.009-0.30 logit against U7's pre-P3 189/192 — and the shipped
+  checkpoints were re-gated at fd46c7a, 35B-A3B ALL PASS (6 graded) and 27B ALL
+  PASS (5 graded). Reviews across d5757f1..ac40526: Fable and Fable-2 no defects,
+  Opus and Opus-2 no correctness defects, Qwen no high findings; the one real
+  find was the parity gate inheriting `XWEN_HC_CLASSIC`/`XWEN_PLE_PROFILE` from
+  the caller's environment (fixed 6eaf980), and Opus naming the
+  single-threadgroup decode mechanism before the profile did; 188ba73 landed the polish
+  from both rounds (`fused()` now checks the weights it binds, so the documented
+  fall-back holds; a bitwise test that had drifted onto the split pair is pinned back to
+  the single kernel; the PLE table length is validated before its range is
+  advised). The P2 private-
+  memory mystery was also closed as design, not a bug (D24): ~11.4 GB of the
+  15 accounted for, and the follow-ups ledgered. **P3 pauses here**, with the
+  device-side PLE gate/conv, the QSA top-k kernel, the `mv_id` Q5_1 arm, an
+  unexplained bimodal decode and the prefetch A/B all in TODO.md's P3 ledger.

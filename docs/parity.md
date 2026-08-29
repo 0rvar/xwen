@@ -41,6 +41,16 @@ All three **re-passed again at xwen 643a411**, after the prefill-mask layout cha
 (one f16 plane broadcast across heads, on every checkpoint) and the rest of that fix
 round — 35B-A3B and 27B six graded checks each, 3.8-27B five with the same ppl skip.
 
+**Re-passed again at xwen fd46c7a** (2026-08-29), after the P3 Metal source changes —
+the Q5_1 arm in the vendored `mm_id` and the four fused hyper-connection kernels:
+**35B-A3B ALL PASS**, six graded checks (mm cos 0.999631, ppl Δnll 0.000791), and
+**Qwen3.6-27B ALL PASS**, five graded. Nothing was re-measured or moved. The two
+commits after it — 2c8d3b3 (the hc norm's split launch) and ac40526 (PLE row prefetch)
+— were NOT re-gated, deliberately: the split path is reachable only from the qwen4exp
+carrier and is bit-identical to the kernel it replaces even there, and the prefetch is
+non-numeric (it faults pages early and changes no value). Neither touches a shipped
+checkpoint's math.
+
 ```bash
 just init                               # git submodule update --init --recursive
 bash scripts/build-llamacpp.sh          # cmake from an ephemeral nix shell, system CLT SDK
@@ -339,6 +349,21 @@ Env combinations that define each side (what `parity-gate.ts` sets for you):
 list — the gate checks both as provenance on both sides of the strict tier (see
 "Provenance pins"), so a manual dump that omits either fails the tier rather than
 merely shifting numbers.
+
+Five more switches exist and appear in NO row of that table, because they affect
+**qwen4exp (Qwen3.8-Flash-Next) only** — a checkpoint the harness cannot yet run at all
+(see "Limitations"). They are listed here so a future gate extension does not rediscover
+them, and because `parity-gate.ts` explicitly strips the first two from the run env
+(6eaf980): inheriting one from the caller's shell would grade a path the report does not
+name.
+
+| switch | what it does | why it is not a gate row |
+|---|---|---|
+| `XWEN_HC_CLASSIC=1` | reverts the four fused hyper-connection kernels to the candle chains they replace | a real kill switch, and the one to pin on a reference side once qwen4exp is gradeable: `hc_silu_quarter` and `hc_write` are bit-identical to the chains but `hc_norm` and `hc_mix` are BOUNDED, the same class as `XWEN_DELTA_CLASSIC` |
+| `XWEN_HC_SPLIT_MAX_N=<n>` | token-count ceiling below which the hc norm takes the split launch (default 32; `0` pins the single kernel, a large value pins the split pair) | an A/B knob, not a kill switch — both launch shapes compute the SAME BITS (`split_matches_single_bitwise`), so it can never move a parity number |
+| `XWEN_PLE_PROFILE=1` | one stderr line per forward with the PLE layer's sub-step timings | instrumentation; zero cost unset, and it adds syncs that inflate decode |
+| `XWEN_PLE_NO_PREFETCH=1` | disables the advisory PLE row prefetch thread | non-numeric — the prefetch only faults pages early |
+| `XWEN_PLE_NO_RANDOM=1` | skips `MADV_RANDOM` on the PLE table's byte range | non-numeric, same reason |
 
 `XWEN_MOE_GLUE_CLASSIC=1` is the opposite case and is deliberately NOT on the strict
 candidate: the fused MoE router and block epilogue are bit-identical to the candle
@@ -720,3 +745,14 @@ the fixture and the frozen bound — recalibrate.
   parity is not available; both tracks compare the last position.
 - Run eval-callback with `-ngl 999` (the `ref-dump.sh` default) so the oracle uses
   the Metal path, closest to our engine.
+- **The harness cannot run on Qwen3.8-Flash-Next (`qwen4exp`) at all** (2026-08-29).
+  Every tier's reference side is `--moe-impl reference` and `ReferenceExperts::forward`
+  panics on that checkpoint's 512-expert / top-10 geometry (`src/moe.rs:198`), so no
+  tier reaches a grade; the fused runner is unaffected. Until one fix unblocks all
+  four, that checkpoint's math is graded by **forced replay against llama.cpp**
+  (`logits-dump --replay` along the oracle's own greedy trajectory — the decode tier's
+  methodology with llama.cpp standing in for the blocked reference runner; method and
+  numbers in docs/qwen4exp-parity-2026-08-29.md). Two things follow even after the
+  panic is fixed: the floors here are calibrated on the ggml-org Q4_K_M mix and that
+  file is unsloth UD-Q4_K_XL, so they need re-deriving for it, and it has no
+  reference-ppl fixture. All ledgered in TODO.md.

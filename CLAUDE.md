@@ -214,6 +214,13 @@ Those drafted figures are WITHIN-SWEEP against the plain arm of the same sweep;
 do not difference them against a drafted number from another session — the 27B's
 between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 reads
 36.5-37.6 in today's own 0.3 arm.
+Qwen3.8-Flash-Next (EXPERIMENTAL, CLI-only), 2026-08-29 after the P3 kernel pass,
+plain because no drafter exists for it: **prefill ~796 tok/s @530, decode ~43**,
+against llama.cpp's 789 / 41.4 on the same file in the same hour (four interleaved
+rounds, medians; `pmset -g` said `powermode 0` that session — still no high-power
+claim). Its decode is bimodal round over round (~42 vs ~44) and unexplained, and
+`XWEN_STACK_PROFILE`'s decode stages are SYNC-INFLATED — they rank stages, they are
+not timings, so take every headline from an unprofiled run.
 Within-session cross-drafter comparison, 2026-08-15 (the only way to compare the
 two kinds honestly — same machine, same hour): the 3.6-27B's DFlash head runs
 1.50x/1.47x over its own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x
