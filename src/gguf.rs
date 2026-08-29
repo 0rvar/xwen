@@ -345,6 +345,20 @@ pub struct GgufFile {
     shard_of: HashMap<String, usize>,
 }
 
+/// One tensor's bytes as a location in a mapped shard rather than a loaded
+/// tensor — see [`GgufFile::raw_tensor`].
+pub(crate) struct RawTensor {
+    /// The mapping the bytes live in. Held as an `Arc` because the reader
+    /// outlives the call (`MmapSource`'s lifetime invariant).
+    pub src: Arc<MmapSource>,
+    /// Absolute byte offset of the tensor's first block inside `src`.
+    pub offset: usize,
+    /// The tensor's byte length in its stored dtype.
+    pub len: usize,
+    pub dtype: GgmlDType,
+    pub shape: Vec<usize>,
+}
+
 impl GgufFile {
     /// THE alias-load mapping of a single-file GGUF, present on Metal unless
     /// `XWEN_LOAD_CLASSIC`. A holder of aliased weights whose tensors cannot
@@ -381,6 +395,55 @@ impl GgufFile {
             Some(&i) => &self.shards[i],
             None => &self.shards[0],
         }
+    }
+
+    /// Where one tensor's bytes physically live: the shard mapping holding
+    /// them, the absolute offset into it, the byte length, the stored dtype and
+    /// the shape.
+    ///
+    /// For the one consumer that reads a tensor on the CPU instead of uploading
+    /// it: the PLE n-gram table, 28.8 GB that never becomes a device tensor and
+    /// is gathered one 160-float row at a time (docs/qwen4exp-port.md D2). It
+    /// therefore returns a location, not a `Tensor` — and needs the mmap, so a
+    /// classic (non-aliasing) open is refused here rather than silently
+    /// reading through the file handle a row at a time.
+    ///
+    /// The dtype comes from candle's parsed tensor table, so this covers the
+    /// dtypes candle can name. An IQ4_NL table (every Unsloth Q3/Q4 mix) is not
+    /// one of them — `Content::read` cannot parse such a file at all — and
+    /// reaches the reader through `qwen4exp::ple::PleTable::from_source`, which
+    /// takes the location directly from the loader that parsed it (D8 class 1).
+    pub(crate) fn raw_tensor(&self, name: &str) -> Result<RawTensor> {
+        let info = self
+            .content
+            .tensor_infos
+            .get(name)
+            .with_context(|| format!("tensor {name} not found"))?;
+        let src = self
+            .shard_for(name)
+            .mmap
+            .as_ref()
+            .with_context(|| {
+                format!(
+                    "tensor {name} has no file mapping to read rows from (non-Metal device, or \
+                     XWEN_LOAD_CLASSIC)"
+                )
+            })?
+            .clone();
+        let dtype = info.ggml_dtype;
+        let block = dtype.block_size();
+        let elems = info.shape.elem_count();
+        ensure!(
+            elems.is_multiple_of(block),
+            "{name}: {elems} elements is not a multiple of {dtype:?} block size {block}"
+        );
+        Ok(RawTensor {
+            src,
+            offset: (self.content.tensor_data_offset + info.offset) as usize,
+            len: elems / block * dtype.type_size(),
+            dtype,
+            shape: info.shape.dims().to_vec(),
+        })
     }
 
     /// Identity of this checkpoint, computed once at `open`. Persisted artifacts
@@ -1106,6 +1169,69 @@ impl Weights {
             bail!("{} is not a rank-2 weight: {dims:?}", self.name(name));
         };
         Ok(t)
+    }
+
+    /// The dtype `<prefix>.<name>.weight` is STORED at, before any dequantize.
+    /// A caller whose kernel choice depends on the storage (the QSA indexer,
+    /// whose projections upstream keeps off the quantizer's list) asks this
+    /// rather than guessing from the file's `general.file_type`, which
+    /// describes the mix and not any one tensor.
+    pub fn stored_dtype(&self, name: &str) -> Result<GgmlDType> {
+        let full = self.name(name);
+        Ok(self
+            .src
+            .content
+            .tensor_infos
+            .get(&full)
+            .with_context(|| format!("tensor {full} not found"))?
+            .ggml_dtype)
+    }
+
+    /// A rank-2 weight `[out_dim, in_dim]` stored BF16, as a dense bf16 tensor
+    /// for `ops::matmul_bf16`. The `qwen4exp` QSA indexer's `indexer.q_proj` /
+    /// `indexer.k_proj` are the callers: upstream's converter puts both on the
+    /// quantizer's skip list, so they arrive at the source precision (BF16) in
+    /// every quant mix, and candle's `QMatMul` has no bf16 route.
+    ///
+    /// On an mmap load the GGUF bytes ARE the dense plane, so this aliases the
+    /// page cache exactly as `dense_f16` does. `ensure_bf16_fits_f16` runs
+    /// first for the same reason it runs on the drafter planes: the bf16
+    /// tensor-path gemm stages bf16 → half, and a value outside f16's range
+    /// would become inf mid-kernel.
+    ///
+    /// A file that ships these at some other dtype (a self-conversion that let
+    /// the quantizer touch them) takes the copying path — dequantize, then
+    /// round to bf16 — rather than failing to load.
+    pub fn dense_bf16(&self, name: &str) -> Result<Tensor> {
+        let full = self.name(name);
+        let info = self
+            .src
+            .content
+            .tensor_infos
+            .get(&full)
+            .with_context(|| format!("tensor {full} not found"))?;
+        let dims = info.shape.dims().to_vec();
+        let [out_dim, in_dim] = dims[..] else {
+            bail!("{full} is not a rank-2 weight: {dims:?}");
+        };
+        if info.ggml_dtype == GgmlDType::BF16
+            && let Some(src) = self.src.shard_for(&full).mmap.as_ref()
+        {
+            let abs_off = (self.src.content.tensor_data_offset + info.offset) as usize;
+            let len = out_dim * in_dim * DType::BF16.size_in_bytes();
+            crate::dflash::ensure_bf16_fits_f16(src.bytes(abs_off, len)?, &full)?;
+            return dense_alias_tensor(
+                src,
+                &self.src.device,
+                abs_off,
+                out_dim,
+                in_dim,
+                DType::BF16,
+            )
+            .with_context(|| format!("mmap-aliasing {full}"));
+        }
+        let qt = self.qtensor(name)?;
+        Ok(qt.dequantize(&self.src.device)?.to_dtype(DType::BF16)?)
     }
 
     /// One attention projection weight `[out_dim, in_dim]`: the dense f16 plane
