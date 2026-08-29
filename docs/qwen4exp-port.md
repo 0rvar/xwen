@@ -1088,6 +1088,14 @@ Units (U2-U5 parallel, then U6, then U7):
   in 0.22 s (35.7 tok/s). **Those are a tiny sample from one cold run, not a
   perf claim, and the power mode is not confirmed** — the real numbers come
   after U7 and P3.
+  **Second smoke** (greedy, thinking ON, `--no-draft`, max_ctx 4096, a code
+  prompt): 400 coherent tokens — reasoning inside `<think>`, a clean `</think>`,
+  then a working Python function with a unittest. Warm load 20.8 s, 77.1 GB
+  resident; prefill 78 tokens in 0.57 s (137.6 tok/s), decode 400 tokens in
+  10.68 s (37.5 tok/s). Same caveats as above — single run, power mode not
+  confirmed — plus one specific to this file: the 43 Q5_1-down layers prefill
+  through the per-token `mul_mv_id` fallback (D18), so prefill here is a floor,
+  not the shape's ceiling.
   One upstream-worthy find from U3: candle's Metal `index_select` is **silently
   wrong on strided sources** — no error, just wrong rows. Worked around by
   gathering per head; worth reporting upstream.
