@@ -17,7 +17,9 @@
 //! two projections and the key norm run on the GPU; the gate, the conv and the
 //! silu run on the host in f32 over a downloaded copy of the carrier, which
 //! costs one device→host sync per forward. That is a known P3 cost, taken so
-//! the first correct version is a short walk from the oracle.
+//! the first correct version is a short walk from the oracle. `XWEN_PLE_PROFILE`
+//! ([`crate::ops::ple_profile`]) splits one forward into its sub-steps and says
+//! which half of that hybrid the layer's `stack_profile` figure actually is.
 //!
 //! The reuse here is deliberate and not an accident of convenience: the hash
 //! ([`super::ref_ple::PleHashRef`]) and the grouped RMS norm
@@ -26,6 +28,7 @@
 //! it. The references are frozen, so nothing can drift underneath.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::quantized::GgmlDType;
@@ -36,6 +39,7 @@ use super::ref_hc::grouped_rms_norm;
 use super::ref_ple::{PleHashRef, gate_function_probe};
 use crate::config::XwenConfig;
 use crate::gguf::{GgufFile, MmapSource, QLinear, RawDtype, StoredDtype, Weights};
+use crate::host_log::host_line;
 
 /// The stored dtypes the n-gram table is read at.
 ///
@@ -744,8 +748,12 @@ impl PleLayer {
             state.state_len
         );
 
+        // Sub-step timing, off unless XWEN_PLE_PROFILE is set (ops::ple_profile).
+        let mut prof = FwdProfile::start(&self.device)?;
+
         // --- host: hash, then gather and dequantize 16 table rows per token.
         let rows = self.hash.rows(&state.history, tokens);
+        ple_step(&mut prof, "hash");
         let emb_dim = self.n_heads * self.head_dim;
         let mut emb = vec![0.0f32; n * emb_dim];
         for (t, row_set) in rows.chunks_exact(self.n_heads).enumerate() {
@@ -756,11 +764,14 @@ impl PleLayer {
                     .with_context(|| format!("gathering PLE row for token {t}, head {h}"))?;
             }
         }
+        ple_step(&mut prof, "gather");
 
         // --- device: the two projections and the key norm.
         let emb_t = Tensor::from_vec(emb, (n, emb_dim), &self.device)?;
+        ple_step_device(&mut prof, &self.device, "upload")?;
         let key = self.grouped_norm_device(&self.key_proj.forward(&emb_t)?)?;
         let value = self.value_proj.forward(&emb_t)?;
+        ple_step_device(&mut prof, &self.device, "proj")?;
 
         // --- the one sync per forward (D17). 40 KB per token at the shipped
         // geometry, and the reason this layer is on P3's list.
@@ -773,6 +784,9 @@ impl PleLayer {
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        // No sync of its own: each `to_vec1` commits and waits on the way past,
+        // so the device is already idle here.
+        ple_step(&mut prof, "readback");
 
         // --- host: the per-stream gate, and the conv input's own norm.
         let scale = 1.0 / (self.hidden as f32).sqrt();
@@ -809,6 +823,7 @@ impl PleLayer {
             );
             gated_normed[row].copy_from_slice(&normed);
         }
+        ple_step(&mut prof, "gate");
 
         // --- host: depthwise causal conv, channel-major over state ++ chunk:
         //   out[c, t] = Σ_j w[c, j] · x[c, t - (k - 1 - j) · dilation]
@@ -841,6 +856,7 @@ impl PleLayer {
             state.conv[c * state_len..(c + 1) * state_len]
                 .copy_from_slice(&line[line_len - state_len..]);
         }
+        ple_step(&mut prof, "conv");
 
         // While a checkpoint is armed, record the state after each token so a
         // partial accept can land between them. `padded` still holds the whole
@@ -862,10 +878,87 @@ impl PleLayer {
                 )?;
             }
         }
+        // Zero on every ordinary forward — an unarmed state records nothing —
+        // and non-zero only inside a speculative verify.
+        ple_step(&mut prof, "trail");
 
         state.history = self.hash.next_history(&state.history, tokens);
-        Ok(Tensor::from_vec(out, (n, width), &self.device)?)
+        let addend = Tensor::from_vec(out, (n, width), &self.device)?;
+        ple_step_device(&mut prof, &self.device, "out_upload")?;
+        ple_report(&prof, n, &rows);
+        Ok(addend)
     }
+}
+
+/// One forward's sub-step wall clock, gated on [`crate::ops::ple_profile`].
+///
+/// Held as an `Option` by the forward, so with the switch unset every hook is
+/// one `is_none` check and no clock is ever read. The steps are recorded in the
+/// order they run and printed once, at the end of the forward — a forward that
+/// returns an error prints nothing, because the numbers it would print would be
+/// missing whichever step failed.
+struct FwdProfile {
+    /// Start of the open sub-step. Every interval since the previous step's
+    /// close belongs to the next step recorded, so the printed steps sum to the
+    /// bracket and nothing between them goes unaccounted.
+    mark: Instant,
+    steps: Vec<(&'static str, Duration)>,
+}
+
+impl FwdProfile {
+    /// Opens the bracket from an idle device, or returns `None` when the switch
+    /// is unset. The entry sync is what makes a device sub-step's figure mean
+    /// "this step's GPU work" rather than "this step's GPU work plus whatever
+    /// the caller left queued".
+    fn start(device: &Device) -> Result<Option<Self>> {
+        if !crate::ops::ple_profile() {
+            return Ok(None);
+        }
+        device.synchronize()?;
+        Ok(Some(Self {
+            mark: Instant::now(),
+            steps: Vec::new(),
+        }))
+    }
+}
+
+/// Close a host sub-step: no sync, because nothing was dispatched.
+fn ple_step(p: &mut Option<FwdProfile>, name: &'static str) {
+    if let Some(p) = p.as_mut() {
+        let now = Instant::now();
+        p.steps.push((name, now.duration_since(p.mark)));
+        p.mark = now;
+    }
+}
+
+/// Close a sub-step that dispatched device work, waiting for it first — the
+/// same contract `stack_profile` holds its stages to.
+fn ple_step_device(p: &mut Option<FwdProfile>, device: &Device, name: &'static str) -> Result<()> {
+    if p.is_some() {
+        device.synchronize()?;
+        ple_step(p, name);
+    }
+    Ok(())
+}
+
+/// Print the bracket. `rows` is the table row set this forward gathered; its
+/// distinct count is computed here and only here, so an unprofiled forward
+/// never builds the set.
+fn ple_report(p: &Option<FwdProfile>, n: usize, rows: &[u64]) {
+    let Some(p) = p.as_ref() else { return };
+    let distinct: std::collections::HashSet<u64> = rows.iter().copied().collect();
+    let total: Duration = p.steps.iter().map(|(_, d)| *d).sum();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let mut line = format!(
+        "xwen: ple-profile n={n} rows={} distinct={} total={:.3}ms",
+        rows.len(),
+        distinct.len(),
+        ms(total),
+    );
+    for (name, d) in &p.steps {
+        line.push_str(&format!(" {name}={:.3}", ms(*d)));
+    }
+    host_line(line);
 }
 
 /// `x · sigmoid(x)`, written as the oracle writes it

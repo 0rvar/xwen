@@ -132,6 +132,34 @@ pub fn stack_profile() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_STACK_PROFILE").is_some())
 }
 
+/// `XWEN_PLE_PROFILE` breaks ONE `Stage::Ple` bracket into its sub-steps and
+/// prints a line per forward: the n-gram hash, the mmap row gather + IQ4_NL
+/// dequant, the embedding upload, the device projections, the device→host
+/// readback, the host gate, the host conv, the speculative trail, and the
+/// addend upload.
+///
+/// `stack_profile` prices the PLE layer as one number; this says which half of
+/// the D17 hybrid that number is. The device sub-steps are bracketed by
+/// `Device::synchronize` on the same contract `stack_profile` uses — a device
+/// step's figure is completed GPU work, not enqueue time — and the forward
+/// opens with a sync too, so an inherited backlog is charged to the caller's
+/// bracket rather than to whichever sub-step first drains it.
+///
+/// The line also carries the row count fetched from the table and how many of
+/// those rows were DISTINCT, which is the difference between "the gather is
+/// arithmetic" and "the gather is page faults": a decode step's 16 rows are
+/// 16 unrelated 90-byte reads scattered over a 28.8 GB mapping.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`stack_profile`, `dense_mm_classic`): any value enables it. Unset — the
+/// normal case — costs one `Option` check per sub-step and reads no clock at
+/// all. A forward that errors prints nothing, so a failed run's last PLE call
+/// is invisible here.
+pub fn ple_profile() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_PLE_PROFILE").is_some())
+}
+
 /// `XWEN_CHUNK_SYNC` makes the plain prefill loop wait for each chunk's forward
 /// to complete before enqueueing the next, instead of letting the chunks
 /// pipeline.
