@@ -238,7 +238,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DELTA_DECODE_KERNEL" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MV_EXT_CLASSIC" || k.startsWith("XWEN_MV_EXT_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k === "XWEN_HC_CLASSIC" || k === "XWEN_STACK_PROFILE" || k === "XWEN_CHUNK_SYNC" || k === "XWEN_PREFILL_CHUNK" || k === "XWEN_PLE_PROFILE" || k === "XWEN_DELTA_BA_CLASSIC" || k === "XWEN_QSA_CLASSIC" || k === "XWEN_QSA_HOST_TOPK" || k.startsWith("XWEN_MM_ID")) continue;
+    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ACT_L2_CLASSIC" || k === "XWEN_SHEXP_QMATMUL" || k === "XWEN_HC_GEMM_QMATMUL" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DELTA_DECODE_KERNEL" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MV_EXT_CLASSIC" || k.startsWith("XWEN_MV_EXT_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k === "XWEN_HC_CLASSIC" || k === "XWEN_STACK_PROFILE" || k === "XWEN_CHUNK_SYNC" || k === "XWEN_PREFILL_CHUNK" || k === "XWEN_PLE_PROFILE" || k === "XWEN_DELTA_BA_CLASSIC" || k === "XWEN_QSA_CLASSIC" || k === "XWEN_QSA_HOST_TOPK" || k.startsWith("XWEN_MM_ID")) continue;
     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
     // those explicitly per run; an inherited one would skew every tier.
     if (k.startsWith("XWEN_PARITY_")) continue;
@@ -486,6 +486,9 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
     const delta = p.delta ?? (version < 6 ? "classic" : undefined);
     const denseMm = p.dense_mm ?? (version < 7 ? "classic" : undefined);
     const mvExt = p.mv_ext ?? (version < 8 ? "classic" : undefined);
+    const actL2 = p.act_l2 ?? (version < 9 ? "classic" : undefined);
+    const shexpGemm = p.shexp_gemm ?? (version < 9 ? "classic" : undefined);
+    const hcGemm = p.hc_gemm ?? (version < 9 ? "classic" : undefined);
     return (
       p.moe_impl === "reference" &&
       p.attn_dtype === "f32" &&
@@ -497,7 +500,10 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
       act === "classic" &&
       delta === "classic" &&
       denseMm === "classic" &&
-      mvExt === "classic"
+      mvExt === "classic" &&
+      actL2 === "classic" &&
+      shexpGemm === "classic" &&
+      hcGemm === "classic"
     );
   } catch {
     return false;

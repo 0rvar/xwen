@@ -286,6 +286,22 @@ struct Provenance {
     /// the two are level, reduction-order noise apart — and either way it is
     /// irrelevant to the pin: the oracle has to be one fixed path.
     mv_ext: Option<String>,
+    /// The f16-tile rescale branch's fused activation glue ("fused" for
+    /// `ops::silu_mul_l2`, "classic" for the candle chain — also the oracle's
+    /// unconditional value, its ReferenceExperts never reaching the branch).
+    /// Bounded-close (a different sum order), so load-bearing like `dense_mm`.
+    /// Introduced at schema version 9 with grandfather "classic".
+    act_l2: Option<String>,
+    /// The shared expert's prefill route ("fused" for the dense
+    /// cooperative-tensor gemm via `QLinear::forward_gemm`, "classic" for
+    /// QMatMul at every token count). Introduced at schema version 9 with
+    /// grandfather "classic".
+    shexp_gemm: Option<String>,
+    /// The hyper-connection bottleneck's prefill route ("fused" both
+    /// projections on the dense gemm, "classic" both on QMatMul, "down-only" /
+    /// "up-only" the split A/B arms). Introduced at schema version 9 with
+    /// grandfather "classic".
+    hc_gemm: Option<String>,
 }
 
 impl Provenance {
@@ -470,6 +486,32 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
                 Some(d) => Some(
                     d.as_str()
                         .context("provenance `mv_ext` is not a string")?
+                        .to_string(),
+                ),
+                None => None,
+            },
+            // The v9 trio: absent in pre-v9 dumps (grandfathered to "classic"
+            // by the version-aware check); present-but-not-a-string is malformed.
+            act_l2: match p.get("act_l2") {
+                Some(d) => Some(
+                    d.as_str()
+                        .context("provenance `act_l2` is not a string")?
+                        .to_string(),
+                ),
+                None => None,
+            },
+            shexp_gemm: match p.get("shexp_gemm") {
+                Some(d) => Some(
+                    d.as_str()
+                        .context("provenance `shexp_gemm` is not a string")?
+                        .to_string(),
+                ),
+                None => None,
+            },
+            hc_gemm: match p.get("hc_gemm") {
+                Some(d) => Some(
+                    d.as_str()
+                        .context("provenance `hc_gemm` is not a string")?
                         .to_string(),
                 ),
                 None => None,
@@ -925,6 +967,37 @@ fn check_mv_ext(p: &Provenance, side: &str, want: &str) -> Result<()> {
     check_field(p, side, "mv_ext", p.mv_ext.as_deref(), want)
 }
 
+/// `want` is "classic" for the Reference-oracle side (its ReferenceExperts
+/// never reaches the f16-tile rescale branch) and for strict-tier candidates
+/// (`XWEN_ACT_CLASSIC=1` pins the fold off along with the activation), and
+/// "fused" for the mm/decode/ppl candidates. Load-bearing like `check_dense_mm`:
+/// the fold's sum of squares runs in a different order than candle's
+/// `sum_keepdim`, so it is bounded-close, not bit-identical. Introduced at
+/// schema version 9 with grandfather "classic".
+fn check_act_l2(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "act_l2", p.act_l2.as_deref(), want)
+}
+
+/// `want` is "classic" for the Reference-oracle side and strict-tier
+/// candidates (both produced under `XWEN_DENSE_MM_CLASSIC=1`, which
+/// `QLinear::forward_gemm` honours), and "fused" for the mm/decode/ppl
+/// candidates grading the shared expert's dense-gemm prefill route.
+/// Load-bearing like `check_dense_mm` — same kernel, same precision class.
+/// Introduced at schema version 9 with grandfather "classic".
+fn check_shexp_gemm(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "shexp_gemm", p.shexp_gemm.as_deref(), want)
+}
+
+/// `want` is "classic" for the Reference-oracle side and strict-tier
+/// candidates (`XWEN_DENSE_MM_CLASSIC=1` again) and "fused" for mm/decode/ppl.
+/// On checkpoints without hyper-connections the field labels the configured
+/// route, exactly as `dense_mm` does on the 35B — the pin still catches a dump
+/// produced under a mismatched environment. Introduced at schema version 9
+/// with grandfather "classic".
+fn check_hc_gemm(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "hc_gemm", p.hc_gemm.as_deref(), want)
+}
+
 /// Enforce the attention DECODE-projection path recorded in one side's provenance.
 /// The reference oracle and strict-tier candidates run under `XWEN_ATTN_F32=1`,
 /// so the whole block is the dequant-f32 QMatMul → "f32-bypass" (`want = Some`).
@@ -1027,6 +1100,12 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             // different order and a fused reference would grade it against
             // itself.
             check_mv_ext(p, "reference dump", "classic")?;
+            // The v9 trio, same reasoning as delta/dense_mm/mv_ext: all three
+            // are bounded-close, and the reference pins force them classic
+            // (--moe-impl reference, XWEN_ACT_CLASSIC, XWEN_DENSE_MM_CLASSIC).
+            check_act_l2(p, "reference dump", "classic")?;
+            check_shexp_gemm(p, "reference dump", "classic")?;
+            check_hc_gemm(p, "reference dump", "classic")?;
             // The oracle's XWEN_ATTN_F32 makes the whole attention block the
             // dequant-f32 QMatMul, so its decode projections are "f32-bypass" too
             // (redundant with attn_mm, but pinned for symmetry / stale-dump defence).
@@ -1257,6 +1336,20 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
     };
     if let Some(p) = &candidate.provenance {
         check_mv_ext(p, "candidate dump", want_mv_ext)?;
+    }
+
+    // EVERY tier also pins the v9 trio, with the same tier mapping: strict
+    // candidates are produced under XWEN_ACT_CLASSIC=1 and
+    // XWEN_DENSE_MM_CLASSIC=1, which force the L2 fold and both dense-gemm
+    // routes off ("classic"); mm/decode grade the shipped routes ("fused").
+    let want_v9 = match tier {
+        Tier::Strict => "classic",
+        Tier::Mm | Tier::Decode => "fused",
+    };
+    if let Some(p) = &candidate.provenance {
+        check_act_l2(p, "candidate dump", want_v9)?;
+        check_shexp_gemm(p, "candidate dump", want_v9)?;
+        check_hc_gemm(p, "candidate dump", want_v9)?;
     }
 
     // EVERY tier also pins the CANDIDATE's attention decode-projection path:
@@ -1606,6 +1699,9 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_delta(p, "reference-greedy.json", "classic")?;
             check_dense_mm(p, "reference-greedy.json", "classic")?;
             check_mv_ext(p, "reference-greedy.json", "classic")?;
+            check_act_l2(p, "reference-greedy.json", "classic")?;
+            check_shexp_gemm(p, "reference-greedy.json", "classic")?;
+            check_hc_gemm(p, "reference-greedy.json", "classic")?;
             check_attn_decode(p, "reference-greedy.json", Some("f32-bypass"))?;
         }
         Some(p) => bail!(
@@ -1634,6 +1730,9 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_delta(p, "candidate-greedy.json", "fused")?;
             check_dense_mm(p, "candidate-greedy.json", "fused")?;
             check_mv_ext(p, "candidate-greedy.json", "fused")?;
+            check_act_l2(p, "candidate-greedy.json", "fused")?;
+            check_shexp_gemm(p, "candidate-greedy.json", "fused")?;
+            check_hc_gemm(p, "candidate-greedy.json", "fused")?;
             // The decode gate grades the shipped decode gemv: "f16" (official) or
             // "q8" (UD) both pass; XWEN_PARITY_EXPECT_ATTN_DECODE pins one.
             check_attn_decode(
@@ -1973,6 +2072,9 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_delta(p, "reference-ppl.json", "classic")?;
             check_dense_mm(p, "reference-ppl.json", "classic")?;
             check_mv_ext(p, "reference-ppl.json", "classic")?;
+            check_act_l2(p, "reference-ppl.json", "classic")?;
+            check_shexp_gemm(p, "reference-ppl.json", "classic")?;
+            check_hc_gemm(p, "reference-ppl.json", "classic")?;
             check_attn_decode(p, "reference-ppl.json", Some("f32-bypass"))?;
         }
         Some(p) => bail!(
@@ -2001,6 +2103,9 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_delta(p, "candidate-ppl.json", "fused")?;
             check_dense_mm(p, "candidate-ppl.json", "fused")?;
             check_mv_ext(p, "candidate-ppl.json", "fused")?;
+            check_act_l2(p, "candidate-ppl.json", "fused")?;
+            check_shexp_gemm(p, "candidate-ppl.json", "fused")?;
+            check_hc_gemm(p, "candidate-ppl.json", "fused")?;
             check_attn_decode(p, "candidate-ppl.json", expected_attn_decode().as_deref())?;
         }
         Some(p) => bail!(
@@ -2229,6 +2334,32 @@ fn prov(moe_impl: &str) -> Provenance {
                 "f32-bypass"
             } else {
                 "f16"
+            }
+            .to_string(),
+        ),
+        // The v9 trio follows the same reference/fused split as its siblings:
+        // the oracle side pins all three classic, shipped candidates run fused.
+        act_l2: Some(
+            if moe_impl == "reference" {
+                "classic"
+            } else {
+                "fused"
+            }
+            .to_string(),
+        ),
+        shexp_gemm: Some(
+            if moe_impl == "reference" {
+                "classic"
+            } else {
+                "fused"
+            }
+            .to_string(),
+        ),
+        hc_gemm: Some(
+            if moe_impl == "reference" {
+                "classic"
+            } else {
+                "fused"
             }
             .to_string(),
         ),
@@ -3553,8 +3684,8 @@ fn compare_pins_candidate_attn_decode_per_tier() {
     // strict runs under XWEN_ATTN_F32, so the decode projections are the
     // dequant-f32 QMatMul → "f32-bypass"; a candidate carrying the shipped f16
     // decode gemv ran the wrong build. attn_decode is the LAST candidate pin, so
-    // this must clear every other strict pin (including act, delta, dense_mm and
-    // mv_ext) to reach it.
+    // this must clear every other strict pin (including act, delta, dense_mm,
+    // mv_ext and the v9 trio) to reach it.
     let mut p = prov("fused");
     p.attn_dtype = Some("f32".to_string());
     p.attn_mm = Some("f32-bypass".to_string());
@@ -3566,6 +3697,9 @@ fn compare_pins_candidate_attn_decode_per_tier() {
     p.delta = Some("classic".to_string());
     p.dense_mm = Some("classic".to_string());
     p.mv_ext = Some("classic".to_string());
+    p.act_l2 = Some("classic".to_string());
+    p.shexp_gemm = Some("classic".to_string());
+    p.hc_gemm = Some("classic".to_string());
     // attn_decode defaults to "f16" — wrong for strict (expects "f32-bypass").
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict)
         .unwrap_err()
@@ -3739,6 +3873,15 @@ fn load_dump_defaults_missing_schema_version_to_v1() {
     assert_eq!(prov.mv_ext, None);
     check_mv_ext(&prov, "reference dump", "classic")
         .expect("missing mv_ext at v1 must grandfather to classic");
+    assert_eq!(prov.act_l2, None);
+    check_act_l2(&prov, "reference dump", "classic")
+        .expect("missing act_l2 at v1 must grandfather to classic");
+    assert_eq!(prov.shexp_gemm, None);
+    check_shexp_gemm(&prov, "reference dump", "classic")
+        .expect("missing shexp_gemm at v1 must grandfather to classic");
+    assert_eq!(prov.hc_gemm, None);
+    check_hc_gemm(&prov, "reference dump", "classic")
+        .expect("missing hc_gemm at v1 must grandfather to classic");
 }
 
 #[test]
@@ -3807,6 +3950,9 @@ fn committed_ppl_reference_fixtures_stay_valid() {
         check_flash(&p, &name, "classic").unwrap();
         check_dense_mm(&p, &name, "classic").unwrap();
         check_mv_ext(&p, &name, "classic").unwrap();
+        check_act_l2(&p, &name, "classic").unwrap();
+        check_shexp_gemm(&p, &name, "classic").unwrap();
+        check_hc_gemm(&p, &name, "classic").unwrap();
         checked += 1;
     }
     assert!(

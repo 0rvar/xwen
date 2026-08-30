@@ -383,6 +383,47 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
         // strict dumps; unlike its siblings it is the CLOSER of the two paths to
         // the f32 oracle, which changes nothing about the pin.
         "mv_ext": if xwen::ops::mv_ext_classic() { "classic" } else { "fused" },
+        // The f16-tile rescale branch's fused activation glue (silu*mul + L2
+        // norm + clamp + headroom scale in one pass, ops::silu_mul_l2):
+        // "classic" for the seven-dispatch candle chain, "fused" for the
+        // kernel. Like `act`, the Reference oracle's ReferenceExperts never
+        // reaches it ("classic" unconditionally, also the v9 grandfather);
+        // XWEN_ACT_CLASSIC disables it along with XWEN_ACT_L2_CLASSIC. It only
+        // executes on the mm_id f16-staged rescale branch, so on other configs
+        // it labels the configured path, exactly as `dense_mm` does on the 35B.
+        "act_l2": if matches!(moe_impl, "reference" | "ref") {
+            "classic"
+        } else if xwen::ops::act_classic() || xwen::ops::act_l2_classic() {
+            "classic"
+        } else {
+            "fused"
+        },
+        // The MoE shared expert's three projections at prefill: "fused" for the
+        // dense cooperative-tensor gemm route (QLinear::forward_gemm above
+        // dense_mm_min_seq), "classic" for QMatMul at every token count (under
+        // XWEN_SHEXP_QMATMUL, or XWEN_DENSE_MM_CLASSIC which forward_gemm
+        // honours). Env-derived for every runner, like `dense_mm`, and like it
+        // a configured-path label where no MoE/shexp layer runs.
+        "shexp_gemm": if xwen::ops::dense_mm_classic() || xwen::ops::shexp_qmatmul() {
+            "classic"
+        } else {
+            "fused"
+        },
+        // The hyper-connection bottleneck's two projections at prefill:
+        // "classic" when both stay on QMatMul (XWEN_HC_GEMM_QMATMUL=both, or
+        // XWEN_DENSE_MM_CLASSIC), "fused" when both take the dense gemm, and
+        // "down-only" / "up-only" for the split A/B arms. Env-derived; a
+        // configured-path label on checkpoints without hyper-connections.
+        "hc_gemm": if xwen::ops::dense_mm_classic() {
+            "classic"
+        } else {
+            match xwen::ops::hc_gemm_qmatmul() {
+                xwen::ops::HcGemmQmatmul::Both => "classic",
+                xwen::ops::HcGemmQmatmul::Neither => "fused",
+                xwen::ops::HcGemmQmatmul::Down => "up-only",
+                xwen::ops::HcGemmQmatmul::Up => "down-only",
+            }
+        },
     }))
 }
 

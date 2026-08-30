@@ -101,8 +101,20 @@ impl HcRead {
         let hidden = cfg.hidden;
 
         let norm_w = w.dense_f32(&format!("{prefix}_norm"))?;
-        let down = w.qlinear(&format!("{prefix}_down"))?;
-        let up = w.qlinear(&format!("{prefix}_up"))?;
+        // Loaded through the buffer-retaining path so each carries a plane for
+        // the fused read's prefill gemm (`forward_gemm`); the plane views the
+        // QMatMul allocation, so it costs no device memory (each of the two
+        // q8_0 tensors is ~3.3 MB). `without_mv_ext` keeps `forward` off the
+        // small-batch window the plane would otherwise open at 2..8 tokens, so
+        // every hc path — `XWEN_HC_CLASSIC` included — stays on QMatMul there.
+        let down = w
+            .qlinear_with_buffer(&format!("{prefix}_down"))?
+            .0
+            .without_mv_ext();
+        let up = w
+            .qlinear_with_buffer(&format!("{prefix}_up"))?
+            .0
+            .without_mv_ext();
         let inject = if with_inject {
             Some(w.qlinear(&format!("{prefix}_inject"))?)
         } else {
@@ -375,8 +387,23 @@ impl HcRead {
             self.hidden,
             self.eps as f32,
         )?;
-        let low = crate::ops::hc_silu_quarter(&self.down.forward(&normed)?, self.hc_count)?;
-        let up = self.up.forward(&low)?;
+        // The bottleneck's two matmuls take the vendored dense gemm at prefill
+        // (`QLinear::forward_gemm`, above `dense_mm_min_seq()`), each arm
+        // separately revocable by `XWEN_HC_GEMM_QMATMUL` because their shapes
+        // differ (down k = hc_count*hidden, up k = low_rank). Decode is the same
+        // `QMatMul` gemv either way.
+        let arms = crate::ops::hc_gemm_qmatmul();
+        let low_in = if arms.down_on_qmatmul() {
+            self.down.forward(&normed)?
+        } else {
+            self.down.forward_gemm(&normed)?
+        };
+        let low = crate::ops::hc_silu_quarter(&low_in, self.hc_count)?;
+        let up = if arms.up_on_qmatmul() {
+            self.up.forward(&low)?
+        } else {
+            self.up.forward_gemm(&low)?
+        };
         let mixed = crate::ops::hc_mix(&up, &normed, self.hc_count, self.hidden)?;
         Ok((mixed, inject))
     }

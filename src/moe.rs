@@ -354,30 +354,51 @@ impl FusedExperts {
         // flips) to ~1e-3 final-logit divergence, but a bitwise match cannot cascade.
         // `XWEN_ACT_CLASSIC` reverts to the candle two-op chain (the reference
         // oracle's ReferenceExperts also runs that chain). See docs/parity.md §3b.
-        let act = if crate::ops::act_classic() {
-            (silu(&gate)? * up)?
-        } else {
-            crate::ops::silu_mul(&gate, &up)?
-        }; // [seq, top_k, expert_ff]
-
         if needs_rescale {
             // Per-column L2 rescale keeps the f16-tile down cast in range; the
             // factor divides back out in the combine (a per-column identity). 32768
             // (f16's safe headroom) is only meaningful on this f16-tile branch.
+            // Default: the activation, its L2 norm, the clamp and the scale in ONE
+            // vendored pass (`ops::silu_mul_l2`) — bounded against the candle
+            // chain below to accumulation-order noise (the sum's order differs),
+            // never bitwise, which is fine here because this branch is off the
+            // strict tier by construction (see silu_mul.metal). Both
+            // `XWEN_ACT_L2_CLASSIC` and `XWEN_ACT_CLASSIC` keep the chain, as does
+            // an expert_ff wider than the kernel's row array.
             let f16_safe = 32768.0_f64;
-            let col_l2 = act
-                .sqr()?
-                .sum_keepdim(2)?
-                .sqrt()?
-                .clamp(1e-8_f32, 1e30_f32)?; // [seq, top_k, 1]
-            let act_s = (&act * f16_safe)?.broadcast_div(&col_l2)?;
+            let expert_ff = gate.dim(2)?;
+            let fold = !crate::ops::act_l2_classic()
+                && !crate::ops::act_classic()
+                && crate::ops::silu_mul_l2_supported(expert_ff);
+            let (act_s, col_l2) = if fold {
+                crate::ops::silu_mul_l2(&gate, &up, f16_safe as f32, 1e-8, 1e30)?
+            } else {
+                let act = Self::activation(&gate, &up)?;
+                let col_l2 = act
+                    .sqr()?
+                    .sum_keepdim(2)?
+                    .sqrt()?
+                    .clamp(1e-8_f32, 1e30_f32)?; // [seq, top_k, 1]
+                ((&act * f16_safe)?.broadcast_div(&col_l2)?, col_l2)
+            };
             let down = matmul(&self.down, &act_s, ids)?; // [seq, top_k, hidden]
             return Ok((down, Some(col_l2)));
         }
 
         // Default: f32 down projection (mv_id or mm_id-hp) — no f16 cast, so the
         // activation feeds the down matmul directly, no rescale needed.
+        let act = Self::activation(&gate, &up)?; // [seq, top_k, expert_ff]
         Ok((matmul(&self.down, &act, ids)?, None))
+    }
+
+    /// `silu(gate) * up`, fused (`ops::silu_mul`) unless `XWEN_ACT_CLASSIC` keeps
+    /// candle's two-op chain — see the comment above the activation call site.
+    fn activation(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+        if crate::ops::act_classic() {
+            Ok((silu(gate)? * up)?)
+        } else {
+            crate::ops::silu_mul(gate, up)
+        }
     }
 }
 
@@ -465,15 +486,29 @@ impl SharedExpert {
     /// bit-identical to candle's two dispatches. The dense checkpoint's MLP
     /// keeps the candle chain: it is not part of an MoE block, and its
     /// dispatch count is not what bounds decode.
+    ///
+    /// At prefill (above `dense_mm_min_seq()`) the three projections take the
+    /// vendored dense cooperative-tensor gemm through `QLinear::forward_gemm`,
+    /// the same route and precision class as the 27B's dense FFN; `XWEN_SHEXP_QMATMUL`
+    /// (or `XWEN_DENSE_MM_CLASSIC`, which `forward_gemm` honours itself) keeps
+    /// candle's `QMatMul`, which decode always runs.
     pub fn swiglu_out(&self, x: &Tensor) -> Result<Tensor> {
-        let g = self.gate.forward(x)?;
-        let u = self.up.forward(x)?;
+        let gemm = !crate::ops::shexp_qmatmul();
+        let proj = |w: &QLinear, x: &Tensor| -> candle_core::Result<Tensor> {
+            if gemm {
+                w.forward_gemm(x)
+            } else {
+                w.forward(x)
+            }
+        };
+        let g = proj(&self.gate, x)?;
+        let u = proj(&self.up, x)?;
         let h = if !crate::ops::moe_glue_classic() && x.device().is_metal() {
             crate::ops::silu_mul(&g, &u)?
         } else {
             (silu(&g)? * u)?
         };
-        Ok(self.down.forward(&h)?)
+        Ok(proj(&self.down, &h)?)
     }
 
     /// The RAW pre-sigmoid shared-expert gate logit, `[seq, 1]` f32. The sigmoid
@@ -1433,9 +1468,28 @@ mod tests {
                 up: tiled_stack(dev, EXPERT_FF, HIDDEN, s + 2),
                 down: tiled_stack(dev, HIDDEN, EXPERT_FF, s + 3),
             };
+            // Production-faithful shared expert: q8_0 (the shipped shexp
+            // dtype) with a plane over the same allocation, as
+            // `qlinear_with_buffer` hands out — so the prefill bench actually
+            // exercises `forward_gemm` above the gemm floor. (An earlier build
+            // used plane-less q4_K `from_qtensor` layers, so a shexp-route arm
+            // measured QMatMul on both sides; the e2e attribution for the
+            // shexp lever came from the production path and stands.)
             let ql = |t: &Tensor| {
-                let qt = QTensor::quantize_onto(t, GgmlDType::Q4K, dev).unwrap();
-                QLinear::from_qtensor(Arc::new(qt)).unwrap()
+                use candle_core::quantized::QStorage;
+                let qcpu = QTensor::quantize(t, GgmlDType::Q8_0).unwrap();
+                let storage =
+                    QStorage::from_data(qcpu.data().unwrap(), dev, GgmlDType::Q8_0).unwrap();
+                let QStorage::Metal(qms) = &storage else {
+                    panic!("expected Metal quantized storage")
+                };
+                let buffer = Arc::new(qms.buffer().clone());
+                let dims = (t.dims()[0], t.dims()[1]);
+                QLinear::from_qtensor_with_buffer(
+                    Arc::new(QTensor::new(storage, dims).unwrap()),
+                    buffer,
+                )
+                .unwrap()
             };
             let shared = SharedExpert {
                 gate: ql(&det_tensor(&[SHARED_FF, HIDDEN], s + 20, 0.5)),
@@ -2394,8 +2448,9 @@ mod tests {
             );
         }
 
-        /// The always-on shared-expert SwiGLU (q4_K QLinear gate/up/down) at
-        /// prefill width, through the production `SharedExpert::forward`.
+        /// The always-on shared-expert SwiGLU (planed q8_0 gate/up/down, the
+        /// shipped dtype, so the dense-gemm route is reachable) at prefill
+        /// width, through the production `SharedExpert::forward`.
         #[test]
         #[ignore = "perf bench"]
         fn prefill_shared_expert_bench() {

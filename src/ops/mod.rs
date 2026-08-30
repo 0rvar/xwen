@@ -34,7 +34,7 @@ pub use moe_glue::{moe_epilogue, moe_router, moe_router_supported};
 pub use mv_ext::{matmul_mv_ext, mv_ext_supported};
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
 pub use q8::matmul_q8;
-pub use silu_mul::silu_mul;
+pub use silu_mul::{silu_mul, silu_mul_l2, silu_mul_l2_supported};
 
 pub use crate::gguf::ExpertStack;
 
@@ -432,6 +432,75 @@ pub(crate) fn candle_fast_math_disabled() -> bool {
 pub fn act_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_ACT_CLASSIC").is_some())
+}
+
+/// `XWEN_ACT_L2_CLASSIC=1` reverts the routed experts' f16-tile L2 rescale — the
+/// `silu(gate)*up` activation, its per-row L2 norm, the clamp and the headroom
+/// scale, one vendored pass (`ops::silu_mul_l2`) — back to the candle chain
+/// (`ops::silu_mul` then sqr → sum_keepdim → sqrt → clamp → affine →
+/// broadcast_div, six more dispatches over the activation). The fold is BOUNDED
+/// against that chain, not bitwise: its sum-of-squares runs in a fixed
+/// sequential-then-tree order where candle's `sum_keepdim` runs in its own, so
+/// the two agree to accumulation-order noise (3.574e-7 max relative measured by
+/// `l2_fold_matches_candle_chain`). It only ever runs on the rescale branch
+/// (mm_id with an f16-staged activation), which the strict parity tier never
+/// takes, and mm / decode / ppl grade it. `XWEN_ACT_CLASSIC` also disables it
+/// (the fold contains the activation the older switch reverts).
+///
+/// PRESENCE-BASED and cached (read once), like the sibling MoE switches.
+pub fn act_l2_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_ACT_L2_CLASSIC").is_some())
+}
+
+/// `XWEN_SHEXP_QMATMUL=1` keeps the MoE shared expert's three projections on
+/// candle's `QMatMul` at every token count, instead of routing them onto the
+/// vendored dense cooperative-tensor gemm (`ops::matmul_dense_q`, via
+/// `QLinear::forward_gemm`) above `dense_mm_min_seq()`. That gemm's precision
+/// class is the 27B FFN's (~4e-4 rel_l2 from the f32 oracle, docs/parity.md
+/// §3b), so like the 27B FFN it is also off under `XWEN_DENSE_MM_CLASSIC`,
+/// which the strict tier pins on both sides.
+///
+/// PRESENCE-BASED and cached (read once).
+pub fn shexp_qmatmul() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_SHEXP_QMATMUL").is_some())
+}
+
+/// Which of the hyper-connection bottleneck's two projections (`hc_*_down`,
+/// `[low_rank, hc_count*hidden]`, and `hc_*_up`, `[hc_count*hidden, low_rank]`)
+/// stay on candle's `QMatMul` at prefill instead of the vendored dense gemm.
+/// `XWEN_HC_GEMM_QMATMUL=down` / `=up` / `=both` (any other value reads as
+/// `both`); unset routes both onto the gemm above `dense_mm_min_seq()`. Two
+/// arms because they are different shapes: `down` has k = 10240 and `up` only
+/// k = 320 (ten NK steps), and whether the gemm wins at ten steps is a
+/// measurement, not a given. Off under `XWEN_DENSE_MM_CLASSIC` like every
+/// dense-gemm route. Decode (one token) is untouched either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HcGemmQmatmul {
+    Neither,
+    Down,
+    Up,
+    Both,
+}
+
+impl HcGemmQmatmul {
+    pub fn down_on_qmatmul(self) -> bool {
+        matches!(self, Self::Down | Self::Both)
+    }
+    pub fn up_on_qmatmul(self) -> bool {
+        matches!(self, Self::Up | Self::Both)
+    }
+}
+
+pub fn hc_gemm_qmatmul() -> HcGemmQmatmul {
+    static V: OnceLock<HcGemmQmatmul> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("XWEN_HC_GEMM_QMATMUL") {
+        Err(_) => HcGemmQmatmul::Neither,
+        Ok(v) if v == "down" => HcGemmQmatmul::Down,
+        Ok(v) if v == "up" => HcGemmQmatmul::Up,
+        Ok(_) => HcGemmQmatmul::Both,
+    })
 }
 
 /// `XWEN_MOE_GLUE_CLASSIC=1` reverts the MoE block glue — the fused routing

@@ -333,6 +333,23 @@ struct SiluMulArgs {
     n: i32,
 }
 
+/// Matches the Metal `silu_mul_l2_args` struct (src/ops/silu_mul.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SiluMulL2Args {
+    ff: i32,
+    n_rows: i32,
+    scale: f32,
+    clamp_min: f32,
+    clamp_max: f32,
+}
+
+/// `kernel_moe_silu_mul_l2`'s launch shape: one 256-thread threadgroup per row,
+/// holding the row's activation in a 1024-float threadgroup array. Rows wider
+/// than that are the caller's problem (the candle chain).
+pub(crate) const SILU_MUL_L2_THREADS: usize = 256;
+pub(crate) const SILU_MUL_L2_MAX_FF: usize = 1024;
+
 /// candle's `fast_sum` threadgroup width for a `top_k`-wide reduction:
 /// `min(pipeline_max, next_pow2(top_k/2))`. The combine kernels reproduce it so
 /// the simd_sum lane partition matches candle's reduction order bit-for-bit, but
@@ -2535,6 +2552,111 @@ pub(crate) fn run_silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     drop(up_guard);
 
     Ok(output_tensor(dst, mdev, n, shape))
+}
+
+/// Fused SwiGLU activation PLUS the f16-tile L2 rescale against
+/// `kernel_moe_silu_mul_l2` (silu_mul.metal): from the `[seq, top_k, expert_ff]`
+/// f32 `gate`/`up` pair, returns `(act_s, col_l2)` — `act_s` the same shape,
+/// `col_l2` `[seq, top_k, 1]` — as `FusedExperts::project_inner`'s candle chain
+/// defines them: `act = silu(gate) * up`, `col_l2 = clamp(sqrt(Σ act²), clamp_min,
+/// clamp_max)`, `act_s = (act * scale) / col_l2`. One threadgroup per row;
+/// bails (never falls back) for `expert_ff > SILU_MUL_L2_MAX_FF`, so the caller
+/// must ask `silu_mul_l2_supported` first. Bounded, not bitwise, against the
+/// chain (the sum's order differs — see the kernel header).
+pub(crate) fn run_silu_mul_l2(
+    gate: &Tensor,
+    up: &Tensor,
+    scale: f32,
+    clamp_min: f32,
+    clamp_max: f32,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = gate.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("silu_mul_l2 requires gate on a Metal device");
+    };
+    if gate.dtype() != DType::F32 {
+        bail!("gate must be f32, got {:?}", gate.dtype());
+    }
+    if up.dtype() != DType::F32 {
+        bail!("up must be f32, got {:?}", up.dtype());
+    }
+    if gate.dims() != up.dims() {
+        bail!(
+            "gate shape {:?} must equal up shape {:?}",
+            gate.dims(),
+            up.dims()
+        );
+    }
+    if !gate.is_contiguous() || !up.is_contiguous() {
+        bail!("gate and up must be contiguous");
+    }
+    if !gate.device().same_device(up.device()) {
+        bail!("gate and up must live on the same Metal device");
+    }
+    let (seq, top_k, ff) = gate
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("gate must be rank-3 [seq, top_k, expert_ff]: {e}"))?;
+    if ff == 0 || ff > SILU_MUL_L2_MAX_FF {
+        bail!("silu_mul_l2 supports 1..={SILU_MUL_L2_MAX_FF} columns per row, got {ff}");
+    }
+    let n_rows = checked_elems(&[seq, top_k], "silu_mul_l2 rows")?;
+    if n_rows == 0 {
+        bail!("silu_mul_l2 requires a non-empty activation, got [{seq}, {top_k}, {ff}]");
+    }
+    let n = checked_elems(&[n_rows, ff], "silu_mul_l2")?;
+    glue_index_fits_i32(n)?;
+
+    let pipeline = pipelines::silu_mul_pipeline(mdev.device(), "kernel_moe_silu_mul_l2")?;
+    let act_s = mdev.new_buffer(n, DType::F32, "silu_mul_l2 act")?;
+    let col_l2 = mdev.new_buffer(n_rows, DType::F32, "silu_mul_l2 col_l2")?;
+
+    let (gate_guard, gate_layout) = gate.storage_and_layout();
+    let Storage::Metal(gate_storage) = &*gate_guard else {
+        bail!("gate is not on a Metal device");
+    };
+    let (up_guard, up_layout) = up.storage_and_layout();
+    let Storage::Metal(up_storage) = &*up_guard else {
+        bail!("up is not on a Metal device");
+    };
+
+    let args = SiluMulL2Args {
+        ff: ff as i32,
+        n_rows: n_rows as i32,
+        scale,
+        clamp_min,
+        clamp_max,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(gate_storage.buffer()),
+            gate_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(up_storage.buffer()),
+            up_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&act_s), 0);
+        encoder.set_output_buffer(4, Some(&col_l2), 0);
+        encoder.dispatch_thread_groups(
+            mtl_size!(n_rows, 1, 1),
+            mtl_size!(SILU_MUL_L2_THREADS, 1, 1),
+        );
+    }
+    drop(gate_guard);
+    drop(up_guard);
+
+    Ok((
+        output_tensor(act_s, mdev, n, (seq, top_k, ff)),
+        output_tensor(col_l2, mdev, n_rows, (seq, top_k, 1)),
+    ))
 }
 
 /// Matches the Metal `moe_router_args` struct (src/ops/moe_glue.metal).

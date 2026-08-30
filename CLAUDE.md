@@ -226,7 +226,8 @@ drafting, so every drafted figure below is still against the pre-fold plain leve
 Prefill: the chunk is PER ARCHITECTURE since 2026-08-30 — 2048 on the MoE
 checkpoints, 512 on the dense (`Arch::prefill_chunk_default`, `XWEN_PREFILL_CHUNK`
 overrides; decisions.md "Prefill chunk") — measured that day at 3851 tokens: **35B 2634
-(2429 at 512)**; the dense 27B reads 5-6% SLOWER at 2048 (650/599 vs 608/571) and keeps
+(2429 at 512)**, and 3081-3090 @3803 after the 2026-08-30 FFN-glue levers (the L2
+fold + shexp onto dense_mm; 2746-2755 in the same sweep's all-classic arm); the dense 27B reads 5-6% SLOWER at 2048 (650/599 vs 608/571) and keeps
 512 (its 702@925 / 445@4k are from 2026-07-29 and not re-measured). Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run
 adds ~9s of Metal pipeline compilation. With drafting (the default since P9a) at
 the per-model defaults: **27B 37.5-38.2 code / 36.8-37.4 chat** (+46-52% over
@@ -246,7 +247,10 @@ P3 kernel pass for prefill and 2026-08-30 at the ba fold (0261e17) for decode,
 plain because no drafter exists for it: **prefill ~796 tok/s @530, decode 46.5-46.7
 (44.4-44.5 before the ba fold, 43.1 before the PLE row prefetch)** — 530-token prompt
 (long prompts at the 2048 chunk of 2026-08-30: **824 @3851 / 951 @1962**, against
-748 / 883 at the old 512 chunk, same session; **decode by context, same day, after the
+748 / 883 at the old 512 chunk, same session; the FFN-glue levers of the same day —
+the rescale-chain L2 fold plus the shexp and hc gemms onto dense_mm, hc `up` alone
+worth +7-11% — lift it to **~960-980 @3803 and ~860 @7606**, the same sweep's
+all-classic arms reading 865-872 / 766; **decode by context, same day, after the
 QSA block-key cache, fused gather and device-side selection (2026-08-30): 46 below the
 2048 indexer budget and 44-45 at 3.8k-32k, plain — 30 before the arc, 33 after the
 cache alone; the cliff is closed, TODO.md keeps the follow-ups**) —

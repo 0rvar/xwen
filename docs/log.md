@@ -4,6 +4,78 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-30 (FFN glue) — the L2 fold and the shexp/hc gemms onto dense_mm: Flash-Next prefill +12% at 3803 and 7606 tokens, 35B +12%
+
+The mm_id tile pass ended with the attribution that reset this queue: the expert gemms
+are a minority of the prefill `ffn` stage. At the 2048 chunk the stage is 22
+dispatches/layer (8 gemms, 14 glue); per layer the rescale chain makes six elementwise
+passes over the [t,10,640] activation (~367 MB), the shared expert runs three Q8_0
+QMatMuls through candle's 32-token-tile mul_mm (~334 MB), and the hc `down`/`up`
+(Q8_0 [320,10240] / [10240,320]) ran plain QMatMul outside the stage entirely (~40 GB
+of weight re-reads per chunk). Three levers, each behind its own switch:
+
+1. **The L2 fold** (`ops::silu_mul_l2`, `XWEN_ACT_L2_CLASSIC` reverts): the rescale
+   branch's seven dispatches — silu_mul, sqr, sum_keepdim, sqrt, clamp, affine,
+   broadcast_div — as one threadgroup-per-row kernel (row in registers, fixed
+   sequential-then-tree sum). Bounded, not bitwise: 3.574e-7 max-rel act_s / 2.287e-7
+   col_l2 against the chain (`l2_fold_matches_candle_chain`); the strict tier is
+   structurally blind to it (mv_id has no rescale branch), mm/decode/ppl grade it.
+2. **shexp onto dense_mm** (`XWEN_SHEXP_QMATMUL` reverts): the three projections
+   through the new `QLinear::forward_gemm` above `dense_mm_min_seq` (32) — the P8c
+   kernel, its precision class measured 3.68-3.70e-4 rel_l2 vs the QMatMul route at
+   the shexp shapes (`forward_gemm_matches_qmatmul_at_prefill_and_is_forward_below`).
+3. **hc down/up onto dense_mm** (`XWEN_HC_GEMM_QMATMUL=down|up|both` reverts per
+   arm): planes via `qlinear_with_buffer` (each ~3.3 MB, sharing the QMatMul
+   allocation), routed from the fused hc read only; 3.66-3.69e-4 at both shapes.
+
+**Bench** (3803/7606-token prompts, `XWEN_BENCH=1 generate --no-draft --raw -n 64
+--stats`, two rounds with arm order reversed, 60 s idles; `pmset -g` before/mid/after:
+`powermode 0`, no `lowpowermode` key; anchors p1937: 1133.7 → 1119.6 → 1148.5
+prefill, ±1.3%). Cumulative arms, prefill tok/s (decode flat at 43.0-44.1 in every arm):
+
+| arm | p3803 r1/r2 | p7606 (1 round) |
+|---|---|---|
+| all-classic | 872.1 / 865.0 | 766.5 |
+| +fold | 918.3 / 902.3 | 771.9 |
+| +fold+shexp | 918.2 / 898.2 | 767.0 |
+| +fold+shexp+hc-down | 896.7 / 913.1 | 775.5 |
+| +hc-up = default | 962.2 / 976.7 | 860.5 |
+
+Attribution within-sweep: the fold +4.8%, shexp ≈0 end-to-end (its 334 MB was small
+against the stage), hc-down ≈0, **hc-up +7-11%** — the k=320 shape briefed as "may not
+win" is the biggest single lever; its [10240,320] output side is where QMatMul's
+32-token tiling re-read the most weight bytes. Total +11.6% @3803, +12.3% @7606. The
+35B (no hc): 2754.8/2746.3 → 3089.9/3081.1 prefill (+12%), decode 106.9-108.7 flat.
+The free A/B there, `XWEN_MM_ID_TENSOR_HP=1` (f32 activation tiles, which have no
+rescale chain at all): 2286-2314 prefill — the f32-tile gemm loses ~25% against the
+f16 tensor default, so deleting the rescale work does not begin to pay for it.
+Refuted (decisions.md).
+
+**Greedy** (temp-0, 64 tokens, p3803): forks on both checkpoints, and the bisect says
+near-ties rather than a guilty lever. The all-classic arm is deterministic (rerun
+byte-identical, and byte-identical to the prior session's default), yet EVERY lever
+alone forks Flash-Next at the same decode token ~28 ("due to bureaucracy" → "due to
+warfare"), four of five arms producing one identical alternative continuation. On the
+35B the fold and the shexp route each fork at byte 208 with identical outputs,
+combined at byte 214. No tool reports the top-2 logit margin at a decode step
+(`logits-dump` is prompt-only), so the tie can be argued but not priced — ledgered.
+
+**Gate** (35B): ALL PASS, six graded — the first re-pass where graded numbers moved:
+mm cos 0.999631 → 0.999618, ppl Δnll 0.000791 → 0.001179, both within the frozen
+floors; strict bit-exact, all three levers structurally off it. Provenance schema v9
+adds `act_l2` / `shexp_gemm` / `hc_gemm`, all grandfathered "classic".
+
+**The review find that mattered** (Opus, Codex and Qwen converged on it): the hc
+planes as first implemented also opened the mv_ext 2..8-token window on every hc path
+— the plane predicate is `dense_mm_supported || mv_ext_supported`, hc `down`
+(k 10240) passes the mv_ext one where `up` (k 320) does not, so ragged chunks and
+serve resumes would have changed numerics asymmetrically, `XWEN_HC_CLASSIC` included.
+The rule now: **hc planes are dense_mm-only** — `QLinear::without_mv_ext` keeps
+`forward` on QMatMul at every count the gemm doesn't take, bitwise the pre-plane
+behavior (`without_mv_ext_keeps_small_batch_on_qmatmul`), while `forward_gemm`
+keeps the plane. The shexp planes predate this change and keep their window:
+`XWEN_SHEXP_QMATMUL` restores the immediate pre-change route, mv_ext included.
+
 ## 2026-08-30 (mm_id tiles) — work-list grid and NR1 64: expert gemms +17-23% in isolation, prefill unchanged end-to-end at 3803 tokens, and the ffn stage turns out to be mostly not the gemms
 
 The prefill-chunk pass left a ledger item for a NARROWER `mm_id` token tile (32 → 16)

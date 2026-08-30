@@ -2477,14 +2477,35 @@ non-gemm items come first.
   At 2048 rows per chunk the guard is a band of elementwise dispatches per layer that
   decode never pays; fold it into the gemm epilogue or the following norm, whichever the
   profiler ranks higher (rank, do not price — the profilers are sync-inflated). Promoted
-  to first 2026-08-30: it is part of the non-gemm majority of `ffn`.
+  to first 2026-08-30: it is part of the non-gemm majority of `ffn`. **SHIPPED
+  2026-08-30** (log.md "FFN glue"): `ops::silu_mul_l2` folds the whole band —
+  silu*mul, Σact², sqrt, clamp, ×32768, divide — into one dispatch
+  (`XWEN_ACT_L2_CLASSIC` reverts; 3.574e-7 max-rel vs the chain); +4.8% Flash-Next
+  prefill @3803 within-sweep, and the 35B mm/ppl tiers moved within floors
+  (0.999618 / 0.001179).
 - [ ] **Route the hyper-connection and shared-expert gemms onto `dense_mm`.** The P8c
   gemm (`src/ops/dense_mm.metal`) was 2.2-2.7x on the 27B's dense FFN; whether the
   Flash-Next hc mix and the `shexp` gemms take it at prefill today has not been checked,
   and at 2048 rows per chunk they are squarely in its `seq > 32` envelope. Same gate
   as `dense_mm` (Q4_K/Q8_0 source, graded by mm/ppl), and the same accuracy trade.
   Promoted to second 2026-08-30: the shared expert is in the non-gemm-expert majority of
-  `ffn`.
+  `ffn`. **SHIPPED 2026-08-30** (log.md "FFN glue"): both routed through
+  `QLinear::forward_gemm` above seq 32 (`XWEN_SHEXP_QMATMUL` /
+  `XWEN_HC_GEMM_QMATMUL` revert; hc planes dense_mm-only, decisions.md). The
+  surprise inverted the ranking: shexp ≈0 end-to-end, hc `up` (k=320, the shape
+  flagged "may not win") +7-11%; Flash-Next 872 → 962-977 @3803, 766 → 860 @7606,
+  35B 2755 → 3090 @3803.
+- [ ] **`DENSE_MM_MIN_SEQ` is unfitted for the shexp/hc shapes.** The 32-token
+  floor was fitted on the 27B FFN (k 5120/17408); the shexp (k 2560/640, and
+  2048/512 on the 35B) and hc (k 10240/320) routes inherit it unmeasured
+  (2026-08-30). Only matters for short chunks and ragged tails; sweep
+  `XWEN_DENSE_MM_MIN_SEQ` over those shapes if they ever show up hot.
+- [ ] **No decode-step top-2 margin tooling.** Twice on 2026-08-30 (the QSA-cache
+  greedy fork, then the FFN-glue fork bisect) a temp-0 fork needed the top-2 logit
+  margin at the forked step; `logits-dump` dumps prompt logits only, so both
+  bisects ended at "near-tie by determinism argument" instead of a number. A
+  greedy-margins mode (per-step top-2 ids + logit gap) would settle these in one
+  run.
 - [ ] **A long-prompt mm tier.** The strict/mm/decode tiers grade a 58-token prompt, so
   the 64-wide `_t64` mm_id kernel (selected when `t*top_k/n_expert ≥ 24`) is exercised
   only by the ppl tier's 4218-token corpus at the 2048 chunk. Its identity with the

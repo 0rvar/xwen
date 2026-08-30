@@ -82,6 +82,22 @@ fix batch that touched map0), verbatim both times:
 threadgroup owns a tile, not what it computes). Only the ppl tier ran the 64-wide kernel
 (see the switch table above).
 
+**Re-passed at the FFN-glue levers, 2026-08-30** (unstaged on cfc0f4f; log.md "FFN
+glue" — the rescale-chain L2 fold plus the shexp/hc dense-gemm routes): **35B-A3B ALL
+PASS**, six graded checks — and the first re-pass where graded numbers MOVED, because
+two of the levers run on the mm/ppl candidates: mm cos 0.999631 → **0.999618**, ppl
+Δnll 0.000791 → **0.001179**, both within the frozen floors, nothing loosened.
+`PASS strict (classic mv fallback) code-short cos=1.000000 top5=5/5` ·
+`PASS mm code-short cos=0.999618 top5=5/5` ·
+`PASS decode code-short 63/64 agree, 1 excused, 0 mismatch` ·
+`PASS decode text-mixed 62/64 agree, 2 excused, 0 mismatch` ·
+`PASS decode long-mixed 61/64 agree, 3 excused, 0 mismatch` ·
+`PASS ppl corpus Δnll=0.001179` · `ALL PASS (6 graded)`. strict stays bit-exact
+because all three levers are structurally off it: the strict candidate runs
+`XWEN_NO_MM_ID=1` (no rescale branch exists on mv_id) and both strict sides pin
+`XWEN_DENSE_MM_CLASSIC=1` (which `QLinear::forward_gemm` honours). The movers are
+the L2 fold and the shexp gemm — the 35B has no hyper-connections.
+
 ```bash
 just init                               # git submodule update --init --recursive
 bash scripts/build-llamacpp.sh          # cmake from an ephemeral nix shell, system CLT SDK
@@ -432,6 +448,9 @@ report does not name.
 | `XWEN_PLE_NO_RANDOM=1` | skips `MADV_RANDOM` on the PLE table's byte range | non-numeric, same reason |
 | `XWEN_MM_ID_FULL_GRID=1` | launches mm_id pass 2 on the full ggml grid (one column of token tiles per expert, sized for the whole chunk; ~97% of threadgroups early-return) instead of the flat (expert, tile) work list map0 now emits | a real kill switch for the work-list grid, but both arms compute the SAME BITS (`work_list_and_nr1_64_match_full_grid_nr1_32_bitwise`) — the grid only decides which threadgroup owns a tile; it applies to every MoE checkpoint, and `parity-gate.ts` strips it via its `XWEN_MM_ID` prefix match |
 | `XWEN_MM_ID_NR1=32\|64` | forces the mm_id tensor-path token-tile width (default: 64 when `t*top_k/n_expert >= 24`, else 32; the `_t64` kernels dequantize each expert tile half as often) | an A/B knob. The 32/64 identity is MEASURED and test-pinned (the same test, on FN gate/up and down geometries with partial tiles and on a production-mean routing where the auto rule picks 64), NOT structural: the two widths are different `matmul2d` instantiations and the reduction order inside each is the toolchain's, so a future Metal toolchain could separate them and the test would say so. Note that the strict/mm/decode tiers grade a 58-token prompt (mean rows per expert far below 24, so NR1 32) and only the ppl tier (4218-token corpus at the 2048 chunk) exercises NR1 64 — a long-prompt mm tier is ledgered in TODO.md. Stripped by the same prefix match |
+| `XWEN_ACT_L2_CLASSIC=1` | reverts the f16-tile prefill branch's activation glue — `silu(gate)*up`, its per-row L2 norm, the clamp and the 32768 headroom scale, one pass (`ops::silu_mul_l2`, `kernel_moe_silu_mul_l2`) — to the seven-dispatch candle chain (`silu_mul`, sqr, sum_keepdim, sqrt, clamp, affine, broadcast_div) | a real kill switch and NOT a bit-identity anchor: the sum of squares runs sequential-per-thread then a fixed 256→1 tree where candle's `sum_keepdim` runs its own order, so the two arms agree to ~4e-7 relative (`l2_fold_matches_candle_chain`, bound 1e-5). It never reaches the strict tier: that candidate runs `XWEN_NO_MM_ID=1`, and the rescale branch exists only under mm_id with an f16-staged activation. mm / decode / ppl grade it where it runs by default — and those tiers run the 3.6 files, so the 35B is what grades the fold; NO tier grades Flash-Next, the checkpoint with the most fold traffic, like the rest of qwen4exp. `XWEN_ACT_CLASSIC=1` also disables it. Provenance `act_l2` (schema v9, grandfather "classic"). Stripped by name |
+| `XWEN_SHEXP_QMATMUL=1` | keeps the MoE shared expert's three q8_0 projections on candle's `QMatMul` at every token count, instead of the vendored dense cooperative-tensor gemm (`QLinear::forward_gemm` → `ops::matmul_dense_q`) above `dense_mm_min_seq` | the same kernel and precision class as the 27B's dense FFN (~3.7e-4 rel_l2 from the `QMatMul` route at the shexp shapes, `forward_gemm_matches_qmatmul_at_prefill_and_is_forward_below`), and pinned off the same way: `forward_gemm` honours `XWEN_DENSE_MM_CLASSIC`, which both sides of **strict** already set, so strict never sees it and mm / decode / ppl grade it. `XWEN_SHEXP_QMATMUL=1` restores exactly the immediate pre-change route — which already included the mv_ext 2..=8-token window, the shexp planes predating this change. Provenance `shexp_gemm` (schema v9, grandfather "classic"). Stripped by name |
+| `XWEN_HC_GEMM_QMATMUL=down\|up\|both` | keeps the named hyper-connection bottleneck projection(s) (`hc_*_down` [320,10240] and `hc_*_up` [10240,320], q8_0) on `QMatMul` at prefill instead of the dense gemm; unset routes both above `dense_mm_min_seq`, from the fused hc read only. The hc planes are dense_mm-only (`QLinear::without_mv_ext`, decisions.md), so at 2..=8 tokens every hc path — `XWEN_HC_CLASSIC` included — stays bitwise on QMatMul | two arms because `up` is a ten-NK-step shape whose win is a measurement; the same precision class and the same `XWEN_DENSE_MM_CLASSIC` pin as the shexp row (~3.7e-4 rel_l2 at both shapes, same test). Not gradeable until qwen4exp has a tier. Provenance `hc_gemm` (schema v9, grandfather "classic"; values classic/fused/down-only/up-only). Stripped by name |
 
 `XWEN_MOE_GLUE_CLASSIC=1` is the opposite case and is deliberately NOT on the strict
 candidate: the fused MoE router and block epilogue are bit-identical to the candle
@@ -722,8 +741,10 @@ more sensitive, and the fused path still clears it with 2.5x headroom. Widening 
 later requires evidence that the increase is benign — which perplexity alone cannot
 show, so corroborate with greedy agreement and the cosine tiers before touching it.
 
-**Trip-wire for future kernel work:** the fused scan sits at 0.000791 on the 35B. A
-further ~2.5x rise fails the gate. Read that as the instrument working; the cosine
+**Trip-wire for future kernel work:** the fused scan sat at 0.000791 on the 35B
+through 2026-08-30, when the FFN-glue levers (the L2 fold and the shexp gemm; see the
+re-pass record in §1) moved the shipped path to 0.001179 — the budget is now shared,
+not the scan's alone. A further ~2x rise fails the gate. Read that as the instrument working; the cosine
 tiers are much less sensitive here (the 35B mm cosine actually *improved* with the
 fused scan, 0.999540 → 0.999631), so perplexity is the number to watch.
 

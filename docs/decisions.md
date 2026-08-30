@@ -344,7 +344,36 @@ boundaries exactly, so the switch is a safety handle and a provenance anchor, no
 tier. The routed experts keep their older, narrower switches (`XWEN_ACT_CLASSIC`,
 `XWEN_COMBINE_CLASSIC`), which still apply on the classic branch. Because nothing here
 can move a dump, the parity schema is untouched: no `moe_glue` provenance field, no pin,
-no grandfather clause (2026-07-29).
+no grandfather clause (2026-07-29). That uniformity ended 2026-08-30, and the
+additions got their own switches and provenance fields precisely because they CAN
+move a dump: the rescale branch's activation glue folds into `ops::silu_mul_l2`
+(bounded — its sum order is not candle's; `XWEN_ACT_L2_CLASSIC`, provenance
+`act_l2` at schema v9), and the shared expert's three projections can take the
+dense prefill gemm (`XWEN_SHEXP_QMATMUL`, provenance `shexp_gemm`).
+`XWEN_MOE_GLUE_CLASSIC` still covers only the bit-identical trio.
+
+**hc planes are dense_mm-only.** The loader's plane predicate is
+`dense_mm_supported || mv_ext_supported`, so giving the hyper-connection bottleneck
+planes for the prefill gemm would also have opened the mv_ext 2..8-token window
+inside `QLinear::forward` — on every hc path including `XWEN_HC_CLASSIC`, and
+asymmetrically: `down` (k 10240) is mv_ext-eligible where `up` (k 320) is not.
+Ragged chunks and serve resumes live in that window. `QLinear::without_mv_ext`
+therefore pins the hc projections' `forward` to QMatMul at every token count the
+gemm doesn't take — bitwise the pre-plane behavior, test-pinned
+(`without_mv_ext_keeps_small_batch_on_qmatmul`) — while `forward_gemm` keeps the
+plane. The shexp planes predate the change and keep their window:
+`XWEN_SHEXP_QMATMUL` restores that surface's immediate pre-change route, mv_ext
+included (2026-08-30; all three external/internal reviewers converged on the find).
+
+**Rejected: keeping the hc dense-gemm route off by default until a qwen4exp oracle
+tier exists** (a Codex review recommendation). The whole qwen4exp port is graded
+without an oracle tier — forced replay, greedy equivalence, and switch A/Bs — so the
+condition would gate this one lever on infrastructure nothing else waits for. The
+route is A/B'd at the dense_mm precision class (3.66-3.69e-4 rel_l2 against the
+QMatMul route over identical bytes), its greedy forks bisect to near-ties (every
+lever alone forks the same token; the all-classic arm is deterministic), and it is
+worth +7-11% prefill on the default checkpoint. `XWEN_HC_GEMM_QMATMUL` remains the
+lever if evidence turns (2026-08-30).
 
 **The MoE router matmul stays candle's; the fusion starts at the logits.** The obvious
 version of the router fusion swallows the gemv too, and it was rejected on evidence
@@ -640,6 +669,15 @@ and `XWEN_MM_ID_NR1` as kill switch and A/B knob, and the finding re-ranks the p
 ledger toward the non-gemm parts of `ffn` (2026-08-30).
 
 ## Refuted perf directions — do not reopen without new evidence
+
+**Refuted: the f32-tile mm_id family (`_t_hp`) as a way to delete the rescale chain
+on the 35B.** The rescale chain exists only because the default f16 tensor tiles
+stage the activation as half; the `_t_hp` family stages f32 and needs none of it.
+But at the 2048 chunk the `XWEN_MM_ID_TENSOR_HP=1` arm reads 2286-2314 prefill
+tok/s against the default's 3081-3090 in the same sweep — the f32 tiles cost ~25% of
+the gemm where the whole rescale chain costs a few percent of the stage (and the L2
+fold has since collapsed it to one dispatch). Decode unchanged (108.4-108.7).
+Measured 2026-08-30, log.md "FFN glue".
 
 Laguna's refuted list (death-by-dispatch, encoder takeover, all-f16 activation chains,
 mixed-operand matmul2d as a tensor speedup, sub-32-seq mm_id) transfers as *prior

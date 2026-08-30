@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 8;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 9;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -82,6 +82,20 @@ pub struct ProvenanceField {
 /// sites) or level with it (the vendored q8_0 gemv, also ~1e-6, at the attention
 /// and DeltaNet projections). Neither is bit-identical, so the pin is the same.
 /// Env-derived, like `dense_mm`.
+///
+/// Version 9: act_l2 (the f16-tile rescale branch's fused activation glue —
+/// silu*mul + per-row L2 + clamp + headroom scale in one pass, "fused" for
+/// `ops::silu_mul_l2`, "classic" for the candle chain and the oracle, whose
+/// ReferenceExperts never reaches the branch; XWEN_ACT_L2_CLASSIC, and
+/// XWEN_ACT_CLASSIC disables it too), shexp_gemm (the shared expert's prefill
+/// route: "fused" for the dense cooperative-tensor gemm via
+/// QLinear::forward_gemm, "classic" for QMatMul; XWEN_SHEXP_QMATMUL or
+/// XWEN_DENSE_MM_CLASSIC), and hc_gemm (the hyper-connection bottleneck's
+/// prefill route: "classic"/"fused"/"down-only"/"up-only" per
+/// XWEN_HC_GEMM_QMATMUL, "classic" under XWEN_DENSE_MM_CLASSIC). All three
+/// grandfather "classic": no pre-v9 binary had the fold or the routes. All
+/// three are load-bearing like `dense_mm` — the fold's sum order is not
+/// candle's, and the gemm routes carry dense_mm's reduced-precision class.
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_impl",
@@ -161,6 +175,21 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "mv_ext",
         introduced: 8,
+        grandfather: Some("classic"),
+    },
+    ProvenanceField {
+        name: "act_l2",
+        introduced: 9,
+        grandfather: Some("classic"),
+    },
+    ProvenanceField {
+        name: "shexp_gemm",
+        introduced: 9,
+        grandfather: Some("classic"),
+    },
+    ProvenanceField {
+        name: "hc_gemm",
+        introduced: 9,
         grandfather: Some("classic"),
     },
 ];
@@ -255,6 +284,14 @@ mod tests {
         assert_eq!(resolve_missing("mv_ext", 1), Some("classic"));
         assert_eq!(resolve_missing("mv_ext", 7), Some("classic"));
         assert_eq!(resolve_missing("mv_ext", 8), None);
+        // act_l2 / shexp_gemm / hc_gemm introduced at v9: v1..v8 dumps missing
+        // them resolve to "classic" (no earlier binary had the fold or the
+        // dense-gemm routes); missing at v9 fails.
+        for f in ["act_l2", "shexp_gemm", "hc_gemm"] {
+            assert_eq!(resolve_missing(f, 1), Some("classic"), "{f}");
+            assert_eq!(resolve_missing(f, 8), Some("classic"), "{f}");
+            assert_eq!(resolve_missing(f, 9), None, "{f}");
+        }
         // Baseline fields are required at every version.
         assert_eq!(resolve_missing("attn_dtype", 1), None);
         assert_eq!(resolve_missing("attn_dtype", 2), None);

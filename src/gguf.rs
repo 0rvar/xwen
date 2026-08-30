@@ -1427,6 +1427,13 @@ pub struct QLinear {
     /// (it never retains a buffer) and therefore what the XWEN_ATTN_F32 parity
     /// path keeps.
     plane: Option<QuantPlane>,
+    /// Whether `forward` may take the small-batch (2..=8 token) mv_ext window
+    /// when a plane is present. True everywhere except the hyper-connection
+    /// bottleneck: its planes exist ONLY for the prefill gemm (`forward_gemm`),
+    /// and letting them open the window would change the 2..8-token numerics of
+    /// every hc path — `XWEN_HC_CLASSIC` included, which promises the pre-plane
+    /// candle chain (`without_mv_ext`).
+    mv_ext_ok: bool,
 }
 
 impl QLinear {
@@ -1470,6 +1477,7 @@ impl QLinear {
         // sees a contiguous, offset-0 rank-2 activation. Any other rank or a
         // token count outside the window falls through to QMatMul unchanged.
         if let Some(plane) = &self.plane
+            && self.mv_ext_ok
             && let Ok((t, _)) = x.dims2()
             && let Some(r1ptg) = crate::ops::mv_ext_window(t)
             && crate::ops::mv_ext_supported(plane.dtype, plane.in_dim)
@@ -1478,6 +1486,39 @@ impl QLinear {
                 .map_err(|e| candle_core::Error::Msg(format!("{e:?}")));
         }
         self.inner.forward(&x)
+    }
+
+    /// [`forward`](Self::forward), plus the vendored dense cooperative-tensor
+    /// gemm (`ops::matmul_dense_q`) for a rank-2 f32 activation of more than
+    /// `ops::dense_mm_min_seq()` rows — the route the 27B's dense FFN takes at
+    /// prefill, offered here to any planed projection whose caller opts in (the
+    /// MoE shared expert, the hyper-connection bottleneck). Everything else —
+    /// fewer rows, no plane, a dtype the gemm is not instantiated for, other
+    /// ranks, or `XWEN_DENSE_MM_CLASSIC` — is exactly `forward`.
+    ///
+    /// The gemm is the reduced-precision class (~4e-4 rel_l2 from the f32
+    /// oracle, docs/parity.md §3b), not `QMatMul`'s ~2e-4, which is why it is
+    /// opt-in per caller and off under the same switch the strict tier pins.
+    pub fn forward_gemm(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        if let Some(plane) = &self.plane
+            && !crate::ops::dense_mm_classic()
+            && x.dtype() == DType::F32
+            && let Ok((t, _)) = x.dims2()
+            && t > crate::ops::dense_mm_min_seq()
+            && crate::ops::dense_mm_supported(plane.dtype, plane.in_dim)
+        {
+            // The kernel reads x straight from device memory, so a strided view
+            // has to be materialized; an offset-only view is fine (the dispatch
+            // binds the start offset).
+            let x = if x.is_contiguous() {
+                x.clone()
+            } else {
+                x.contiguous()?
+            };
+            return crate::ops::matmul_dense_q(plane, &x)
+                .map_err(|e| candle_core::Error::Msg(format!("{e:?}")));
+        }
+        self.forward(x)
     }
 
     /// Wraps an already-loaded rank-2 weight `[out_dim, in_dim]` as a linear layer,
@@ -1492,7 +1533,39 @@ impl QLinear {
             in_dim,
             out_dim,
             plane: None,
+            mv_ext_ok: true,
         })
+    }
+
+    /// Wraps an already-loaded rank-2 weight together with a raw view of ITS
+    /// OWN device allocation, exactly as `Weights::qlinear_with_buffer` pairs
+    /// them for file-loaded tensors — for tests and benches that build
+    /// synthetic weights and need the planed routes (`forward_gemm`, the
+    /// mv_ext window) reachable. Keeps the loader's support predicate, so an
+    /// unsupported dtype/width yields a plane-less layer, not an error.
+    pub fn from_qtensor_with_buffer(qt: Arc<QTensor>, buffer: Arc<Buffer>) -> Result<Self> {
+        let dtype = qt.dtype();
+        let mut lin = Self::from_qtensor(qt)?;
+        lin.plane = (crate::ops::dense_mm_supported(dtype, lin.in_dim)
+            || crate::ops::mv_ext_supported(dtype, lin.in_dim))
+        .then(|| QuantPlane {
+            buffer,
+            base_off: 0,
+            dtype,
+            out_dim: lin.out_dim,
+            in_dim: lin.in_dim,
+        });
+        Ok(lin)
+    }
+
+    /// The same layer with the small-batch mv_ext window disabled: `forward`
+    /// is candle's `QMatMul` at every token count (bitwise the plane-less
+    /// loader's behavior), while `forward_gemm` keeps the plane. For
+    /// projections whose plane exists only for the prefill gemm — the
+    /// hyper-connection bottleneck.
+    pub fn without_mv_ext(mut self) -> Self {
+        self.mv_ext_ok = false;
+        self
     }
 }
 
@@ -1677,6 +1750,7 @@ impl Weights {
             inner: QMatMul::from_arc(qt)?,
             in_dim,
             out_dim,
+            mv_ext_ok: true,
             // This loader never retains the device buffer, so there is nothing
             // to hand a vendored kernel; `qlinear_with_buffer` is the one that
             // can. Deliberate for the XWEN_ATTN_F32 attention projections, the
@@ -1755,6 +1829,7 @@ impl Weights {
             in_dim,
             out_dim,
             plane,
+            mv_ext_ok: true,
         };
         Ok((qlinear, buffer, dtype))
     }
@@ -3767,5 +3842,211 @@ mod tests {
         if checked == 0 {
             eprintln!("no official checkpoint is cached; the parser was not differenced");
         }
+    }
+
+    /// Relative L2 distance, `||got - want|| / ||want||`.
+    fn rel_l2(got: &[f32], want: &[f32]) -> f32 {
+        let (mut d, mut n) = (0.0f64, 0.0f64);
+        for (g, w) in got.iter().zip(want) {
+            d += ((*g - *w) as f64).powi(2);
+            n += (*w as f64).powi(2);
+        }
+        (d / n.max(1e-30)).sqrt() as f32
+    }
+
+    /// A planed `QLinear` built exactly as `qlinear_with_buffer` builds one —
+    /// the `QMatMul` and the plane sharing ONE device allocation — so the two
+    /// routes below read identical bytes and any difference is the kernel's.
+    fn planed_qlinear(
+        device: &Device,
+        dt: GgmlDType,
+        out_dim: usize,
+        in_dim: usize,
+        seed: u64,
+    ) -> QLinear {
+        let dense = Tensor::from_vec(
+            fill(out_dim * in_dim, seed),
+            (out_dim, in_dim),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let qcpu = QTensor::quantize(&dense, dt).unwrap();
+        let raw = qcpu.data().unwrap();
+        let storage = QStorage::from_data(raw, device, dt).unwrap();
+        let QStorage::Metal(qms) = &storage else {
+            panic!("expected Metal storage")
+        };
+        let buffer = Arc::new(qms.buffer().clone());
+        let qtensor = Arc::new(QTensor::new(storage, (out_dim, in_dim)).unwrap());
+        QLinear {
+            inner: QMatMul::from_arc(qtensor).unwrap(),
+            in_dim,
+            out_dim,
+            plane: Some(QuantPlane {
+                buffer,
+                base_off: 0,
+                dtype: dt,
+                out_dim,
+                in_dim,
+            }),
+            mv_ext_ok: true,
+        }
+    }
+
+    /// `forward_gemm` routes the vendored dense gemm above `dense_mm_min_seq()`
+    /// and is exactly `forward` at or below it. Graded against the `QMatMul`
+    /// route over the same bytes at the shapes the two opt-in callers bring:
+    /// the shared expert (q8_0, hidden 2560 <-> 640 on Flash-Next, 2048 <-> 512
+    /// on the 35B) and the hyper-connection bottleneck (q8_0, 10240 -> 320 and
+    /// 320 -> 10240, the latter the ten-NK-step shape). Bound: the dense gemm's
+    /// precision class (~4e-4 rel_l2 from the f32 oracle at the 27B FFN shapes,
+    /// dense_mm.rs `TOL`), with the two routes' separate rounding summed — the
+    /// same 1e-3 the 27B FFN is graded at, never tighter than the kernel's
+    /// reduced-precision descriptor allows.
+    #[test]
+    fn forward_gemm_matches_qmatmul_at_prefill_and_is_forward_below() {
+        let device = metal_device().unwrap();
+        let t_gemm = crate::ops::dense_mm_min_seq() + 31; // above the floor, with a ragged tile
+        let shapes: [(usize, usize); 6] = [
+            (640, 2560),
+            (2560, 640), // Flash-Next shexp gate/up, down
+            (512, 2048),
+            (2048, 512), // 35B shexp
+            (320, 10240),
+            (10240, 320), // hc down, up
+        ];
+        for (i, &(out_dim, in_dim)) in shapes.iter().enumerate() {
+            let lin = planed_qlinear(&device, GgmlDType::Q8_0, out_dim, in_dim, 0x51 + i as u64);
+            let x = Tensor::from_vec(
+                fill(t_gemm * in_dim, 0x77 + i as u64),
+                (t_gemm, in_dim),
+                &Device::Cpu,
+            )
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
+            let got: Vec<f32> = lin
+                .forward_gemm(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let want: Vec<f32> = lin
+                .forward(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let rel = rel_l2(&got, &want);
+            eprintln!("forward_gemm [{out_dim},{in_dim}] t={t_gemm}: rel_l2 vs QMatMul {rel:.3e}");
+            assert!(
+                rel < 1e-3,
+                "[{out_dim},{in_dim}]: rel_l2 {rel:.3e} vs QMatMul"
+            );
+
+            // At one token the two are the same call: bitwise.
+            let x1 = x.narrow(0, 0, 1).unwrap().contiguous().unwrap();
+            let g1: Vec<f32> = lin
+                .forward_gemm(&x1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let w1: Vec<f32> = lin
+                .forward(&x1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert!(
+                g1.iter().zip(&w1).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "[{out_dim},{in_dim}] t=1 differs"
+            );
+
+            // The gate boundary, once (the shapes share one dispatcher): AT the
+            // floor forward_gemm is exactly forward (same QMatMul call, bitwise);
+            // one past it the gemm routes and lands in its precision class.
+            if i == 0 {
+                for (t, must_route) in [
+                    (crate::ops::dense_mm_min_seq(), false),
+                    (crate::ops::dense_mm_min_seq() + 1, true),
+                ] {
+                    let xb = Tensor::from_vec(
+                        fill(t * in_dim, 0xB0 + t as u64),
+                        (t, in_dim),
+                        &Device::Cpu,
+                    )
+                    .unwrap()
+                    .to_device(&device)
+                    .unwrap();
+                    let gb: Vec<f32> = lin
+                        .forward_gemm(&xb)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    let wb: Vec<f32> = lin
+                        .forward(&xb)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    if must_route {
+                        let rel = rel_l2(&gb, &wb);
+                        assert!(rel < 1e-3, "t={t}: rel_l2 {rel:.3e} vs QMatMul");
+                    } else {
+                        assert!(
+                            gb.iter().zip(&wb).all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "t={t} (the floor) must not route the gemm"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The hyper-connection projections carry planes ONLY for the prefill gemm:
+    /// `without_mv_ext` keeps `forward` off the small-batch (2..=8 token)
+    /// window, so a planed-but-gemm-only layer is bitwise the plane-less
+    /// `from_qtensor` one there — which is what makes the hc paths
+    /// (`XWEN_HC_CLASSIC` included) numerically unchanged by the planes.
+    #[test]
+    fn without_mv_ext_keeps_small_batch_on_qmatmul() {
+        let device = metal_device().unwrap();
+        let (out_dim, in_dim) = (320usize, 10240usize); // hc down, the mv_ext-eligible shape
+        let gemm_only =
+            planed_qlinear(&device, GgmlDType::Q8_0, out_dim, in_dim, 0xC1).without_mv_ext();
+        let mut plain = planed_qlinear(&device, GgmlDType::Q8_0, out_dim, in_dim, 0xC1);
+        plain.plane = None; // the pre-plane loader's shape, over identical bytes
+        let x = Tensor::from_vec(fill(4 * in_dim, 0xC2), (4, in_dim), &Device::Cpu)
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
+        let got: Vec<f32> = gemm_only
+            .forward(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let want: Vec<f32> = plain
+            .forward(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            got.iter()
+                .zip(&want)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "a gemm-only plane must leave 2..=8-token forwards bitwise on QMatMul"
+        );
     }
 }

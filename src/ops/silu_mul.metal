@@ -70,3 +70,99 @@ kernel void kernel_moe_silu_mul(
     const float s = g / (1 + exp(-g));
     dst[tid] = s * up[tid];
 }
+
+// Matches dispatch.rs SiluMulL2Args (#[repr(C)]).
+typedef struct {
+    int32_t ff;        // row width (expert_ff), <= SILU_MUL_L2_MAX_FF
+    int32_t n_rows;    // seq * top_k
+    float   scale;     // the f16-headroom factor (32768)
+    float   clamp_min; // col_l2 floor (1e-8)
+    float   clamp_max; // col_l2 ceiling (1e30)
+} silu_mul_l2_args;
+
+#define SILU_MUL_L2_THREADS 256
+#define SILU_MUL_L2_MAX_FF 1024
+// The kernel keeps each thread's slice of the row in a fixed-size register
+// array, so the ceiling is exactly this many columns per thread; the host
+// mirrors both constants (dispatch.rs SILU_MUL_L2_*, cross-checked by the
+// silu_mul.rs `metal_and_host_constants_agree` test).
+#define SILU_MUL_L2_COLS_PER_THREAD (SILU_MUL_L2_MAX_FF / SILU_MUL_L2_THREADS)
+static_assert(SILU_MUL_L2_MAX_FF == SILU_MUL_L2_COLS_PER_THREAD * SILU_MUL_L2_THREADS,
+              "the per-thread register array must cover the row ceiling exactly");
+
+// The f16-tile prefill branch's activation glue in ONE pass: for each
+// [token, slot] row of the [seq, top_k, expert_ff] gate/up pair,
+//   act    = silu(gate) * up              (the kernel above's expression, verbatim)
+//   col_l2 = clamp(sqrt(Σ act²), clamp_min, clamp_max)
+//   act_s  = (act * scale) / col_l2
+// which is what the candle chain in FusedExperts::project_inner computes as
+// sqr → sum_keepdim → sqrt → clamp → affine(scale) → broadcast_div (six
+// dispatches over the activation). `act_s` is what the down gemm consumes and
+// `col_l2` is what `combine` divides back out; the per-op rounding of each
+// elementwise step matches the chain (`sqr` as `a*a`, the scale as a separate
+// multiply, then the divide), so the only place the two can differ is the SUM.
+//
+// Reduction order (fixed, so the result is deterministic run over run): thread
+// `i` of the 256 accumulates its elements SEQUENTIALLY in ascending column order
+// (columns i, i+256, i+512, i+768), then a threadgroup tree halves 256 → 1
+// (partial[i] += partial[i + s] for s = 128, 64, ..., 1), barrier between
+// levels. candle's `sum_keepdim` reduces in its own strided/simd order, so the
+// two agree to accumulation-order noise (~1e-7 relative on the sum, which the
+// sqrt halves) — bounded in the silu_mul.rs test, NOT bitwise. This kernel is
+// therefore off the strict parity tier by construction (the strict candidate runs
+// mv_id, which never takes the rescale branch) and graded by mm / decode / ppl.
+//
+// One threadgroup of 256 threads per row; rows wider than 1024 columns fall
+// back to the chain on the host (`run_silu_mul_l2` bails, the caller decides).
+kernel void kernel_moe_silu_mul_l2(
+        constant silu_mul_l2_args & args [[buffer(0)]],
+        device const float * gate       [[buffer(1)]],
+        device const float * up         [[buffer(2)]],
+        device       float * act_s      [[buffer(3)]],
+        device       float * col_l2     [[buffer(4)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float partial[SILU_MUL_L2_THREADS];
+
+    if (row >= (uint) args.n_rows) {
+        return;
+    }
+    const uint ff = (uint) args.ff;
+    const uint base = row * ff;
+
+    // Each thread's up-to-4 activation values stay in registers between the
+    // reduction and the rescale store — no threadgroup staging of the row.
+    float act[SILU_MUL_L2_COLS_PER_THREAD];
+    float acc = 0.0f;
+    for (uint r = 0; r < SILU_MUL_L2_COLS_PER_THREAD; ++r) {
+        const uint c = tid + r * SILU_MUL_L2_THREADS;
+        if (c < ff) {
+            const float g = gate[base + c];
+            const float s = g / (1 + exp(-g));
+            const float a = s * up[base + c];
+            act[r] = a;
+            acc += a * a;
+        }
+    }
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = SILU_MUL_L2_THREADS / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // clamp(x, lo, hi) as candle's maximum(lo) then minimum(hi).
+    const float l2 = min(max(sqrt(partial[0]), args.clamp_min), args.clamp_max);
+    if (tid == 0) {
+        col_l2[row] = l2;
+    }
+    for (uint r = 0; r < SILU_MUL_L2_COLS_PER_THREAD; ++r) {
+        const uint c = tid + r * SILU_MUL_L2_THREADS;
+        if (c < ff) {
+            act_s[base + c] = (act[r] * args.scale) / l2;
+        }
+    }
+}
