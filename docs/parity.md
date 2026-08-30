@@ -51,6 +51,21 @@ carrier and is bit-identical to the kernel it replaces even there, and the prefe
 non-numeric (it faults pages early and changes no value). Neither touches a shipped
 checkpoint's math.
 
+**Re-passed again at xwen 0261e17** (2026-08-30), after the fused beta|alpha projection
+(`kernel_delta_ba_fused`, which runs on the fused DeltaNet path at seq ≤ 32 and therefore
+on every decode step of every checkpoint here): **35B-A3B ALL PASS**, six graded checks,
+summaries byte-identical to the fd46c7a run; **Qwen3.6-27B ALL PASS**, five graded;
+**Qwen3.8-27B ALL PASS**, five graded, with the same known ppl skip. All three re-gated
+deliberately this time rather than argued past — unlike 2c8d3b3 and ac40526 above, this
+kernel is bounded (2e-6) rather than bit-identical and it is on the decode path of every
+shipped checkpoint, which is exactly the case the decode and ppl tiers exist for. The
+intervening commit f89972f (`kernel_delta_scan_decode`) needs no gate of its own: it is
+opt-in behind `XWEN_DELTA_DECODE_KERNEL` and unreachable in a gate run, which strips the
+flag from the run env. The review polish that followed the fold (ab5b322 — a device
+threadgroup-capability check inside the predicate, a tail geometry brought under test,
+comment corrections) changes no arithmetic on any path, so the 0261e17 grade stands for
+it.
+
 ```bash
 just init                               # git submodule update --init --recursive
 bash scripts/build-llamacpp.sh          # cmake from an ephemeral nix shell, system CLT SDK

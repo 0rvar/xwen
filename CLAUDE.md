@@ -214,10 +214,15 @@ kernel-vs-reference invariants and is the fast pre-check.
 ## Perf state
 
 As of 2026-08-15 for the 3.8-27B, 2026-08-08 for the 3.6 pair (`lowpowermode 0` —
-NOT low-power mode; this machine emits no `powermode` key, so high-power mode is
-never positively confirmable and must not be claimed. Interleaved protocol; full
-history in log.md). Plain (--no-draft), measured inside the sweeps that graded
-each: 35B-A3B decode 104-107 tok/s, 27B 24.8-25.3, 3.8-27B 23.7-24.8.
+NOT low-power mode; high-power mode is never positively confirmable and must not be
+claimed. **The KEY SET CHANGED at some point: this used to emit no `powermode` key,
+and on 2026-08-29/30 two agents saw `pmset -g` print `powermode 0` and NO
+`lowpowermode` key. Report the line verbatim as of the session; still never claim
+high-power mode from either key.** Interleaved protocol; full history in log.md). Plain (--no-draft), measured inside the
+sweeps that graded each: **35B-A3B decode 114 tok/s as of 0261e17** (2026-08-30, the
+beta|alpha fold, +8.8% over the 105.1 arm of the same session; was 104-107 through
+2026-08-08), 27B 24.8-25.3, 3.8-27B 23.7-24.8. The fold has NOT been re-swept with
+drafting, so every drafted figure below is still against the pre-fold plain level.
 Prefill unchanged since 2026-07-29 and not re-measured: 35B ~1900-2550@4k; 27B
 702@925 / 445@4k. Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run
 adds ~9s of Metal pipeline compilation. With drafting (the default since P9a) at
@@ -234,13 +239,18 @@ between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 read
 36.5-37.6 in today's own 0.3 arm.
 Qwen3.8-Flash-Next (EXPERIMENTAL; every surface since P4, but these numbers are
 `generate`'s — serve has never been benchmarked on it, TODO.md), 2026-08-29 after the
-P3 kernel pass,
-plain because no drafter exists for it: **prefill ~796 tok/s @530, decode ~45 (43 before the PLE row prefetch)**,
-against llama.cpp's 789 / 41.4 on the same file in the same hour (four interleaved
-rounds, medians; `pmset -g` said `powermode 0` that session — still no high-power
-claim). Its decode is bimodal round over round (~42 vs ~44) and unexplained, and
-`XWEN_STACK_PROFILE`'s decode stages are SYNC-INFLATED — they rank stages, they are
-not timings, so take every headline from an unprofiled run.
+P3 kernel pass for prefill and 2026-08-30 at the ba fold (0261e17) for decode,
+plain because no drafter exists for it: **prefill ~796 tok/s @530, decode 46.5-46.7
+(44.4-44.5 before the ba fold, 43.1 before the PLE row prefetch)** — 530-token prompt,
+interleaved rounds, medians, the fold measured in two sessions,
+against llama.cpp's 789 / 41.4 on the same file in the same hour as the 2026-08-29 arm
+(`pmset -g` said `powermode 0` that session — still no high-power
+claim). Its decode is bimodal round over round (~42 vs ~44 at the pre-fold level) and
+unexplained, and BOTH per-step profilers — `XWEN_STACK_PROFILE`'s decode stages and
+`XWEN_GDN_PROFILE`'s whole line — are SYNC-INFLATED: they RANK steps, they do not PRICE
+them (two figures off the GDN line read 2-3x high against amortized benches of the same
+work), so take every headline from an unprofiled run and price a step with an amortized
+bench or end-to-end tok/s, never with a profiler figure.
 Within-session cross-drafter comparison, 2026-08-15 (the only way to compare the
 two kinds honestly — same machine, same hour): the 3.6-27B's DFlash head runs
 1.50x/1.47x over its own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x

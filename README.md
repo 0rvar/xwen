@@ -60,18 +60,22 @@ already in the HF cache; an uncached one is a 400 pointing at `xwen fetch`.
 unlike Qwen3.8-27B this one is a whole second architecture rather than a registry entry
 over an existing graph: sparse attention, hyper-connections and a 51B n-gram embedding table on
 top of the familiar gated DeltaNet and MoE. It loads, generates and stops correctly, and
-its graph agrees with upstream llama.cpp (186/192 forced-replay steps after the P3
-kernel pass, 189/192 before it, zero hard mismatches either way — every divergence a
-rank-2 near-tie; `docs/qwen4exp-parity-2026-08-29.md`). It now runs on every surface:
+its graph agrees with upstream llama.cpp (185/192 forced-replay steps at 0261e17,
+186/192 after the P3 kernel pass, 189/192 before it, zero hard mismatches at any of them
+— every divergence a rank-2-or-3 near-tie, margins down to 0.0002 logit;
+`docs/qwen4exp-parity-2026-08-29.md`). It now runs on every surface:
 snapshots, rewind, page-out and the on-disk tier carry its QSA indexer rows and its PLE
 conv window and n-gram history, so `serve` and `batch` treat it like any other
 checkpoint. It is still not finished: there is no drafter for its graph (so it decodes
 plain, and `--draft` is refused rather than ignored), it is not auto-fetched, and it has
 no parity harness or perplexity floor of its own. It is, however, fast: after the P3 kernel
-pass it runs **prefill 795.7 tok/s and decode 44.5-45.8 tok/s (43.1 before the PLE row
-prefetch)** where llama.cpp on the same file in the same hour runs 789 and 41.4 — plain,
-no drafter, 530-token prompt, four interleaved rounds,
-medians, `powermode 0` with no high-power claim. See `docs/qwen4exp-port.md`.
+pass it runs **prefill 795.7 tok/s, and decode 46.5-46.7 tok/s since the beta|alpha fold
+of 2026-08-30 (44.4-45.8 before it, 43.1 before the PLE row prefetch)** where llama.cpp on
+the same file in the same hour as the prefill arm runs 789 and 41.4 — plain,
+no drafter, 530-token prompt, interleaved rounds,
+medians, `powermode 0` with no high-power claim. Take those from unprofiled runs: the
+per-step profilers (`XWEN_STACK_PROFILE`, `XWEN_GDN_PROFILE`) sync-bracket each step, so
+they rank steps and do not price them. See `docs/qwen4exp-port.md`.
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full
 names); the HTTP APIs take the **full names only**. Qwen3.8-27B (added 2026-08-14) runs
@@ -152,6 +156,10 @@ of 3 reps, arms interleaved, `lowpowermode 0` on AC):
 | `Qwen3.6-27B` | +46 to +52% | +46 to +52% | 78-86% | 2026-08-08 |
 | `Qwen3.6-35B-A3B` | +26 to +28% | +15 to +17% | 68-74% | 2026-08-08 |
 | `Qwen3.8-27B` | +44 to +45% | +37 to +38% | 78-80% | 2026-08-15 |
+
+The 35B-A3B's PLAIN decode level moved on 2026-08-30 (105.1 → 114.4 tok/s, the
+beta|alpha fold at 0261e17); the gains in this table were fitted against the older level
+and have not been re-swept, so read them as gains over their own sweep's plain arm.
 
 Acceptance trades against draft length, so raising `--draft-p-min` buys acceptance and
 loses tok/s. Ranges span the medians each shipped configuration was measured at; compare

@@ -527,6 +527,70 @@ llama.cpp hardcodes F32 for both conv and delta states. State per layer per sequ
 `(d_conv−1)·conv_dim` floats conv + `128·128·H_v` floats delta (2 MiB on the 35B)
 (2026-07-28).
 
+**The beta|alpha projection folds into its own head below 32 tokens — a dispatch removed,
+not a kernel made faster (2026-08-30).** `kernel_delta_ba_fused` (delta.metal) reads
+`x_normed` and the `[hidden, 2 · v_heads]` f32 weight and writes `beta` and the log-decay
+directly, replacing a candle gemv (~30 µs per layer for a ~1 MB weight, i.e. ~33 GB/s)
+plus `kernel_delta_ba`; the projection output the two-dispatch arm materializes never
+reaches memory. It removes one dispatch per DeltaNet layer per token and nothing else,
+and it pays on both DeltaNet checkpoints (530-token prompt, 128 decoded, unprofiled,
+interleaved): **Flash-Next 44.4-44.5 → 46.5-46.7 tok/s (+4.6-4.8%, 36 layers), 35B-A3B
+105.1 → 114.4 (+8.8%, 30 layers)**, prefill unchanged on both (796-798 / 2248-2268),
+because a prefill chunk takes the gemv either way. The 35B gains nearly twice as much for
+the reason that generalizes to every remaining fusion on this path: the saving is a fixed
+~0.7-0.8 ms, and it lands against a 9.5 ms token there against Flash-Next's 22.
+
+Geometry: one threadgroup owns `DELTA_BA_COLS` = 8 output columns, FITTED (8 → 12
+threadgroups at 7.4 µs; 16 → 6 at 9.9; 4 → 24, tying at decode and losing by half at seq
+8-32; below 8 a threadgroup's weight run stops filling a cache line on its own), each
+column's dot split across `DELTA_BA_ROWS` = 128 row chunks folded in a tree, and a `_t4`
+specialization tiling `DELTA_BA_TOKS` = 4 tokens so a short verify chunk reads the weight
+once per tile rather than once per token.
+
+Three things about it are load-bearing. **The ceiling is deliberately short of the
+crossover.** `DELTA_BA_MAX_SEQ` = 32 covers decode (1) and a DFlash verify block (16);
+the measured crossover is farther out (18.8 µs fused against the chain's 71.7 at seq 32,
+`delta_ba_timing`), and it is not taken, because the fused kernel reads the whole weight
+once per token TILE where candle's gemm reads it once per CHUNK — prefill chunks are
+hundreds of tokens, that regime has never been measured, and the gemm's reuse is why
+prefill is shaped the way it is. Prefill takes the gemv unchanged. **The epilogue is
+shared so the arms cannot drift.** The beta sigmoid and the softplus decay against the
+pre-baked `ssm_a` and the dt offset are two `static inline` helpers (`delta_ba_beta`,
+`delta_ba_logdecay`) called from both kernels, which is what keeps the plain
+`kernel_delta_ba` BITWISE against the reference while the fused one exists.
+**It is bounded, not bitwise**, because it reassociates the dot product against candle's
+gemv: graded at 2e-6 across every shipped geometry at seq 1/3/4/5/16/32, the widest
+(hidden 5120) measuring 1.05e-6 on the decay — the same class as `XWEN_DELTA_CLASSIC`,
+and tight enough that a swapped beta/alpha column block or a mis-tiled token still fails
+by orders of magnitude. `XWEN_DELTA_BA_CLASSIC=1` restores the two-dispatch chain as a
+kill switch (not a bit-identity anchor); `parity-gate.ts` strips it from the run env with
+the other kernel switches, and it sits inside the arm `XWEN_DELTA_CLASSIC` already
+switches away from, so it appears in no parity row (parity.md).
+
+**State the text claim precisely: byte-identical over the window that was GRADED, not
+forever.** All three shipped checkpoints re-passed their gates at 0261e17 (35B-A3B six
+graded, 27B five, 3.8-27B five), and Flash-Next forced replay reads 185/192 with 7
+near-ties (0.0002-0.288 logit, rank 2-3), 0 hard, against 186/192 with 6 ties at fd46c7a
+— the extra flip is a 0.0002-logit tie. The greedy text is byte-identical to the classic
+arm over 64 tokens and **forks at about step 124 of a 128-token free run** on the
+530-token prompt. That is what a 2e-6 bound predicts and not a defect, but "byte-identical"
+without the window attached is the kind of claim that gets quoted into a bitwise
+assumption later. Under teacher forcing over 128 steps the two arms pick the same top-1 at
+every step and drift apart by at most 0.32 logit (log.md 2026-08-30); the fork is that drift
+crossing a boundary on the free-run path, not a step either arm gets wrong.
+
+Follow-up ab5b322 added a device threadgroup-capability check to
+`delta_ba_fused_applies` (the predicate now refuses a device whose
+`maxTotalThreadsPerThreadgroup` cannot cover `DELTA_BA_COLS * DELTA_BA_ROWS`), brought a
+tail geometry under test, and corrected the comments; no arithmetic moved, so the
+0261e17 parity grade stands for it.
+
+This is the arc's one shipped win out of three units, and the reason it paid generalizes:
+see "How to read `XWEN_GDN_PROFILE`" and the `attn_qkv` refutation below. The dispatch it
+displaced was also doing real work badly, which is NOT true of the remaining fusion
+candidates on this path (TODO.md item (14)) — expect 8.41 µs × 36 layers ≈ 0.3 ms from
+those on Flash-Next, not 1 ms.
+
 ## Refuted perf directions — do not reopen without new evidence
 
 Laguna's refuted list (death-by-dispatch, encoder takeover, all-f16 activation chains,
@@ -651,6 +715,81 @@ What it does pay for is the arm — the bench that priced the scan honestly need
 to price it against, and the next person told the decode step is starving for bandwidth
 should be able to run the fix rather than rebuild it. `delta_scan_decode_timing` calls
 both kernels directly and needs no switch (2026-08-30).
+
+**"`attn_qkv` runs at a third of its siblings' rate" is REFUTED — at DRAM it is the
+FASTEST of the three GDN projections, and the profiler's ordering of them is inverted.**
+`XWEN_GDN_PROFILE`'s decode line reported the `attn_qkv` plane (`[2560 → 10240]`, 1003
+MB/token over 36 layers) at 346 GB/s where `attn_gate` (`[2560 → 6144]`) read 523 and
+`ssm_out` (`[6144 → 2560]`) read 537 through the same `kernel_mul_mv_q8_0_f32_attn` —
+which reads like an output width the grid or the cache falls off at, on the single
+largest weight read in the block. `q8_gemv_shape_sweep` (src/ops/q8.rs) sweeps eight
+shapes across both axes in three arms: `reuse` (one plane, 32 dispatches per sync —
+cache-resident, **never quotable as a kernel rate**), `rotate` (distinct planes covering
+~512 MB round-robin, which is the situation a real decode step is in) and `synced` (one
+dispatch per flush, the condition the profiler itself measures in).
+
+The rotate arm, medians of three runs of 41 rounds: `attn_gate` **464 GB/s** (36.1 µs),
+`ssm_out` **465** (35.9), `attn_qkv` **510** (54.6), and off the production shapes 493 at
+8192, 525 at 12288, 505 at `[10240 → 2560]`, 531 at `[6144 → 6144]`. Four K=2560 shapes
+fit **t = 8.41 µs + bytes / 604 GB/s** by least squares (R² 0.99996, max residual 0.09
+µs); the three off-axis shapes were held out and land within 0.8 µs. There is no cliff at
+any width — the rate rises monotonically with bytes moved, because the only thing varying
+is how much traffic the fixed 8.41 µs amortizes over, which is exactly why the widest
+production plane is the fastest one. `[2560 → 2560]` is the one shape off the line (30.8
+µs against 19.9 predicted, 55% over) and is EXCLUDED from the fit: 1280 threadgroups is
+too small a grid to fill 40 cores, and it is also the only cell that moved run to run.
+
+**The 346 was not reproduced, and the entry does not claim it was.** The synced arm reads
+122 GB/s for `attn_qkv`, because its raw number still carries the ~157 µs sync floor that
+`gdn_profile` subtracts; reconstructing the profiler's own arithmetic (solve the floor
+from the reported `attn_gate` figure, 160.3 µs, subtract from `attn_qkv`'s 227.8) gives
+67.5 µs = 413 GB/s against production's 346. Right mechanism, right direction, right
+order of magnitude, wrong number. What is established is that **the kernel cannot produce
+a 346/523/537 spread and the measurement condition demonstrably can** — the condition
+turns a true 18.5 µs gap between the two shapes into a measured 35.6 µs one, and a
+constant floor subtraction from ~200 µs numbers amplifies it further. The synced arm has
+its own fit, `t = 157 µs + bytes / 476 GB/s`, so that condition also costs ~21% of the
+marginal rate on top of the floor.
+
+The 604 GB/s is a marginal slope differenced between two arms of the same bench, NOT an
+appeal to a peak-bandwidth figure — this machine's peak has never been measured and the
+repo rule forbids arguing from the nominal one. Machine conditions, stated because they
+were not ideal: `pgrep` was clean at the START of the session and not re-verified per
+run; at least one other agent was on the machine during part of it (the unstable
+`[2560 → 2560]` cell is the visible contention); the four cells the conclusion rests on
+held to ±0.3 µs across three runs; and power mode was read only afterwards (`powermode
+0`), which does not establish what was in force during the runs.
+
+A geometry retune was priced at the same time and there is none: six `(NR0, NSG)`
+configurations A/B'd by temporary edits to q8.metal and dispatch.rs (reverted), all six
+passing `q8_decode_production_shapes`. The shipped `(2, 4)` wins at all three production
+shapes (36.1 / 54.2 / 36.1 µs); `(4, 4)`, `(8, 4)` and `(2, 2)` are clean and worse,
+`(4, 2)` and `(4, 8)` are much worse but came out non-monotonic in `n_out` and count as
+"clearly not a win" rather than as figures.
+
+Do not re-open a "slow plane" reading off the profile line without an amortized arm; the
+sweep is `#[ignore]`d and takes seconds (2026-08-30).
+
+**How to read `XWEN_GDN_PROFILE`: it RANKS steps, it does not PRICE them.** Every step on
+the line is bracketed by a device sync, so a step that issues one kernel pays a GPU round
+trip the real forward overlaps away. The module's dispatch-floor correction is one global
+number, while the inflation is per step and roughly inverse to the step's byte count — so
+the correction does not recover it, and the printed shares are shares of an inflated
+total (the raw mixer total, 78 ms, is more than three whole unprofiled decode tokens).
+Two figures off that line have now been measured properly and both were wrong by 2-3x in
+the same direction: the scan (3.79-7.19 ms/token on the line, 1.35-1.43 amortized) and
+`attn_qkv` (346 GB/s on the line, 510 at DRAM). Neither inflated figure was reproduced
+EXACTLY from outside — the qkv reconstruction lands at 413 rather than 346 — so the
+correction to make when reading the line is directional, not a divisor: assume a step is
+faster than it says, by more the fewer dispatches and bytes it has, and re-measure rather
+than rescale. Use it to decide WHICH step to
+investigate — that is what the 27B prefill work used it for and it was right every time.
+Then price the step with an amortized bench (batched dispatches per sync, outputs held
+alive, per CLAUDE.md's benching rules) or with end-to-end tok/s before believing a cost,
+and never quote a decode figure from it as one. The same rule already applies to
+`XWEN_STACK_PROFILE`'s decode stages. Fixing the instrument — bracket the whole block
+once and attribute by difference, or run every step under `XWEN_GDN_REPS` and say so on
+the line — is ledgered, not done (2026-08-30).
 
 **Chunk-boundary device syncs and command-buffer batching granularity are both REFUTED
 as levers on the 27B prefill residual.** The residual — +350 to +560 µs/token of
@@ -1787,7 +1926,12 @@ Ledgered with the values and sources (TODO.md).
 
 Inherited unchanged from laguna: state the power mode with every number, never report
 first-forward prefill as steady-state, bench via the scripts with warmup, and one
-~20–70 GB process at a time (2026-07-28).
+~20–70 GB process at a time (2026-07-28). AMENDED 2026-08-30: `pmset -g`'s key set on
+this machine is not stable — it used to print `lowpowermode` and no `powermode`, and on
+2026-08-29/30 it printed `powermode 0` and no `lowpowermode`. Quote whichever line the
+session actually produced, verbatim, and read it BEFORE the runs; an after-the-fact
+reading does not establish what was in force during them. Neither key ever licenses a
+high-power claim.
 
 **A/B perf comparisons must INTERLEAVE the two arms, and a sequential matrix is not a
 valid A/B.** Measured 2026-07-28 while benching the fused DeltaNet kernels: a

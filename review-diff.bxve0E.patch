@@ -1,0 +1,1874 @@
+diff --git a/scripts/parity-gate.ts b/scripts/parity-gate.ts
+index f147388..2330438 100755
+--- a/scripts/parity-gate.ts
++++ b/scripts/parity-gate.ts
+@@ -222,8 +222,9 @@ function die(msg: string): never {
+  *
+  * A toggle missing from this list is not a loud failure: it would apply to BOTH
+  * sides and the gate would pass while grading a kernel nobody asked for. Add new
+- * switches here as they land — `XWEN_DELTA_SCAN_V2` is the one that has no
+- * provenance field of its own, so stripping it is the only guard.
++ * switches here as they land — `XWEN_DELTA_SCAN_V2` and
++ * `XWEN_DELTA_DECODE_KERNEL` are the ones with no provenance field of their
++ * own, so stripping them is the only guard.
+  *
+  * `XWEN_STACK_PROFILE`, `XWEN_PLE_PROFILE` and `XWEN_CHUNK_SYNC` are stripped for a different
+  * reason: neither changes any arithmetic, but both insert device syncs into the
+@@ -234,7 +235,7 @@ function baseEnv(): Record<string, string> {
+   const e: Record<string, string> = {};
+   for (const [k, v] of Object.entries(process.env)) {
+     if (v === undefined) continue;
+-    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MV_EXT_CLASSIC" || k.startsWith("XWEN_MV_EXT_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k === "XWEN_HC_CLASSIC" || k === "XWEN_STACK_PROFILE" || k === "XWEN_CHUNK_SYNC" || k === "XWEN_PLE_PROFILE" || k.startsWith("XWEN_MM_ID")) continue;
++    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DELTA_DECODE_KERNEL" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MV_EXT_CLASSIC" || k.startsWith("XWEN_MV_EXT_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k === "XWEN_HC_CLASSIC" || k === "XWEN_STACK_PROFILE" || k === "XWEN_CHUNK_SYNC" || k === "XWEN_PLE_PROFILE" || k === "XWEN_DELTA_BA_CLASSIC" || k.startsWith("XWEN_MM_ID")) continue;
+     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
+     // those explicitly per run; an inherited one would skew every tier.
+     if (k.startsWith("XWEN_PARITY_")) continue;
+diff --git a/src/gdn_profile.rs b/src/gdn_profile.rs
+index 30e1d71..37c0b69 100644
+--- a/src/gdn_profile.rs
++++ b/src/gdn_profile.rs
+@@ -102,10 +102,14 @@ pub enum Step {
+     /// tiles in its load stage, so a fused block leaves this at zero.
+     QkNorm,
+     /// The fused `beta|alpha` projection (one f32 gemv over `[hidden, 2 *
+-    /// v_heads]`), or the reference's two separate ones.
++    /// v_heads]`), or the reference's two separate ones. At the small token
++    /// counts where `ops::delta_ba_fused` applies this step is the WHOLE
++    /// beta/decay path — projection and head in one kernel — and `BaHead`
++    /// records no call at all.
+     BaProj,
+     /// `beta = sigmoid(..)` and the log decay `g = ssm_a * softplus(..)` from
+-    /// that projection's output.
++    /// that projection's output. Absent from a line whose blocks folded it into
++    /// `BaProj`; the two arms are therefore compared as `ba_proj + ba_head`.
+     BaHead,
+     /// `attn_gate`: the z gate projection.
+     GateProj,
+diff --git a/src/linear_attn.rs b/src/linear_attn.rs
+index 3a913a1..bbc4bfd 100644
+--- a/src/linear_attn.rs
++++ b/src/linear_attn.rs
+@@ -209,6 +209,8 @@ impl LinearAttnBlock {
+     /// The fused path: eight dispatches per layer at any sequence length —
+     /// three projections, the conv+silu+state kernel, the beta/decay head, the
+     /// whole recurrent scan, the gated output norm, and the output projection.
++    /// SEVEN at the small token counts where the beta|alpha projection folds
++    /// into the beta/decay head's own kernel (`ops::delta_ba_fused_applies`).
+     ///
+     /// A multi-token chunk under an armed rollback trail keeps those eight
+     /// scan-side dispatches (the scan writes one state plane per token instead
+@@ -239,12 +241,26 @@ impl LinearAttnBlock {
+         gdn_profile::step(&mut prof, dev, Step::Conv, bytes.conv)?;
+ 
+         // beta and the decay come from the layer INPUT, not the conv output.
+-        let ba = gdn_profile::rep(&prof, || Ok(x_normed.matmul(&self.ba_wt)?))?; // [seq, 2 * v_heads]
+-        gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_proj)?;
+-        let (beta, g) = gdn_profile::rep(&prof, || {
+-            crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)
+-        })?;
+-        gdn_profile::step(&mut prof, dev, Step::BaHead, bytes.ba_head)?;
++        // At small token counts the projection and the head are ONE kernel and
++        // the block closes a single `ba_proj` step carrying both steps' bytes;
++        // a prefill chunk (or `XWEN_DELTA_BA_CLASSIC`) keeps the candle gemv
++        // and closes both steps, which is what makes the two arms readable
++        // against each other under XWEN_GDN_PROFILE.
++        let (beta, g) = if crate::ops::delta_ba_fused_applies(x_normed, &self.ba_wt) {
++            let pair = gdn_profile::rep(&prof, || {
++                crate::ops::delta_ba_fused(x_normed, &self.ba_wt, &self.ssm_a, &self.dt_bias)
++            })?;
++            gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_fused)?;
++            pair
++        } else {
++            let ba = gdn_profile::rep(&prof, || Ok(x_normed.matmul(&self.ba_wt)?))?; // [seq, 2 * v_heads]
++            gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_proj)?;
++            let pair = gdn_profile::rep(&prof, || {
++                crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)
++            })?;
++            gdn_profile::step(&mut prof, dev, Step::BaHead, bytes.ba_head)?;
++            pair
++        };
+ 
+         let z = gdn_profile::rep(&prof, || self.z_proj.forward(x_normed))?; // [seq, v_dim]
+         gdn_profile::step(
+@@ -473,6 +489,15 @@ impl LinearAttnBlock {
+             // The `[hidden, 2 * v_heads]` f32 weight, which dwarfs its operands.
+             ba_proj: f32b(self.ba_wt.elem_count()),
+             ba_head: f32b(seq * 2 * vh + 2 * seq * vh + 2 * vh),
++            // The fused arm moves the same weight plane plus the layer input it
++            // contracts and the two vectors it writes; the projection output
++            // the two-dispatch arm materializes never reaches memory.
++            ba_fused: f32b(
++                self.ba_wt.elem_count()
++                    + seq * (self.ba_wt.elem_count() / (2 * vh))
++                    + 2 * seq * vh
++                    + 2 * vh,
++            ),
+             // o and z in, the result out.
+             gnorm: f32b(3 * seq * vh * hd + hd),
+             // Held in the struct so `scan` can size the state planes it writes.
+@@ -488,6 +513,8 @@ struct ByteFloors {
+     qk_norm: u64,
+     ba_proj: u64,
+     ba_head: u64,
++    /// The one-dispatch arm's floor: projection and head together.
++    ba_fused: u64,
+     gnorm: u64,
+     /// One `[v_heads, 128, 128]` f32 state plane.
+     state_plane: u64,
+@@ -1278,6 +1305,71 @@ mod tests {
+         }
+     }
+ 
++    /// The same rollback invariant when the verify span is walked ONE TOKEN AT
++    /// A TIME. Two things have to hold and neither fails loudly: the state each
++    /// step hands the cache is the state that step produced (a scan updating the
++    /// state in place would leave the trail's earlier entries holding the LATEST
++    /// state, and only a mid-span commit would show it), and commit 0 must still
++    /// find the checkpoint's own bits.
++    ///
++    /// This grades whichever seq == 1 scan the test process was launched with —
++    /// the general kernel by default, `kernel_delta_scan_decode` under
++    /// `XWEN_DELTA_DECODE_KERNEL`, the reference scan under
++    /// `XWEN_DELTA_CLASSIC` (where it is trivially true and harmless); all three
++    /// switches are read once per process. The decode kernel's own half of this
++    /// — that it leaves the state it was handed untouched — is pinned
++    /// switch-free by `decode_scan_does_not_mutate_the_incoming_state`
++    /// (src/ops/delta.rs).
++    #[test]
++    fn rollback_through_single_token_steps_lands_where_the_reference_lands() {
++        let Ok(metal) = crate::gguf::metal_device() else {
++            return;
++        };
++        let _guard = path_lock();
++        let (kh, vh, hidden, span) = (16usize, 48usize, 256usize, 4usize);
++        let cfg = cfg_for(kh, vh, 128, hidden);
++        let block = build_on(&random_block(&cfg, hidden, 0x600), &cfg, &metal);
++        let prefix = Tensor::from_vec(seeded_vec(2 * hidden, 0x601), (2, hidden), &metal).unwrap();
++        let x = Tensor::from_vec(seeded_vec(span * hidden, 0x602), (span, hidden), &metal).unwrap();
++
++        for commit in 0..=span {
++            let run = |fused: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
++                let mut cache = cache_on(&cfg, &metal, 32);
++                block.forward(&prefix, &mut cache).unwrap();
++                let ckpt = cache.checkpoint(span).unwrap();
++                let (_, before) = cache.linear_state().unwrap();
++                let before = flat(&before);
++                for t in 0..span {
++                    let row = x.narrow(0, t, 1).unwrap().contiguous().unwrap();
++                    if fused {
++                        block.forward(&row, &mut cache).unwrap();
++                    } else {
++                        block.forward_classic(&row, &mut cache).unwrap();
++                    }
++                }
++                cache.rollback(&ckpt, 2, span, commit).unwrap();
++                assert_eq!(cache.len(), 2 + commit);
++                let (conv, delta) = cache.linear_state().unwrap();
++                (flat(&conv), flat(&delta), before)
++            };
++            let (fused_conv, fused_delta, before) = run(true);
++            let (ref_conv, ref_delta, _) = run(false);
++            assert_eq!(fused_conv, ref_conv, "commit {commit}: conv window");
++            assert_all_close(
++                &fused_delta,
++                &ref_delta,
++                2e-5,
++                &format!("commit {commit} delta state"),
++            );
++            if commit == 0 {
++                assert_eq!(
++                    fused_delta, before,
++                    "rejecting every token must restore the checkpoint's state bit for bit"
++                );
++            }
++        }
++    }
++
+     /// The L2 normalization floors the NORM at eps rather than adding eps under
+     /// the root — `ggml_l2_norm`'s form. A unit vector therefore comes back
+     /// exactly unchanged (the rsqrt form would shrink it by sqrt(1+eps)), and a
+diff --git a/src/ops/delta.metal b/src/ops/delta.metal
+index 0bdb0bd..782110b 100644
+--- a/src/ops/delta.metal
++++ b/src/ops/delta.metal
+@@ -9,10 +9,23 @@
+ //                        buffers (no concatenation, no slice_set state write).
+ //   kernel_delta_ba      beta = sigmoid(b_raw) and g = ssm_a * softplus(a_raw +
+ //                        dt_bias) from ONE fused [hidden, 2*v_heads] projection.
++//   kernel_delta_ba_fused_t{1,4}
++//                        that same head with the projection itself folded in:
++//                        one dispatch reads x and the [hidden, 2*v_heads]
++//                        weight and writes beta and g. Small n only (decode and
++//                        short verify chunks); above the host's threshold the
++//                        candle gemm's weight reuse wins. XWEN_DELTA_BA_CLASSIC
++//                        reverts to the gemv + kernel_delta_ba pair.
+ //   kernel_delta_scan    the whole delta-rule recurrence over T timesteps, with
+ //                        the head's state slice resident in registers for the
+ //                        entire scan: one dispatch per layer per chunk. It folds
+ //                        the q/k L2 clamp-norm into its own load stage.
++//   kernel_delta_scan_decode  the same recurrence for ONE token, the shape a
++//                        decode step could take: no timestep loop, the state
++//                        moved as float4, the row-slice folds done inside a
++//                        simdgroup. OPT-IN behind XWEN_DELTA_DECODE_KERNEL and
++//                        a measured wash; kernel_delta_scan runs decode by
++//                        default.
+ //   kernel_delta_gnorm   the gated output RMSNorm (rms -> ssm_norm.weight ->
+ //                        silu(z)), with kernel_delta_gnorm_sigmoid its
+ //                        sigmoid(z) sibling for the qwen4exp graph — one
+@@ -21,6 +34,10 @@
+ // A layer therefore costs eight dispatches at any sequence length. The
+ // kill-switch back to the reference scan is XWEN_DELTA_CLASSIC.
+ //
++// The decode scan is a WASH against the general one end to end, so it is
++// OPT-IN (XWEN_DELTA_DECODE_KERNEL) and kept for the measurement, not for a
++// speedup — docs/decisions.md, "A decode-specialized scan kernel is a WASH".
++//
+ // Two further kernels are not on the shipped path and exist as MEASURED
+ // ARTIFACTS of a refuted direction (docs/decisions.md, "The DeltaNet scan
+ // decomposition"): kernel_delta_scan_v2, llama.cpp's Metal decomposition of the
+@@ -46,6 +63,11 @@
+ //   - kernel_delta_l2norm is the same story for the q/k norm: the ops match
+ //     `linear_attn::l2_norm` one for one (sum of squares, sqrt, floor at eps,
+ //     divide) and only the 128-term sum reassociates. Its test grades at 2e-6.
++//   - kernel_delta_scan_decode is the same story at seq == 1: same per-thread
++//     arithmetic in the same order as kernel_delta_scan, with the cross-thread
++//     fold reassociated once more (a simd_shuffle_xor butterfly over the row
++//     slices, then the simdgroup partials). Graded at 1e-5 against both the
++//     general kernel and the reference.
+ //   - kernel_delta_scan partitions the k- and q-contractions across threads and
+ //     folds them through threadgroup memory, where the reference runs a candle
+ //     gemm. It deliberately does NOT carry the fp pragmas — its two inner loops
+@@ -136,6 +158,46 @@ typedef struct {
+     int32_t v_heads;
+ } delta_ba_args;
+ 
++// ===========================================================================
++// The beta/decay head. Two entry points over ONE epilogue:
++//   kernel_delta_ba        the epilogue alone, over a projection candle
++//                          already computed (prefill, and the kill switch).
++//   kernel_delta_ba_fused  the [n, hidden] x [hidden, 2*v_heads] projection
++//                          AND the epilogue in one dispatch (small n).
++// The two helpers below are that shared epilogue: the arithmetic that has to
++// round like candle's exists once. Both pin FP contraction and reassociation
++// off and keep the reference's per-op rounding boundaries, which is what makes
++// kernel_delta_ba bit-identical to the candle chain
++// (ba_matches_reference_bitwise); the fused kernel differs from it only in the
++// dot product it computes for itself.
++// ===========================================================================
++
++// candle's usigmoid: recip(1 + exp(-x)).
++static inline float delta_ba_beta(float b_raw) {
++#pragma clang fp contract(off)
++#pragma clang fp reassociate(off)
++    return 1.0f / (1 + exp(-b_raw));
++}
++
++// The LOG decay `a * softplus(a_raw + dt_bias)`, softplus in the stable
++// relu + ln(1 + exp(-|x|)) form with the reference's per-op rounding
++// boundaries: candle's affine kernel is an explicit fma, its badd/bmul single
++// f32 operations. `a` is `ssm_a`, pre-baked as -exp(A_log), so the result is
++// <= 0 and the decay the scan exponentiates lands in (0, 1].
++static inline float delta_ba_logdecay(float a_raw, float dt_bias, float a) {
++#pragma clang fp contract(off)
++#pragma clang fp reassociate(off)
++    const float x = a_raw + dt_bias;
++    const float ax = abs(x);
++    const float sum = x + ax;
++    const float relu = fma(sum, 0.5f, 0.0f);
++    const float e = exp(-ax);
++    const float one_plus = fma(e, 1.0f, 1.0f);
++    const float tail = log(one_plus);
++    const float sp = relu + tail;
++    return sp * a;
++}
++
+ // beta and the log-decay from one fused projection. `ba` is [seq, 2*v_heads]:
+ // the beta logits occupy the first v_heads columns of a row and the alpha
+ // logits the second v_heads — the layout produced by concatenating ssm_beta and
+@@ -164,22 +226,158 @@ kernel void kernel_delta_ba(
+     const int t = (int) tid / args.v_heads;
+     const int base = t * 2 * args.v_heads;
+ 
+-    // candle's usigmoid: recip(1 + exp(-x)).
+-    const float b = ba[base + h];
+-    beta[tid] = 1.0f / (1 + exp(-b));
++    beta[tid] = delta_ba_beta(ba[base + h]);
++    g[tid] = delta_ba_logdecay(ba[base + args.v_heads + h], dt_bias[h], ssm_a[h]);
++}
+ 
+-    // softplus(a_raw + dt_bias), the stable relu + ln(1 + exp(-|x|)) form, with
+-    // the reference's per-op rounding boundaries: candle's affine kernel is an
+-    // explicit fma, its badd/bmul single f32 operations.
+-    const float x = ba[base + args.v_heads + h] + dt_bias[h];
+-    const float ax = abs(x);
+-    const float sum = x + ax;
+-    const float relu = fma(sum, 0.5f, 0.0f);
+-    const float e = exp(-ax);
+-    const float one_plus = fma(e, 1.0f, 1.0f);
+-    const float tail = log(one_plus);
+-    const float sp = relu + tail;
+-    g[tid] = sp * ssm_a[h];
++// Matches dispatch.rs DeltaBaFusedArgs (#[repr(C)]).
++typedef struct {
++    int32_t seq;
++    int32_t hidden;
++    int32_t v_heads;
++} delta_ba_fused_args;
++
++// The threadgroup shape of kernel_delta_ba_fused, mirrored by dispatch.rs
++// (DELTA_BA_* there) which sizes the grid from it. COLS x ROWS threads:
++// DELTA_BA_COLS output columns wide, DELTA_BA_ROWS deep in row chunks of the
++// hidden dim, each thread holding one partial dot product per column per token
++// of its tile.
++#define DELTA_BA_COLS 8
++#define DELTA_BA_ROWS 128
++#define DELTA_BA_TOKS 4
++
++static_assert(DELTA_BA_COLS * DELTA_BA_ROWS <= 1024,
++              "a threadgroup is at most 1024 threads");
++static_assert((DELTA_BA_ROWS & (DELTA_BA_ROWS - 1)) == 0,
++              "the partial-sum tree halves DELTA_BA_ROWS to 1");
++static_assert(DELTA_BA_TOKS * DELTA_BA_ROWS * DELTA_BA_COLS * 4 <= 32768,
++              "the partial buffer must fit threadgroup memory");
++
++// The beta|alpha PROJECTION and its epilogue in ONE dispatch: reads x
++// [n, hidden] and the concatenated [hidden, 2*v_heads] weight and writes beta
++// and g directly, so the candle gemv that produced `ba` for kernel_delta_ba
++// disappears along with its dispatch. At decode that gemv was 10% of the whole
++// GDN mixer for a matmul of 96 dot products (docs/log.md).
++//
++// The partition is over OUTPUT COLUMNS, which is the only split of this shape
++// that needs no cross-threadgroup reduction: column c of the weight is read by
++// exactly one threadgroup, and beta (c < v_heads) and g (c >= v_heads) are
++// independent per column. Inside a threadgroup, lane j of a row chunk reads
++// w[i][colbase + j], so the DELTA_BA_COLS lanes of one chunk read one
++// contiguous run of the row-major weight; the DELTA_BA_ROWS chunks then fold
++// their partials through threadgroup memory in a tree.
++//
++// TOKS tokens are tiled into one threadgroup so a multi-token chunk reads the
++// weight once per tile rather than once per token — the whole reason this shape
++// is confined to small n. Above the host's threshold the weight stops fitting
++// the reuse pattern and candle's gemm wins; see dispatch.rs.
++//
++// Deliberately NOT bit-identical to kernel_delta_ba over the same input: the
++// dot product is summed as DELTA_BA_ROWS partials folded in a tree, where
++// candle's gemv sums in its own order. The epilogue is the same helpers, so
++// the only difference is that reassociation (graded at 2e-6 in delta.rs).
++template <int TOKS>
++static inline void delta_ba_fused_body(
++        constant delta_ba_fused_args & args,
++        device const float * x,
++        device const float * w,
++        device const float * ssm_a,
++        device const float * dt_bias,
++        device       float * beta,
++        device       float * g,
++        threadgroup  float * part,
++        uint2 tgid,
++        uint tid) {
++    const int two_vh = 2 * args.v_heads;
++    const int j = (int) (tid % DELTA_BA_COLS);
++    const int r = (int) (tid / DELTA_BA_COLS);
++    const int col = (int) tgid.x * DELTA_BA_COLS + j;
++    const int t0 = (int) tgid.y * TOKS;
++    // At least one, because the grid has ceil(seq / TOKS) tiles in y.
++    const int live = min(TOKS, args.seq - t0);
++
++    // Rows past the tile's end clamp onto its last live token: the duplicate
++    // reads are harmless and their accumulator is never written out, which
++    // keeps `acc` a fully unrolled register array with no branch in the loop.
++    const device float * xp[TOKS];
++    for (int u = 0; u < TOKS; ++u) {
++        xp[u] = x + (size_t) (t0 + min(u, live - 1)) * args.hidden;
++    }
++
++    float acc[TOKS];
++    for (int u = 0; u < TOKS; ++u) {
++        acc[u] = 0.0f;
++    }
++    if (col < two_vh) {
++        device const float * wp = w + col;
++        for (int i = r; i < args.hidden; i += DELTA_BA_ROWS) {
++            const float wv = wp[(size_t) i * two_vh];
++            for (int u = 0; u < TOKS; ++u) {
++                acc[u] = fma(xp[u][i], wv, acc[u]);
++            }
++        }
++    }
++    for (int u = 0; u < TOKS; ++u) {
++        part[(u * DELTA_BA_ROWS + r) * DELTA_BA_COLS + j] = acc[u];
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (int s = DELTA_BA_ROWS / 2; s > 0; s >>= 1) {
++        if (r < s) {
++            for (int u = 0; u < TOKS; ++u) {
++                part[(u * DELTA_BA_ROWS + r) * DELTA_BA_COLS + j] +=
++                    part[(u * DELTA_BA_ROWS + r + s) * DELTA_BA_COLS + j];
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    if (r != 0 || col >= two_vh) {
++        return;
++    }
++    const bool is_beta = col < args.v_heads;
++    const int h = is_beta ? col : col - args.v_heads;
++    for (int u = 0; u < live; ++u) {
++        const float dot = part[(u * DELTA_BA_ROWS) * DELTA_BA_COLS + j];
++        const int idx = (t0 + u) * args.v_heads + h;
++        if (is_beta) {
++            beta[idx] = delta_ba_beta(dot);
++        } else {
++            g[idx] = delta_ba_logdecay(dot, dt_bias[h], ssm_a[h]);
++        }
++    }
++}
++
++// The decode specialization: one token, so no tile clamping survives constant
++// folding and the inner loop is one fma per weight load.
++kernel void kernel_delta_ba_fused_t1(
++        constant delta_ba_fused_args & args [[buffer(0)]],
++        device const float * x              [[buffer(1)]],
++        device const float * w              [[buffer(2)]],
++        device const float * ssm_a          [[buffer(3)]],
++        device const float * dt_bias        [[buffer(4)]],
++        device       float * beta           [[buffer(5)]],
++        device       float * g              [[buffer(6)]],
++        uint2 tgid [[threadgroup_position_in_grid]],
++        uint2 tid  [[thread_position_in_threadgroup]]) {
++    threadgroup float part[1 * DELTA_BA_ROWS * DELTA_BA_COLS];
++    delta_ba_fused_body<1>(args, x, w, ssm_a, dt_bias, beta, g, part, tgid, tid.x);
++}
++
++// The short-chunk specialization: DELTA_BA_TOKS tokens share one pass over the
++// weight.
++kernel void kernel_delta_ba_fused_t4(
++        constant delta_ba_fused_args & args [[buffer(0)]],
++        device const float * x              [[buffer(1)]],
++        device const float * w              [[buffer(2)]],
++        device const float * ssm_a          [[buffer(3)]],
++        device const float * dt_bias        [[buffer(4)]],
++        device       float * beta           [[buffer(5)]],
++        device       float * g              [[buffer(6)]],
++        uint2 tgid [[threadgroup_position_in_grid]],
++        uint2 tid  [[thread_position_in_threadgroup]]) {
++    threadgroup float part[DELTA_BA_TOKS * DELTA_BA_ROWS * DELTA_BA_COLS];
++    delta_ba_fused_body<DELTA_BA_TOKS>(args, x, w, ssm_a, dt_bias, beta, g, part, tgid, tid.x);
+ }
+ 
+ // Matches dispatch.rs DeltaGnormArgs (#[repr(C)]).
+@@ -524,6 +722,184 @@ kernel void kernel_delta_scan(
+     }
+ }
+ 
++// The decode scan's threadgroup geometry (see kernel_delta_scan_decode below).
++// A threadgroup is still DELTA_D threads owning DELTA_DEC_TG_COLS value
++// columns of one head, but the columns are handed out FOUR AT A TIME so every
++// state touch is a float4: a thread owns DELTA_DEC_SLICE rows of one float4
++// column group, and the DELTA_DEC_ROWS threads sharing a group fold through
++// simd_shuffle_xor first and threadgroup memory only across simdgroups.
++#define DELTA_DEC_VEC 4        // value columns per thread — one float4
++#define DELTA_DEC_LANES 8      // float4 column groups across a threadgroup
++#define DELTA_DEC_ROWS 16      // key-dim slices those groups are split across
++#define DELTA_DEC_SLICE 8      // DELTA_D / DELTA_DEC_ROWS, state rows per thread
++#define DELTA_DEC_TG_COLS 32   // DELTA_DEC_VEC * DELTA_DEC_LANES
++#define DELTA_DEC_COL_BLOCKS 4 // DELTA_D / DELTA_DEC_TG_COLS, threadgroups per head
++#define DELTA_DEC_SGS 4        // DELTA_D / 32, simdgroups per threadgroup
++
++// The seven are not independent: the threadgroup is DELTA_D threads laid out as
++// DELTA_DEC_ROWS x DELTA_DEC_LANES, each thread owns DELTA_DEC_SLICE rows of
++// DELTA_DEC_VEC columns, and DELTA_DEC_COL_BLOCKS threadgroups tile a head's
++// value dim. The host sizes the grid from its own copies (dispatch.rs
++// DELTA_HEAD_DIM / DELTA_DEC_COL_BLOCKS, cross-checked by a test), so a value
++// that drifted out of this relation would index outside a head's state slice.
++static_assert(DELTA_DEC_VEC * DELTA_DEC_LANES == DELTA_DEC_TG_COLS,
++              "a threadgroup's float4 groups must tile its columns exactly");
++static_assert(DELTA_DEC_ROWS * DELTA_DEC_LANES == DELTA_D,
++              "the decode threadgroup must be exactly DELTA_D threads");
++static_assert(DELTA_DEC_SLICE == DELTA_D / DELTA_DEC_ROWS,
++              "each thread owns DELTA_D / DELTA_DEC_ROWS state rows");
++static_assert(DELTA_DEC_COL_BLOCKS == DELTA_D / DELTA_DEC_TG_COLS,
++              "DELTA_DEC_COL_BLOCKS threadgroups must tile a head's value dim exactly");
++static_assert(DELTA_DEC_SGS * 32 == DELTA_D, "DELTA_DEC_SGS simdgroups per threadgroup");
++static_assert(32 % DELTA_DEC_LANES == 0,
++              "a simdgroup must hold a whole number of column groups for the "
++              "shuffle fold to reduce over row slices only");
++
++// The delta-rule recurrence for ONE token — the decode step, hoisted out of
++// kernel_delta_scan's timestep loop. Same math, same operands, and the same
++// most-recent-first `s_out` contract at the single plane a one-token chunk can
++// name (n_planes is 1 by construction, so plane 0 is the whole trail and a
++// rollback restores it unchanged).
++//
++// Why a second kernel: at seq == 1 the general scan's loop body IS the kernel,
++// so everything it amortizes over a chunk it pays in full — a barrier-separated
++// two-phase fold through part[][], the q/k staging, and 32 scalar state loads
++// per thread at a 512-byte stride. This one drops the loop and rebuilds the
++// same decomposition around the memory: the state is read once and written once
++// as float4 (each load instruction covers 512 contiguous bytes of a state row
++// instead of 128), the row-slice fold happens inside a simdgroup with
++// simd_shuffle_xor, and threadgroup memory carries only the DELTA_DEC_SGS
++// per-simdgroup partials. The q/k L2 clamp-norm is computed once per
++// threadgroup, one thread per head dim, and broadcast through `qn`/`kn`.
++//
++// Arithmetic is the general kernel's, in the same order per thread; only the
++// cross-thread fold reassociates, so this is bounded against the reference in
++// exactly the class kernel_delta_scan already sits in (docs/parity.md).
++kernel void kernel_delta_scan_decode(
++        constant delta_scan_args & args [[buffer(0)]],
++        device const float  * conv  [[buffer(1)]],
++        device const float  * beta  [[buffer(2)]],
++        device const float  * g     [[buffer(3)]],
++        device const float4 * s_in  [[buffer(4)]],
++        device       float  * out   [[buffer(5)]],
++        device       float4 * s_out [[buffer(6)]],
++        uint tgid [[threadgroup_position_in_grid]],
++        uint tid  [[thread_position_in_threadgroup]],
++        uint sgid [[simdgroup_index_in_threadgroup]],
++        uint lane [[thread_index_in_simdgroup]]) {
++    threadgroup float qn[DELTA_D];
++    threadgroup float kn[DELTA_D];
++    threadgroup float red[2][DELTA_D / 32];
++    // Two fold buffers, not one reused: a third barrier to separate the k fold
++    // from the q fold would cost more than 512 bytes of threadgroup memory.
++    threadgroup float4 part_k[DELTA_DEC_SGS][DELTA_DEC_LANES];
++    threadgroup float4 part_o[DELTA_DEC_SGS][DELTA_DEC_LANES];
++
++    const int h = (int) tgid / DELTA_DEC_COL_BLOCKS;
++    const int c = (int) tid % DELTA_DEC_LANES; // float4 column group
++    const int r = (int) tid / DELTA_DEC_LANES; // row slice
++    const int i0 = r * DELTA_DEC_SLICE;
++    const int j0 = ((int) tgid % DELTA_DEC_COL_BLOCKS) * DELTA_DEC_TG_COLS + c * DELTA_DEC_VEC;
++
++    const int k_dim = args.k_heads * DELTA_D;
++    const int kh = h % args.k_heads; // TILED, not interleaved
++    const int v_off = 2 * k_dim + h * DELTA_D;
++
++    // The state slice this thread owns, in float4s: DELTA_D / DELTA_DEC_VEC of
++    // them to a state row, DELTA_D rows to a head.
++    const int s4_row = DELTA_D / DELTA_DEC_VEC;
++    const size_t s4_base = (size_t) h * DELTA_D * s4_row + (size_t) (j0 / DELTA_DEC_VEC);
++    float4 s[DELTA_DEC_SLICE];
++#pragma unroll
++    for (int a = 0; a < DELTA_DEC_SLICE; ++a) {
++        s[a] = s_in[s4_base + (size_t) (i0 + a) * s4_row];
++    }
++
++    // q/k load + L2 clamp-norm, one thread per head dim, published to the whole
++    // threadgroup. Once per dispatch, where the general kernel does this per
++    // timestep.
++    const int d = (int) tid;
++    const float qr = conv[kh * DELTA_D + d];
++    const float kr = conv[k_dim + kh * DELTA_D + d];
++    const float q_lane = simd_sum(qr * qr);
++    const float k_lane = simd_sum(kr * kr);
++    if (lane == 0) {
++        red[0][sgid] = q_lane;
++        red[1][sgid] = k_lane;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    float q_sum = 0.0f;
++    float k_sum = 0.0f;
++    for (int u = 0; u < DELTA_D / 32; ++u) {
++        q_sum += red[0][u];
++        k_sum += red[1][u];
++    }
++    qn[d] = qr / max(sqrt(q_sum), args.eps);
++    kn[d] = kr / max(sqrt(k_sum), args.eps);
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    // Decay the state, then contract it with k over the key dim. The row slices
++    // a simdgroup holds fold with a shuffle butterfly over the lane bits that
++    // carry `r`; only the DELTA_DEC_SGS simdgroup partials reach memory.
++    const float dec = exp(g[h]);
++    float4 sk = 0.0f;
++#pragma unroll
++    for (int a = 0; a < DELTA_DEC_SLICE; ++a) {
++        s[a] *= dec;
++        sk += s[a] * kn[i0 + a];
++    }
++    for (uint m = DELTA_DEC_LANES; m < 32; m <<= 1) {
++        sk += simd_shuffle_xor(sk, m);
++    }
++    if (lane < DELTA_DEC_LANES) {
++        part_k[sgid][lane] = sk;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    float4 sk_col = part_k[0][c];
++    for (int u = 1; u < DELTA_DEC_SGS; ++u) {
++        sk_col += part_k[u][c];
++    }
++
++    // v is read as scalars: the conv buffer may start at any f32 offset, and
++    // four loads per thread is nothing next to the state.
++    const float4 v = float4(conv[v_off + j0], conv[v_off + j0 + 1],
++                            conv[v_off + j0 + 2], conv[v_off + j0 + 3]);
++    const float4 delta = (v - sk_col) * beta[h];
++
++    // Rank-1 update, then read the UPDATED state out with q.
++    float4 ov = 0.0f;
++#pragma unroll
++    for (int a = 0; a < DELTA_DEC_SLICE; ++a) {
++        s[a] += kn[i0 + a] * delta;
++        ov += qn[i0 + a] * s[a];
++    }
++    for (uint m = DELTA_DEC_LANES; m < 32; m <<= 1) {
++        ov += simd_shuffle_xor(ov, m);
++    }
++    if (lane < DELTA_DEC_LANES) {
++        part_o[sgid][lane] = ov;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++#pragma unroll
++    for (int a = 0; a < DELTA_DEC_SLICE; ++a) {
++        s_out[s4_base + (size_t) (i0 + a) * s4_row] = s[a];
++    }
++
++    if (r == 0) {
++        float4 o_col = part_o[0][c];
++        for (int u = 1; u < DELTA_DEC_SGS; ++u) {
++            o_col += part_o[u][c];
++        }
++        o_col *= args.scale;
++        device float * o_ptr = out + (size_t) h * DELTA_D + j0;
++        o_ptr[0] = o_col.x;
++        o_ptr[1] = o_col.y;
++        o_ptr[2] = o_col.z;
++        o_ptr[3] = o_col.w;
++    }
++}
++
+ // The v2 scan's geometry. A SIMDGROUP, not a threadgroup, is the unit of
+ // ownership: one simdgroup owns one value column j of one head's state for the
+ // whole scan, holding the column's DELTA_D key entries DELTA_V2_KPL to a lane.
+diff --git a/src/ops/delta.rs b/src/ops/delta.rs
+index 361349c..ae79208 100644
+--- a/src/ops/delta.rs
++++ b/src/ops/delta.rs
+@@ -40,6 +40,36 @@ pub fn delta_ba(ba: &Tensor, ssm_a: &Tensor, dt_bias: &Tensor) -> Result<(Tensor
+     dispatch::run_delta_ba(ba, ssm_a, dt_bias)
+ }
+ 
++/// The beta|alpha PROJECTION and that same head in ONE dispatch: `x` is the
++/// layer input `[seq, hidden]` f32, `w` the concatenated `[hidden, 2 *
++/// v_heads]` beta|alpha weight built at load. Returns the same `(beta, g)` as
++/// `delta_ba` over `x.matmul(w)`, with `g` the LOG decay — one kernel instead
++/// of a candle gemv plus [`delta_ba`].
++///
++/// Only for the token counts [`delta_ba_fused_applies`] admits: the kernel
++/// reads the whole weight once per token tile, so a prefill chunk keeps the
++/// gemm. NOT bit-identical to the chain it replaces — the dot product
++/// reassociates against candle's gemv (`ba_fused_matches_the_gemv_chain`
++/// grades it at 2e-6); the epilogue is the same Metal helper, so nothing else
++/// differs.
++pub fn delta_ba_fused(
++    x: &Tensor,
++    w: &Tensor,
++    ssm_a: &Tensor,
++    dt_bias: &Tensor,
++) -> Result<(Tensor, Tensor)> {
++    dispatch::run_delta_ba_fused(x, w, ssm_a, dt_bias)
++}
++
++/// Whether [`delta_ba_fused`] can serve this input and weight — the caller's
++/// fork between it and the `matmul` + [`delta_ba`] chain. False under the
++/// `XWEN_DELTA_BA_CLASSIC` kill switch, off a Metal device, on a
++/// non-contiguous or non-f32 operand, and outside the geometry the kernel's
++/// grid is built for (token count, V-heads, hidden dim).
++pub fn delta_ba_fused_applies(x: &Tensor, w: &Tensor) -> bool {
++    !crate::ops::delta_ba_classic() && dispatch::delta_ba_fused_applies(x, w)
++}
++
+ /// Gated output RMSNorm: `rms_norm(o, eps) * ssm_norm_weight * gate(z)` per
+ /// head, one pass. `o` and `z` are `[seq, v_heads, head_dim]` f32 contiguous,
+ /// `w` is `[head_dim]`. The gate multiplies AFTER the weight and outside the
+@@ -70,7 +100,9 @@ pub fn delta_l2norm(conv: &Tensor, k_heads: usize, eps: f32) -> Result<Tensor> {
+ /// fused) — q and k are L2 clamp-normalized in the kernel's load stage (or by a
+ /// separate `delta_l2norm` dispatch under `XWEN_DELTA_SCAN_V2`) and read with
+ /// the tiled K-head mapping, so no
+-/// materialized tile-and-broadcast is needed. `beta`/`g` are `[seq, v_heads]`,
++/// materialized tile-and-broadcast is needed. `XWEN_DELTA_DECODE_KERNEL` sends
++/// a one-token chunk to the decode-specialized kernel instead (same math, same
++/// bound, a measured wash). `beta`/`g` are `[seq, v_heads]`,
+ /// `s` is the incoming `[v_heads, 128, 128]` f32 state. Returns the per-token
+ /// output `[seq, v_heads, 128]` and the state after the last token; `s` itself
+ /// is left untouched.
+@@ -123,6 +155,11 @@ mod tests {
+     /// 128: the dense 27B (16 K-heads, 48 V-heads, conv width 10240) and the
+     /// 35B-A3B (16 / 32, conv width 8192). Every kernel test runs both, so a
+     /// K-head tiling or width assumption that only holds for one is caught.
++    ///
++    /// Qwen3.8-Flash-Next is the third checkpoint and needs no third entry: its
++    /// gated-DeltaNet layers are 16 K-heads / 48 V-heads at 128, byte-for-byte
++    /// the 27B's geometry (docs/qwen4exp-tensors.md). It differs in how many
++    /// layers run it, which is a model-level number, not a kernel one.
+     const GEOMETRIES: [(usize, usize); 2] = [(16, 48), (16, 32)];
+ 
+     const HD: usize = DELTA_HEAD_DIM;
+@@ -288,6 +325,146 @@ mod tests {
+         }
+     }
+ 
++    /// The three shipped `(hidden, v_heads)` pairs the fused beta|alpha
++    /// projection runs at: the dense 27B / 3.8-27B (5120, 48), the 35B-A3B
++    /// (2048, 32) and Flash-Next (2560, 48). Two different hidden dims at the
++    /// same V-head count, and two different V-head counts, so a kernel that
++    /// confused the two axes fails on at least one.
++    const BA_GEOMETRIES: [(usize, usize); 3] = [(5120, 48), (2048, 32), (2560, 48)];
++
++    /// The gemv + `delta_ba` chain the fused projection replaces, run through
++    /// candle exactly as `forward_fused` runs it off the fused path.
++    fn reference_ba_chain(
++        x: &Tensor,
++        w: &Tensor,
++        ssm_a: &Tensor,
++        dt_bias: &Tensor,
++    ) -> (Tensor, Tensor) {
++        let ba = x.matmul(w).unwrap();
++        delta_ba(&ba, ssm_a, dt_bias).unwrap()
++    }
++
++    /// Build one geometry's operands: the layer input, the concatenated
++    /// beta|alpha weight, the pre-baked (strictly negative) `ssm_a`, and the dt
++    /// offset.
++    fn ba_operands(
++        hidden: usize,
++        v_heads: usize,
++        seq: usize,
++        seed: u64,
++        device: &Device,
++    ) -> (Tensor, Tensor, Tensor, Tensor) {
++        let x = on_device(
++            pseudo_random(seq * hidden, seed, -2.0, 2.0),
++            (seq, hidden),
++            device,
++        );
++        let w = on_device(
++            pseudo_random(hidden * 2 * v_heads, seed + 1, -0.08, 0.08),
++            (hidden, 2 * v_heads),
++            device,
++        );
++        let a: Vec<f32> = pseudo_random(v_heads, seed + 2, 0.1, 4.0)
++            .into_iter()
++            .map(|v| -v)
++            .collect();
++        let ssm_a = on_device(a, v_heads, device);
++        let dt_bias = on_device(pseudo_random(v_heads, seed + 3, -4.0, 4.0), v_heads, device);
++        (x, w, ssm_a, dt_bias)
++    }
++
++    /// UNIT 2b: the one-dispatch beta|alpha projection must reproduce the gemv
++    /// + `delta_ba` chain it replaces, at every shipped geometry and every
++    /// token-tiling class the kernel distinguishes: one token (the `_t1`
++    /// specialization), a chunk that straddles a tile boundary, an exact tile,
++    /// and the largest chunk the host will hand it.
++    ///
++    /// NOT bit-identity, deliberately: the kernel sums each dot product as
++    /// `DELTA_BA_ROWS` per-thread partials folded in a tree where candle's gemv
++    /// sums in its own order, so f32 reassociation alone separates them. The
++    /// epilogue is the same Metal helper on both sides, so 2e-6 — the bound the
++    /// two reassociating norms carry — is the right class of tolerance: the
++    /// widest geometry's 5120-term dot measures 1.0e-6 on `g`, whose softplus
++    /// passes the dot's absolute error through as a relative one wherever the
++    /// decay is small. Anything looser would stop catching a swapped
++    /// beta/alpha column block or a mis-tiled token, both of which fail here by
++    /// orders of magnitude.
++    #[test]
++    fn ba_fused_matches_the_gemv_chain() {
++        let device = metal_device().unwrap();
++        for (gi, &(hidden, v_heads)) in BA_GEOMETRIES.iter().enumerate() {
++            for &seq in &[1usize, 3, 4, 5, 16, dispatch::DELTA_BA_MAX_SEQ] {
++                let seed = 0x2600 + gi as u64 * 401 + seq as u64;
++                let (x, w, ssm_a, dt_bias) = ba_operands(hidden, v_heads, seq, seed, &device);
++
++                assert!(
++                    crate::ops::delta_ba_fused_applies(&x, &w),
++                    "hidden={hidden} v={v_heads} seq={seq} is a shipped geometry"
++                );
++                let (beta, g) = delta_ba_fused(&x, &w, &ssm_a, &dt_bias).unwrap();
++                let (want_beta, want_g) = reference_ba_chain(&x, &w, &ssm_a, &dt_bias);
++
++                let label = format!("ba_fused hidden={hidden} v={v_heads} seq={seq}");
++                assert_eq!(beta.dims(), &[seq, v_heads]);
++                assert_close(&beta, &want_beta, 2e-6, &format!("{label} beta"));
++                assert_close(&g, &want_g, 2e-6, &format!("{label} g"));
++            }
++        }
++    }
++
++    /// The fused projection is a shape, not a fallback: everything outside the
++    /// geometry its grid is built for must be REFUSED by the dispatch and
++    /// reported as inapplicable by the predicate, so the block takes the gemv
++    /// chain instead of running a kernel that would leave columns or tokens
++    /// unwritten.
++    #[test]
++    fn ba_fused_refuses_a_geometry_its_grid_cannot_cover() {
++        let device = metal_device().unwrap();
++        let (hidden, v_heads) = (2560usize, 48usize);
++        let (x, w, ssm_a, dt_bias) = ba_operands(hidden, v_heads, 1, 0x2700, &device);
++        let f32z = |d: (usize, usize)| Tensor::zeros(d, DType::F32, &device).unwrap();
++        let vec_f32 = |n: usize| Tensor::zeros(n, DType::F32, &device).unwrap();
++
++        // Above the token ceiling the candle gemm's weight reuse wins, so the
++        // kernel is not merely slower there — it is not offered at all.
++        let long = ba_operands(
++            hidden,
++            v_heads,
++            dispatch::DELTA_BA_MAX_SEQ + 1,
++            0x2701,
++            &device,
++        );
++        assert!(!crate::ops::delta_ba_fused_applies(&long.0, &long.1));
++        assert!(delta_ba_fused(&long.0, &long.1, &long.2, &long.3).is_err());
++
++        // An empty chunk encodes a zero-dimension grid.
++        let empty = f32z((0, hidden));
++        assert!(!crate::ops::delta_ba_fused_applies(&empty, &w));
++        assert!(delta_ba_fused(&empty, &w, &ssm_a, &dt_bias).is_err());
++
++        // An odd column count cannot split into beta|alpha.
++        let odd = f32z((hidden, 2 * v_heads - 1));
++        assert!(!crate::ops::delta_ba_fused_applies(&x, &odd));
++        assert!(delta_ba_fused(&x, &odd, &ssm_a, &dt_bias).is_err());
++
++        // A weight whose rows are not x's hidden dim.
++        let short = f32z((hidden - 1, 2 * v_heads));
++        assert!(!crate::ops::delta_ba_fused_applies(&x, &short));
++        assert!(delta_ba_fused(&x, &short, &ssm_a, &dt_bias).is_err());
++
++        // Beyond the V-head and hidden ceilings.
++        let wide = f32z((hidden, 2 * (dispatch::DELTA_BA_MAX_V_HEADS + 1)));
++        assert!(!crate::ops::delta_ba_fused_applies(&x, &wide));
++        let tall_x = f32z((1, dispatch::DELTA_BA_MAX_HIDDEN + 1));
++        let tall_w = f32z((dispatch::DELTA_BA_MAX_HIDDEN + 1, 2 * v_heads));
++        assert!(!crate::ops::delta_ba_fused_applies(&tall_x, &tall_w));
++        assert!(delta_ba_fused(&tall_x, &tall_w, &ssm_a, &dt_bias).is_err());
++
++        // Per-head vectors that do not match the weight's V-head count.
++        assert!(delta_ba_fused(&x, &w, &vec_f32(v_heads + 1), &dt_bias).is_err());
++        assert!(delta_ba_fused(&x, &w, &ssm_a, &vec_f32(v_heads - 1)).is_err());
++    }
++
+     /// UNIT 3: the fused gated output norm must match the reference's
+     /// rms → ssm_norm.weight → silu(z) chain. Only the 128-term sum of squares
+     /// reassociates (hardware simd_sum vs candle's reduce partition), so this is
+@@ -705,6 +882,154 @@ mod tests {
+         assert!(delta_scan_with_trail(&conv, &beta, &g, &s0, k_heads, EPS as f32, seq).is_ok());
+     }
+ 
++    /// UNIT 4e: the decode kernel is a SECOND implementation of the same
++    /// recurrence, taken by every seq == 1 step, so it is graded twice — against
++    /// the general kernel it replaces and against the frozen reference — over
++    /// several CONSECUTIVE steps that carry their own state forward. Carrying
++    /// the state is the point: a per-step difference that a single step hides
++    /// compounds, and a kernel that dropped or double-decayed part of its state
++    /// slice diverges by step two.
++    ///
++    /// Both arms are called explicitly rather than through `delta_scan`, so this
++    /// grades both kernels whichever way `XWEN_DELTA_DECODE_KERNEL` is set —
++    /// which matters more now that the decode kernel is opt-in and a default
++    /// test run never reaches it through the router.
++    #[test]
++    fn decode_scan_matches_the_general_kernel_and_the_reference() {
++        let device = metal_device().unwrap();
++        for (ki, &(k_heads, v_heads)) in GEOMETRIES.iter().enumerate() {
++            let conv_dim = (2 * k_heads + v_heads) * HD;
++            let seed = 0x4700 + ki as u64 * 313;
++            let s0 = on_device(
++                pseudo_random(v_heads * HD * HD, seed, -0.5, 0.5),
++                (v_heads, HD, HD),
++                &device,
++            );
++            let (mut s_dec, mut s_gen, mut s_ref) = (s0.clone(), s0.clone(), s0.clone());
++
++            for step in 0..4u64 {
++                let seed = seed + 1 + step * 7;
++                let conv = on_device(
++                    pseudo_random(conv_dim, seed, -2.0, 2.0),
++                    (1, conv_dim),
++                    &device,
++                );
++                let beta = on_device(
++                    pseudo_random(v_heads, seed + 1, 0.01, 0.99),
++                    (1, v_heads),
++                    &device,
++                );
++                let g = on_device(
++                    pseudo_random(v_heads, seed + 2, -0.6, -0.001),
++                    (1, v_heads),
++                    &device,
++                );
++
++                let (o_dec, next_dec) = dispatch::run_delta_scan_decode(
++                    &conv, &beta, &g, &s_dec, k_heads, EPS as f32, 1,
++                )
++                .unwrap();
++                let (o_gen, next_gen) = dispatch::run_delta_scan_default(
++                    &conv, &beta, &g, &s_gen, k_heads, EPS as f32, 1,
++                )
++                .unwrap();
++                let (o_ref, next_ref) = reference_scan(&conv, &beta, &g, &s_ref, k_heads, v_heads);
++
++                let label = format!("decode k={k_heads} v={v_heads} step={step}");
++                assert_eq!(o_dec.dims(), &[1, v_heads, HD]);
++                assert_eq!(next_dec.dims(), &[1, v_heads, HD, HD]);
++                s_dec = next_dec.squeeze(0).unwrap();
++                s_gen = next_gen.squeeze(0).unwrap();
++                assert_close(&o_dec, &o_gen, 1e-5, &format!("{label} out vs general"));
++                assert_close(&s_dec, &s_gen, 1e-5, &format!("{label} state vs general"));
++                assert_close(&o_dec, &o_ref, 1e-5, &format!("{label} out vs reference"));
++                assert_close(
++                    &s_dec,
++                    &next_ref,
++                    1e-5,
++                    &format!("{label} state vs reference"),
++                );
++                s_ref = next_ref;
++            }
++        }
++    }
++
++    /// The decode kernel writes a fresh state buffer, like the general one: the
++    /// state it was handed comes back unchanged, and a re-run of the same
++    /// dispatch reproduces the same bits. A rollback trail holds the incoming
++    /// state (and, once armed, every state the trail recorded), so an in-place
++    /// update here would corrupt a checkpoint rather than fail a test.
++    #[test]
++    fn decode_scan_does_not_mutate_the_incoming_state() {
++        let device = metal_device().unwrap();
++        let (k_heads, v_heads) = (16usize, 48usize);
++        let conv_dim = (2 * k_heads + v_heads) * HD;
++        let conv = on_device(
++            pseudo_random(conv_dim, 0x5100, -2.0, 2.0),
++            (1, conv_dim),
++            &device,
++        );
++        let beta = on_device(
++            pseudo_random(v_heads, 0x5101, 0.01, 0.99),
++            (1, v_heads),
++            &device,
++        );
++        let g = on_device(
++            pseudo_random(v_heads, 0x5102, -0.6, -0.001),
++            (1, v_heads),
++            &device,
++        );
++        let s0 = on_device(
++            pseudo_random(v_heads * HD * HD, 0x5103, -0.5, 0.5),
++            (v_heads, HD, HD),
++            &device,
++        );
++        let before: Vec<f32> = s0.flatten_all().unwrap().to_vec1().unwrap();
++
++        let (o1, s1) =
++            dispatch::run_delta_scan_decode(&conv, &beta, &g, &s0, k_heads, EPS as f32, 1).unwrap();
++        let after: Vec<f32> = s0.flatten_all().unwrap().to_vec1().unwrap();
++        assert_eq!(before, after, "the incoming state was overwritten");
++
++        let (o2, s2) =
++            dispatch::run_delta_scan_decode(&conv, &beta, &g, &s0, k_heads, EPS as f32, 1).unwrap();
++        assert_bits_eq(&o2, &o1, "rerun output");
++        assert_bits_eq(&s2, &s1, "rerun state");
++    }
++
++    /// The decode kernel is the seq == 1 kernel and says so rather than
++    /// mis-indexing: a longer chunk, and a plane count no one-token chunk can
++    /// name, are refused. `run_delta_scan` never sends it either, but the
++    /// entry point is `pub(crate)` and the next caller should not have to know.
++    #[test]
++    fn decode_scan_refuses_a_multi_token_chunk() {
++        let device = metal_device().unwrap();
++        let (k_heads, v_heads) = (16usize, 32usize);
++        let conv_dim = (2 * k_heads + v_heads) * HD;
++        let s0 = Tensor::zeros((v_heads, HD, HD), DType::F32, &device).unwrap();
++        let rows = |seq: usize| {
++            (
++                Tensor::zeros((seq, conv_dim), DType::F32, &device).unwrap(),
++                Tensor::zeros((seq, v_heads), DType::F32, &device).unwrap(),
++            )
++        };
++        let (conv, bg) = rows(3);
++        assert!(
++            dispatch::run_delta_scan_decode(&conv, &bg, &bg, &s0, k_heads, EPS as f32, 1).is_err(),
++            "the decode kernel accepted a three-token chunk"
++        );
++        let (conv1, bg1) = rows(1);
++        assert!(
++            dispatch::run_delta_scan_decode(&conv1, &bg1, &bg1, &s0, k_heads, EPS as f32, 2)
++                .is_err(),
++            "the decode kernel accepted two state planes for one token"
++        );
++        assert!(
++            dispatch::run_delta_scan_decode(&conv1, &bg1, &bg1, &s0, k_heads, EPS as f32, 1)
++                .is_ok()
++        );
++    }
++
+     /// The scan leaves the state it was handed untouched: the kernel writes a
+     /// fresh buffer rather than updating in place, which is what lets the
+     /// caller keep the incoming state alive for a rollback trail (and what
+@@ -873,30 +1198,76 @@ mod tests {
+     /// silent — the kernel would index state rows the grid never covers, or
+     /// threadgroups would write past a head's slice — so parse the kernel's
+     /// numbers out of the source and compare.
+-    #[test]
+-    fn scan_geometry_matches_metal() {
++    /// The integer in delta.metal's `#define <name> <int>`, ignoring any
++    /// trailing comment.
++    fn define(name: &str) -> usize {
+         const SRC: &str = include_str!("delta.metal");
++        SRC.lines()
++            .find_map(|line| {
++                let rest = line.trim_start().strip_prefix("#define ")?;
++                let rest = rest.strip_prefix(name)?;
++                rest.strip_prefix(' ')?
++                    .split_whitespace()
++                    .next()?
++                    .parse()
++                    .ok()
++            })
++            .unwrap_or_else(|| panic!("delta.metal has no `#define {name} <integer>`"))
++    }
+ 
+-        /// The integer in `#define <name> <int>`, ignoring any trailing comment.
+-        fn define(name: &str) -> usize {
+-            SRC.lines()
+-                .find_map(|line| {
+-                    let rest = line.trim_start().strip_prefix("#define ")?;
+-                    let rest = rest.strip_prefix(name)?;
+-                    rest.strip_prefix(' ')?
+-                        .split_whitespace()
+-                        .next()?
+-                        .parse()
+-                        .ok()
+-                })
+-                .unwrap_or_else(|| panic!("delta.metal has no `#define {name} <integer>`"))
+-        }
++    /// The fused beta|alpha projection's threadgroup shape is spelled out
++    /// twice — as `#define`s in delta.metal, which size its partial-sum buffer
++    /// and its reduction tree, and as Rust constants in dispatch.rs, which size
++    /// the grid and the threadgroup. Drift between the two is silent: columns
++    /// or tokens the grid never covers are simply never written.
++    #[test]
++    fn ba_fused_geometry_matches_metal() {
++        assert_eq!(
++            define("DELTA_BA_COLS"),
++            dispatch::DELTA_BA_COLS,
++            "delta.metal DELTA_BA_COLS and dispatch.rs DELTA_BA_COLS disagree; \
++             the launch's column blocks are sized from the Rust copy"
++        );
++        assert_eq!(
++            define("DELTA_BA_ROWS"),
++            dispatch::DELTA_BA_ROWS,
++            "delta.metal DELTA_BA_ROWS and dispatch.rs DELTA_BA_ROWS disagree; \
++             the threadgroup width is sized from the Rust copy"
++        );
++        assert_eq!(
++            define("DELTA_BA_TOKS"),
++            dispatch::DELTA_BA_TOKS,
++            "delta.metal DELTA_BA_TOKS and dispatch.rs DELTA_BA_TOKS disagree; \
++             the launch's token tiles are sized from the Rust copy"
++        );
++        // The same relations the kernel's own static_asserts hold it to.
++        let (cols, rows, toks) = (
++            dispatch::DELTA_BA_COLS,
++            dispatch::DELTA_BA_ROWS,
++            dispatch::DELTA_BA_TOKS,
++        );
++        assert!(cols * rows <= 1024, "a threadgroup is at most 1024 threads");
++        assert_eq!(rows & (rows - 1), 0, "the reduction tree halves the rows");
++        assert!(
++            toks * rows * cols * 4 <= 32768,
++            "the partial buffer must fit threadgroup memory"
++        );
++    }
+ 
++    #[test]
++    fn scan_geometry_matches_metal() {
+         let d = define("DELTA_D");
+         let cols = define("DELTA_TG_COLS");
+         let rows = define("DELTA_TG_ROWS");
+         let slice = define("DELTA_S_SLICE");
+         let col_blocks = define("DELTA_COL_BLOCKS");
++        let dec_vec = define("DELTA_DEC_VEC");
++        let dec_lanes = define("DELTA_DEC_LANES");
++        let dec_rows = define("DELTA_DEC_ROWS");
++        let dec_slice = define("DELTA_DEC_SLICE");
++        let dec_cols = define("DELTA_DEC_TG_COLS");
++        let dec_blocks = define("DELTA_DEC_COL_BLOCKS");
++        let dec_sgs = define("DELTA_DEC_SGS");
+         let kpl = define("DELTA_V2_KPL");
+         let sgs = define("DELTA_V2_SGS");
+         let col_tgs = define("DELTA_V2_COL_TGS");
+@@ -911,6 +1282,12 @@ mod tests {
+             "delta.metal DELTA_COL_BLOCKS and dispatch.rs DELTA_COL_BLOCKS disagree; \
+              the v1 scan grid is sized from the Rust copy"
+         );
++        assert_eq!(
++            dec_blocks,
++            dispatch::DELTA_DEC_COL_BLOCKS,
++            "delta.metal DELTA_DEC_COL_BLOCKS and dispatch.rs DELTA_DEC_COL_BLOCKS disagree; \
++             the decode scan grid is sized from the Rust copy"
++        );
+         assert_eq!(
+             sgs,
+             dispatch::DELTA_V2_SGS,
+@@ -929,6 +1306,24 @@ mod tests {
+         assert_eq!(rows * cols, d, "the v1 threadgroup must be DELTA_D threads");
+         assert_eq!(slice, d / rows, "v1 state rows per thread");
+         assert_eq!(col_blocks, d / cols, "v1 threadgroups per head");
++        assert_eq!(
++            dec_vec * dec_lanes,
++            dec_cols,
++            "a decode threadgroup's float4 groups must tile its columns"
++        );
++        assert_eq!(
++            dec_rows * dec_lanes,
++            d,
++            "the decode threadgroup must be DELTA_D threads"
++        );
++        assert_eq!(dec_slice, d / dec_rows, "decode state rows per thread");
++        assert_eq!(dec_blocks, d / dec_cols, "decode threadgroups per head");
++        assert_eq!(dec_sgs * 32, d, "decode simdgroups per threadgroup");
++        assert_eq!(
++            32 % dec_lanes,
++            0,
++            "a simdgroup must hold a whole number of decode column groups"
++        );
+         assert_eq!(kpl * 32, d, "a v2 simdgroup's lanes must cover the key dim");
+         assert_eq!(col_tgs * sgs, d, "v2 threadgroups per head");
+     }
+@@ -1027,6 +1422,220 @@ mod tests {
+         }
+     }
+ 
++    /// Isolation timing for the DECODE scan: the seq == 1 step every decoded
++    /// token runs once per DeltaNet layer, and at Flash-Next's 36 of them the
++    /// largest single share of the GDN mixer (`XWEN_GDN_PROFILE`).
++    ///
++    /// Both kernels in ONE process — they are called directly rather than
++    /// through the cached `XWEN_DELTA_DECODE_KERNEL` switch — and the shape is
++    /// a real token's: `XWEN_BENCH_LAYERS` distinct states, each advanced once
++    /// per iteration, so no state is warm from the dispatch before it and the
++    /// rate is AMORTIZED over a token's worth of dispatches instead of measured
++    /// one dispatch at a time (CLAUDE.md's benching rules).
++    ///
++    /// `#[ignore]`d — run on a `pgrep`-verified free GPU with:
++    ///   cargo test --release -p xwen delta_scan_decode_timing -- --ignored --nocapture
++    #[test]
++    #[ignore = "perf bench"]
++    fn delta_scan_decode_timing() {
++        use std::time::Instant;
++
++        let device = metal_device().unwrap();
++        let Device::Metal(mdev) = &device else {
++            unreachable!("metal_device() returned a non-Metal device")
++        };
++        let get = |k: &str, d: usize| {
++            std::env::var(k)
++                .ok()
++                .and_then(|s| s.parse().ok())
++                .unwrap_or(d)
++        };
++        let (warm, iters) = (get("XWEN_BENCH_WARMUP", 5), get("XWEN_BENCH_ITERS", 20));
++        let layers = get("XWEN_BENCH_LAYERS", 36);
++
++        for &(k_heads, v_heads) in GEOMETRIES.iter() {
++            let conv_dim = (2 * k_heads + v_heads) * HD;
++            let seed = 0x9500 + v_heads as u64;
++            let conv = on_device(
++                pseudo_random(conv_dim, seed, -2.0, 2.0),
++                (1, conv_dim),
++                &device,
++            );
++            let beta = on_device(
++                pseudo_random(v_heads, seed + 1, 0.01, 0.99),
++                (1, v_heads),
++                &device,
++            );
++            let g = on_device(
++                pseudo_random(v_heads, seed + 2, -0.6, -0.001),
++                (1, v_heads),
++                &device,
++            );
++            // The state read once and written once per layer, plus the streaming
++            // operands — the same floor `LinearAttnBlock::byte_floors` declares.
++            let bytes = 4.0
++                * layers as f64
++                * (2.0 * (v_heads * HD * HD) as f64
++                    + conv_dim as f64
++                    + (v_heads * HD) as f64
++                    + 2.0 * v_heads as f64);
++
++            // The floor arm: candle's affine over the same state, which reads
++            // and writes exactly the bytes the scan does and computes nothing.
++            // A scan arm sitting on this number is bandwidth-bound and not
++            // worth another decomposition.
++            {
++                let mut states: Vec<Tensor> = (0..layers)
++                    .map(|l| {
++                        on_device(
++                            pseudo_random(v_heads * HD * HD, seed + 100 + l as u64, -0.5, 0.5),
++                            (v_heads, HD, HD),
++                            &device,
++                        )
++                    })
++                    .collect();
++                let mut token = || {
++                    for l in 0..layers {
++                        states[l] = states[l].affine(1.0, 0.0).unwrap();
++                    }
++                };
++                for _ in 0..warm {
++                    token();
++                    mdev.wait_until_completed().unwrap();
++                }
++                let mut times = Vec::with_capacity(iters);
++                for _ in 0..iters {
++                    let t = Instant::now();
++                    token();
++                    mdev.wait_until_completed().unwrap();
++                    times.push(t.elapsed().as_secs_f64() * 1e3);
++                }
++                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
++                let (median, best) = (times[iters / 2], times[0]);
++                let state_bytes = 4.0 * layers as f64 * 2.0 * (v_heads * HD * HD) as f64;
++                eprintln!(
++                    "decode-scan floor   k={k_heads} v={v_heads} layers={layers}: \
++                     median {median:.3} ms/token ({:.1} GB/s) | best {best:.3} ms ({:.1} GB/s)",
++                    state_bytes / (median * 1e6),
++                    state_bytes / (best * 1e6),
++                );
++            }
++
++            for (label, decode) in [("general", false), ("decode ", true)] {
++                let mut states: Vec<Tensor> = (0..layers)
++                    .map(|l| {
++                        on_device(
++                            pseudo_random(v_heads * HD * HD, seed + 100 + l as u64, -0.5, 0.5),
++                            (v_heads, HD, HD),
++                            &device,
++                        )
++                    })
++                    .collect();
++                let mut token = || {
++                    for l in 0..layers {
++                        let next = if decode {
++                            dispatch::run_delta_scan_decode(
++                                &conv, &beta, &g, &states[l], k_heads, EPS as f32, 1,
++                            )
++                        } else {
++                            dispatch::run_delta_scan_default(
++                                &conv, &beta, &g, &states[l], k_heads, EPS as f32, 1,
++                            )
++                        }
++                        .unwrap()
++                        .1;
++                        states[l] = next.squeeze(0).unwrap();
++                    }
++                };
++                for _ in 0..warm {
++                    token();
++                    mdev.wait_until_completed().unwrap();
++                }
++                let mut times = Vec::with_capacity(iters);
++                for _ in 0..iters {
++                    let t = Instant::now();
++                    token();
++                    mdev.wait_until_completed().unwrap();
++                    times.push(t.elapsed().as_secs_f64() * 1e3);
++                }
++                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
++                let median = times[iters / 2];
++                let best = times[0];
++                eprintln!(
++                    "decode-scan {label} k={k_heads} v={v_heads} layers={layers}: \
++                     median {median:.3} ms/token ({:.1} GB/s) | best {best:.3} ms ({:.1} GB/s)",
++                    bytes / (median * 1e6),
++                    bytes / (best * 1e6),
++                );
++            }
++        }
++    }
++
++    /// Isolation timing for the two beta|alpha arms — the fused one-dispatch
++    /// kernel against the candle gemv plus `delta_ba` it replaces — at every
++    /// shipped geometry, across the token counts that decide where
++    /// `DELTA_BA_MAX_SEQ` belongs. The fused kernel reads the whole weight once
++    /// per token tile and candle's gemm reads it once per chunk, so the fused
++    /// arm's advantage decays with n and the crossover is what this measures.
++    ///
++    /// Multiply a per-call figure by the model's DeltaNet layer count (27B: 48,
++    /// 35B-A3B: 30, Flash-Next: 36) for the step's share of one token.
++    ///
++    /// The FIRST cell printed reads several times high in both arms and is not
++    /// a measurement of the geometry it names — the process's first delta
++    /// dispatches walk a cold buffer pool. Read from the second geometry on, or
++    /// compare cells at the same position across runs.
++    ///
++    /// `#[ignore]`d — run on a `pgrep`-verified free GPU with:
++    ///   cargo test --release -p xwen delta_ba_timing -- --ignored --nocapture
++    #[test]
++    #[ignore = "perf bench"]
++    fn delta_ba_timing() {
++        use std::time::Instant;
++
++        let device = metal_device().unwrap();
++        let get = |k: &str, d: usize| {
++            std::env::var(k)
++                .ok()
++                .and_then(|s| s.parse().ok())
++                .unwrap_or(d)
++        };
++        let (warm, iters) = (get("XWEN_BENCH_WARMUP", 20), get("XWEN_BENCH_ITERS", 100));
++        let Device::Metal(mdev) = &device else {
++            unreachable!("metal_device() returned a non-Metal device")
++        };
++
++        for &(hidden, v_heads) in BA_GEOMETRIES.iter() {
++            for &seq in &[1usize, 2, 4, 8, 16, 32] {
++                let (x, w, ssm_a, dt_bias) =
++                    ba_operands(hidden, v_heads, seq, 0x9100 + seq as u64, &device);
++                // Amortized: the whole batch of iterations is one sync, so a
++                // per-call figure is not one command buffer's round trip.
++                let bench = |label: &str, f: &mut dyn FnMut()| {
++                    for _ in 0..warm {
++                        f();
++                    }
++                    mdev.wait_until_completed().unwrap();
++                    let t = Instant::now();
++                    for _ in 0..iters {
++                        f();
++                    }
++                    mdev.wait_until_completed().unwrap();
++                    let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
++                    eprintln!("{label} hidden={hidden} v={v_heads} seq={seq}: {us:.2} us/call");
++                };
++
++                bench("ba fused ", &mut || {
++                    delta_ba_fused(&x, &w, &ssm_a, &dt_bias).unwrap();
++                });
++                bench("ba classic", &mut || {
++                    let ba = x.matmul(&w).unwrap();
++                    delta_ba(&ba, &ssm_a, &dt_bias).unwrap();
++                });
++            }
++        }
++    }
++
+     /// Every op resolves its operands via `start_offset * dtype_size`; the other
+     /// tests build inputs with `Tensor::from_vec` (offset 0). Feed each op a
+     /// CONTIGUOUS view that starts mid-buffer and compare against the same view
+@@ -1087,6 +1696,17 @@ mod tests {
+             "offset ba g",
+         );
+ 
++        // The fused projection, whose four operands all resolve through
++        // `start_offset`: the layer input, the weight, and both per-head
++        // vectors. Graded against the same views through the gemv chain.
++        let hidden = 512usize;
++        let xv = offset(seq, hidden, 2, 0x7010, -2.0, 2.0);
++        let wv = offset(hidden, 2 * v_heads, 3, 0x7011, -0.08, 0.08);
++        let (fb, fg) = delta_ba_fused(&xv, &wv, &ssm_a, &dt_bias).unwrap();
++        let (wb, wg) = reference_ba_chain(&xv, &wv, &ssm_a, &dt_bias);
++        assert_close(&fb, &wb, 1e-6, "offset ba_fused beta");
++        assert_close(&fg, &wg, 1e-6, "offset ba_fused g");
++
+         let conv = offset(seq, conv_dim, 2, 0x7006, -2.0, 2.0);
+         let beta = offset(seq, v_heads, 3, 0x7007, 0.01, 0.99);
+         let g = offset(seq, v_heads, 1, 0x7008, -0.6, -0.001);
+diff --git a/src/ops/dispatch.rs b/src/ops/dispatch.rs
+index f0f2383..bab88f3 100644
+--- a/src/ops/dispatch.rs
++++ b/src/ops/dispatch.rs
+@@ -2972,6 +2972,15 @@ struct DeltaBaArgs {
+     v_heads: i32,
+ }
+ 
++/// Matches the Metal `delta_ba_fused_args` struct (src/ops/delta.metal).
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct DeltaBaFusedArgs {
++    seq: i32,
++    hidden: i32,
++    v_heads: i32,
++}
++
+ /// Matches the Metal `delta_gnorm_args` struct (src/ops/delta.metal).
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+@@ -3029,6 +3038,13 @@ pub(crate) const DELTA_HEAD_DIM: usize = 128;
+ /// from this copy, so a drift would write outside a head's state slice.
+ pub(crate) const DELTA_COL_BLOCKS: usize = 4;
+ 
++/// Threadgroups the DECODE scan kernel launches per V-head
++/// (`DELTA_DEC_COL_BLOCKS` in delta.metal — the value-dim columns split four
++/// ways, four columns to a thread). Kept in step with the kernel's own
++/// `#define` by `scan_geometry_matches_metal` (src/ops/delta.rs): the grid is
++/// sized from this copy, so a drift would write outside a head's state slice.
++pub(crate) const DELTA_DEC_COL_BLOCKS: usize = 4;
++
+ /// Simdgroups per threadgroup in the v2 scan (`DELTA_V2_SGS` in delta.metal) —
+ /// also the number of state value-columns a threadgroup covers, one per
+ /// simdgroup, since a simdgroup owns a column outright.
+@@ -3041,6 +3057,54 @@ pub(crate) const DELTA_V2_SGS: usize = 4;
+ /// head's state unowned.
+ pub(crate) const DELTA_V2_COL_TGS: usize = 32;
+ 
++/// Output columns one `kernel_delta_ba_fused_*` threadgroup owns
++/// (`DELTA_BA_COLS` in delta.metal). The column partition needs no
++/// cross-threadgroup reduction, so this alone sets how many threadgroups the
++/// launch has per token tile: `ceil(2 * v_heads / DELTA_BA_COLS)`.
++///
++/// FITTED, 2026-08-30 (`delta_ba_timing`, Flash-Next geometry, decode): 8 gives
++/// 12 threadgroups at 96 columns and 7.4 us; 16 gives 6 and 9.9 us; 4 gives 24
++/// and ties at decode but loses by half at seq 8-32. Narrower than 8 the
++/// per-threadgroup weight run stops filling a cache line on its own and the
++/// blocks sharing one line have to arrive together to make up for it.
++pub(crate) const DELTA_BA_COLS: usize = 8;
++
++/// Row chunks of the hidden dim one `kernel_delta_ba_fused_*` threadgroup
++/// splits its columns' dot products across (`DELTA_BA_ROWS` in delta.metal).
++/// `DELTA_BA_COLS * DELTA_BA_ROWS` is the threadgroup width.
++pub(crate) const DELTA_BA_ROWS: usize = 128;
++
++/// Tokens the `_t4` specialization tiles into one threadgroup
++/// (`DELTA_BA_TOKS` in delta.metal), so a short chunk reads the weight once per
++/// tile instead of once per token. Kept in step with the kernel's own
++/// `#define`s by `ba_fused_geometry_matches_metal` (src/ops/delta.rs): the grid
++/// below is sized from these copies, so a drift would leave columns or tokens
++/// unwritten.
++pub(crate) const DELTA_BA_TOKS: usize = 4;
++
++/// Token ceiling for the fused beta|alpha projection. The kernel reads the
++/// whole `[hidden, 2 * v_heads]` weight once per token TILE, so its advantage
++/// over candle's gemm — which reads it once per chunk — decays with the token
++/// count; above this the gemm wins and the two-dispatch chain is taken instead.
++/// Covers decode (1) and a DFlash verify block (16).
++///
++/// The measured crossover is farther out than 32 — at the Flash-Next geometry
++/// the fused arm is 18.8 us against the chain's 71.7 at seq 32
++/// (`delta_ba_timing`, 2026-08-30) — and this ceiling is deliberately short of
++/// it: prefill chunks are hundreds of tokens, where the fused kernel's
++/// once-per-tile weight read has never been measured and the gemm's reuse is
++/// the whole reason prefill is shaped the way it is.
++pub(crate) const DELTA_BA_MAX_SEQ: usize = 32;
++
++/// V-head ceiling for the fused beta|alpha projection: the shipped geometries
++/// are 48 and 32, and the kernel's grid is `2 * v_heads` columns wide.
++pub(crate) const DELTA_BA_MAX_V_HEADS: usize = 64;
++
++/// Hidden-dim ceiling for the fused beta|alpha projection (shipped: 5120, 2560,
++/// 2048). Each thread walks `hidden / DELTA_BA_ROWS` weight rows, so a far
++/// wider hidden is a shape this launch was not measured at.
++pub(crate) const DELTA_BA_MAX_HIDDEN: usize = 8192;
++
+ /// The simdgroup width the delta kernels are written against.
+ /// `kernel_delta_scan` reduces q/k through `red[2][DELTA_D / 32]` indexed by
+ /// simdgroup index, and `kernel_delta_gnorm` folds its sum of squares through a
+@@ -3258,6 +3322,167 @@ pub(crate) fn run_delta_ba(
+     ))
+ }
+ 
++/// Whether `run_delta_ba_fused` can serve this pair — the predicate the block
++/// consults before choosing between the fused kernel and the candle gemv plus
++/// `kernel_delta_ba`. Everything it checks is a geometry or layout fact the
++/// kernel's grid depends on, so a `false` here is "take the other path", never
++/// an error.
++pub(crate) fn delta_ba_fused_applies(x: &Tensor, w: &Tensor) -> bool {
++    let (Ok((seq, hidden)), Ok((w_rows, two_vh))) = (x.dims2(), w.dims2()) else {
++        return false;
++    };
++    x.device().is_metal()
++        && x.device().same_device(w.device())
++        && x.dtype() == DType::F32
++        && w.dtype() == DType::F32
++        && x.is_contiguous()
++        && w.is_contiguous()
++        && w_rows == hidden
++        && two_vh % 2 == 0
++        && two_vh / 2 <= DELTA_BA_MAX_V_HEADS
++        && two_vh >= 2
++        && (1..=DELTA_BA_MAX_SEQ).contains(&seq)
++        && (1..=DELTA_BA_MAX_HIDDEN).contains(&hidden)
++}
++
++/// The beta|alpha PROJECTION and the beta/decay head in ONE dispatch, against
++/// `kernel_delta_ba_fused_t{1,4}` (delta.metal). `x` is the layer input
++/// `[seq, hidden]` f32, `w` the concatenated `[hidden, 2 * v_heads]` beta|alpha
++/// weight built at load (column block 0 beta, block 1 alpha), `ssm_a` the
++/// pre-baked `-exp(A_log)` and `dt_bias` the dt offset, both `[v_heads]`.
++/// Returns the same `(beta, g)` pair as [`run_delta_ba`] over the gemv output,
++/// with `g` the LOG decay.
++///
++/// This replaces a candle f32 gemv that cost 29 us per layer for 96 dot
++/// products — ~50x off its byte floor — plus the head dispatch behind it. It is
++/// for SMALL token counts only ([`delta_ba_fused_applies`]): the weight is read
++/// once per `DELTA_BA_TOKS`-token tile, so a prefill chunk keeps the gemm.
++///
++/// NOT bit-identical to the gemv + [`run_delta_ba`] chain: the dot product is
++/// summed as `DELTA_BA_ROWS` partials folded in a tree where candle sums in its
++/// own order. The epilogue is the same Metal helper, so that reassociation is
++/// the only difference (graded at 2e-6 in delta.rs).
++pub(crate) fn run_delta_ba_fused(
++    x: &Tensor,
++    w: &Tensor,
++    ssm_a: &Tensor,
++    dt_bias: &Tensor,
++) -> Result<(Tensor, Tensor)> {
++    let cdev = x.device().clone();
++    let Device::Metal(mdev) = &cdev else {
++        bail!("delta_ba_fused requires x on a Metal device");
++    };
++
++    let (seq, hidden) = x
++        .dims2()
++        .map_err(|e| anyhow::anyhow!("x must be rank-2 [seq, hidden]: {e}"))?;
++    let (w_rows, two_vh) = w
++        .dims2()
++        .map_err(|e| anyhow::anyhow!("the beta|alpha weight must be rank-2: {e}"))?;
++    if two_vh % 2 != 0 {
++        bail!("the beta|alpha weight has {two_vh} columns, expected an even 2 * v_heads");
++    }
++    let v_heads = two_vh / 2;
++    check_f32(x, &[seq, hidden], "x")?;
++    check_f32(w, &[w_rows, two_vh], "beta|alpha weight")?;
++    check_f32(ssm_a, &[v_heads], "ssm_a")?;
++    check_f32(dt_bias, &[v_heads], "dt_bias")?;
++    if w_rows != hidden {
++        bail!("the beta|alpha weight has {w_rows} rows, expected x's hidden dim {hidden}");
++    }
++    if seq == 0 || v_heads == 0 || hidden == 0 {
++        bail!("delta_ba_fused needs at least one token, one V-head and one input column");
++    }
++    if seq > DELTA_BA_MAX_SEQ {
++        bail!("delta_ba_fused is for at most {DELTA_BA_MAX_SEQ} tokens, got {seq}");
++    }
++    if v_heads > DELTA_BA_MAX_V_HEADS {
++        bail!("delta_ba_fused is for at most {DELTA_BA_MAX_V_HEADS} V-heads, got {v_heads}");
++    }
++    if hidden > DELTA_BA_MAX_HIDDEN {
++        bail!("delta_ba_fused is for a hidden dim of at most {DELTA_BA_MAX_HIDDEN}, got {hidden}");
++    }
++    for (name, t) in [
++        ("the beta|alpha weight", w),
++        ("ssm_a", ssm_a),
++        ("dt_bias", dt_bias),
++    ] {
++        if !x.device().same_device(t.device()) {
++            bail!("{name} must live on the same Metal device as x");
++        }
++    }
++    let n = checked_elems(&[seq, v_heads], "delta_ba_fused")?;
++    glue_index_fits_i32(checked_elems(&[hidden, two_vh], "delta_ba_fused weight")?)?;
++    glue_index_fits_i32(checked_elems(&[seq, hidden], "delta_ba_fused input")?)?;
++
++    // One token per threadgroup at decode, where the tile clamp folds away.
++    let (kernel, toks) = if seq == 1 {
++        ("kernel_delta_ba_fused_t1", 1)
++    } else {
++        ("kernel_delta_ba_fused_t4", DELTA_BA_TOKS)
++    };
++    let pipeline = pipelines::delta_pipeline(mdev.device(), kernel)?;
++    let width = DELTA_BA_COLS * DELTA_BA_ROWS;
++    if pipeline.max_total_threads_per_threadgroup() < width {
++        bail!(
++            "{kernel} needs {width} threads per threadgroup, the pipeline allows {}",
++            pipeline.max_total_threads_per_threadgroup()
++        );
++    }
++    let beta = mdev.new_buffer(n, DType::F32, "delta_beta")?;
++    let g = mdev.new_buffer(n, DType::F32, "delta_g")?;
++
++    let (x_guard, x_layout) = x.storage_and_layout();
++    let Storage::Metal(x_storage) = &*x_guard else {
++        bail!("x is not on a Metal device");
++    };
++    let (w_guard, w_layout) = w.storage_and_layout();
++    let Storage::Metal(w_storage) = &*w_guard else {
++        bail!("the beta|alpha weight is not on a Metal device");
++    };
++    let (a_guard, a_layout) = ssm_a.storage_and_layout();
++    let Storage::Metal(a_storage) = &*a_guard else {
++        bail!("ssm_a is not on a Metal device");
++    };
++    let (dt_guard, dt_layout) = dt_bias.storage_and_layout();
++    let Storage::Metal(dt_storage) = &*dt_guard else {
++        bail!("dt_bias is not on a Metal device");
++    };
++
++    let args = DeltaBaFusedArgs {
++        seq: seq as i32,
++        hidden: hidden as i32,
++        v_heads: v_heads as i32,
++    };
++    {
++        let cmd = mdev.command_encoder()?;
++        let ep = &cmd;
++        let encoder = ep.encoder();
++        let encoder: &ComputeCommandEncoder = encoder.as_ref();
++        encoder.set_compute_pipeline_state(&pipeline);
++        encoder.set_bytes(0, &args);
++        encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
++        encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
++        encoder.set_input_buffer(3, Some(a_storage.buffer()), f32_off(a_layout));
++        encoder.set_input_buffer(4, Some(dt_storage.buffer()), f32_off(dt_layout));
++        encoder.set_output_buffer(5, Some(&beta), 0);
++        encoder.set_output_buffer(6, Some(&g), 0);
++        encoder.dispatch_thread_groups(
++            mtl_size!(two_vh.div_ceil(DELTA_BA_COLS), seq.div_ceil(toks), 1),
++            mtl_size!(width, 1, 1),
++        );
++    }
++    drop(x_guard);
++    drop(w_guard);
++    drop(a_guard);
++    drop(dt_guard);
++
++    Ok((
++        output_tensor(beta, mdev, n, (seq, v_heads)),
++        output_tensor(g, mdev, n, (seq, v_heads)),
++    ))
++}
++
+ /// Fused gated output RMSNorm against `kernel_delta_gnorm` (delta.metal):
+ /// `rms_norm(o, eps) * ssm_norm_weight * gate(z)` per head, in one pass. `o` is
+ /// `[seq, v_heads, head_dim]` f32, `z` the gate projection output in the same
+@@ -3491,11 +3716,14 @@ fn check_delta_scan_operands(
+ /// speculative verify walk needs — llama.cpp's snapshot-slot ordering, kept so
+ /// the two are readable against each other.
+ ///
+-/// The default is `kernel_delta_scan`, which normalizes q and k in its own load
+-/// stage. `XWEN_DELTA_SCAN_V2` selects the measured artifact instead:
+-/// `run_delta_l2norm` followed by `kernel_delta_scan_v2`. Both are bounded
+-/// against the reference scan and differ only in the order the two key-dim
+-/// contractions are summed.
++/// Three kernels, one contract. Every length takes `kernel_delta_scan` by
++/// default, which normalizes q and k in its own load stage. Two opt-in arms
++/// exist and neither is faster: `XWEN_DELTA_DECODE_KERNEL` sends a ONE-TOKEN
++/// chunk to `kernel_delta_scan_decode`, the same recurrence with the timestep
++/// loop gone, and `XWEN_DELTA_SCAN_V2` selects `run_delta_l2norm` followed by
++/// `kernel_delta_scan_v2` at every length. All three are bounded against the
++/// reference scan and differ only in the order the key-dim contractions are
++/// summed.
+ pub(crate) fn run_delta_scan(
+     conv: &Tensor,
+     beta: &Tensor,
+@@ -3506,10 +3734,21 @@ pub(crate) fn run_delta_scan(
+     planes: usize,
+ ) -> Result<(Tensor, Tensor)> {
+     if crate::ops::delta_scan_v2() {
+-        run_delta_scan_v2(conv, beta, g, s, k_heads, eps, planes)
+-    } else {
+-        run_delta_scan_default(conv, beta, g, s, k_heads, eps, planes)
+-    }
++        return run_delta_scan_v2(conv, beta, g, s, k_heads, eps, planes);
++    }
++    // A one-token chunk goes to the decode kernel only when the opt-in switch
++    // asks for it (it is a measured wash — `ops::delta_decode_kernel`).
++    // `planes` is 1 there by construction (1..=seq), and the float4 state
++    // pointer needs a 16-byte buffer offset — every state a cache hands over
++    // starts at 0, and a head-aligned test view is 64 KiB in, but a view that
++    // is neither falls back rather than reading misaligned.
++    let decode = crate::ops::delta_decode_kernel()
++        && matches!(conv.dims2(), Ok((1, _)))
++        && f32_off(s.layout()).is_multiple_of(16);
++    if decode {
++        return run_delta_scan_decode(conv, beta, g, s, k_heads, eps, planes);
++    }
++    run_delta_scan_default(conv, beta, g, s, k_heads, eps, planes)
+ }
+ 
+ /// `XWEN_DELTA_SCAN_V2`: the q/k norm as its own dispatch, then
+@@ -3617,10 +3856,115 @@ fn run_delta_scan_v2(
+     ))
+ }
+ 
++/// The DECODE arm: `kernel_delta_scan_decode` — one token, no timestep loop,
++/// the state read and written as float4 with the row-slice folds done inside a
++/// simdgroup. Same operands, same outputs and the same single state plane as
++/// `run_delta_scan_default` at `seq == 1`. OPT-IN and a measured wash — see
++/// `ops::delta_decode_kernel`, which is the only thing that selects it.
++///
++/// Preconditions the caller has already established: `seq == 1` (so `planes` is
++/// 1, the only plane count a one-token chunk can name) and a state view whose
++/// byte offset is float4-aligned.
++pub(crate) fn run_delta_scan_decode(
++    conv: &Tensor,
++    beta: &Tensor,
++    g: &Tensor,
++    s: &Tensor,
++    k_heads: usize,
++    eps: f32,
++    planes: usize,
++) -> Result<(Tensor, Tensor)> {
++    let cdev = conv.device().clone();
++    let Device::Metal(mdev) = &cdev else {
++        bail!("delta_scan requires conv on a Metal device");
++    };
++    let (seq, conv_dim, v_heads) = check_delta_scan_operands(conv, beta, g, s, k_heads, planes)?;
++    let (d_k, d_v) = (DELTA_HEAD_DIM, DELTA_HEAD_DIM);
++    if seq != 1 || planes != 1 {
++        bail!("delta_scan_decode is the seq == 1 kernel, got seq {seq} with {planes} planes");
++    }
++    let s_off = f32_off(s.layout());
++    if !s_off.is_multiple_of(16) {
++        bail!(
++            "delta_scan_decode reads the state as float4; its byte offset {s_off} is not 16-byte aligned"
++        );
++    }
++
++    let out_len = checked_elems(&[seq, v_heads, DELTA_HEAD_DIM], "delta_scan out")?;
++    let state_len = checked_elems(&[planes, v_heads, d_k, d_v], "delta_scan state")?;
++    glue_index_fits_i32(checked_elems(&[seq, conv_dim], "delta_scan conv")?)?;
++    glue_index_fits_i32(out_len)?;
++
++    let pipeline = pipelines::delta_pipeline(mdev.device(), "kernel_delta_scan_decode")?;
++    if pipeline.max_total_threads_per_threadgroup() < DELTA_HEAD_DIM {
++        bail!(
++            "delta_scan needs {DELTA_HEAD_DIM} threads per threadgroup, the pipeline allows {}",
++            pipeline.max_total_threads_per_threadgroup()
++        );
++    }
++    check_delta_simd_width(&pipeline, "kernel_delta_scan_decode")?;
++    let out = mdev.new_buffer(out_len, DType::F32, "delta_scan_out")?;
++    let s_out = mdev.new_buffer(state_len, DType::F32, "delta_scan_state")?;
++
++    let (conv_guard, conv_layout) = conv.storage_and_layout();
++    let Storage::Metal(conv_storage) = &*conv_guard else {
++        bail!("conv is not on a Metal device");
++    };
++    let (beta_guard, beta_layout) = beta.storage_and_layout();
++    let Storage::Metal(beta_storage) = &*beta_guard else {
++        bail!("beta is not on a Metal device");
++    };
++    let (g_guard, g_layout) = g.storage_and_layout();
++    let Storage::Metal(g_storage) = &*g_guard else {
++        bail!("g is not on a Metal device");
++    };
++    let (s_guard, s_layout) = s.storage_and_layout();
++    let Storage::Metal(s_storage) = &*s_guard else {
++        bail!("delta state is not on a Metal device");
++    };
++
++    let args = DeltaScanArgs {
++        seq: seq as i32,
++        k_heads: k_heads as i32,
++        v_heads: v_heads as i32,
++        conv_dim: conv_dim as i32,
++        n_planes: planes as i32,
++        scale: 1.0 / (DELTA_HEAD_DIM as f32).sqrt(),
++        eps,
++    };
++    {
++        let cmd = mdev.command_encoder()?;
++        let ep = &cmd;
++        let encoder = ep.encoder();
++        let encoder: &ComputeCommandEncoder = encoder.as_ref();
++        encoder.set_compute_pipeline_state(&pipeline);
++        encoder.set_bytes(0, &args);
++        encoder.set_input_buffer(1, Some(conv_storage.buffer()), f32_off(conv_layout));
++        encoder.set_input_buffer(2, Some(beta_storage.buffer()), f32_off(beta_layout));
++        encoder.set_input_buffer(3, Some(g_storage.buffer()), f32_off(g_layout));
++        encoder.set_input_buffer(4, Some(s_storage.buffer()), f32_off(s_layout));
++        encoder.set_output_buffer(5, Some(&out), 0);
++        encoder.set_output_buffer(6, Some(&s_out), 0);
++        encoder.dispatch_thread_groups(
++            mtl_size!(v_heads * DELTA_DEC_COL_BLOCKS, 1, 1),
++            mtl_size!(DELTA_HEAD_DIM, 1, 1),
++        );
++    }
++    drop(conv_guard);
++    drop(beta_guard);
++    drop(g_guard);
++    drop(s_guard);
++
++    Ok((
++        output_tensor(out, mdev, out_len, (seq, v_heads, DELTA_HEAD_DIM)),
++        output_tensor(s_out, mdev, state_len, (planes, v_heads, d_k, d_v)),
++    ))
++}
++
+ /// The shipped path: `kernel_delta_scan` alone — a threadgroup per head per
+ /// value-column block, with the q/k L2 clamp-norm folded into its load stage, so
+ /// the whole recurrence is one dispatch. See `run_delta_scan`.
+-fn run_delta_scan_default(
++pub(crate) fn run_delta_scan_default(
+     conv: &Tensor,
+     beta: &Tensor,
+     g: &Tensor,
+diff --git a/src/ops/mod.rs b/src/ops/mod.rs
+index f5d3718..201f52e 100644
+--- a/src/ops/mod.rs
++++ b/src/ops/mod.rs
+@@ -19,8 +19,8 @@ pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, r
+ pub use bf16::matmul_bf16;
+ pub use combine::combine;
+ pub use delta::{
+-    DELTA_HEAD_DIM, delta_ba, delta_conv, delta_gnorm, delta_l2norm, delta_scan,
+-    delta_scan_with_trail,
++    DELTA_HEAD_DIM, delta_ba, delta_ba_fused, delta_ba_fused_applies, delta_conv, delta_gnorm,
++    delta_l2norm, delta_scan, delta_scan_with_trail,
+ };
+ pub use dense_mm::{dense_mm_supported, matmul_dense_q};
+ pub use dispatch::mv_vendored_supported;
+@@ -559,6 +559,56 @@ pub fn delta_classic() -> bool {
+     *V.get_or_init(|| std::env::var_os("XWEN_DELTA_CLASSIC").is_some())
+ }
+ 
++/// `XWEN_DELTA_DECODE_KERNEL=1` routes the seq == 1 gated-DeltaNet step to
++/// `kernel_delta_scan_decode`, the decode-specialized scan, instead of the
++/// general `kernel_delta_scan` every length takes by default. The two run the
++/// same math on the same operands and leave the same single state plane — the
++/// decode kernel drops the timestep loop, moves the state as float4 and folds
++/// its row slices inside a simdgroup — so this is an A/B knob, not a numerics
++/// anchor: both arms are BOUNDED against the reference in the same class, and
++/// `XWEN_DELTA_CLASSIC` remains the switch that takes a run all the way back to
++/// the frozen reference scan.
++///
++/// OPT-IN because it is a measured WASH end to end (44.6-44.7 tok/s against the
++/// general kernel's 44.7-44.8 on Flash-Next, 105.4 against 105.5 on the
++/// 35B-A3B, byte-identical greedy text either way), kept for the bench arm and
++/// the refutation it carries rather than for a speedup — docs/decisions.md, "A
++/// decode-specialized scan kernel is a WASH". Its `#[ignore]`d bench is
++/// `delta_scan_decode_timing` (src/ops/delta.rs), which calls both kernels
++/// directly and needs no switch.
++///
++/// Prefill and any multi-token verify chunk are unaffected — they never reach
++/// the decode kernel — so a run that sets this differs only in the fold order
++/// of its DECODE arithmetic.
++///
++/// PRESENCE-BASED and cached (read once), like the sibling switches: any value
++/// enables it — only leaving it unset keeps the general kernel everywhere.
++pub fn delta_decode_kernel() -> bool {
++    static V: OnceLock<bool> = OnceLock::new();
++    *V.get_or_init(|| std::env::var_os("XWEN_DELTA_DECODE_KERNEL").is_some())
++}
++
++/// `XWEN_DELTA_BA_CLASSIC=1` splits the fused beta|alpha projection back into
++/// the two dispatches it replaced: a candle f32 gemv over the `[hidden, 2 *
++/// v_heads]` weight, then `kernel_delta_ba` over its output. Only the shape of
++/// that one step changes — both arms run the same `LinearAttnBlock` fused path,
++/// and a prefill chunk takes the gemv either way (the fused kernel is confined
++/// to small token counts, `dispatch::DELTA_BA_MAX_SEQ`).
++///
++/// Like `XWEN_DELTA_CLASSIC` and unlike the combine/act/glue switches, this is
++/// NOT a bit-identity anchor: the fused kernel sums each dot product as
++/// per-thread partials folded in a tree where candle's gemv sums in its own
++/// order, so the two arms agree to ~1e-6 rather than bitwise. The epilogue is
++/// the same Metal helper on both sides.
++///
++/// PRESENCE-BASED and cached (read once), like the sibling switches
++/// (`delta_classic`, `flash_classic`): any value enables it — only leaving it
++/// unset keeps the fused kernel.
++pub fn delta_ba_classic() -> bool {
++    static V: OnceLock<bool> = OnceLock::new();
++    *V.get_or_init(|| std::env::var_os("XWEN_DELTA_BA_CLASSIC").is_some())
++}
++
+ /// `XWEN_DELTA_SCAN_V2=1` runs the gated-DeltaNet recurrence through
+ /// `kernel_delta_scan_v2` and the `ops::delta_l2norm` dispatch it needs, instead
+ /// of the shipped single-dispatch `kernel_delta_scan`. That pair is llama.cpp's

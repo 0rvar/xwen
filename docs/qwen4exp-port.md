@@ -18,8 +18,11 @@ divergence is resolved at construction time.
   vendored `mm_id` (8112733), four fused hyper-connection kernels (8aeed73) and
   a split norm launch below 32 tokens (2c8d3b3), plus PLE row prefetch
   (ac40526) and the review polish (188ba73). At a 530-token prompt, interleaved:
-  **prefill 239 → 796 tok/s** against llama.cpp's 789, **decode 37.8 → 43.1 → 45 with the PLE prefetch**
-  against 41.4. Graded by forced replay at 186/192 with 0 hard mismatches, and the shipped checkpoints
+  **prefill 239 → 796 tok/s** against llama.cpp's 789, **decode 37.8 → 43.1 → 45
+  with the PLE prefetch** against 41.4, **then → 46.7 with the beta|alpha fold**
+  (0261e17, 2026-08-30, +4.6-4.8% over its own 44.4-44.5 arm; no llama.cpp arm that
+  session; the 35B-A3B gained +8.8% from the same commit).
+  Graded by forced replay at 186/192 with 0 hard mismatches, and the shipped checkpoints
   re-gated (35B and 27B ALL PASS at fd46c7a). Decisions D19-D25. **P3 pauses
   here with its ledger open**: the PLE gate/conv are still on the host, QSA
   top-k is still on the host, decode is bimodal for no known reason, and the
@@ -1058,12 +1061,17 @@ decoded tokens, arms interleaved, four rounds, medians:
 | --- | --- | --- |
 | shipped (fused hc, split below 32, Q5_1 `mm_id`) | **795.7** | **43.1** |
 | + PLE row prefetch (ac40526), cold prompt per arm | 774.7-797.9 | **44.5-45.8** |
+| + beta\|alpha fold (0261e17, 2026-08-30), decode arm only | 796-798, unchanged | **46.5-46.7** |
 | `XWEN_HC_SPLIT_MAX_N=0` (fused, single kernel) | 793.5 | 35.1 |
 | `XWEN_HC_CLASSIC=1` (candle chains, Q5_1 arm still on) | 438.0 | 37.8 |
 | llama.cpp, same file, same hour | 789 | 41.4 |
 
 **1.01x llama.cpp on prefill and 1.04x on decode**, from 0.30x and 0.91x at the P2
-close. Net of the two hc commits against the classic chains: +82% prefill, +14%
+close. The beta|alpha fold's 46.5-46.7 is +4.6-4.8% over its OWN 44.4-44.5 arm on
+2026-08-30 and has no llama.cpp arm from that session, so it does not extend the 1.04x —
+differencing it against the 41.4 above would be a cross-session comparison this repo does
+not make. Forced replay at 0261e17 reads 185/192 (7 near-ties, margins 0.0002-0.288
+logit, 0 hard) against 186/192 at fd46c7a, the extra flip being a 0.0002-logit tie. Net of the two hc commits against the classic chains: +82% prefill, +14%
 decode. The three arms produce byte-identical text over 128 tokens, so the split is a
 launch shape and nothing else (D22).
 

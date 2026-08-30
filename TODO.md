@@ -2034,6 +2034,77 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     checkpoints. Whole-token byte floor ≈ 5.5 GB (experts 1.5, GDN 2.1, attn
     0.6, hc 0.7, lm_head 0.6) ≈ 9 ms at nominal → a ceiling near 100-110
     tok/s that nobody should quote as reachable; llama.cpp sits at 41.
+    **ANNOTATED 2026-08-30 after the GDN mixer arc (ae82696, 5526213, f89972f,
+    0261e17; log.md "the GDN mixer arc", decisions.md "How to read
+    `XWEN_GDN_PROFILE`"). The 10.8 ms above is SYNC-INFLATED and so is every
+    share derived from it** — `XWEN_GDN_PROFILE` brackets each step with a
+    device sync, its floor correction is one global number against a per-step
+    inflation, and its raw mixer total (78 ms) is more than three whole
+    unprofiled tokens. Two figures off that line have since been priced
+    properly and both were 2-3x high: the scan (3.79-7.19 ms/token on the line,
+    1.35-1.43 amortized) and `attn_qkv` (346 GB/s on the line, 510 amortized).
+    So the "up to +11-15 tok/s if the layer reached bandwidth" in (14) is
+    **withdrawn as a target**: the layer is much closer to bandwidth than the
+    line said. What the per-op breakdown (14) asked for now exists, and it says
+    the lever is DISPATCH COUNT, not bytes:
+    - **`ba_proj` — SHIPPED 0261e17.** The beta|alpha gemv folded into
+      `kernel_delta_ba_fused` below 32 tokens: one dispatch fewer per DeltaNet
+      layer per token, **Flash-Next decode 44.4-44.5 → 46.5-46.7 tok/s
+      (+4.6-4.8%, 36 layers)** and **35B-A3B 105.1 → 114.4 (+8.8%, 30
+      layers)**, prefill unchanged on both. Bounded at 2e-6, so the greedy text
+      is byte-identical over the graded 64-token window and forks at ~step 124
+      of 128 — say the window when quoting it. All three shipped checkpoints
+      re-gated ALL PASS at 0261e17 (parity.md); Flash-Next forced replay
+      185/192, 0 hard. `XWEN_DELTA_BA_CLASSIC=1` restores the chain.
+    - **`attn_qkv` — RETIRED, there was nothing there.** `q8_gemv_shape_sweep`
+      (src/ops/q8.rs): the K=2560 shapes fit `t = 8.41 µs + bytes / 604 GB/s`
+      (LSQ, R² 0.99996) with no cliff at any width, and at DRAM `attn_qkv` is
+      the FASTEST of the three GDN projections — 510 GB/s against `attn_gate`
+      464 and `ssm_out` 465, the profiler's ordering being inverted. The 346
+      was one dispatch behind a full flush (not reproduced exactly: the
+      reconstruction lands at 413). A `(NR0, NSG)` retune was priced at the
+      same time and the shipped (2, 4) wins — no geometry gain available.
+    - **The scan — kept OPT-IN, a wash.** `kernel_delta_scan_decode` behind
+      `XWEN_DELTA_DECODE_KERNEL=1`; the general kernel already moves the state
+      at 525-564 GB/s marginal, within 1.4x of a candle copy of the same bytes
+      (its own ledger section below).
+    The GDN block issues **288 dispatches per decoded token** and the sweep's
+    fit prices a dispatch at **8.41 µs of fixed cost regardless of size**, so
+    36 dispatches ≈ 0.3 ms ≈ **~+1.5%** of a ~21.4 ms token. On the 35B-A3B the
+    same arithmetic roughly doubles (30 layers against an 8.7 ms token), which
+    is what the ba fold's +8.8% there against +4.6-4.8% here already showed. That arithmetic,
+    not a bandwidth headroom argument, is what sizes what remains — three
+    candidates, each its own kernel change, none started:
+    - **conv+silu+state into the scan** (−36 dispatches) → **+1-2%**.
+    - **gnorm+zgate into `out_proj`'s prologue** (−36) → **+1-2%**; the two are
+      already 0.08 ms of profiled work, so this is dispatches only.
+    - **the three Q8_0 projections (`attn_qkv`, `attn_gate`, `ssm_out`) as one
+      multi-plane launch** (−72) → **+2-4%**; note the `XWEN_MOE_DUAL`
+      precedent (decisions.md) — merging dispatches that were already
+      saturating bandwidth in parallel LOSES, so this one needs an A/B before
+      it is believed, and these three planes are bandwidth-saturating.
+    Ranges are deliberately narrower than the ba fold's measured +4.8%: that
+    fold displaced a dispatch that was ALSO doing real work badly (a candle f32
+    gemv at 33 GB/s), which is not true of any of the three above.
+    **(15) MoE decode efficiency gets the same lens and it is the smaller
+    target than it looks.** Counted from `src/moe.rs` on the decode path
+    (`MoeBlock::forward` → `FusedExperts::project` + `ops::moe_epilogue`; the
+    fused-glue predicate holds for this checkpoint, `use_mm` is false at seq 1):
+    **12 dispatches per MoE layer and ZERO host syncs** — router matmul,
+    `kernel_moe_router`, gate/up/down expert gather-matvecs (one per PLANE, not
+    per expert), `kernel_moe_silu_mul`, the four shexp dispatches, the shexp
+    gate matmul, and `kernel_moe_epilogue`. All 48 layers carry an MoE FFN, so
+    **576 MoE dispatches per token** — twice the GDN block's 288, and the
+    largest single dispatch population in the model. At 8.41 µs that is ~4.8 ms
+    of a ~21 ms token in launch cost alone, which is most of why `ffn` reads
+    ≈190 GB/s effective. But the glue is already fused (24 → 14 dispatches in
+    2026-07-29's pass, and again since), and `XWEN_MOE_GLUE_CLASSIC` costs ~21
+    per layer, so what is left is the six matvec/matmul dispatches per layer
+    plus four glue ones. The **+3-8 tok/s** estimate above stands only if a
+    real fusion exists there; the dual gate|up kernel that would have been the
+    obvious one is REFUTED on this device (decisions.md, `XWEN_MOE_DUAL`).
+    Next step is a count-reducing shape nobody has proposed yet, not a rate
+    argument.
     **STATUS after P3's first pass (2026-08-29): (1) partly, (2), (3) and (6)
     done; (4), (5), (8) untouched; (7) closed earlier; (9) retired; (10)-(13)
     added.** In rough order of expected
