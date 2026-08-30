@@ -668,6 +668,21 @@ SwiGLU, combine and shared expert. Shipped anyway as the correct shape of the ke
 and `XWEN_MM_ID_NR1` as kill switch and A/B knob, and the finding re-ranks the prefill
 ledger toward the non-gemm parts of `ffn` (2026-08-30).
 
+**Dispatch-floor levers ranked (2026-08-30).** The 8.41 µs fixed cost every dispatch
+pays is not a Metal constant and it is not ours to fix in a `.metal` file — the ranked
+candidates for it are all in candle's encoder layer, and a read of the pinned rev
+(21cca0b) put them in order: whole-scope barriers that could be per-resource scoped
+(`encoder.rs:104-149`), cross-encoder fence waits that are unfiltered by dependency
+(every new encoder waits on every live fence), and the CPU-side locking each dispatch
+does to bind (an `EntryState` mutex, 4-6 acquisitions and `HashSet` inserts per bind) —
+that last being the only one plausible as a component of the floor itself. All three are
+candle patches, none is priced, and the commit cadence
+(`CANDLE_METAL_COMPUTE_PER_BUFFER`, default 50, counted per dispatch) is the one knob
+that needs no patch. Full anchors and the reasoning in log.md "technique survey"; queue
+in TODO.md. Nothing here ships on a tok/s reading alone: candle's pooled-buffer recycle
+has no in-flight check (`device.rs:488-503`), so a concurrency or cadence change is
+graded by the parity gate plus greedy equivalence.
+
 ## Refuted perf directions — do not reopen without new evidence
 
 **Refuted: the f32-tile mm_id family (`_t_hp`) as a way to delete the rescale chain
@@ -919,6 +934,43 @@ r1ptg rows stops paying once the token count is large enough for the tiled path'
 threadgroup grid to fill, and past that it is strictly the worse decomposition. The
 crossover is where ggml put it. Do not re-raise the ceiling without a kernel that
 changes this shape (2026-08-08).
+
+**Refuted: tensor cores for the decode gemv.** The cooperative-tensor path has paid
+twice on this machine (dense_mm's 2.2-2.7x, the `mm_id` `_t` family) and the obvious
+next thought is to point it at decode. Three independent sources say no, and they agree
+closely enough that spending a bench on it would be spending it to confirm a
+consensus: Apple's own M5 figures put the decode gain at **+19-27% against a +28%
+memory-bandwidth gain** — it tracks bandwidth, not arithmetic — and both BaseRT-M5
+(arXiv 2607.00501) and MLX keep decode on SIMD kernels while using cooperative tensors
+for prefill. The mechanism is the one the `mul_mv_id` dual-weight refutation above
+already taught in another form: a batch-1 mat-vec reads a weight byte per FMA, and the
+arithmetic units are not what it waits on. Cooperative tensors stay a PREFILL lever
+here. Re-open only with a measurement on this machine (2026-08-30, log.md "technique
+survey").
+
+**Refuted: reducing the number of graph splits.** llama.cpp PR #27880 measured exactly
+this, on qwen4exp, on an M5: splits 4 → 2 moved prefill **665.65 → 665.27** tok/s and
+decode **27.99 → 27.29**. Nothing, in both directions of nothing, with decode slightly
+the wrong way. Their graph and their measurement, but the same architecture family and
+the same GPU generation, and there is no version of this cheap enough to be worth our
+own arm (2026-08-30).
+
+**Refuted AS ALREADY PRESENT: "adopt MLX-style concurrent encoding".** The most-cited
+Apple-silicon inference technique — one long-lived encoder in concurrent dispatch mode
+with dependency-derived barriers instead of an encoder per kernel — is the top item on
+every survey of this area, and candle already does all of it. Anchors, pinned rev
+21cca0b, candle-metal-kernels: `computeCommandEncoderWithDispatchType(Concurrent)` at
+`command_buffer.rs:24`; the dependency-tracked `auto_barrier` with hazard sets spanning
+the whole window since the last barrier at `encoder.rs:104-149`; fences plus untracked
+buffers across encoder boundaries; commit every `CANDLE_METAL_COMPUTE_PER_BUFFER`
+dispatches (default 50 — per DISPATCH, not per op as the doc comment says) at
+`commands.rs:18,162`. xwen's 137 dispatch sites bind through
+`set_input_buffer`/`set_output_buffer` and participate fully, so there is no xwen-side
+adoption left to do; encoders break only at the readbacks (`sampler.rs:257` and the
+scoring path), explicit synchronizes, blits, and the ~77-dispatch decode step's two
+rollovers. What remains is not the scheme but its granularity — see "Dispatch-floor
+levers ranked" under Kernel policy, and do not re-propose the scheme itself
+(2026-08-30).
 
 ## Speculative decoding
 

@@ -2631,3 +2631,56 @@ changed, so everything here is a follow-up rather than a leftover.
   same prompts, thermal protocol. Sources and the full engine survey are in the session
   log only; re-research before citing (aggregator-tier numbers were discarded as
   unreliable).
+
+## Deferred from the technique survey (2026-08-30)
+
+Research pass, no code (log.md "technique survey"; the three refutations it produced are
+in decisions.md "Refuted perf directions"). **Every item here is UNPRICED** — the survey
+ranked candidates against published evidence, it did not measure anything on this
+machine, so no item carries an expected win. Each says what would have to be measured
+first. The candle-side items (3) and (4) are patches to the pinned rev 21cca0b, which
+nothing in this repo has done before; treat that as part of their cost.
+
+- [ ] **llama.cpp's 64-node lookahead reorder, to widen the concurrent dispatch sets**
+  (`ggml-metal-common.cpp:300-370`). candle already encodes concurrently with
+  dependency-derived barriers (decisions.md, "Refuted AS ALREADY PRESENT"), so the
+  remaining question is how much independent work there is to overlap — and on the
+  decode path the graph is mostly a serial chain, one layer feeding the next. **Measure
+  the available parallelism before implementing anything**: how many of a decode step's
+  ~77 dispatches have no dependency on their predecessor. If that number is small, the
+  reorder is dead on the decode side regardless of what it does for llama.cpp, and only
+  prefill (where the expert gemms are genuinely independent) is left. Estimate unknown.
+- [ ] **Fuse gate/up + SiLU onto the cooperative-tensor accumulators in `mm_id`**
+  (BaseRT-M5's shape, arXiv 2607.00501). Prefill only; the `_t` family already
+  dequantizes the expert tile once per token tile, and this would keep both projections'
+  results in the accumulators through the activation instead of round-tripping them.
+  **Bounded by an already-measured fact**: the expert gemms are a MINORITY of the
+  prefill `ffn` stage — the 2026-08-30 mm_id pass moved them +17-23% in isolation and
+  the stage fell 3-5%. So a few percent of `ffn` at best, and the non-gemm parts of that
+  stage (router, combine, SwiGLU glue) rank above it. Estimate unknown but capped low.
+- [ ] **Per-resource barrier scoping and dependency-filtered cross-encoder fence waits**
+  (candle patch). candle's `auto_barrier` emits a whole-scope barrier over the full
+  window since the last one (`encoder.rs:104-149`), and every new encoder waits on every
+  live fence rather than only the ones it depends on. This is the same pair the
+  2026-08-08 prefill-residual entry left standing as the unconfirmed remainder after
+  `XWEN_CHUNK_SYNC` and the cadence sweep both cleared — and that entry's closing
+  condition was "do not re-propose without an instrument that can see inside a chunk",
+  which a patched candle IS. Estimate unknown; the residual it targets is +350-560
+  µs/token on 27B prefill.
+- [ ] **Reduce candle's CPU-side locking per dispatch** (candle patch): an `EntryState`
+  mutex with 4-6 lock acquisitions and `HashSet` inserts on every bind. This is the one
+  survey item that **attacks the fitted 8.41 µs dispatch floor directly** rather than
+  working around it, and the floor is what every dispatch-count fusion on the ledger is
+  ultimately buying against. Estimate unknown — nobody has profiled the CPU side of a
+  dispatch here, and it should be profiled before it is patched.
+- [ ] **`CANDLE_METAL_COMPUTE_PER_BUFFER` default (50, per DISPATCH not per op —
+  `commands.rs:18,162`).** A decode step issues ~77 dispatches, so it rolls the command
+  buffer about twice a token. A cadence A/B was in flight as this section was written;
+  **its result and any default change belong in this line** (the 2026-08-08 sweep found
+  10/200/1000 within 0.9% at 4k PREFILL, which does not speak to decode).
+
+Hazard that applies to every item above: candle's pooled-buffer recycle fires at
+`strong_count == 1` with no in-flight check (`device.rs:488-503`), so a cadence or
+concurrency change can hand a still-live buffer back to the pool. Grade these with the
+parity gate plus greedy equivalence, never with tok/s alone — a corruption from this
+mechanism is intermittent and looks like a sampling difference.
