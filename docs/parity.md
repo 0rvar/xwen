@@ -397,11 +397,11 @@ chunk than its reference is comparing two shapes the report does not name, so
 Δnll 0.000791 with the candidate provenance recording `seq_len: 2048` — digit-identical
 to the 512-era figure, so the chunk moves the ppl tier by less than the printed precision.
 
-Six more switches exist and appear in NO row of that table, because they affect
+Seven more switches exist and appear in NO row of that table, because they affect
 **qwen4exp (Qwen3.8-Flash-Next) only** — a checkpoint the harness cannot yet run at all
 (see "Limitations"). They are listed here so a future gate extension does not rediscover
 them, and because `parity-gate.ts` explicitly strips `XWEN_HC_CLASSIC`,
-`XWEN_QSA_CLASSIC` and `XWEN_PLE_PROFILE` from the run env (6eaf980 for the first;
+`XWEN_QSA_CLASSIC`, `XWEN_QSA_HOST_TOPK` and `XWEN_PLE_PROFILE` from the run env (6eaf980 for the first;
 the others followed): inheriting one from the caller's shell would grade a path the
 report does not name.
 
@@ -409,6 +409,7 @@ report does not name.
 |---|---|---|
 | `XWEN_HC_CLASSIC=1` | reverts the four fused hyper-connection kernels to the candle chains they replace | a real kill switch, and the one to pin on a reference side once qwen4exp is gradeable: `hc_silu_quarter` and `hc_write` are bit-identical to the chains but `hc_norm` and `hc_mix` are BOUNDED, the same class as `XWEN_DELTA_CLASSIC` |
 | `XWEN_QSA_CLASSIC=1` | reverts the QSA indexer's decode fast path — the cached block-key plane (`IndexerCache::blocks`) and the fused K/V row gather (`ops::qsa_gather`) — to the per-call full recompute and the per-head `index_select` chain | a real kill switch, but both arms are BIT-IDENTICAL by construction (the pool replays candle's two-thread strided-reduce order, the gather is a copy; `cached_block_keys_match_the_classic_recompute`, `f16_matches_the_index_select_chain_bitwise`), so it can never move a parity number; it only matters above the 2048-token indexer budget |
+| `XWEN_QSA_HOST_TOPK=1` | reverts the QSA indexer's device-side block selection at decode (`ops::qsa_select`, `kernel_qsa_select`: radix top-k over the score bits plus the block-to-row expansion, one dispatch per layer) to the per-layer score readback and the host `top_blocks` + `expand_into` — the readback that drained the pipeline 12 times per step; `XWEN_QSA_CLASSIC` implies it | a real kill switch, but both arms produce the SAME ROWS by construction for EVERY input, contract or not: host and kernel rank through one `score_key` (bit pattern of a non-negative float; sign bit or NaN → 0), score descending then block index ascending (`device_select_matches_host_top_blocks_bitwise`, `device_select_tie_quota_spans_stripes`, `device_select_matches_host_on_nan_and_negative_scores`, and the three-arm `cached_block_keys_match_the_classic_recompute`), so it can never move a parity number; it only matters above the 2048-token indexer budget |
 | `XWEN_HC_SPLIT_MAX_N=<n>` | token-count ceiling below which the hc norm takes the split launch (default 32; `0` pins the single kernel, a large value pins the split pair) | an A/B knob, not a kill switch — both launch shapes compute the SAME BITS (`split_matches_single_bitwise`), so it can never move a parity number |
 | `XWEN_PLE_PROFILE=1` | one stderr line per forward with the PLE layer's sub-step timings | instrumentation; zero cost unset, and it adds syncs that inflate decode |
 | `XWEN_PLE_NO_PREFETCH=1` | disables the advisory PLE row prefetch thread | non-numeric — the prefetch only faults pages early |

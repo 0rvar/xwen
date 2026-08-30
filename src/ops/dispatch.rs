@@ -4438,6 +4438,114 @@ pub(crate) fn run_qsa_gather(t: &Tensor, rows: &Tensor) -> Result<Tensor> {
 }
 
 // ---------------------------------------------------------------------------
+// QSA decode block selection — see src/ops/qsa_select.metal.
+
+/// Matches the Metal `qsa_select_args` struct (src/ops/qsa_select.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaSelectArgs {
+    nb: i32,
+    keep: i32,
+    ratio: i32,
+    tail: i32,
+}
+
+/// The threadgroup width `kernel_qsa_select` is written for: one threadgroup
+/// per call, every thread owning a contiguous stripe of the `nb` scores. The
+/// kernel sizes its per-simdgroup scratch for this many threads.
+const QSA_SELECT_MAX_THREADS: usize = 1024;
+
+/// Select the top-`keep` of the `nb` block scores `scores` (f32 `[nb]`) and
+/// expand them, plus the `tail` positions above the last complete block, into
+/// the ascending u32 row list `[keep * ratio + tail]` — `QsaIndexer::top_blocks`
+/// + `expand_into` on device, against `kernel_qsa_select`. One threadgroup.
+pub(crate) fn run_qsa_select(
+    scores: &Tensor,
+    keep: usize,
+    ratio: usize,
+    tail: usize,
+) -> Result<Tensor> {
+    let cdev = scores.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("qsa_select requires its scores on a Metal device");
+    };
+    if scores.dtype() != DType::F32 {
+        bail!("qsa_select scores must be f32, got {:?}", scores.dtype());
+    }
+    if !scores.is_contiguous() {
+        bail!("qsa_select scores must be contiguous");
+    }
+    let nb = scores.dims1()?;
+    if nb == 0 {
+        bail!("qsa_select over no blocks");
+    }
+    if keep == 0 || keep > nb {
+        bail!("qsa_select keep {keep} must be in 1..={nb}");
+    }
+    if ratio == 0 || tail >= ratio {
+        bail!("qsa_select tail {tail} must be below the block ratio {ratio}");
+    }
+    for (v, what) in [(nb, "nb"), (keep, "keep"), (ratio, "ratio"), (tail, "tail")] {
+        if v > i32::MAX as usize {
+            bail!("qsa_select {what} {v} overflows i32");
+        }
+    }
+    // Row indices are u32 on the wire (the gather reads them as such).
+    let n_sel = checked_elems(&[keep, ratio], "qsa_select")? + tail;
+    if checked_elems(&[nb, ratio], "qsa_select")? + tail > u32::MAX as usize {
+        bail!("qsa_select positions overflow u32");
+    }
+
+    let pipeline = pipelines::qsa_select_pipeline(mdev.device(), "kernel_qsa_select")?;
+    // The scans are built from simdgroup prefix sums, so the width must be
+    // whole simdgroups; a pipeline that cannot run 32 threads has no width
+    // this kernel can use.
+    let width = pipeline
+        .max_total_threads_per_threadgroup()
+        .min(QSA_SELECT_MAX_THREADS);
+    if width < 32 {
+        bail!("qsa_select pipeline admits only {width} threads per threadgroup");
+    }
+    let width = width - width % 32;
+    let dst = mdev.new_buffer(n_sel, DType::U32, "qsa_select")?;
+
+    let (s_guard, s_layout) = scores.storage_and_layout();
+    let Storage::Metal(s_storage) = &*s_guard else {
+        bail!("qsa_select scores are not on a Metal device");
+    };
+    let args = QsaSelectArgs {
+        nb: nb as i32,
+        keep: keep as i32,
+        ratio: ratio as i32,
+        tail: tail as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(s_storage.buffer()),
+            s_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(2, Some(&dst), 0);
+        encoder.dispatch_thread_groups(mtl_size!(1, 1, 1), mtl_size!(width, 1, 1));
+    }
+    drop(s_guard);
+
+    let storage = MetalStorage::new(dst, mdev.clone(), n_sel, DType::U32);
+    Ok(Tensor::from_storage(
+        Storage::Metal(storage),
+        n_sel,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Hyper-connections (qwen4exp carrier read/write) — see src/ops/hc.metal.
 // ---------------------------------------------------------------------------
 

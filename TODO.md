@@ -2498,6 +2498,23 @@ A/B named four things it did not take.
   arms, greedy byte-identical. ~8.5 ms/token of the cliff remains (32.8 → 30.4 ms/step at
   3.8k against 21.8 below budget). **Step C is next**: a device-side top-k (or fused
   score+select writing row indices) that removes the 12 per-step score readbacks.
+  **2026-08-30, later still: step C SHIPPED** (`kernel_qsa_select`, radix select over a
+  canonical score key shared with the host comparator, quota compaction, no readback;
+  kill switch `XWEN_QSA_HOST_TOPK`; log.md "QSA decode, step C", decisions.md "Decode
+  selection runs on the device"). Thermal protocol, arm order alternated: 3.8k 33.1/33.0
+  → 41.1/44.1, 7.6k 33.9/33.3 → 44.2/45.0, 16k 32.0 → 41.7 (10 tokens), 32k 33.8 → 45.3,
+  anchors 45.6 → 46.7, greedy byte-identical at 3.8k and 16k. **The cliff is closed**:
+  45 at 32k against 46.7 below budget. Remaining sub-items:
+  - The threshold walk is serial on thread 0 (256 bins × 4 passes); a cooperative
+    256-thread walk (per-bin prefix via scan) is the obvious next shape. Measure the
+    kernel's share of the step with an amortized bench before acting — at 44-45 vs 46.7
+    there is at most ~1 ms/step left in the whole above-budget path.
+  - Prefill (`n > 1`) still reads the scores back once per chunk per layer to assemble
+    the `[n_q, n_kv]` mask on the host. A device-side mask build (top-k per query row,
+    then a fill kernel) would remove it; low value — one sync per chunk, not per token.
+  - The earlier stack profile put `ple` +3.2 ms above budget and called it possible
+    bleed from the adjacent syncs; those syncs are gone, so re-profile (rank only) to
+    see whether the term went with them.
   - `strided_sum` (the reduce-order replay) refuses extents above 5: candle's reducer
     folds through a 4-lane `simd_sum` there and the bit-identity breaks (1 ulp at
     extent 6). Both production extents are 4; a checkpoint with `ratio` or indexer

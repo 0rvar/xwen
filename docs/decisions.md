@@ -2129,8 +2129,37 @@ to extent 5 (one or two threads) and is REFUSED above, where candle folds throug
 4-lane `simd_sum` in an order the tree does not reproduce (1 ulp at extent 6, measured).
 The K/V row gather for the decode selection is one Metal kernel per plane
 (`ops::qsa_gather`), a copy and therefore bitwise; a non-Metal source takes the candle
-chain with no switch. `XWEN_QSA_CLASSIC` restores both old paths. Bench and the caveat
-on the prefill difference: log.md 2026-08-30 (QSA decode, steps A+B).
+chain with no switch. `XWEN_QSA_CLASSIC` restores both old paths, and the host top-k
+below with them. Bench and the caveat on the prefill difference: log.md 2026-08-30 (QSA
+decode, steps A+B).
+
+**Decode selection runs on the device (2026-08-30).** A single-token step above the
+budget selects its blocks in `kernel_qsa_select` and never reads the scores back; the
+row buffer it writes is what the attention's gather reads. Four decisions inside that:
+
+1. *A canonical integer key, on both arms.* Selection ranks by `score_key` — the bit
+   pattern of a non-negative finite float, denormals included; a set sign bit or a NaN
+   keys as 0 — with a Rust copy in `top_blocks`' comparator and a Metal copy in the
+   kernel. Not a float compare: Metal's `max(-0.0f, 0.0f)` returned `-0.0` in the
+   first cut and its bit pattern is the largest key (caught by the tie sweep), and a
+   flush-to-zero compare would rank a denormal equal to zero where the host ranks it
+   above. The shared key also made the host a true total order — it was `partial_cmp`
+   with an `Equal` fallback, which under a NaN depends on the walk order.
+2. *MSB-first radix select over a sort.* The step needs a threshold and a set, not an
+   order; four 256-bin histogram passes over ≤ 65536 keys in one threadgroup find the
+   threshold and the equal-quota, and two exclusive scans compact in index order, which
+   is exactly the tie rule (lower index wins) for free. A sort would have to be stable
+   and would cost its own kernel; candle's `arg_sort` would make the tie rule a property
+   of its stability.
+3. *Prefill stays on the host.* A chunk's overlay is a `[n_q, n_kv]` mask assembled on
+   the host anyway, so its one readback per chunk buys the assembly; a device mask build
+   is a separate, low-value item (TODO.md).
+4. *Both arms identical by construction, so the switch is a fallback, not a parity row.*
+   `XWEN_QSA_HOST_TOPK` runs the readback path; because both rank by one key the rows
+   are the same for every input, and the tests hold the kernel to the host bit for bit
+   (tie sweep, quota across stripes, NaN/negative, the three-arm scripted sequence).
+   Bench: log.md 2026-08-30 (QSA decode, step C) — 33 → 44-45 tok/s at 3.8k-32k, the
+   cliff closed.
 
 **Third arch, composition over forking.** `Arch::Qwen4Exp` gets its own graph module;
 shared blocks (DeltaNet, attention internals, MoE glue, rope) are reused by composition

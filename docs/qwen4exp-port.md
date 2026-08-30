@@ -25,7 +25,7 @@ divergence is resolved at construction time.
   Graded by forced replay at 186/192 with 0 hard mismatches, and the shipped checkpoints
   re-gated (35B and 27B ALL PASS at fd46c7a). Decisions D19-D25. **P3 pauses
   here with its ledger open**: the PLE gate/conv are still on the host, QSA
-  top-k is still on the host, decode is bimodal for no known reason, and the
+  top-k is still on the host (moved to the device 2026-08-30, step C), decode is bimodal for no known reason, and the
   PLE prefetch A/B is not yet measured. See "Perf state" below and TODO.md's P3
   ledger.
 - Phase before it: **P2 units U0-U7 LANDED 2026-08-29 — FIRST LIGHT, and the
@@ -1063,6 +1063,7 @@ decoded tokens, arms interleaved, four rounds, medians:
 | + PLE row prefetch (ac40526), cold prompt per arm | 774.7-797.9 | **44.5-45.8** |
 | + beta\|alpha fold (0261e17, 2026-08-30), decode arm only | 796-798, unchanged | **46.5-46.7** |
 | by context, after the QSA block-key cache + fused gather (2026-08-30, 64 decoded, thermal protocol): 1937 / 3803 / 7606 tokens | 961-998 / 825-841 / 711-736 | **45.4-46.2 / 32.8-32.9 / 33.5** (was 30.4-30.5 / 30.3 above the 2048 budget) |
+| by context, after the device-side QSA selection (2026-08-30, later; thermal protocol, arms alternated): 1937 / 3803 / 7606 / 15972 / 32061 tokens | 960-972 / 832-837 / 695-717 / 597 / 473 | **45.6-46.7 / 41.1-44.1 / 44.2-45.0 / 41.7 (10 tokens) / 45.3** (host top-k arm same session: 33.0-33.1 / 33.3-33.9 / 32.0 / 33.8) |
 | `XWEN_HC_SPLIT_MAX_N=0` (fused, single kernel) | 793.5 | 35.1 |
 | `XWEN_HC_CLASSIC=1` (candle chains, Q5_1 arm still on) | 438.0 | 37.8 |
 | llama.cpp, same file, same hour | 789 | 41.4 |

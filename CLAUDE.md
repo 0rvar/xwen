@@ -247,9 +247,9 @@ plain because no drafter exists for it: **prefill ~796 tok/s @530, decode 46.5-4
 (44.4-44.5 before the ba fold, 43.1 before the PLE row prefetch)** — 530-token prompt
 (long prompts at the 2048 chunk of 2026-08-30: **824 @3851 / 951 @1962**, against
 748 / 883 at the old 512 chunk, same session; **decode by context, same day, after the
-QSA block-key cache + fused gather: 46 below the 2048 indexer budget, 33 at 3.8k-7.6k —
-30 before the cache — the rest of the cliff being the 12 per-step score readbacks,
-TODO.md**) —
+QSA block-key cache, fused gather and device-side selection (2026-08-30): 46 below the
+2048 indexer budget and 44-45 at 3.8k-32k, plain — 30 before the arc, 33 after the
+cache alone; the cliff is closed, TODO.md keeps the follow-ups**) —
 interleaved rounds, medians, the fold measured in two sessions,
 against llama.cpp's 789 / 41.4 on the same file in the same hour as the 2026-08-29 arm
 (`pmset -g` said `powermode 0` that session — still no high-power

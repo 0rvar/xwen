@@ -4,6 +4,68 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-30 (QSA decode, step C) — block selection moved onto the device: Flash-Next decode above the 2048 budget 33 → 44-45 tok/s at 3.8k-32k, the cliff closed
+
+Steps A+B (below) left one named cost: each of the 12 QSA layers read its block scores
+back to the host every decode step (`to_vec1` in `select_with`), ran `top_blocks` +
+`expand_into` there and uploaded the rows. Each readback drains the pipeline, so the CPU
+could not encode layer N+1 while the GPU ran layer N — the GPU idled 12 times per token.
+
+**Mechanism.** `kernel_qsa_select` (`src/ops/qsa_select.metal`, `ops::qsa_select`,
+`dispatch::run_qsa_select`): one threadgroup of 1024 threads per layer per step, each
+thread a contiguous stripe of `ceil(nb / 1024)` scores. The threshold is found by
+MSB-first radix select over a canonical integer key — four passes of a 256-bin threadgroup
+histogram, thread 0 walking the bins downward to the one where the cumulative count
+reaches what is still needed. Then a compaction: per-thread counts of keys above and equal
+to the threshold, two threadgroup exclusive scans (simd prefix + per-simdgroup totals) that
+rank the equal keys in index order and assign output slots, and a re-walk that emits every
+above-threshold block and the lowest-indexed equal ones up to the quota. Stripes are
+contiguous and thread-ordered, so the rows come out ascending. `keep == nb` is an
+identity fill. `n_sel = keep * ratio + tail` is known on the host (`tail = (pos+1) %
+ratio` at a single-token step), so the output buffer is allocated at the right size and the
+step has no readback at all: the attention's gather reads the row buffer the kernel wrote.
+Prefill (`n > 1`) keeps the host path — its overlay is a host-assembled mask anyway.
+
+**The key.** Both arms rank by ONE function, `score_key` (a Rust copy in indexer.rs used
+by `top_blocks`' comparator, a Metal copy in the kernel): a non-negative finite float
+orders by its bit pattern, denormals included; a set sign bit or a NaN keys as 0. This
+made the host comparator a true total order (it was `partial_cmp` with an `Equal`
+fallback) and makes the two arms identical for every input, contract or not. The trap
+on the way: the design's `as_type<uint>(max(score, 0.0f))` FAILED the tie sweep at
+`nb 100 keep 50` — Metal's `max(-0.0f, 0.0f)` returned `-0.0`, whose bit pattern is
+the LARGEST key, so a `-0.0` block was kept ahead of everything. The pure-bit key also
+sidesteps flush-to-zero on the compare, which would have ranked a denormal equal to 0.
+
+Kill switch `XWEN_QSA_HOST_TOPK` (presence-based; `XWEN_QSA_CLASSIC` implies it;
+stripped by parity-gate.ts; a row in parity.md's qwen4exp table). Tests: the kernel against
+`top_blocks` + `expand_into` bit for bit over nb ∈ {1, 5, 100, 511, 512, 513, 2000,
+65536} × keep ∈ {1, nb/2, 512, nb} × tail 0..3 with heavily tied scores (exact zeros,
+−0.0, denormals) and continuous ones; a tie-quota case spanning 500 stripes; NaN and
+negative scores; the dispatch's bails; and the scripted-sequence test now runs THREE arms
+(classic+host, cached+host, cached+device) with identical rows at every step.
+
+**Bench** (thermal protocol; `--no-draft --raw -n 64 --stats`; before =
+`XWEN_QSA_HOST_TOPK=1`, after = default; arm order alternated between rounds — r1
+before-then-after, r2 after-then-before; 60 s between rounds; `pmset -g` printed
+`powermode 0` at both ends; no other model process):
+
+| prompt | before decode | after decode | before prefill | after prefill |
+| --- | --- | --- | --- | --- |
+| 1937 anchor (after arm) start → end | | 45.6 → 46.7 | | 960.2 → 972.3 |
+| 3803 r1 / r2 | 33.1 / 33.0 | 41.1 / 44.1 | 835.7 / 834.8 | 832.0 / 837.3 |
+| 7606 r1 / r2 | 33.9 / 33.3 | 44.2 / 45.0 | 718.0 / 686.5 | 695.3 / 716.5 |
+| 15972 (one round; only 10 tokens decoded before EOS) | 32.0 | 41.7 | 589.2 | 596.6 |
+| 32061 (one round) | 33.8 | 45.3 | 470.9 | 473.4 |
+
+Anchor drift +2.4% (within the 3% flag). Above-budget decode now runs at 44-45 against
+the 45.6-46.7 below-budget anchor at every length up to 32k: the QSA cliff is closed,
+and the per-step cost no longer grows with context in the indexer. The 3803 r1 "after"
+figure (41.1) is a 32-token sample (EOS) and the 16k rows are 10-token samples; the
+prefill differences flip sign with arm order and are noise. Greedy (`--top-k 1`, 64
+tokens) byte-identical between arms at 3803 and at 15972. The cooperative bin walk,
+the prefill readback and the earlier profile's `ple` +3.2 ms above budget are the
+ledgered follow-ups (TODO.md).
+
 ## 2026-08-30 (QSA decode, steps A+B) — block keys cached per complete block and the K/V row gather fused: Flash-Next decode above the 2048 budget 30.5 → 32.9 at 3.8k, 30.3 → 33.5 at 7.6k
 
 The decode cliff at the QSA budget (TODO.md, measured earlier today: 46 tok/s below 2048

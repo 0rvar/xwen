@@ -135,6 +135,12 @@ const HC_SOURCE: &str = include_str!("hc.metal");
 /// no rounding contract to state. Under `XWEN_QSA_CLASSIC` nothing asks for
 /// it, so it never compiles.
 const QSA_GATHER_SOURCE: &str = include_str!("qsa_gather.metal");
+/// Vendored QSA decode block selection (device-side top-k of the block scores,
+/// expanded into the gather's row list). Own library; integer work over
+/// canonicalized score bits, so it has no rounding contract to state. Under
+/// `XWEN_QSA_CLASSIC` or `XWEN_QSA_HOST_TOPK` nothing asks for it, so it never
+/// compiles.
+const QSA_SELECT_SOURCE: &str = include_str!("qsa_select.metal");
 
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
@@ -357,4 +363,9 @@ pub(crate) fn hc_pipeline(device: &Device, name: &str) -> Result<ComputePipeline
 /// Pipeline for a `qsa_gather.metal` kernel (the QSA decode row gather).
 pub(crate) fn qsa_gather_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, QSA_GATHER_SOURCE, "qsa_gather", name)
+}
+
+/// Pipeline for the `qsa_select.metal` kernel (the QSA decode block selection).
+pub(crate) fn qsa_select_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, QSA_SELECT_SOURCE, "qsa_select", name)
 }

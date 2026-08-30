@@ -16,27 +16,35 @@
 //! # Where the work runs
 //!
 //! Projections, both norms, both ropes, the block mean-pool and the scores run
-//! on device as ordinary candle ops. **The top-k and the expansion of blocks
-//! into a token set run on the HOST**, off a `[n_q, n_blocks]` score readback.
-//! Two reasons, both P2-shaped:
+//! on device as ordinary candle ops. What happens next depends on the chunk:
 //!
-//! 1. The tie rule is a set-identity property, and a host `select_nth_unstable`
-//!    under an explicit (score descending, block index ascending) total order
-//!    reproduces it exactly. `arg_sort` would make it a property of candle's
-//!    sort stability instead — and at long context the relu floors a large
-//!    fraction of block scores at exactly 0, so ties are the normal case, not
-//!    an edge case.
-//! 2. The prefill overlay is materialized as a `[n_q, n_kv]` additive mask
-//!    anyway, so the round trip buys the assembly for free.
+//! - **A decode step (one query) selects ON DEVICE**: `kernel_qsa_select`
+//!   (`ops::qsa_select`) takes the `[n_blocks]` score row, finds the top-k by
+//!   radix select over the score bits and writes the expanded row list, so the
+//!   step never reads anything back. Before it, each of the 12 QSA layers
+//!   drained the pipeline once per token for a readback of a few KB, and the
+//!   GPU idled while the CPU encoded the next layer. `XWEN_QSA_HOST_TOPK`
+//!   restores the readback.
+//! - **A prefill chunk selects on the HOST**, off a `[n_q, n_blocks]` score
+//!   readback, because its overlay is materialized as a `[n_q, n_kv]` additive
+//!   mask anyway, so the round trip buys the assembly for free.
 //!
-//! The cost is real and known: at 2200 tokens the readback is ~5 MB and the
-//! mask upload ~19 MB (the f32 `[n_q, n_kv]` plane), per QSA layer per forward,
-//! plus the ~9.7 MB f16 copy `PrefillMask::from_raw` makes of it for sdpa. That
-//! f16 copy is ONE plane broadcast across the heads, not one per head — see
-//! `from_raw`, where materializing it would be 232 MB at this length. A partial
-//! top-k kernel plus a device-side block→token expansion is the P3 replacement
-//! (TODO.md); the selection sets it must reproduce are pinned by the tests
-//! below.
+//! Both paths implement one tie rule, and it is a set-identity property: a
+//! total order (score descending, block index ascending) that the host states
+//! outright in `select_nth_unstable`'s comparator and the kernel reproduces
+//! over the score bits. `arg_sort` would have made it a property of candle's
+//! sort stability instead — and at long context the relu floors a large
+//! fraction of block scores at exactly 0, so ties are the normal case, not an
+//! edge case. The kernel is held to the host's rows bit for bit
+//! (`device_select_matches_host_top_blocks_bitwise`).
+//!
+//! The prefill cost is real and known: at 2200 tokens the readback is ~5 MB
+//! and the mask upload ~19 MB (the f32 `[n_q, n_kv]` plane), per QSA layer per
+//! forward, plus the ~9.7 MB f16 copy `PrefillMask::from_raw` makes of it for
+//! sdpa. That f16 copy is ONE plane broadcast across the heads, not one per
+//! head — see `from_raw`, where materializing it would be 232 MB at this
+//! length. A device-side mask assembly is the remaining replacement (TODO.md);
+//! the selection sets it must reproduce are pinned by the tests below.
 //!
 //! # Blocks are query-independent
 //!
@@ -48,7 +56,6 @@
 //! is also why a chunked prefill and a single-shot one select identically: the
 //! blocks are cut from the sequence, never from the chunk.
 
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
@@ -272,21 +279,33 @@ impl QsaIndexer {
         cache: &mut IndexerCache,
         pos: usize,
     ) -> Result<QsaSelection> {
-        self.select_with(x_normed, cache, pos, crate::ops::qsa_classic())
+        let classic = crate::ops::qsa_classic();
+        self.select_with(
+            x_normed,
+            cache,
+            pos,
+            classic,
+            classic || crate::ops::qsa_host_topk(),
+        )
     }
 
-    /// [`Self::select`] with the block-key path chosen by the caller instead of
-    /// by `XWEN_QSA_CLASSIC`: `classic` recomputes every block key from the raw
-    /// rows each call ([`Self::block_keys_classic`]), the default reads them off
-    /// the cache's block plane ([`Self::block_keys_cached`]). The two are
-    /// bit-identical (`cached_block_keys_match_the_classic_recompute`); the
-    /// split exists so one test can run both over one scripted sequence.
+    /// [`Self::select`] with the two decode paths chosen by the caller instead
+    /// of by `XWEN_QSA_CLASSIC` / `XWEN_QSA_HOST_TOPK`: `classic` recomputes
+    /// every block key from the raw rows each call
+    /// ([`Self::block_keys_classic`]), the default reads them off the cache's
+    /// block plane ([`Self::block_keys_cached`]); `host_topk` reads a decode
+    /// step's scores back and selects on the host ([`Self::top_blocks`]), the
+    /// default selects on device (`ops::qsa_select`). Each pair is
+    /// bit-identical (`cached_block_keys_match_the_classic_recompute`,
+    /// `device_select_matches_host_top_blocks_bitwise`); the split exists so
+    /// one test can run the arms over one scripted sequence.
     fn select_with(
         &self,
         x_normed: &Tensor,
         cache: &mut IndexerCache,
         pos: usize,
         classic: bool,
+        host_topk: bool,
     ) -> Result<QsaSelection> {
         let (n, _hidden) = x_normed.dims2()?;
         ensure!(
@@ -345,8 +364,26 @@ impl QsaIndexer {
             .relu()?
             .reshape((self.n_heads, n, n_blocks))?;
         let scores = (strided_sum(&per_head, 0)? * scale)?; // [n, n_blocks]
-        let scores = scores.flatten_all()?.to_vec1::<f32>()?;
 
+        // A decode step selects on device: no readback, so the CPU keeps
+        // encoding the next layer while the GPU is still on this one. The
+        // prefill overlay is a host-assembled mask and keeps the readback.
+        if n == 1 && !host_topk && matches!(device, Device::Metal(_)) {
+            let keep = (self.budget / self.ratio).min(n_blocks);
+            // At a single-token step `n_kv == pos + 1` (the cache length was
+            // checked to equal `pos` above), so this tail is exactly the
+            // `(pos + 1) % ratio` positions `expand_into` would append.
+            let tail = n_kv - n_blocks * self.ratio;
+            let rows = crate::ops::qsa_select::select_rows(
+                &scores.flatten_all()?.contiguous()?,
+                keep,
+                self.ratio,
+                tail,
+            )?;
+            return Ok(QsaSelection::Rows(rows));
+        }
+
+        let scores = scores.flatten_all()?.to_vec1::<f32>()?;
         let sets = self.top_blocks(&scores, n, n_blocks, pos);
 
         if n == 1 {
@@ -449,9 +486,10 @@ impl QsaIndexer {
     /// blocks; it keeps `min(budget / ratio, that)` of them.
     ///
     /// Ties keep the LOWER block index, matching `ref_qsa::select`. The
-    /// comparator says so outright — score descending, then index ascending —
-    /// rather than leaning on a sort's stability, because the relu makes exact
-    /// ties the common case rather than a curiosity.
+    /// comparator says so outright — score descending, then index ascending,
+    /// both through [`score_key`] — rather than leaning on a sort's stability,
+    /// because the relu makes exact ties the common case rather than a
+    /// curiosity.
     fn top_blocks(&self, scores: &[f32], n: usize, n_blocks: usize, pos: usize) -> Vec<Vec<usize>> {
         let keep_max = self.budget / self.ratio;
         let mut order: Vec<usize> = Vec::with_capacity(n_blocks);
@@ -468,12 +506,11 @@ impl QsaIndexer {
                 order.extend(0..nb);
                 if keep < nb {
                     // A total order (the index breaks every tie), so a partial
-                    // selection names exactly the same set a full sort would.
+                    // selection names exactly the same set a full sort would
+                    // — and the same set the device kernel names, since both
+                    // rank by `score_key`.
                     order.select_nth_unstable_by(keep - 1, |&a, &b| {
-                        row[b]
-                            .partial_cmp(&row[a])
-                            .unwrap_or(Ordering::Equal)
-                            .then(a.cmp(&b))
+                        score_key(row[b]).cmp(&score_key(row[a])).then(a.cmp(&b))
                     });
                 }
                 let mut kept = order[..keep].to_vec();
@@ -500,6 +537,28 @@ impl QsaIndexer {
         for t in (visible - visible % self.ratio)..visible {
             out.push(t as u32);
         }
+    }
+}
+
+/// The ordering key of one block score, shared by the host selection
+/// (`QsaIndexer::top_blocks`) and the device one (`kernel_qsa_select`'s
+/// `score_key`, which must stay the same function).
+///
+/// A non-negative finite float orders by its bit pattern, denormals included,
+/// so the key IS the score's order for everything the relu'd score can be. A
+/// set sign bit — `-0.0`, or a negative that the relu makes impossible — keys
+/// as 0, and so does a NaN (host and device alike, so a NaN is a tie with
+/// every zero-scored block and nothing else; it is outside the contract
+/// either way). Because every input maps to an integer, the comparator built
+/// on it is a TOTAL order (key descending, block index ascending) — where a
+/// `partial_cmp` fallback would have made a NaN "equal" to everything and
+/// the selection depend on the walk order.
+pub(crate) fn score_key(s: f32) -> u32 {
+    let u = s.to_bits();
+    if u & 0x8000_0000 != 0 || s.is_nan() {
+        0
+    } else {
+        u
     }
 }
 
@@ -1323,18 +1382,34 @@ mod tests {
 
         let mut classic = ix.new_cache(8192, &device).unwrap();
         let mut cached = ix.new_cache(8192, &device).unwrap();
+        let mut host = ix.new_cache(8192, &device).unwrap();
+        // Three arms: classic keys + host top-k (the pre-fast-path answer),
+        // cached keys + device top-k (what ships), and cached keys + host
+        // top-k in between so a difference names the path that caused it.
         fn run(
             ix: &QsaIndexer,
             classic: &mut IndexerCache,
             cached: &mut IndexerCache,
+            host: &mut IndexerCache,
             x: &Tensor,
             pos: usize,
             what: &str,
         ) -> QsaSelection {
-            let a = ix.select_with(x, classic, pos, true).unwrap();
-            let b = ix.select_with(x, cached, pos, false).unwrap();
-            assert_eq!(selection_bits(&a), selection_bits(&b), "{what}: selection");
+            let a = ix.select_with(x, classic, pos, true, true).unwrap();
+            let h = ix.select_with(x, host, pos, false, true).unwrap();
+            let b = ix.select_with(x, cached, pos, false, false).unwrap();
+            assert_eq!(
+                selection_bits(&a),
+                selection_bits(&h),
+                "{what}: selection, classic vs cached keys"
+            );
+            assert_eq!(
+                selection_bits(&h),
+                selection_bits(&b),
+                "{what}: selection, host vs device top-k"
+            );
             assert_eq!(classic.len(), cached.len(), "{what}: length");
+            assert_eq!(host.len(), cached.len(), "{what}: length");
             assert_block_plane_matches(ix, cached, !matches!(b, QsaSelection::Dense), what);
             b
         }
@@ -1343,7 +1418,15 @@ mod tests {
         // still fills), the second crossing it.
         let a = xt.narrow(0, 0, 1500).unwrap().contiguous().unwrap();
         assert!(matches!(
-            run(&ix, &mut classic, &mut cached, &a, 0, "chunk 0..1500"),
+            run(
+                &ix,
+                &mut classic,
+                &mut cached,
+                &mut host,
+                &a,
+                0,
+                "chunk 0..1500"
+            ),
             QsaSelection::Dense
         ));
         assert_eq!(cached.blocks_ready(), 0, "a Dense chunk builds no keys");
@@ -1353,7 +1436,15 @@ mod tests {
             .contiguous()
             .unwrap();
         assert!(matches!(
-            run(&ix, &mut classic, &mut cached, &b, 1500, "chunk 1500..2200"),
+            run(
+                &ix,
+                &mut classic,
+                &mut cached,
+                &mut host,
+                &b,
+                1500,
+                "chunk 1500..2200"
+            ),
             QsaSelection::Mask(_)
         ));
         assert_eq!(cached.blocks_ready(), SEQ / RATIO);
@@ -1363,7 +1454,15 @@ mod tests {
             let pos = SEQ + i;
             let before = cached.blocks_ready();
             assert!(matches!(
-                run(&ix, &mut classic, &mut cached, &step(i), pos, "step"),
+                run(
+                    &ix,
+                    &mut classic,
+                    &mut cached,
+                    &mut host,
+                    &step(i),
+                    pos,
+                    "step"
+                ),
                 QsaSelection::Rows(_)
             ));
             assert_eq!(cached.blocks_ready(), (pos + 1) / RATIO);
@@ -1373,11 +1472,21 @@ mod tests {
         // rollback drops the block that closed at 2208.
         let ck_c = classic.checkpoint(4).unwrap();
         let ck_f = cached.checkpoint(4).unwrap();
+        let ck_h = host.checkpoint(4).unwrap();
         let spec = extra.narrow(0, 5, 4).unwrap().contiguous().unwrap();
-        run(&ix, &mut classic, &mut cached, &spec, 2205, "speculated 4");
+        run(
+            &ix,
+            &mut classic,
+            &mut cached,
+            &mut host,
+            &spec,
+            2205,
+            "speculated 4",
+        );
         assert_eq!(cached.blocks_ready(), 2209 / RATIO);
         classic.rollback(&ck_c, 2205, 4, 2).unwrap();
         cached.rollback(&ck_f, 2205, 4, 2).unwrap();
+        host.rollback(&ck_h, 2205, 4, 2).unwrap();
         assert_eq!(cached.len(), 2207);
         assert_eq!(
             cached.blocks_ready(),
@@ -1390,6 +1499,7 @@ mod tests {
         // DIFFERENT tokens: the block that spanned the cut is rebuilt.
         classic.truncate(2202).unwrap();
         cached.truncate(2202).unwrap();
+        host.truncate(2202).unwrap();
         assert_eq!(cached.blocks_ready(), 550, "truncate clamps the plane");
         for i in 9..14 {
             let pos = 2202 + (i - 9);
@@ -1397,6 +1507,7 @@ mod tests {
                 &ix,
                 &mut classic,
                 &mut cached,
+                &mut host,
                 &step(i),
                 pos,
                 "post-truncate step",
@@ -1407,18 +1518,224 @@ mod tests {
         // A reset empties the plane; an import rebuilds it from the rows.
         let image = cached.export_rows().unwrap();
         cached.reset();
+        host.reset();
         assert_eq!(cached.blocks_ready(), 0);
         cached.import_rows(&image, 2207, &device).unwrap();
+        host.import_rows(&image, 2207, &device).unwrap();
         assert_eq!(cached.blocks_ready(), 0, "an import trusts no cached key");
         run(
             &ix,
             &mut classic,
             &mut cached,
+            &mut host,
             &step(14),
             2207,
             "post-import step",
         );
         assert_eq!(cached.blocks_ready(), 2208 / RATIO);
+    }
+
+    /// A minimal indexer whose only job is to own `budget` and `ratio` for
+    /// `top_blocks` / `expand_into` — the host side of the selection.
+    fn selector(budget: usize, ratio: usize, device: &Device) -> QsaIndexer {
+        let (heads, hd, hidden) = (1usize, 8usize, 8usize);
+        let rope = Arc::new(
+            Rope::new(
+                &RopeKind::Plain {
+                    freq_base: THETA,
+                    n_rot: 4,
+                },
+                64,
+                device,
+            )
+            .unwrap(),
+        );
+        QsaIndexer::from_tensors(
+            Tensor::zeros((heads * hd, hidden), DType::F32, device).unwrap(),
+            Tensor::zeros((hd, hidden), DType::F32, device).unwrap(),
+            Tensor::ones(hd, DType::F32, device).unwrap(),
+            Tensor::ones(hd, DType::F32, device).unwrap(),
+            rope,
+            heads,
+            hd,
+            budget,
+            ratio,
+            EPS,
+        )
+        .unwrap()
+    }
+
+    /// The host selection for one query at position `pos` over `scores`:
+    /// `top_blocks` then `expand_into`, exactly as `select_with`'s host arm
+    /// runs them.
+    fn host_rows(ix: &QsaIndexer, scores: &[f32], nb: usize, pos: usize) -> Vec<u32> {
+        let sets = ix.top_blocks(scores, 1, nb, pos);
+        let mut rows = Vec::new();
+        ix.expand_into(&sets[0], pos, &mut rows);
+        rows
+    }
+
+    /// The device selection for the same query.
+    fn device_rows(
+        scores: &[f32],
+        keep: usize,
+        ratio: usize,
+        tail: usize,
+        device: &Device,
+    ) -> Vec<u32> {
+        let t = Tensor::from_vec(scores.to_vec(), scores.len(), device).unwrap();
+        crate::ops::qsa_select::select_rows(&t, keep, ratio, tail)
+            .unwrap()
+            .to_vec1::<u32>()
+            .unwrap()
+    }
+
+    /// Scores the way long context produces them: a few distinct values with
+    /// exact 0.0 the most common by far, plus the two things the key
+    /// canonicalization has to get right — `-0.0` (equal to 0.0, and the
+    /// host's `partial_cmp` says so) and denormals (above 0.0, below
+    /// everything else, and monotone in their bit pattern).
+    fn tied_scores(seed: u64, nb: usize) -> Vec<f32> {
+        rand(seed, nb, 0.0, 1.0)
+            .into_iter()
+            .map(|u| match (u * 16.0) as u32 {
+                0..=6 => 0.0,
+                7 => -0.0,
+                8 => 1e-40,
+                9 => 1e-41,
+                10 => 0.5,
+                11 => 0.5,
+                12 => 1.0,
+                13 => 2.0,
+                14 => 7.25,
+                _ => 3.0e5,
+            })
+            .collect()
+    }
+
+    /// `kernel_qsa_select` produces exactly the rows `top_blocks` +
+    /// `expand_into` produce, over a sweep of block counts (one block, a
+    /// partial stripe, exactly and either side of the 512 the shipped budget
+    /// keeps, and the 65536 blocks of a full-context stripe), keep counts
+    /// (one, half, the shipped 512, everything), tail lengths, and scores with
+    /// many exact ties — the tie rule is the load-bearing part.
+    #[test]
+    fn device_select_matches_host_top_blocks_bitwise() {
+        let device = metal_device().unwrap();
+        for &nb in &[1usize, 5, 100, 511, 512, 513, 2000, 65536] {
+            let mut keeps = vec![1, nb / 2, 512, nb];
+            keeps.retain(|&k| k >= 1 && k <= nb);
+            keeps.dedup();
+            for &keep in &keeps {
+                let ix = selector(keep * RATIO, RATIO, &device);
+                for tail in 0..RATIO {
+                    let pos = nb * RATIO + tail - 1;
+                    for (kind, scores) in [
+                        ("tied", tied_scores(0x600 + nb as u64, nb)),
+                        ("continuous", rand(0x700 + nb as u64, nb, 0.0, 4.0)),
+                    ] {
+                        let want = host_rows(&ix, &scores, nb, pos);
+                        let got = device_rows(&scores, keep, RATIO, tail, &device);
+                        assert_eq!(want.len(), keep * RATIO + tail);
+                        assert_eq!(got, want, "nb {nb} keep {keep} tail {tail} {kind}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scores outside the contract — NaN, negative — still select the same
+    /// rows on both arms, because both rank through one `score_key` (a NaN
+    /// or a negative keys as 0, a tie with every zero-scored block).
+    #[test]
+    fn device_select_matches_host_on_nan_and_negative_scores() {
+        let device = metal_device().unwrap();
+        let nb = 3000;
+        let mut scores = rand(0x900, nb, -2.0, 2.0);
+        for (i, s) in scores.iter_mut().enumerate() {
+            match i % 7 {
+                0 => *s = f32::NAN,
+                1 => *s = -f32::NAN,
+                2 => *s = 0.0,
+                3 => *s = -0.0,
+                _ => {}
+            }
+        }
+        for &keep in &[1usize, 700, 1500, 2999] {
+            let ix = selector(keep * RATIO, RATIO, &device);
+            let want = host_rows(&ix, &scores, nb, nb * RATIO + 1);
+            let got = device_rows(&scores, keep, RATIO, 2, &device);
+            assert_eq!(got, want, "keep {keep}");
+        }
+    }
+
+    /// The equal-to-threshold quota spans many threads' stripes: every score
+    /// equal, so the threshold is that value and `need_eq` is the whole keep,
+    /// which the ranks scanned across the threadgroup must hand to the LOWEST
+    /// block indices; and a two-value case where the quota is filled from a
+    /// tie scattered across the stripes above a band that is kept outright.
+    #[test]
+    fn device_select_tie_quota_spans_stripes() {
+        let device = metal_device().unwrap();
+        // 4096 blocks over 1024 threads: four per stripe, the 2000 kept
+        // blocks come out of 500 stripes.
+        let nb = 4096;
+        let flat = vec![1.0f32; nb];
+        let ix = selector(2000 * RATIO, RATIO, &device);
+        let got = device_rows(&flat, 2000, RATIO, 2, &device);
+        assert_eq!(got, host_rows(&ix, &flat, nb, nb * RATIO + 1));
+        let want: Vec<u32> = (0..2000 * RATIO as u32).chain([16384, 16385]).collect();
+        assert_eq!(
+            got, want,
+            "all-equal: the lowest 2000 blocks, then the tail"
+        );
+
+        // All zero at the widest stripe: 65536 blocks, keep 512 = 8 stripes.
+        let nb = 65536;
+        let zeros = vec![0.0f32; nb];
+        let ix = selector(512 * RATIO, RATIO, &device);
+        let got = device_rows(&zeros, 512, RATIO, 0, &device);
+        assert_eq!(got, host_rows(&ix, &zeros, nb, nb * RATIO - 1));
+        assert_eq!(got, (0..512 * RATIO as u32).collect::<Vec<u32>>());
+
+        // 3000 blocks at 2.0 scattered among 1.0s, keep 3500: every 2.0 and
+        // the first 500 of the 1.0s, in index order.
+        let nb = 8000;
+        let u = rand(0x800, nb, 0.0, 1.0);
+        let mut two = 0;
+        let mixed: Vec<f32> = u
+            .iter()
+            .map(|&x| {
+                if x < 0.375 && two < 3000 {
+                    two += 1;
+                    2.0
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        assert_eq!(two, 3000);
+        let ix = selector(3500 * RATIO, RATIO, &device);
+        let got = device_rows(&mixed, 3500, RATIO, 3, &device);
+        assert_eq!(got, host_rows(&ix, &mixed, nb, nb * RATIO + 2));
+        let mut ones_kept = 0;
+        let blocks: Vec<usize> = got[..3500 * RATIO]
+            .chunks(RATIO)
+            .map(|c| c[0] as usize / RATIO)
+            .collect();
+        for &b in &blocks {
+            if mixed[b] == 1.0 {
+                ones_kept += 1;
+            }
+        }
+        assert_eq!(ones_kept, 500);
+        let first_one_rejected = (0..nb).filter(|&b| mixed[b] == 1.0).nth(500).unwrap();
+        assert!(
+            blocks
+                .iter()
+                .all(|&b| mixed[b] == 2.0 || b < first_one_rejected),
+            "the kept 1.0 blocks are the 500 lowest-indexed ones"
+        );
     }
 
     /// `strided_sum` reproduces candle's strided reduce bit for bit at the two

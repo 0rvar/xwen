@@ -14,6 +14,7 @@ pub mod mv_id;
 mod pipelines;
 pub mod q8;
 pub mod qsa_gather;
+pub mod qsa_select;
 pub mod silu_mul;
 
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
@@ -521,6 +522,23 @@ pub fn hc_classic() -> bool {
 pub fn qsa_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_QSA_CLASSIC").is_some())
+}
+
+/// Kill switch (`XWEN_QSA_HOST_TOPK`) for the QSA indexer's device-side block
+/// selection at decode (`ops::qsa_select`, `kernel_qsa_select`): set, a
+/// single-token `QsaIndexer::select` above budget reads the block scores back
+/// to the host and runs `top_blocks` + `expand_into` there, as every decode
+/// step did before the kernel — one pipeline drain per QSA layer per step.
+/// Both arms produce the SAME ROWS by construction (the kernel implements the
+/// host's total order over the score bits;
+/// `device_select_matches_host_top_blocks_bitwise`), so this is a fallback,
+/// never a parity row. `XWEN_QSA_CLASSIC` implies it.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches: any value
+/// enables it — only leaving it unset keeps the device path.
+pub fn qsa_host_topk() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_QSA_HOST_TOPK").is_some())
 }
 
 /// Token count the carrier's grouped norm must be BELOW for `ops::hc_norm` to
