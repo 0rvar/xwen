@@ -2458,6 +2458,16 @@ A/B named four things it did not take.
   quarter-empty one; a 16-row tile would waste less of the second tile and lets the
   1024 chunk (~20 rows) stop paying for a half-empty tile too. Untested; the win, if
   any, is bounded by the expert gemm's share of prefill, so profile that share first.
+  **REFUTED by a code read, 2026-08-30, before any bench**: the `_t` kernel dequantizes
+  the expert's whole weight tile once per TOKEN tile (mm_id.metal ~590-625, indexed by
+  expert and out-row only), and it is dequant-bound, so passes per expert =
+  ceil(rows/NR1) and a narrower tile RAISES the dominant cost (Flash-Next 1.88 → 2.97
+  passes; 35B 2.5 → 4.5). The lever runs the other way — NR1 64 (1.0 / 1.5 passes,
+  +6% / +20% MMA slots, 16 KB smem) — and the larger waste is the grid: sized for one
+  expert owning every row, ~97% of launched threadgroups early-return at the 2048 chunk
+  (down: 1,310,720 launched, 40,960 useful). Both are being implemented as a work-list
+  grid (map0 emits (expert, tile) pairs; host bound ceil(t*top_k/NR1)+n_expert, no
+  readback) plus a templated NR1 64 on the `_t` family, each behind a switch.
 - [ ] **Route the hyper-connection and shared-expert gemms onto `dense_mm`.** The P8c
   gemm (`src/ops/dense_mm.metal`) was 2.2-2.7x on the 27B's dense FFN; whether the
   Flash-Next hc mix and the `shexp` gemms take it at prefill today has not been checked,
