@@ -1620,9 +1620,10 @@ mod tests {
         assert_eq!(s.top_p, None);
         assert_eq!(s.cache_snapshots, DEFAULT_CACHE_SNAPSHOTS);
         assert_eq!(s.cache_slots, DEFAULT_CACHE_SLOTS);
-        // The disk tier is on, budgeted, and lives under $HOME unless told
-        // otherwise.
-        assert!(s.disk_cache);
+        // The disk tier is opt-in (SSD wear is the operator's call); when
+        // turned on it is budgeted and lives under $HOME unless told otherwise.
+        assert_eq!(s.disk_cache, DEFAULT_DISK_CACHE);
+        assert!(!s.disk_cache);
         assert_eq!(s.cache_dir, default_cache_dir());
         assert_eq!(s.disk_max_gib, DEFAULT_DISK_MAX_GIB);
         assert_eq!(s.disk_min_tokens, DEFAULT_DISK_MIN_TOKENS);
