@@ -2001,6 +2001,39 @@ Decision: we WILL port it, targeting Q4_K on this machine.
   - **2026-08-29 — P3 perf ledger for Flash-Next (everything deferred from P2).**
     P2 was correctness-first by decision (decisions.md), so every one of these is
     a known cost taken deliberately, not a discovery.
+    **Gain estimates for what remains (2026-08-30, from the floor-corrected
+    decode attribution at 6fbc7e8: 22.66 ms/token = 44.1 tok/s; mixer_delta
+    10.8 ms / 39%, ffn 7.9 / 28%, ple 1.1-3.8, mixer_full_attn 2.3, hc reads
+    1.9, lm_head 1.2, hc writes / qsa_select / embed under the profiler floor).
+    These are attributions and byte counts, NOT measurements of the fixes;
+    peak bandwidth has never been measured on this machine, so every ceiling
+    below is against the nominal figure and may be optimistic.**
+    (5) PLE readback collapse (three `to_vec1` → one): saves ~0.3 of the
+    0.52 ms readback → **+0.5-0.7 tok/s**; PLE gate/conv/readback all on
+    device (proj stays): PLE 1.06 → ~0.45 ms → **+1.2 tok/s decode, +5-6%
+    prefill (~40 ms of host gate+conv per 512-token chunk, ~+45 tok/s)**; if
+    the stack profiler's 3.75 ms `ple` charge is real (it brackets the hash
+    and the carrier add the sub-step timer does not; unreconciled), the upside
+    is **up to +6 tok/s**. (1a) vendored `mv_id` Q5_1 arm: the down plane is
+    ~40% of the ~1.5 GB of expert bytes per token; a 1.2-1.5x kernel over
+    candle's baked one on ~3 ms → **+1-2 tok/s**; (1c) per-stack `use_mm` is
+    prefill-only and now moot on this file. (3) hc decode gemv through xwen's
+    vendored mv path instead of candle `QMatMul` (0.7 GB/token, floor ~1.2 ms
+    against 1.9 measured for the whole read) → **+0-1.2 tok/s**; in-place
+    `hc_write` is under the floor → **~0**. (10) bimodal decode (42 vs 44):
+    **+0-1 tok/s at the median** if the fast mode can be held. NOT YET
+    LEDGERED and the largest by far: (14) `mixer_delta` — 36 GDN layers at
+    10.8 ms/token against a projection byte floor of ~2.1 GB/token (attn_qkv +
+    attn_gate + ssm_out, Q8_0) ≈ 3.5-4 ms at nominal bandwidth plus ~0.4 ms
+    of delta-state traffic → **up to +11-15 tok/s** if the layer reached
+    bandwidth, which needs a per-op breakdown of the stage first (projections
+    vs conv vs delta step vs gnorm; no number exists); (15) MoE decode
+    efficiency — `ffn` moves ~1.5 GB/token in 7.9 ms (≈190 GB/s effective,
+    the same rate the 35B-A3B shows), so routing glue and dispatch count, not
+    bytes, are the cost → **+3-8 tok/s** plausible, shared with the shipped
+    checkpoints. Whole-token byte floor ≈ 5.5 GB (experts 1.5, GDN 2.1, attn
+    0.6, hc 0.7, lm_head 0.6) ≈ 9 ms at nominal → a ceiling near 100-110
+    tok/s that nobody should quote as reachable; llama.cpp sits at 41.
     **STATUS after P3's first pass (2026-08-29): (1) partly, (2), (3) and (6)
     done; (4), (5), (8) untouched; (7) closed earlier; (9) retired; (10)-(13)
     added.** In rough order of expected
