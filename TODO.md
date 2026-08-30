@@ -2484,5 +2484,10 @@ A/B named four things it did not take.
   Fix, in order: cache the pooled+normed+roped key per FULL block (immutable once the
   block is complete; only the tail block is recomputed per step), which kills (1) and
   (3); then a device-side top-k or fused score+select writing row indices, which kills
-  (2). Bench at 2k/4k/16k/32k. The shipped checkpoints have no indexer and are
-  unaffected. No runtime QSA kill switch exists (`force_dense_qsa` is cfg(test)).
+  (2). Bench at 2k/4k/16k/32k. Stack profile (attribution only, sync-inflated) puts the
+  +13.3 ms/token growth at 1919 → 3810 in three stages: `qsa_select` +5.0 ms,
+  `mixer_full_attn` +4.5 ms (the gather path — 24 `index_select` dispatches plus a
+  `stack` per layer, attention.rs:702-713, which only runs above the budget; capped is
+  not cheap) and `ple` +3.2 ms (unexplained, possibly bleed from the adjacent syncs), so
+  the fix also needs a single-dispatch gather (or attention reading the row list
+  directly). The shipped checkpoints have no indexer and are unaffected. No runtime QSA kill switch exists (`force_dense_qsa` is cfg(test)).
