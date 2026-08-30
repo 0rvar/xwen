@@ -3322,17 +3322,38 @@ pub(crate) fn run_delta_ba(
     ))
 }
 
+/// The kernel `run_delta_ba_fused` dispatches for a chunk of `seq` tokens, and
+/// the tokens its threadgroup tiles. One token per threadgroup at decode, where
+/// the tile clamp folds away. The predicate below asks the same question, so
+/// both sides name the same pipeline.
+fn delta_ba_fused_kernel(seq: usize) -> (&'static str, usize) {
+    if seq == 1 {
+        ("kernel_delta_ba_fused_t1", 1)
+    } else {
+        ("kernel_delta_ba_fused_t4", DELTA_BA_TOKS)
+    }
+}
+
 /// Whether `run_delta_ba_fused` can serve this pair — the predicate the block
 /// consults before choosing between the fused kernel and the candle gemv plus
-/// `kernel_delta_ba`. Everything it checks is a geometry or layout fact the
-/// kernel's grid depends on, so a `false` here is "take the other path", never
-/// an error.
+/// `kernel_delta_ba`. Everything it checks is a geometry, layout or device
+/// capability fact the kernel's grid depends on, so a `false` here is "take the
+/// other path", never an error.
+///
+/// The capability half is the pipeline's own threadgroup limit: the grid is a
+/// fixed `DELTA_BA_COLS * DELTA_BA_ROWS` threads wide, so a device that derates
+/// this pipeline below that cannot run it at any geometry. It is checked HERE
+/// rather than at the dispatch fork precisely because a derated device must
+/// fall back rather than fail (the dispatch keeps the same check as a
+/// defensive bail).
 pub(crate) fn delta_ba_fused_applies(x: &Tensor, w: &Tensor) -> bool {
     let (Ok((seq, hidden)), Ok((w_rows, two_vh))) = (x.dims2(), w.dims2()) else {
         return false;
     };
-    x.device().is_metal()
-        && x.device().same_device(w.device())
+    let Device::Metal(mdev) = x.device() else {
+        return false;
+    };
+    let geometry = x.device().same_device(w.device())
         && x.dtype() == DType::F32
         && w.dtype() == DType::F32
         && x.is_contiguous()
@@ -3342,7 +3363,13 @@ pub(crate) fn delta_ba_fused_applies(x: &Tensor, w: &Tensor) -> bool {
         && two_vh / 2 <= DELTA_BA_MAX_V_HEADS
         && two_vh >= 2
         && (1..=DELTA_BA_MAX_SEQ).contains(&seq)
-        && (1..=DELTA_BA_MAX_HIDDEN).contains(&hidden)
+        && (1..=DELTA_BA_MAX_HIDDEN).contains(&hidden);
+    if !geometry {
+        return false;
+    }
+    let (kernel, _) = delta_ba_fused_kernel(seq);
+    pipelines::delta_max_threads(mdev.device(), kernel)
+        .is_ok_and(|limit| limit >= DELTA_BA_COLS * DELTA_BA_ROWS)
 }
 
 /// The beta|alpha PROJECTION and the beta/decay head in ONE dispatch, against
@@ -3415,14 +3442,12 @@ pub(crate) fn run_delta_ba_fused(
     glue_index_fits_i32(checked_elems(&[hidden, two_vh], "delta_ba_fused weight")?)?;
     glue_index_fits_i32(checked_elems(&[seq, hidden], "delta_ba_fused input")?)?;
 
-    // One token per threadgroup at decode, where the tile clamp folds away.
-    let (kernel, toks) = if seq == 1 {
-        ("kernel_delta_ba_fused_t1", 1)
-    } else {
-        ("kernel_delta_ba_fused_t4", DELTA_BA_TOKS)
-    };
+    let (kernel, toks) = delta_ba_fused_kernel(seq);
     let pipeline = pipelines::delta_pipeline(mdev.device(), kernel)?;
     let width = DELTA_BA_COLS * DELTA_BA_ROWS;
+    // Defensive: `delta_ba_fused_applies` has already refused a device that
+    // derates this pipeline, so a caller reaching here on one skipped the
+    // predicate rather than being told to fall back.
     if pipeline.max_total_threads_per_threadgroup() < width {
         bail!(
             "{kernel} needs {width} threads per threadgroup, the pipeline allows {}",

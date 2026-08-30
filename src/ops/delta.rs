@@ -332,6 +332,19 @@ mod tests {
     /// confused the two axes fails on at least one.
     const BA_GEOMETRIES: [(usize, usize); 3] = [(5120, 48), (2048, 32), (2560, 48)];
 
+    /// A `(hidden, v_heads)` pair that takes BOTH of the kernel's tail
+    /// branches, which no shipped geometry does: every one of those has
+    /// `2 * v_heads` a multiple of `DELTA_BA_COLS` (so the column guard
+    /// `col < two_vh` never fires) and `hidden` a multiple of
+    /// `DELTA_BA_ROWS` (so the strided row walk never stops a thread short of
+    /// the others). 12 columns leaves the second threadgroup four lanes idle
+    /// and 2000 rows leaves 80 of the 128 row chunks one iteration shorter, so
+    /// a guard dropped from either loop shows up as garbage in the columns or
+    /// the partials past the end. Not a shape any Qwen checkpoint has — the
+    /// kernel is offered to whatever custom GGUF fits its ceilings, which is
+    /// what makes the tails reachable in the first place.
+    const BA_TAIL_GEOMETRY: (usize, usize) = (2000, 6);
+
     /// The gemv + `delta_ba` chain the fused projection replaces, run through
     /// candle exactly as `forward_fused` runs it off the fused path.
     fn reference_ba_chain(
@@ -377,7 +390,9 @@ mod tests {
     /// + `delta_ba` chain it replaces, at every shipped geometry and every
     /// token-tiling class the kernel distinguishes: one token (the `_t1`
     /// specialization), a chunk that straddles a tile boundary, an exact tile,
-    /// and the largest chunk the host will hand it.
+    /// and the largest chunk the host will hand it. `BA_TAIL_GEOMETRY` runs the
+    /// short token counts again at a width and depth that fire the column and
+    /// row tail guards no shipped geometry reaches.
     ///
     /// NOT bit-identity, deliberately: the kernel sums each dot product as
     /// `DELTA_BA_ROWS` per-thread partials folded in a tree where candle's gemv
@@ -392,14 +407,20 @@ mod tests {
     #[test]
     fn ba_fused_matches_the_gemv_chain() {
         let device = metal_device().unwrap();
-        for (gi, &(hidden, v_heads)) in BA_GEOMETRIES.iter().enumerate() {
-            for &seq in &[1usize, 3, 4, 5, 16, dispatch::DELTA_BA_MAX_SEQ] {
+        let shipped_seqs: &[usize] = &[1, 3, 4, 5, 16, dispatch::DELTA_BA_MAX_SEQ];
+        let tail_seqs: &[usize] = &[1, 3, 5];
+        let cases = BA_GEOMETRIES
+            .iter()
+            .map(|&g| (g, shipped_seqs))
+            .chain(std::iter::once((BA_TAIL_GEOMETRY, tail_seqs)));
+        for (gi, ((hidden, v_heads), seqs)) in cases.enumerate() {
+            for &seq in seqs {
                 let seed = 0x2600 + gi as u64 * 401 + seq as u64;
                 let (x, w, ssm_a, dt_bias) = ba_operands(hidden, v_heads, seq, seed, &device);
 
                 assert!(
                     crate::ops::delta_ba_fused_applies(&x, &w),
-                    "hidden={hidden} v={v_heads} seq={seq} is a shipped geometry"
+                    "hidden={hidden} v={v_heads} seq={seq} is inside the kernel's ceilings"
                 );
                 let (beta, g) = delta_ba_fused(&x, &w, &ssm_a, &dt_bias).unwrap();
                 let (want_beta, want_g) = reference_ba_chain(&x, &w, &ssm_a, &dt_bias);

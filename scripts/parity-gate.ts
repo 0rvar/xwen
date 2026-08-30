@@ -222,9 +222,9 @@ function die(msg: string): never {
  *
  * A toggle missing from this list is not a loud failure: it would apply to BOTH
  * sides and the gate would pass while grading a kernel nobody asked for. Add new
- * switches here as they land — `XWEN_DELTA_SCAN_V2` and
- * `XWEN_DELTA_DECODE_KERNEL` are the ones with no provenance field of their
- * own, so stripping them is the only guard.
+ * switches here as they land — `XWEN_DELTA_SCAN_V2`,
+ * `XWEN_DELTA_DECODE_KERNEL` and `XWEN_DELTA_BA_CLASSIC` are the ones with no
+ * provenance field of their own, so stripping them is the only guard.
  *
  * `XWEN_STACK_PROFILE`, `XWEN_PLE_PROFILE` and `XWEN_CHUNK_SYNC` are stripped for a different
  * reason: neither changes any arithmetic, but both insert device syncs into the

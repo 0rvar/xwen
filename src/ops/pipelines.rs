@@ -146,6 +146,14 @@ struct Cache {
     /// Pipelines keyed by (device registry id, function name). Function names
     /// are unique across our sources, so the source key is not part of the key.
     pipelines: HashMap<(u64, String), ComputePipeline>,
+    /// `max_total_threads_per_threadgroup` per (device registry id, function
+    /// name) — what a DISPATCH PREDICATE needs to know before it commits to a
+    /// kernel, so a device that derates a pipeline below the width its grid
+    /// assumes is a "take the other path", not an error at encode time. Kept
+    /// beside the pipelines rather than read off one per call: the predicates
+    /// run per layer per token at decode, and this is a map lookup where
+    /// cloning the pipeline to ask it would be an ObjC round trip.
+    max_threads: HashMap<(u64, String), usize>,
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -154,6 +162,7 @@ fn cache() -> &'static Mutex<Cache> {
         Mutex::new(Cache {
             libraries: HashMap::new(),
             pipelines: HashMap::new(),
+            max_threads: HashMap::new(),
         })
     })
 }
@@ -312,6 +321,26 @@ pub(crate) fn flash_pipeline(device: &Device, name: &str) -> Result<ComputePipel
 /// Pipeline for a `delta.metal` kernel (vendored fused gated-DeltaNet ops).
 pub(crate) fn delta_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, DELTA_SOURCE, "delta", name)
+}
+
+/// The threadgroup width `name`'s pipeline admits on `device`, compiling it on
+/// first ask and caching the number thereafter.
+///
+/// For the predicates that must decide BEFORE the dispatch whether a fused
+/// delta kernel can run at all: a pipeline whose register pressure derates it
+/// below the width its grid assumes has to route the block to the fallback
+/// path, and a predicate cannot report an error. An `Err` here is a compile or
+/// lookup failure, which the caller reads the same way — this kernel is not
+/// available — while every other delta dispatch reports it loudly.
+pub(crate) fn delta_max_threads(device: &Device, name: &str) -> Result<usize> {
+    let key = (device.registry_id(), name.to_string());
+    if let Some(&width) = cache().lock().unwrap().max_threads.get(&key) {
+        return Ok(width);
+    }
+    // Built outside the lock: `delta_pipeline` takes it itself.
+    let width = delta_pipeline(device, name)?.max_total_threads_per_threadgroup();
+    cache().lock().unwrap().max_threads.insert(key, width);
+    Ok(width)
 }
 
 /// Pipeline for an `hc.metal` kernel (vendored fused hyper-connection gates).

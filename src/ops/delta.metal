@@ -63,11 +63,13 @@
 //   - kernel_delta_l2norm is the same story for the q/k norm: the ops match
 //     `linear_attn::l2_norm` one for one (sum of squares, sqrt, floor at eps,
 //     divide) and only the 128-term sum reassociates. Its test grades at 2e-6.
-//   - kernel_delta_scan_decode is the same story at seq == 1: same per-thread
-//     arithmetic in the same order as kernel_delta_scan, with the cross-thread
-//     fold reassociated once more (a simd_shuffle_xor butterfly over the row
-//     slices, then the simdgroup partials). Graded at 1e-5 against both the
-//     general kernel and the reference.
+//   - kernel_delta_scan_decode is the same story at seq == 1: the same
+//     operations on the same operands as kernel_delta_scan, split a different
+//     way — a thread folds 8 state rows where the general kernel folds 32, and
+//     the partials meet through a simd_shuffle_xor butterfly and then the
+//     simdgroup partials. Both the per-thread sums and the fold order differ,
+//     so it is not bitwise against the general kernel either. Graded at 1e-5
+//     against both it and the reference.
 //   - kernel_delta_scan partitions the k- and q-contractions across threads and
 //     folds them through threadgroup memory, where the reference runs a candle
 //     gemm. It deliberately does NOT carry the fp pragmas — its two inner loops
@@ -772,9 +774,14 @@ static_assert(32 % DELTA_DEC_LANES == 0,
 // per-simdgroup partials. The q/k L2 clamp-norm is computed once per
 // threadgroup, one thread per head dim, and broadcast through `qn`/`kn`.
 //
-// Arithmetic is the general kernel's, in the same order per thread; only the
-// cross-thread fold reassociates, so this is bounded against the reference in
-// exactly the class kernel_delta_scan already sits in (docs/parity.md).
+// Every arithmetic operation is the general kernel's, on the same operands, but
+// the PARTITION is not: a thread folds DELTA_DEC_SLICE state rows here against
+// the general kernel's DELTA_S_SLICE, and the partials meet through a
+// simd_shuffle_xor tree rather than a pass over part[][]. So both the per-thread
+// sums and the order they combine in differ, and this is not bit-identical to
+// kernel_delta_scan at seq == 1 — it reassociates the same 128-term reductions
+// a different way, which leaves it bounded against the reference in exactly the
+// class kernel_delta_scan already sits in (docs/parity.md).
 kernel void kernel_delta_scan_decode(
         constant delta_scan_args & args [[buffer(0)]],
         device const float  * conv  [[buffer(1)]],
