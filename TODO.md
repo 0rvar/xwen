@@ -2135,7 +2135,11 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     at all and there are no fixtures for it. Low priority precisely because the run
     fails either way; fix by gating the gate's accepted set on fixture existence.
     Same entry: its **`shards` key is dead** — nothing reads it, the loader finds
-    the shard set from any one file. Delete it or make it load-bearing. **(13) NEW
+    the shard set from any one file. Delete it or make it load-bearing.
+    **RESOLVED 2026-08-30: made load-bearing.** `officialModel` checked shard 1
+    only, so an interrupted 111 GB fetch resolved as a cache hit and then failed
+    deep inside the load; it now requires every entry in `shards` and names the
+    missing ones. The parity-gate half of this item is untouched and still open. **(13) NEW
     2026-08-29 — two review-noted low items in the fused hc path, knowingly not
     fixed.** `n == 0` is not bailed on in every fused entry point — no zero-token
     forward is reachable from the stack today, so this is defensive only. And the
@@ -2161,7 +2165,24 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     default moved. Closing this item makes `default_servable()` return
     `default()` and retires both the fallback and its line, so P4's definition of
     done now includes deleting them (the hub test asserts the two converge once
-    the default is servable). A qwen4exp
+    the default is servable).
+    **2026-08-30 second annotation: `xwen batch` IS IN THE SAME BOAT and is
+    gated with serve.** It was ledgered as a mode that could run the checkpoint;
+    it cannot. A batch prefills the items' shared prefix once and takes a cache
+    snapshot there (`batch.rs` `run_batch`), and an enum-scored field snapshots
+    and restores around every option it scores (`score_field`) — both
+    `refuse_state_transfer` on qwen4exp, so a zero-flag batch would have failed
+    after a 111 GB download and a full prefill. Until this item closes,
+    `BatchRequest::model()` resolves an absent `"model"` to
+    `Model::default_servable()` (with serve's own fallback line on stderr) and
+    refuses a payload naming Flash-Next up front (`Model::unbatchable_message`).
+    `XWEN_BATCH_NO_CACHE` is NOT a way around it: it skips the shared prefix and
+    leaves the per-option snapshots. So closing this item also retires batch's
+    fallback and its refusal, and `Model::servable()` — which now gates both
+    surfaces — becomes true in one place for both. The narrower fix, if P4 slips,
+    is teaching batch to run without either snapshot (cold items, and scored
+    fields re-prefilled from the item's own prefix), which costs the prefill dedup
+    that is the whole point of the mode. A qwen4exp
     target would 500 on the snapshot path, because prefix-cache
     snapshots, host snapshots and the disk tier do not carry the new recurrent
     state (indexer raw-key caches, PLE conv window, the 2-id token history) — D15

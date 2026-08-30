@@ -4,6 +4,60 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-30 (same day, follow-up) — `xwen batch` was never able to run the new default; it now shares serve's fallback, and a `--model` file identifies itself on the one-shot path
+
+Review of the default move found two holes in it.
+
+**`xwen batch` cannot run qwen4exp, and the default move pointed it straight at it.**
+The entry above lists `batch` among the modes that "can run it". They cannot: batch
+prefills the items' shared prefix once and takes a cache snapshot there
+(`batch.rs:515`), and an enum-scored field snapshots and restores around every option it
+scores (`batch.rs:1518`/`:1527`). Both are `XwenModel::refuse_state_transfer` on
+qwen4exp, for the same reason serve is refused. So a zero-flag `xwen batch` would have
+downloaded 111 GB, loaded it, prefilled, and failed at the first snapshot with a message
+about cache images. `XWEN_BATCH_NO_CACHE` is not an escape hatch either: it skips the
+shared prefix and leaves the per-option snapshots, so it works right up until a schema
+has an enum in it, which is worse than not working.
+
+`BatchRequest::model()` now resolves an absent `"model"` to `Model::default_servable()`,
+the same fallback serve uses, and refuses `Qwen3.8-Flash-Next` by name before the load.
+The CLI prints the fallback line on stderr when the payload named nothing, mirroring
+serve's. A hub test asserts the two defaults are the same checkpoint, so P4 cannot make
+one servable and leave the other behind.
+
+That made `Model::servable()` a predicate about two surfaces rather than one, and its doc
+said the opposite in as many words ("the CLI one-shots (`generate`, `chat`, `batch`) run
+the checkpoint fine"). Corrected, along with `hub.rs`'s `servable` doc and
+`batch.rs:210`. `unservable_reason()` lost its trailing serve clause and is now the model
+half only, so both refusals can quote it and add what they do with a cache image;
+`unbatchable_message()` is batch's. The serve line quoted in the entry below therefore
+reads slightly differently now. Neither message offers the other refused surface as the
+way out, which the single message did (it sent an operator to `xwen batch`), and a test
+pins that.
+
+**A custom GGUF on `generate`/`chat`/`batch` was silently taking the default family.**
+With `--model <gguf>` and no `--model-size`, the one-shots used `select.size()` for the
+chat dialect, the drafter and the label, which after the default move meant Flash-Next
+for any file at all. Serve has read this off the file since it started identifying
+checkpoints. The rule moved into `XwenConfig::identify` (returning `Identity::Official`
+or `Identity::Assumed`), `serve::engine::identify_checkpoint` became a thin mapping onto
+`Target`, and `one_shot_checkpoint` in main.rs is the CLI's caller. `--model-size` stays
+a cross-check that has to agree; a file that identifies as nothing still falls back to
+`Arch::model()` with a line. Batch reads the payload's `"model"` as that cross-check,
+since it has no size flag. The metadata open happens before the template knobs resolve
+and before `resolve_model` can download anything, so a contradicting flag fails in
+milliseconds.
+
+Two smaller ones. `scripts/hf.ts`'s `officialModel` checked shard 1 only, so an
+interrupted 111 GB fetch resolved as a cache hit and failed deep in the load; it now
+requires every entry in `shards` and names the missing ones, which is what that key was
+added for (TODO.md called it dead). And the README's model section still said "all
+Q4_K_M" (Flash-Next is UD-Q4_K_XL), called the checkpoint "CLI-ONLY" (it is
+`generate`/`chat` only), and claimed a status for "both checkpoints" from when there were
+two.
+
+998 lib tests and 5 bin tests pass.
+
 ## 2026-08-30 — Flash-Next becomes the default checkpoint; serve falls back to the 35B-A3B and says so
 
 `#[default]` on `hub::Model` moved from `Qwen35BA3B` to `Qwen38FlashNext`. Every mode

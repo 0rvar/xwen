@@ -2035,7 +2035,9 @@ warned about: they were useful for sizing the work and worthless as ground truth
 one of them was re-derived from `config.json`, the transformers modular file and the
 shipped GGUF headers before a line was written (2026-08-25, graded 2026-08-26).
 
-**Flash-Next is CLI-only until P4, by construction rather than by convention.**
+**Flash-Next is `generate`/`chat`-only until P4, by construction rather than by
+convention.** (Written as "CLI-only"; corrected 2026-08-30 — `xwen batch` is gated with
+serve, see the amendment below.)
 `Model::servable()` is false for this checkpoint, so `xwen serve` refuses it at startup
 — both the registry entry and a custom qwen4exp GGUF — never lists it, and 400s a
 request that names it. `Model::auto_fetch()` is false and `Model::supports_drafting()`
@@ -2072,6 +2074,39 @@ the operator's own zero-flag run — `ensure_model` fetches all four shards afte
 size notice every other checkpoint gets, and it resumes in place. Refusing to fetch the
 default would have made the default unusable, which is not a gate, it is a bug
 (2026-08-30).
+
+**AMENDED 2026-08-30 (same day): `xwen batch` is on serve's side of that line, not the
+one-shots'.** The entry above (and `Model::servable`'s own doc) counted `batch` among the
+modes that can run the default. It cannot: a batch prefills the items' shared prefix once
+and snapshots the cache there, and a scored field snapshots and restores around every
+option it scores, so it moves cache state on its ORDINARY path exactly as the server
+does. `servable()` therefore gates two surfaces, and both resolve an unnamed checkpoint
+through `default_servable()` — a hub test pins that the two agree, so P4 cannot free one
+and leave the other. An explicitly named `Qwen3.8-Flash-Next` is refused before the load,
+by the same rule and for the same reason serve refuses it.
+
+Two consequences worth writing down. `unservable_reason()` is now the MODEL's half of
+the reason only (what the state is and what carries it); each surface adds what it does
+with a cache image, because "the server snapshots, rewinds and pages conversations out"
+is false of batch and a shared reason that says it would be wrong on one of its two
+callers. And neither refusal offers the other refused surface as the way out, which the
+single message did — it sent an operator from serve to `xwen batch`. `XWEN_BATCH_NO_CACHE`
+is deliberately not offered as a way through: it skips the shared prefix and leaves the
+per-option snapshots, so it would be an escape hatch that works until the schema has an
+enum in it.
+
+**The FILE identifies the checkpoint on the one-shot path too, not just in serve.** With
+`--model <gguf>` and no `--model-size`, `generate`/`chat`/`batch` used the CLI default
+for the chat dialect, the drafter and the label, which after the default flip meant
+someone's 35B conversion was rendered with Flash-Next's template and offered Flash-Next's
+(nonexistent) drafter. Serve has read this off the file since it began identifying
+checkpoints, and the two surfaces disagreeing about what a file IS is not a defensible
+split. The rule now lives once, in `XwenConfig::identify`: the file first, `--model-size`
+(or, on batch, the payload's `"model"`) as a cross-check that must agree, and a file that
+identifies as nothing falling back to `Arch::model()` with a line. `serve::engine::
+identify_checkpoint` keeps only the mapping onto `Target` and the startup log, which is
+serve's own. The read is metadata-only and happens before the template knobs resolve, so
+a contradicting flag still fails in milliseconds rather than after the load (2026-08-30).
 
 **Space→hyphen folding applies to the exact-name comparison only.** The file calls
 itself "Qwen3.8 Flash Next" where the official name is `Qwen3.8-Flash-Next`, so

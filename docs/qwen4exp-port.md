@@ -1344,7 +1344,11 @@ GLUE, which is dispatch count rather than a gemm.
   is false, so `xwen serve` refuses at startup both for the registry entry and
   for a custom qwen4exp GGUF, the model is never listed, and a request naming it
   is a 400; `Model::auto_fetch()` is false; `Model::supports_drafting()` is false
-  so `--draft` is refused rather than silently ignored. Hardening and coverage:
+  so `--draft` is refused rather than silently ignored. (**Corrected 2026-08-30:**
+  "CLI-only" means `xwen generate` and `xwen chat`. `xwen batch` snapshots the
+  items' shared prefix and rescores fields off it, so it moves cache state on its
+  ordinary path exactly as serve does; `Model::servable()` gates both surfaces and
+  batch refuses this checkpoint the same way, with the same P4 exit.) Hardening and coverage:
   QSA overlay guards; **prefill masks are now one f16 plane broadcast across
   heads on ALL checkpoints** — a layout change only, ~800 MB/layer saved at 4k on
   the 27B (parity gate re-run at 643a411 to confirm no math moved: **all three

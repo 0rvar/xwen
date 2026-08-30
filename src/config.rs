@@ -52,6 +52,35 @@ pub enum Arch {
     Qwen4Exp,
 }
 
+/// What a GGUF file turned out to be, from [`XwenConfig::identify`].
+///
+/// Two variants rather than a bare `Model` because the two carry different
+/// authority and every surface reports them differently: one is what the file
+/// says it is, the other is a guess the caller has to admit to making. Serve
+/// also labels its API model id from the difference — an assumed file answers
+/// under its own file name, never under the checkpoint's, so a response cannot
+/// claim official weights ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Identity {
+    /// The file names an official checkpoint — or `--model-size` named one and
+    /// the file did not contradict it.
+    Official(crate::hub::Model),
+    /// Nothing names a checkpoint, so the architecture's registry entry is
+    /// assumed. Callers say so out loud: it decides the chat dialect and the
+    /// drafter, and on the dense architecture the two 27B releases are a
+    /// coin-flip.
+    Assumed(crate::hub::Model),
+}
+
+impl Identity {
+    /// The checkpoint either way, for the callers that only need to run it.
+    pub fn model(self) -> crate::hub::Model {
+        match self {
+            Identity::Official(model) | Identity::Assumed(model) => model,
+        }
+    }
+}
+
 /// Activation applied to the DeltaNet z-gate (`attn_gate`'s output) before the
 /// gated RMSNorm's final multiply. Resolved at construction — the block never
 /// branches per token — because swapping it yields a graph that runs and
@@ -241,6 +270,66 @@ impl XwenConfig {
     /// that must have an answer falls back to `arch.model()` and says so.
     pub fn checkpoint(&self, path: &std::path::Path) -> Option<crate::hub::Model> {
         crate::hub::Model::identify(self.arch, self.general_name.as_deref(), Some(path))
+    }
+
+    /// Which checkpoint to RUN this file as, cross-checked against an explicit
+    /// selection. The whole `--model <gguf>` rule in one place, because every
+    /// surface that opens a file someone named has to apply the same one: the
+    /// server, and the one-shot commands (`generate`, `chat`, `batch`), which
+    /// otherwise disagree about what a custom GGUF is and render it with a
+    /// different chat dialect than the server would.
+    ///
+    /// `selected` is a CROSS-CHECK, never an override. It must agree with a file
+    /// that identifies itself — disagreement about the architecture or about the
+    /// release is an error, not a silent reinterpretation — and it settles a file
+    /// that identifies as nothing, which is the only case where it decides
+    /// anything. A file that still says nothing falls back to the architecture's
+    /// registry entry as [`Identity::Assumed`], which every caller reports.
+    ///
+    /// `selector` is where that selection came from, for the error to name: it is
+    /// `--model-size` on every surface but `xwen batch`, which has no size flag
+    /// and takes the checkpoint from its payload instead.
+    pub fn identify(
+        &self,
+        path: &std::path::Path,
+        selected: Option<crate::hub::Model>,
+        selector: &str,
+    ) -> Result<Identity> {
+        let identified = self.checkpoint(path);
+        if let Some(selected) = selected {
+            ensure!(
+                self.arch == selected.arch(),
+                "{selected} (from {selector}) names a {} model, but {} holds a {} model",
+                selected.arch().key(),
+                path.display(),
+                self.arch.key()
+            );
+            if let Some(identified) = identified {
+                ensure!(
+                    identified == selected,
+                    "{selected} (from {selector}) contradicts {}, which says it is {}; drop it \
+                     to run what the file says it is",
+                    path.display(),
+                    identified.full_name()
+                );
+            }
+            // The file said nothing, so the flag settles it: an official
+            // checkpoint in a file the operator vouched for.
+            return Ok(Identity::Official(selected));
+        }
+        match identified {
+            Some(model) => Ok(Identity::Official(model)),
+            None => {
+                let assumed = self.arch.model().with_context(|| {
+                    format!(
+                        "{} names no official checkpoint and its architecture has no registry \
+                         checkpoint to assume; it cannot be run",
+                        path.display()
+                    )
+                })?;
+                Ok(Identity::Assumed(assumed))
+            }
+        }
     }
 
     pub fn is_full_attn(&self, il: usize) -> bool {
@@ -913,6 +1002,133 @@ mod tests {
         assert_eq!(cfg.conv_dim(), (2 * 16 + 32) * 128);
         assert_eq!(cfg.conv_dim(), 8192);
         assert_eq!(cfg.linear_v_dim(), 4096);
+    }
+
+    /// A config at the given architecture and `general.name`, for the
+    /// identification rules. Only those two fields and the path participate; the
+    /// geometry is filler.
+    fn named(arch: Arch, general_name: Option<&str>) -> XwenConfig {
+        XwenConfig {
+            arch,
+            general_name: general_name.map(str::to_string),
+            n_layer: 1,
+            hidden: 2048,
+            vocab: 248320,
+            n_head: vec![16],
+            n_kv_head: 2,
+            head_dim: 256,
+            layer_kind: vec![LayerKind::Linear],
+            linear_k_heads: 16,
+            linear_v_heads: 32,
+            linear_head_dim: 128,
+            conv_kernel: 4,
+            dense_ff: 0,
+            n_expert: 256,
+            n_expert_used: 8,
+            expert_ff: 512,
+            shared_expert_ff: 512,
+            rms_eps: 1e-6,
+            n_ctx_train: 262144,
+            rope: RopeKind::Plain {
+                freq_base: 1e7,
+                n_rot: 64,
+            },
+            eog_tokens: vec![248046, 248044],
+            qwen4exp: None,
+        }
+    }
+
+    /// A file someone points `--model` at decides which checkpoint it is, with
+    /// no `--model-size` in sight — and a custom conversion that names no
+    /// release still lands on its own ARCHITECTURE's checkpoint, not on whatever
+    /// the CLI's compile-time default happens to be.
+    ///
+    /// That last case is the one this rule exists for: the plain default is
+    /// qwen4exp, so before the file was consulted a custom MoE GGUF was rendered
+    /// with Flash-Next's chat dialect and offered Flash-Next's (nonexistent)
+    /// drafter, silently.
+    #[test]
+    fn a_named_file_identifies_itself_without_a_flag() {
+        let path = std::path::Path::new("/models/my-finetune-Q4_K_M.gguf");
+        assert_eq!(
+            named(Arch::Moe, Some("Qwen3.6-35B-A3B"))
+                .identify(path, None, "--model-size")
+                .unwrap(),
+            Identity::Official(crate::hub::Model::Qwen35BA3B)
+        );
+        // Nothing names a checkpoint: the architecture's registry entry is
+        // assumed, and `Assumed` is what makes every caller say so.
+        assert_eq!(
+            named(Arch::Moe, Some("my-finetune"))
+                .identify(path, None, "--model-size")
+                .unwrap(),
+            Identity::Assumed(crate::hub::Model::Qwen35BA3B)
+        );
+        // The file NAME answers when the metadata does not.
+        assert_eq!(
+            named(Arch::Moe, None)
+                .identify(
+                    std::path::Path::new("/models/Qwen3.6-35B-A3B-Q4_K_M.gguf"),
+                    None,
+                    "--model-size",
+                )
+                .unwrap(),
+            Identity::Official(crate::hub::Model::Qwen35BA3B)
+        );
+    }
+
+    /// `--model-size` is a cross-check, never an override: it settles a file
+    /// that says nothing, and contradicting one that does is a startup error
+    /// naming both sides rather than a silent reinterpretation of the weights.
+    #[test]
+    fn a_selection_that_contradicts_the_file_is_an_error() {
+        let path = std::path::Path::new("/models/custom.gguf");
+        let moe = named(Arch::Moe, Some("Qwen3.6-35B-A3B"));
+
+        // Right architecture, wrong release — the case the architecture check
+        // cannot catch, since the two 27B releases share the dense graph.
+        let err = named(Arch::Dense, Some("Qwen3.6-27B"))
+            .identify(path, Some(crate::hub::Model::Qwen3827B), "--model-size")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Qwen3.6-27B"), "{err}");
+        assert!(err.contains("3.8-27b"), "{err}");
+        assert!(err.contains("--model-size"), "{err}");
+
+        // Where the selection came from is the CALLER's word, because batch has
+        // no size flag and takes its checkpoint from the payload.
+        let err = named(Arch::Dense, Some("Qwen3.6-27B"))
+            .identify(
+                path,
+                Some(crate::hub::Model::Qwen3827B),
+                "the request's \"model\" field",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the request's \"model\" field"), "{err}");
+
+        // Wrong architecture, which no name can change: caught before the
+        // release check, and naming the two architectures.
+        let err = named(Arch::Dense, None)
+            .identify(path, Some(crate::hub::Model::Qwen35BA3B), "--model-size")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("qwen35moe") && err.contains("qwen35"), "{err}");
+
+        // The file says nothing, so the flag settles it — the one case where a
+        // selection decides anything.
+        assert_eq!(
+            named(Arch::Dense, Some("my-finetune"))
+                .identify(path, Some(crate::hub::Model::Qwen3827B), "--model-size")
+                .unwrap(),
+            Identity::Official(crate::hub::Model::Qwen3827B)
+        );
+        // Agreeing with the file is not a contradiction.
+        assert_eq!(
+            moe.identify(path, Some(crate::hub::Model::Qwen35BA3B), "--model-size")
+                .unwrap(),
+            Identity::Official(crate::hub::Model::Qwen35BA3B)
+        );
     }
 
     fn content(metadata: std::collections::HashMap<String, Value>) -> Content {

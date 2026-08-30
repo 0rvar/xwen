@@ -36,6 +36,13 @@
 //! item from a reset cache. It exists so replay can be A/B'd against scratch on
 //! the same request.
 //!
+//! Moving cache state is therefore ordinary here, not an optimization a target
+//! can opt out of — `XWEN_BATCH_NO_CACHE` skips only the shared prefix, while a
+//! scored field snapshots per option regardless. So a checkpoint whose state no
+//! cache image carries cannot run a batch at all, and
+//! [`BatchRequest::model`] refuses one up front rather than mid-run
+//! ([`Model::servable`], which gates this surface and `xwen serve` together).
+//!
 //! A schema may instead ask for its fields to be SCORED: annotate an enum or
 //! boolean property with `include_score` and that item stops free-decoding
 //! altogether. The runner writes the JSON itself — the structural skeleton is
@@ -209,17 +216,26 @@ pub enum ThinkingSpec {
 }
 
 impl BatchRequest {
-    /// The checkpoint this request names, or the default one when it names
-    /// none — the plain [`Model::default`], since `xwen batch` is a CLI
-    /// one-shot and runs every checkpoint including the unservable one. The
-    /// server's batch route resolves against the checkpoint it is SERVING
+    /// The checkpoint this request names, or the default one when it names none
+    /// — [`Model::default_servable`], the same zero-flag default `xwen serve`
+    /// resolves, and NOT the plain [`Model::default`]. Batch moves cache state
+    /// exactly as the server does: the shared prefix is snapshotted here and
+    /// every enum-scored field snapshots and restores around each option, all of
+    /// which a qwen4exp target refuses. So the unservable checkpoint is neither
+    /// this default nor a legal value of the field, and a request naming it is
+    /// refused HERE — before the caller's 20 GB load — rather than at the first
+    /// snapshot, mid-run, with a whole batch already prefilled.
+    ///
+    /// The server's batch route resolves against the checkpoint it is SERVING
     /// instead and rewrites the field before the runner sees it
     /// (`serve::batch`), so this default is never the answer there.
     pub fn model(&self) -> Result<Model> {
-        match &self.model {
-            Some(name) => name.parse().map_err(|e: String| anyhow!("batch: {e}")),
-            None => Ok(Model::default()),
-        }
+        let model = match &self.model {
+            Some(name) => name.parse().map_err(|e: String| anyhow!("batch: {e}"))?,
+            None => Model::default_servable(),
+        };
+        ensure!(model.servable(), "batch: {}", model.unbatchable_message());
+        Ok(model)
     }
 }
 
@@ -2513,7 +2529,10 @@ mod tests {
     #[test]
     fn the_model_comes_from_the_payload() {
         let mut request: BatchRequest = serde_json::from_str(r#"{ "items": [] }"#).unwrap();
-        assert_eq!(request.model().unwrap(), Model::default());
+        // Absent means the default a cache-moving surface can actually run,
+        // which is serve's too — not the plain CLI default, which batch snapshots
+        // its way out of running.
+        assert_eq!(request.model().unwrap(), Model::default_servable());
         request.model = Some("27b".into());
         assert_eq!(request.model().unwrap(), Model::Qwen27B);
         request.model = Some("Qwen3.8-27B".into());
@@ -2524,6 +2543,31 @@ mod tests {
         // rather than resolving to something plausible.
         request.model = Some("my-finetune-Q4_K_M".into());
         assert!(request.model().is_err());
+    }
+
+    /// A checkpoint whose recurrent state no cache image carries is refused by
+    /// the field that names it, in every spelling, and the message says why and
+    /// where to go instead.
+    ///
+    /// The refusal has to happen here rather than at the first snapshot: by then
+    /// the caller has loaded a 111 GB checkpoint and prefilled a shared prefix,
+    /// and the error would name a cache-image internal rather than the fact that
+    /// this checkpoint cannot batch at all.
+    #[test]
+    fn a_checkpoint_whose_state_no_snapshot_carries_cannot_batch() {
+        let mut request: BatchRequest = serde_json::from_str(r#"{ "items": [] }"#).unwrap();
+        for name in ["flash-next", "Qwen3.8-Flash-Next"] {
+            request.model = Some(name.into());
+            let err = request.model().unwrap_err().to_string();
+            assert!(err.contains("Qwen3.8-Flash-Next"), "{err}");
+            assert!(err.contains("xwen batch"), "{err}");
+            assert!(err.contains("xwen chat"), "{err}");
+        }
+        // Every checkpoint that can move cache state still resolves normally.
+        for model in crate::hub::MODELS.into_iter().filter(|m| m.servable()) {
+            request.model = Some(model.full_name().into());
+            assert_eq!(request.model().unwrap(), model);
+        }
     }
 
     fn prepared(schema: Option<Value>, prefix_text: &str) -> Prepared {

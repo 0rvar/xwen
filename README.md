@@ -7,10 +7,12 @@ laguna/maxuna engine: candle-based, mmap no-copy weight loading, vendored Metal
 kernels, speculative decoding, and an HTTP server speaking Anthropic Messages and
 OpenAI Chat Completions.
 
-**Status: runs, and matches upstream.** The 35B-A3B generates correctly end to end
-(greedy, chat template, thinking split, clean stops) at ~59 tok/s decode, and both
-checkpoints now pass the parity gate against upstream llama.cpp on identical GGUF
-weights (`docs/parity.md`). No DeltaNet Metal kernels yet. See `TODO.md` for the
+**Status: runs, and matches upstream.** All four checkpoints generate correctly end to
+end (greedy, chat template, thinking split, clean stops), and the 3.6 pair passes the
+parity gate against upstream llama.cpp on identical GGUF weights (`docs/parity.md`) —
+Qwen3.8-27B runs that same dense graph. Flash-Next has no harness of its own yet and was
+verified by forced replay against llama.cpp (`docs/qwen4exp-port.md`). Decode rates are
+in Speculative decoding below and in CLAUDE.md's Perf state. See `TODO.md` for the
 priority ledger and `docs/log.md` for the narrative.
 
 ## Docs
@@ -28,14 +30,14 @@ SDK — see flake.nix). `cargo build --release`. Ops tests need a Metal device.
 
 ## Models
 
-Four checkpoints, all Q4_K_M — all resolved through the HF cache and downloaded on
-first use:
+Four checkpoints — Q4_K_M, except Flash-Next's UD-Q4_K_XL — all resolved through the HF
+cache and downloaded on first use:
 
 | Full name | Repo | `--model-size` | Drafter |
 | --- | --- | --- | --- |
 | `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` (default) | none |
 | `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash block drafter, 3.5 GB |
-| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` (serve's default) | DFlash block drafter, 0.8 GB |
+| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` (serve's and batch's default) | DFlash block drafter, 0.8 GB |
 | `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | MTP head, 3.2 GB |
 
 **Flash-Next is the default (2026-08-30), so a zero-flag first run downloads 111 GB**
@@ -45,23 +47,29 @@ unsloth/Qwen3.8-Flash-Next-GGUF <shard>... --jobs 2` does the same with parallel
 verified, resumable downloads. Pass `--model-size 35b` (or `27b`, `3.8-27b`) for a
 ~20 GB checkpoint instead.
 
-**`xwen serve` defaults to `Qwen3.6-35B-A3B`**, not to Flash-Next, because it cannot
-serve Flash-Next yet (below). A zero-flag `xwen serve` says which checkpoint it picked
-and why; `--model-size flash-next` is still refused outright rather than silently
-substituted.
+**`xwen serve` and `xwen batch` default to `Qwen3.6-35B-A3B`**, not to Flash-Next,
+because neither can run Flash-Next yet (below): both move a whole cache state around on
+their ordinary path — the server snapshots, rewinds and pages conversations out, and a
+batch prefills the items' shared prefix once and replays that snapshot per item. A
+zero-flag `xwen serve` or a payload with no `"model"` says which checkpoint it picked
+and why; naming Flash-Next explicitly is refused outright on both rather than silently
+substituted. `xwen generate` and `xwen chat` run it with no flags — they never move
+cache state.
 
-**Qwen3.8-Flash-Next is EXPERIMENTAL and CLI-ONLY (P3, 2026-08-29)** — unlike
-Qwen3.8-27B this one is a whole second architecture rather than a registry entry over an
+**Qwen3.8-Flash-Next is EXPERIMENTAL, and `generate`/`chat` only (P3, 2026-08-29)** —
+unlike Qwen3.8-27B this one is a whole second architecture rather than a registry entry over an
 existing graph: sparse attention, hyper-connections and a 51B n-gram embedding table on
 top of the familiar gated DeltaNet and MoE. It loads, generates and stops correctly, and
 its graph agrees with upstream llama.cpp (186/192 forced-replay steps after the P3
 kernel pass, 189/192 before it, zero hard mismatches either way — every divergence a
-rank-2 near-tie; `docs/qwen4exp-parity-2026-08-29.md`). It is not finished: **`xwen serve`
-REFUSES this checkpoint until P4**, because snapshots and the prefix cache cannot carry
-its recurrent state; there is no drafter; and it has no parity harness or perplexity
-floor of its own. It is, however, fast: after the P3 kernel pass it runs **prefill
-795.7 tok/s and decode 44.5-45.8 tok/s (43.1 before the PLE row prefetch)** where llama.cpp on the same file in the same hour
-runs 789 and 41.4 — plain, no drafter, 530-token prompt, four interleaved rounds,
+rank-2 near-tie; `docs/qwen4exp-parity-2026-08-29.md`). It is not finished:
+**`xwen serve` and `xwen batch` both REFUSE this checkpoint until P4**, because
+snapshots and the prefix cache cannot carry its recurrent state (the QSA raw-key caches,
+the PLE conv window and its n-gram token history); there is no drafter; and it has no
+parity harness or perplexity floor of its own. It is, however, fast: after the P3 kernel
+pass it runs **prefill 795.7 tok/s and decode 44.5-45.8 tok/s (43.1 before the PLE row
+prefetch)** where llama.cpp on the same file in the same hour runs 789 and 41.4 — plain,
+no drafter, 530-token prompt, four interleaved rounds,
 medians, `powermode 0` with no high-power claim. See `docs/qwen4exp-port.md`.
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full
@@ -179,7 +187,11 @@ from a sampler-stream bug is seed-dependence: a stream bug diverges at every see
 stdin, one JSON response on stdout, progress lines on stderr. The shared prefix is
 prefilled once and the KV cache snapshotted there; every item restores that snapshot
 and prefills only its own tail, so nine questions about the same document cost one
-prefill of it rather than nine. The checkpoint comes from the payload, not a flag.
+prefill of it rather than nine. The checkpoint comes from the payload, not a flag — or
+from `-m <gguf>`'s own identity when one is given, with the payload's name as the
+cross-check. Because those snapshots are how a batch runs at all, this surface cannot run
+Qwen3.8-Flash-Next: naming it is refused up front, and a payload naming nothing gets
+`Qwen3.6-35B-A3B` (serve's default too) with a line on stderr saying so.
 
 ```bash
 xwen batch < request.json > response.json

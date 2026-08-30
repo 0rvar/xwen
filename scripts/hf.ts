@@ -30,8 +30,10 @@ export const CHECKPOINTS = {
   },
   // The one SPLIT checkpoint: four shards, and `model` is shard 1 because that
   // is what every consumer passes on a command line — the loader (and
-  // llama.cpp) walk to the siblings from there. `shards` lists all four so a
-  // cache check can insist on the whole set rather than on the entry point.
+  // llama.cpp) walk to the siblings from there. `shards` lists all four and
+  // `officialModel` insists on every one of them: an interrupted 111 GB fetch
+  // leaves shard 1 cached and the rest not, which resolves as a hit against the
+  // entry point alone and then fails deep in the load.
   // No drafter: the release ships an MTP head xwen does not load (hub.rs).
   "flash-next": {
     repo: "unsloth/Qwen3.8-Flash-Next-GGUF",
@@ -92,17 +94,35 @@ export function cachedFile(repo: string, file: string): string | null {
   return existsSync(path) ? path : null;
 }
 
-/** The official model for `size`, or throw with the fix. */
+/** Every file that has to be cached for `size` to load: the shard set on a
+ *  split checkpoint, the single file on the others. */
+export function modelFiles(size: ModelSize): readonly string[] {
+  const ck = CHECKPOINTS[size];
+  return "shards" in ck ? ck.shards : [ck.model];
+}
+
+/** The official model for `size`, or throw with the fix.
+ *
+ *  Returns the ENTRY POINT (shard 1 on a split checkpoint) but insists on the
+ *  WHOLE set: the loader walks to the siblings from whatever file it is handed,
+ *  so a cache holding only shard 1 resolves here and then fails deep inside the
+ *  load. A half-finished 111 GB download is exactly the state this catches, and
+ *  it names the missing shards rather than reporting a hit. */
 export function officialModel(size: ModelSize = defaultSize()): string {
   const ck = CHECKPOINTS[size];
-  const path = cachedFile(ck.repo, ck.model);
-  if (!path) {
+  const files = modelFiles(size);
+  const missing = files.filter((file) => !cachedFile(ck.repo, file));
+  if (missing.length > 0) {
+    const what =
+      files.length === 1
+        ? `${ck.repo}/${ck.model} is not in the Hugging Face cache`
+        : `${missing.length} of ${ck.repo}'s ${files.length} shards are not in the Hugging ` +
+          `Face cache (${missing.join(", ")})`;
     throw new Error(
-      `${ck.repo}/${ck.model} is not in the Hugging Face cache; ` +
-        `run \`xwen fetch --model-size ${size}\` (or pass --model / $XWEN_MODEL)`,
+      `${what}; run \`xwen fetch --model-size ${size}\` (or pass --model / $XWEN_MODEL)`,
     );
   }
-  return path;
+  return cachedFile(ck.repo, ck.model)!;
 }
 
 /** The official drafter for `size`, or null — which also covers a checkpoint

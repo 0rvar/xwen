@@ -105,11 +105,16 @@ message (3.6 does), and does not split inline `<think>` out of assistant content
 HF cache (`HF_HUB_CACHE` > `HF_HOME/hub`), cache-first via hf-hub, download on miss.
 **The default checkpoint is Qwen3.8-Flash-Next as of 2026-08-30** (`unsloth/
 Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, four shards, 111 GB, no drafter) — so a zero-flag
-`generate`/`chat`/`batch`/`fetch` run downloads 111 GB on a cold cache, after the usual
-size notice. `xwen serve` CANNOT run it (P4) and falls back to Qwen3.6-35B-A3B with a
-logged line: `Model::default_servable()` in hub.rs is that rule, and it names its
-fallback rather than deriving it from `MODELS` order, which would hand the server the
-much slower 27B. An explicit `--model-size flash-next` on serve is still refused.
+`generate`/`chat`/`fetch` run downloads 111 GB on a cold cache, after the usual size
+notice. `xwen serve` AND `xwen batch` cannot run it (P4) and fall back to
+Qwen3.6-35B-A3B with a line: `Model::servable()` gates both surfaces — batch snapshots
+the items' shared prefix and rescores fields off it, so it moves cache state on its
+ordinary path exactly as the server does — and `Model::default_servable()` is the one
+fallback rule they share. It NAMES its fallback rather than deriving it from `MODELS`
+order, which would hand them the much slower 27B. Naming Flash-Next explicitly
+(`--model-size flash-next` on serve, `"model"` in a batch payload) is still refused.
+`XWEN_BATCH_NO_CACHE` does not get batch around it: it skips the shared prefix and
+leaves the per-option snapshots.
 Other repos/files (hub.rs): `ggml-org/Qwen3.6-27B-GGUF`,
 `ggml-org/Qwen3.6-35B-A3B-GGUF` and `ggml-org/Qwen3.8-27B-GGUF`, Q4_K_M. Sizes: 19.1 GB
 (27B), 20.4 GB (35B), 19.0 GB (3.8-27B). Q8_0: 28.6 / 36.9 / 28.6 GB. Drafter sidecars,
@@ -153,6 +158,12 @@ edited ref costs a full re-download.
   override: it must agree with a file that identifies itself (disagreement is a startup
   error) and only settles a file that identifies as nothing. A file that still says
   nothing runs as `Arch::model()` with a logged warning, under its own file name.
+  That rule is `XwenConfig::identify` (returning `Identity::Official`/`::Assumed`) and it
+  applies on EVERY surface as of 2026-08-30, not just serve: `--model <gguf>` on
+  `generate`/`chat`/`batch` reads the file too, because the checkpoint decides the chat
+  dialect, the drafter and the label. On batch the payload's `"model"` is the
+  cross-check, there being no size flag there. `serve::engine::identify_checkpoint` is
+  now only the mapping onto `Target` plus the startup log.
   Qwen3.8's tokenizer.json is NOT
   byte-identical to 3.6's — it adds seven audio/TTS specials at 248070-248076 over an
   identical base vocab and merge table — but the embedded 3.6 tokenizer is what ships
@@ -222,7 +233,7 @@ Those drafted figures are WITHIN-SWEEP against the plain arm of the same sweep;
 do not difference them against a drafted number from another session — the 27B's
 between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 reads
 36.5-37.6 in today's own 0.3 arm.
-Qwen3.8-Flash-Next (EXPERIMENTAL, CLI-only), 2026-08-29 after the P3 kernel pass,
+Qwen3.8-Flash-Next (EXPERIMENTAL, `generate`/`chat` only), 2026-08-29 after the P3 kernel pass,
 plain because no drafter exists for it: **prefill ~796 tok/s @530, decode ~45 (43 before the PLE row prefetch)**,
 against llama.cpp's 789 / 41.4 on the same file in the same hour (four interleaved
 rounds, medians; `pmset -g` said `powermode 0` that session — still no high-power

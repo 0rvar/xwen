@@ -25,6 +25,7 @@ use super::types::{
 };
 use crate::XwenConfig;
 use crate::batch::{BatchHooks, BatchProgress};
+use crate::config::Identity;
 use crate::dflash::{DflashConfig, DflashDrafter, DrafterImage, DrafterImageKind};
 use crate::drafter::DrafterKind;
 use crate::generate::{GenEvent, Generator, SpecParams, SpecStats, feasible_think_budget};
@@ -169,51 +170,25 @@ const ASSISTANT_CLOSE: &str = "</assistant>";
 /// The returned target is `Target::official` when the file is one of the
 /// checkpoints and `Target::served` when it is not: only the second answers to a
 /// file name, and only the first lets an official name resolve locally.
+///
+/// The rule itself is [`XwenConfig::identify`], shared with the one-shot
+/// commands so a custom GGUF is not one checkpoint to the server and another to
+/// `xwen generate`. What is serve's own is the mapping onto `Target` and the
+/// startup log line.
 pub fn identify_checkpoint(
     settings: &ServeSettings,
     cfg: &XwenConfig,
     selected: Option<hub::Model>,
 ) -> Result<(Target, Option<ServeLog>)> {
-    let identified = cfg.checkpoint(&settings.model);
-    if let Some(selected) = selected {
-        ensure!(
-            cfg.arch == selected.arch(),
-            "--model-size {selected} names a {} model, but {} holds a {} model",
-            selected.arch().key(),
-            settings.model.display(),
-            cfg.arch.key()
-        );
-        if let Some(identified) = identified {
-            ensure!(
-                identified == selected,
-                "--model-size {selected} contradicts {}, which says it is {}; drop the flag \
-                 to serve what the file says it is",
-                settings.model.display(),
-                identified.full_name()
-            );
-        }
-        // The file said nothing, so the flag settles it: an official checkpoint
-        // in a file the operator vouched for.
-        return Ok((Target::official(selected), None));
-    }
-    match identified {
-        Some(model) => Ok((Target::official(model), None)),
-        None => {
-            let assumed = cfg.arch.model().with_context(|| {
-                format!(
-                    "{} names no official checkpoint and its architecture has no registry \
-                     checkpoint to assume; it cannot be served",
-                    settings.model.display()
-                )
-            })?;
-            Ok((
-                Target::served(assumed),
-                Some(ServeLog::CheckpointUnidentified {
-                    path: settings.model.clone(),
-                    assumed,
-                }),
-            ))
-        }
+    match cfg.identify(&settings.model, selected, "--model-size")? {
+        Identity::Official(model) => Ok((Target::official(model), None)),
+        Identity::Assumed(assumed) => Ok((
+            Target::served(assumed),
+            Some(ServeLog::CheckpointUnidentified {
+                path: settings.model.clone(),
+                assumed,
+            }),
+        )),
     }
 }
 

@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use xwen::batch::{BatchRequest, BatchResponse};
 use xwen::chat::{ChatOptions, Message, ReasoningEffort, build_prompt_with_spans};
-use xwen::config::XwenConfig;
+use xwen::config::{Identity, XwenConfig};
 use xwen::dflash::DflashDrafter;
 use xwen::generate::{Generator, SpecParams};
 use xwen::gguf;
@@ -40,26 +40,27 @@ struct Cli {
 #[derive(Parser)]
 struct ModelArgs {
     /// Which official checkpoint to run: Qwen3.8-Flash-Next (`flash-next` —
-    /// the default, and EXPERIMENTAL; CLI-only, since `xwen serve` refuses it
-    /// until snapshot support lands), the dense Qwen3.6-27B, the
-    /// Qwen3.6-35B-A3B MoE, or the dense Qwen3.8-27B. `xwen serve` defaults to
-    /// Qwen3.6-35B-A3B instead, because it cannot run the default yet.
-    /// Each checkpoint's full name works here too. A
-    /// `--model <gguf>` path
-    /// overrides the target file outright; for the one-shot commands this flag
-    /// still selects the family (and so the drafter sidecar), while
-    /// `xwen serve` reads the family from the GGUF itself and uses the flag
-    /// only to pick the default file when nothing else names one — or to break
-    /// the tie when a custom dense GGUF does not say which release it is.
+    /// the default, and EXPERIMENTAL; `xwen generate` and `xwen chat` only,
+    /// since `xwen serve` and `xwen batch` both move cache state it cannot
+    /// carry yet), the dense Qwen3.6-27B, the Qwen3.6-35B-A3B MoE, or the dense
+    /// Qwen3.8-27B. `xwen serve` and `xwen batch` default to Qwen3.6-35B-A3B
+    /// instead, because neither can run the default yet. Each checkpoint's full
+    /// name works here too. A `--model <gguf>` path overrides the target file
+    /// outright, and then the FILE says which checkpoint it is: this flag is the
+    /// cross-check (it must agree, or startup fails) and the tie-break for a
+    /// custom GGUF that names no release — on every surface alike.
     #[arg(long, value_name = "27b|35b|3.8-27b|flash-next")]
     model_size: Option<Model>,
 }
 
 impl ModelArgs {
     /// The selected checkpoint, or [`Model::default`] when the flag was
-    /// omitted. Serve wants [`Model::default_servable`] for the omitted case
-    /// instead and substitutes it itself (`run_serve`); every other command can
-    /// run the plain default.
+    /// omitted — for `fetch` and `inspect`, which name a file to act on and
+    /// never load a graph. The commands that RUN one go through
+    /// `one_shot_checkpoint` (which reads a `--model` file's own identity) or,
+    /// for serve, through `identify_checkpoint`; both want
+    /// [`Model::default_servable`] rather than the plain default wherever the
+    /// surface moves cache state.
     fn size(&self) -> Model {
         self.model_size.unwrap_or_default()
     }
@@ -403,7 +404,11 @@ enum Cmd {
     /// tail, so a run of N questions about the same document costs one prefill
     /// of it rather than N. Which checkpoint to run comes from the payload
     /// (`"model": "27b"` / `"35b"`), not from a flag — one request is one
-    /// model's work. Sampling defaults to greedy and thinking to off, so a
+    /// model's work — or from the `-m` file's own identity when one is given.
+    /// Because those snapshots are how a batch runs at all, this surface cannot
+    /// run Qwen3.8-Flash-Next: a payload naming it is refused up front, and a
+    /// payload naming nothing gets Qwen3.6-35B-A3B (serve's default too) with a
+    /// line saying so. Sampling defaults to greedy and thinking to off, so a
     /// batch is reproducible and a tight token budget goes to the answer.
     ///
     /// Progress lines go to stderr; stdout carries the JSON alone. Setting
@@ -415,7 +420,8 @@ enum Cmd {
     Batch {
         /// Model GGUF (default: the checkpoint the payload names, ensured in
         /// the Hugging Face cache — downloaded on first use, cached forever
-        /// after).
+        /// after). Given one, the file decides which checkpoint it is and the
+        /// payload's `model` becomes the cross-check.
         #[arg(short, long)]
         model: Option<PathBuf>,
         /// Custom tokenizer.json (default: the checkpoint tokenizer embedded
@@ -792,6 +798,56 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     xwen::serve::run(settings, selected)
 }
 
+/// Which checkpoint a one-shot run (`generate`, `chat`, `batch`) is against.
+///
+/// The FILE decides whenever there is one. `--model <gguf>` names a file whose
+/// identity is a fact about its metadata, and reading it here is what keeps the
+/// chat dialect, the drafter sidecar and the label the run reports agreeing with
+/// what actually loaded — the same rule `xwen serve` applies to the file it
+/// serves (`XwenConfig::identify`), so a custom GGUF is not one checkpoint on
+/// one surface and another on the next.
+///
+/// `selected` is a cross-check, not an override: it must agree with a file that
+/// identifies itself, and settles one that identifies as nothing. It is what the
+/// run named, `selector` is what to call that in an error, and `default` is what
+/// a run that named nothing gets when there is also no file to read. All three
+/// differ per command — `--model-size` and the plain default on `generate` and
+/// `chat`, the payload's `"model"` and the servable default on `batch` — which
+/// is why none of them is inlined here.
+///
+/// Metadata only: a second cheap open of a file the loader is about to mmap
+/// anyway, done BEFORE the load so a contradicting flag fails in milliseconds
+/// rather than after 20 GB (111 on the default) is resident.
+fn one_shot_checkpoint(
+    model: Option<&Path>,
+    selected: Option<Model>,
+    selector: &str,
+    default: Model,
+) -> Result<Model> {
+    let Some(path) = model else {
+        return Ok(selected.unwrap_or(default));
+    };
+    let gguf = gguf::open(path, &candle_core::Device::Cpu)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let cfg = XwenConfig::from_gguf(&gguf.content)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(match cfg.identify(path, selected, selector)? {
+        Identity::Official(model) => model,
+        Identity::Assumed(assumed) => {
+            // Said out loud because it decides the chat template dialect and the
+            // drafter, and on the dense architecture the two 27B releases are a
+            // coin-flip — the operator is the only one who can break that tie.
+            eprintln!(
+                "xwen: {} names no official checkpoint; running it as {} \
+                 (pass {selector} to name it)",
+                path.display(),
+                assumed.full_name()
+            );
+            assumed
+        }
+    })
+}
+
 /// `-m` given: use it verbatim. Omitted: the selected official checkpoint,
 /// ensured in the standard Hugging Face cache (idempotent — the cached path
 /// comes back without a request; only a missing file is downloaded, with
@@ -936,9 +992,38 @@ fn batch_request(
         !request.items.is_empty(),
         "batch: the request holds no items"
     );
-    // The payload names the checkpoint; `-m` still overrides the file, exactly
-    // as it does for the other commands.
-    let size = request.model()?;
+    // The payload names the checkpoint; `-m` still overrides the FILE, and when
+    // it is given that file's own identity is what the run is against — the
+    // payload's name (or its absence) is only the cross-check, exactly as
+    // `--model-size` is for the other commands.
+    //
+    // `BatchRequest::model` has already refused a checkpoint batch cannot run,
+    // so what is left to check here is a custom GGUF that turns out to BE one.
+    let named = request
+        .model
+        .is_some()
+        .then(|| request.model())
+        .transpose()?;
+    if model.is_none() && named.is_none() && !Model::default().servable() {
+        // Nothing named a checkpoint, so an unrunnable default is a fallback
+        // rather than a refusal — the same rule, notice and reason a zero-flag
+        // `xwen serve` prints, because otherwise a different model answers here
+        // than the one `xwen generate` would.
+        eprintln!(
+            "xwen: {} cannot run under `xwen batch` yet ({}); running {}. \
+             Name a checkpoint in the request's \"model\" field to choose.",
+            Model::default().full_name(),
+            Model::default().unservable_reason(),
+            Model::default_servable().full_name(),
+        );
+    }
+    let size = one_shot_checkpoint(
+        model.as_deref(),
+        named,
+        "the request's \"model\" field",
+        Model::default_servable(),
+    )?;
+    ensure!(size.servable(), "batch: {}", size.unbatchable_message());
 
     let load_start = std::time::Instant::now();
     let mut generator = build_generator(
@@ -1177,10 +1262,19 @@ fn main() -> Result<()> {
             // Validated whether or not thinking is on, so a 3.6 run learns
             // about a useless flag at startup rather than never.
             think.check_think_budgets(min_think, max_think)?;
-            let chat_opts = think.chat_options(select.size())?;
+            // Read before the template knobs are resolved: with `--model` the
+            // FILE decides which checkpoint this is, and the dialect, the
+            // drafter and the effort preamble all key off that answer.
+            let size = one_shot_checkpoint(
+                model.as_deref(),
+                select.model_size,
+                "--model-size",
+                Model::default(),
+            )?;
+            let chat_opts = think.chat_options(size)?;
             let mut generator = build_generator(
-                &resolve_model(model, select.size())?,
-                select.size(),
+                &resolve_model(model, size)?,
+                size,
                 tokenizer.as_deref(),
                 &moe_impl,
                 max_ctx,
@@ -1357,10 +1451,16 @@ fn main() -> Result<()> {
         }) => {
             // Validated before the 20 GB load, like every startup cross-check.
             think.check_think_budgets(min_think, max_think)?;
-            let chat_opts = think.chat_options(select.size())?;
+            let size = one_shot_checkpoint(
+                model.as_deref(),
+                select.model_size,
+                "--model-size",
+                Model::default(),
+            )?;
+            let chat_opts = think.chat_options(size)?;
             let mut generator = build_generator(
-                &resolve_model(model, select.size())?,
-                select.size(),
+                &resolve_model(model, size)?,
+                size,
                 tokenizer.as_deref(),
                 &moe_impl,
                 max_ctx,
@@ -1387,6 +1487,35 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use xwen::chat::ChatDialect;
+
+    /// With no `--model` file there is nothing to identify, so a one-shot runs
+    /// what it was told to — and what "told to nothing" means differs per
+    /// command, which is the whole reason the fallback is a parameter:
+    /// `generate` and `chat` get the plain default, `batch` gets the one it can
+    /// actually snapshot its way through.
+    ///
+    /// The file branch is the same rule serve applies and is pinned where that
+    /// rule lives (`XwenConfig::identify`); it needs a real GGUF and is not
+    /// re-tested here.
+    #[test]
+    fn without_a_file_a_one_shot_runs_what_it_was_told_to() {
+        assert_eq!(
+            one_shot_checkpoint(None, None, "--model-size", Model::default()).unwrap(),
+            Model::default()
+        );
+        assert_eq!(
+            one_shot_checkpoint(None, None, "--model-size", Model::default_servable()).unwrap(),
+            Model::default_servable()
+        );
+        // An explicit selection wins over either fallback, and is the only thing
+        // that can name the unservable checkpoint on a one-shot.
+        for default in [Model::default(), Model::default_servable()] {
+            assert_eq!(
+                one_shot_checkpoint(None, Some(Model::Qwen27B), "--model-size", default).unwrap(),
+                Model::Qwen27B
+            );
+        }
+    }
 
     /// A checkpoint whose graph has no speculative verify seam refuses a drafter
     /// it was ASKED for, and quietly decodes plain when it was not.
