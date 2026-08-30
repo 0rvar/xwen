@@ -345,7 +345,10 @@ mod tests {
                     dialect: Dialect::Anthropic,
                     streaming: true,
                 },
-                model: crate::serve::types::Target::official(crate::hub::Model::default()),
+                // Named rather than `Model::default()`: what these tests need
+                // is a checkpoint that differs from the 27B they compare
+                // against, not whichever one is currently default.
+                model: crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B),
                 prompt,
                 boundary: 0,
                 anchor: None,
@@ -832,10 +835,10 @@ mod tests {
         }
         let (short_resident, _rb) = entry(vec![2; 40], Duration::from_secs(1), now);
         let mut queue = vec![long_other, short_resident];
-        // The resident checkpoint is the default (35B); the 27B job's prefix
-        // would match 95 tokens IF its checkpoint were loaded — the model
-        // check is what must keep that discount from applying.
-        let resident = crate::serve::types::Target::official(crate::hub::Model::default());
+        // The resident checkpoint is the 35B the fixture builds jobs for; the
+        // 27B job's prefix would match 95 tokens IF its checkpoint were loaded
+        // — the model check is what must keep that discount from applying.
+        let resident = crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B);
         let hot = |job: &Job| {
             if job.model() == resident && !job.prompt().is_empty() && job.prompt()[0] == 1 {
                 95

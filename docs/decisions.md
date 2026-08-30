@@ -2046,6 +2046,33 @@ token history all live outside `LayerCache` by decision, and the disk tier has n
 for them. A server that accepted the checkpoint would 500 on the first page-out, which
 is a worse failure than a startup refusal (2026-08-29).
 
+**Flash-Next is the default checkpoint; serve falls back rather than refuses.** The
+`#[default]` on `hub::Model` moved from `Qwen35BA3B` to `Qwen38FlashNext`: it is the
+best model here, it is faster than the dense pair, and every mode that can run it should
+run it with no flags. Serve is the one mode that cannot (the entry above), and the rule
+there is a FALLBACK, not a refusal: a run that named no checkpoint asked for none in
+particular, so `xwen serve` serves `Model::default_servable()` and prints one line naming
+both checkpoints and the reason. An explicit `--model-size flash-next` is still refused
+exactly as before — naming a checkpoint and getting a different one silently is the
+failure mode the whole `checkpoint_selectable` rule exists to prevent. The fallback fires
+only when nothing else named a model: a config with its own `model` path is not falling
+back to anything, so it gets no line.
+
+`default_servable()` NAMES `Qwen3.6-35B-A3B` rather than deriving "the first servable
+entry of `MODELS`". `MODELS` is a display order (it is what `/v1/models` prints), and its
+first servable entry is the 27B, which decodes at roughly a quarter of the 35B-A3B's
+rate — so the derivation would have silently downgraded every existing server while
+looking principled. The named constant keeps serve's behaviour exactly what it was
+before the flip.
+
+The `auto_fetch()` gate is UNCHANGED, and that is the one visible cost: a zero-flag
+`generate`/`chat`/`batch`/`fetch` on a cold cache now downloads 111 GB. `auto_fetch` was
+always about a checkpoint arriving as a side effect of a stranger's request, not about
+the operator's own zero-flag run — `ensure_model` fetches all four shards after the same
+size notice every other checkpoint gets, and it resumes in place. Refusing to fetch the
+default would have made the default unusable, which is not a gate, it is a bug
+(2026-08-30).
+
 **Space→hyphen folding applies to the exact-name comparison only.** The file calls
 itself "Qwen3.8 Flash Next" where the official name is `Qwen3.8-Flash-Next`, so
 identification folds the two spellings — but only on the exact-name pass, not on the

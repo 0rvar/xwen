@@ -1976,7 +1976,11 @@ mod tests {
             model_loaded: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Cancel::default()),
             model_id: "xwen-test".to_string(),
-            default_target: types::Target::served(crate::hub::Model::default()),
+            // Named, not `Model::default()`: these tests assert rendered
+            // prompts, and the rendering is dialect-keyed to the checkpoint. A
+            // server can never hold the plain default anyway — it is
+            // unservable — so this is also what a real one would carry.
+            default_target: types::Target::served(crate::hub::Model::Qwen35BA3B),
             max_ctx,
             next_request_id: Arc::new(AtomicU64::new(1)),
         };

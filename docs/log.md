@@ -4,6 +4,57 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-30 — Flash-Next becomes the default checkpoint; serve falls back to the 35B-A3B and says so
+
+`#[default]` on `hub::Model` moved from `Qwen35BA3B` to `Qwen38FlashNext`. Every mode
+that can run it now runs it with no flags: `generate`, `chat`, `batch`, `fetch`, and
+`bun scripts/bench.ts`. Nothing about the checkpoint changed — it is the same
+EXPERIMENTAL label, the same three P2 gates, the same 111 GB of shards.
+
+Serve is the mode that cannot run it, so it does not. `Model::default_servable()` is the
+new rule: `Model::default()` when the server can run it, otherwise `Qwen3.6-35B-A3B`. A
+zero-flag `xwen serve` prints one line —
+
+    xwen: Qwen3.8-Flash-Next cannot be served yet (the qwen4exp recurrent state (the QSA
+    raw-key caches, the PLE conv window and its n-gram token history) is not carried by
+    any cache image, and the server snapshots, rewinds and pages conversations out on
+    its ordinary path); serving Qwen3.6-35B-A3B. Pass --model-size to choose.
+
+— and serves the 35B-A3B, which is what it served yesterday. `--model-size flash-next`
+is still a startup refusal: naming a checkpoint and quietly getting another one is the
+failure `checkpoint_selectable` exists to prevent. The reason clause is now
+`Model::unservable_reason()`, so the refusal and the fallback line cannot drift apart.
+
+Two things that went differently from the plan. The fallback was specified as "the first
+entry of `MODELS` that is servable" — that entry is the **27B**, not the 35B-A3B, because
+`MODELS` is the order `/v1/models` prints in, not a preference order. Deriving it would
+have cut every existing server's decode to about a quarter (25 tok/s against 104-107)
+while looking principled, so `default_servable()` names its fallback. And the fallback
+notice moved inside the "nothing named a model" branch: a config file with its own
+`model` path is not falling back to anything and should not be told that it is.
+
+`auto_fetch()` is deliberately unchanged, which leaves the one real cost: a zero-flag run
+on a cold cache downloads 111 GB. That gate was always about a checkpoint arriving as a
+side effect of a stranger's HTTP request, not about an operator's own zero-flag run;
+`ensure_model` fetches all four shards after the same size notice every other checkpoint
+prints, and resumes in place.
+
+Drafting: the default checkpoint ships no sidecar, so the zero-flag path prints "decodes
+without speculation (no drafter exists for its graph yet)" rather than the old "no
+drafter available" line, which read as something having gone missing.
+
+Scripts: `hf.ts`'s `defaultSize()` follows the binary to `flash-next`. `parity-gate.ts`
+now pins `35b` explicitly — it has no llama.cpp oracle for the qwen4exp graph — and
+`retune-draft.ts` was already excluded by `draftingSizes()`. `spec-equivalence.ts` keeps
+its explicit three-checkpoint list.
+
+Also removed: `hub::official_drafter()`, which had no callers (serve's `engine.rs` has
+its own function of the same name).
+
+994 lib tests and 4 bin tests pass. Two new hub tests pin the default and the fallback,
+and the fallback test asserts the two must converge once the default becomes servable —
+so P4 cannot land and leave serve on the older model by accident.
+
 ## 2026-08-29 (P3, later the same day) — Flash-Next prefill 239 → 796 tok/s and decode 37.8 → 45: a Q5_1 `mm_id` arm, four fused hyper-connection kernels, and a norm split across streams below 32 tokens
 
 **Context.** P2 closed hours earlier with the graph correct and prefill 3.3-3.5x behind

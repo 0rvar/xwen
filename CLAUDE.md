@@ -103,13 +103,21 @@ message (3.6 does), and does not split inline `<think>` out of assistant content
 ## Checkpoint location
 
 HF cache (`HF_HUB_CACHE` > `HF_HOME/hub`), cache-first via hf-hub, download on miss.
-Default repos/files (hub.rs): `ggml-org/Qwen3.6-27B-GGUF`,
+**The default checkpoint is Qwen3.8-Flash-Next as of 2026-08-30** (`unsloth/
+Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, four shards, 111 GB, no drafter) — so a zero-flag
+`generate`/`chat`/`batch`/`fetch` run downloads 111 GB on a cold cache, after the usual
+size notice. `xwen serve` CANNOT run it (P4) and falls back to Qwen3.6-35B-A3B with a
+logged line: `Model::default_servable()` in hub.rs is that rule, and it names its
+fallback rather than deriving it from `MODELS` order, which would hand the server the
+much slower 27B. An explicit `--model-size flash-next` on serve is still refused.
+Other repos/files (hub.rs): `ggml-org/Qwen3.6-27B-GGUF`,
 `ggml-org/Qwen3.6-35B-A3B-GGUF` and `ggml-org/Qwen3.8-27B-GGUF`, Q4_K_M. Sizes: 19.1 GB
 (27B), 20.4 GB (35B), 19.0 GB (3.8-27B). Q8_0: 28.6 / 36.9 / 28.6 GB. Drafter sidecars,
 one per checkpoint and TWO kinds: `dflash-*-BF16.gguf` on the 3.6 pair (3.5 GB / 0.8 GB)
 and `mtp-Qwen3.8-27B-Q8_0.gguf` on the 3.8 (3.2 GB). Every drafter accessor on `Model`
-is still `Option` — that shape is about a checkpoint that ships none, and no current one
-is. MTP sidecars also exist for both 3.6 checkpoints and are unused (they have DFlash
+is `Option`, and Flash-Next is the checkpoint that exercises it: it ships none, so the
+default run decodes plain and says so. MTP sidecars also exist for both 3.6 checkpoints
+and are unused (they have DFlash
 heads, which are the better drafter there). `mmproj-*` files are the vision tower —
 never load them.
 Inherited hf-hub trap: refs/main is read verbatim; a trailing newline in a manually
@@ -325,9 +333,11 @@ not a regression — see "Perf state").
 
 ## serve (INHERITED, partially adapted)
 
-The serve/ tree runs as forked. Not yet adapted: ChatML/tool-call parsing in the
-dialect layers (Qwen's `<function=...>` XML-ish call format, string-args-raw rule) and
-prefix-cache snapshots carrying recurrent state (see decisions.md "Serving"). Thinking
+The serve/ tree runs as forked. Its zero-flag default is `Model::default_servable()`
+(Qwen3.6-35B-A3B), NOT the plain default — see "Checkpoint location". Not yet adapted:
+ChatML/tool-call parsing in the dialect layers (Qwen's `<function=...>` XML-ish call
+format, string-args-raw rule) and prefix-cache snapshots carrying recurrent state
+(see decisions.md "Serving"). Thinking
 semantics ARE adapted as of 2026-08-19: open-`<think>` seeding, per-dialect
 preserve_thinking (a request field on the native and OpenAI dialects, the checkpoint
 template's default otherwise — the normalizers pass ALL replayed reasoning through in

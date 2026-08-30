@@ -285,7 +285,9 @@ function parseArgs(argv: string[]): Opts {
 
   const sizeArg = flags["model-size"] === undefined ? "both" : String(flags["model-size"]).toLowerCase();
   // `both` means the checkpoints that can speculate at all — a release with no
-  // DFlash sidecar has no floor to fit and no drafted arm to fit it against.
+  // sidecar has no floor to fit and no drafted arm to fit it against. That is
+  // what keeps xwen's default checkpoint (flash-next, which ships none) out of
+  // this sweep: there is nothing here to tune for it.
   const sizes: ModelSize[] =
     sizeArg === "both"
       ? draftingSizes()

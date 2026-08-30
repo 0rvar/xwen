@@ -1,7 +1,7 @@
 # xwen
 
-Pure-Rust, Metal-only inference engine for **Qwen3.6-27B**, **Qwen3.6-35B-A3B** and
-**Qwen3.8-27B** (GGUF), with **Qwen3.8-Flash-Next** in progress, optimized for a single
+Pure-Rust, Metal-only inference engine for **Qwen3.8-Flash-Next** (the default),
+**Qwen3.6-27B**, **Qwen3.6-35B-A3B** and **Qwen3.8-27B** (GGUF), optimized for a single
 Apple Silicon machine (M5 Max). Manual fork of the
 laguna/maxuna engine: candle-based, mmap no-copy weight loading, vendored Metal
 kernels, speculative decoding, and an HTTP server speaking Anthropic Messages and
@@ -28,15 +28,27 @@ SDK — see flake.nix). `cargo build --release`. Ops tests need a Metal device.
 
 ## Models
 
-Three shipped checkpoints, all Q4_K_M, plus one in progress — all resolved through the
-HF cache and downloaded on first use:
+Four checkpoints, all Q4_K_M — all resolved through the HF cache and downloaded on
+first use:
 
 | Full name | Repo | `--model-size` | Drafter |
 | --- | --- | --- | --- |
+| `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` (default) | none |
 | `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash block drafter, 3.5 GB |
-| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` (default) | DFlash block drafter, 0.8 GB |
+| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` (serve's default) | DFlash block drafter, 0.8 GB |
 | `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | MTP head, 3.2 GB |
-| `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` | none |
+
+**Flash-Next is the default (2026-08-30), so a zero-flag first run downloads 111 GB**
+across four shards — the notice naming the size prints before the fetch starts, and it
+resumes in place. `xwen fetch` prefetches it; `bun scripts/hf-fetch.ts
+unsloth/Qwen3.8-Flash-Next-GGUF <shard>... --jobs 2` does the same with parallel,
+verified, resumable downloads. Pass `--model-size 35b` (or `27b`, `3.8-27b`) for a
+~20 GB checkpoint instead.
+
+**`xwen serve` defaults to `Qwen3.6-35B-A3B`**, not to Flash-Next, because it cannot
+serve Flash-Next yet (below). A zero-flag `xwen serve` says which checkpoint it picked
+and why; `--model-size flash-next` is still refused outright rather than silently
+substituted.
 
 **Qwen3.8-Flash-Next is EXPERIMENTAL and CLI-ONLY (P3, 2026-08-29)** — unlike
 Qwen3.8-27B this one is a whole second architecture rather than a registry entry over an
@@ -57,7 +69,7 @@ names); the HTTP APIs take the **full names only**. Qwen3.8-27B (added 2026-08-1
 the same graph as Qwen3.6-27B — its config is byte-identical — so it needs no model math
 of its own. It ships no DFlash sidecar, but it does ship a first-party MTP head, which is
 a different drafter shape and became a second drafter implementation (2026-08-15); all
-three checkpoints now speculate.
+three qwen35 checkpoints speculate. Flash-Next does not (below).
 
 ## Thinking, effort and sampling
 
@@ -106,7 +118,8 @@ superseded reasoning, 3.8 keeps it).
 
 ## Speculative decoding
 
-Every checkpoint ships a drafter and speculates, in one of **two kinds**. The Qwen 3.6
+The three qwen35 checkpoints ship a drafter and speculate, in one of **two kinds**;
+Flash-Next ships none and decodes plain, saying so in a startup line. The Qwen 3.6
 pair carry DFlash sidecars: block drafters that propose a whole block out of one forward,
 so depth is nearly free (`--draft-max` defaults to 15, a structural ceiling rather than a
 fitted number). Qwen3.8-27B carries a first-party MTP head, which is a different shape —
@@ -114,7 +127,8 @@ one extra transformer layer that chains a forward per step and feeds itself, so 
 costs linearly and is fitted rather than capped (4).
 
 Drafting is **opt-out** as of 2026-07-29: a zero-flag run speculates with the
-checkpoint's official sidecar, `--no-draft` decodes plain, and `--draft <gguf>` swaps in
+checkpoint's official sidecar where one exists (which the default checkpoint's does
+not), `--no-draft` decodes plain, and `--draft <gguf>` swaps in
 a custom drafter. Speculation is decided **per checkpoint, not per process**: a server
 drafts for each checkpoint it loads with that checkpoint's own sidecar, and the
 dashboard's `draft` cell reports what the LOADED checkpoint is doing rather than what was

@@ -1284,9 +1284,12 @@ pub fn init_template() -> String {
 # Command-line flags win over this file, and each one that contradicts a value
 # set here prints a warning naming the flag, both values and this path.
 
-# The model GGUF to serve. Unset (and no --model), the official checkpoint is
-# used, fetched into the Hugging Face cache on first use (`xwen fetch`
-# prefetches).
+# The model GGUF to serve. Unset (and no --model), the server's default
+# checkpoint is used, fetched into the Hugging Face cache on first use
+# (`xwen fetch` prefetches). That default is Qwen3.6-35B-A3B, not xwen's overall
+# default: the server cannot run Qwen3.8-Flash-Next until its recurrent state
+# rides in a cache image, so it serves the best checkpoint it can and says so at
+# startup. `--model-size` picks another.
 # model = "/path/to/Qwen3.6-35B-A3B-Q4_K_M.gguf"
 
 # Address to bind. Loopback keeps the server off the network; "0.0.0.0" accepts

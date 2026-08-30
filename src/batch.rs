@@ -210,7 +210,11 @@ pub enum ThinkingSpec {
 
 impl BatchRequest {
     /// The checkpoint this request names, or the default one when it names
-    /// none.
+    /// none — the plain [`Model::default`], since `xwen batch` is a CLI
+    /// one-shot and runs every checkpoint including the unservable one. The
+    /// server's batch route resolves against the checkpoint it is SERVING
+    /// instead and rewrites the field before the runner sees it
+    /// (`serve::batch`), so this default is never the answer there.
     pub fn model(&self) -> Result<Model> {
         match &self.model {
             Some(name) => name.parse().map_err(|e: String| anyhow!("batch: {e}")),

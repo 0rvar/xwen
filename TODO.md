@@ -2120,7 +2120,15 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     refusal is enforced in code (`Model::servable()` false: startup refusal for
     both the registry entry and a custom qwen4exp GGUF, never listed, 400 on a
     request naming it; `auto_fetch()` and `supports_drafting()` false too), so
-    this bullet is now the P4 STARTING POINT rather than a warning. A qwen4exp
+    this bullet is now the P4 STARTING POINT rather than a warning.
+    **2026-08-30 annotation: Flash-Next is now the PLAIN DEFAULT**
+    (`Model::default()`), so this refusal is what a zero-flag `xwen serve` hits
+    — it falls back to `Model::default_servable()` (Qwen3.6-35B-A3B) and logs
+    one line saying which and why. The three gates are unchanged; only the
+    default moved. Closing this item makes `default_servable()` return
+    `default()` and retires both the fallback and its line, so P4's definition of
+    done now includes deleting them (the hub test asserts the two converge once
+    the default is servable). A qwen4exp
     target would 500 on the snapshot path, because prefix-cache
     snapshots, host snapshots and the disk tier do not carry the new recurrent
     state (indexer raw-key caches, PLE conv window, the 2-id token history) — D15

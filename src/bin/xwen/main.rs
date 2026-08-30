@@ -21,8 +21,10 @@ use xwen::serve::config::{CliOverrides, DraftMode, ServeToml};
 #[derive(Parser)]
 #[command(
     name = "xwen",
-    about = "Qwen 3.6 inference on Metal. Bare `xwen` serves over HTTP \
-             with the live dashboard; subcommands cover everything else.",
+    about = "Qwen inference on Metal, defaulting to Qwen3.8-Flash-Next. Bare \
+             `xwen` serves over HTTP with the live dashboard (which serves \
+             Qwen3.6-35B-A3B until Flash-Next is servable); subcommands cover \
+             everything else.",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -37,11 +39,12 @@ struct Cli {
 /// Which official checkpoint to run.
 #[derive(Parser)]
 struct ModelArgs {
-    /// Which official checkpoint to run: the dense Qwen3.6-27B, the
-    /// Qwen3.6-35B-A3B MoE (the default), the dense Qwen3.8-27B, or
-    /// Qwen3.8-Flash-Next (`flash-next` — experimental, CLI-only: `xwen serve`
-    /// refuses it until snapshot support lands). Each checkpoint's full name
-    /// works here too. A
+    /// Which official checkpoint to run: Qwen3.8-Flash-Next (`flash-next` —
+    /// the default, and EXPERIMENTAL; CLI-only, since `xwen serve` refuses it
+    /// until snapshot support lands), the dense Qwen3.6-27B, the
+    /// Qwen3.6-35B-A3B MoE, or the dense Qwen3.8-27B. `xwen serve` defaults to
+    /// Qwen3.6-35B-A3B instead, because it cannot run the default yet.
+    /// Each checkpoint's full name works here too. A
     /// `--model <gguf>` path
     /// overrides the target file outright; for the one-shot commands this flag
     /// still selects the family (and so the drafter sidecar), while
@@ -53,7 +56,10 @@ struct ModelArgs {
 }
 
 impl ModelArgs {
-    /// The selected checkpoint, or the default when the flag was omitted.
+    /// The selected checkpoint, or [`Model::default`] when the flag was
+    /// omitted. Serve wants [`Model::default_servable`] for the omitted case
+    /// instead and substitutes it itself (`run_serve`); every other command can
+    /// run the plain default.
     fn size(&self) -> Model {
         self.model_size.unwrap_or_default()
     }
@@ -264,15 +270,18 @@ enum Cmd {
     /// Ensure the official model + drafter sidecar are in the Hugging Face
     /// cache (idempotent: anything already cached is not touched), then print
     /// their paths. Every command does this lazily for whatever it needs; this
-    /// just prefetches.
+    /// just prefetches. With no --model-size that is the default checkpoint,
+    /// Qwen3.8-Flash-Next: four shards and 111 GB, so name a size for anything
+    /// smaller.
     Fetch {
         #[command(flatten)]
         select: ModelArgs,
     },
     /// Dump GGUF metadata and tensor listing.
     Inspect {
-        /// Model GGUF (default: the official checkpoint, ensured in the Hugging
-        /// Face cache — downloaded on first use, cached forever after).
+        /// Model GGUF (default: the checkpoint --model-size names, ensured in
+        /// the Hugging Face cache — downloaded on first use, cached forever
+        /// after).
         #[arg(short, long)]
         model: Option<PathBuf>,
         #[command(flatten)]
@@ -280,8 +289,9 @@ enum Cmd {
     },
     /// One-shot generation from a prompt.
     Generate {
-        /// Model GGUF (default: the official checkpoint, ensured in the Hugging
-        /// Face cache — downloaded on first use, cached forever after).
+        /// Model GGUF (default: the checkpoint --model-size names, ensured in
+        /// the Hugging Face cache — downloaded on first use, cached forever
+        /// after).
         #[arg(short, long)]
         model: Option<PathBuf>,
         #[command(flatten)]
@@ -336,8 +346,9 @@ enum Cmd {
     },
     /// Interactive chat REPL.
     Chat {
-        /// Model GGUF (default: the official checkpoint, ensured in the Hugging
-        /// Face cache — downloaded on first use, cached forever after).
+        /// Model GGUF (default: the checkpoint --model-size names, ensured in
+        /// the Hugging Face cache — downloaded on first use, cached forever
+        /// after).
         #[arg(short, long)]
         model: Option<PathBuf>,
         #[command(flatten)]
@@ -439,7 +450,8 @@ struct ServeArgs {
     #[arg(long)]
     init: bool,
     /// Model GGUF to serve (default: the config file's `model`, else the
-    /// official checkpoint from the Hugging Face cache).
+    /// server's default checkpoint from the Hugging Face cache — Qwen3.6-35B-A3B,
+    /// not the CLI's Qwen3.8-Flash-Next, which the server cannot run yet).
     #[arg(short, long)]
     model: Option<PathBuf>,
     #[command(flatten)]
@@ -683,19 +695,39 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     let source = file.as_ref().map(|_| path.as_path());
     let file = file.unwrap_or_else(ServeToml::default);
 
-    // Neither the CLI nor the config named a model: serve the hub-cached
-    // official checkpoint. Injected into the CLI side of the merge (rather than
-    // inside `resolve`) so config resolution itself stays pure and testable.
     let selected = args.select.model_size;
     // Before anything is resolved or fetched: a `--model-size` naming a
     // checkpoint the server cannot run is refused here rather than after a
     // 111 GB download and a load that fails every request.
-    if !args.select.size().servable() {
-        bail!("{}", args.select.size().unservable_message());
+    if let Some(size) = selected {
+        ensure!(size.servable(), "{}", size.unservable_message());
     }
     let mut overrides = args.overrides();
+    // Neither the CLI nor the config named a model: serve the hub-cached
+    // official checkpoint. Injected into the CLI side of the merge (rather than
+    // inside `resolve`) so config resolution itself stays pure and testable.
     if overrides.model.is_none() && file.model.is_none() {
-        overrides.model = Some(resolve_model(None, args.select.size())?);
+        // A run that named nothing asked for no checkpoint in particular, so an
+        // unservable default is not a refusal — the server falls back to the
+        // best checkpoint it can run and says which, and why, since otherwise
+        // the surprise is a different model answering than the CLI would.
+        // The notice belongs here rather than beside the check above: a config
+        // that names its own model file is not falling back to anything.
+        let size = selected.unwrap_or_else(|| {
+            let default = Model::default();
+            if default.servable() {
+                return default;
+            }
+            let fallback = Model::default_servable();
+            eprintln!(
+                "xwen: {} cannot be served yet ({}); serving {}. Pass --model-size to choose.",
+                default.full_name(),
+                default.unservable_reason(),
+                fallback.full_name(),
+            );
+            fallback
+        });
+        overrides.model = Some(resolve_model(None, size)?);
     }
 
     let (settings, warnings) = xwen::serve::config::resolve(&file, source, &overrides)?;
@@ -999,10 +1031,21 @@ fn build_generator(
             .clone()
             .unwrap_or_else(|| PathBuf::from("official"));
         let Some(path) = resolve_draft(&requested, size, explicit)? else {
-            eprintln!(
-                "xwen: no drafter available for {}; decoding without speculation",
-                size.full_name()
-            );
+            // Two different facts, and the zero-flag default run hits the first
+            // one: a checkpoint with no verify seam was never going to
+            // speculate, so that is a statement of how it decodes, not a
+            // warning that something went missing.
+            if !size.supports_drafting() {
+                eprintln!(
+                    "xwen: {} decodes without speculation (no drafter exists for its graph yet)",
+                    size.full_name()
+                );
+            } else {
+                eprintln!(
+                    "xwen: no drafter available for {}; decoding without speculation",
+                    size.full_name()
+                );
+            }
             return Ok(generator);
         };
         let draft_start = std::time::Instant::now();

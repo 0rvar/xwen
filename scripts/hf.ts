@@ -6,9 +6,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** The checkpoints, mirroring the `Checkpoint` consts in src/hub.rs. `35b` is
- *  the default everywhere the size is not named, matching the CLI's
- *  `--model-size` default. `drafter` is null for a checkpoint whose release
+/** The checkpoints, mirroring the `Checkpoint` consts in src/hub.rs.
+ *  `flash-next` is the default everywhere the size is not named, matching the
+ *  CLI's `--model-size` default. `drafter` is null for a checkpoint whose release
  *  ships no sidecar at all; every current one ships one, in one of the two
  *  KINDS — a DFlash block drafter on the 3.6 pair, an MTP head on the 3.8 —
  *  which the scripts only care about where the kind changes what a run costs. */
@@ -48,9 +48,12 @@ export const CHECKPOINTS = {
 
 export type ModelSize = keyof typeof CHECKPOINTS;
 
-/** `$XWEN_MODEL_SIZE`, else `35b`. Throws on an unknown size. */
+/** `$XWEN_MODEL_SIZE`, else `flash-next` — the binary's own default. A script
+ *  that CANNOT run the default checkpoint (parity-gate, which has no oracle for
+ *  the qwen4exp graph) must name its size rather than lean on this. Throws on an
+ *  unknown size. */
 export function defaultSize(): ModelSize {
-  const s = (process.env.XWEN_MODEL_SIZE ?? "35b").toLowerCase();
+  const s = (process.env.XWEN_MODEL_SIZE ?? "flash-next").toLowerCase();
   if (s in CHECKPOINTS) return s as ModelSize;
   throw new Error(`unknown model size ${s} (expected ${Object.keys(CHECKPOINTS).join("|")})`);
 }
@@ -114,9 +117,10 @@ export function draftingSizes(): ModelSize[] {
   return (Object.keys(CHECKPOINTS) as ModelSize[]).filter((size) => CHECKPOINTS[size].drafter);
 }
 
-// CLI: `bun scripts/hf.ts [model|drafter] [27b|35b]` prints the resolved cache
-// path, for shell commands that need an explicit path (ref-dump.sh,
-// llama-server, …). The size defaults to $XWEN_MODEL_SIZE, else 35b.
+// CLI: `bun scripts/hf.ts [model|drafter] [27b|35b|3.8-27b|flash-next]` prints
+// the resolved cache path, for shell commands that need an explicit path
+// (ref-dump.sh, llama-server, …). The size defaults to $XWEN_MODEL_SIZE, else
+// flash-next.
 if (import.meta.main) {
   const which = process.argv[2] ?? "model";
   const size = (process.argv[3] as ModelSize | undefined) ?? defaultSize();

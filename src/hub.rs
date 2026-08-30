@@ -29,8 +29,9 @@ use crate::drafter::DrafterKind;
 pub enum Model {
     /// Qwen3.6-27B, dense (`qwen35`).
     Qwen27B,
-    /// Qwen3.6-35B-A3B, MoE (`qwen35moe`) — the bring-up model.
-    #[default]
+    /// Qwen3.6-35B-A3B, MoE (`qwen35moe`) — the bring-up model, and still
+    /// [`Model::default_servable`]: the checkpoint `xwen serve` falls back to
+    /// while the plain default cannot be served.
     Qwen35BA3B,
     /// Qwen3.8-27B, dense (`qwen35`). The 3.8 release's config is byte-identical
     /// to [`Model::Qwen27B`]'s, so the two run the same graph at the same
@@ -43,6 +44,11 @@ pub enum Model {
     /// that is not a ggml-org conversion (Qwen published no GGUF; Unsloth's
     /// UD-Q4_K_XL is the de-facto default), and the first that ships no drafter
     /// sidecar at all.
+    ///
+    /// The default checkpoint: it is the best model here, and every mode that
+    /// can run it runs it with no flags. `xwen serve` is the one that cannot
+    /// (see [`Model::servable`]) and falls back to [`Model::default_servable`].
+    #[default]
     Qwen38FlashNext,
 }
 
@@ -433,16 +439,51 @@ impl Model {
         }
     }
 
+    /// The checkpoint `xwen serve` runs when nothing named one: [`Model::default`]
+    /// when the server can run it, and otherwise the best one it can.
+    ///
+    /// Separate from `default` because the two answer different questions.
+    /// `default` is "the best checkpoint here", which every CLI one-shot runs
+    /// with no flags; this is "the best one the SERVER can run". They differ
+    /// only while the plain default is unservable — this is serve's zero-flag
+    /// default until the qwen4exp snapshot work (TODO.md P4) makes the plain
+    /// default servable, at which point the branch below stops being taken and
+    /// this returns the same answer `default` does.
+    ///
+    /// The fallback is NAMED rather than derived from [`MODELS`], because that
+    /// array's order is the one `/v1/models` prints in — a display order, not a
+    /// preference order. Taking its first servable entry would hand the server
+    /// the 27B, which decodes at a quarter of the 35B-A3B's rate: a silent
+    /// regression for everyone already serving, dressed up as a derivation.
+    pub fn default_servable() -> Model {
+        let default = Model::default();
+        if default.servable() {
+            return default;
+        }
+        Model::Qwen35BA3B
+    }
+
+    /// Why serve cannot run this checkpoint, as a clause that reads inside a
+    /// sentence. The one place the reason is written: the startup refusal and
+    /// the zero-flag fallback notice both quote it, so they cannot drift into
+    /// two explanations of the same limitation.
+    ///
+    /// One reason, not a per-checkpoint one, because there is one unservable
+    /// graph — asking a servable checkpoint gets the answer it would have had.
+    pub const fn unservable_reason(self) -> &'static str {
+        "the qwen4exp recurrent state (the QSA raw-key caches, the PLE conv window and its \
+         n-gram token history) is not carried by any cache image, and the server snapshots, \
+         rewinds and pages conversations out on its ordinary path"
+    }
+
     /// The one sentence every surface says when it refuses an unservable
     /// checkpoint, so the CLI and the APIs cannot drift into two explanations.
     pub fn unservable_message(self) -> String {
         format!(
-            "{} cannot be served yet: the qwen4exp recurrent state (the QSA raw-key caches, \
-             the PLE conv window and its n-gram token history) is not carried by any cache \
-             image, and the server snapshots, rewinds and pages conversations out on its \
-             ordinary path. Use the CLI for now — `xwen generate`, `xwen chat` or \
-             `xwen batch` — which never move cache state",
-            self.full_name()
+            "{} cannot be served yet: {}. Use the CLI for now — `xwen generate`, `xwen chat` \
+             or `xwen batch` — which never move cache state",
+            self.full_name(),
+            self.unservable_reason(),
         )
     }
 
@@ -847,12 +888,6 @@ pub fn cached_model(model: Model) -> Option<PathBuf> {
 /// for a checkpoint that ships none at all. Offline.
 pub fn cached_drafter(model: Model) -> Option<PathBuf> {
     cached_file(model.repo(), model.drafter_file()?)
-}
-
-/// The cached drafter of the default model, or `None`. Offline. The zero-arg
-/// entry point for callers that have no model selection to pass.
-pub fn official_drafter() -> Option<PathBuf> {
-    cached_drafter(Model::default())
 }
 
 /// Idempotent ensure: the cached path when present (no network), otherwise a
@@ -1532,7 +1567,7 @@ mod tests {
     #[test]
     fn resolves_through_refs_main() {
         let root = scratch("refs");
-        let model = Model::default();
+        let model = Model::Qwen35BA3B;
         install(&root, "cafe01", model.repo(), model.file());
         let path = cached_file_in(&root, model.repo(), model.file()).unwrap();
         assert!(
@@ -1546,7 +1581,7 @@ mod tests {
     #[test]
     fn a_dangling_blob_symlink_is_a_miss() {
         let root = scratch("dangling");
-        let model = Model::default();
+        let model = Model::Qwen35BA3B;
         install(&root, "cafe03", model.repo(), model.file());
         std::fs::remove_file(repo_dir(&root, model.repo()).join("blobs/aa00")).unwrap();
         assert!(cached_file_in(&root, model.repo(), model.file()).is_none());
@@ -1556,7 +1591,7 @@ mod tests {
     #[test]
     fn a_missing_repo_is_a_miss() {
         let root = scratch("missing");
-        let model = Model::default();
+        let model = Model::Qwen35BA3B;
         assert!(cached_file_in(&root, model.repo(), model.file()).is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1577,6 +1612,32 @@ mod tests {
         );
         assert!(cached_file_in(&root, Model::Qwen27B.repo(), Model::Qwen27B.file()).is_none());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A zero-flag run gets the best checkpoint here, not the one bring-up
+    /// started on. Pinned because the default is a product decision that lives
+    /// in one derive attribute, where nothing else would notice it moving.
+    #[test]
+    fn the_default_is_flash_next() {
+        assert_eq!(Model::default(), Model::Qwen38FlashNext);
+        assert_eq!(Model::default().full_name(), "Qwen3.8-Flash-Next");
+    }
+
+    /// Serve answers with a checkpoint it can actually run. While the plain
+    /// default is unservable that is a different checkpoint from
+    /// [`Model::default`], and the difference is the whole reason the server
+    /// prints a line about which one it picked.
+    #[test]
+    fn serve_default_is_the_first_servable_checkpoint() {
+        let fallback = Model::default_servable();
+        assert!(fallback.servable(), "{fallback}");
+        assert_eq!(fallback, Model::Qwen35BA3B);
+        // The fallback exists only because the default is unservable. Once it
+        // is servable the two must be the same checkpoint, or a server would
+        // keep serving the older model for no reason anyone wrote down.
+        if Model::default().servable() {
+            assert_eq!(fallback, Model::default());
+        }
     }
 
     #[test]

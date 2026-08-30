@@ -163,7 +163,10 @@ function parseArgs(argv: string[]): Opts {
   // officialModel() throws with fetch instructions when the cache is empty —
   // only reached when no explicit model was named, so a --model run never
   // requires the official file to be present.
-  const model = explicit ?? officialModel(size);
+  // The 35B is pinned rather than deferred to hf.ts's default: this gate cannot
+  // run xwen's default checkpoint (there is no llama.cpp oracle for the qwen4exp
+  // graph, and its harness panics), so it must name a size of its own.
+  const model = explicit ?? officialModel(size ?? "35b");
   // EVERY run is suffixed by the checkpoint's basename — there are two official
   // checkpoints (27B dense, 35B-A3B MoE) with different weights, different
   // architectures and therefore different floors, so nothing may share a parity
