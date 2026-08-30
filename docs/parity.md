@@ -424,7 +424,11 @@ flat 512 before), and the logits-dump ppl pass reads the same accessor so that t
 tier scores the chunk shape generate really runs. It moves numbers only through
 chunk-boundary accumulation order, not arithmetic, but a candidate dumped at a different
 chunk than its reference is comparing two shapes the report does not name, so
-`parity-gate.ts` strips it from the run env (`baseEnv()`) like the others. The 35B's
+`parity-gate.ts` strips it from the run env (`baseEnv()`) like the others. (One name-space
+caveat, noted 2026-08-30: `baseEnv()` strips only `XWEN_*` names, so an ambient
+`CANDLE_*` variable — e.g. `CANDLE_METAL_COMPUTE_PER_BUFFER` — WOULD leak into gate
+runs. Nothing sets one today and the knob is refuted anyway; if candle env tuning ever
+returns, extend the strip list first.) The 35B's
 2048 default was graded the same day (7378bb1, 2026-08-30): ALL PASS, 6 tiers, ppl
 Δnll 0.000791 with the candidate provenance recording `seq_len: 2048` — digit-identical
 to the 512-era figure, so the chunk moves the ppl tier by less than the printed precision.

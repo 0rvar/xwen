@@ -909,7 +909,10 @@ itself costs +9.2 µs/token at 925 and +2.4 at 4k — a per-chunk fixed price, n
 length-dependent one.)
 
 *Command-buffer batching.* `CANDLE_METAL_COMPUTE_PER_BUFFER` swept over 10 / 200 / 1000
-against candle's default 50 at 4k: all four means within 0.9%. A 100x range of batching
+against candle's default 50 at 4k: all four means within 0.9%. (Decode-side coda,
+2026-08-30: the same knob at 200/1000 LOSES decode monotonically with context — −3.6%
+@1937 to −6.8% @7606 at 1000, greedy byte-identical — so 50 is not merely adequate, it
+is the right side of the curve; see the technique-survey ledger item.) A 100x range of batching
 granularity moves nothing, so the cost is neither submission overhead nor a per-buffer
 fixed price.
 

@@ -2673,11 +2673,15 @@ nothing in this repo has done before; treat that as part of their cost.
   working around it, and the floor is what every dispatch-count fusion on the ledger is
   ultimately buying against. Estimate unknown — nobody has profiled the CPU side of a
   dispatch here, and it should be profiled before it is patched.
-- [ ] **`CANDLE_METAL_COMPUTE_PER_BUFFER` default (50, per DISPATCH not per op —
-  `commands.rs:18,162`).** A decode step issues ~77 dispatches, so it rolls the command
-  buffer about twice a token. A cadence A/B was in flight as this section was written;
-  **its result and any default change belong in this line** (the 2026-08-08 sweep found
-  10/200/1000 within 0.9% at 4k PREFILL, which does not speak to decode).
+- [x] **`CANDLE_METAL_COMPUTE_PER_BUFFER` default (50, per DISPATCH not per op —
+  `commands.rs:18,162`): REFUTED 2026-08-30, keep 50.** The decode-side A/B (Flash-Next,
+  3 rounds rotated, 60 s idles, anchors clean, `powermode 0`): 1000 lost every cell,
+  monotonically with context — decode −3.6% @1937, −6.2% @3803, −6.8% @7606 (prefill
+  −6.4% there too); 200 a wash short, −1.6 to −2.0% long (35B same direction). Greedy
+  byte-identical across arms, so it is pure performance, and the 2026-08-08 prefill
+  sweep (10-1000 within 0.9%) plus this decode result close the knob in both directions:
+  frequent rollovers are FREE-to-beneficial (plausibly by keeping the in-flight pool and
+  the `prev_ce_outputs` fence map small). No default change; nobody should set the var.
 
 Hazard that applies to every item above: candle's pooled-buffer recycle fires at
 `strong_count == 1` with no in-flight check (`device.rs:488-503`), so a cadence or
