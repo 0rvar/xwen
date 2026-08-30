@@ -2347,7 +2347,7 @@ mod tests {
             .enumerate()
             .map(|(il, _)| (plane(il as u8), plane(0x40 + il as u8)))
             .collect();
-        Arc::new(HostFullKv::new(pos, N_KV, HEAD_DIM, planes).unwrap())
+        Arc::new(HostFullKv::new(pos, N_KV, HEAD_DIM, planes, Vec::new(), 0).unwrap())
     }
 
     /// Drafter rows covering `[0, pos)`, in the shape the drafter's own cache has.

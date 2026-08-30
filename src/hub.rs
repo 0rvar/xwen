@@ -29,9 +29,10 @@ use crate::drafter::DrafterKind;
 pub enum Model {
     /// Qwen3.6-27B, dense (`qwen35`).
     Qwen27B,
-    /// Qwen3.6-35B-A3B, MoE (`qwen35moe`) — the bring-up model, and still
-    /// [`Model::default_servable`]: the checkpoint `xwen serve` falls back to
-    /// while the plain default cannot be served.
+    /// Qwen3.6-35B-A3B, MoE (`qwen35moe`) — the bring-up model, and the
+    /// checkpoint [`Model::default_servable`] names as its fallback for a plain
+    /// default a cache-moving surface cannot run. Nothing takes that branch
+    /// today.
     Qwen35BA3B,
     /// Qwen3.8-27B, dense (`qwen35`). The 3.8 release's config is byte-identical
     /// to [`Model::Qwen27B`]'s, so the two run the same graph at the same
@@ -45,9 +46,12 @@ pub enum Model {
     /// UD-Q4_K_XL is the de-facto default), and the first that ships no drafter
     /// sidecar at all.
     ///
-    /// The default checkpoint: it is the best model here, and every mode that
-    /// can run it runs it with no flags. `xwen serve` is the one that cannot
-    /// (see [`Model::servable`]) and falls back to [`Model::default_servable`].
+    /// The default checkpoint, on every surface: it is the best model here and a
+    /// zero-flag run of any mode runs it. `xwen serve` and `xwen batch` joined
+    /// the rest in P4 (2026-08-30), when the cache images learned to carry the
+    /// QSA indexer rows and the PLE state. What it still does NOT do is download
+    /// itself inside a request ([`Model::auto_fetch`]) or draft
+    /// ([`Model::supports_drafting`]).
     #[default]
     Qwen38FlashNext,
 }
@@ -418,28 +422,20 @@ impl Model {
     /// Whether the surfaces that MOVE cache state can run this checkpoint at
     /// all: `xwen serve` and `xwen batch`.
     ///
-    /// False for Qwen3.8-Flash-Next, and not as a policy choice: both surfaces
-    /// move a conversation's whole cache state around on their ORDINARY path,
-    /// and qwen4exp refuses every one of those moves until P4. In the server a
-    /// planned snapshot stop takes `take_cache_snapshot` after almost every
-    /// first prefill (`serve/engine.rs`), a shared-prefix rewind takes
-    /// `restore_cache_snapshot`, and a second conversation arriving pages the
-    /// live one out with `export_full_kv`. `xwen batch` does the same two things
-    /// for its own reasons: the shared prefix is prefilled once and snapshotted
-    /// (`batch::run_batch`), and every enum-scored field snapshots and restores
-    /// around each option it scores (`batch::score_field`). All of those are
-    /// `XwenModel::refuse_state_transfer` errors on qwen4exp, because the QSA
-    /// raw-key planes, the PLE conv window and its n-gram history are carried by
-    /// no cache image. So a qwen4exp file on either surface would not be slow or
-    /// degraded, it would fail nearly every request — which is worth refusing up
-    /// front rather than mid-run.
+    /// True for every checkpoint in the registry, and has been since the
+    /// qwen4exp cache images landed (2026-08-30): the QSA indexers' raw keys
+    /// travel with the full-attention rows in a `HostFullKv` and the PLE conv
+    /// window and n-gram history ride on their layer's snapshot entry, so a
+    /// snapshot, a rewind, a page-out and a stored image all carry the whole
+    /// conversation on qwen4exp exactly as they do on the DeltaNet trunk.
     ///
-    /// `xwen generate` and `xwen chat` run the checkpoint fine: they never move
-    /// cache state. This gates the server and the batch runner only.
+    /// Kept as a method rather than deleted because it is the question those
+    /// surfaces actually ask, and the next architecture that arrives half-ported
+    /// needs somewhere to say no. It is not a policy knob: a checkpoint answers
+    /// false here only while some part of its state has no image.
     pub const fn servable(self) -> bool {
         match self {
-            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B => true,
-            Model::Qwen38FlashNext => false,
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => true,
         }
     }
 
@@ -453,11 +449,10 @@ impl Model {
     /// Separate from `default` because the two answer different questions.
     /// `default` is "the best checkpoint here", which `xwen generate` and
     /// `xwen chat` run with no flags; this is "the best one a surface that moves
-    /// cache state can run". They differ only while the plain default is
-    /// unservable — this is the zero-flag default there until the qwen4exp
-    /// snapshot work (TODO.md P4) makes the plain default servable, at which
-    /// point the branch below stops being taken and this returns the same answer
-    /// `default` does.
+    /// cache state can run". Every registry checkpoint is servable as of
+    /// 2026-08-30, so the two answer the same today and the fallback below is
+    /// never taken — it is kept for the next architecture that arrives before
+    /// its cache images do.
     ///
     /// The fallback is NAMED rather than derived from [`MODELS`], because that
     /// array's order is the one `/v1/models` prints in — a display order, not a
@@ -470,61 +465,6 @@ impl Model {
             return default;
         }
         Model::Qwen35BA3B
-    }
-
-    /// Why the cache-moving surfaces cannot run this checkpoint, as a clause
-    /// that reads inside a sentence. The one place the reason is written: every
-    /// refusal and every zero-flag fallback notice quotes it, so they cannot
-    /// drift into several explanations of the same limitation.
-    ///
-    /// The MODEL's half of the reason only — what the state is and what carries
-    /// it. Each surface adds what IT does with a cache image, because those
-    /// differ (the server snapshots, rewinds and pages conversations out; batch
-    /// snapshots a shared prefix and rescores fields off it) and a reason that
-    /// named one of them would be wrong on the other.
-    ///
-    /// One reason, not a per-checkpoint one, because there is one unservable
-    /// graph — asking a servable checkpoint gets the answer it would have had.
-    pub const fn unservable_reason(self) -> &'static str {
-        "the qwen4exp recurrent state (the QSA raw-key caches, the PLE conv window and its \
-         n-gram token history) is not carried by any cache image"
-    }
-
-    /// The one sentence every serve surface says when it refuses an unservable
-    /// checkpoint, so the CLI and the APIs cannot drift into two explanations.
-    pub fn unservable_message(self) -> String {
-        format!(
-            "{} cannot be served yet: {}, and the server snapshots, rewinds and pages \
-             conversations out on its ordinary path. Use `xwen generate` or `xwen chat` for \
-             now — they never move cache state",
-            self.full_name(),
-            self.unservable_reason(),
-        )
-    }
-
-    /// The same refusal for `xwen batch`, which is in the same boat for the same
-    /// reason and a different set of moves: it prefills the items' shared prefix
-    /// once and snapshots the cache there, and it snapshots and restores around
-    /// every option of an enum-scored field.
-    ///
-    /// Its own sentence rather than a reworded [`Self::unservable_message`],
-    /// because "cannot be served" is not what happened and the escape hatch is
-    /// not the same one — but it quotes the same [`Self::unservable_reason`], so
-    /// the WHY is written once.
-    ///
-    /// Deliberately does not offer `XWEN_BATCH_NO_CACHE` as a way through: that
-    /// only skips the shared-prefix snapshot, and an item with an enum-scored
-    /// field still snapshots per option, so it would be an escape hatch that
-    /// works until the schema changes.
-    pub fn unbatchable_message(self) -> String {
-        format!(
-            "{} cannot run under `xwen batch` yet: {}, and batch prefills the items' shared \
-             prefix once and replays that snapshot per item (and snapshots again around every \
-             enum-scored field). Use `xwen generate` or `xwen chat` for now — they never move \
-             cache state",
-            self.full_name(),
-            self.unservable_reason(),
-        )
     }
 
     /// Whether this checkpoint's graph can be drafted for at all — by its own
@@ -1068,46 +1008,34 @@ mod tests {
         assert_eq!(Model::Qwen38FlashNext.snapshot_bytes(), 118_038_528);
     }
 
-    /// The three P2 capability gates on the qwen4exp checkpoint, and the fact
-    /// that they are gates rather than the table's shape: every other checkpoint
-    /// answers yes to all three, so a predicate that stopped consulting `self`
-    /// would still pass the rest of the suite.
+    /// The two remaining capability gates on the qwen4exp checkpoint, and the
+    /// fact that they are gates rather than the table's shape: every other
+    /// checkpoint answers yes to both, so a predicate that stopped consulting
+    /// `self` would still pass the rest of the suite.
     ///
     /// Each is a different limitation with a different lifetime, which is why
-    /// they are three predicates and not one "experimental" flag:
-    /// `auto_fetch` is about a 111 GB download and would stay false even after
-    /// the graph is finished; `servable` is P4's cache-image work; and
-    /// `supports_drafting` is D6's missing verify seam.
+    /// they are two predicates and not one "experimental" flag: `auto_fetch` is
+    /// about a 111 GB download and would stay false even after everything else
+    /// is finished, while `supports_drafting` is D6's missing verify seam.
+    /// `servable` used to be a third and no longer is — the cache images carry
+    /// the QSA raw keys and the PLE state as of 2026-08-30, so `xwen serve` and
+    /// `xwen batch` run this checkpoint like any other.
     #[test]
-    fn the_qwen4exp_checkpoint_is_gated_out_of_fetching_serving_and_drafting() {
+    fn the_qwen4exp_checkpoint_is_gated_out_of_fetching_and_drafting() {
         assert!(!Model::Qwen38FlashNext.auto_fetch());
-        assert!(!Model::Qwen38FlashNext.servable());
         assert!(!Model::Qwen38FlashNext.supports_drafting());
+        assert!(Model::Qwen38FlashNext.servable());
 
         for model in [Model::Qwen27B, Model::Qwen35BA3B, Model::Qwen3827B] {
             assert!(model.auto_fetch(), "{model}");
-            assert!(model.servable(), "{model}");
             assert!(model.supports_drafting(), "{model}");
         }
-
-        // The messages name the checkpoint and point somewhere the operator can
-        // actually go — a message that only says "no" is a dead end.
-        let unservable = Model::Qwen38FlashNext.unservable_message();
-        assert!(unservable.contains("Qwen3.8-Flash-Next"), "{unservable}");
-        assert!(unservable.contains("xwen chat"), "{unservable}");
-        // `servable` gates two surfaces, so it owes two messages — and neither
-        // may point at the other's surface as the way out, which is the mistake
-        // the one-message version made (it sent an operator to `xwen batch`).
-        let unbatchable = Model::Qwen38FlashNext.unbatchable_message();
-        assert!(unbatchable.contains("Qwen3.8-Flash-Next"), "{unbatchable}");
-        assert!(unbatchable.contains("xwen chat"), "{unbatchable}");
-        for message in [&unservable, &unbatchable] {
-            let offered = message.split_once("Use ").expect("a way out").1;
-            assert!(
-                !offered.contains("xwen serve") && !offered.contains("xwen batch"),
-                "a refusal must not send the operator to the other refused surface: {message}"
-            );
+        for model in MODELS {
+            assert!(model.servable(), "{model}");
         }
+
+        // The message names the checkpoint and points somewhere the operator can
+        // actually go — a message that only says "no" is a dead end.
         let undraftable = Model::Qwen38FlashNext.no_drafting_message();
         assert!(undraftable.contains("Qwen3.8-Flash-Next"), "{undraftable}");
         assert!(undraftable.contains("--no-draft"), "{undraftable}");
@@ -1676,27 +1604,23 @@ mod tests {
         assert_eq!(Model::default().full_name(), "Qwen3.8-Flash-Next");
     }
 
-    /// Serve answers with a checkpoint it can actually run. While the plain
-    /// default is unservable that is a different checkpoint from
-    /// [`Model::default`], and the difference is the whole reason the server
-    /// prints a line about which one it picked.
+    /// Serve answers with a checkpoint it can actually run — which, now that
+    /// every checkpoint's state has a cache image, is the plain default. The
+    /// fallback rule stays because the question it answers stays; what changed
+    /// is that nothing takes the fallback branch.
     #[test]
     fn serve_default_is_the_first_servable_checkpoint() {
         let fallback = Model::default_servable();
         assert!(fallback.servable(), "{fallback}");
-        assert_eq!(fallback, Model::Qwen35BA3B);
-        // The fallback exists only because the default is unservable. Once it
-        // is servable the two must be the same checkpoint, or a server would
-        // keep serving the older model for no reason anyone wrote down.
-        if Model::default().servable() {
-            assert_eq!(fallback, Model::default());
-        }
+        // A server must not keep serving an older model for a reason nobody
+        // wrote down: while the default is servable the two converge.
+        assert_eq!(fallback, Model::default());
     }
 
-    /// `xwen batch` answers with the same zero-flag checkpoint the server does,
-    /// because it is unservable for the same reason: it snapshots the items'
+    /// `xwen batch` answers with the same zero-flag checkpoint the server does:
+    /// both move cache state on their ordinary path — batch snapshots the items'
     /// shared prefix and restores per item, and snapshots again around every
-    /// enum-scored option.
+    /// enum-scored option — so both resolve through the same rule.
     ///
     /// Pinned across the two modules rather than inside either: the two defaults
     /// are resolved by different code (`BatchRequest::model`, `run_serve`), and
@@ -1707,6 +1631,7 @@ mod tests {
         let absent: crate::batch::BatchRequest =
             serde_json::from_str(r#"{ "items": [] }"#).unwrap();
         assert_eq!(absent.model().unwrap(), Model::default_servable());
+        assert_eq!(absent.model().unwrap(), Model::default());
         assert!(absent.model().unwrap().servable());
     }
 

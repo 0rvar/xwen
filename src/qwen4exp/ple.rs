@@ -558,6 +558,38 @@ fn worker(
     std::hint::black_box(sink);
 }
 
+/// A PLE state's two halves as plain host data, for a caller that has to move
+/// them somewhere the state itself cannot go: a cache snapshot, a host image, a
+/// file.
+///
+/// Both halves are already host-side inside [`PleState`] — the conv window is
+/// computed on the CPU (D17) and the history is token ids — so this is a copy,
+/// not a readback. It carries `state_len` so it describes itself: an image that
+/// reaches a differently-shaped layer is rejected rather than reinterpreted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PleImage {
+    /// Raw token history, oldest first, at most `ngram_size - 1` ids.
+    pub history: Vec<u32>,
+    /// The conv window, `[width, state_len]` channel-major, oldest column first.
+    pub conv: Vec<f32>,
+    /// `(conv_kernel - 1) * dilation`, the layer geometry this window belongs to.
+    pub state_len: usize,
+}
+
+/// What a [`PleImage`] claims about its size, with none of its bytes.
+///
+/// The restore checks run twice — once on a device snapshot and once on a host
+/// image read off disk — and both ask the same three questions. Asking them of a
+/// shape rather than of two different image types is what keeps the two paths
+/// from drifting into two sets of rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PleShape {
+    /// Number of f32 elements in the conv window (`width * state_len`).
+    pub conv_len: usize,
+    pub state_len: usize,
+    pub history_len: usize,
+}
+
 /// The PLE layer's recurrent state: everything a forward carries across a chunk
 /// boundary.
 ///
@@ -577,6 +609,12 @@ pub struct PleState {
     /// `(k - 1) * dilation`, kept so the state can validate itself against a
     /// layer without carrying a reference to one.
     state_len: usize,
+    /// `ngram_size - 1`, the exact length `history` settles at after any
+    /// forward — and therefore the bound a restored image must respect. Kept
+    /// for the same reason `state_len` is: an image arriving from a snapshot or
+    /// off disk has to be checked against the layer's geometry, and the state
+    /// is what the checker has in hand.
+    max_history: usize,
     /// The state after EACH token stepped since [`checkpoint`](Self::checkpoint)
     /// armed this state, in token order — `(history, conv window)` per token.
     ///
@@ -623,11 +661,12 @@ impl PleState {
 
     /// A zeroed state, the correct start for a fresh sequence: no history (so
     /// every predecessor slot reads as eos) and a zero conv window.
-    pub fn new(width: usize, state_len: usize) -> Self {
+    pub fn new(width: usize, state_len: usize, max_history: usize) -> Self {
         Self {
             history: Vec::new(),
             conv: vec![0.0; width * state_len],
             state_len,
+            max_history,
             trail: Vec::new(),
             armed: None,
         }
@@ -734,6 +773,96 @@ impl PleState {
         )
     }
 
+    /// A copy of both halves, for a caller that has to move this state
+    /// somewhere it cannot go itself — a cache snapshot, a host image, a file.
+    ///
+    /// The trail is deliberately NOT carried. It exists to answer a partial
+    /// accept inside one speculative verify and is cleared by the rollback that
+    /// consumes it; a snapshot is taken between forwards, where the only state
+    /// that means anything is the committed one.
+    pub fn image(&self) -> PleImage {
+        PleImage {
+            history: self.history.clone(),
+            conv: self.conv.clone(),
+            state_len: self.state_len,
+        }
+    }
+
+    /// What this state's own image would claim, for checking an arriving one
+    /// against without building either.
+    pub fn shape(&self) -> PleShape {
+        PleShape {
+            conv_len: self.conv.len(),
+            state_len: self.state_len,
+            history_len: self.history.len(),
+        }
+    }
+
+    /// Whether `shape` describes a state this layer could hold at `pos`
+    /// committed tokens.
+    ///
+    /// The conv window has to be exactly this layer's — a shorter one would
+    /// leave the tail holding another conversation's activations, a longer one
+    /// would be silently truncated.
+    ///
+    /// The history is checked against the ONE length a live state has at that
+    /// position, not against an upper bound and not against a set. A state that
+    /// has stepped no token holds nothing; every state that has stepped at least
+    /// one holds exactly `ngram_size - 1` ids, because `PleHashRef::next_history`
+    /// left-pads with eos and then takes that many. Nothing else is reachable, in
+    /// either direction.
+    ///
+    /// Both halves of that matter and they fail the same silent way. A PARTIAL
+    /// history — one id on a 3-gram layer — makes the hash pad an extra eos in
+    /// front of the real predecessor. An EMPTY history at a nonzero position
+    /// makes it pad two, which is the same bug wearing a "fresh state" costume:
+    /// an image is only legitimately empty when it restores to position zero.
+    /// Either way the conversation runs, answers, and conditions its PLE
+    /// injection on an n-gram that never occurred, and nothing downstream reports
+    /// it — which is why `pos` is threaded down to here rather than left to the
+    /// caller's judgement.
+    pub fn accepts(&self, shape: PleShape, pos: usize) -> Result<()> {
+        ensure!(
+            shape.state_len == self.state_len && shape.conv_len == self.conv.len(),
+            "PLE image is {} f32 over {} columns, the layer holds {} over {}",
+            shape.conv_len,
+            shape.state_len,
+            self.conv.len(),
+            self.state_len
+        );
+        let want = if pos == 0 { 0 } else { self.max_history };
+        ensure!(
+            shape.history_len == want,
+            "PLE image carries {} history ids at position {pos}; a state of this n-gram order \
+             holds exactly {want} there ({} once it has stepped a token, 0 only at position 0)",
+            shape.history_len,
+            self.max_history
+        );
+        Ok(())
+    }
+
+    /// Put this state back to the one `image` captured.
+    ///
+    /// The trail goes with it, for the reason `LayerCache::restore`'s DeltaNet
+    /// arm clears its own: a restore replaces the history the trail was
+    /// recorded against, so a rollback answered from it afterwards would return
+    /// a state from a sequence this one no longer is.
+    pub fn restore(&mut self, image: &PleImage, pos: usize) -> Result<()> {
+        self.accepts(
+            PleShape {
+                conv_len: image.conv.len(),
+                state_len: image.state_len,
+                history_len: image.history.len(),
+            },
+            pos,
+        )?;
+        self.history.clone_from(&image.history);
+        self.conv.clone_from(&image.conv);
+        self.trail.clear();
+        self.armed = None;
+        Ok(())
+    }
+
     /// The raw-token history, oldest first, for a caller that has to persist it.
     pub fn history(&self) -> &[u32] {
         &self.history
@@ -806,6 +935,12 @@ impl PleLayer {
     /// allocate a conv state it never fills and quietly shrink the receptive
     /// field.
     pub fn dilation(&self) -> usize {
+        self.ngram_size()
+    }
+
+    /// The n-gram order the hash reads, which is also what bounds the rolling
+    /// token history at `ngram_size - 1`.
+    pub fn ngram_size(&self) -> usize {
         self.hash.ngram_size
     }
 
@@ -817,7 +952,11 @@ impl PleLayer {
 
     /// A zeroed state sized for this layer: the correct start for a sequence.
     pub fn new_state(&self) -> PleState {
-        PleState::new(self.width(), self.conv_state_len())
+        PleState::new(
+            self.width(),
+            self.conv_state_len(),
+            self.ngram_size().saturating_sub(1),
+        )
     }
 
     /// Loads the layer from its `blk.N` weights plus the root-level table.
@@ -2125,6 +2264,81 @@ mod tests {
         assert_eq!(
             l.conv_state_len(),
             j["config"]["conv_state_len"].as_u64().unwrap() as usize
+        );
+    }
+
+    /// A PLE image is accepted only at the history length a live state really
+    /// has at that position: nothing at position zero, exactly `ngram_size - 1`
+    /// anywhere else. Every other length is refused.
+    ///
+    /// None of the rejected cases is a shape error — the conv window is the
+    /// right size and the ids are valid — which is the whole reason this needs a
+    /// test. A partial history makes the hash left-pad one extra eos in front of
+    /// the real predecessor; an empty history at a nonzero position makes it pad
+    /// two. Either way the state installs cleanly, the conversation runs and
+    /// answers, and its PLE injection is conditioned on an n-gram that never
+    /// occurred, with nothing downstream reporting it.
+    ///
+    /// The position dependence is the part a set-membership check would miss:
+    /// `history_len == 0` is correct at position 0 and wrong everywhere else, so
+    /// the rule cannot be stated without `pos`.
+    #[test]
+    fn a_ple_image_is_accepted_only_at_the_history_length_its_position_implies() {
+        let (width, state_len, ngram) = (6usize, 9usize, 3usize);
+        let mut state = PleState::new(width, state_len, ngram - 1);
+
+        let image = |history: Vec<u32>| PleImage {
+            history,
+            conv: vec![0.25; width * state_len],
+            state_len,
+        };
+        let shape = |history_len: usize| PleShape {
+            conv_len: width * state_len,
+            state_len,
+            history_len,
+        };
+
+        // Position zero holds nothing; anywhere past it holds a full history.
+        state.accepts(shape(0), 0).unwrap();
+        state.accepts(shape(ngram - 1), 7).unwrap();
+        state.restore(&image(vec![41, 43]), 7).unwrap();
+        assert_eq!(state.history(), [41, 43]);
+        assert!(state.conv_window().iter().all(|v| *v == 0.25));
+
+        // A partial history, refused with the length it should have had.
+        let err = state.restore(&image(vec![41]), 7).unwrap_err().to_string();
+        assert!(err.contains("holds exactly 2 there"), "{err}");
+        // Refused before anything is written: the state is the one it was.
+        assert_eq!(state.history(), [41, 43]);
+
+        // An EMPTY history at a nonzero position — legitimate-looking, and the
+        // one a bound of "0 or max" would have waved through.
+        let err = state
+            .restore(&image(Vec::new()), 7)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holds exactly 2 there"), "{err}");
+        assert_eq!(state.history(), [41, 43]);
+
+        // And the mirror: a full history at position zero, where a state that has
+        // stepped no token cannot have one.
+        assert!(state.accepts(shape(ngram - 1), 0).is_err());
+
+        // Longer than the order keeps, which the hash would silently drop.
+        assert!(state.accepts(shape(ngram), 7).is_err());
+
+        // The conv window is still checked independently of the history.
+        assert!(
+            state
+                .restore(
+                    &PleImage {
+                        history: vec![41, 43],
+                        conv: vec![0.25; width * state_len - 1],
+                        state_len,
+                    },
+                    7
+                )
+                .is_err()
         );
     }
 }

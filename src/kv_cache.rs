@@ -6,6 +6,8 @@ use candle_core::{DType, Device, Tensor};
 use half::f16;
 
 use crate::config::{LayerKind, XwenConfig};
+use crate::qwen4exp::indexer::IndexerCache;
+use crate::qwen4exp::ple::{PleImage, PleShape};
 
 /// Per-layer state. Full-attention layers preallocate K/V to `max_ctx` and grow
 /// via slice_set (cache dtype f16, because sdpa runs in f16); gated-DeltaNet
@@ -538,6 +540,10 @@ impl LayerCache {
         // it can try needs the answer in advance, and two copies of these rules would
         // drift.
         self.check_restorable(snap, pos)?;
+        // The PLE decoration is not this cache's business — `XwenModel` installs
+        // it into `Qwen4ExpParts` beside this call — so a decorated snapshot is
+        // restored from what it wraps.
+        let snap = snap.cache_part();
         match (self, snap) {
             (LayerCache::Full { len, .. }, LayerSnapshot::Full) => {
                 *len = pos;
@@ -584,7 +590,7 @@ impl LayerCache {
     /// separable: a caller can ask the whole stack first and decline the restore rather
     /// than discover it halfway.
     pub fn check_restorable(&self, snap: &LayerSnapshot, pos: usize) -> Result<()> {
-        match (self, snap) {
+        match (self, snap.cache_part()) {
             (LayerCache::Full { k, .. }, LayerSnapshot::Full) => {
                 let slots = k.dim(1)?;
                 anyhow::ensure!(
@@ -751,6 +757,55 @@ pub enum LayerSnapshot {
         conv: Tensor,
         delta: Tensor,
     },
+    /// A layer that ALSO carries the qwen4exp PLE injection state: `inner` is
+    /// whatever its KV cache alone would have produced, `ple` is the conv window
+    /// and n-gram history riding along with it.
+    ///
+    /// A wrapper rather than a fourth kind because the PLE layer is not a layer
+    /// kind: on the shipped checkpoint it is a DeltaNet layer, whose conv and
+    /// delta state a `Ple` variant that replaced `Linear` would silently drop.
+    /// The nesting is one deep — a `Ple` inside a `Ple` is refused wherever one
+    /// can be built — and every cache-side path (`LayerCache::restore`,
+    /// `check_restorable`) unwraps to `inner` and is otherwise unaware of it:
+    /// the PLE state does not live in a `LayerCache` at all, it lives in
+    /// `Qwen4ExpParts`, and the model is what pairs the two.
+    Ple {
+        inner: Box<LayerSnapshot>,
+        ple: PleImage,
+    },
+}
+
+impl LayerSnapshot {
+    /// This layer's KV-cache snapshot with any PLE decoration stripped — what
+    /// the cache itself was asked for and what it is given back.
+    pub(crate) fn cache_part(&self) -> &LayerSnapshot {
+        match self {
+            LayerSnapshot::Ple { inner, .. } => inner,
+            other => other,
+        }
+    }
+
+    /// The PLE image riding on this layer, if any.
+    pub(crate) fn ple(&self) -> Option<&PleImage> {
+        match self {
+            LayerSnapshot::Ple { ple, .. } => Some(ple),
+            _ => None,
+        }
+    }
+
+    /// Wrap this snapshot so it carries `ple` as well. Refuses a second wrap:
+    /// the nesting is one deep by construction, and everything that reads it
+    /// (the disk record's reader included) relies on that.
+    pub(crate) fn with_ple(self, ple: PleImage) -> Result<Self> {
+        anyhow::ensure!(
+            !matches!(self, LayerSnapshot::Ple { .. }),
+            "kv_snapshot: a layer carries at most one PLE state"
+        );
+        Ok(LayerSnapshot::Ple {
+            inner: Box::new(self),
+            ple,
+        })
+    }
 }
 
 /// A restore point for the whole cache, taken between forwards: the committed
@@ -779,32 +834,90 @@ impl CacheSnapshot {
         &self.layers
     }
 
+    /// The PLE images this snapshot carries, one entry per layer in layer order
+    /// and `None` on every layer that carries none — which is every layer of
+    /// every architecture but qwen4exp.
+    pub(crate) fn ple_images(&self) -> Vec<Option<&PleImage>> {
+        self.layers.iter().map(LayerSnapshot::ple).collect()
+    }
+
+    /// The same vector with the images' shapes instead of their bytes, for the
+    /// check that runs before anything is written.
+    pub(crate) fn ple_shapes(&self) -> Vec<Option<PleShape>> {
+        self.layers
+            .iter()
+            .map(|layer| layer.ple().map(ple_shape))
+            .collect()
+    }
+
     /// Copy this snapshot down to host RAM. The device tensors are read out into
     /// owned byte buffers, so the result outlives the GPU cache it came from and
     /// several of them can be held at once (one per parked conversation) without
     /// consuming device memory.
     pub fn to_host(&self) -> Result<HostSnapshot> {
-        let layers = self
-            .layers
-            .iter()
-            .map(|layer| match layer {
-                LayerSnapshot::Full => Ok(HostLayerSnapshot::Full),
-                LayerSnapshot::Swa { k, v, window } => Ok(HostLayerSnapshot::Swa {
-                    k: f16_bytes(k)?,
-                    v: f16_bytes(v)?,
-                    shape: k.dims3()?,
-                    window: *window,
-                }),
-                LayerSnapshot::Linear { conv, delta } => Ok(HostLayerSnapshot::Linear {
-                    conv: f32_bytes(conv)?,
-                    delta: f32_bytes(delta)?,
-                    conv_shape: conv.dims2()?,
-                    delta_shape: delta.dims3()?,
-                }),
-            })
-            .collect::<Result<_>>()?;
+        let layers = self.layers.iter().map(host_layer).collect::<Result<_>>()?;
         HostSnapshot::new(self.pos, layers)
     }
+}
+
+/// One device layer snapshot copied down to host RAM. Recursive on the PLE
+/// wrapper, which is one deep by construction.
+fn host_layer(layer: &LayerSnapshot) -> Result<HostLayerSnapshot> {
+    match layer {
+        LayerSnapshot::Full => Ok(HostLayerSnapshot::Full),
+        LayerSnapshot::Swa { k, v, window } => Ok(HostLayerSnapshot::Swa {
+            k: f16_bytes(k)?,
+            v: f16_bytes(v)?,
+            shape: k.dims3()?,
+            window: *window,
+        }),
+        LayerSnapshot::Linear { conv, delta } => Ok(HostLayerSnapshot::Linear {
+            conv: f32_bytes(conv)?,
+            delta: f32_bytes(delta)?,
+            conv_shape: conv.dims2()?,
+            delta_shape: delta.dims3()?,
+        }),
+        LayerSnapshot::Ple { inner, ple } => Ok(HostLayerSnapshot::Ple {
+            inner: Box::new(host_layer(inner)?),
+            conv: f32_slice_bytes(&ple.conv),
+            history: ple.history.clone(),
+            state_len: ple.state_len,
+        }),
+    }
+}
+
+/// What a `PleImage` claims about its size.
+fn ple_shape(image: &PleImage) -> PleShape {
+    PleShape {
+        conv_len: image.conv.len(),
+        state_len: image.state_len,
+        history_len: image.history.len(),
+    }
+}
+
+/// Little-endian f32 bytes of a host slice — the PLE conv window's wire form.
+/// The device planes go through `f32_bytes`, which reads a tensor back first;
+/// this half of a snapshot is already host data (the PLE forward is a host
+/// hybrid), so there is nothing to read back.
+fn f32_slice_bytes(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * size_of::<f32>());
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// The inverse of `f32_slice_bytes`.
+fn f32_slice_from_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        bytes.len() % size_of::<f32>() == 0,
+        "kv_host: {} bytes is not a whole number of f32",
+        bytes.len()
+    );
+    Ok(bytes
+        .chunks_exact(size_of::<f32>())
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 /// Little-endian write of a `u32` — the width the persisted records use for tags
@@ -979,6 +1092,12 @@ impl<R: Read> RecordReader<R> {
 const LAYER_FULL: u32 = 0;
 const LAYER_SWA: u32 = 1;
 const LAYER_LINEAR: u32 = 2;
+/// A layer carrying the qwen4exp PLE state as well: the PLE fields, then the
+/// tag and fields of the layer it wraps. A build that predates this tag refuses
+/// the record outright ("unknown kind tag"), which is the right answer — its
+/// caches have no PLE state to put the window and the history into, and a
+/// resume without them would attend to the wrong n-gram.
+const LAYER_PLE: u32 = 3;
 
 /// What one DeltaNet state plane may claim. The largest a shipped checkpoint
 /// produces is the 27B's delta state: 48 V-heads x 128 x 128 f32, 3 MiB. This is
@@ -990,6 +1109,20 @@ pub(crate) const MAX_STORED_STATE_BYTES: usize = 1 << 26;
 pub(crate) const MAX_STORED_V_HEADS: usize = 512;
 pub(crate) const MAX_STORED_CONV_DIM: usize = 1 << 17;
 pub(crate) const MAX_STORED_CONV_TAIL: usize = 16;
+
+/// Caps on the qwen4exp PLE state a record may declare. The shipped checkpoint
+/// carries 10240 channels x 9 columns of f32 (360 KiB) and two history ids;
+/// both of these are an order of magnitude past that.
+pub(crate) const MAX_STORED_PLE_CONV_BYTES: usize = 1 << 24;
+pub(crate) const MAX_STORED_PLE_WIDTH: usize = 1 << 20;
+pub(crate) const MAX_STORED_PLE_STATE_LEN: usize = 256;
+pub(crate) const MAX_STORED_PLE_HISTORY: usize = 64;
+
+/// Caps on the qwen4exp QSA indexer plane a `HostFullKv` may declare. One key
+/// head at head dim 128 held f32, so a plane is `pos * head_dim * 4` — 512 B
+/// per token per QSA layer on the shipped checkpoint.
+pub(crate) const MAX_STORED_INDEXER_HEAD_DIM: usize = 512;
+pub(crate) const MAX_STORED_INDEXER_PLANE_BYTES: usize = 1 << 30;
 
 /// Host-RAM mirror of a `CacheSnapshot`: the SWA rings as raw bytes plus the
 /// shape and window they were captured at. No candle types appear in the stored
@@ -1031,6 +1164,70 @@ pub(crate) enum HostLayerSnapshot {
         conv_shape: (usize, usize),
         delta_shape: (usize, usize, usize),
     },
+    /// The host mirror of [`LayerSnapshot::Ple`]: the PLE conv window as
+    /// little-endian f32 (`(width, state_len)` channel-major, oldest column
+    /// first), the raw n-gram token history oldest first, and the layer
+    /// snapshot it decorates.
+    Ple {
+        inner: Box<HostLayerSnapshot>,
+        conv: Vec<u8>,
+        history: Vec<u32>,
+        state_len: usize,
+    },
+}
+
+impl HostLayerSnapshot {
+    /// This layer's cache image with any PLE decoration stripped.
+    fn cache_part(&self) -> &HostLayerSnapshot {
+        match self {
+            HostLayerSnapshot::Ple { inner, .. } => inner,
+            other => other,
+        }
+    }
+
+    /// What the PLE image on this layer claims about its size, if there is one.
+    fn ple_shape(&self) -> Option<PleShape> {
+        match self {
+            HostLayerSnapshot::Ple {
+                conv,
+                history,
+                state_len,
+                ..
+            } => Some(PleShape {
+                conv_len: conv.len() / size_of::<f32>(),
+                state_len: *state_len,
+                history_len: history.len(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The layout checks a PLE decoration must pass: the window is a whole number
+/// of f32, it is a whole number of `state_len`-column channels, and the state is
+/// not empty. Nothing here knows the layer's width — that is the live geometry's
+/// job, in `PleState::accepts`.
+fn ple_width(conv_bytes: usize, state_len: usize) -> usize {
+    conv_bytes / size_of::<f32>() / state_len.max(1)
+}
+
+fn check_ple_layer(idx: usize, conv: &[u8], state_len: usize) -> Result<()> {
+    anyhow::ensure!(
+        state_len > 0,
+        "kv_host_snapshot: layer {idx} declares a zero-column PLE conv window"
+    );
+    anyhow::ensure!(
+        conv.len() % size_of::<f32>() == 0,
+        "kv_host_snapshot: layer {idx}'s PLE conv window is {} bytes, not a whole number of f32",
+        conv.len()
+    );
+    let elems = conv.len() / size_of::<f32>();
+    anyhow::ensure!(
+        elems > 0 && elems % state_len == 0,
+        "kv_host_snapshot: layer {idx}'s PLE conv window holds {elems} f32, not a whole number \
+         of {state_len}-column channels"
+    );
+    Ok(())
 }
 
 /// The layout checks a DeltaNet layer must pass before anything is built from
@@ -1092,6 +1289,254 @@ fn check_ring_layer(
     Ok(())
 }
 
+/// Frame one layer image: its kind tag, then that kind's fields. Recursive on
+/// the PLE wrapper, which writes its own fields and then the layer it decorates
+/// — so a reader that does not know `LAYER_PLE` stops at the tag rather than
+/// misreading the fields behind it.
+fn write_layer(w: &mut impl Write, layer: &HostLayerSnapshot) -> std::io::Result<()> {
+    match layer {
+        HostLayerSnapshot::Full => write_u32(w, LAYER_FULL)?,
+        HostLayerSnapshot::Swa {
+            k,
+            v,
+            shape,
+            window,
+        } => {
+            write_u32(w, LAYER_SWA)?;
+            let (n_kv, slots, head_dim) = *shape;
+            write_count(w, n_kv)?;
+            write_count(w, slots)?;
+            write_count(w, head_dim)?;
+            write_count(w, *window)?;
+            write_plane(w, k)?;
+            write_plane(w, v)?;
+        }
+        HostLayerSnapshot::Linear {
+            conv,
+            delta,
+            conv_shape,
+            delta_shape,
+        } => {
+            write_u32(w, LAYER_LINEAR)?;
+            write_count(w, conv_shape.0)?;
+            write_count(w, conv_shape.1)?;
+            write_count(w, delta_shape.0)?;
+            write_count(w, delta_shape.1)?;
+            write_count(w, delta_shape.2)?;
+            write_plane(w, conv)?;
+            write_plane(w, delta)?;
+        }
+        HostLayerSnapshot::Ple {
+            inner,
+            conv,
+            history,
+            state_len,
+        } => {
+            write_u32(w, LAYER_PLE)?;
+            // Width and columns both, so the plane's byte count is derivable from
+            // the record's own fields the way every other plane's is — the
+            // carrier width appears nowhere else in a snapshot.
+            write_count(w, ple_width(conv.len(), *state_len))?;
+            write_count(w, *state_len)?;
+            write_count(w, history.len())?;
+            for id in history {
+                write_u32(w, *id)?;
+            }
+            write_plane(w, conv)?;
+            write_layer(w, inner)?;
+        }
+    }
+    Ok(())
+}
+
+/// Upload one host layer image, giving every plane freshly allocated device
+/// storage. Recursive on the PLE wrapper; the PLE halves stay on the host, which
+/// is where the layer that reads them runs (D17).
+fn device_layer(idx: usize, layer: &HostLayerSnapshot, device: &Device) -> Result<LayerSnapshot> {
+    match layer {
+        HostLayerSnapshot::Full => Ok(LayerSnapshot::Full),
+        HostLayerSnapshot::Swa {
+            k,
+            v,
+            shape,
+            window,
+        } => {
+            // Re-checked at the upload, not only where the image was
+            // assembled: this is the last point before the bytes reach a
+            // ring another conversation may still be holding.
+            check_ring_layer(idx, k, v, *shape, *window)?;
+            let (n_kv, slots, head_dim) = *shape;
+            let dims = [n_kv, slots, head_dim];
+            Ok(LayerSnapshot::Swa {
+                k: f16_tensor(k, &dims, device)?,
+                v: f16_tensor(v, &dims, device)?,
+                window: *window,
+            })
+        }
+        HostLayerSnapshot::Linear {
+            conv,
+            delta,
+            conv_shape,
+            delta_shape,
+        } => {
+            check_linear_layer(idx, conv, delta, *conv_shape, *delta_shape)?;
+            let (tail, conv_dim) = *conv_shape;
+            let (v_heads, d_k, d_v) = *delta_shape;
+            Ok(LayerSnapshot::Linear {
+                conv: f32_tensor(conv, &[tail, conv_dim], device)?,
+                delta: f32_tensor(delta, &[v_heads, d_k, d_v], device)?,
+            })
+        }
+        HostLayerSnapshot::Ple {
+            inner,
+            conv,
+            history,
+            state_len,
+        } => {
+            check_ple_layer(idx, conv, *state_len)?;
+            device_layer(idx, inner, device)?.with_ple(PleImage {
+                history: history.clone(),
+                conv: f32_slice_from_bytes(conv)?,
+                state_len: *state_len,
+            })
+        }
+    }
+}
+
+/// Read back one `write_layer` body. Every field is untrusted input, capped
+/// before it sizes anything, and the planes are charged against the record's own
+/// framed budget by `r`. `outer` is false inside a PLE decoration, which is what
+/// bounds the recursion at one level.
+fn read_layer<R: Read>(
+    r: &mut RecordReader<R>,
+    idx: usize,
+    outer: bool,
+) -> Result<HostLayerSnapshot> {
+    match r.u32()? {
+        LAYER_FULL => Ok(HostLayerSnapshot::Full),
+        LAYER_SWA => {
+            let n_kv = plausible("KV head count", r.count()?, MAX_STORED_KV_HEADS)?;
+            let slots = plausible("ring slot count", r.count()?, MAX_STORED_WINDOW)?;
+            let head_dim = plausible("head dim", r.count()?, MAX_STORED_HEAD_DIM)?;
+            let window = plausible("window", r.count()?, MAX_STORED_WINDOW)?;
+            let shape = (n_kv, slots, head_dim);
+            let plane = f16_bytes_for(&[n_kv, slots, head_dim])?;
+            let k = r.plane_of(plane)?;
+            let v = r.plane_of(plane)?;
+            Ok(HostLayerSnapshot::Swa {
+                k,
+                v,
+                shape,
+                window,
+            })
+        }
+        LAYER_LINEAR => {
+            let tail = plausible("conv tail", r.count()?, MAX_STORED_CONV_TAIL)?;
+            let conv_dim = plausible("conv width", r.count()?, MAX_STORED_CONV_DIM)?;
+            let v_heads = plausible("V-head count", r.count()?, MAX_STORED_V_HEADS)?;
+            let d_k = plausible("delta key dim", r.count()?, MAX_STORED_HEAD_DIM)?;
+            let d_v = plausible("delta value dim", r.count()?, MAX_STORED_HEAD_DIM)?;
+            let conv_shape = (tail, conv_dim);
+            let delta_shape = (v_heads, d_k, d_v);
+            let conv =
+                r.plane_of_up_to(f32_bytes_for(&[tail, conv_dim])?, MAX_STORED_STATE_BYTES)?;
+            let delta =
+                r.plane_of_up_to(f32_bytes_for(&[v_heads, d_k, d_v])?, MAX_STORED_STATE_BYTES)?;
+            Ok(HostLayerSnapshot::Linear {
+                conv,
+                delta,
+                conv_shape,
+                delta_shape,
+            })
+        }
+        LAYER_PLE => {
+            anyhow::ensure!(
+                outer,
+                "kv_host_snapshot: layer {idx} carries a PLE state inside a PLE state"
+            );
+            let width = plausible("PLE conv width", r.count()?, MAX_STORED_PLE_WIDTH)?;
+            let state_len = plausible("PLE conv columns", r.count()?, MAX_STORED_PLE_STATE_LEN)?;
+            let history_len = plausible("PLE history length", r.count()?, MAX_STORED_PLE_HISTORY)?;
+            let mut history = Vec::new();
+            for _ in 0..history_len {
+                history.push(r.u32()?);
+            }
+            let conv = r.plane_of_up_to(
+                f32_bytes_for(&[width, state_len])?,
+                MAX_STORED_PLE_CONV_BYTES,
+            )?;
+            let inner = Box::new(read_layer(r, idx, false)?);
+            Ok(HostLayerSnapshot::Ple {
+                inner,
+                conv,
+                history,
+                state_len,
+            })
+        }
+        tag => anyhow::bail!("kv_host_snapshot: layer {idx} has unknown kind tag {tag}"),
+    }
+}
+
+/// Bytes `write_layer` produces for one layer.
+fn layer_serialized_len(layer: &HostLayerSnapshot) -> usize {
+    size_of::<u32>()
+        + match layer {
+            HostLayerSnapshot::Full => 0,
+            HostLayerSnapshot::Swa { k, v, .. } => {
+                4 * size_of::<u64>() + plane_bytes(k.len()) + plane_bytes(v.len())
+            }
+            HostLayerSnapshot::Linear { conv, delta, .. } => {
+                5 * size_of::<u64>() + plane_bytes(conv.len()) + plane_bytes(delta.len())
+            }
+            HostLayerSnapshot::Ple {
+                inner,
+                conv,
+                history,
+                ..
+            } => {
+                3 * size_of::<u64>()
+                    + history.len() * size_of::<u32>()
+                    + plane_bytes(conv.len())
+                    + layer_serialized_len(inner)
+            }
+        }
+}
+
+/// Every layout check one host layer image must pass, PLE decoration included.
+/// `outer` is false inside a decoration, which is what refuses a `Ple` nested in
+/// a `Ple`: the wrapper is one deep by construction and a record claiming
+/// otherwise is one this build did not write.
+fn check_host_layer(idx: usize, layer: &HostLayerSnapshot, outer: bool) -> Result<()> {
+    match layer {
+        HostLayerSnapshot::Full => Ok(()),
+        HostLayerSnapshot::Swa {
+            k,
+            v,
+            shape,
+            window,
+        } => check_ring_layer(idx, k, v, *shape, *window),
+        HostLayerSnapshot::Linear {
+            conv,
+            delta,
+            conv_shape,
+            delta_shape,
+        } => check_linear_layer(idx, conv, delta, *conv_shape, *delta_shape),
+        HostLayerSnapshot::Ple {
+            inner,
+            conv,
+            state_len,
+            ..
+        } => {
+            anyhow::ensure!(
+                outer,
+                "kv_host_snapshot: layer {idx} carries a PLE state inside a PLE state"
+            );
+            check_ple_layer(idx, conv, *state_len)?;
+            check_host_layer(idx, inner, false)
+        }
+    }
+}
+
 impl HostSnapshot {
     /// Assemble a snapshot image, checking every ring layer against the shape and
     /// window it claims. Both producers go through here — a device readback and a
@@ -1099,24 +1544,7 @@ impl HostSnapshot {
     /// invariants an in-process one is.
     pub(crate) fn new(pos: usize, layers: Vec<HostLayerSnapshot>) -> Result<Self> {
         for (idx, layer) in layers.iter().enumerate() {
-            if let HostLayerSnapshot::Swa {
-                k,
-                v,
-                shape,
-                window,
-            } = layer
-            {
-                check_ring_layer(idx, k, v, *shape, *window)?;
-            }
-            if let HostLayerSnapshot::Linear {
-                conv,
-                delta,
-                conv_shape,
-                delta_shape,
-            } = layer
-            {
-                check_linear_layer(idx, conv, delta, *conv_shape, *delta_shape)?;
-            }
+            check_host_layer(idx, layer, true)?;
         }
         Ok(Self { pos, layers })
     }
@@ -1128,39 +1556,7 @@ impl HostSnapshot {
         write_count(w, self.pos)?;
         write_count(w, self.layers.len())?;
         for layer in &self.layers {
-            match layer {
-                HostLayerSnapshot::Full => write_u32(w, LAYER_FULL)?,
-                HostLayerSnapshot::Swa {
-                    k,
-                    v,
-                    shape,
-                    window,
-                } => {
-                    write_u32(w, LAYER_SWA)?;
-                    let (n_kv, slots, head_dim) = *shape;
-                    write_count(w, n_kv)?;
-                    write_count(w, slots)?;
-                    write_count(w, head_dim)?;
-                    write_count(w, *window)?;
-                    write_plane(w, k)?;
-                    write_plane(w, v)?;
-                }
-                HostLayerSnapshot::Linear {
-                    conv,
-                    delta,
-                    conv_shape,
-                    delta_shape,
-                } => {
-                    write_u32(w, LAYER_LINEAR)?;
-                    write_count(w, conv_shape.0)?;
-                    write_count(w, conv_shape.1)?;
-                    write_count(w, delta_shape.0)?;
-                    write_count(w, delta_shape.1)?;
-                    write_count(w, delta_shape.2)?;
-                    write_plane(w, conv)?;
-                    write_plane(w, delta)?;
-                }
-            }
+            write_layer(w, layer)?;
         }
         Ok(())
     }
@@ -1168,20 +1564,7 @@ impl HostSnapshot {
     /// Bytes `write_to` produces, for the container directory that has to declare
     /// this record's length before the planes are streamed out.
     pub(crate) fn serialized_len(&self) -> usize {
-        let mut n = 2 * size_of::<u64>();
-        for layer in &self.layers {
-            n += size_of::<u32>();
-            match layer {
-                HostLayerSnapshot::Full => {}
-                HostLayerSnapshot::Swa { k, v, .. } => {
-                    n += 4 * size_of::<u64>() + plane_bytes(k.len()) + plane_bytes(v.len());
-                }
-                HostLayerSnapshot::Linear { conv, delta, .. } => {
-                    n += 5 * size_of::<u64>() + plane_bytes(conv.len()) + plane_bytes(delta.len());
-                }
-            }
-        }
-        n
+        2 * size_of::<u64>() + self.layers.iter().map(layer_serialized_len).sum::<usize>()
     }
 
     /// Read back a `write_to` body of `len` bytes. Every field is untrusted input:
@@ -1197,49 +1580,7 @@ impl HostSnapshot {
         // from an allocation nothing can catch.
         let mut layers = Vec::new();
         for idx in 0..layer_count {
-            match r.u32()? {
-                LAYER_FULL => layers.push(HostLayerSnapshot::Full),
-                LAYER_SWA => {
-                    let n_kv = plausible("KV head count", r.count()?, MAX_STORED_KV_HEADS)?;
-                    let slots = plausible("ring slot count", r.count()?, MAX_STORED_WINDOW)?;
-                    let head_dim = plausible("head dim", r.count()?, MAX_STORED_HEAD_DIM)?;
-                    let window = plausible("window", r.count()?, MAX_STORED_WINDOW)?;
-                    let shape = (n_kv, slots, head_dim);
-                    let plane = f16_bytes_for(&[n_kv, slots, head_dim])?;
-                    let k = r.plane_of(plane)?;
-                    let v = r.plane_of(plane)?;
-                    layers.push(HostLayerSnapshot::Swa {
-                        k,
-                        v,
-                        shape,
-                        window,
-                    });
-                }
-                LAYER_LINEAR => {
-                    let tail = plausible("conv tail", r.count()?, MAX_STORED_CONV_TAIL)?;
-                    let conv_dim = plausible("conv width", r.count()?, MAX_STORED_CONV_DIM)?;
-                    let v_heads = plausible("V-head count", r.count()?, MAX_STORED_V_HEADS)?;
-                    let d_k = plausible("delta key dim", r.count()?, MAX_STORED_HEAD_DIM)?;
-                    let d_v = plausible("delta value dim", r.count()?, MAX_STORED_HEAD_DIM)?;
-                    let conv_shape = (tail, conv_dim);
-                    let delta_shape = (v_heads, d_k, d_v);
-                    let conv = r.plane_of_up_to(
-                        f32_bytes_for(&[tail, conv_dim])?,
-                        MAX_STORED_STATE_BYTES,
-                    )?;
-                    let delta = r.plane_of_up_to(
-                        f32_bytes_for(&[v_heads, d_k, d_v])?,
-                        MAX_STORED_STATE_BYTES,
-                    )?;
-                    layers.push(HostLayerSnapshot::Linear {
-                        conv,
-                        delta,
-                        conv_shape,
-                        delta_shape,
-                    });
-                }
-                tag => anyhow::bail!("kv_host_snapshot: layer {idx} has unknown kind tag {tag}"),
-            }
+            layers.push(read_layer(&mut r, idx, true)?);
         }
         r.finish()?;
         Self::new(pos, layers)
@@ -1254,41 +1595,7 @@ impl HostSnapshot {
             .layers
             .iter()
             .enumerate()
-            .map(|(idx, layer)| match layer {
-                HostLayerSnapshot::Full => Ok(LayerSnapshot::Full),
-                HostLayerSnapshot::Swa {
-                    k,
-                    v,
-                    shape,
-                    window,
-                } => {
-                    // Re-checked at the upload, not only where the image was
-                    // assembled: this is the last point before the bytes reach a
-                    // ring another conversation may still be holding.
-                    check_ring_layer(idx, k, v, *shape, *window)?;
-                    let (n_kv, slots, head_dim) = *shape;
-                    let dims = [n_kv, slots, head_dim];
-                    Ok(LayerSnapshot::Swa {
-                        k: f16_tensor(k, &dims, device)?,
-                        v: f16_tensor(v, &dims, device)?,
-                        window: *window,
-                    })
-                }
-                HostLayerSnapshot::Linear {
-                    conv,
-                    delta,
-                    conv_shape,
-                    delta_shape,
-                } => {
-                    check_linear_layer(idx, conv, delta, *conv_shape, *delta_shape)?;
-                    let (tail, conv_dim) = *conv_shape;
-                    let (v_heads, d_k, d_v) = *delta_shape;
-                    Ok(LayerSnapshot::Linear {
-                        conv: f32_tensor(conv, &[tail, conv_dim], device)?,
-                        delta: f32_tensor(delta, &[v_heads, d_k, d_v], device)?,
-                    })
-                }
-            })
+            .map(|(idx, layer)| device_layer(idx, layer, device))
             .collect::<Result<_>>()?;
         Ok(CacheSnapshot::new(self.pos, layers))
     }
@@ -1308,7 +1615,7 @@ impl HostSnapshot {
             caches.len()
         );
         for (idx, (layer, cache)) in self.layers.iter().zip(caches).enumerate() {
-            match (layer, cache) {
+            match (layer.cache_part(), cache) {
                 // No position bound here: a full layer's allocation grows on
                 // demand (`LayerCache::ensure_full_capacity`), and the row
                 // import that precedes this restore is what grows it. The
@@ -1362,14 +1669,35 @@ impl HostSnapshot {
     /// Host bytes this image occupies — the number to budget when deciding how
     /// many snapshots a parked conversation may keep.
     pub fn byte_len(&self) -> usize {
+        self.layers.iter().map(layer_byte_len).sum()
+    }
+
+    /// The PLE images this image carries, as shapes only, one entry per layer in
+    /// layer order and `None` on every layer that carries none.
+    ///
+    /// Shapes rather than data for the reason `check_restorable` exists at all:
+    /// this is what a caller asks BEFORE it commits to a restore, and the answer
+    /// must not cost a copy of every window.
+    pub(crate) fn ple_shapes(&self) -> Vec<Option<PleShape>> {
         self.layers
             .iter()
-            .map(|layer| match layer {
-                HostLayerSnapshot::Full => 0,
-                HostLayerSnapshot::Swa { k, v, .. } => k.len() + v.len(),
-                HostLayerSnapshot::Linear { conv, delta, .. } => conv.len() + delta.len(),
-            })
-            .sum()
+            .map(HostLayerSnapshot::ple_shape)
+            .collect()
+    }
+}
+
+/// Host bytes one layer image occupies, PLE decoration included.
+fn layer_byte_len(layer: &HostLayerSnapshot) -> usize {
+    match layer {
+        HostLayerSnapshot::Full => 0,
+        HostLayerSnapshot::Swa { k, v, .. } => k.len() + v.len(),
+        HostLayerSnapshot::Linear { conv, delta, .. } => conv.len() + delta.len(),
+        HostLayerSnapshot::Ple {
+            inner,
+            conv,
+            history,
+            ..
+        } => layer_byte_len(inner) + conv.len() + history.len() * size_of::<u32>(),
     }
 }
 
@@ -1396,6 +1724,22 @@ pub struct HostFullKv {
     n_kv_head: usize,
     head_dim: usize,
     planes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// One raw indexer-key plane per QSA layer, in layer order, little-endian
+    /// f32, row-major `(pos, qsa_head_dim)`.
+    ///
+    /// Empty on every architecture but qwen4exp, where a full-attention layer
+    /// keeps a SECOND per-position plane: the lightning indexer's raw keys, which
+    /// are what the token selection is scored against. They belong here rather
+    /// than in a `HostSnapshot` for the same reason the K/V rows do — every
+    /// position writes its own row, so the state is position-indexed and grows
+    /// with the conversation, and a snapshot restores it by truncation alone.
+    ///
+    /// One key head, not `n_kv_head`: the indexer is MQA. A prefix of the
+    /// positions is therefore a prefix of the buffer, where a K/V prefix is a
+    /// per-head gather.
+    qsa: Vec<Vec<u8>>,
+    /// Head dim the QSA planes are laid out over, 0 when there are none.
+    qsa_head_dim: usize,
 }
 
 impl HostFullKv {
@@ -1407,6 +1751,8 @@ impl HostFullKv {
         n_kv_head: usize,
         head_dim: usize,
         planes: Vec<(Vec<u8>, Vec<u8>)>,
+        qsa: Vec<Vec<u8>>,
+        qsa_head_dim: usize,
     ) -> Result<Self> {
         let want = f16_bytes_for(&[n_kv_head, pos, head_dim])?;
         for (idx, (k, v)) in planes.iter().enumerate() {
@@ -1418,11 +1764,34 @@ impl HostFullKv {
                 v.len()
             );
         }
+        anyhow::ensure!(
+            qsa.is_empty() || qsa.len() == planes.len(),
+            "kv_host_full: {} QSA planes against {} full-attention layers — a qwen4exp file \
+             carries an indexer on every one of them or on none",
+            qsa.len(),
+            planes.len()
+        );
+        anyhow::ensure!(
+            qsa.is_empty() == (qsa_head_dim == 0),
+            "kv_host_full: {} QSA planes at head dim {qsa_head_dim}",
+            qsa.len()
+        );
+        let want_qsa = f32_bytes_for(&[pos, qsa_head_dim])?;
+        for (idx, plane) in qsa.iter().enumerate() {
+            anyhow::ensure!(
+                plane.len() == want_qsa,
+                "kv_host_full: QSA layer {idx} holds {} bytes, expected {want_qsa} for \
+                 ({pos}, {qsa_head_dim}) f32",
+                plane.len()
+            );
+        }
         Ok(Self {
             pos,
             n_kv_head,
             head_dim,
             planes,
+            qsa,
+            qsa_head_dim,
         })
     }
 
@@ -1437,17 +1806,32 @@ impl HostFullKv {
             write_plane(w, k)?;
             write_plane(w, v)?;
         }
+        // The QSA planes trail the K/V ones, which is why writing them is a
+        // container-version bump (`disk_cache::CONTAINER_VERSION` 3 -> 4) rather
+        // than a new tag: they sit inside an existing record, and a v3 reader
+        // would stop at the end of the K/V planes with the record's framed length
+        // unconsumed. It refuses the whole file at the version check instead.
+        write_count(w, self.qsa_head_dim)?;
+        write_count(w, self.qsa.len())?;
+        for plane in &self.qsa {
+            write_plane(w, plane)?;
+        }
         Ok(())
     }
 
     /// Bytes `write_to` produces, for the container directory that has to declare
     /// this record's length before the planes are streamed out.
     pub(crate) fn serialized_len(&self) -> usize {
-        4 * size_of::<u64>()
+        6 * size_of::<u64>()
             + self
                 .planes
                 .iter()
                 .map(|(k, v)| plane_bytes(k.len()) + plane_bytes(v.len()))
+                .sum::<usize>()
+            + self
+                .qsa
+                .iter()
+                .map(|plane| plane_bytes(plane.len()))
                 .sum::<usize>()
     }
 
@@ -1469,8 +1853,15 @@ impl HostFullKv {
             let v = r.plane_of(plane)?;
             planes.push((k, v));
         }
+        let qsa_head_dim = plausible("QSA head dim", r.count()?, MAX_STORED_INDEXER_HEAD_DIM)?;
+        let qsa_count = plausible("QSA layer count", r.count()?, MAX_STORED_LAYERS)?;
+        let qsa_plane = f32_bytes_for(&[pos, qsa_head_dim])?;
+        let mut qsa = Vec::new();
+        for _ in 0..qsa_count {
+            qsa.push(r.plane_of_up_to(qsa_plane, MAX_STORED_INDEXER_PLANE_BYTES)?);
+        }
         r.finish()?;
-        Self::new(pos, n_kv_head, head_dim, planes)
+        Self::new(pos, n_kv_head, head_dim, planes, qsa, qsa_head_dim)
     }
 
     /// Check that `cache` is laid out the way this image says it is, before any
@@ -1491,15 +1882,67 @@ impl HostFullKv {
         Ok(())
     }
 
+    /// The same check for one QSA layer: the head dim the plane is laid out over
+    /// has to be the one the live cache stores, and `pos` rows have to fit in the
+    /// allocation. Byte counts alone would not catch a swapped head dim on a
+    /// square plane, and the import writes rows the selection then scores.
+    pub(crate) fn ensure_qsa_matches(&self, cache: &IndexerCache, pos: usize) -> Result<()> {
+        anyhow::ensure!(
+            cache.head_dim() == self.qsa_head_dim(),
+            "kv_host_full: QSA image is {} wide but the cache is {}",
+            self.qsa_head_dim(),
+            cache.head_dim()
+        );
+        anyhow::ensure!(
+            pos <= cache.capacity(),
+            "kv_host_full: {pos} QSA rows do not fit the cache's {} slots",
+            cache.capacity()
+        );
+        Ok(())
+    }
+
     /// Host bytes this image occupies — 48 KiB per token on the shipped
     /// checkpoint (12 full layers x K/V x 8 heads x 128 dims x f16).
     pub fn byte_len(&self) -> usize {
-        self.planes.iter().map(|(k, v)| k.len() + v.len()).sum()
+        self.planes
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+            + self.qsa.iter().map(Vec::len).sum::<usize>()
     }
 
     /// Number of full-attention layers covered.
     pub(crate) fn layers(&self) -> usize {
         self.planes.len()
+    }
+
+    /// Number of QSA indexer planes carried — the full-attention layer count on
+    /// qwen4exp, zero everywhere else.
+    pub(crate) fn qsa_layers(&self) -> usize {
+        self.qsa.len()
+    }
+
+    /// Head dim the QSA planes are laid out over, 0 when there are none.
+    pub(crate) fn qsa_head_dim(&self) -> usize {
+        self.qsa_head_dim
+    }
+
+    /// Raw indexer keys for rows `[0, pos)` of QSA layer `idx`, ready to hand to
+    /// `IndexerCache::import_rows`. One key head, so this is a slice, not the
+    /// per-head gather `prefix` has to do for the K/V planes.
+    pub(crate) fn qsa_prefix(&self, idx: usize, pos: usize) -> Result<&[u8]> {
+        anyhow::ensure!(
+            pos <= self.pos,
+            "kv_host_full: requested pos {pos} exceeds the image's {} positions",
+            self.pos
+        );
+        let plane = self.qsa.get(idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "kv_host_full: QSA layer {idx} is past the image's {} planes",
+                self.qsa.len()
+            )
+        })?;
+        Ok(&plane[..f32_bytes_for(&[pos, self.qsa_head_dim])?])
     }
 
     /// K/V bytes for rows `[0, pos)` of full-attention layer `idx`, ready to hand
@@ -1578,7 +2021,22 @@ impl HostFullKv {
                 (gather(k), gather(v))
             })
             .collect();
-        Self::new(end - start, self.n_kv_head, self.head_dim, planes)
+        // The QSA planes have one head, so a range of positions is one slice of
+        // the buffer whatever the source's length — no re-striding needed.
+        let qsa_row = f32_bytes_for(&[self.qsa_head_dim])?;
+        let qsa = self
+            .qsa
+            .iter()
+            .map(|plane| plane[start * qsa_row..end * qsa_row].to_vec())
+            .collect();
+        Self::new(
+            end - start,
+            self.n_kv_head,
+            self.head_dim,
+            planes,
+            qsa,
+            self.qsa_head_dim,
+        )
     }
 
     /// One image covering the concatenation of `spans`, in the order given.
@@ -1600,6 +2058,7 @@ impl HostFullKv {
             .first()
             .ok_or_else(|| anyhow::anyhow!("kv_host_full: nothing to concatenate"))?;
         let (n_kv_head, head_dim, layers) = (first.n_kv_head, first.head_dim, first.planes.len());
+        let (qsa_layers, qsa_head_dim) = (first.qsa.len(), first.qsa_head_dim);
         let mut pos = 0usize;
         for (idx, span) in spans.iter().enumerate() {
             anyhow::ensure!(
@@ -1612,15 +2071,27 @@ impl HostFullKv {
                 span.head_dim,
                 span.planes.len(),
             );
+            anyhow::ensure!(
+                span.qsa.len() == qsa_layers && span.qsa_head_dim == qsa_head_dim,
+                "kv_host_full: span {idx} carries {} QSA planes at head dim {}, the first \
+                 carries {qsa_layers} at {qsa_head_dim}",
+                span.qsa.len(),
+                span.qsa_head_dim,
+            );
             pos = pos
                 .checked_add(span.pos)
                 .ok_or_else(|| anyhow::anyhow!("kv_host_full: the spans' lengths overflow"))?;
         }
         let row = f16_bytes_for(&[head_dim])?;
         let want = f16_bytes_for(&[n_kv_head, pos, head_dim])?;
+        let qsa_row = f32_bytes_for(&[qsa_head_dim])?;
         let mut planes: Vec<(Vec<u8>, Vec<u8>)> = (0..layers)
             .map(|_| (vec![0u8; want], vec![0u8; want]))
             .collect();
+        // One head, so a span's rows land as one contiguous run rather than one
+        // per head — but scattered in the same pass, so a span's buffers are
+        // still released as soon as its rows are in.
+        let mut qsa: Vec<Vec<u8>> = (0..qsa_layers).map(|_| vec![0u8; pos * qsa_row]).collect();
         let mut at = 0usize;
         for span in spans {
             let span_pos = span.pos;
@@ -1636,9 +2107,13 @@ impl HostFullKv {
                 // `sk` and `sv` go here, one layer at a time, rather than at the end of
                 // the composition.
             }
+            for (idx, plane) in span.qsa.into_iter().enumerate() {
+                let take = span_pos * qsa_row;
+                qsa[idx][at * qsa_row..at * qsa_row + take].copy_from_slice(&plane[..take]);
+            }
             at += span_pos;
         }
-        Self::new(pos, n_kv_head, head_dim, planes)
+        Self::new(pos, n_kv_head, head_dim, planes, qsa, qsa_head_dim)
     }
 }
 
@@ -1651,7 +2126,10 @@ impl HostFullKv {
 ///
 /// Split out of `XwenModel::export_full_kv` so the layer pairing is testable
 /// against a hand-built stack, with no checkpoint loaded.
-pub(crate) fn export_full_kv_from(caches: &[LayerCache]) -> Result<HostFullKv> {
+pub(crate) fn export_full_kv_from(
+    caches: &[LayerCache],
+    qsa: &[&IndexerCache],
+) -> Result<HostFullKv> {
     let mut shape: Option<(usize, usize, usize)> = None;
     let mut planes = Vec::new();
     for cache in caches {
@@ -1663,7 +2141,34 @@ pub(crate) fn export_full_kv_from(caches: &[LayerCache]) -> Result<HostFullKv> {
         planes.push(cache.export_full_rows()?);
     }
     let (pos, n_kv_head, head_dim) = shape.unwrap_or((0, 0, 0));
-    HostFullKv::new(pos, n_kv_head, head_dim, planes)
+    // The indexer caches are driven in lockstep with the full-attention layers'
+    // KV, so a disagreement here is a length bug upstream rather than something
+    // to paper over with a shorter export.
+    //
+    // The head dim is checked per layer rather than taken from the first and
+    // trusted. `HostFullKv::new` would catch a mismatched plane by its LENGTH,
+    // but only while `pos > 0`: at zero positions every plane is zero bytes and
+    // that check says nothing, so an image built from a stack whose indexers
+    // disagreed would describe itself with one layer's geometry and be imported
+    // into all of them. Nothing on the shipped checkpoint can reach that — every
+    // QSA layer shares `indexer_head_dim` — which is exactly why it is worth two
+    // lines here rather than a comment saying it cannot happen.
+    let qsa_head_dim = qsa.first().map_or(0, |cache| cache.head_dim());
+    let mut qsa_planes = Vec::with_capacity(qsa.len());
+    for (idx, cache) in qsa.iter().enumerate() {
+        anyhow::ensure!(
+            cache.len() == pos,
+            "kv_export: QSA layer {idx} holds {} keys, the full-attention layers hold {pos}",
+            cache.len()
+        );
+        anyhow::ensure!(
+            cache.head_dim() == qsa_head_dim,
+            "kv_export: QSA layer {idx} is {} wide, the first is {qsa_head_dim}",
+            cache.head_dim()
+        );
+        qsa_planes.push(cache.export_rows()?);
+    }
+    HostFullKv::new(pos, n_kv_head, head_dim, planes, qsa_planes, qsa_head_dim)
 }
 
 /// Upload `image`'s rows `[0, pos)` into a cache stack's full-attention layers,
@@ -1675,13 +2180,24 @@ pub(crate) fn export_full_kv_from(caches: &[LayerCache]) -> Result<HostFullKv> {
 /// `export_full_kv_from`.
 pub(crate) fn import_full_kv_into(
     caches: &mut [LayerCache],
+    qsa: &mut [&mut IndexerCache],
     image: &HostFullKv,
     pos: usize,
 ) -> Result<()> {
-    check_full_kv_importable(caches, image, pos)?;
+    let borrowed: Vec<&IndexerCache> = qsa.iter().map(|cache| &**cache).collect();
+    check_full_kv_importable(caches, &borrowed, image, pos)?;
+    drop(borrowed);
     for (idx, cache) in caches.iter_mut().filter(|c| c.is_full()).enumerate() {
         let (k, v) = image.prefix(idx, pos)?;
         cache.import_full_rows(&k, &v, pos)?;
+    }
+    for (idx, cache) in qsa.iter_mut().enumerate() {
+        // The import sets the length, which is what keeps `select`'s
+        // `cache.len == pos` invariant: the indexer scores exactly the positions
+        // the KV rows cover, and a plane imported without its length would score
+        // whatever the previous conversation left behind.
+        let device = cache.device()?;
+        cache.import_rows(image.qsa_prefix(idx, pos)?, pos, &device)?;
     }
     Ok(())
 }
@@ -1695,6 +2211,7 @@ pub(crate) fn import_full_kv_into(
 /// rather than a second set that can drift from them.
 pub(crate) fn check_full_kv_importable(
     caches: &[LayerCache],
+    qsa: &[&IndexerCache],
     image: &HostFullKv,
     pos: usize,
 ) -> Result<()> {
@@ -1711,6 +2228,18 @@ pub(crate) fn check_full_kv_importable(
     );
     for cache in caches.iter().filter(|c| c.is_full()) {
         image.ensure_matches(cache)?;
+    }
+    // An image with no QSA planes cannot resume a qwen4exp conversation and one
+    // with them cannot resume any other: the indexer either scores every position
+    // or the selection reads rows nothing wrote.
+    anyhow::ensure!(
+        image.qsa_layers() == qsa.len(),
+        "kv_host_full: image carries {} QSA indexer planes, the model has {}",
+        image.qsa_layers(),
+        qsa.len()
+    );
+    for cache in qsa {
+        image.ensure_qsa_matches(cache, pos)?;
     }
     Ok(())
 }
@@ -1771,7 +2300,7 @@ pub(crate) fn materialize(t: &Tensor) -> Result<Tensor> {
 
 /// Byte count of an f32 block with the given dimensions — `f16_bytes_for` for
 /// the recurrent-state planes, and untrusted-input-safe for the same reason.
-fn f32_bytes_for(dims: &[usize]) -> Result<usize> {
+pub(crate) fn f32_bytes_for(dims: &[usize]) -> Result<usize> {
     dims.iter().try_fold(size_of::<f32>(), |acc, &d| {
         acc.checked_mul(d)
             .ok_or_else(|| anyhow::anyhow!("kv_host: f32 byte count for {dims:?} overflows usize"))
@@ -1781,7 +2310,7 @@ fn f32_bytes_for(dims: &[usize]) -> Result<usize> {
 /// Raw little-endian f32 bytes of `t` in row-major order — how a DeltaNet
 /// recurrent state travels in a host image. `t` must own its storage; the
 /// readback copies the whole allocation before applying the layout.
-fn f32_bytes(t: &Tensor) -> Result<Vec<u8>> {
+pub(crate) fn f32_bytes(t: &Tensor) -> Result<Vec<u8>> {
     anyhow::ensure!(
         t.dtype() == DType::F32,
         "kv_export: recurrent state images are f32, got {:?}",
@@ -1802,7 +2331,7 @@ fn f32_bytes(t: &Tensor) -> Result<Vec<u8>> {
 
 /// The inverse of `f32_bytes`: a fresh `shape` tensor on `device` owning those
 /// bytes.
-fn f32_tensor(bytes: &[u8], shape: &[usize], device: &Device) -> Result<Tensor> {
+pub(crate) fn f32_tensor(bytes: &[u8], shape: &[usize], device: &Device) -> Result<Tensor> {
     Ok(Tensor::from_raw_buffer(bytes, DType::F32, shape, device)?)
 }
 
@@ -2554,7 +3083,8 @@ mod tests {
             append_range(&mut c, 0, pos, n_kv, hd, &dev);
             write_specials(&c, 0, n_kv, hd, &dev);
             let (k_bytes, v_bytes) = c.export_full_rows().unwrap();
-            let image = HostFullKv::new(pos, n_kv, hd, vec![(k_bytes, v_bytes)]).unwrap();
+            let image =
+                HostFullKv::new(pos, n_kv, hd, vec![(k_bytes, v_bytes)], Vec::new(), 0).unwrap();
             assert_eq!(image.byte_len(), 2 * n_kv * pos * hd * size_of::<f16>());
 
             // Another conversation takes the slots over: different positions, so
@@ -2604,7 +3134,7 @@ mod tests {
         let mut c = fresh_full(max_ctx, n_kv, hd, &dev);
         append_range(&mut c, 0, pos, n_kv, hd, &dev);
         let planes = vec![c.export_full_rows().unwrap()];
-        let image = HostFullKv::new(pos, n_kv, hd, planes).unwrap();
+        let image = HostFullKv::new(pos, n_kv, hd, planes, Vec::new(), 0).unwrap();
 
         assert!(image.prefix(0, pos + 1).is_err(), "pos past the image");
         assert!(image.prefix(1, pos).is_err(), "layer past the image");
@@ -2630,7 +3160,15 @@ mod tests {
         // The declared shape is checked against the planes at construction, so a
         // record can never be read with a layout its bytes do not support.
         assert!(
-            HostFullKv::new(pos, n_kv, hd, vec![(vec![0u8; 4], vec![0u8; 4])]).is_err(),
+            HostFullKv::new(
+                pos,
+                n_kv,
+                hd,
+                vec![(vec![0u8; 4], vec![0u8; 4])],
+                Vec::new(),
+                0
+            )
+            .is_err(),
             "plane size must match the declared shape"
         );
     }
@@ -2664,7 +3202,7 @@ mod tests {
             bytes
         };
         let planes = (0..layers).map(|l| (plane(l, 0), plane(l, 1))).collect();
-        let whole = HostFullKv::new(pos, n_kv, hd, planes).unwrap();
+        let whole = HostFullKv::new(pos, n_kv, hd, planes, Vec::new(), 0).unwrap();
 
         // A range's rows are the source's rows for those positions, per head.
         for (start, end) in [(0, pos), (0, 4), (4, 9), (3, 3), (2, 7)] {
@@ -2718,7 +3256,7 @@ mod tests {
         assert!(whole.range(0, pos + 1).is_err());
         assert!(whole.range(5, 4).is_err());
         assert!(HostFullKv::concat(Vec::new()).is_err());
-        let other = HostFullKv::new(pos, hd, n_kv, vec![]).unwrap();
+        let other = HostFullKv::new(pos, hd, n_kv, vec![], Vec::new(), 0).unwrap();
         assert!(HostFullKv::concat(vec![whole.range(0, 2).unwrap(), other]).is_err());
     }
 
@@ -2736,7 +3274,7 @@ mod tests {
         let kinds = [true, false, false, false, true, false];
         let mut caches = mixed_stack(&kinds, pos, n_kv, hd, max_ctx, window, &dev);
 
-        let image = export_full_kv_from(&caches).unwrap();
+        let image = export_full_kv_from(&caches, &[]).unwrap();
         assert_eq!(image.pos, pos);
         assert_eq!(image.layers(), 2, "one plane per full-attention layer");
         assert_eq!(image.byte_len(), 2 * 2 * n_kv * pos * hd * size_of::<f16>());
@@ -2747,7 +3285,7 @@ mod tests {
             append_range(cache, 500 + il * 1000, pos + 3, n_kv, hd, &dev);
         }
 
-        import_full_kv_into(&mut caches, &image, pos).unwrap();
+        import_full_kv_into(&mut caches, &mut [], &image, pos).unwrap();
 
         let want = mixed_stack(&kinds, pos, n_kv, hd, max_ctx, window, &dev);
         for (il, (got, want)) in caches.iter().zip(&want).enumerate() {
@@ -2779,27 +3317,27 @@ mod tests {
         let (n_kv, hd, max_ctx, window, pos) = (2, 4, 64, 8, 9);
         let kinds = [true, false, true, false];
         let mut caches = mixed_stack(&kinds, pos, n_kv, hd, max_ctx, window, &dev);
-        let image = export_full_kv_from(&caches).unwrap();
+        let image = export_full_kv_from(&caches, &[]).unwrap();
 
         assert!(
-            import_full_kv_into(&mut caches, &image, pos + 1).is_err(),
+            import_full_kv_into(&mut caches, &mut [], &image, pos + 1).is_err(),
             "more positions than the image holds"
         );
 
         let fewer = mixed_stack(&[true, false], pos, n_kv, hd, max_ctx, window, &dev);
-        let fewer_image = export_full_kv_from(&fewer).unwrap();
+        let fewer_image = export_full_kv_from(&fewer, &[]).unwrap();
         assert!(
-            import_full_kv_into(&mut caches, &fewer_image, pos).is_err(),
+            import_full_kv_into(&mut caches, &mut [], &fewer_image, pos).is_err(),
             "an image covering a different number of full-attention layers"
         );
 
         // Heads and head dim swapped. The totals are identical, so only the
         // record's own shape metadata can tell this from a valid image.
         let swapped = mixed_stack(&kinds, pos, hd, n_kv, max_ctx, window, &dev);
-        let swapped_image = export_full_kv_from(&swapped).unwrap();
+        let swapped_image = export_full_kv_from(&swapped, &[]).unwrap();
         assert_eq!(swapped_image.byte_len(), image.byte_len());
         assert!(
-            import_full_kv_into(&mut caches, &swapped_image, pos).is_err(),
+            import_full_kv_into(&mut caches, &mut [], &swapped_image, pos).is_err(),
             "a transposed image has the right size and the wrong layout"
         );
     }
@@ -2865,7 +3403,7 @@ mod tests {
                 )
             })
             .collect();
-        let image = HostFullKv::new(pos, n_kv, hd, planes.clone()).unwrap();
+        let image = HostFullKv::new(pos, n_kv, hd, planes.clone(), Vec::new(), 0).unwrap();
 
         let mut bytes = Vec::new();
         image.write_to(&mut bytes).unwrap();
@@ -2966,6 +3504,8 @@ mod tests {
             n_kv,
             hd,
             vec![(plane_pattern(plane, 1), plane_pattern(plane, 2))],
+            Vec::new(),
+            0,
         )
         .unwrap();
         let mut bytes = Vec::new();
@@ -3259,5 +3799,310 @@ mod tests {
             delta_shape: (2, 4, 4),
         };
         assert!(HostSnapshot::new(0, vec![empty]).is_err());
+    }
+
+    // ------------------------------------------------ qwen4exp cache images ---
+
+    /// A PLE image at a small test geometry, keyed to `seed` so an image restored
+    /// from the wrong layer shows up as wrong values.
+    fn ple_image(seed: u64, width: usize, state_len: usize) -> PleImage {
+        PleImage {
+            history: vec![7, 13],
+            conv: seeded(width * state_len, seed),
+            state_len,
+        }
+    }
+
+    fn full_kv_bytes(image: &HostFullKv) -> Vec<u8> {
+        let mut out = Vec::new();
+        image.write_to(&mut out).unwrap();
+        out
+    }
+
+    /// The qwen4exp PLE state travels on the layer it belongs to, through every
+    /// stage a conversation's cache image passes: device snapshot, host copy,
+    /// framed record, and back onto the device.
+    ///
+    /// It rides on that layer's OWN entry rather than in a vector of its own,
+    /// which is what keeps `layers` one-to-one with the cache stack — and it
+    /// wraps rather than replaces, because the PLE layer is also a DeltaNet
+    /// layer and a variant that stood in for `Linear` would drop the recurrent
+    /// state the layer's own cache holds.
+    #[test]
+    fn a_ple_state_rides_on_its_layer_through_the_whole_image_chain() {
+        let dev = dev();
+        let (tail, conv_dim, v_heads, hd) = (3usize, 6usize, 2usize, 4usize);
+        let (width, state_len) = (5usize, 9usize);
+        let mut linear = fresh_linear(tail, conv_dim, v_heads, hd, &dev);
+        let steps: Vec<(Tensor, Tensor)> = (0..4)
+            .map(|p| linear_state_for(p, tail, conv_dim, v_heads, hd, &dev))
+            .collect();
+        linear.advance_linear(4, steps).unwrap();
+        let want_linear = linear_values(&linear);
+        let ple = ple_image(31, width, state_len);
+
+        let mut caches = vec![fresh_full(16, 2, 8, &dev), linear];
+        let mut layers: Vec<LayerSnapshot> = caches
+            .iter()
+            .map(LayerCache::snapshot)
+            .collect::<Result<_>>()
+            .unwrap();
+        // One PLE state per layer: a second wrap is a bug, not a second state.
+        assert!(
+            LayerSnapshot::Full
+                .with_ple(ple.clone())
+                .unwrap()
+                .with_ple(ple.clone())
+                .is_err()
+        );
+        let decorated = layers.pop().unwrap().with_ple(ple.clone()).unwrap();
+        layers.push(decorated);
+        let snapshot = CacheSnapshot::new(4, layers);
+
+        let want_shapes = vec![
+            None,
+            Some(PleShape {
+                conv_len: width * state_len,
+                state_len,
+                history_len: 2,
+            }),
+        ];
+        assert_eq!(snapshot.ple_shapes(), want_shapes);
+
+        let host = snapshot.to_host().unwrap();
+        assert_eq!(host.ple_shapes(), want_shapes);
+        let linear_bytes =
+            f32_bytes_for(&[tail, conv_dim]).unwrap() + f32_bytes_for(&[v_heads, hd, hd]).unwrap();
+        assert_eq!(
+            host.byte_len(),
+            linear_bytes + width * state_len * size_of::<f32>() + 2 * size_of::<u32>(),
+            "the PLE window and its history are part of what a parked snapshot costs"
+        );
+
+        let mut framed = Vec::new();
+        host.write_to(&mut framed).unwrap();
+        assert_eq!(framed.len(), host.serialized_len());
+        let read = HostSnapshot::read_from(&framed[..], framed.len() as u64).unwrap();
+        assert_eq!(read.pos, 4);
+        assert_eq!(read.ple_shapes(), want_shapes);
+        read.check_restorable(&caches, 4).unwrap();
+
+        let rebuilt = read.to_snapshot(&dev).unwrap();
+        assert_eq!(rebuilt.ple_images(), vec![None, Some(&ple)]);
+
+        // Clobber the live state so the restore has something to put back.
+        caches[1].reset().unwrap();
+        assert_ne!(linear_values(&caches[1]), want_linear);
+        for (cache, layer) in caches.iter_mut().zip(rebuilt.layers()) {
+            cache.restore(layer, 4).unwrap();
+        }
+        assert_eq!(
+            linear_values(&caches[1]),
+            want_linear,
+            "the decoration must not cost the layer its own recurrent state"
+        );
+        assert_eq!(caches[1].len(), 4);
+    }
+
+    /// A PLE state inside a PLE state is refused wherever one can be built: the
+    /// wrapper is one deep by construction, and every reader of the record —
+    /// `byte_len`, `serialized_len`, the upload — walks it assuming so.
+    #[test]
+    fn a_ple_state_nested_in_a_ple_state_is_refused() {
+        let nested = HostLayerSnapshot::Ple {
+            inner: Box::new(HostLayerSnapshot::Ple {
+                inner: Box::new(HostLayerSnapshot::Full),
+                conv: vec![0u8; 4 * 6],
+                history: vec![1],
+                state_len: 3,
+            }),
+            conv: vec![0u8; 4 * 6],
+            history: vec![2],
+            state_len: 3,
+        };
+        assert!(HostSnapshot::new(4, vec![nested]).is_err());
+
+        // And on the way back in, where the record is untrusted input rather
+        // than something this process assembled.
+        let framed = HostLayerSnapshot::Ple {
+            inner: Box::new(HostLayerSnapshot::Ple {
+                inner: Box::new(HostLayerSnapshot::Full),
+                conv: vec![0u8; 4 * 6],
+                history: vec![1],
+                state_len: 3,
+            }),
+            conv: vec![0u8; 4 * 6],
+            history: vec![2],
+            state_len: 3,
+        };
+        let mut bytes = Vec::new();
+        write_count(&mut bytes, 4).unwrap();
+        write_count(&mut bytes, 1).unwrap();
+        write_layer(&mut bytes, &framed).unwrap();
+        let err = match HostSnapshot::read_from(&bytes[..], bytes.len() as u64) {
+            Ok(_) => panic!("a nested PLE state read back as a valid record"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("PLE state inside a PLE state"), "{err}");
+    }
+
+    /// A PLE window whose bytes do not describe its declared columns is refused
+    /// before anything is built from it, on both the host and the device paths.
+    #[test]
+    fn ple_records_reject_shape_and_length_lies() {
+        let dev = dev();
+        let bad = |conv: Vec<u8>, state_len: usize| HostLayerSnapshot::Ple {
+            inner: Box::new(HostLayerSnapshot::Full),
+            conv,
+            history: vec![1, 2],
+            state_len,
+        };
+        // Not a whole number of f32.
+        assert!(HostSnapshot::new(1, vec![bad(vec![0u8; 7], 3)]).is_err());
+        // A whole number of f32, but not a whole number of columns.
+        assert!(HostSnapshot::new(1, vec![bad(vec![0u8; 4 * 7], 3)]).is_err());
+        // Zero columns, and an empty window.
+        assert!(HostSnapshot::new(1, vec![bad(vec![0u8; 4 * 6], 0)]).is_err());
+        assert!(HostSnapshot::new(1, vec![bad(Vec::new(), 3)]).is_err());
+        // The upload re-checks rather than trusting the assembly.
+        assert!(device_layer(0, &bad(vec![0u8; 4 * 7], 3), &dev).is_err());
+    }
+
+    /// The QSA indexers' raw keys travel with the full-attention rows, not in a
+    /// snapshot: they are position-indexed, so they grow with the conversation
+    /// and a fixed-size ring image could never carry them.
+    ///
+    /// The plane has ONE key head where a K/V plane has `n_kv_head`, so a range
+    /// of positions is a slice of the buffer rather than a per-head gather —
+    /// which is the property `range`, `concat` and `qsa_prefix` all lean on.
+    #[test]
+    fn qsa_indexer_planes_ride_with_the_full_attention_rows() {
+        let (n_kv, hd, pos, layers, qhd) = (3usize, 4usize, 9usize, 2usize, 2usize);
+        let kv_plane = f16_bytes_for(&[n_kv, pos, hd]).unwrap();
+        let qsa_plane = f32_bytes_for(&[pos, qhd]).unwrap();
+        let planes: Vec<(Vec<u8>, Vec<u8>)> = (0..layers)
+            .map(|il| {
+                (
+                    plane_pattern(kv_plane, il as u8),
+                    plane_pattern(kv_plane, 0x40 + il as u8),
+                )
+            })
+            .collect();
+        let qsa: Vec<Vec<u8>> = (0..layers)
+            .map(|il| plane_pattern(qsa_plane, 0x80 + il as u8))
+            .collect();
+        let whole = HostFullKv::new(pos, n_kv, hd, planes.clone(), qsa.clone(), qhd).unwrap();
+
+        assert_eq!(whole.qsa_layers(), layers);
+        assert_eq!(whole.qsa_head_dim(), qhd);
+        assert_eq!(
+            whole.byte_len(),
+            2 * layers * kv_plane + layers * qsa_plane,
+            "a paged-out qwen4exp conversation costs the indexer planes too"
+        );
+
+        // A prefix of the positions is a prefix of the buffer.
+        let row = f32_bytes_for(&[qhd]).unwrap();
+        for (idx, plane) in qsa.iter().enumerate() {
+            assert_eq!(whole.qsa_prefix(idx, pos).unwrap(), &plane[..]);
+            assert_eq!(whole.qsa_prefix(idx, 4).unwrap(), &plane[..4 * row]);
+            assert_eq!(whole.qsa_prefix(idx, 0).unwrap(), &[] as &[u8]);
+        }
+        assert!(whole.qsa_prefix(layers, pos).is_err());
+        assert!(whole.qsa_prefix(0, pos + 1).is_err());
+
+        // Every partition composes back into the whole, planes included.
+        for cut in 0..=pos {
+            let spans = vec![whole.range(0, cut).unwrap(), whole.range(cut, pos).unwrap()];
+            let back = HostFullKv::concat(spans).unwrap();
+            assert_eq!(back.qsa_layers(), layers);
+            assert_eq!(
+                full_kv_bytes(&back),
+                full_kv_bytes(&whole),
+                "recomposed at {cut}"
+            );
+        }
+
+        // And the framed record carries them, with the length it declared.
+        let mut bytes = Vec::new();
+        whole.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), whole.serialized_len());
+        let back = HostFullKv::read_from(&bytes[..], bytes.len() as u64).unwrap();
+        assert_eq!(back.qsa_layers(), layers);
+        assert_eq!(back.qsa_head_dim(), qhd);
+        for (idx, plane) in qsa.iter().enumerate() {
+            assert_eq!(back.qsa_prefix(idx, pos).unwrap(), &plane[..]);
+        }
+    }
+
+    /// Every way a QSA plane set can disagree with the image it is part of, each
+    /// caught before a byte of it reaches a live indexer.
+    #[test]
+    fn qsa_planes_that_do_not_describe_their_image_are_refused() {
+        let (n_kv, hd, pos, qhd) = (2usize, 4usize, 5usize, 2usize);
+        let kv_plane = f16_bytes_for(&[n_kv, pos, hd]).unwrap();
+        let qsa_plane = f32_bytes_for(&[pos, qhd]).unwrap();
+        let planes = || -> Vec<(Vec<u8>, Vec<u8>)> {
+            (0..2)
+                .map(|il| {
+                    (
+                        plane_pattern(kv_plane, il as u8),
+                        plane_pattern(kv_plane, 0x40 + il as u8),
+                    )
+                })
+                .collect()
+        };
+        let good = || -> Vec<Vec<u8>> {
+            (0..2)
+                .map(|il| plane_pattern(qsa_plane, 0x80 + il as u8))
+                .collect()
+        };
+
+        // A plane shorter than the positions it claims.
+        let mut short = good();
+        short[1].truncate(qsa_plane - 4);
+        assert!(HostFullKv::new(pos, n_kv, hd, planes(), short, qhd).is_err());
+        // One plane for two full-attention layers: an indexer on some layers and
+        // not others is not a shape this architecture has.
+        assert!(HostFullKv::new(pos, n_kv, hd, planes(), vec![good()[0].clone()], qhd).is_err());
+        // Planes at head dim zero, and a head dim with no planes.
+        assert!(HostFullKv::new(pos, n_kv, hd, planes(), good(), 0).is_err());
+        assert!(HostFullKv::new(pos, n_kv, hd, planes(), Vec::new(), qhd).is_err());
+        // Spans that disagree about their indexer geometry cannot be composed.
+        let with = HostFullKv::new(pos, n_kv, hd, planes(), good(), qhd).unwrap();
+        let without = HostFullKv::new(pos, n_kv, hd, planes(), Vec::new(), 0).unwrap();
+        assert!(HostFullKv::concat(vec![with, without]).is_err());
+    }
+
+    /// A qwen35 conversation's image carries no indexer planes at all, and its
+    /// record is the pre-v4 one with the two zero counts the fields cost — the
+    /// bytes in front of them are untouched, which is what makes the container
+    /// bump the only thing an older build sees.
+    #[test]
+    fn a_qwen35_image_carries_no_indexer_planes() {
+        let dev = dev();
+        let (n_kv, hd, max_ctx, window, pos) = (2, 4, 64, 8, 6);
+        let kinds = [true, false, true, false];
+        let caches = mixed_stack(&kinds, pos, n_kv, hd, max_ctx, window, &dev);
+        let image = export_full_kv_from(&caches, &[]).unwrap();
+
+        assert_eq!(image.qsa_layers(), 0);
+        assert_eq!(image.qsa_head_dim(), 0);
+        assert_eq!(
+            image.byte_len(),
+            2 * 2 * n_kv * pos * hd * size_of::<f16>(),
+            "no indexer term on a checkpoint with no indexers"
+        );
+
+        let bytes = full_kv_bytes(&image);
+        assert_eq!(bytes.len(), image.serialized_len());
+        assert_eq!(
+            &bytes[bytes.len() - 2 * size_of::<u64>()..],
+            &[0u8; 16],
+            "the QSA fields are two zero counts and nothing else"
+        );
+        let back = HostFullKv::read_from(&bytes[..], bytes.len() as u64).unwrap();
+        assert_eq!(back.qsa_layers(), 0);
+        assert_eq!(full_kv_bytes(&back), bytes);
     }
 }

@@ -22,8 +22,7 @@ use xwen::serve::config::{CliOverrides, DraftMode, ServeToml};
 #[command(
     name = "xwen",
     about = "Qwen inference on Metal, defaulting to Qwen3.8-Flash-Next. Bare \
-             `xwen` serves over HTTP with the live dashboard (which serves \
-             Qwen3.6-35B-A3B until Flash-Next is servable); subcommands cover \
+             `xwen` serves over HTTP with the live dashboard; subcommands cover \
              everything else.",
     args_conflicts_with_subcommands = true
 )]
@@ -405,11 +404,10 @@ enum Cmd {
     /// of it rather than N. Which checkpoint to run comes from the payload
     /// (`"model": "27b"` / `"35b"`), not from a flag — one request is one
     /// model's work — or from the `-m` file's own identity when one is given.
-    /// Because those snapshots are how a batch runs at all, this surface cannot
-    /// run Qwen3.8-Flash-Next: a payload naming it is refused up front, and a
-    /// payload naming nothing gets Qwen3.6-35B-A3B (serve's default too) with a
-    /// line saying so. Sampling defaults to greedy and thinking to off, so a
-    /// batch is reproducible and a tight token budget goes to the answer.
+    /// A payload naming nothing gets the same zero-flag checkpoint `xwen serve`
+    /// resolves, the two surfaces moving cache state for the same reasons.
+    /// Sampling defaults to greedy and thinking to off, so a batch is
+    /// reproducible and a tight token budget goes to the answer.
     ///
     /// Progress lines go to stderr; stdout carries the JSON alone. Setting
     /// XWEN_BATCH_NO_CACHE runs every item from a reset cache instead, which is
@@ -456,8 +454,7 @@ struct ServeArgs {
     #[arg(long)]
     init: bool,
     /// Model GGUF to serve (default: the config file's `model`, else the
-    /// server's default checkpoint from the Hugging Face cache — Qwen3.6-35B-A3B,
-    /// not the CLI's Qwen3.8-Flash-Next, which the server cannot run yet).
+    /// server's default checkpoint from the Hugging Face cache).
     #[arg(short, long)]
     model: Option<PathBuf>,
     #[command(flatten)]
@@ -702,37 +699,16 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     let file = file.unwrap_or_else(ServeToml::default);
 
     let selected = args.select.model_size;
-    // Before anything is resolved or fetched: a `--model-size` naming a
-    // checkpoint the server cannot run is refused here rather than after a
-    // 111 GB download and a load that fails every request.
-    if let Some(size) = selected {
-        ensure!(size.servable(), "{}", size.unservable_message());
-    }
     let mut overrides = args.overrides();
     // Neither the CLI nor the config named a model: serve the hub-cached
     // official checkpoint. Injected into the CLI side of the merge (rather than
     // inside `resolve`) so config resolution itself stays pure and testable.
     if overrides.model.is_none() && file.model.is_none() {
-        // A run that named nothing asked for no checkpoint in particular, so an
-        // unservable default is not a refusal — the server falls back to the
-        // best checkpoint it can run and says which, and why, since otherwise
-        // the surprise is a different model answering than the CLI would.
-        // The notice belongs here rather than beside the check above: a config
-        // that names its own model file is not falling back to anything.
-        let size = selected.unwrap_or_else(|| {
-            let default = Model::default();
-            if default.servable() {
-                return default;
-            }
-            let fallback = Model::default_servable();
-            eprintln!(
-                "xwen: {} cannot be served yet ({}); serving {}. Pass --model-size to choose.",
-                default.full_name(),
-                default.unservable_reason(),
-                fallback.full_name(),
-            );
-            fallback
-        });
+        // The zero-flag checkpoint goes through `default_servable` rather than
+        // `default`, because this surface moves cache state and that is the
+        // question the rule answers. The two agree today; the indirection is
+        // what keeps them agreeing on purpose rather than by coincidence.
+        let size = selected.unwrap_or_else(Model::default_servable);
         overrides.model = Some(resolve_model(None, size)?);
     }
 
@@ -744,20 +720,14 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         bail!("model {} does not exist", settings.model.display());
     }
 
-    // The served FILE decides, not the name: someone's own conversion onto the
-    // qwen4exp graph is as unservable as the official checkpoint is, for the
-    // same reason, and it identifies as no checkpoint at all — `identify_
-    // checkpoint` falls it back to `Arch::model()`, which is the qwen4exp
-    // checkpoint, which is unservable. Read once here and reused by the drafter
-    // prefetch below.
+    // The served FILE decides which checkpoint this is, not the name: it settles
+    // the chat dialect, the drafter and the label. Read once here and reused by
+    // the drafter prefetch below.
     let served_cfg =
         XwenConfig::from_gguf(&gguf::open(&settings.model, &candle_core::Device::Cpu)?.content)
             .with_context(|| format!("reading {}", settings.model.display()))?;
     let (served_target, _) =
         xwen::serve::engine::identify_checkpoint(&settings, &served_cfg, selected)?;
-    if !served_target.model.servable() {
-        bail!("{}", served_target.model.unservable_message());
-    }
 
     match &settings.draft {
         DraftMode::Off => {}
@@ -997,33 +967,19 @@ fn batch_request(
     // payload's name (or its absence) is only the cross-check, exactly as
     // `--model-size` is for the other commands.
     //
-    // `BatchRequest::model` has already refused a checkpoint batch cannot run,
-    // so what is left to check here is a custom GGUF that turns out to BE one.
     let named = request
         .model
         .is_some()
         .then(|| request.model())
         .transpose()?;
-    if model.is_none() && named.is_none() && !Model::default().servable() {
-        // Nothing named a checkpoint, so an unrunnable default is a fallback
-        // rather than a refusal — the same rule, notice and reason a zero-flag
-        // `xwen serve` prints, because otherwise a different model answers here
-        // than the one `xwen generate` would.
-        eprintln!(
-            "xwen: {} cannot run under `xwen batch` yet ({}); running {}. \
-             Name a checkpoint in the request's \"model\" field to choose.",
-            Model::default().full_name(),
-            Model::default().unservable_reason(),
-            Model::default_servable().full_name(),
-        );
-    }
+    // `default_servable` rather than `default`, because batch moves cache state
+    // and that is the question the rule answers. The two agree today.
     let size = one_shot_checkpoint(
         model.as_deref(),
         named,
         "the request's \"model\" field",
         Model::default_servable(),
     )?;
-    ensure!(size.servable(), "batch: {}", size.unbatchable_message());
 
     let load_start = std::time::Instant::now();
     let mut generator = build_generator(
@@ -1507,8 +1463,7 @@ mod tests {
             one_shot_checkpoint(None, None, "--model-size", Model::default_servable()).unwrap(),
             Model::default_servable()
         );
-        // An explicit selection wins over either fallback, and is the only thing
-        // that can name the unservable checkpoint on a one-shot.
+        // An explicit selection wins over either fallback.
         for default in [Model::default(), Model::default_servable()] {
             assert_eq!(
                 one_shot_checkpoint(None, Some(Model::Qwen27B), "--model-size", default).unwrap(),

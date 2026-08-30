@@ -253,11 +253,11 @@ fn model_id(settings: &ServeSettings, served: &crate::serve::types::Target) -> S
 ///
 /// Two conditions, and they refuse for different reasons.
 ///
-/// [`crate::hub::Model::servable`] is about the engine: a qwen4exp checkpoint
-/// snapshots, rewinds and pages out on the server's ordinary path and refuses
-/// every one of those moves until P4, so serving it would fail nearly every
-/// request. Startup already refuses to SERVE such a file; this is what keeps a
-/// server running something else from loading one on the side.
+/// [`crate::hub::Model::servable`] is about the engine: a checkpoint whose state
+/// no cache image carries would fail nearly every request on a server that
+/// snapshots, rewinds and pages conversations out on its ordinary path. Every
+/// registry checkpoint answers true today; the condition stays because it is
+/// what the next half-ported architecture is refused by.
 ///
 /// [`crate::hub::Model::auto_fetch`] is about the download: a checkpoint whose
 /// fetch is over 100 GB is not started in the middle of a request that then
@@ -279,7 +279,7 @@ pub(crate) fn checkpoint_selectable(model: crate::hub::Model) -> bool {
 /// The served file leads unconditionally, whatever [`checkpoint_selectable`]
 /// says about its checkpoint: it is open on disk, so the download half of the
 /// predicate does not apply to it — and the engine half was settled at startup,
-/// which refuses to serve an unservable file at all.
+/// which refuses to serve a file this build cannot move the cache state of.
 fn listed_models(served: &str) -> Vec<String> {
     listed_models_with(served, &checkpoint_selectable)
 }
@@ -354,7 +354,12 @@ fn resolve_requested_model_with(
 /// the other is not available on this surface at all.
 pub(crate) fn unselectable_model_message(model: crate::hub::Model) -> String {
     if !model.servable() {
-        return model.unservable_message();
+        return format!(
+            "{} cannot be served by this build: its recurrent state is not carried by any \
+             cache image, and the server snapshots, rewinds and pages conversations out on \
+             its ordinary path",
+            model.full_name()
+        );
     }
     uncached_model_message(model)
 }
@@ -1541,39 +1546,48 @@ mod tests {
         }
     }
 
-    /// A checkpoint the engine cannot run is never offered and never selected,
-    /// however available its file is.
+    /// The engine half of [`checkpoint_selectable`] no longer refuses anything:
+    /// every registry checkpoint's state has a cache image as of 2026-08-30, so
+    /// what is left for Qwen3.8-Flash-Next is the DOWNLOAD half, which its 111 GB
+    /// answers. Listed and selectable exactly when it is really cached, and a
+    /// 400 that points at the fetch command rather than at the CLI when it is not.
     ///
-    /// Qwen3.8-Flash-Next is the case: the server snapshots, rewinds and pages
-    /// conversations out on its ordinary path, and qwen4exp refuses every one of
-    /// those until P4, so a request naming it would fail somewhere in the middle
-    /// rather than up front. The 400 says so and points at the CLI, which runs
-    /// it fine.
-    ///
-    /// The predicate is checked directly rather than injected here: `servable`
-    /// is a property of the build, not of this machine's hub cache, so there is
-    /// nothing to vary.
+    /// The cached/uncached arms go through the injected predicate, because
+    /// whether this machine happens to hold 111 GB is not what the rule says.
     #[test]
-    fn an_unservable_checkpoint_is_never_listed_or_selected() {
+    fn flash_next_is_gated_only_by_the_download_rule() {
         use crate::hub::Model;
         let served = types::Target::official(Model::Qwen3827B);
         let served_id = "Qwen3.8-27B";
 
-        assert!(!checkpoint_selectable(Model::Qwen38FlashNext));
-        for model in [Model::Qwen27B, Model::Qwen35BA3B, Model::Qwen3827B] {
-            assert!(checkpoint_selectable(model), "{model}");
+        for model in crate::hub::MODELS {
+            assert!(model.servable(), "{model}");
         }
+        assert_eq!(
+            checkpoint_selectable(Model::Qwen38FlashNext),
+            crate::hub::cached_model(Model::Qwen38FlashNext).is_some(),
+            "nothing but the cache decides this now"
+        );
 
-        let ids = listed_models(served_id);
+        let cached = |_| true;
+        let ids = listed_models_with(served_id, &cached);
+        assert!(ids.iter().any(|id| id == "Qwen3.8-Flash-Next"), "{ids:?}");
+        assert_eq!(
+            resolve_requested_model_with(Some("Qwen3.8-Flash-Next"), served, served_id, &cached),
+            Ok((
+                types::Target::official(Model::Qwen38FlashNext),
+                "Qwen3.8-Flash-Next".to_string()
+            ))
+        );
+
+        let uncached = |model: Model| model != Model::Qwen38FlashNext;
+        let ids = listed_models_with(served_id, &uncached);
         assert!(!ids.iter().any(|id| id == "Qwen3.8-Flash-Next"), "{ids:?}");
-        assert!(ids.iter().any(|id| id == "Qwen3.6-27B"), "{ids:?}");
-
         let err =
-            resolve_requested_model(Some("Qwen3.8-Flash-Next"), served, served_id).unwrap_err();
-        assert!(err.contains("cannot be served yet"), "{err}");
-        assert!(err.contains("xwen chat"), "{err}");
-        // Not the fetch message: this is not a download away.
-        assert!(!err.contains("xwen fetch"), "{err}");
+            resolve_requested_model_with(Some("Qwen3.8-Flash-Next"), served, served_id, &uncached)
+                .unwrap_err();
+        assert!(err.contains("--model-size flash-next"), "{err}");
+        assert!(!err.contains("xwen chat"), "{err}");
     }
 
     /// A checkpoint too large to download inside a request is listed and
@@ -1582,10 +1596,9 @@ mod tests {
     /// and letting `checkpoint_paths` fetch — is a client's typo starting a
     /// 111 GB download.
     ///
-    /// Driven through an injected predicate because the only checkpoint that is
-    /// explicit-only today is also unservable, so the shipped table cannot
-    /// exhibit this half on its own. The rule is the one under test, not which
-    /// checkpoint happens to hit it.
+    /// Driven through an injected predicate because whether the one
+    /// explicit-only checkpoint is really cached varies by machine. The rule is
+    /// the one under test, not which checkpoint happens to hit it.
     #[test]
     fn an_explicit_only_checkpoint_is_offered_only_once_it_is_cached() {
         use crate::hub::Model;
@@ -1711,7 +1724,7 @@ mod tests {
     /// a client counting tokens for a model this server does not serve is asking
     /// about the wrong model, and every other surface tells it so.
     #[tokio::test]
-    async fn an_unservable_model_is_refused_by_every_dialect() {
+    async fn a_model_this_server_does_not_serve_is_refused_by_every_dialect() {
         let (state, queue) = probe_state(4096);
         let chat = |body: &'static str| {
             let state = state.clone();
@@ -1977,9 +1990,9 @@ mod tests {
             shutdown: Arc::new(Cancel::default()),
             model_id: "xwen-test".to_string(),
             // Named, not `Model::default()`: these tests assert rendered
-            // prompts, and the rendering is dialect-keyed to the checkpoint. A
-            // server can never hold the plain default anyway — it is
-            // unservable — so this is also what a real one would carry.
+            // prompts, and the rendering is dialect-keyed to the checkpoint, so
+            // pinning it here is what keeps them reading the dialect they were
+            // written against.
             default_target: types::Target::served(crate::hub::Model::Qwen35BA3B),
             max_ctx,
             next_request_id: Arc::new(AtomicU64::new(1)),

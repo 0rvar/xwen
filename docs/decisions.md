@@ -2013,7 +2013,16 @@ growing a fourth variant across five enums and ~15 match sites. Prefix-cache sna
 host snapshots and the disk tier do not carry them: a qwen4exp target refuses
 snapshot save and restore with a loud error. Why: it decoupled three parallel units from
 `kv_cache.rs` entirely. The cost is honest and now scheduled — it is exactly why serve
-is refused until P4 (2026-08-29).
+is refused until P4 (2026-08-29). **SUPERSEDED IN PART 2026-08-30 (P4; the port doc's
+D15 carries the same annotation):** `kv_cache.rs` now DOES carry two of the three — the
+PLE conv window and its n-gram history as an image on the layer's own snapshot entry,
+the QSA raw keys as planes inside `HostFullKv` — and a qwen4exp target snapshots,
+rewinds, pages out and stores like any other. What survives is the residency half of the
+decision, which was never only about P2 scope: the state still LIVES in
+`Qwen4ExpParts`, not in a `LayerCache`, and `LayerCache::restore`/`check_restorable`
+unwrap straight to the inner layer and stay unaware of the PLE — `XwenModel` is what
+pairs the two. The refusal was P2 scope and nothing else, which is why it could be
+retired without moving where the state lives (see the entry below).
 
 **PLE in P2 is host-hybrid, knowingly.** Hash, table row gather and IQ4_NL row dequant
 run on the CPU from `MmapSource::bytes`; `key_proj`/`value_proj` run on device; the
@@ -2037,7 +2046,9 @@ shipped GGUF headers before a line was written (2026-08-25, graded 2026-08-26).
 
 **Flash-Next is `generate`/`chat`-only until P4, by construction rather than by
 convention.** (Written as "CLI-only"; corrected 2026-08-30 — `xwen batch` is gated with
-serve, see the amendment below.)
+serve, see the amendment below. **RETIRED 2026-08-30 when P4 shipped**: every surface
+runs the checkpoint; kept as the record of what the gate was and what lifting it
+required.)
 `Model::servable()` is false for this checkpoint, so `xwen serve` refuses it at startup
 — both the registry entry and a custom qwen4exp GGUF — never lists it, and 400s a
 request that names it. `Model::auto_fetch()` is false and `Model::supports_drafting()`
@@ -2094,6 +2105,56 @@ single message did — it sent an operator from serve to `xwen batch`. `XWEN_BAT
 is deliberately not offered as a way through: it skips the shared prefix and leaves the
 per-option snapshots, so it would be an escape hatch that works until the schema has an
 enum in it.
+
+**RETIRED 2026-08-30 by the entry below.** The refusal, the fallback, both surfaces'
+messages, their shared `unservable_reason()` and `refuse_state_transfer` itself are all
+deleted: the cache images carry the state, so `servable()` is true for every registry
+checkpoint and `default_servable()` returns `default()`. `xwen serve` and `xwen batch`
+run Flash-Next with no flags, `/v1/models` lists it and a request may select it — gated
+now only by the download rule, so it is listed exactly when the file is really in the HF
+cache and the 400 for an uncached one points at `xwen fetch`. The default flip itself
+stands unchanged; what is retired is its serve-and-batch fallback clause. The entries
+above stay as the record of what was refused and why, and of the batch correction that
+had to land before the refusal could be lifted from one place for both surfaces.
+
+**Two kinds of recurrent state, two routes into a cache image — and the PLE image rides
+on its layer's entry rather than becoming a fourth layer kind.** qwen4exp carries two
+things no image carried before, and they travel differently because they ARE different.
+The QSA lightning-indexer raw keys are position-indexed exactly like a full-attention
+layer's K/V: one row per token, one MQA key head, nothing recurrent about them. So a
+snapshot stores NO data for them at all — a restore is `IndexerCache::truncate(pos)`,
+exact — and only the page-out path moves bytes, as a `qsa` plane set plus a
+`qsa_head_dim` inside `HostFullKv`, beside the trunk's K/V planes and travelling with
+them through `range`, `concat` and `qsa_prefix` (one head, so a position range is a
+slice of the buffer rather than the per-head gather the K/V planes need). The PLE conv
+window and its rolling n-gram token history are the opposite: recurrent summaries with
+no inverse, unreconstructible from any position, so they must travel as DATA — `PleImage`
+/ `PleShape`, with `PleState::image/shape/accepts/restore`. Nothing about that is a
+preference; it falls out of whether a position determines the state.
+
+The layer alignment is the part that could have gone the other way. The snapshot's
+`layers` vector stays ONE ENTRY PER TRUNK LAYER, and the PLE image rides on its layer's
+own entry through a WRAPPER — `LayerSnapshot::Ple { inner, ple }`, host mirror
+`HostLayerSnapshot::Ple`, disk tag `LAYER_PLE = 3` — rather than a fourth kind alongside
+`Full`/`Swa`/`Linear`. Why a wrapper: the PLE layer is ALSO a DeltaNet layer, so a flat
+`Ple` variant standing in for `Linear` would have silently dropped that layer's conv and
+delta state, which is exactly the class of failure a snapshot cannot afford (it restores,
+it runs, it generates different text). Nesting is one deep by construction and a `Ple`
+inside a `Ple` is refused on both the assembly path and the read path. `LayerCache::
+restore` and `check_restorable` unwrap to `inner` and never learn what a PLE is; the
+state does not live in a `LayerCache` at all, and `XwenModel` is the one place that pairs
+the layer entry with `Qwen4ExpParts`.
+
+The container version went 3 → 4, and the interesting thing is that only ONE of the two
+halves forced it. `disk_cache.rs`'s documented invariant is that the version discriminates
+FRAMING and never content — content is discriminated by the checkpoint binding and by the
+per-layer kind tags. The PLE state is a new per-layer tag inside unchanged framing, so an
+old reader refuses that layer by its tag and no bump is needed, exactly as the DeltaNet
+recurrent state landed. The QSA planes sit INSIDE the existing full-attention record,
+after its K/V planes, where nothing tags them: a v3 reader would parse the K/V planes,
+stop, and then fail on framed bytes it never consumed — a confusing corruption error over
+a file that is not corrupt. The bump turns that into what it actually is, a `Binding`
+rejection: the scan deletes the file and the conversation costs a re-prefill (2026-08-30).
 
 **The FILE identifies the checkpoint on the one-shot path too, not just in serve.** With
 `--model <gguf>` and no `--model-size`, `generate`/`chat`/`batch` used the CLI default

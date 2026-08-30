@@ -923,12 +923,33 @@ impl XwenModel {
     /// rings (~72 MiB on the shipped checkpoint, independent of context length);
     /// full-attention layers need no data, their positions keep their slots.
     pub fn take_cache_snapshot(&self) -> Result<CacheSnapshot> {
-        self.refuse_state_transfer("take_cache_snapshot")?;
-        let layers: Vec<LayerSnapshot> = self
+        let mut layers: Vec<LayerSnapshot> = self
             .caches
             .iter()
             .map(LayerCache::snapshot)
             .collect::<Result<_>>()?;
+        // On qwen4exp the PLE injection layer carries a second recurrent state
+        // that lives in `Qwen4ExpParts` rather than in a `LayerCache` — the
+        // dilated conv window and the n-gram token history, neither of which has
+        // an inverse. It rides on that layer's own snapshot entry, so the vector
+        // still has one entry per layer and the pairing needs no layer ids. The
+        // QSA indexers carry nothing here: their raw keys are position-indexed
+        // like a full-attention layer's K/V, so a restore truncates them.
+        if let Some(parts) = self.qwen4exp.as_ref() {
+            let images = parts.ple_images();
+            ensure!(
+                images.len() == layers.len(),
+                "take_cache_snapshot: the qwen4exp parts cover {} layers, the cache stack has {}",
+                images.len(),
+                layers.len()
+            );
+            for (layer, image) in layers.iter_mut().zip(images) {
+                if let Some(image) = image {
+                    let taken = std::mem::replace(layer, LayerSnapshot::Full);
+                    *layer = taken.with_ple(image)?;
+                }
+            }
+        }
         Ok(CacheSnapshot::new(self.cache_len(), layers))
     }
 
@@ -939,7 +960,6 @@ impl XwenModel {
     /// positions `[0, pos)` with a different token sequence since. Callers that
     /// diverge inside the snapshot's prefix must reset the cache instead.
     pub fn restore_cache_snapshot(&mut self, snapshot: &CacheSnapshot) -> Result<()> {
-        self.refuse_state_transfer("restore_cache_snapshot")?;
         ensure!(
             snapshot.layers().len() == self.caches.len(),
             "restore_cache_snapshot: snapshot covers {} layers, model has {}",
@@ -952,8 +972,26 @@ impl XwenModel {
             snapshot.pos(),
             self.max_ctx
         );
+        // Asked of every half before ANY of them is written, and that has to
+        // include the trunk layers themselves. `LayerCache::restore` re-checks
+        // each layer inline, which refuses the bad layer but not the ones before
+        // it: a kind mismatch at layer five leaves four already overwritten and
+        // the rest holding the previous conversation, at lengths that still
+        // agree. Nothing downstream can see that, so the preflight is a separate
+        // immutable pass over the same rule rather than a comment claiming the
+        // inline checks add up to one.
+        self.check_ple_images(&snapshot.ple_shapes(), snapshot.pos())?;
+        for (cache, layer) in self.caches.iter().zip(snapshot.layers()) {
+            cache.check_restorable(layer, snapshot.pos())?;
+        }
+        if let Some(parts) = self.qwen4exp.as_ref() {
+            parts.check_restore_at(snapshot.pos())?;
+        }
         for (cache, layer) in self.caches.iter_mut().zip(snapshot.layers()) {
             cache.restore(layer, snapshot.pos())?;
+        }
+        if let Some(parts) = self.qwen4exp.as_mut() {
+            parts.restore(&snapshot.ple_images(), snapshot.pos())?;
         }
         Ok(())
     }
@@ -967,8 +1005,12 @@ impl XwenModel {
     /// `HostFullKv::byte_len`) plus the device-to-host copy; unlike a snapshot it
     /// scales with context length.
     pub fn export_full_kv(&self) -> Result<HostFullKv> {
-        self.refuse_state_transfer("export_full_kv")?;
-        crate::kv_cache::export_full_kv_from(&self.caches)
+        let qsa = self
+            .qwen4exp
+            .as_ref()
+            .map(|parts| parts.indexer_caches())
+            .unwrap_or_default();
+        crate::kv_cache::export_full_kv_from(&self.caches, &qsa)
     }
 
     /// Whether this model could take `image` and `rings` at `pos`, decided without
@@ -986,14 +1028,20 @@ impl XwenModel {
         rings: &HostSnapshot,
         pos: usize,
     ) -> Result<()> {
-        self.refuse_state_transfer("check_importable")?;
         ensure!(
             pos <= self.max_ctx,
             "check_importable: pos {pos} exceeds max_ctx {}",
             self.max_ctx
         );
-        crate::kv_cache::check_full_kv_importable(&self.caches, image, pos)?;
-        rings.check_restorable(&self.caches, pos)
+        let qsa = self
+            .qwen4exp
+            .as_ref()
+            .map(|parts| parts.indexer_caches())
+            .unwrap_or_default();
+        crate::kv_cache::check_full_kv_importable(&self.caches, &qsa, image, pos)?;
+        rings.check_restorable(&self.caches, pos)?;
+        self.check_ple_images(&rings.ple_shapes(), pos)?;
+        Ok(())
     }
 
     /// Upload `image`'s rows `[0, pos)` into every full-attention layer and set
@@ -1010,7 +1058,6 @@ impl XwenModel {
     /// keys. Importing establishes exactly that, which is why a snapshot restore
     /// is sound after another conversation has run over those slots.
     pub fn import_full_kv(&mut self, image: &HostFullKv, pos: usize) -> Result<()> {
-        self.refuse_state_transfer("import_full_kv")?;
         // Only the positions actually being imported have to fit: an image longer
         // than this model's context is still a valid source for a shorter resume
         // (an on-disk record written by a larger-context server, say).
@@ -1022,7 +1069,44 @@ impl XwenModel {
         // A paged-in conversation can be longer than anything this instance has
         // run yet, so the import grows the buffers exactly as a prefill would.
         self.grow_kv_capacity(pos)?;
-        crate::kv_cache::import_full_kv_into(&mut self.caches, image, pos)
+        // The QSA indexer planes travel with the K/V rows and are imported with
+        // them: their rows are position-indexed, so they are the half of the
+        // qwen4exp state that grows with the conversation and cannot be carried
+        // by a fixed-size snapshot.
+        let mut qsa = self
+            .qwen4exp
+            .as_mut()
+            .map(|parts| parts.indexer_caches_mut())
+            .unwrap_or_default();
+        crate::kv_cache::import_full_kv_into(&mut self.caches, &mut qsa, image, pos)
+    }
+
+    /// Whether the PLE images a snapshot carries — one entry per layer, `None`
+    /// where a layer carries none — describe states this model could hold.
+    ///
+    /// The `None` arm is the one worth spelling out: a model with no PLE layers
+    /// at all must REFUSE an image that carries one rather than quietly ignore
+    /// it. A dropped PLE window is not a missing optimization, it is a
+    /// conversation resuming mid-n-gram against a window of somebody else's
+    /// activations — which runs, answers, and attends to the wrong tokens. The
+    /// checkpoint binding makes this unreachable through the disk tier, and no
+    /// in-process path can cross two architectures either; it is checked anyway
+    /// because the cost of being wrong here is silent.
+    fn check_ple_images(
+        &self,
+        shapes: &[Option<crate::qwen4exp::ple::PleShape>],
+        pos: usize,
+    ) -> Result<()> {
+        match self.qwen4exp.as_ref() {
+            Some(parts) => parts.check_ple_restorable(shapes, pos),
+            None => {
+                ensure!(
+                    shapes.iter().all(Option::is_none),
+                    "cache image: the snapshot carries a PLE state, this model has no PLE layer"
+                );
+                Ok(())
+            }
+        }
     }
 
     pub fn reset_cache(&mut self) -> Result<()> {
@@ -1072,25 +1156,6 @@ impl XwenModel {
             self.max_ctx,
             gb(kv_bytes(&self.cfg, self.kv_slots)),
         ));
-        Ok(())
-    }
-
-    /// Refuse the cache-image paths on qwen4exp, by name.
-    ///
-    /// Snapshots, host images and the disk tier all move a conversation's whole
-    /// state somewhere else and back. On qwen4exp that state includes three
-    /// things none of those formats carry: the QSA indexers' raw-key planes, the
-    /// PLE conv window and the PLE n-gram token history. Restoring without them
-    /// would produce a model that runs, answers, and quietly attends to the
-    /// wrong tokens — so the transfer is refused rather than silently partial.
-    /// Ledgered for P4 (docs/qwen4exp-port.md D15).
-    fn refuse_state_transfer(&self, what: &str) -> Result<()> {
-        ensure!(
-            self.qwen4exp.is_none(),
-            "{what}: qwen4exp recurrent extras not snapshot-able yet (P4) — the QSA raw-key \
-             caches, the PLE conv window and its n-gram token history are not carried by any \
-             cache image, and a restore without them attends to the wrong tokens"
-        );
         Ok(())
     }
 

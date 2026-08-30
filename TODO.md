@@ -2202,6 +2202,65 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     thinking render byte-identical, which is why P2 could ship on it); and the
     checkpoint's tokenizer adds seven audio/TTS specials at 248070-248076 that
     the embedded 3.6 tokenizer does not carry — harmless for text, unhandled.
+    **SHIPPED 2026-08-30 — the cache images carry the qwen4exp state, and both
+    gated surfaces are open** (log.md 2026-08-30, decisions.md
+    "Qwen3.8-Flash-Next"). The two pieces of state travel by two different
+    routes because they are two different kinds of state. The QSA indexers' raw
+    keys are position-indexed exactly like a full-attention layer's K/V — every
+    token writes its own row — so a snapshot needs no data for them at all (a
+    restore is `IndexerCache::truncate(pos)`, exact) and only the page-out path
+    has to move bytes: `HostFullKv` grew a `qsa` plane set and a `qsa_head_dim`
+    beside the trunk's K/V planes, with `range`/`concat`/`qsa_prefix` support
+    (one MQA key head, so a position range is a slice rather than the per-head
+    gather the K/V planes need), and `export_full_kv_from`,
+    `import_full_kv_into` and `check_full_kv_importable` all take the indexer
+    caches now. The PLE conv window and its rolling n-gram history are
+    recurrent summaries with no inverse, so they travel as DATA: `PleImage` /
+    `PleShape` and `PleState::image/shape/accepts/restore` in
+    `src/qwen4exp/ple.rs`. The prediction above about the history is one of the
+    two things this bullet got wrong: it is NOT sequence-level state stored
+    beside `CacheSnapshot::pos`, and it needed no plane type of its own — it
+    rides on its layer's snapshot entry with the conv window, as raw ids in the
+    image rather than as a framed f32 plane. The other correction is the shape
+    of the layer entry: the snapshot's `layers` vector stays ONE ENTRY PER TRUNK
+    LAYER and the PLE image rides on its layer's own entry through a WRAPPER
+    variant, `LayerSnapshot::Ple { inner, ple }` (host mirror
+    `HostLayerSnapshot::Ple`, disk tag `LAYER_PLE = 3`), because the PLE layer
+    is ALSO a DeltaNet layer — a flat fourth kind standing in for `Linear`
+    would have silently dropped that layer's conv and delta state. Nesting is
+    one deep and a `Ple` inside a `Ple` is refused on both the assembly and the
+    read path. `LAYER_PLE` needed no container bump (a new per-layer tag inside
+    unchanged framing, the way the DeltaNet state landed); the QSA planes did,
+    because they sit inside the existing full-attention record after its K/V
+    planes where nothing tags them, so a v3 reader would parse the K/V planes,
+    stop, and fail on framed bytes it never consumed — a corruption error over
+    a file that is not corrupt. `CONTAINER_VERSION` 3 → 4 turns that into a
+    clean `Binding` rejection: scan deletes the file, the conversation costs a
+    re-prefill. What that closed: `XwenModel::refuse_state_transfer` and all
+    five of its call sites are gone and do the real work,
+    `Model::unservable_reason`/`unservable_message`/`unbatchable_message` are
+    deleted along with serve's startup refusal and fallback notice and batch's
+    refusal, `Model::servable()` is true for every registry checkpoint (kept as
+    a method: it is the question the cache-moving surfaces ask, and the next
+    half-ported architecture needs somewhere to say no), and
+    `Model::default_servable()` now returns `Model::default()` with its
+    fallback branch dead but kept. `xwen serve` and `xwen batch` both run
+    Flash-Next with no flags; `/v1/models` lists it and requests may select it,
+    gated now ONLY by the download rule, so it is listed and selectable exactly
+    when the file is really in the HF cache and the 400 for an uncached one
+    points at `xwen fetch`. `Model::snapshot_bytes()` already counted the PLE
+    conv window and `Model::kv_bytes_per_token()` already counted the indexer's
+    512 B/token/layer — verified and unchanged, now load-bearing for page-out
+    sizing rather than forward-looking. TWO GATES DID NOT MOVE and this ledger
+    keeps them: `auto_fetch()` stays false (a 111 GB fetch is explicit-only and
+    would stay false whatever else lands) and `supports_drafting()` stays false
+    (D6's missing speculative verify seam — no MTP or other drafter is wired,
+    so `DraftMode` resolution logs "no drafter available" for this checkpoint
+    and leaves the others' drafting alone). The rest of this bullet — the
+    unconsumed `recommended_presence_penalty`, the Unsloth template
+    divergences, the seven audio/TTS specials — is untouched and still open.
+    New work this arc left behind is in "Deferred from the qwen4exp cache-image
+    arc (2026-08-30, P4)" at the end of this file.
   - **2026-08-29 — Upstream reports owed (three, none filed).** **(1) candle
     Metal `index_select` is silently wrong on strided sources** — no error, just
     wrong rows; found in U3 and worked around by gathering per head. This is a
@@ -2220,3 +2279,53 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     fixtures already pin, which would retire report (2). If it merges: re-vendor,
     re-read every QSA entry in the port doc, and re-check the divergence list
     before filing anything.
+
+## Deferred from the qwen4exp cache-image arc (2026-08-30, P4)
+
+Snapshots, page-out, rewind and the disk tier learned the qwen4exp recurrent state, and
+`xwen serve` and `xwen batch` opened for Flash-Next (log.md 2026-08-30, decisions.md
+"Qwen3.8-Flash-Next"). These are the pieces that arc deliberately did not take.
+
+- [ ] **`IndexerCache` still allocates at `max_ctx` up front and has no growth path,
+  and page-in is now a second reason to care.** The trunk's KV grows lazily — the cache
+  starts at 8k positions and extends as a conversation lengthens — while every QSA
+  layer's raw-key plane is allocated whole at load, 4 MB per layer at 8k and ~1.6 GB
+  across the 12 QSA layers at the checkpoint's 262144 ctx, paid whether or not the
+  conversation ever gets there. That was already ledgered as a memory item under the P3
+  bullet (item 8) and as one of the three shrinks in "Refuted: the ~15 GB of private
+  memory is a leak"; what the cache images add is a correctness-shaped consequence
+  rather than a wasteful one: **a conversation paged back in longer than the live
+  allocation is REFUSED rather than grown**, because `import_full_kv_into` sets
+  `IndexerCache::len` to the imported row count and cannot set it past the plane it was
+  given. On the trunk's planes the same import grows. Fixing the allocation fixes both
+  halves at once, and the growth rule should be the trunk's (extend on demand, drop back
+  on idle unload) rather than a second policy.
+- [ ] **Flash-Next still ships no drafter, and `supports_drafting()` stays false.** The
+  blocker is D6, not the sidecar: the MTP head in this checkpoint's config has no
+  transformers implementation and separate `fc_embedding`/`fc_hidden` projections rather
+  than 3.8's concat `eh_proj`, so its forward semantics are unconfirmed and were not
+  guessed at. The verify machinery downstream of a proposal is kind-agnostic and would
+  take a third kind cheaply — what is missing is the speculative tap contract on the
+  qwen4exp stack (spec taps are not defined for this graph) plus a confirmed head. Until
+  then `--draft` is refused rather than ignored and `DraftMode` resolution logs "no
+  drafter available" for this checkpoint alone.
+- [ ] **The disk tier's stored-image path for qwen4exp is pinned by unit tests only; no
+  real serve smoke has been run against the 111 GB file.** A qwen4exp segment
+  round-trips with its indexer planes and PLE state, and a v3 container is rejected, but
+  both run over constructed payloads. There is no serve-engine harness that runs a real
+  model — `page_out_live`/`page_in` are private free functions over a private
+  `EngineState` and the engine tests use stand-in payloads — so the equivalence is
+  pinned one level down, at `export_full_kv` + `take_cache_snapshot().to_host()` →
+  `check_importable` → `import_full_kv` → `restore_cache_snapshot`, which is exactly the
+  sequence those two functions perform. What is untested is the real file through a real
+  server: load, converse, page out to disk, evict, page back in, continue. Cheap to run
+  once (one conversation, `idle_unload` short, the disk tier on) and the thing most
+  likely to find a shape mismatch the unit fixtures do not reach.
+- [ ] **A qwen4exp serve run has never been benchmarked.** Every perf number for this
+  checkpoint in CLAUDE.md and the port doc comes from `generate` — prefill ~796 tok/s,
+  decode ~45, both measured on the one-shot path. Serve adds the queue, the prefix
+  cache, page-out and per-request template rendering, and on a 111 GB resident trunk the
+  page-out itself is the interesting cost: a `HostFullKv` for this checkpoint carries
+  the QSA planes on top of the K/V ones, and `snapshot_bytes` is now what sizes it. Do
+  not quote the one-shot figures as serve figures until a serve run has been measured
+  under the usual protocol (interleaved rounds, medians, power mode stated).

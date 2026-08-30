@@ -115,7 +115,20 @@ const MAGIC: &[u8; 8] = b"LAGKVIMG";
 /// begins with the position where a v3 one begins with the kind — unreadable
 /// rather than misread: the checkpoint binding cannot help here, since the same
 /// target file can be served with either drafter attached.
-const CONTAINER_VERSION: u32 = 3;
+///
+/// Version 4 is the qwen4exp cache images (2026-08-30). Its two halves landed on
+/// opposite sides of that invariant, which is exactly why one of them bumps and
+/// the other does not. The PLE conv window and n-gram history ride on their
+/// layer's snapshot entry under a NEW per-layer tag (`LAYER_PLE`), so a build
+/// that does not know them refuses that layer by its tag — no bump needed, the
+/// same way the DeltaNet state landed. The QSA indexers' raw keys ride INSIDE the
+/// existing full-attention record, after its K/V planes, where nothing tags them:
+/// a v3 reader would parse the K/V planes, stop, and fail on the framed bytes it
+/// never consumed — a confusing corruption error over a file that is not corrupt.
+/// The bump turns that into what it is: a v4 file on an older build is a clean
+/// `Binding` rejection, which is to say the scan deletes it and the conversation
+/// costs a re-prefill.
+const CONTAINER_VERSION: u32 = 4;
 
 /// Extension every stored segment carries. The name in front of it is the segment's
 /// identity (see [`chain_id`]).
@@ -1159,7 +1172,7 @@ mod tests {
             .enumerate()
             .map(|(il, _)| (pattern(plane, il as u8), pattern(plane, 0x40 + il as u8)))
             .collect();
-        HostFullKv::new(rows, N_KV, HEAD_DIM, planes).unwrap()
+        HostFullKv::new(rows, N_KV, HEAD_DIM, planes, Vec::new(), 0).unwrap()
     }
 
     fn snapshot(pos: usize) -> HostSnapshot {
@@ -1685,6 +1698,14 @@ mod tests {
         assert_binding(read_segment_header(&v1, &checkpoint(), RULES), "version 1");
         assert_binding(read_segment(&v1, &checkpoint(), RULES), "version 1");
 
+        // The version before the QSA indexer planes joined the full-attention
+        // record. Refused the same way, and this is the direction that matters:
+        // a v4 file reaching a v3 build gets THIS rejection rather than a
+        // corruption error over framed bytes it did not know to read.
+        let v3 = patched("v3", &|b| b[8..12].copy_from_slice(&3u32.to_le_bytes()));
+        assert_binding(read_segment_header(&v3, &checkpoint(), RULES), "version 3");
+        assert_binding(read_segment(&v3, &checkpoint(), RULES), "version 3");
+
         let bumped = patched("version", &|b| {
             b[8..12].copy_from_slice(&99u32.to_le_bytes())
         });
@@ -2000,6 +2021,118 @@ mod tests {
         assert_corrupt(
             read_segment_header(&path, &checkpoint(), RULES),
             "snapshot past the span",
+        );
+    }
+
+    /// The qwen4exp geometry a stored segment carries on top of the trunk's: one
+    /// QSA indexer plane per full-attention layer, and a PLE state on one layer.
+    const QSA_HEAD_DIM: usize = 4;
+    const PLE_WIDTH: usize = 6;
+    const PLE_STATE_LEN: usize = 9;
+    /// The tiny fixture's shape: the PLE injection rides on a DeltaNet layer.
+    const PLE_LAYER: usize = 3;
+
+    fn qwen4exp_full_kv(rows: usize) -> HostFullKv {
+        let plane = N_KV * rows * HEAD_DIM * size_of::<half::f16>();
+        let planes = KINDS
+            .iter()
+            .filter(|full| **full)
+            .enumerate()
+            .map(|(il, _)| (pattern(plane, il as u8), pattern(plane, 0x40 + il as u8)))
+            .collect::<Vec<_>>();
+        let qsa = (0..planes.len())
+            .map(|il| pattern(rows * QSA_HEAD_DIM * size_of::<f32>(), 0x90 + il as u8))
+            .collect();
+        HostFullKv::new(rows, N_KV, HEAD_DIM, planes, qsa, QSA_HEAD_DIM).unwrap()
+    }
+
+    fn qwen4exp_snapshot(pos: usize) -> HostSnapshot {
+        let ring = N_KV * WINDOW * HEAD_DIM * size_of::<half::f16>();
+        let layers = KINDS
+            .iter()
+            .enumerate()
+            .map(|(il, full)| {
+                let base = if *full {
+                    HostLayerSnapshot::Full
+                } else {
+                    HostLayerSnapshot::Swa {
+                        k: pattern(ring, (pos + il) as u8),
+                        v: pattern(ring, 0x40u8.wrapping_add((pos + il) as u8)),
+                        shape: (N_KV, WINDOW, HEAD_DIM),
+                        window: WINDOW,
+                    }
+                };
+                if il == PLE_LAYER {
+                    HostLayerSnapshot::Ple {
+                        inner: Box::new(base),
+                        conv: pattern(
+                            PLE_WIDTH * PLE_STATE_LEN * size_of::<f32>(),
+                            0xb0u8.wrapping_add(pos as u8),
+                        ),
+                        history: vec![41, 43],
+                        state_len: PLE_STATE_LEN,
+                    }
+                } else {
+                    base
+                }
+            })
+            .collect();
+        HostSnapshot::new(pos, layers).unwrap()
+    }
+
+    /// A qwen4exp segment survives the round trip with both halves of its extra
+    /// state: the QSA indexers' raw keys inside the full-attention record, the
+    /// PLE conv window and n-gram history on their layer's snapshot entry.
+    ///
+    /// The whole point of storing them is that a hydration is a resume rather
+    /// than a re-prefill, so the comparison is byte-for-byte on the records
+    /// themselves — the same standard the trunk's rows are held to.
+    #[test]
+    fn a_qwen4exp_segment_round_trips_with_its_indexer_planes_and_ple_state() {
+        let dir = Dir::new("qwen4exp_round_trip");
+        let path = dir.file("root.lkv");
+        let ids = tokens(SPAN);
+        let rows = qwen4exp_full_kv(SPAN);
+        let tip = qwen4exp_snapshot(SPAN);
+
+        let bytes = write_segment(
+            &path,
+            &checkpoint(),
+            RULES,
+            0,
+            None,
+            &ids,
+            &rows,
+            &[(SPAN, &tip)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+
+        let header = read_segment_header(&path, &checkpoint(), RULES).unwrap();
+        assert_eq!(header.snapshot_positions, vec![SPAN]);
+        assert_eq!(header.drafter_pos, None);
+
+        let segment = read_segment(&path, &checkpoint(), RULES).unwrap();
+        assert_eq!(segment.full_kv.pos, SPAN);
+        assert_eq!(bytes_of(&segment.full_kv), bytes_of(&rows));
+        assert_snapshots_equal(&segment.snapshots[0].1, &tip, "tip snapshot");
+
+        // And the extra state is really in there rather than silently dropped
+        // into records that happen to compare equal because both lost it.
+        let mut framed = Vec::new();
+        rows.write_to(&mut framed).unwrap();
+        assert!(
+            framed.len()
+                > 4 * size_of::<u64>()
+                    + 2 * 2 * (size_of::<u64>() + N_KV * SPAN * HEAD_DIM * size_of::<half::f16>()),
+            "the record must be longer than its K/V planes alone"
+        );
+        let mut framed = Vec::new();
+        tip.write_to(&mut framed).unwrap();
+        assert!(
+            framed.len() > snapshot(SPAN).serialized_len(),
+            "the PLE decoration must cost bytes a trunk snapshot does not"
         );
     }
 }

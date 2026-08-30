@@ -106,15 +106,14 @@ HF cache (`HF_HUB_CACHE` > `HF_HOME/hub`), cache-first via hf-hub, download on m
 **The default checkpoint is Qwen3.8-Flash-Next as of 2026-08-30** (`unsloth/
 Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, four shards, 111 GB, no drafter) — so a zero-flag
 `generate`/`chat`/`fetch` run downloads 111 GB on a cold cache, after the usual size
-notice. `xwen serve` AND `xwen batch` cannot run it (P4) and fall back to
-Qwen3.6-35B-A3B with a line: `Model::servable()` gates both surfaces — batch snapshots
-the items' shared prefix and rescores fields off it, so it moves cache state on its
-ordinary path exactly as the server does — and `Model::default_servable()` is the one
-fallback rule they share. It NAMES its fallback rather than deriving it from `MODELS`
-order, which would hand them the much slower 27B. Naming Flash-Next explicitly
-(`--model-size flash-next` on serve, `"model"` in a batch payload) is still refused.
-`XWEN_BATCH_NO_CACHE` does not get batch around it: it skips the shared prefix and
-leaves the per-option snapshots.
+notice. **Every surface runs it as of 2026-08-30 (P4)**, `xwen serve` and `xwen batch`
+included: cache images carry the QSA indexer rows and the PLE state, so
+`Model::servable()` is true for every registry checkpoint and `default_servable()` ==
+`default()`. Both are kept as the seam the next half-ported arch says no through, and
+the fallback branch is dead code on purpose. The two gates that DID stay closed:
+`auto_fetch()` false — so on the wire Flash-Next is listed and selectable exactly when
+the file is really in the HF cache, and an uncached one is a 400 pointing at
+`xwen fetch` — and `supports_drafting()` false (no drafter exists for the graph; D6).
 Other repos/files (hub.rs): `ggml-org/Qwen3.6-27B-GGUF`,
 `ggml-org/Qwen3.6-35B-A3B-GGUF` and `ggml-org/Qwen3.8-27B-GGUF`, Q4_K_M. Sizes: 19.1 GB
 (27B), 20.4 GB (35B), 19.0 GB (3.8-27B). Q8_0: 28.6 / 36.9 / 28.6 GB. Drafter sidecars,
@@ -233,7 +232,9 @@ Those drafted figures are WITHIN-SWEEP against the plain arm of the same sweep;
 do not difference them against a drafted number from another session — the 27B's
 between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 reads
 36.5-37.6 in today's own 0.3 arm.
-Qwen3.8-Flash-Next (EXPERIMENTAL, `generate`/`chat` only), 2026-08-29 after the P3 kernel pass,
+Qwen3.8-Flash-Next (EXPERIMENTAL; every surface since P4, but these numbers are
+`generate`'s — serve has never been benchmarked on it, TODO.md), 2026-08-29 after the
+P3 kernel pass,
 plain because no drafter exists for it: **prefill ~796 tok/s @530, decode ~45 (43 before the PLE row prefetch)**,
 against llama.cpp's 789 / 41.4 on the same file in the same hour (four interleaved
 rounds, medians; `pmset -g` said `powermode 0` that session — still no high-power
@@ -344,11 +345,13 @@ not a regression — see "Perf state").
 
 ## serve (INHERITED, partially adapted)
 
-The serve/ tree runs as forked. Its zero-flag default is `Model::default_servable()`
-(Qwen3.6-35B-A3B), NOT the plain default — see "Checkpoint location". Not yet adapted:
+The serve/ tree runs as forked. Its zero-flag default is `Model::default_servable()`,
+which since P4 (2026-08-30) is just `Model::default()` — Flash-Next serves like any
+other checkpoint, snapshots/rewind/page-out/disk tier all carrying its QSA indexer rows
+and PLE state (decisions.md "Qwen3.8-Flash-Next"), and no surface falls back to
+anything. Still not adapted:
 ChatML/tool-call parsing in the dialect layers (Qwen's `<function=...>` XML-ish call
-format, string-args-raw rule) and prefix-cache snapshots carrying recurrent state
-(see decisions.md "Serving"). Thinking
+format, string-args-raw rule). Thinking
 semantics ARE adapted as of 2026-08-19: open-`<think>` seeding, per-dialect
 preserve_thinking (a request field on the native and OpenAI dialects, the checkpoint
 template's default otherwise — the normalizers pass ALL replayed reasoning through in
@@ -366,10 +369,13 @@ Options, and a pinned value pins both modes). Still open on thinking: the Anthro
 dialect has no per-request effort knob (server-wide default applies) and penalties stay
 accept-and-drop — both ledgered (TODO.md 2026-08-19 section).
 
-API model names are FULL names only (`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B` —
-`Model::full_name`, matching `general.name` and the repo), plus the served file's own id
-when that file is none of them. The CLI's `27b`/`35b`/`3.8-27b` aliases are refused on
-the wire; an unknown `model` is a 400 on every surface (both dialects, count_tokens and
+API model names are FULL names only (`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B`,
+`Qwen3.8-Flash-Next` — `Model::full_name`, matching `general.name` and the repo), plus
+the served file's own id when that file is none of them. Flash-Next is listed and
+selectable only while its shards are in the HF cache (`auto_fetch` false — an uncached
+one is a 400 naming `xwen fetch`, not an in-request 111 GB download). The CLI's
+`27b`/`35b`/`3.8-27b`/`flash-next` aliases are refused on the wire; an unknown `model`
+is a 400 on every surface (both dialects, count_tokens and
 the batch route), never a silent fall back to the default. `/v1/models` lists each id
 exactly once and every listed id is selectable (2026-08-14).
 

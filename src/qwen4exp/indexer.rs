@@ -438,8 +438,11 @@ impl QsaIndexer {
 /// This is the `LayerCache::Full` story with one head and no values: every
 /// token writes its own absolute slot, so a rollback is a pure length
 /// truncation and a checkpoint carries no data. It lives here rather than in
-/// `kv_cache.rs` deliberately (D15) — the five enums there stay untouched
-/// through P2.
+/// `kv_cache.rs` deliberately (D15) — it is a qwen4exp overlay, not a fifth
+/// layer kind. What `kv_cache.rs` does carry is its IMAGE: a page-out copies
+/// these rows into the `HostFullKv` beside the trunk's K/V, because a
+/// position-indexed plane is exactly the half of a conversation's state a
+/// fixed-size snapshot cannot reconstruct.
 ///
 /// f32, not the BF16 the HF implementation caches: the pooled key is used at
 /// f32 anyway (`ref_qsa` D13), and 4 MB per layer at 8k context is not worth a
@@ -497,6 +500,13 @@ impl IndexerCache {
         self.raw.dim(0).expect("raw keys are rank-2")
     }
 
+    /// The device this plane lives on, for an import that has to build its
+    /// upload somewhere. Read off the allocation itself rather than passed in, so
+    /// a caller cannot hand rows to a cache on another device.
+    pub(crate) fn device(&self) -> Result<Device> {
+        Ok(self.raw.device().clone())
+    }
+
     /// The first `upto` cached keys, `[upto, head_dim]`.
     fn visible(&self, upto: usize) -> Result<Tensor> {
         ensure!(
@@ -523,6 +533,39 @@ impl IndexerCache {
         );
         self.raw.slice_set(keys, 0, self.len)?;
         self.len += n;
+        Ok(())
+    }
+
+    /// The committed rows `[0, len)` as little-endian f32 bytes, row-major
+    /// `(len, head_dim)`.
+    ///
+    /// The trunk's K/V planes are `(head, position, dim)` and a prefix of the
+    /// positions is therefore a gather; this plane has ONE key head, so a prefix
+    /// of the positions IS a prefix of the buffer. Every range operation on the
+    /// host image leans on that.
+    pub(crate) fn export_rows(&self) -> Result<Vec<u8>> {
+        crate::kv_cache::f32_bytes(&self.raw.narrow(0, 0, self.len)?)
+    }
+
+    /// Upload `bytes` — `(pos, head_dim)` f32, as produced by
+    /// [`Self::export_rows`] — into rows `[0, pos)` and set the length to `pos`.
+    ///
+    /// Rows above `pos` keep whatever they held; nothing reads them, exactly as
+    /// nothing reads a truncated `Full` layer's stale slots.
+    pub(crate) fn import_rows(&mut self, bytes: &[u8], pos: usize, device: &Device) -> Result<()> {
+        let head_dim = self.head_dim();
+        ensure!(
+            pos <= self.capacity(),
+            "indexer cache holds {} slots; an import of {pos} rows overruns it",
+            self.capacity()
+        );
+        // Nothing to upload, and a zero-row tensor is not worth asking candle
+        // for: an empty import is the same state a reset leaves behind.
+        if pos > 0 {
+            let rows = crate::kv_cache::f32_tensor(bytes, &[pos, head_dim], device)?;
+            self.raw.slice_set(&rows, 0, 0)?;
+        }
+        self.len = pos;
         Ok(())
     }
 

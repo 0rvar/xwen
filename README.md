@@ -37,7 +37,7 @@ cache and downloaded on first use:
 | --- | --- | --- | --- |
 | `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` (default) | none |
 | `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash block drafter, 3.5 GB |
-| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` (serve's and batch's default) | DFlash block drafter, 0.8 GB |
+| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` | DFlash block drafter, 0.8 GB |
 | `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | MTP head, 3.2 GB |
 
 **Flash-Next is the default (2026-08-30), so a zero-flag first run downloads 111 GB**
@@ -47,26 +47,27 @@ unsloth/Qwen3.8-Flash-Next-GGUF <shard>... --jobs 2` does the same with parallel
 verified, resumable downloads. Pass `--model-size 35b` (or `27b`, `3.8-27b`) for a
 ~20 GB checkpoint instead.
 
-**`xwen serve` and `xwen batch` default to `Qwen3.6-35B-A3B`**, not to Flash-Next,
-because neither can run Flash-Next yet (below): both move a whole cache state around on
-their ordinary path — the server snapshots, rewinds and pages conversations out, and a
-batch prefills the items' shared prefix once and replays that snapshot per item. A
-zero-flag `xwen serve` or a payload with no `"model"` says which checkpoint it picked
-and why; naming Flash-Next explicitly is refused outright on both rather than silently
-substituted. `xwen generate` and `xwen chat` run it with no flags — they never move
-cache state.
+**Every surface defaults to Flash-Next as of 2026-08-30**, `xwen serve` and `xwen batch`
+included. Both move a whole cache state around on their ordinary path — the server
+snapshots, rewinds and pages conversations out, and a batch prefills the items' shared
+prefix once and replays that snapshot per item — and as of P4 a cache image carries
+everything this checkpoint needs, so neither refuses it and neither falls back. What did
+not change is the fetch rule: the server never downloads 111 GB inside a request, so
+Flash-Next is listed by `/v1/models` and selectable by name only while its shards are
+already in the HF cache; an uncached one is a 400 pointing at `xwen fetch`.
 
-**Qwen3.8-Flash-Next is EXPERIMENTAL, and `generate`/`chat` only (P3, 2026-08-29)** —
-unlike Qwen3.8-27B this one is a whole second architecture rather than a registry entry over an
-existing graph: sparse attention, hyper-connections and a 51B n-gram embedding table on
+**Qwen3.8-Flash-Next is EXPERIMENTAL (P3, 2026-08-29; servable since P4, 2026-08-30)** —
+unlike Qwen3.8-27B this one is a whole second architecture rather than a registry entry
+over an existing graph: sparse attention, hyper-connections and a 51B n-gram embedding table on
 top of the familiar gated DeltaNet and MoE. It loads, generates and stops correctly, and
 its graph agrees with upstream llama.cpp (186/192 forced-replay steps after the P3
 kernel pass, 189/192 before it, zero hard mismatches either way — every divergence a
-rank-2 near-tie; `docs/qwen4exp-parity-2026-08-29.md`). It is not finished:
-**`xwen serve` and `xwen batch` both REFUSE this checkpoint until P4**, because
-snapshots and the prefix cache cannot carry its recurrent state (the QSA raw-key caches,
-the PLE conv window and its n-gram token history); there is no drafter; and it has no
-parity harness or perplexity floor of its own. It is, however, fast: after the P3 kernel
+rank-2 near-tie; `docs/qwen4exp-parity-2026-08-29.md`). It now runs on every surface:
+snapshots, rewind, page-out and the on-disk tier carry its QSA indexer rows and its PLE
+conv window and n-gram history, so `serve` and `batch` treat it like any other
+checkpoint. It is still not finished: there is no drafter for its graph (so it decodes
+plain, and `--draft` is refused rather than ignored), it is not auto-fetched, and it has
+no parity harness or perplexity floor of its own. It is, however, fast: after the P3 kernel
 pass it runs **prefill 795.7 tok/s and decode 44.5-45.8 tok/s (43.1 before the PLE row
 prefetch)** where llama.cpp on the same file in the same hour runs 789 and 41.4 — plain,
 no drafter, 530-token prompt, four interleaved rounds,
@@ -189,9 +190,9 @@ prefilled once and the KV cache snapshotted there; every item restores that snap
 and prefills only its own tail, so nine questions about the same document cost one
 prefill of it rather than nine. The checkpoint comes from the payload, not a flag — or
 from `-m <gguf>`'s own identity when one is given, with the payload's name as the
-cross-check. Because those snapshots are how a batch runs at all, this surface cannot run
-Qwen3.8-Flash-Next: naming it is refused up front, and a payload naming nothing gets
-`Qwen3.6-35B-A3B` (serve's default too) with a line on stderr saying so.
+cross-check. A payload naming nothing gets the default checkpoint, Flash-Next included:
+those snapshots carry the qwen4exp recurrent state as of 2026-08-30, so this surface no
+longer has a checkpoint it refuses.
 
 ```bash
 xwen batch < request.json > response.json
@@ -299,13 +300,16 @@ imaging the live conversation out first (the same path an idle unload takes) —
 model resident at a time, always, and `idle_unload` applies to whichever is loaded.
 
 **On the wire a checkpoint has exactly one name: its full name** (`Qwen3.6-27B`,
-`Qwen3.6-35B-A3B`, `Qwen3.8-27B`) — 2026-08-14. The CLI's short aliases are a CLI
-spelling and are refused by every API. Selection by surface:
+`Qwen3.6-35B-A3B`, `Qwen3.8-27B`, `Qwen3.8-Flash-Next`) — 2026-08-14. The CLI's short
+aliases are a CLI spelling and are refused by every API. Selection by surface:
 
 - `GET /v1/models` lists each checkpoint once, the served one first, under exactly the
   string a `model` field selects it by — every listed id is selectable, which is the
-  point of a listing. A served GGUF that is none of the official checkpoints (a custom
-  `--model` path) leads the list under its file name, which is then its only id.
+  point of a listing. Flash-Next is listed only while its shards are in the HF cache,
+  for the same reason: it is the one checkpoint a request may not download, so listing
+  it uncached would list an id that is a 400. A served GGUF that is none of the
+  official checkpoints (a custom `--model` path) leads the list under its file name,
+  which is then its only id.
 - The compat dialects, `/v1/messages/count_tokens` and `/xwen/v1/batch` all resolve
   `model` the same way: absent or empty means the served file, this server's own id
   means the served file, another checkpoint's full name selects that checkpoint out of
@@ -332,6 +336,8 @@ prefix cache stays bound to the default checkpoint; the other checkpoint runs wi
 it. A requested checkpoint (or its drafter) missing from the HF cache is downloaded
 inside the request — a one-line notice in the server log; hf-hub's byte-level progress
 bar goes to raw stderr, so under `--tui` it draws over the dashboard (TODO.md).
+Flash-Next is the exception: 111 GB is not something a stranger's request gets to start,
+so an uncached one is a 400 naming `xwen fetch` instead.
 
 Request bodies are capped at 100 MB (real cost is judged in tokens by the queue and
 `context_length`, not in bytes). `context_length` — default: the checkpoint's trained

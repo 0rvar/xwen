@@ -49,7 +49,7 @@ use crate::stack_profile::Stage;
 
 use super::hc::{HcRead, hc_write, seed_stream};
 use super::indexer::{IndexerCache, IndexerCheckpoint, QsaIndexer};
-use super::ple::{PleLayer, PleSnapshot, PleState};
+use super::ple::{PleImage, PleLayer, PleShape, PleSnapshot, PleState};
 
 /// Everything one qwen4exp layer has that a qwen35 layer does not. The block
 /// itself (attention / DeltaNet / MoE) lives in `XwenModel::layers` beside its
@@ -73,10 +73,18 @@ pub struct Qwen4ExpLayer {
 /// The qwen4exp additions to `XwenModel`: the per-layer gates and extra
 /// recurrent state, plus the tail mixer that replaces `output_norm`.
 ///
-/// The new recurrent state deliberately does NOT live in `LayerCache` (D15):
-/// the indexer's raw keys and the PLE's two states have their own
-/// checkpoint/rollback/reset here, driven from the existing `XwenModel` cache
-/// methods, so `kv_cache.rs`'s five enums stay untouched through P2.
+/// The new recurrent state LIVES here rather than in `LayerCache` (D15): the
+/// indexer's raw keys and the PLE's two states have their own
+/// checkpoint/rollback/reset in this file, driven from the existing `XwenModel`
+/// cache methods.
+///
+/// What changed in P4 is the IMAGES, not the ownership. A conversation that
+/// leaves the GPU cache and comes back has to take both of these with it, so
+/// `kv_cache.rs` now carries them — the indexer's raw keys as a plane set in a
+/// `HostFullKv`, since they are position-indexed like a full-attention layer's
+/// K/V, and the PLE state as a `PleImage` riding on its layer's snapshot entry,
+/// since it is a recurrent summary with no inverse. The state still belongs to
+/// this struct; `XwenModel` is what pairs it with the cache stack.
 pub struct Qwen4ExpParts {
     pub layers: Vec<Qwen4ExpLayer>,
     /// The tail mixer (`output_hc_*`): the same read path with no injection
@@ -86,8 +94,9 @@ pub struct Qwen4ExpParts {
     pub hc_count: usize,
     pub hidden: usize,
     /// The state a `kv_checkpoint` armed, consumed by `kv_rollback`. Held here
-    /// rather than in `KvCheckpoint` for the same reason the rest of this
-    /// struct exists: `kv_cache.rs` stays out of P2.
+    /// rather than in `KvCheckpoint` for the same reason the rest of this struct
+    /// exists: a speculative rollback is not a cache image, and the pairing is
+    /// stamped with `(len0, span)` instead of carried by the type system.
     pending: Option<Qwen4ExpCheckpoint>,
 }
 
@@ -103,7 +112,7 @@ struct Qwen4ExpCheckpoint {
     /// taken at, so a rollback can prove the two are the same checkpoint.
     ///
     /// These parts are armed and rolled back BESIDE the `KvCheckpoint` rather
-    /// than inside it (D15 keeps `kv_cache.rs` out of P2), which means nothing
+    /// than inside it (D15), which means nothing
     /// in the type system ties one to the other: a caller holding two
     /// checkpoints could roll the KV back against one and these against the
     /// other, and every state would be self-consistently wrong. Stamping the
@@ -244,6 +253,144 @@ impl Qwen4ExpParts {
             }
         }
         Ok(())
+    }
+
+    /// The PLE images to store beside a cache snapshot: one entry per trunk
+    /// layer, in layer order, `Some` exactly on the layers that carry a PLE
+    /// state.
+    ///
+    /// One entry per layer rather than one per PLE layer, so the vector lines up
+    /// with the snapshot's `layers` and with `self.layers` at the same index —
+    /// the alignment is what lets a restore pair an image with the state it came
+    /// from without carrying a layer id in the record.
+    pub fn ple_images(&self) -> Vec<Option<PleImage>> {
+        self.layers
+            .iter()
+            .map(|layer| layer.ple_state.as_ref().map(PleState::image))
+            .collect()
+    }
+
+    /// Whether `shapes` — one entry per trunk layer, as [`Self::ple_images`]
+    /// produces — describes states this model could hold at `pos` committed
+    /// tokens.
+    ///
+    /// Checked before anything is written, for the reason every other
+    /// `check_*` on this path exists: the restore walks layers, and one that
+    /// fails at layer twenty has already replaced nineteen.
+    ///
+    /// `pos` is not decoration: it is what tells an empty history apart from a
+    /// state that has stepped tokens and lost its history somewhere. See
+    /// [`PleState::accepts`].
+    pub fn check_ple_restorable(&self, shapes: &[Option<PleShape>], pos: usize) -> Result<()> {
+        ensure!(
+            shapes.len() == self.layers.len(),
+            "qwen4exp restore: the image covers {} layers, the model has {}",
+            shapes.len(),
+            self.layers.len()
+        );
+        for (il, (layer, shape)) in self.layers.iter().zip(shapes).enumerate() {
+            match (layer.ple_state.as_ref(), shape) {
+                (None, None) => {}
+                (Some(state), Some(shape)) => state
+                    .accepts(*shape, pos)
+                    .with_context(|| format!("qwen4exp restore: layer {il}"))?,
+                (Some(_), None) => bail!(
+                    "qwen4exp restore: layer {il} holds a PLE state and the image carries none"
+                ),
+                (None, Some(_)) => bail!(
+                    "qwen4exp restore: the image carries a PLE state for layer {il}, which has \
+                     none"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Put the qwen4exp-only state back to what a snapshot at `pos` captured:
+    /// every indexer cache truncated to `pos`, every PLE state replaced by its
+    /// image.
+    ///
+    /// The two halves rewind differently and both are exact. The indexer's raw
+    /// keys are position-indexed like a full-attention layer's K/V — every token
+    /// writes its own row — so dropping the tail IS the rewind. The PLE state is
+    /// a recurrent summary with no inverse, which is why it travels as data:
+    /// there is nothing to compute it back from.
+    pub fn restore(&mut self, images: &[Option<&PleImage>], pos: usize) -> Result<()> {
+        ensure!(
+            images.len() == self.layers.len(),
+            "qwen4exp restore: the image covers {} layers, the model has {}",
+            images.len(),
+            self.layers.len()
+        );
+        for (il, (layer, image)) in self.layers.iter_mut().zip(images).enumerate() {
+            if let Some(cache) = layer.indexer_cache.as_mut() {
+                cache
+                    .truncate(pos)
+                    .with_context(|| format!("qwen4exp restore: layer {il} indexer"))?;
+            }
+            match (layer.ple_state.as_mut(), image) {
+                (None, None) => {}
+                (Some(state), Some(image)) => state
+                    .restore(image, pos)
+                    .with_context(|| format!("qwen4exp restore: layer {il}"))?,
+                _ => bail!(
+                    "qwen4exp restore: layer {il}'s PLE state and the image disagree about \
+                     whether it has one"
+                ),
+            }
+        }
+        // A restore replaces the history any armed checkpoint was taken against,
+        // exactly as `PleState::restore` and `LayerCache::restore` clear their own
+        // trails. Leaving it would let a rollback answer from a sequence this
+        // model is no longer running.
+        self.pending = None;
+        Ok(())
+    }
+
+    /// Every QSA layer's indexer cache, in layer order — the planes a
+    /// `HostFullKv` carries alongside the full-attention K/V rows.
+    /// Whether every indexer cache holds at least `pos` keys, which is what
+    /// [`Self::restore`]'s truncation requires of them.
+    ///
+    /// Separate from [`Self::check_ple_restorable`] because it is not a property
+    /// of the IMAGE, it is a property of the cache the image is landing in, and
+    /// only one caller is really constrained by it. Both paths run it — it sits
+    /// inside `restore_cache_snapshot`, which a page-in reaches too — but a
+    /// page-in has already run `import_full_kv` by then, and that set every
+    /// indexer's length to exactly the position being restored, so the check is
+    /// trivially true there. The rewind is what it is FOR: rewinding into a cache
+    /// that never held those positions would extend an indexer over rows nothing
+    /// wrote, and `truncate` refuses rather than inventing them.
+    ///
+    /// Which is why it is deliberately NOT part of `check_importable`: that runs
+    /// BEFORE the import, where the lengths legitimately do not agree yet, and
+    /// demanding it there would refuse every page-in.
+    pub fn check_restore_at(&self, pos: usize) -> Result<()> {
+        for (il, layer) in self.layers.iter().enumerate() {
+            if let Some(cache) = layer.indexer_cache.as_ref() {
+                ensure!(
+                    pos <= cache.len(),
+                    "qwen4exp restore: layer {il}'s indexer holds {} keys, and a restore to \
+                     {pos} would extend it over rows nothing wrote — import the rows first",
+                    cache.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn indexer_caches(&self) -> Vec<&IndexerCache> {
+        self.layers
+            .iter()
+            .filter_map(|layer| layer.indexer_cache.as_ref())
+            .collect()
+    }
+
+    pub fn indexer_caches_mut(&mut self) -> Vec<&mut IndexerCache> {
+        self.layers
+            .iter_mut()
+            .filter_map(|layer| layer.indexer_cache.as_mut())
+            .collect()
     }
 
     /// Drop every sequence-scoped state, alongside `LayerCache::reset`.
@@ -937,5 +1084,199 @@ mod tests {
             .map(|(i, _)| i)
             .unwrap();
         assert!(top < vocab, "argmax {top} is outside the vocabulary");
+    }
+
+    // ---------------------------------------------------- cache images (P4) ---
+
+    /// A model at a geometry of the caller's choosing, so a test can build a
+    /// SECOND model that differs in exactly the one dimension it is about.
+    fn tiny_model_at(
+        geo: &TinyGeometry,
+        tag: &str,
+        device: &Device,
+        max_ctx: usize,
+    ) -> (XwenModel, PathBuf) {
+        let dir = fixture_dir(tag);
+        let path = dir.join("tiny-qwen4exp.gguf");
+        write_tiny_qwen4exp(&path, geo).unwrap();
+        let gguf = crate::gguf::open(&path, device).unwrap();
+        let model = XwenModel::load(gguf, ExpertRunner::Reference, max_ctx).unwrap();
+        (model, dir)
+    }
+
+    /// Decode `tokens` one at a time from `pos`, returning each step's logits.
+    fn decode_from(
+        model: &mut XwenModel,
+        device: &Device,
+        pos: usize,
+        tokens: &[u32],
+    ) -> Vec<Vec<f32>> {
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(i, &tok)| host(&model.forward(&ids(device, &[tok]), pos + i).unwrap()))
+            .collect()
+    }
+
+    /// A snapshot taken between forwards restores the whole conversation — the
+    /// KV caches, the QSA indexers' raw keys, and the PLE conv window and n-gram
+    /// history — so the continuation off a restore is the continuation off the
+    /// original, token for token and logit for logit.
+    ///
+    /// The rewind arm is the harder one and the reason the two states travel
+    /// differently. Restoring to a SHORTER position truncates the indexer caches
+    /// (their rows are position-indexed, so the tail is simply dropped) and
+    /// installs the PLE image (a recurrent summary with no inverse, so it has to
+    /// have been copied). Getting either wrong yields a model that runs and
+    /// answers while attending to the wrong tokens, which is why this compares
+    /// logits rather than checking that nothing errored.
+    #[test]
+    fn a_snapshot_restores_the_whole_qwen4exp_conversation() {
+        let Some(device) = device_or_skip("a_snapshot_restores_the_whole_qwen4exp_conversation")
+        else {
+            return;
+        };
+        for fixture in [Fixture::Exact, Fixture::Mixed] {
+            let what = fixture.label();
+            let (mut model, dir) = tiny_model_of(fixture, "snapshot_restore", &device, 128);
+
+            model.forward(&ids(&device, &SEQ[..5]), 0).unwrap();
+            let early = model.take_cache_snapshot().unwrap();
+            assert_eq!(early.pos(), 5);
+            let want_early = decode_from(&mut model, &device, 5, &SEQ[5..8]);
+
+            model.forward(&ids(&device, &SEQ[8..10]), 8).unwrap();
+            let late = model.take_cache_snapshot().unwrap();
+            let want_late = decode_from(&mut model, &device, 10, &SEQ[10..13]);
+
+            // Rewind to the tip: the ordinary rewind, at the position the cache
+            // is already at.
+            model.restore_cache_snapshot(&late).unwrap();
+            assert_eq!(model.cache_len(), 10, "{what}: tip restore length");
+            assert_eq!(
+                decode_from(&mut model, &device, 10, &SEQ[10..13]),
+                want_late,
+                "{what}: a restore at the tip changed the continuation"
+            );
+
+            // Rewind to a SHORTER position, past which a different continuation
+            // has already been written into the caches.
+            model.restore_cache_snapshot(&early).unwrap();
+            assert_eq!(model.cache_len(), 5, "{what}: rewind length");
+            assert_eq!(
+                decode_from(&mut model, &device, 5, &SEQ[5..8]),
+                want_early,
+                "{what}: a rewind to a shorter position changed the continuation"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The page-out/page-in pair: everything a conversation needs to leave the
+    /// GPU cache and come back is `export_full_kv` plus a host snapshot, and on
+    /// qwen4exp that means the QSA indexer planes travel with the full-attention
+    /// rows while the PLE state travels in the snapshot.
+    ///
+    /// The displaced conversation is really run over the cache in between, so a
+    /// half that failed to travel would be answered from ITS state rather than
+    /// from stale-but-harmless zeros — which is what makes this test able to
+    /// fail.
+    #[test]
+    fn an_exported_image_pages_a_qwen4exp_conversation_back_in() {
+        let Some(device) =
+            device_or_skip("an_exported_image_pages_a_qwen4exp_conversation_back_in")
+        else {
+            return;
+        };
+        let (mut model, dir) = tiny_model("page_out_in", &device, 128);
+
+        model.forward(&ids(&device, &SEQ[..10]), 0).unwrap();
+        let want = decode_from(&mut model, &device, 10, &SEQ[10..13]);
+
+        // Back to the paged-out position, and image it there.
+        model.reset_cache().unwrap();
+        model.forward(&ids(&device, &SEQ[..10]), 0).unwrap();
+        let image = model.export_full_kv().unwrap();
+        let rings = model.take_cache_snapshot().unwrap().to_host().unwrap();
+        assert_eq!(image.pos, 10);
+        assert_eq!(rings.pos, 10);
+
+        // Another conversation takes the cache over, writing its own keys into
+        // every slot the first one held.
+        model.reset_cache().unwrap();
+        let intruder: Vec<u32> = SEQ.iter().rev().copied().collect();
+        model.forward(&ids(&device, &intruder[..12]), 0).unwrap();
+
+        // And the first one comes back, in the order the server pages in.
+        model.check_importable(&image, &rings, 10).unwrap();
+        model.import_full_kv(&image, 10).unwrap();
+        model
+            .restore_cache_snapshot(&rings.to_snapshot(&device).unwrap())
+            .unwrap();
+        assert_eq!(model.cache_len(), 10);
+        assert_eq!(
+            decode_from(&mut model, &device, 10, &SEQ[10..13]),
+            want,
+            "a paged-in conversation continued differently than it would have"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An image from a differently-shaped model is refused loudly, by the half
+    /// that disagrees, before a byte of it is written.
+    ///
+    /// Two shapes, because the two halves are checked by different code and a
+    /// test that only covered one would leave the other free to accept anything:
+    /// the QSA indexer's head dim is checked against the live indexer cache on
+    /// the `HostFullKv` path, and the PLE conv window against the live PLE state
+    /// on the snapshot path.
+    #[test]
+    fn an_image_from_another_geometry_is_refused_by_the_half_that_disagrees() {
+        let Some(device) =
+            device_or_skip("an_image_from_another_geometry_is_refused_by_the_half_that_disagrees")
+        else {
+            return;
+        };
+        let (mut model, dir) = tiny_model("shape_mismatch_a", &device, 64);
+        model.forward(&ids(&device, &SEQ[..6]), 0).unwrap();
+        let image = model.export_full_kv().unwrap();
+        let rings = model.take_cache_snapshot().unwrap().to_host().unwrap();
+        let snapshot = model.take_cache_snapshot().unwrap();
+
+        // A narrower indexer: the same layers, the same KV rows, a different
+        // raw-key plane. Byte counts alone would not catch this — the planes
+        // would simply be shorter — so the head dim is compared directly.
+        let narrow_qsa = TinyGeometry {
+            indexer_head_dim: 8,
+            ..TinyGeometry::default()
+        };
+        let (other, other_dir) = tiny_model_at(&narrow_qsa, "shape_mismatch_qsa", &device, 64);
+        let err = other
+            .check_importable(&image, &rings, 6)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("QSA image is"), "{err}");
+
+        // A narrower carrier: the PLE conv window is `hc_count * hidden` wide,
+        // so halving the streams halves the window the image carries.
+        let narrow_carrier = TinyGeometry {
+            hc_count: 2,
+            ..TinyGeometry::default()
+        };
+        let (mut third, third_dir) =
+            tiny_model_at(&narrow_carrier, "shape_mismatch_ple", &device, 64);
+        // `{:#}` so the whole chain shows: the outer context names the layer,
+        // the cause names the shapes.
+        let err = format!("{:#}", third.restore_cache_snapshot(&snapshot).unwrap_err());
+        assert!(err.contains("PLE image is"), "{err}");
+        assert!(err.contains("layer 1"), "{err}");
+        // Refused BEFORE anything was written: the model still runs.
+        third.forward(&ids(&device, &SEQ[..3]), 0).unwrap();
+
+        for dir in [dir, other_dir, third_dir] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

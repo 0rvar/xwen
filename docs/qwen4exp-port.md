@@ -236,6 +236,13 @@ items. Vision is an inline ViT, cleanly droppable for text-only.
   keeps a per-token trail bounded by the checkpoint span, mirroring
   `LayerCache::Linear`, and `Qwen4ExpCheckpoint` is stamped `(len0, span)` and
   verified on use. Tests pin commits 0..3 bitwise on probe logits.
+  **Superseded in part 2026-08-30 (P4)**: the refusal was P2 scope and is gone —
+  `kv_cache.rs` now carries the PLE conv window and history as an image on the
+  layer's own snapshot entry (`LayerSnapshot::Ple`, disk tag `LAYER_PLE`) and the
+  QSA raw keys as planes inside `HostFullKv`. The residency half of D15 stands:
+  the state still lives in `Qwen4ExpParts`, `LayerCache` unwraps to the inner
+  layer and stays unaware of the PLE, and `XwenModel` pairs the two. See
+  decisions.md "Qwen3.8-Flash-Next".
 - **D16 (2026-08-29) QSA overlay contract.** `AttnBlock::forward` gains a
   trailing `Option<&QsaSelection>` (`Dense` / `Mask` / `Rows`); the `None` path
   is byte-identical for existing checkpoints. See "P2 plan". **Amended by the
