@@ -419,7 +419,7 @@ mod tests {
                 let (x, w, ssm_a, dt_bias) = ba_operands(hidden, v_heads, seq, seed, &device);
 
                 assert!(
-                    crate::ops::delta_ba_fused_applies(&x, &w),
+                    crate::ops::dispatch::delta_ba_fused_applies(&x, &w),
                     "hidden={hidden} v={v_heads} seq={seq} is inside the kernel's ceilings"
                 );
                 let (beta, g) = delta_ba_fused(&x, &w, &ssm_a, &dt_bias).unwrap();
@@ -455,30 +455,34 @@ mod tests {
             0x2701,
             &device,
         );
-        assert!(!crate::ops::delta_ba_fused_applies(&long.0, &long.1));
+        assert!(!crate::ops::dispatch::delta_ba_fused_applies(
+            &long.0, &long.1
+        ));
         assert!(delta_ba_fused(&long.0, &long.1, &long.2, &long.3).is_err());
 
         // An empty chunk encodes a zero-dimension grid.
         let empty = f32z((0, hidden));
-        assert!(!crate::ops::delta_ba_fused_applies(&empty, &w));
+        assert!(!crate::ops::dispatch::delta_ba_fused_applies(&empty, &w));
         assert!(delta_ba_fused(&empty, &w, &ssm_a, &dt_bias).is_err());
 
         // An odd column count cannot split into beta|alpha.
         let odd = f32z((hidden, 2 * v_heads - 1));
-        assert!(!crate::ops::delta_ba_fused_applies(&x, &odd));
+        assert!(!crate::ops::dispatch::delta_ba_fused_applies(&x, &odd));
         assert!(delta_ba_fused(&x, &odd, &ssm_a, &dt_bias).is_err());
 
         // A weight whose rows are not x's hidden dim.
         let short = f32z((hidden - 1, 2 * v_heads));
-        assert!(!crate::ops::delta_ba_fused_applies(&x, &short));
+        assert!(!crate::ops::dispatch::delta_ba_fused_applies(&x, &short));
         assert!(delta_ba_fused(&x, &short, &ssm_a, &dt_bias).is_err());
 
         // Beyond the V-head and hidden ceilings.
         let wide = f32z((hidden, 2 * (dispatch::DELTA_BA_MAX_V_HEADS + 1)));
-        assert!(!crate::ops::delta_ba_fused_applies(&x, &wide));
+        assert!(!crate::ops::dispatch::delta_ba_fused_applies(&x, &wide));
         let tall_x = f32z((1, dispatch::DELTA_BA_MAX_HIDDEN + 1));
         let tall_w = f32z((dispatch::DELTA_BA_MAX_HIDDEN + 1, 2 * v_heads));
-        assert!(!crate::ops::delta_ba_fused_applies(&tall_x, &tall_w));
+        assert!(!crate::ops::dispatch::delta_ba_fused_applies(
+            &tall_x, &tall_w
+        ));
         assert!(delta_ba_fused(&tall_x, &tall_w, &ssm_a, &dt_bias).is_err());
 
         // Per-head vectors that do not match the weight's V-head count.

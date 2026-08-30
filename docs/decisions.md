@@ -527,7 +527,7 @@ llama.cpp hardcodes F32 for both conv and delta states. State per layer per sequ
 `(d_conv−1)·conv_dim` floats conv + `128·128·H_v` floats delta (2 MiB on the 35B)
 (2026-07-28).
 
-**The beta|alpha projection folds into its own head below 32 tokens — a dispatch removed,
+**The beta|alpha projection folds into its own head at up to 32 tokens — a dispatch removed,
 not a kernel made faster (2026-08-30).** `kernel_delta_ba_fused` (delta.metal) reads
 `x_normed` and the `[hidden, 2 · v_heads]` f32 weight and writes `beta` and the log-decay
 directly, replacing a candle gemv (~30 µs per layer for a ~1 MB weight, i.e. ~33 GB/s)

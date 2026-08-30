@@ -2048,7 +2048,7 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     line said. What the per-op breakdown (14) asked for now exists, and it says
     the lever is DISPATCH COUNT, not bytes:
     - **`ba_proj` — SHIPPED 0261e17.** The beta|alpha gemv folded into
-      `kernel_delta_ba_fused` below 32 tokens: one dispatch fewer per DeltaNet
+      `kernel_delta_ba_fused` at up to 32 tokens: one dispatch fewer per DeltaNet
       layer per token, **Flash-Next decode 44.4-44.5 → 46.5-46.7 tok/s
       (+4.6-4.8%, 36 layers)** and **35B-A3B 105.1 → 114.4 (+8.8%, 30
       layers)**, prefill unchanged on both. Bounded at 2e-6, so the greedy text
