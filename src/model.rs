@@ -375,6 +375,13 @@ impl XwenModel {
         &self.cfg
     }
 
+    /// Prompt tokens per prefill forward on every surface: the architecture's
+    /// fitted default (`Arch::prefill_chunk_default`) unless `XWEN_PREFILL_CHUNK`
+    /// overrides it.
+    pub fn prefill_chunk(&self) -> usize {
+        crate::ops::prefill_chunk_override().unwrap_or(self.cfg.arch.prefill_chunk_default())
+    }
+
     /// Identity of the checkpoint this model was loaded from — what a persisted
     /// cache image is stamped with and validated against.
     pub fn checkpoint_id(&self) -> crate::gguf::CheckpointId {

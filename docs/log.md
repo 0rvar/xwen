@@ -4,6 +4,43 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-30 (prefill chunk) — the prefill chunk goes per architecture: 2048 on the MoE checkpoints (+10% Flash-Next, +8% 35B-A3B at 3.9k tokens), 512 stays on the dense 27B where 2048 is 5-6% slower
+
+The prefill chunk had been a flat `const PREFILL_CHUNK = 512` in generate.rs and again in
+serve/engine.rs since the fork, chosen for the dense 27B's attention working set. On an
+MoE checkpoint the chunk is also the expert batch: Flash-Next routes top-10 of 512
+experts, so a 512-token chunk gives each expert ~10 rows per `mm_id` gemm. The A/B:
+`XWEN_PREFILL_CHUNK` (new, `ops::prefill_chunk_override`), `XWEN_BENCH=1`, `--no-draft
+--raw --stats`, `-n 128`, the `prefill-4k.txt` fixture (3851 tokens) and its first half
+(1962 tokens), arms interleaved within each round, one process at a time, first run after
+the cold start discarded, `pmset -g` printing `powermode 0` (no high-power claim).
+
+Flash-Next, three rounds, prefill tok/s (medians): at 3851 tokens **748 / 814 / 824 /
+745** for chunks 512 / 1024 / 2048 / 4096; at 1962 tokens **883 / 933 / 951 / 957** (the
+last two are the same single chunk there). Decode after the 4k prompt 27.4 / 27.5 /
+27.9 / 27.1 — unchanged. 35B-A3B, two rounds, 3851 tokens: **2429 / 2429 at 512 → 2641 /
+2627 at 2048** (+8.4%), decode 107-108 either way. Dense 27B, two rounds, 3851 tokens:
+**650 / 599 at 512 → 608 / 571 at 2048** — 2048 is 6.5% and 4.7% slower within its own
+round (the between-round drift is the usual duty-cycle settling; the arms were
+interleaved so it cancels). Greedy output over 64 tokens on the 2k prompt is
+byte-identical between 512 and 2048 on Flash-Next. Peak `phys_footprint` (polled at
+1 s): Flash-Next 17.4 GB at 512 and 1024, 19.5 at 2048, 22.5 at 4096; 35B 9.4 → 11.3;
+27B 41 → 44-46. No OOM.
+
+The dense result explains the 4096 one. The sdpa mask and the attention score tile grow
+with the square of the chunk; a checkpoint with no expert batch pays that and collects
+nothing, and on the MoE ones it outruns the rows-per-expert gain past 2048. So the
+default is per architecture — `Arch::prefill_chunk_default`: 2048 for `Moe` and
+`Qwen4Exp`, 512 for `Dense` — read through `XwenModel::prefill_chunk` by every surface:
+generate/chat/batch, serve (whose own constant is gone; the snapshot economics are
+position-based, `SNAPSHOT_MIN_GAIN` 1024 tokens, and never assumed the chunk), and the
+logits-dump ppl pass (which used to hard-code 512 to "match generate" and now reads the
+same accessor). `parity-gate.ts` strips `XWEN_PREFILL_CHUNK` from the run env. The
+35B's new chunk has not been re-graded by the parity gate; the last full run was at 512.
+Deferred (TODO.md "prefill-chunk pass"): a 16-row `mm_id` token tile, the hc/shexp gemms
+onto `dense_mm`, the f16 rescale chain at prefill, and the unattributed decode fall from
+46.7 tok/s at a 530-token prompt to 27.4 at 3.9k context, seen in every arm alike.
+
 ## 2026-08-30 (later still) — the GDN mixer arc: a per-step profiler names three targets, two of them turn out to be its own brackets, and folding the beta|alpha projection buys +4.6-4.8% on Flash-Next and +8.8% on the 35B-A3B
 
 `XWEN_GDN_PROFILE` (ae82696) is a per-step attribution of the gated-DeltaNet block: one

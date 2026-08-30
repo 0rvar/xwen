@@ -223,8 +223,11 @@ sweeps that graded each: **35B-A3B decode 114 tok/s as of 0261e17** (2026-08-30,
 beta|alpha fold, +8.8% over the 105.1 arm of the same session; was 104-107 through
 2026-08-08), 27B 24.8-25.3, 3.8-27B 23.7-24.8. The fold has NOT been re-swept with
 drafting, so every drafted figure below is still against the pre-fold plain level.
-Prefill unchanged since 2026-07-29 and not re-measured: 35B ~1900-2550@4k; 27B
-702@925 / 445@4k. Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run
+Prefill: the chunk is PER ARCHITECTURE since 2026-08-30 — 2048 on the MoE
+checkpoints, 512 on the dense (`Arch::prefill_chunk_default`, `XWEN_PREFILL_CHUNK`
+overrides; decisions.md "Prefill chunk") — measured that day at 3851 tokens: **35B 2634
+(2429 at 512)**; the dense 27B reads 5-6% SLOWER at 2048 (650/599 vs 608/571) and keeps
+512 (its 702@925 / 445@4k are from 2026-07-29 and not re-measured). Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run
 adds ~9s of Metal pipeline compilation. With drafting (the default since P9a) at
 the per-model defaults: **27B 37.5-38.2 code / 36.8-37.4 chat** (+46-52% over
 plain), **35B 133.6-134.8 code / 122.3-123.7 chat** (+26-28% / +15-17%), both
@@ -241,7 +244,10 @@ Qwen3.8-Flash-Next (EXPERIMENTAL; every surface since P4, but these numbers are
 `generate`'s — serve has never been benchmarked on it, TODO.md), 2026-08-29 after the
 P3 kernel pass for prefill and 2026-08-30 at the ba fold (0261e17) for decode,
 plain because no drafter exists for it: **prefill ~796 tok/s @530, decode 46.5-46.7
-(44.4-44.5 before the ba fold, 43.1 before the PLE row prefetch)** — 530-token prompt,
+(44.4-44.5 before the ba fold, 43.1 before the PLE row prefetch)** — 530-token prompt
+(long prompts at the 2048 chunk of 2026-08-30: **824 @3851 / 951 @1962**, against
+748 / 883 at the old 512 chunk, same session; decode at 3.9k context reads 27.4 in that
+session and the fall from 46.7 is unattributed, TODO.md) —
 interleaved rounds, medians, the fold measured in two sessions,
 against llama.cpp's 789 / 41.4 on the same file in the same hour as the 2026-08-29 arm
 (`pmset -g` said `powermode 0` that session — still no high-power

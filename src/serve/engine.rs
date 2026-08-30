@@ -37,11 +37,6 @@ use crate::ops::ExpertRunner;
 use crate::sampler::SamplerOptions;
 use crate::tokenizer::LagunaTokenizer;
 
-/// Prompt tokens per prefill dispatch, matching `generate.rs`'s own chunking so
-/// that splitting a prefill to check for a departed client costs no extra GPU
-/// passes.
-const PREFILL_CHUNK: usize = 512;
-
 /// How much prefill a mid-prefill snapshot has to save before it is worth taking.
 ///
 /// The cost is fixed — every DeltaNet layer's recurrent state, 62.8 MiB of host RAM on
@@ -2103,11 +2098,14 @@ fn prefill(
     total: usize,
     trace: &mut JobTrace,
 ) -> Result<Option<CancelReason>> {
-    for (index, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
+    // The same chunk as the generate path, so splitting a prefill to check for a
+    // departed client costs no extra GPU passes.
+    let chunk_len = engine.generator.prefill_chunk();
+    for (index, chunk) in tokens.chunks(chunk_len).enumerate() {
         if let Some(reason) = abandon.reason() {
             return Ok(Some(reason));
         }
-        let at = start_pos + index * PREFILL_CHUNK;
+        let at = start_pos + index * chunk_len;
         let started = Instant::now();
         engine.generator.prefill_tokens(chunk, at)?;
         trace.record.prefill_secs += started.elapsed().as_secs_f64();

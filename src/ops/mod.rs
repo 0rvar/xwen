@@ -268,6 +268,22 @@ pub fn chunk_sync() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_CHUNK_SYNC").is_some())
 }
 
+/// `XWEN_PREFILL_CHUNK=<usize>` overrides the prefill chunk — how many prompt
+/// tokens every prefill path (`generate`/`chat`/`batch`, serve, the ppl pass)
+/// feeds the model per forward. The default is per architecture
+/// (`Arch::prefill_chunk_default`, read through `XwenModel::prefill_chunk`);
+/// this is the A/B knob over it. Cached (read once); unset, unparseable or
+/// zero means "no override".
+pub fn prefill_chunk_override() -> Option<usize> {
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_PREFILL_CHUNK")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
 /// Largest token count routed to the vendored small-batch mat-vec
 /// (`ops::matmul_mv_ext`). Inclusive, and it is ggml's own tested envelope: its
 /// host dispatches `mul_mv_ext` for ne11 in 2..=8 and the tiled gemm above that

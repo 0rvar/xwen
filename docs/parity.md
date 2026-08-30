@@ -385,6 +385,17 @@ two arms agree to ~1e-6, the same class as `XWEN_DELTA_CLASSIC`. The decode and 
 tiers are where it would show. `parity-gate.ts` strips it from the run env with the
 others.
 
+`XWEN_PREFILL_CHUNK=<n>` appears in no row and is not a kernel switch at all: it is the
+prefill chunk every surface feeds the model in (`XwenModel::prefill_chunk`: per
+architecture since 2026-08-30 — 2048 on the MoE checkpoints, 512 on the dense ones; a
+flat 512 before), and the logits-dump ppl pass reads the same accessor so that the ppl
+tier scores the chunk shape generate really runs. It moves numbers only through
+chunk-boundary accumulation order, not arithmetic, but a candidate dumped at a different
+chunk than its reference is comparing two shapes the report does not name, so
+`parity-gate.ts` strips it from the run env (`baseEnv()`) like the others. The 35B's
+2048 default has NOT yet been graded by the gate (the last full run was at 512, which
+the dense file still runs); the ppl tier is where a chunk change would show first.
+
 Five more switches exist and appear in NO row of that table, because they affect
 **qwen4exp (Qwen3.8-Flash-Next) only** — a checkpoint the harness cannot yet run at all
 (see "Limitations"). They are listed here so a future gate extension does not rediscover

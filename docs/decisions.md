@@ -591,6 +591,32 @@ displaced was also doing real work badly, which is NOT true of the remaining fus
 candidates on this path (TODO.md item (14)) — expect 8.41 µs × 36 layers ≈ 0.3 ms from
 those on Flash-Next, not 1 ms.
 
+**The prefill chunk is per architecture — 2048 on the MoE checkpoints, 512 on the dense
+ones — on every surface, and 4096 is not better anywhere.** Prompts are fed to the model
+`XwenModel::prefill_chunk()` tokens at a time: `Arch::prefill_chunk_default` unless
+`XWEN_PREFILL_CHUNK` overrides it, and serve, generate, chat, batch and the logits-dump
+ppl pass all read that one accessor (so a serve prefill split for a departed-client check
+still costs no extra GPU passes, and the ppl tier scores the shape generate runs). It was
+a flat 512 from the fork, chosen for the dense 27B's attention working set. On an MoE
+checkpoint the chunk is also the expert batch: Flash-Next routes top-10 of 512 experts,
+so a 512-token chunk hands each expert ~10 rows per `mm_id` gemm and the gemm runs at
+gemv-like intensity; at 2048 each expert sees ~40 rows. Measured 2026-08-30
+(`powermode 0`, interleaved arms, medians; log.md): Flash-Next at 3851 tokens
+748 → 814 → 824 → 745 tok/s for chunks 512 / 1024 / 2048 / 4096 (three rounds), at 1962
+tokens 883 → 933 → 951 → 957; 35B-A3B at 3851 tokens 2429 → 2634 for 512 → 2048 (+8.4%,
+two rounds); the dense 27B at 3851 tokens 650/599 → 608/571 (round 1 / round 2), 2048
+being 5-6% SLOWER in both rounds. Decode was unchanged in every arm, and greedy output
+over 64 tokens byte-identical between 512 and 2048. Peak phys_footprint rose 17.4 → 19.5
+GB at 2048 and 22.5 GB at 4096 on Flash-Next, 9.4 → 11.3 GB on the 35B, 41 → 44-46 GB on
+the 27B. The dense result is the explanation for the 4096 one: what grows with the chunk
+is not only the expert batch — the sdpa mask and the attention score tile grow with the
+SQUARE of the chunk — so a checkpoint with no expert batch to feed pays the quadratic
+cost and collects nothing, and on the MoE ones that cost outruns the rows-per-expert gain
+past 2048 (at 1962 tokens 4096 and 2048 are the same single chunk, which is why that
+prompt cannot separate them). Hence a per-architecture default rather than one number:
+2048 where there are experts, 512 where there are none, 1024 the MoE fallback if the
++2 GB ever matters (2026-08-30).
+
 ## Refuted perf directions — do not reopen without new evidence
 
 Laguna's refuted list (death-by-dispatch, encoder takeover, all-f16 activation chains,

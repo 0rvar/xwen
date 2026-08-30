@@ -19,10 +19,6 @@ use crate::sampler::{SampleControl, Sampler, SamplerOptions};
 use crate::stack_profile::Phase;
 use crate::tokenizer::LagunaTokenizer;
 
-/// Prompt tokens are fed to the model in chunks of this size. Keeps prefill
-/// attention/MoE tensors bounded while still amortizing per-forward overhead.
-const PREFILL_CHUNK: usize = 512;
-
 /// Chunked prefill (512-token chunks) + single-token decode loop with a
 /// streaming callback. One GPU->CPU sync per decoded token (the logits
 /// readback that feeds the CPU sampler).
@@ -1693,7 +1689,7 @@ impl Generator {
         // one-time upload/compile costs. Off by default; never affects output.
         if std::env::var_os("XWEN_BENCH").is_some() {
             let mut warm_pos = 0usize;
-            for chunk in tokens.chunks(PREFILL_CHUNK) {
+            for chunk in tokens.chunks(self.model.prefill_chunk()) {
                 let input = Tensor::new(chunk, &device)?;
                 let _ = self.model.forward(&input, warm_pos)?;
                 warm_pos += chunk.len();
@@ -1712,7 +1708,7 @@ impl Generator {
         let mut cancelled = false;
         let mut pos = 0usize;
         let mut logits = None;
-        for chunk in tokens.chunks(PREFILL_CHUNK) {
+        for chunk in tokens.chunks(self.model.prefill_chunk()) {
             if should_stop() {
                 cancelled = true;
                 break;
@@ -1796,6 +1792,12 @@ impl Generator {
     /// position. The taps are drained either way, so a dropped chunk's taps never
     /// accumulate into the next one, and the target's tokens and logits are
     /// unaffected.
+    /// The prefill chunk this generator's model runs (`XwenModel::prefill_chunk`),
+    /// so a caller splitting a prefill itself chunks at the same boundary.
+    pub fn prefill_chunk(&self) -> usize {
+        self.model.prefill_chunk()
+    }
+
     pub fn prefill_tokens(&mut self, tokens: &[u32], start_pos: usize) -> Result<()> {
         ensure!(!tokens.is_empty(), "prefill_tokens: nothing to prefill");
         let max_ctx = self.model.max_ctx();
@@ -1814,7 +1816,7 @@ impl Generator {
         let device = model.device().clone();
         model.set_phase(Phase::Prefill);
         let mut pos = start_pos;
-        for chunk in tokens.chunks(PREFILL_CHUNK) {
+        for chunk in tokens.chunks(model.prefill_chunk()) {
             let input = Tensor::new(chunk, &device)?;
             *last_logits = Some(model.forward(&input, pos)?);
             // Drain both hidden-state channels unconditionally: either one left
@@ -3170,7 +3172,7 @@ impl Generator {
         // output. Mirrors the plain-decode path so spec timings are steady-state.
         if std::env::var_os("XWEN_BENCH").is_some() {
             let mut warm_pos = 0usize;
-            for chunk in tokens.chunks(PREFILL_CHUNK) {
+            for chunk in tokens.chunks(model.prefill_chunk()) {
                 let input = Tensor::new(chunk, &device)?;
                 let _ = model.forward(&input, warm_pos)?;
                 let taps = model.take_spec_taps();
@@ -3194,7 +3196,7 @@ impl Generator {
         let mut cancelled = false;
         let mut pos = 0usize;
         let mut logits = None;
-        for chunk in tokens.chunks(PREFILL_CHUNK) {
+        for chunk in tokens.chunks(model.prefill_chunk()) {
             if should_stop() {
                 cancelled = true;
                 break;
@@ -3665,7 +3667,7 @@ impl Generator {
         } = self;
         let device = model.device().clone();
         let mut pos = 0usize;
-        for chunk in tokens.chunks(PREFILL_CHUNK) {
+        for chunk in tokens.chunks(model.prefill_chunk()) {
             if should_stop() {
                 break;
             }

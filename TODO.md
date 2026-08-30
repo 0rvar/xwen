@@ -2447,3 +2447,31 @@ WASH"). These are the two things it deliberately did not take.
   and attribute by difference, or run every step under `XWEN_GDN_REPS` and say so on
   the line; until then treat it like `XWEN_STACK_PROFILE`'s decode stages (CLAUDE.md
   already says those rank, not time).
+
+## Deferred from the prefill-chunk pass (2026-08-30)
+
+The chunk went 512 → 2048 on the MoE checkpoints, on every surface, and stayed 512 on
+the dense ones (decisions.md "Prefill chunk", log.md 2026-08-30 "prefill chunk"). The
+A/B named four things it did not take.
+- [ ] **A narrower `mm_id` token tile (NR1 32 → 16).** At the 2048 chunk each Flash-Next
+  expert sees ~40 rows per gemm, which a 32-row tile covers as one full tile plus a
+  quarter-empty one; a 16-row tile would waste less of the second tile and lets the
+  1024 chunk (~20 rows) stop paying for a half-empty tile too. Untested; the win, if
+  any, is bounded by the expert gemm's share of prefill, so profile that share first.
+- [ ] **Route the hyper-connection and shared-expert gemms onto `dense_mm`.** The P8c
+  gemm (`src/ops/dense_mm.metal`) was 2.2-2.7x on the 27B's dense FFN; whether the
+  Flash-Next hc mix and the `shexp` gemms take it at prefill today has not been checked,
+  and at 2048 rows per chunk they are squarely in its `seq > 32` envelope. Same gate
+  as `dense_mm` (Q4_K/Q8_0 source, graded by mm/ppl), and the same accuracy trade.
+- [ ] **The f16 rescale chain at prefill** (`moe.rs` `needs_rescale`, the L2 guard that
+  keeps the down-projection input inside f16 range on the f16-tile prefill variants).
+  At 2048 rows per chunk the guard is a band of elementwise dispatches per layer that
+  decode never pays; fold it into the gemm epilogue or the following norm, whichever the
+  profiler ranks higher (rank, do not price — the profilers are sync-inflated).
+- [ ] **Decode falls from 46.7 tok/s at a 530-token prompt to 27.4 at 3.9k context on
+  Flash-Next, and nothing attributes it.** Observed 2026-08-30 in the chunk sweep
+  (128 tokens after the 3851-token prompt, every chunk arm alike, so the chunk is not the
+  cause). The full-attention layers' KV read grows with context but not 1.7x over 3.4k
+  tokens on 25% of the layers; the QSA indexer, the mask upload and the PLE n-gram
+  history are the other context-scaling parts. Being mapped separately; ledgered here so
+  the observation is not lost.

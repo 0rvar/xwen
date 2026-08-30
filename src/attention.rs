@@ -1223,8 +1223,9 @@ mod tests {
     }
 
     /// Per-stage isolation timing for ONE 27B full-attention layer, walked over
-    /// the exact chunk sequence a real prefill issues (`PREFILL_CHUNK` = 512
-    /// tokens at a time), with the KV operands laid out the way the cache hands
+    /// the chunk sequence a real prefill issued when this bench was written
+    /// (512 tokens at a time, which is still the dense checkpoints' chunk —
+    /// `Arch::prefill_chunk_default`; the MoE ones run 2048), with the KV operands laid out the way the cache hands
     /// them to sdpa: a `[1, n_kv, max_ctx, head_dim]` f16 allocation narrowed on
     /// the token axis, so each head carries the full max_ctx stride.
     ///
@@ -1247,7 +1248,8 @@ mod tests {
         const N_KV: usize = 4;
         const HD: usize = 256;
         const MAX_CTX: usize = 8192;
-        /// Production's prefill chunk (generate.rs `PREFILL_CHUNK`).
+        /// The dense 27B's production prefill chunk
+        /// (`Arch::prefill_chunk_default`).
         const CHUNK: usize = 512;
 
         let device = crate::gguf::metal_device().unwrap();

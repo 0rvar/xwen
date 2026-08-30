@@ -458,11 +458,6 @@ fn main() -> Result<()> {
     }
 }
 
-/// Prompt chunk size for the perplexity pass — matches `generate::PREFILL_CHUNK`
-/// so the fused side exercises the same 512-token mm_id prefill kernel the real
-/// generate path uses (and `>= MM_ID_MIN_SEQ`, so the mm_id path is active).
-const PPL_CHUNK: usize = 512;
-
 /// FNV-1a 64-bit over the little-endian token bytes: a stable, dependency-free
 /// digest of the exact scored token stream, so the gate can re-verify alignment
 /// even against a stored reference dump whose full `tokens` array was trimmed.
@@ -527,7 +522,12 @@ fn run_ppl(
     let mut per_chunk_means: Vec<f64> = Vec::new();
     let mut nonfinite: u64 = 0;
     let mut pos = 0usize;
-    for chunk in tokens.chunks(PPL_CHUNK) {
+    // The real prefill chunk (`XwenModel::prefill_chunk`), so the fused side
+    // exercises the mm_id prefill kernel at the shape the generate path runs
+    // (and `>= MM_ID_MIN_SEQ`, so the mm_id path is active); `XWEN_PREFILL_CHUNK`
+    // moves both together.
+    let ppl_chunk = model.prefill_chunk();
+    for chunk in tokens.chunks(ppl_chunk) {
         let input = Tensor::new(chunk, device)?;
         let chunk_logits = model.forward_all_logits(&input, pos)?; // [chunk, vocab]
         let host = chunk_logits
@@ -564,7 +564,7 @@ fn run_ppl(
     anyhow::ensure!(n_scored > 0, "no positions scored (corpus too short?)");
     let mean_nll = -logprobs.iter().sum::<f64>() / n_scored as f64;
 
-    let seq_len = n_tokens.min(PPL_CHUNK); // the prefill chunk length the runner actually saw
+    let seq_len = n_tokens.min(ppl_chunk); // the prefill chunk length the runner actually saw
     let dump = json!({
         "kind": "ppl",
         "model": cli.model.display().to_string(),
