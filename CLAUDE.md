@@ -286,7 +286,11 @@ longer, which settles bandwidth-vs-kernel without a peak). Use AMORTIZED rates
 (BATCH dispatches per sync, outputs held alive), never per-dispatch: a budget
 built from per-dispatch numbers sums to 127% of wall. Keep the duty cycle low —
 the same shape measured 23% slower in a 36 s run than in a 9 s one, with no
-thermal flag anywhere. llama.cpp's prefill thermal-boosts harder than xwen's
+thermal flag anywhere. The machine thermal-throttles under sustained load as a
+matter of course (owner's word, 2026-08-30), so design rounds around it: short runs,
+arms interleaved tightly (A B A B, never all of A then all of B), ~60 s idle between
+rounds, an anchor arm at the start and end of every session with a >3% drift flag, and
+never a test suite or a second model process alongside a bench. llama.cpp's prefill thermal-boosts harder than xwen's
 (-17% vs -5% settling) — never read a first-reps prefill ratio as steady state.
 And on a machine shared with other agents, calibrate every prefill run against
 the classic arm's known baseline before believing absolutes: three separate
