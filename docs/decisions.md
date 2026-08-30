@@ -1486,6 +1486,23 @@ what renders must follow the checkpoint's template, not the API vendor's serving
 policy. A 3.6 request still renders without superseded reasoning, but because the 3.6
 template says so, not because the API layer pre-judged it.
 
+**Prefix reuse is quantized to snapshots, so a conversation resumes almost free and an
+edited prompt does not (2026-08-30, from the first serve benchmark).** `PrefixCache::plan`
+(src/serve/engine.rs:3727) takes the longest common prefix between the incoming prompt and
+what the slot holds. At the cache's own end it extends; anywhere short of it, it must
+rewind, and `rewind_to` (engine.rs:3701) quantizes DOWN to the nearest snapshot — the
+anchor over the leading system block, a turn boundary, a fork point, or the tail a
+page-out took (`plan_snapshot_stops`, engine.rs:2009) — returning `Cold` below the
+shallowest one. The constraint is the state, not the bookkeeping: DeltaNet and PLE state
+is recurrent, restorable only where it was captured, and no snapshot is ever taken inside
+a message. The two consequences are both real and both measured on Flash-Next (log.md
+2026-08-30 "serve on Flash-Next"): growing a conversation by one exchange resumes off the
+turn boundary — 32k tokens took 67.5 s cold and 489 ms for the next turn, 7.6k took
+10.5 s and 348 ms — while rewriting the last user message of a single-message prompt
+lands under every snapshot and reports `cached_tokens: 0` with a full cold prefill.
+Clients that edit prompts in place should expect that, and the fix, if it is ever worth
+its cost, is mid-message snapshots (TODO.md), not a smarter matcher.
+
 ## The prefix cache and the disk tier
 
 Inherited from laguna; correctness now depends on snapshotting (KV cache for the 10–16

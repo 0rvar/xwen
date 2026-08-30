@@ -4,6 +4,73 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-30 (serve on Flash-Next, first benchmark) — serve decodes at parity with `generate` through 32k (42-47 tok/s), a 32k conversation resumes its next turn in 0.5 s, and an edited prompt re-prefills from zero by design
+
+Every Flash-Next figure in CLAUDE.md was `generate`'s, and TODO.md's "a qwen4exp serve
+run has never been benchmarked" said not to quote them as serve figures. This is that
+run: read-only, at f949b1d, nothing in `src/` touched.
+
+**Setup.** `xwen serve --no-tui --port 8099` on its defaults — `--ctx 262144`, 2 cache
+slots, 4 snapshots, disk tier off, no drafter (Flash-Next ships none). OpenAI dialect,
+streaming, `stream_options.include_usage` on for the cached-token counts,
+`chat_template_kwargs {enable_thinking: false}`, `max_tokens 64`. Prompts are the qsa-c
+fixtures plus ~50 tokens of chat template. Load 23.2 s. `pmset -g` printed `powermode 0`
+and no `lowpowermode` key (verbatim; no high-power claim either way). 20 runs, no errors.
+Scripts under the session scratchpad, `serve-bench/`.
+
+Three passes per prompt, in order: **cold** (nothing in the cache), **cached** (byte-
+identical prompt resubmitted), **partial-edit** (the last user message rewritten, the
+prefix ahead of it untouched). Each length ran twice (r2).
+
+| prompt tokens | TTFT cold | TTFT cached | TTFT partial-edit | decode cold / cached / partial | cached_tokens cold / cached / partial |
+| --- | --- | --- | --- | --- | --- |
+| 1984 | 2305 ms | 95 ms | 2451 ms | 45.19 / 46.87 / 43.00 | 0 / 1977 / 0 |
+| 1982 (r2) | 3957 ms | 97 ms | 2813 ms | 45.41 / 46.76 / 43.85 | |
+| 7655 | 12336 ms | 126 ms | 10942 ms | 44.11 / 45.45 / 43.76 | 0 / 7648 / 0 |
+| 7653 (r2) | 11120 ms | 137 ms | 11416 ms | 44.65 / 44.62 / 43.75 | |
+| 32108 | 63949 ms | 233 ms | 64584 ms | 43.47 / 43.53 / 41.92 | 0 / 32101 / 0 |
+| 32107 (r2) | 62933 ms | 215 ms | 64534 ms | 42.92 / 42.09 / 43.14 | |
+
+Derived prefill (the bench script's own approximation: TTFT minus its render/encode
+delta, first decode step included — NOT tokens over TTFT, which gives 861 for the 2k r1
+cold cell and 501 for the 3957 ms r2 outlier): **~800-940 tok/s at 2k, 627-696 at 8k,
+500-511 at 32k** — the same shape `generate` shows, prefill falling with length while
+decode barely moves. Treat the prefill figures as approximate; `generate --stats` is the
+prefill instrument.
+
+**Thermal check.** The 1984-token anchor read 45.14 tok/s at the start and 42.53 right
+after the two 32k prefills — −5.8%, over the 3% flag — and came back to 46.20 after a
+90 s cooldown. That is the duty cycle, not a level shift; the 32k rows below were taken
+under it and are the pessimistic end of their own spread.
+
+**Against `generate`.** Parity at 2k and 7.6k (44-47 either way). At 32k serve reads
+**4-7% lower** — under the 10% bar, so it was not chased and the
+profiler was not run. One plausible contributor, untested: serve's
+`--ctx 262144` logs `state 2.0GB` where `generate` at `max_ctx 8192` logs 0.2 GB, so the
+recurrent-state allocation serve walks per step is 10x the one-shot path's. Ledgered.
+
+**Multi-turn is where serve wins.** The Claude Code pattern — `[user, assistant, user]`,
+the conversation grown by one exchange — resumes off the turn-boundary snapshot: 7650 →
+7744 tokens cost 10467 ms cold and then **348 ms** for the follow-up (cached 7713 of
+7744); 32108 → 32202 cost 67492 ms and then **489 ms** (cached 32171 of 32202). A 32k
+agent conversation takes its next turn in half a second.
+
+**Editing the last user message gets `cached_tokens: 0` and a full cold prefill, and
+that is the design, not a miss.** `PrefixCache::plan` (src/serve/engine.rs:3727) takes
+the longest common prefix with what the slot holds; because the edit is not at the
+cache's end it cannot extend, so it asks `rewind_to` (engine.rs:3701) for a resume
+point, and `rewind_to` quantizes DOWN to the nearest snapshot — the leading system block
+(the anchor), a turn boundary, a fork point, or the tail a page-out took
+(`plan_snapshot_stops`, engine.rs:2009). Below the shallowest of those it returns
+`Cold`. The reason is state, not bookkeeping: DeltaNet and PLE state is recurrent, so it
+is restorable only at positions where it was captured, and no snapshot sits inside a
+message. Editing the last message of a single-message prompt therefore lands under every
+snapshot and replays from zero. Mid-message snapshots would fix it and cost ~30 KiB of
+image per token retained; ledgered, not taken.
+
+**Footprint** at rest after the 32k runs: 16 GB phys, 21 GB peak, 43 GB of clean mapped
+weights.
+
 ## 2026-08-30 (QSA decode, step C) — block selection moved onto the device: Flash-Next decode above the 2048 budget 33 → 44-45 tok/s at 3.8k-32k, the cliff closed
 
 Steps A+B (below) left one named cost: each of the 12 QSA layers read its block scores

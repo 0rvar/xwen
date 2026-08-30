@@ -2407,7 +2407,7 @@ Snapshots, page-out, rewind and the disk tier learned the qwen4exp recurrent sta
   server: load, converse, page out to disk, evict, page back in, continue. Cheap to run
   once (one conversation, `idle_unload` short, the disk tier on) and the thing most
   likely to find a shape mismatch the unit fixtures do not reach.
-- [ ] **A qwen4exp serve run has never been benchmarked.** Every perf number for this
+- [x] **A qwen4exp serve run has never been benchmarked.** Every perf number for this
   checkpoint in CLAUDE.md and the port doc comes from `generate` — prefill ~796 tok/s,
   decode ~45, both measured on the one-shot path. Serve adds the queue, the prefix
   cache, page-out and per-request template rendering, and on a 111 GB resident trunk the
@@ -2415,6 +2415,22 @@ Snapshots, page-out, rewind and the disk tier learned the qwen4exp recurrent sta
   the QSA planes on top of the K/V ones, and `snapshot_bytes` is now what sizes it. Do
   not quote the one-shot figures as serve figures until a serve run has been measured
   under the usual protocol (interleaved rounds, medians, power mode stated).
+
+  **DONE 2026-08-30 — the run happened; the figures are in log.md ("serve on
+  Flash-Next, first benchmark") and the rule it uncovered is in decisions.md
+  "Serving".** Read-only bench at f949b1d, `xwen serve --no-tui` on defaults
+  (`--ctx 262144`, 2 slots, 4 snapshots, disk tier off, no drafter), OpenAI dialect
+  streaming with `include_usage`, thinking off, `max_tokens 64`, the qsa-c fixtures as
+  prompts, `pmset -g` printing `powermode 0` with no `lowpowermode` key. Serve decode is
+  at parity with `generate`: **45.2-46.9 tok/s at 2k, 44.1-45.5 at 7.6k, 42.1-43.5 at
+  32k**, TTFT-derived prefill ~800-940 / 627-696 / 500-511 at the same lengths. Cached
+  resubmits return in 95-233 ms and a grown conversation takes its next turn in 348 ms
+  at 7.6k / 489 ms at 32k. Footprint at rest after the 32k runs: 16 GB phys, 21 GB peak,
+  43 GB clean mapped weights; load 23.2 s; 20 runs, no errors. Two things the run left
+  behind are new items in the 2026-08-30 serve-benchmark section at the end of this
+  file: serve's 4-7% deficit at 32k, and mid-message snapshots. Page-out cost was NOT
+  measured here — the disk tier was off and no slot swap was forced — so that half of
+  this item's question is still open and lives on in the ~113 MiB floor item above.
 
 ## Deferred from the DeltaNet decode-scan pass (2026-08-30)
 
@@ -2533,3 +2549,33 @@ A/B named four things it did not take.
   - The fused gather is Metal-only; a non-Metal source (the CPU/oracle attention
     path) takes the `index_select` chain with no switch. The kernel refuses a view
     whose start or head stride is not a multiple of 4 elements (vec4 loads).
+
+## Deferred from the first Flash-Next serve benchmark (2026-08-30)
+
+Read-only bench at f949b1d; numbers and protocol in log.md ("serve on Flash-Next, first
+benchmark"), the prefix-reuse rule it uncovered in decisions.md "Serving". Nothing was
+changed, so everything here is a follow-up rather than a leftover.
+- [ ] **serve at 32k decodes 4-7% under `generate` and the cause is unconfirmed — run a
+  `--ctx 8192` / `--ctx 65536` serve arm to test the state-allocation hypothesis.** At
+  2k and 7.6k the two paths are at parity; only 32k separates them, and the difference
+  is under the 10% bar so the profiler was never run. The one visible asymmetry: serve
+  on its `--ctx 262144` default logs `state 2.0GB` where `generate` at `max_ctx 8192`
+  logs 0.2 GB, so serve walks a 10x larger recurrent-state allocation every step even
+  though the live context is the same length. If that is the cause, serving the same 32k
+  prompt under `--ctx 65536` and `--ctx 8192` should close the gap monotonically; if the
+  gap holds at every ctx, it is the queue or the per-step serve overhead instead and the
+  hypothesis is refuted cheaply. Cost is three arms of one prompt, so run this before
+  anything more elaborate. Note the 32k rows were taken while the anchor had drifted
+  −5.8% thermally, so re-anchor between arms.
+- [ ] **Mid-message snapshots would let an edited prompt resume; ledger only.** Today
+  `rewind_to` can only stop at the anchor, a turn boundary, a fork point or a page-out
+  tail, so rewriting the last user message of a single-message prompt falls under every
+  snapshot and re-prefills from zero (`cached_tokens: 0` at all three lengths measured).
+  Periodic snapshots INSIDE a long message — every N thousand tokens — would give the
+  edit somewhere to land, and the recurrent state makes it a snapshot problem rather
+  than a matching problem: there is nothing to restore at a position nobody captured.
+  The price is what makes this a ledger item and not a task: a Flash-Next image is
+  ~30 KiB/token plus the ~113 MiB DeltaNet floor per snapshot, so periodic stops inside
+  a 32k message cost hundreds of MB of host RAM to save prefill for a client that edits
+  prompts in place — a workload nobody here has. Revisit if one shows up; the knob would
+  be an interval, defaulted off.

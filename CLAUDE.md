@@ -241,7 +241,7 @@ do not difference them against a drafted number from another session — the 27B
 between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 reads
 36.5-37.6 in today's own 0.3 arm.
 Qwen3.8-Flash-Next (EXPERIMENTAL; every surface since P4, but these numbers are
-`generate`'s — serve has never been benchmarked on it, TODO.md), 2026-08-29 after the
+`generate`'s — serve matches them as of 2026-08-30, §serve), 2026-08-29 after the
 P3 kernel pass for prefill and 2026-08-30 at the ba fold (0261e17) for decode,
 plain because no drafter exists for it: **prefill ~796 tok/s @530, decode 46.5-46.7
 (44.4-44.5 before the ba fold, 43.1 before the PLE row prefetch)** — 530-token prompt
@@ -371,7 +371,10 @@ The serve/ tree runs as forked. Its zero-flag default is `Model::default_servabl
 which since P4 (2026-08-30) is just `Model::default()` — Flash-Next serves like any
 other checkpoint, snapshots/rewind/page-out/disk tier all carrying its QSA indexer rows
 and PLE state (decisions.md "Qwen3.8-Flash-Next"), and no surface falls back to
-anything. Still not adapted:
+anything. Benchmarked on Flash-Next 2026-08-30 (log.md): decode at parity with
+`generate` (42-47 tok/s through 32k), a 32k conversation resumes its next turn in
+~0.5 s, and an edited prompt re-prefills from zero because prefix reuse quantizes to
+snapshots (decisions.md "Serving"). Still not adapted:
 ChatML/tool-call parsing in the dialect layers (Qwen's `<function=...>` XML-ish call
 format, string-args-raw rule). Thinking
 semantics ARE adapted as of 2026-08-19: open-`<think>` seeding, per-dialect
