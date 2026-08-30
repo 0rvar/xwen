@@ -617,6 +617,28 @@ prompt cannot separate them). Hence a per-architecture default rather than one n
 2048 where there are experts, 512 where there are none, 1024 the MoE fallback if the
 +2 GB ever matters (2026-08-30).
 
+**mm_id tiles: the pass-2 grid is a work list, and the token tile is 64 wide when
+experts average ≥ 24 rows.** The vendored two-pass `mm_id` launched pass 2 on ggml's
+`(t/32, n_out/64, n_expert)` grid — sized for one expert owning every row — so at the
+2048 chunk ~97% of threadgroups early-returned; and its `_t` kernel is dequant-bound
+with the expert tile dequantized once per token tile, so passes per expert are
+ceil(rows/NR1) and the ledgered NARROWER tile (16) would have raised the dominant cost
+(Flash-Next 1.88 → 2.97 passes; 35B 2.5 → 4.5). Hence the opposite: map0 emits a flat
+(expert, tile) work list bounded at ceil(t*top_k/NR1) + n_expert with no readback, pass
+2 walks it, and the `_t` family is templated on NR1 with 64 chosen by
+`t*top_k/n_expert ≥ 24` (Flash-Next 40, 35B 64 at the 2048 chunk). Both are bit-neutral
+by measurement (`work_list_and_nr1_64_match_full_grid_nr1_32_bitwise`; the 32/64
+identity is test-pinned, not structural — different `matmul2d` instantiations). Measured
+2026-08-30: isolated, the expert gemms run +17-23% (FN gate/up 416k → 512k tok/s, FN
+down q5_1 202k → 236k, 35B gate/up 628k → 751k, 35B down 260k → 281k); end-to-end at
+3803 tokens NOTHING claimable (Flash-Next arms inside one arm's round-to-round spread;
+35B +1.9% in one round), the profiler ranking showing why — `ffn` fell only 3-5%
+because the gemms are a minority of that stage next to the router, rescale chain,
+SwiGLU, combine and shared expert. Shipped anyway as the correct shape of the kernel
+(less idle launch, fewer dequant passes, no accuracy trade), with `XWEN_MM_ID_FULL_GRID`
+and `XWEN_MM_ID_NR1` as kill switch and A/B knob, and the finding re-ranks the prefill
+ledger toward the non-gemm parts of `ffn` (2026-08-30).
+
 ## Refuted perf directions — do not reopen without new evidence
 
 Laguna's refuted list (death-by-dispatch, encoder takeover, all-f16 activation chains,

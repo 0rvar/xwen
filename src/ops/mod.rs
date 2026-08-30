@@ -773,13 +773,30 @@ impl MmVariant {
         }
     }
 
-    /// Threadgroup tile bytes: the f32-tile variants (`_hp`, `_t_hp`) need 12288,
-    /// the half-tile variants 8192 (sa+sb+float store-back tile).
-    pub(crate) fn tile_smem(self) -> usize {
-        match self {
-            MmVariant::ClassicHp | MmVariant::TensorHp => 12288,
-            MmVariant::Tensor | MmVariant::ClassicF16 => 8192,
+    /// Kernel host-name suffix for a given pass-2 token-tile width: the tensor
+    /// family is instantiated at 32 (`_t`) and 64 (`_t64`); every other family
+    /// only at 32.
+    pub(crate) fn suffix_nr1(self, nr1: usize) -> anyhow::Result<&'static str> {
+        match (self, nr1) {
+            (MmVariant::Tensor, 64) => Ok("_t64"),
+            (_, 32) => Ok(self.suffix()),
+            (v, n) => anyhow::bail!("mm_id variant {} has no NR1={n} kernel", v.name()),
         }
+    }
+
+    /// Threadgroup tile bytes at token-tile width `nr1`:
+    /// `max(sa + sb, NR0*nr1*4)` with sa = 64*32*sizeof(S0), sb = nr1*32*sizeof(S1)
+    /// and the float store-back tile aliasing the front. The f32-tile variants
+    /// (`_hp`, `_t_hp`) need 12288 at 32, the half-tile variants 8192; the
+    /// half-tile tensor kernel at 64 needs 16384 (the store-back tile dominates).
+    pub(crate) fn tile_smem(self, nr1: usize) -> usize {
+        let elem = match self {
+            MmVariant::ClassicHp | MmVariant::TensorHp => 4,
+            MmVariant::Tensor | MmVariant::ClassicF16 => 2,
+        };
+        let sa = 64 * 32 * elem;
+        let sb = nr1 * 32 * elem;
+        (sa + sb).max(64 * nr1 * 4)
     }
 
     /// Whether this variant casts the down-projection activation to f16 (so the

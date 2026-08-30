@@ -217,6 +217,9 @@ typedef struct {
     int32_t  ne21;  // n_tokens
     int32_t  ne20;  // n_expert_used
     uint64_t nb21;
+    // xwen extension (not in ggml): the pass-2 token-tile width the work list
+    // is built for (32 or 64). Appended after the verbatim ggml fields.
+    int32_t  nr1;
 } ggml_metal_kargs_mul_mm_id_map0;
 
 typedef struct {
@@ -236,13 +239,64 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    // xwen extension (not in ggml): 1 = the grid is the flat work list map0
+    // built (grid.x indexes (expert, tile) pairs in `hwork`), 0 = the full
+    // ggml grid (grid.x = token tile, grid.z = expert). Fills the trailing pad
+    // of the verbatim struct, so the layout stays 96 bytes.
+    int32_t  work_list;
 } ggml_metal_kargs_mul_mm_id;
+
+// Work-list entry: expert in the low 16 bits, token-tile index in the high 16.
+#define MM_ID_WORK_PACK(e, t)   ((uint32_t)(e) | ((uint32_t)(t) << 16))
+#define MM_ID_WORK_EXPERT(w)    ((w) & 0xFFFF)
+#define MM_ID_WORK_TILE(w)      ((w) >> 16)
+
+// Resolve a pass-2 threadgroup to (expert, first token row). In work-list mode
+// `hwork` holds [count, pair0, pair1, ...] and grid.x walks the pairs; the host
+// launches the readback-free bound ceil(t*top_k/NR1) + n_expert, so up to
+// ~n_expert threadgroups past `count` early-return here (the full grid launches
+// one column of tiles per expert sized for the WHOLE token count, and ~97% of
+// those return on `r1 >= tpe[e]`). Returns false when the threadgroup has no
+// work.
+//
+// The two grids are not equivalent for a token routed to the same expert in
+// two slots (outside the routing contract): map0 records only the first slot,
+// so the full grid leaves the second slot's dst rows stale while the work list
+// likewise computes only the recorded row. Neither arm is defined there; under
+// the contract (distinct experts per token) they compute the same bits.
+static inline bool mm_id_resolve_tile(
+        constant ggml_metal_kargs_mul_mm_id & args,
+        device const char * hwork,
+        uint3 tgpig,
+        int NR1,
+        thread int & im,
+        thread int & r1) {
+    if (args.work_list) {
+        device const uint32_t * work = (device const uint32_t *) hwork;
+        if (tgpig.x >= work[0]) {
+            return false;
+        }
+        const uint32_t w = work[1 + tgpig.x];
+        im = MM_ID_WORK_EXPERT(w);
+        r1 = MM_ID_WORK_TILE(w) * NR1;
+    } else {
+        im = tgpig.z;
+        r1 = tgpig.x * NR1;
+    }
+    return true;
+}
 
 // ---- Pass 1: build per-expert token-slot lists ------------------------------
 // One thread per expert. For expert `ide`, walk all tokens; whenever a token
 // selected `ide` in some slot, append the flattened id `token*ne20 + slot` to
 // that expert's region of `hids` (each region is ne21 int32 wide). `htpe[ide]`
 // receives the number of token-slots routed to `ide`.
+//
+// xwen extension: the threadgroup then exclusive-scans ceil(count/nr1) over the
+// experts and writes the flat pass-2 work list to `hwork`: `hwork[0]` = total
+// tile count, `hwork[1..]` = packed (expert, tile) pairs in expert order. The
+// host bounds the list at ceil(n_tokens*ne20/nr1) + n_expert entries (rows sum
+// to n_tokens*ne20 and each expert has at most one partial tile).
 
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
@@ -250,10 +304,18 @@ kernel void kernel_mul_mm_id_map0(
         device  const char * src2,
         device        char * htpe,
         device        char * hids,
+        device        char * hwork,
         threadgroup   char * shmem [[threadgroup(0)]],
         ushort tpitg[[thread_position_in_threadgroup]],
-        ushort   ntg[[threads_per_threadgroup]]) {
+        ushort   ntg[[threads_per_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     const short ide = tpitg; // expert id
+    // The host rounds the threadgroup up to a multiple of 32 so every simdgroup
+    // is full (the simd_* scan below is only defined for full simdgroups).
+    // Phantom threads past the expert count join every barrier and simd op
+    // with a zero contribution, and never write tpe / ids / work entries.
+    const bool live = ide < args.ne02;
 
     uint32_t n_all = 0;
 
@@ -286,7 +348,9 @@ kernel void kernel_mul_mm_id_map0(
                 sel += (sids[i20] == ide)*(i20 + 1);
             }
 
-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
+            if (live) {
+                ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
+            }
 
             n_all += sel > 0;
         }
@@ -295,7 +359,42 @@ kernel void kernel_mul_mm_id_map0(
     }
 
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
-    tpe_u32[ide] = n_all;
+    if (live) {
+        tpe_u32[ide] = n_all;
+    }
+
+    // Work list: exclusive scan of each expert's tile count (phantom threads
+    // hold n_all == 0, so they add nothing). The per-token shmem scratch is free
+    // after the loop's trailing barrier; reuse it for the per-simdgroup totals
+    // (the host sizes shmem for at least 32 of them).
+    const uint32_t nr1 = args.nr1;
+    const uint32_t my_tiles = (n_all + nr1 - 1) / nr1;
+    const uint32_t in_sg = simd_prefix_exclusive_sum(my_tiles);
+    const uint32_t sg_total = simd_sum(my_tiles);
+
+    threadgroup uint32_t * sg_totals = (threadgroup uint32_t *) shmem;
+    if (tiisg == 0) {
+        sg_totals[sgitg] = sg_total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ushort n_sg = (ntg + 31) / 32;
+    uint32_t base = 0;
+    uint32_t total = 0;
+    for (ushort s = 0; s < n_sg; s++) {
+        const uint32_t v = sg_totals[s];
+        base  += (s < sgitg) ? v : 0;
+        total += v;
+    }
+    base += in_sg;
+
+    device uint32_t * work = (device uint32_t *) hwork;
+    for (uint32_t i = 0; i < my_tiles; i++) {
+        work[1 + base + i] = MM_ID_WORK_PACK(ide, i);
+    }
+    if (tpitg == 0) {
+        work[0] = total;
+    }
 }
 
 typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;
@@ -309,7 +408,8 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_8" )]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<10>;
 
 // ---- Pass 2: token-grouped quantized matmul --------------------------------
-// grid = ((n_tokens+31)/32, (ne01+63)/64, n_expert); 128 threads/tg. Each
+// grid = ((n_tokens+31)/32, (ne01+63)/64, n_expert) in full-grid mode, or
+// (tiles_max, (ne01+63)/64, 1) over map0's work list; 128 threads/tg. Each
 // threadgroup handles a 64(row) x 32(col) tile for one expert, reading its
 // token-slot list from `hids`; column-blocks past the expert's count early-out.
 
@@ -321,6 +421,7 @@ kernel void kernel_mul_mm_id(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const char * hwork,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -340,9 +441,12 @@ kernel void kernel_mul_mm_id(
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
+    int im; // expert
+    int r1; // first token row of this tile
+    if (!mm_id_resolve_tile(args, hwork, tgpig, NR1, im, r1)) {
+        return;
+    }
     const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
@@ -531,7 +635,13 @@ template [[host_name("kernel_mul_mm_id_q6_K_f32_hp")]] kernel mul_mm_id kernel_m
 // Ported from ggml-metal.metal:10360-10614 (the GGML_METAL_HAS_TENSOR branch),
 // resolved unconditionally. S0=S1=half, matching the fork's only tensor
 // instantiations. sc aliases the sa region for the cooperative store.
-template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+// NR1 (token rows per tile, 32 or 64) is a template parameter of THIS variant
+// only: the expert weight tile is dequantized once per token tile, so at 64 an
+// expert with ~40-64 routed rows costs one dequant pass instead of two. The
+// activation stage covers the rows in NR1/32 sweeps of 32 (one per 128-thread
+// pass); sa/sb offsets do not depend on NR1, the store-back float tile is
+// NR0*NR1*4 bytes.
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, int NR1>
 kernel void kernel_mul_mm_id_t(
         constant ggml_metal_kargs_mul_mm_id & args,
         device const char * src0,
@@ -539,6 +649,7 @@ kernel void kernel_mul_mm_id_t(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const char * hwork,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -549,15 +660,19 @@ kernel void kernel_mul_mm_id_t(
     threadgroup float * sc = (threadgroup float *)(shmem);
 
     constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
+    static_assert(NR1 == 32 || NR1 == 64, "NR1 must be 32 or 64");
+    constexpr int NSWEEP = NR1/32; // activation-stage sweeps per k-step
 
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
+    int im; // expert
+    int r1; // first token row of this tile
+    if (!mm_id_resolve_tile(args, hwork, tgpig, NR1, im, r1)) {
+        return;
+    }
     const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
@@ -572,16 +687,11 @@ kernel void kernel_mul_mm_id_t(
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
 
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
-    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
 
     const short il0 = (tiitg % NL0);
 
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
-
-    const short i11 = (id % args.ne20) % args.ne11;
-    const short i12 = (id / args.ne20);
     const short i13 = 0;
 
     const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
@@ -591,20 +701,37 @@ kernel void kernel_mul_mm_id_t(
 
     const short iy = 8*(tiitg % NL1);
 
-    device const T1 * y = (device const T1 *)(src1
-        + args.nb13*i13
-        + args.nb12*i12
-        + args.nb11*i11
-        + args.nb10*iy);
+    // One activation row pointer per sweep: sweep w covers tile rows
+    // w*32 .. w*32+31, each thread owning row w*32 + tiitg/NL1 (clamped into
+    // the tile's live rows, as lr1 is in the classic kernel).
+    device const T1 * y[NSWEEP];
+    FOR_UNROLL (short w = 0; w < NSWEEP; w++) {
+        const short row = w*32 + (short)tiitg/NL1;
+        const short lr1 = row < nr1 ? row : nr1 - 1;
+
+        const int id = ids_i32[im*args.ne21 + r1 + lr1];
+
+        const short i11 = (id % args.ne20) % args.ne11;
+        const short i12 = (id / args.ne20);
+
+        y[w] = (device const T1 *)(src1
+            + args.nb13*i13
+            + args.nb12*i12
+            + args.nb11*i11
+            + args.nb10*iy);
+    }
 
     auto tA = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK,  NR0));
-    auto tB = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NR1, NK ));
+    // Extents are innermost-first (NK contiguous, then NR1 rows), matching sa
+    // (NK, NR0) and the sb store above. The fork wrote (NR1, NK), which is the
+    // same shape only while NR1 == NK == 32; at 64 it would read sb transposed.
+    auto tB = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NK,  NR1));
 
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(NR1, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         // dequantize + store to threadgroup memory, row-major (NK-strided).
@@ -625,19 +752,19 @@ kernel void kernel_mul_mm_id_t(
             }
         }
 
-        {
+        FOR_UNROLL (short w = 0; w < NSWEEP; w++) {
             const short sx = (tiitg%NL1);
-            const short sy = (tiitg/NL1)/8;
+            const short sy = (tiitg/NL1)/8 + 4*w;
 
             const short ly = (tiitg/NL1)%8;
 
-            *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y));
+            *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y[w]));
+
+            y[w] += NK;
         }
 
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
-
-        y += NK;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -678,16 +805,25 @@ kernel void kernel_mul_mm_id_t(
     }
 }
 
-typedef decltype(kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>) mul_mm_id_t;
+typedef decltype(kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4, 32>) mul_mm_id_t;
 
 // Tensor-ops variant (`_t`): the fork's cooperative-tensor prefill path. f16
 // operand tiles only (matmul2d's fork instantiation). Fork-exact numerics, so
 // judged under the mm parity tier.
-template [[host_name("kernel_mul_mm_id_q8_0_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q5_1_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_1, 2,     dequantize_q5_1, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q4_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q5_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_id_q6_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q8_0_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4, 32>;
+template [[host_name("kernel_mul_mm_id_q5_1_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_1, 2,     dequantize_q5_1, float, float4x4, float, float2x4, 32>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, 32>;
+template [[host_name("kernel_mul_mm_id_q5_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4, 32>;
+template [[host_name("kernel_mul_mm_id_q6_K_f32_t")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4, 32>;
+
+// 64-row token tiles (`_t64`): same kernel, NR1=64. Half the expert-weight
+// dequant passes when experts average >= ~24 routed rows per chunk (the host
+// picks the width per dispatch, `XWEN_MM_ID_NR1` forces it). 16384 B smem.
+template [[host_name("kernel_mul_mm_id_q8_0_f32_t64")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2,     dequantize_q8_0, float, float4x4, float, float2x4, 64>;
+template [[host_name("kernel_mul_mm_id_q5_1_f32_t64")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_1, 2,     dequantize_q5_1, float, float4x4, float, float2x4, 64>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_t64")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4, 64>;
+template [[host_name("kernel_mul_mm_id_q5_K_f32_t64")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K, QK_NL, dequantize_q5_K, float, float4x4, float, float2x4, 64>;
+template [[host_name("kernel_mul_mm_id_q6_K_f32_t64")]] kernel mul_mm_id_t kernel_mul_mm_id_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float, float2x4, 64>;
 
 // The float-operand tensor-tile variant (`_t_hp`) is instantiated in the
 // SEPARATE source src/ops/mm_id_t_hp.metal, which pipelines.rs concatenates onto

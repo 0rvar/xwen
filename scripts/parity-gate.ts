@@ -218,7 +218,10 @@ function die(msg: string): never {
  * A clean environment for a model run: strips every kernel-selection toggle (all
  * PRESENCE-BASED — a stray XWEN_MM_ID_F16=0 in the shell would still flip the
  * kernel) so each dump runs the path this script intends, and the parity env
- * vars (the gate sets those explicitly). Per-run additions layer on top.
+ * vars (the gate sets those explicitly). Per-run additions layer on top. The
+ * XWEN_MM_ID prefix match also covers the pass-2 launch-shape switches
+ * (XWEN_MM_ID_FULL_GRID, XWEN_MM_ID_NR1), so a gate run always grades the
+ * shipped work-list grid at the production tile width.
  *
  * A toggle missing from this list is not a loud failure: it would apply to BOTH
  * sides and the gate would pass while grading a kernel nobody asked for. Add new

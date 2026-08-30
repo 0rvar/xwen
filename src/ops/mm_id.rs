@@ -25,7 +25,7 @@ pub fn mul_mm_id(stack: &ExpertStack, x: &Tensor, ids: &Tensor) -> Result<Tensor
 /// The returned `Map0Scratch` carries the geometry it was laid out for, so a
 /// consumer projection is validated against the producer before it reads the map.
 pub(crate) fn prepare_map0(n_expert: usize, ids: &Tensor) -> Result<Map0Scratch> {
-    dispatch::prepare_mm_id_map0(n_expert, ids)
+    dispatch::prepare_mm_id_map0(n_expert, ids, crate::ops::mm_id_variant())
 }
 
 /// One mm_id projection against a `prepare_map0` scratch, skipping the map0 pass.
@@ -266,6 +266,287 @@ mod tests {
         }
     }
 
+    /// Amortized throughput of the tensor variant at production geometries under
+    /// the three pass-2 launch shapes: the full ggml grid at NR1 32 (the shape
+    /// before the work list), the work-list grid at 32, and the work-list grid at
+    /// 64. 40 dispatches per sync with the outputs held alive (~7.8 GiB at the
+    /// widest geometry), so it is `#[ignore]`d out of the default suite; run it
+    /// with `cargo test --release mm_id_launch_shape_throughput -- --ignored
+    /// --nocapture`. q4_K everywhere except the FN down, which is q5_1 in the
+    /// shipped file (its k of 640 is not a K-quant super-block multiple).
+    #[test]
+    #[ignore]
+    fn mm_id_launch_shape_throughput() {
+        use crate::ops::MmVariant;
+        use crate::ops::dispatch::MmTuning;
+        use std::time::Instant;
+
+        let device = metal_device().unwrap();
+        struct Geom {
+            name: &'static str,
+            dt: GgmlDType,
+            n_expert: usize,
+            n_out: usize,
+            k: usize,
+            t: usize,
+            top_k: usize,
+            x_per_row: usize,
+        }
+        let geoms = [
+            Geom {
+                name: "FN gate/up q4_K",
+                dt: GgmlDType::Q4K,
+                n_expert: 512,
+                n_out: 640,
+                k: 2560,
+                t: 2048,
+                top_k: 10,
+                x_per_row: 1,
+            },
+            Geom {
+                name: "FN down q5_1",
+                dt: GgmlDType::Q5_1,
+                n_expert: 512,
+                n_out: 2560,
+                k: 640,
+                t: 2048,
+                top_k: 10,
+                x_per_row: 10,
+            },
+            Geom {
+                name: "35B gate/up q4_K",
+                dt: GgmlDType::Q4K,
+                n_expert: 256,
+                n_out: 512,
+                k: 2048,
+                t: 2048,
+                top_k: 8,
+                x_per_row: 1,
+            },
+            Geom {
+                name: "35B down q4_K",
+                dt: GgmlDType::Q4K,
+                n_expert: 256,
+                n_out: 2048,
+                k: 512,
+                t: 2048,
+                top_k: 8,
+                x_per_row: 8,
+            },
+        ];
+        let arms = [
+            (
+                "full-grid NR1 32",
+                MmTuning {
+                    nr1: Some(32),
+                    full_grid: Some(true),
+                },
+            ),
+            (
+                "work-list NR1 32",
+                MmTuning {
+                    nr1: Some(32),
+                    full_grid: Some(false),
+                },
+            ),
+            (
+                "work-list NR1 64",
+                MmTuning {
+                    nr1: Some(64),
+                    full_grid: Some(false),
+                },
+            ),
+        ];
+        for g in &geoms {
+            let (stack, _) = build_stack(&device, g.dt, g.n_expert, g.n_out, g.k, 0x81).unwrap();
+            let ids = distinct_ids(g.t, g.top_k, g.n_expert, 0x82);
+            let ids_t = Tensor::from_vec(ids, (g.t, g.top_k), &device).unwrap();
+            let x_vec = pseudo_random(g.t * g.x_per_row * g.k, 0x83, -1.0, 1.0);
+            let x = Tensor::from_vec(x_vec, (g.t, g.x_per_row, g.k), &device).unwrap();
+            let mut line = format!(
+                "{} (E={} n_out={} k={} t={} top_k={}):",
+                g.name, g.n_expert, g.n_out, g.k, g.t, g.top_k
+            );
+            for (arm, tuning) in &arms {
+                let run_arm = || {
+                    dispatch::run_mm_tuned(&stack, &x, &ids_t, MmVariant::Tensor, *tuning).unwrap()
+                };
+                for _ in 0..4 {
+                    let _ = run_arm();
+                }
+                device.synchronize().unwrap();
+                let iters = 40usize;
+                let mut keep = Vec::with_capacity(iters);
+                let start = Instant::now();
+                for _ in 0..iters {
+                    keep.push(run_arm());
+                }
+                device.synchronize().unwrap();
+                let tps = (g.t * iters) as f64 / start.elapsed().as_secs_f64();
+                drop(keep);
+                line.push_str(&format!("  {arm} {tps:.0} tok/s"));
+            }
+            eprintln!("{line}");
+        }
+    }
+
+    /// Hand-built routing over 68 experts (three simdgroups of map0 threads: two
+    /// full, one ragged — the work-list scan crosses simdgroups and pads the
+    /// last) where expert row counts hit every partial-tile case at both widths:
+    /// expert 2 has 65 rows (three tiles at 32 / two at 64, both with a one-row
+    /// tail), expert 1 has 33 (two tiles at 32, one partial at 64), expert 0 has
+    /// 1, expert 3 has 33, and the remaining 64 experts have 2 rows each (one
+    /// partial tile at either width). top_k 2 with distinct experts per token:
+    /// the tail tokens walk experts 4..68 forwards in slot 0 and backwards in
+    /// slot 1, and the two orders never meet on one token. t=130 makes the mean rows per
+    /// expert 260/68 = 3.8, so the auto rule picks 32 here; the production-mean
+    /// arm of the bitwise test covers the auto-64 selection.
+    fn partial_tile_ids() -> (usize, usize, usize, Vec<u32>) {
+        let (n_expert, t, top_k) = (68usize, 130usize, 2usize);
+        let mut ids = Vec::with_capacity(t * top_k);
+        for i in 0..t {
+            // slot 0: 65 rows of expert 2, 1 of expert 0, then experts 4..68 once each.
+            let slot0 = if i < 65 {
+                2
+            } else if i == 65 {
+                0
+            } else {
+                4 + (i - 66) as u32
+            };
+            // slot 1: 33 rows of expert 1, 33 of expert 3, then experts 4..68 in
+            // reverse.
+            let slot1 = if i < 33 {
+                1
+            } else if i < 66 {
+                3
+            } else {
+                4 + (129 - i) as u32
+            };
+            ids.push(slot0);
+            ids.push(slot1);
+        }
+        assert_eq!(4 + (t - 66), n_expert);
+        (n_expert, t, top_k, ids)
+    }
+
+    /// The pass-2 launch shape must not change the bits: the work-list grid
+    /// against the full grid at NR1 32, and NR1 64 against NR1 32, on the FN
+    /// gate/up (q4_K, n_out 640, k 2560, shared activation row) and down (q5_1,
+    /// n_out 2560, k 640, per-slot rows) geometries with expert row counts {1, 33, 65, 33}.
+    /// The 32 and 64 kernels are different matmul2d instantiations, so their
+    /// identity is MEASURED and pinned here, not structural (the reduction order
+    /// is the toolchain's); a mismatch is reported with its max rel diff rather
+    /// than tolerated. Two routings: the hand-built partial-tile one, and a
+    /// production-mean one (64 experts, t 256, top_k 8: 32 rows per expert, so
+    /// the AUTO rule selects 64 — that arm passes no width and checks the
+    /// selection itself, not only the forced widths).
+    #[test]
+    fn work_list_and_nr1_64_match_full_grid_nr1_32_bitwise() {
+        use crate::ops::MmVariant;
+        use crate::ops::dispatch::MmTuning;
+
+        let device = metal_device().unwrap();
+        let partial = partial_tile_ids();
+        let prod = {
+            let (n_expert, t, top_k) = (64usize, 256usize, 8usize);
+            assert!(
+                t * top_k >= 24 * n_expert,
+                "the auto rule must pick 64 here"
+            );
+            (n_expert, t, top_k, distinct_ids(t, top_k, n_expert, 0xA3))
+        };
+
+        for (routing, (n_expert, t, top_k, ids)) in
+            [("partial-tile", partial), ("production-mean", prod)]
+        {
+            let ids_t = Tensor::from_vec(ids.clone(), (t, top_k), &device).unwrap();
+
+            for (geom0, dt, n_out, k, x_per_row) in [
+                ("gate/up q4_K", GgmlDType::Q4K, 640usize, 2560usize, 1usize),
+                ("down q5_1", GgmlDType::Q5_1, 2560, 640, top_k),
+            ] {
+                let geom = format!("{routing} {geom0}");
+                let (stack, deq) = build_stack(&device, dt, n_expert, n_out, k, 0xA1).unwrap();
+                let x_vec = pseudo_random(t * x_per_row * k, 0xA2, -1.0, 1.0);
+                let x = Tensor::from_vec(x_vec.clone(), (t, x_per_row, k), &device).unwrap();
+                let want = oracle(&deq, &x_vec, &ids, n_out, k, t, top_k, x_per_row);
+
+                let run_arm = |tuning: MmTuning| -> Vec<f32> {
+                    dispatch::run_mm_tuned(&stack, &x, &ids_t, MmVariant::Tensor, tuning)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                };
+                let base = run_arm(MmTuning {
+                    nr1: Some(32),
+                    full_grid: Some(true),
+                });
+                let rel_base = rel_l2(&base, &want);
+                assert!(
+                    rel_base < 1e-3,
+                    "{geom} full-grid NR1 32 rel_l2 {rel_base} vs oracle"
+                );
+
+                for (arm, tuning) in [
+                    (
+                        "work-list NR1 32",
+                        MmTuning {
+                            nr1: Some(32),
+                            full_grid: Some(false),
+                        },
+                    ),
+                    (
+                        "work-list NR1 64",
+                        MmTuning {
+                            nr1: Some(64),
+                            full_grid: Some(false),
+                        },
+                    ),
+                    (
+                        "full-grid NR1 64",
+                        MmTuning {
+                            nr1: Some(64),
+                            full_grid: Some(true),
+                        },
+                    ),
+                    // No width given: the production rule decides (64 on the
+                    // production-mean routing, 32 on the partial-tile one).
+                    (
+                        "work-list auto",
+                        MmTuning {
+                            nr1: None,
+                            full_grid: Some(false),
+                        },
+                    ),
+                ] {
+                    let got = run_arm(tuning);
+                    assert_eq!(got.len(), base.len());
+                    let rel_oracle = rel_l2(&got, &want);
+                    assert!(
+                        rel_oracle < 1e-3,
+                        "{geom} {arm} rel_l2 {rel_oracle} vs oracle"
+                    );
+                    let mismatches = got
+                        .iter()
+                        .zip(&base)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    assert_eq!(
+                        mismatches,
+                        0,
+                        "{geom}: {arm} differs from full-grid NR1 32 in {mismatches} of {} values; \
+                     rel_l2 between arms {:.3e}, max_abs {:.3e} (both vs oracle: {rel_oracle:.3e} / {rel_base:.3e})",
+                        base.len(),
+                        rel_l2(&got, &base),
+                        max_abs(&got, &base)
+                    );
+                }
+            }
+        }
+    }
+
     /// The variant-aware support matrix (`dispatch::mm_kernel_instantiated`,
     /// consumed by `supported`) must exactly track the kernels actually
     /// instantiated in mm_id.metal: for every (variant, dtype) it claims
@@ -374,18 +655,27 @@ mod tests {
         for &variant in VARIANTS {
             for &dt in DTYPES {
                 let claimed = mm_kernel_instantiated(dt, variant);
-                // The exact host name the encoder would dispatch: base + variant suffix.
-                let name = mm_kernel_name(dt)
-                    .ok()
-                    .map(|base| format!("{base}{}", variant.suffix()));
-                let present = name
-                    .as_ref()
-                    .is_some_and(|n| host_name_present(host_src(variant), n));
-                assert_eq!(
-                    claimed, present,
-                    "support matrix disagrees with mm_id.metal for {dt:?}/{variant:?}: \
-                     mm_kernel_instantiated={claimed}, host_name present={present} (name={name:?})"
-                );
+                // The exact host name the encoder would dispatch: base + variant
+                // suffix, at every tile width the variant can be launched at
+                // (`suffix_nr1`; only the tensor family has a 64-wide kernel, and
+                // the support matrix is width-independent, so both widths must
+                // be instantiated wherever the matrix claims the variant).
+                for nr1 in [32usize, 64] {
+                    let Ok(suffix) = variant.suffix_nr1(nr1) else {
+                        continue;
+                    };
+                    let name = mm_kernel_name(dt)
+                        .ok()
+                        .map(|base| format!("{base}{suffix}"));
+                    let present = name
+                        .as_ref()
+                        .is_some_and(|n| host_name_present(host_src(variant), n));
+                    assert_eq!(
+                        claimed, present,
+                        "support matrix disagrees with mm_id.metal for {dt:?}/{variant:?}/NR1={nr1}: \
+                         mm_kernel_instantiated={claimed}, host_name present={present} (name={name:?})"
+                    );
+                }
             }
         }
 

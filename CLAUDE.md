@@ -259,6 +259,11 @@ unexplained, and BOTH per-step profilers — `XWEN_STACK_PROFILE`'s decode stage
 them (two figures off the GDN line read 2-3x high against amortized benches of the same
 work), so take every headline from an unprofiled run and price a step with an amortized
 bench or end-to-end tok/s, never with a profiler figure.
+Prefill at the 2048 chunk is UNCHANGED end-to-end by the 2026-08-30 mm_id tile work
+(work-list grid + NR1 64: +17-23% on the expert gemms in isolation, nothing claimable at
+3803 tokens on either MoE checkpoint), because the prefill `ffn` stage is now mostly
+NOT the expert gemms — router, rescale chain, SwiGLU, combine and shared expert are the
+majority (TODO.md's prefill section is re-ranked accordingly).
 Within-session cross-drafter comparison, 2026-08-15 (the only way to compare the
 two kinds honestly — same machine, same hour): the 3.6-27B's DFlash head runs
 1.50x/1.47x over its own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x

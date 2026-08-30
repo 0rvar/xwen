@@ -2468,7 +2468,29 @@ WASH"). These are the two things it deliberately did not take.
 
 The chunk went 512 → 2048 on the MoE checkpoints, on every surface, and stayed 512 on
 the dense ones (decisions.md "Prefill chunk", log.md 2026-08-30 "prefill chunk"). The
-A/B named four things it did not take.
+A/B named four things it did not take. **Re-ranked 2026-08-30 after the mm_id tile pass**
+(log.md "mm_id tiles"): the expert gemms are a MINORITY of the prefill `ffn` stage (a
+17-23% isolated gemm gain moved `ffn` 3-5% and prefill wall not at all), so the two
+non-gemm items come first.
+- [ ] **The f16 rescale chain at prefill** (`moe.rs` `needs_rescale`, the L2 guard that
+  keeps the down-projection input inside f16 range on the f16-tile prefill variants).
+  At 2048 rows per chunk the guard is a band of elementwise dispatches per layer that
+  decode never pays; fold it into the gemm epilogue or the following norm, whichever the
+  profiler ranks higher (rank, do not price — the profilers are sync-inflated). Promoted
+  to first 2026-08-30: it is part of the non-gemm majority of `ffn`.
+- [ ] **Route the hyper-connection and shared-expert gemms onto `dense_mm`.** The P8c
+  gemm (`src/ops/dense_mm.metal`) was 2.2-2.7x on the 27B's dense FFN; whether the
+  Flash-Next hc mix and the `shexp` gemms take it at prefill today has not been checked,
+  and at 2048 rows per chunk they are squarely in its `seq > 32` envelope. Same gate
+  as `dense_mm` (Q4_K/Q8_0 source, graded by mm/ppl), and the same accuracy trade.
+  Promoted to second 2026-08-30: the shared expert is in the non-gemm-expert majority of
+  `ffn`.
+- [ ] **A long-prompt mm tier.** The strict/mm/decode tiers grade a 58-token prompt, so
+  the 64-wide `_t64` mm_id kernel (selected when `t*top_k/n_expert ≥ 24`) is exercised
+  only by the ppl tier's 4218-token corpus at the 2048 chunk. Its identity with the
+  32-wide kernel is test-pinned but not structural (different `matmul2d`
+  instantiations), so a toolchain change could separate them with only ppl watching. Add
+  an mm-tier fixture long enough to run at least one full 2048-token chunk (2026-08-30).
 - [ ] **A narrower `mm_id` token tile (NR1 32 → 16).** At the 2048 chunk each Flash-Next
   expert sees ~40 rows per gemm, which a 32-row tile covers as one full tile plus a
   quarter-empty one; a 16-row tile would waste less of the second tile and lets the
@@ -2484,16 +2506,13 @@ A/B named four things it did not take.
   (down: 1,310,720 launched, 40,960 useful). Both are being implemented as a work-list
   grid (map0 emits (expert, tile) pairs; host bound ceil(t*top_k/NR1)+n_expert, no
   readback) plus a templated NR1 64 on the `_t` family, each behind a switch.
-- [ ] **Route the hyper-connection and shared-expert gemms onto `dense_mm`.** The P8c
-  gemm (`src/ops/dense_mm.metal`) was 2.2-2.7x on the 27B's dense FFN; whether the
-  Flash-Next hc mix and the `shexp` gemms take it at prefill today has not been checked,
-  and at 2048 rows per chunk they are squarely in its `seq > 32` envelope. Same gate
-  as `dense_mm` (Q4_K/Q8_0 source, graded by mm/ppl), and the same accuracy trade.
-- [ ] **The f16 rescale chain at prefill** (`moe.rs` `needs_rescale`, the L2 guard that
-  keeps the down-projection input inside f16 range on the f16-tile prefill variants).
-  At 2048 rows per chunk the guard is a band of elementwise dispatches per layer that
-  decode never pays; fold it into the gemm epilogue or the following norm, whichever the
-  profiler ranks higher (rank, do not price — the profilers are sync-inflated).
+  **SHIPPED THE OTHER WAY, 2026-08-30** (log.md "mm_id tiles", decisions.md "mm_id
+  tiles"): work-list grid on all three families + `_t64` with the ≥ 24-rows rule,
+  bit-neutral, isolated +17-23% (FN gate/up 416k → 512k tok/s, FN down q5_1 202k →
+  236k, 35B gate/up 628k → 751k, 35B down 260k → 281k), end-to-end at 3803 tokens
+  nothing claimable (Flash-Next 841/799 → 827/862, 35B 2657 → 2708 in one round), the
+  `ffn` stage falling only 3-5% because the gemms are its minority. Any further
+  mm_id tile work sits below the two items above.
 - [ ] **Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the
   2048-token QSA budget, then slopes gently: 46.1 tok/s at 1963 tokens, 30.8 at 2045
   (the run crosses 2048 mid-decode), 30.6 at 2107, 29.4 at 3810, 27.3 at 7620** (2026-08-30,
