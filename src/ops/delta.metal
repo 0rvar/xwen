@@ -13,6 +13,12 @@
 //                        the head's state slice resident in registers for the
 //                        entire scan: one dispatch per layer per chunk. It folds
 //                        the q/k L2 clamp-norm into its own load stage.
+//   kernel_delta_scan_decode  the same recurrence for ONE token, the shape a
+//                        decode step could take: no timestep loop, the state
+//                        moved as float4, the row-slice folds done inside a
+//                        simdgroup. OPT-IN behind XWEN_DELTA_DECODE_KERNEL and
+//                        a measured wash; kernel_delta_scan runs decode by
+//                        default.
 //   kernel_delta_gnorm   the gated output RMSNorm (rms -> ssm_norm.weight ->
 //                        silu(z)), with kernel_delta_gnorm_sigmoid its
 //                        sigmoid(z) sibling for the qwen4exp graph — one
@@ -20,6 +26,10 @@
 //
 // A layer therefore costs eight dispatches at any sequence length. The
 // kill-switch back to the reference scan is XWEN_DELTA_CLASSIC.
+//
+// The decode scan is a WASH against the general one end to end, so it is
+// OPT-IN (XWEN_DELTA_DECODE_KERNEL) and kept for the measurement, not for a
+// speedup — docs/decisions.md, "A decode-specialized scan kernel is a WASH".
 //
 // Two further kernels are not on the shipped path and exist as MEASURED
 // ARTIFACTS of a refuted direction (docs/decisions.md, "The DeltaNet scan
@@ -46,6 +56,11 @@
 //   - kernel_delta_l2norm is the same story for the q/k norm: the ops match
 //     `linear_attn::l2_norm` one for one (sum of squares, sqrt, floor at eps,
 //     divide) and only the 128-term sum reassociates. Its test grades at 2e-6.
+//   - kernel_delta_scan_decode is the same story at seq == 1: same per-thread
+//     arithmetic in the same order as kernel_delta_scan, with the cross-thread
+//     fold reassociated once more (a simd_shuffle_xor butterfly over the row
+//     slices, then the simdgroup partials). Graded at 1e-5 against both the
+//     general kernel and the reference.
 //   - kernel_delta_scan partitions the k- and q-contractions across threads and
 //     folds them through threadgroup memory, where the reference runs a candle
 //     gemm. It deliberately does NOT carry the fp pragmas — its two inner loops
@@ -521,6 +536,184 @@ kernel void kernel_delta_scan(
 #pragma unroll
     for (int a = 0; a < DELTA_S_SLICE; ++a) {
         s_out[s_base + (size_t) (i0 + a) * DELTA_D] = s[a];
+    }
+}
+
+// The decode scan's threadgroup geometry (see kernel_delta_scan_decode below).
+// A threadgroup is still DELTA_D threads owning DELTA_DEC_TG_COLS value
+// columns of one head, but the columns are handed out FOUR AT A TIME so every
+// state touch is a float4: a thread owns DELTA_DEC_SLICE rows of one float4
+// column group, and the DELTA_DEC_ROWS threads sharing a group fold through
+// simd_shuffle_xor first and threadgroup memory only across simdgroups.
+#define DELTA_DEC_VEC 4        // value columns per thread — one float4
+#define DELTA_DEC_LANES 8      // float4 column groups across a threadgroup
+#define DELTA_DEC_ROWS 16      // key-dim slices those groups are split across
+#define DELTA_DEC_SLICE 8      // DELTA_D / DELTA_DEC_ROWS, state rows per thread
+#define DELTA_DEC_TG_COLS 32   // DELTA_DEC_VEC * DELTA_DEC_LANES
+#define DELTA_DEC_COL_BLOCKS 4 // DELTA_D / DELTA_DEC_TG_COLS, threadgroups per head
+#define DELTA_DEC_SGS 4        // DELTA_D / 32, simdgroups per threadgroup
+
+// The seven are not independent: the threadgroup is DELTA_D threads laid out as
+// DELTA_DEC_ROWS x DELTA_DEC_LANES, each thread owns DELTA_DEC_SLICE rows of
+// DELTA_DEC_VEC columns, and DELTA_DEC_COL_BLOCKS threadgroups tile a head's
+// value dim. The host sizes the grid from its own copies (dispatch.rs
+// DELTA_HEAD_DIM / DELTA_DEC_COL_BLOCKS, cross-checked by a test), so a value
+// that drifted out of this relation would index outside a head's state slice.
+static_assert(DELTA_DEC_VEC * DELTA_DEC_LANES == DELTA_DEC_TG_COLS,
+              "a threadgroup's float4 groups must tile its columns exactly");
+static_assert(DELTA_DEC_ROWS * DELTA_DEC_LANES == DELTA_D,
+              "the decode threadgroup must be exactly DELTA_D threads");
+static_assert(DELTA_DEC_SLICE == DELTA_D / DELTA_DEC_ROWS,
+              "each thread owns DELTA_D / DELTA_DEC_ROWS state rows");
+static_assert(DELTA_DEC_COL_BLOCKS == DELTA_D / DELTA_DEC_TG_COLS,
+              "DELTA_DEC_COL_BLOCKS threadgroups must tile a head's value dim exactly");
+static_assert(DELTA_DEC_SGS * 32 == DELTA_D, "DELTA_DEC_SGS simdgroups per threadgroup");
+static_assert(32 % DELTA_DEC_LANES == 0,
+              "a simdgroup must hold a whole number of column groups for the "
+              "shuffle fold to reduce over row slices only");
+
+// The delta-rule recurrence for ONE token — the decode step, hoisted out of
+// kernel_delta_scan's timestep loop. Same math, same operands, and the same
+// most-recent-first `s_out` contract at the single plane a one-token chunk can
+// name (n_planes is 1 by construction, so plane 0 is the whole trail and a
+// rollback restores it unchanged).
+//
+// Why a second kernel: at seq == 1 the general scan's loop body IS the kernel,
+// so everything it amortizes over a chunk it pays in full — a barrier-separated
+// two-phase fold through part[][], the q/k staging, and 32 scalar state loads
+// per thread at a 512-byte stride. This one drops the loop and rebuilds the
+// same decomposition around the memory: the state is read once and written once
+// as float4 (each load instruction covers 512 contiguous bytes of a state row
+// instead of 128), the row-slice fold happens inside a simdgroup with
+// simd_shuffle_xor, and threadgroup memory carries only the DELTA_DEC_SGS
+// per-simdgroup partials. The q/k L2 clamp-norm is computed once per
+// threadgroup, one thread per head dim, and broadcast through `qn`/`kn`.
+//
+// Arithmetic is the general kernel's, in the same order per thread; only the
+// cross-thread fold reassociates, so this is bounded against the reference in
+// exactly the class kernel_delta_scan already sits in (docs/parity.md).
+kernel void kernel_delta_scan_decode(
+        constant delta_scan_args & args [[buffer(0)]],
+        device const float  * conv  [[buffer(1)]],
+        device const float  * beta  [[buffer(2)]],
+        device const float  * g     [[buffer(3)]],
+        device const float4 * s_in  [[buffer(4)]],
+        device       float  * out   [[buffer(5)]],
+        device       float4 * s_out [[buffer(6)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint tid  [[thread_position_in_threadgroup]],
+        uint sgid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float qn[DELTA_D];
+    threadgroup float kn[DELTA_D];
+    threadgroup float red[2][DELTA_D / 32];
+    // Two fold buffers, not one reused: a third barrier to separate the k fold
+    // from the q fold would cost more than 512 bytes of threadgroup memory.
+    threadgroup float4 part_k[DELTA_DEC_SGS][DELTA_DEC_LANES];
+    threadgroup float4 part_o[DELTA_DEC_SGS][DELTA_DEC_LANES];
+
+    const int h = (int) tgid / DELTA_DEC_COL_BLOCKS;
+    const int c = (int) tid % DELTA_DEC_LANES; // float4 column group
+    const int r = (int) tid / DELTA_DEC_LANES; // row slice
+    const int i0 = r * DELTA_DEC_SLICE;
+    const int j0 = ((int) tgid % DELTA_DEC_COL_BLOCKS) * DELTA_DEC_TG_COLS + c * DELTA_DEC_VEC;
+
+    const int k_dim = args.k_heads * DELTA_D;
+    const int kh = h % args.k_heads; // TILED, not interleaved
+    const int v_off = 2 * k_dim + h * DELTA_D;
+
+    // The state slice this thread owns, in float4s: DELTA_D / DELTA_DEC_VEC of
+    // them to a state row, DELTA_D rows to a head.
+    const int s4_row = DELTA_D / DELTA_DEC_VEC;
+    const size_t s4_base = (size_t) h * DELTA_D * s4_row + (size_t) (j0 / DELTA_DEC_VEC);
+    float4 s[DELTA_DEC_SLICE];
+#pragma unroll
+    for (int a = 0; a < DELTA_DEC_SLICE; ++a) {
+        s[a] = s_in[s4_base + (size_t) (i0 + a) * s4_row];
+    }
+
+    // q/k load + L2 clamp-norm, one thread per head dim, published to the whole
+    // threadgroup. Once per dispatch, where the general kernel does this per
+    // timestep.
+    const int d = (int) tid;
+    const float qr = conv[kh * DELTA_D + d];
+    const float kr = conv[k_dim + kh * DELTA_D + d];
+    const float q_lane = simd_sum(qr * qr);
+    const float k_lane = simd_sum(kr * kr);
+    if (lane == 0) {
+        red[0][sgid] = q_lane;
+        red[1][sgid] = k_lane;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (int u = 0; u < DELTA_D / 32; ++u) {
+        q_sum += red[0][u];
+        k_sum += red[1][u];
+    }
+    qn[d] = qr / max(sqrt(q_sum), args.eps);
+    kn[d] = kr / max(sqrt(k_sum), args.eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Decay the state, then contract it with k over the key dim. The row slices
+    // a simdgroup holds fold with a shuffle butterfly over the lane bits that
+    // carry `r`; only the DELTA_DEC_SGS simdgroup partials reach memory.
+    const float dec = exp(g[h]);
+    float4 sk = 0.0f;
+#pragma unroll
+    for (int a = 0; a < DELTA_DEC_SLICE; ++a) {
+        s[a] *= dec;
+        sk += s[a] * kn[i0 + a];
+    }
+    for (uint m = DELTA_DEC_LANES; m < 32; m <<= 1) {
+        sk += simd_shuffle_xor(sk, m);
+    }
+    if (lane < DELTA_DEC_LANES) {
+        part_k[sgid][lane] = sk;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 sk_col = part_k[0][c];
+    for (int u = 1; u < DELTA_DEC_SGS; ++u) {
+        sk_col += part_k[u][c];
+    }
+
+    // v is read as scalars: the conv buffer may start at any f32 offset, and
+    // four loads per thread is nothing next to the state.
+    const float4 v = float4(conv[v_off + j0], conv[v_off + j0 + 1],
+                            conv[v_off + j0 + 2], conv[v_off + j0 + 3]);
+    const float4 delta = (v - sk_col) * beta[h];
+
+    // Rank-1 update, then read the UPDATED state out with q.
+    float4 ov = 0.0f;
+#pragma unroll
+    for (int a = 0; a < DELTA_DEC_SLICE; ++a) {
+        s[a] += kn[i0 + a] * delta;
+        ov += qn[i0 + a] * s[a];
+    }
+    for (uint m = DELTA_DEC_LANES; m < 32; m <<= 1) {
+        ov += simd_shuffle_xor(ov, m);
+    }
+    if (lane < DELTA_DEC_LANES) {
+        part_o[sgid][lane] = ov;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma unroll
+    for (int a = 0; a < DELTA_DEC_SLICE; ++a) {
+        s_out[s4_base + (size_t) (i0 + a) * s4_row] = s[a];
+    }
+
+    if (r == 0) {
+        float4 o_col = part_o[0][c];
+        for (int u = 1; u < DELTA_DEC_SGS; ++u) {
+            o_col += part_o[u][c];
+        }
+        o_col *= args.scale;
+        device float * o_ptr = out + (size_t) h * DELTA_D + j0;
+        o_ptr[0] = o_col.x;
+        o_ptr[1] = o_col.y;
+        o_ptr[2] = o_col.z;
+        o_ptr[3] = o_col.w;
     }
 }
 

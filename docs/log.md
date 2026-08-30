@@ -4,6 +4,57 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-30 (later still) — the DeltaNet decode scan gets its own kernel, and the profiler's "60 GB/s scan" turns out to be a bracket artifact
+
+The gated-DeltaNet scan is the largest single step of the GDN mixer in
+`XWEN_GDN_PROFILE`'s decode line — 29.6% of the corrected mixer on Flash-Next, at ~32
+GB/s of the bytes it declares it must move, where `out_proj` in the same block reads
+249. That gap is what this arc set out to close, and the diagnosis was plausible: at
+seq == 1 the general `kernel_delta_scan` runs its timestep loop exactly once, so it pays
+four threadgroup barriers, the q/k threadgroup staging and a two-phase `part[][]` fold
+with nothing to amortize them over.
+
+`kernel_delta_scan_decode` is that step written as its own kernel. Same decomposition —
+a threadgroup owns one head and 32 of its value columns — but the columns are handed out
+four at a time so every state touch is a `float4` (one load instruction covers 512
+contiguous bytes of a state row instead of 128), the fold over row slices happens with a
+`simd_shuffle_xor` butterfly inside a simdgroup with only the four simdgroup partials
+reaching threadgroup memory, and the q/k L2 clamp-norm is computed once per dispatch
+rather than once per timestep. It keeps the fp32 state, the clamp-form norm, the tiled
+K-head mapping and the most-recent-first `s_out` contract (at seq == 1 there is exactly
+one plane, so a rollback trail restores it unchanged).
+
+It is a wash. Interleaved unprofiled decode on Flash-Next: 44.7 / 44.8 tok/s on the
+general kernel against 44.6 / 44.7 on the decode kernel, with byte-identical 64-token
+greedy text; the 35B-A3B reads 105.5 against 105.4 / 104.4, also byte-identical.
+
+The interesting part is why. The profile line is sync-bracketed per step — the module
+says so and corrects for a dispatch floor, but a step that issues one kernel and waits
+still pays a GPU round trip that the real forward overlaps away. Priced the way this
+repo's own benching rules demand (batched dispatches per sync, a token's worth of layers
+per iteration, one cold state per layer), the scan costs 1.35-1.43 ms/token at 36 layers
+of the 48-V-head geometry, not 3.79-7.19; and a candle affine moving exactly the same
+state bytes with no arithmetic costs 0.98-1.02 (medians of two runs on a machine shared
+with other agents, the second the quieter; the decode kernel reads 1.27-1.41 there,
+0-5% better and 0.3% of a token). The new bench `delta_scan_decode_timing` carries
+that floor arm deliberately, because it is the number that says when to stop: the scan's
+marginal state bandwidth, differenced across the two geometries, is 525-564 GB/s, which
+is what `out_proj` gets. The kernel was already bandwidth-bound. Nothing about barriers,
+fold shapes or grid sizes was ever going to move it, and the 0.4 ms/token that separates
+the shipped kernel from a bytes-only floor is 1.8% of a token.
+
+The kernel is kept OPT-IN behind `XWEN_DELTA_DECODE_KERNEL=1` — the general kernel
+still runs every length by default — because a wash does not pay for a second bounded
+kernel on the decode path, and what it does pay for is the arm the bench prices against.
+It is graded like the general one: 1e-5 against the reference AND against the
+general kernel over consecutive state-carrying steps at both geometries (which is all
+three checkpoints — Flash-Next's DeltaNet layers are 16 K / 48 V at 128, the 27B's
+geometry exactly), plus a rollback test that walks a verify span one token at a time and
+lands where the reference scan lands at every accepted prefix. Two things this did NOT
+do, both ledgered: the in-place state update (the traffic is identical either way and
+the aliasing promise is not the kernel's to make), and correcting the profiler's decode
+brackets, which will keep pointing at this step until they are.
+
 ## 2026-08-30 (P4, later the same day) — Flash-Next serves: the QSA indexer rows ride in `HostFullKv`, the PLE state rides on its own layer's snapshot entry, and the container goes to v4
 
 P4 was the item that kept this checkpoint off two surfaces, and it was always one

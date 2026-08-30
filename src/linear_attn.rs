@@ -1278,6 +1278,71 @@ mod tests {
         }
     }
 
+    /// The same rollback invariant when the verify span is walked ONE TOKEN AT
+    /// A TIME. Two things have to hold and neither fails loudly: the state each
+    /// step hands the cache is the state that step produced (a scan updating the
+    /// state in place would leave the trail's earlier entries holding the LATEST
+    /// state, and only a mid-span commit would show it), and commit 0 must still
+    /// find the checkpoint's own bits.
+    ///
+    /// This grades whichever seq == 1 scan the test process was launched with —
+    /// the general kernel by default, `kernel_delta_scan_decode` under
+    /// `XWEN_DELTA_DECODE_KERNEL`, the reference scan under
+    /// `XWEN_DELTA_CLASSIC` (where it is trivially true and harmless); all three
+    /// switches are read once per process. The decode kernel's own half of this
+    /// — that it leaves the state it was handed untouched — is pinned
+    /// switch-free by `decode_scan_does_not_mutate_the_incoming_state`
+    /// (src/ops/delta.rs).
+    #[test]
+    fn rollback_through_single_token_steps_lands_where_the_reference_lands() {
+        let Ok(metal) = crate::gguf::metal_device() else {
+            return;
+        };
+        let _guard = path_lock();
+        let (kh, vh, hidden, span) = (16usize, 48usize, 256usize, 4usize);
+        let cfg = cfg_for(kh, vh, 128, hidden);
+        let block = build_on(&random_block(&cfg, hidden, 0x600), &cfg, &metal);
+        let prefix = Tensor::from_vec(seeded_vec(2 * hidden, 0x601), (2, hidden), &metal).unwrap();
+        let x = Tensor::from_vec(seeded_vec(span * hidden, 0x602), (span, hidden), &metal).unwrap();
+
+        for commit in 0..=span {
+            let run = |fused: bool| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+                let mut cache = cache_on(&cfg, &metal, 32);
+                block.forward(&prefix, &mut cache).unwrap();
+                let ckpt = cache.checkpoint(span).unwrap();
+                let (_, before) = cache.linear_state().unwrap();
+                let before = flat(&before);
+                for t in 0..span {
+                    let row = x.narrow(0, t, 1).unwrap().contiguous().unwrap();
+                    if fused {
+                        block.forward(&row, &mut cache).unwrap();
+                    } else {
+                        block.forward_classic(&row, &mut cache).unwrap();
+                    }
+                }
+                cache.rollback(&ckpt, 2, span, commit).unwrap();
+                assert_eq!(cache.len(), 2 + commit);
+                let (conv, delta) = cache.linear_state().unwrap();
+                (flat(&conv), flat(&delta), before)
+            };
+            let (fused_conv, fused_delta, before) = run(true);
+            let (ref_conv, ref_delta, _) = run(false);
+            assert_eq!(fused_conv, ref_conv, "commit {commit}: conv window");
+            assert_all_close(
+                &fused_delta,
+                &ref_delta,
+                2e-5,
+                &format!("commit {commit} delta state"),
+            );
+            if commit == 0 {
+                assert_eq!(
+                    fused_delta, before,
+                    "rejecting every token must restore the checkpoint's state bit for bit"
+                );
+            }
+        }
+    }
+
     /// The L2 normalization floors the NORM at eps rather than adding eps under
     /// the root — `ggml_l2_norm`'s form. A unit vector therefore comes back
     /// exactly unchanged (the rsqrt form would shrink it by sqrt(1+eps)), and a

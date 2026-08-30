@@ -350,6 +350,15 @@ list — the gate checks both as provenance on both sides of the strict tier (se
 "Provenance pins"), so a manual dump that omits either fails the tier rather than
 merely shifting numbers.
 
+`XWEN_DELTA_DECODE_KERNEL=1` appears in no row and is not a tier switch: it is an
+OPT-IN A/B arm that sends the seq == 1 step to `kernel_delta_scan_decode` instead of the
+general `kernel_delta_scan` the gates grade. The two are bounded against the reference in
+the same class and differ only in the order one cross-thread fold sums, and it changes no
+prefill arithmetic at all. Like `XWEN_DELTA_SCAN_V2` it has no provenance field, so
+`parity-gate.ts` strips it from the run env (`baseEnv()`) — an inherited one would grade
+a kernel the report does not name. Setting it deliberately is fine for an A/B; both sides
+must then set it, and the decode tier is the one it can move.
+
 Five more switches exist and appear in NO row of that table, because they affect
 **qwen4exp (Qwen3.8-Flash-Next) only** — a checkpoint the harness cannot yet run at all
 (see "Limitations"). They are listed here so a future gate extension does not rediscover

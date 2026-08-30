@@ -3029,6 +3029,13 @@ pub(crate) const DELTA_HEAD_DIM: usize = 128;
 /// from this copy, so a drift would write outside a head's state slice.
 pub(crate) const DELTA_COL_BLOCKS: usize = 4;
 
+/// Threadgroups the DECODE scan kernel launches per V-head
+/// (`DELTA_DEC_COL_BLOCKS` in delta.metal — the value-dim columns split four
+/// ways, four columns to a thread). Kept in step with the kernel's own
+/// `#define` by `scan_geometry_matches_metal` (src/ops/delta.rs): the grid is
+/// sized from this copy, so a drift would write outside a head's state slice.
+pub(crate) const DELTA_DEC_COL_BLOCKS: usize = 4;
+
 /// Simdgroups per threadgroup in the v2 scan (`DELTA_V2_SGS` in delta.metal) —
 /// also the number of state value-columns a threadgroup covers, one per
 /// simdgroup, since a simdgroup owns a column outright.
@@ -3491,11 +3498,14 @@ fn check_delta_scan_operands(
 /// speculative verify walk needs — llama.cpp's snapshot-slot ordering, kept so
 /// the two are readable against each other.
 ///
-/// The default is `kernel_delta_scan`, which normalizes q and k in its own load
-/// stage. `XWEN_DELTA_SCAN_V2` selects the measured artifact instead:
-/// `run_delta_l2norm` followed by `kernel_delta_scan_v2`. Both are bounded
-/// against the reference scan and differ only in the order the two key-dim
-/// contractions are summed.
+/// Three kernels, one contract. Every length takes `kernel_delta_scan` by
+/// default, which normalizes q and k in its own load stage. Two opt-in arms
+/// exist and neither is faster: `XWEN_DELTA_DECODE_KERNEL` sends a ONE-TOKEN
+/// chunk to `kernel_delta_scan_decode`, the same recurrence with the timestep
+/// loop gone, and `XWEN_DELTA_SCAN_V2` selects `run_delta_l2norm` followed by
+/// `kernel_delta_scan_v2` at every length. All three are bounded against the
+/// reference scan and differ only in the order the key-dim contractions are
+/// summed.
 pub(crate) fn run_delta_scan(
     conv: &Tensor,
     beta: &Tensor,
@@ -3506,10 +3516,21 @@ pub(crate) fn run_delta_scan(
     planes: usize,
 ) -> Result<(Tensor, Tensor)> {
     if crate::ops::delta_scan_v2() {
-        run_delta_scan_v2(conv, beta, g, s, k_heads, eps, planes)
-    } else {
-        run_delta_scan_default(conv, beta, g, s, k_heads, eps, planes)
+        return run_delta_scan_v2(conv, beta, g, s, k_heads, eps, planes);
     }
+    // A one-token chunk goes to the decode kernel only when the opt-in switch
+    // asks for it (it is a measured wash — `ops::delta_decode_kernel`).
+    // `planes` is 1 there by construction (1..=seq), and the float4 state
+    // pointer needs a 16-byte buffer offset — every state a cache hands over
+    // starts at 0, and a head-aligned test view is 64 KiB in, but a view that
+    // is neither falls back rather than reading misaligned.
+    let decode = crate::ops::delta_decode_kernel()
+        && matches!(conv.dims2(), Ok((1, _)))
+        && f32_off(s.layout()).is_multiple_of(16);
+    if decode {
+        return run_delta_scan_decode(conv, beta, g, s, k_heads, eps, planes);
+    }
+    run_delta_scan_default(conv, beta, g, s, k_heads, eps, planes)
 }
 
 /// `XWEN_DELTA_SCAN_V2`: the q/k norm as its own dispatch, then
@@ -3617,10 +3638,115 @@ fn run_delta_scan_v2(
     ))
 }
 
+/// The DECODE arm: `kernel_delta_scan_decode` — one token, no timestep loop,
+/// the state read and written as float4 with the row-slice folds done inside a
+/// simdgroup. Same operands, same outputs and the same single state plane as
+/// `run_delta_scan_default` at `seq == 1`. OPT-IN and a measured wash — see
+/// `ops::delta_decode_kernel`, which is the only thing that selects it.
+///
+/// Preconditions the caller has already established: `seq == 1` (so `planes` is
+/// 1, the only plane count a one-token chunk can name) and a state view whose
+/// byte offset is float4-aligned.
+pub(crate) fn run_delta_scan_decode(
+    conv: &Tensor,
+    beta: &Tensor,
+    g: &Tensor,
+    s: &Tensor,
+    k_heads: usize,
+    eps: f32,
+    planes: usize,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = conv.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("delta_scan requires conv on a Metal device");
+    };
+    let (seq, conv_dim, v_heads) = check_delta_scan_operands(conv, beta, g, s, k_heads, planes)?;
+    let (d_k, d_v) = (DELTA_HEAD_DIM, DELTA_HEAD_DIM);
+    if seq != 1 || planes != 1 {
+        bail!("delta_scan_decode is the seq == 1 kernel, got seq {seq} with {planes} planes");
+    }
+    let s_off = f32_off(s.layout());
+    if !s_off.is_multiple_of(16) {
+        bail!(
+            "delta_scan_decode reads the state as float4; its byte offset {s_off} is not 16-byte aligned"
+        );
+    }
+
+    let out_len = checked_elems(&[seq, v_heads, DELTA_HEAD_DIM], "delta_scan out")?;
+    let state_len = checked_elems(&[planes, v_heads, d_k, d_v], "delta_scan state")?;
+    glue_index_fits_i32(checked_elems(&[seq, conv_dim], "delta_scan conv")?)?;
+    glue_index_fits_i32(out_len)?;
+
+    let pipeline = pipelines::delta_pipeline(mdev.device(), "kernel_delta_scan_decode")?;
+    if pipeline.max_total_threads_per_threadgroup() < DELTA_HEAD_DIM {
+        bail!(
+            "delta_scan needs {DELTA_HEAD_DIM} threads per threadgroup, the pipeline allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    check_delta_simd_width(&pipeline, "kernel_delta_scan_decode")?;
+    let out = mdev.new_buffer(out_len, DType::F32, "delta_scan_out")?;
+    let s_out = mdev.new_buffer(state_len, DType::F32, "delta_scan_state")?;
+
+    let (conv_guard, conv_layout) = conv.storage_and_layout();
+    let Storage::Metal(conv_storage) = &*conv_guard else {
+        bail!("conv is not on a Metal device");
+    };
+    let (beta_guard, beta_layout) = beta.storage_and_layout();
+    let Storage::Metal(beta_storage) = &*beta_guard else {
+        bail!("beta is not on a Metal device");
+    };
+    let (g_guard, g_layout) = g.storage_and_layout();
+    let Storage::Metal(g_storage) = &*g_guard else {
+        bail!("g is not on a Metal device");
+    };
+    let (s_guard, s_layout) = s.storage_and_layout();
+    let Storage::Metal(s_storage) = &*s_guard else {
+        bail!("delta state is not on a Metal device");
+    };
+
+    let args = DeltaScanArgs {
+        seq: seq as i32,
+        k_heads: k_heads as i32,
+        v_heads: v_heads as i32,
+        conv_dim: conv_dim as i32,
+        n_planes: planes as i32,
+        scale: 1.0 / (DELTA_HEAD_DIM as f32).sqrt(),
+        eps,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(conv_storage.buffer()), f32_off(conv_layout));
+        encoder.set_input_buffer(2, Some(beta_storage.buffer()), f32_off(beta_layout));
+        encoder.set_input_buffer(3, Some(g_storage.buffer()), f32_off(g_layout));
+        encoder.set_input_buffer(4, Some(s_storage.buffer()), f32_off(s_layout));
+        encoder.set_output_buffer(5, Some(&out), 0);
+        encoder.set_output_buffer(6, Some(&s_out), 0);
+        encoder.dispatch_thread_groups(
+            mtl_size!(v_heads * DELTA_DEC_COL_BLOCKS, 1, 1),
+            mtl_size!(DELTA_HEAD_DIM, 1, 1),
+        );
+    }
+    drop(conv_guard);
+    drop(beta_guard);
+    drop(g_guard);
+    drop(s_guard);
+
+    Ok((
+        output_tensor(out, mdev, out_len, (seq, v_heads, DELTA_HEAD_DIM)),
+        output_tensor(s_out, mdev, state_len, (planes, v_heads, d_k, d_v)),
+    ))
+}
+
 /// The shipped path: `kernel_delta_scan` alone — a threadgroup per head per
 /// value-column block, with the q/k L2 clamp-norm folded into its load stage, so
 /// the whole recurrence is one dispatch. See `run_delta_scan`.
-fn run_delta_scan_default(
+pub(crate) fn run_delta_scan_default(
     conv: &Tensor,
     beta: &Tensor,
     g: &Tensor,

@@ -607,6 +607,51 @@ refutation is worth more as a runnable arm than as a paragraph. `delta_scan_timi
 (src/ops/delta.rs, `#[ignore]`d) is the instrument — re-run it before believing any
 future claim about the scan's cost, including this one.
 
+**A decode-specialized scan kernel is a WASH, and the "60 GB/s scan" that motivated it
+was a profiler artifact.** `kernel_delta_scan_decode` (delta.metal) is the seq == 1
+shape the general kernel's loop body cannot be: no timestep loop, the state read and
+written as float4 rather than as 32 scalars at a 512-byte stride, the row-slice folds
+done with a `simd_shuffle_xor` butterfly inside a simdgroup, and the q/k clamp-norm
+computed once per threadgroup instead of once per timestep. It is correct — graded at
+1e-5 against both the general kernel and the reference over consecutive state-carrying
+steps at both geometries — and it buys nothing.
+
+| arm (Flash-Next, unprofiled, interleaved, `--no-draft`) | round 1 | round 2 |
+|---|---|---|
+| general kernel (shipped) | 44.7 tok/s | 44.8 |
+| decode kernel (`XWEN_DELTA_DECODE_KERNEL=1`) | 44.6 | 44.7 |
+
+The 35B-A3B is the same story (105.5 against 105.4/104.4; its round-1 general arm read
+96.8 cold and is not comparable), and both checkpoints emit byte-identical 64-token
+greedy text under either kernel.
+
+The premise is what actually moved. `XWEN_GDN_PROFILE` reported the scan at 3.79-7.19 ms
+per token and ~30 GB/s of its declared byte floor, which reads like a kernel running at a
+tenth of what `out_proj` achieves in the same block. It is not: every step in that line
+is bracketed by a device sync, so a step that dispatches one kernel pays a full GPU round
+trip the real forward pipelines away, and the module's own dispatch-floor correction does
+not recover it. Priced the way CLAUDE.md's benching rules require — batched dispatches per
+sync, a whole token's worth of layers per iteration, states as cold as the real ones —
+the scan costs **1.35-1.43 ms/token at 36 layers of the 48-V-head geometry (160-170
+GB/s), against 0.98-1.02 ms for a candle affine moving exactly the same state bytes with
+no arithmetic at all** (`delta_scan_decode_timing`, src/ops/delta.rs, which carries that
+floor arm as its third arm; medians of two runs on a shared machine, the second the
+quieter). The decode kernel reads 1.27-1.41 — 0-5% better in isolation, which is the
+0.3% of a token that the end-to-end arms could not see. So the whole prize between "as
+shipped" and "free" is ~0.4 ms of a ~22 ms token, and the state traffic itself — 3.1 MB read plus
+3.1 MB written per layer per token — is most of what remains. Differencing the two
+geometries puts the scan's marginal rate at 525-564 GB/s, which is `out_proj`'s own
+number: the kernel is bandwidth-bound, and it was already bandwidth-bound before this
+kernel existed.
+
+Kept OPT-IN behind `XWEN_DELTA_DECODE_KERNEL=1` rather than shipped as the seq == 1
+default, on the `XWEN_DELTA_SCAN_V2` / `XWEN_MOE_DUAL` precedent: a second bounded
+kernel on the decode path is a permanent parity surface, and a wash does not pay for one.
+What it does pay for is the arm — the bench that priced the scan honestly needs something
+to price it against, and the next person told the decode step is starving for bandwidth
+should be able to run the fix rather than rebuild it. `delta_scan_decode_timing` calls
+both kernels directly and needs no switch (2026-08-30).
+
 **Chunk-boundary device syncs and command-buffer batching granularity are both REFUTED
 as levers on the 27B prefill residual.** The residual — +350 to +560 µs/token of
 length-dependent prefill cost outside every measured stage — was reproduced in situ at

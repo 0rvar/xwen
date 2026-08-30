@@ -559,6 +559,35 @@ pub fn delta_classic() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_DELTA_CLASSIC").is_some())
 }
 
+/// `XWEN_DELTA_DECODE_KERNEL=1` routes the seq == 1 gated-DeltaNet step to
+/// `kernel_delta_scan_decode`, the decode-specialized scan, instead of the
+/// general `kernel_delta_scan` every length takes by default. The two run the
+/// same math on the same operands and leave the same single state plane — the
+/// decode kernel drops the timestep loop, moves the state as float4 and folds
+/// its row slices inside a simdgroup — so this is an A/B knob, not a numerics
+/// anchor: both arms are BOUNDED against the reference in the same class, and
+/// `XWEN_DELTA_CLASSIC` remains the switch that takes a run all the way back to
+/// the frozen reference scan.
+///
+/// OPT-IN because it is a measured WASH end to end (44.6-44.7 tok/s against the
+/// general kernel's 44.7-44.8 on Flash-Next, 105.4 against 105.5 on the
+/// 35B-A3B, byte-identical greedy text either way), kept for the bench arm and
+/// the refutation it carries rather than for a speedup — docs/decisions.md, "A
+/// decode-specialized scan kernel is a WASH". Its `#[ignore]`d bench is
+/// `delta_scan_decode_timing` (src/ops/delta.rs), which calls both kernels
+/// directly and needs no switch.
+///
+/// Prefill and any multi-token verify chunk are unaffected — they never reach
+/// the decode kernel — so a run that sets this differs only in the fold order
+/// of its DECODE arithmetic.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches: any value
+/// enables it — only leaving it unset keeps the general kernel everywhere.
+pub fn delta_decode_kernel() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_DELTA_DECODE_KERNEL").is_some())
+}
+
 /// `XWEN_DELTA_SCAN_V2=1` runs the gated-DeltaNet recurrence through
 /// `kernel_delta_scan_v2` and the `ops::delta_l2norm` dispatch it needs, instead
 /// of the shipped single-dispatch `kernel_delta_scan`. That pair is llama.cpp's

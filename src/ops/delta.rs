@@ -70,7 +70,9 @@ pub fn delta_l2norm(conv: &Tensor, k_heads: usize, eps: f32) -> Result<Tensor> {
 /// fused) — q and k are L2 clamp-normalized in the kernel's load stage (or by a
 /// separate `delta_l2norm` dispatch under `XWEN_DELTA_SCAN_V2`) and read with
 /// the tiled K-head mapping, so no
-/// materialized tile-and-broadcast is needed. `beta`/`g` are `[seq, v_heads]`,
+/// materialized tile-and-broadcast is needed. `XWEN_DELTA_DECODE_KERNEL` sends
+/// a one-token chunk to the decode-specialized kernel instead (same math, same
+/// bound, a measured wash). `beta`/`g` are `[seq, v_heads]`,
 /// `s` is the incoming `[v_heads, 128, 128]` f32 state. Returns the per-token
 /// output `[seq, v_heads, 128]` and the state after the last token; `s` itself
 /// is left untouched.
@@ -123,6 +125,11 @@ mod tests {
     /// 128: the dense 27B (16 K-heads, 48 V-heads, conv width 10240) and the
     /// 35B-A3B (16 / 32, conv width 8192). Every kernel test runs both, so a
     /// K-head tiling or width assumption that only holds for one is caught.
+    ///
+    /// Qwen3.8-Flash-Next is the third checkpoint and needs no third entry: its
+    /// gated-DeltaNet layers are 16 K-heads / 48 V-heads at 128, byte-for-byte
+    /// the 27B's geometry (docs/qwen4exp-tensors.md). It differs in how many
+    /// layers run it, which is a model-level number, not a kernel one.
     const GEOMETRIES: [(usize, usize); 2] = [(16, 48), (16, 32)];
 
     const HD: usize = DELTA_HEAD_DIM;
@@ -705,6 +712,154 @@ mod tests {
         assert!(delta_scan_with_trail(&conv, &beta, &g, &s0, k_heads, EPS as f32, seq).is_ok());
     }
 
+    /// UNIT 4e: the decode kernel is a SECOND implementation of the same
+    /// recurrence, taken by every seq == 1 step, so it is graded twice — against
+    /// the general kernel it replaces and against the frozen reference — over
+    /// several CONSECUTIVE steps that carry their own state forward. Carrying
+    /// the state is the point: a per-step difference that a single step hides
+    /// compounds, and a kernel that dropped or double-decayed part of its state
+    /// slice diverges by step two.
+    ///
+    /// Both arms are called explicitly rather than through `delta_scan`, so this
+    /// grades both kernels whichever way `XWEN_DELTA_DECODE_KERNEL` is set —
+    /// which matters more now that the decode kernel is opt-in and a default
+    /// test run never reaches it through the router.
+    #[test]
+    fn decode_scan_matches_the_general_kernel_and_the_reference() {
+        let device = metal_device().unwrap();
+        for (ki, &(k_heads, v_heads)) in GEOMETRIES.iter().enumerate() {
+            let conv_dim = (2 * k_heads + v_heads) * HD;
+            let seed = 0x4700 + ki as u64 * 313;
+            let s0 = on_device(
+                pseudo_random(v_heads * HD * HD, seed, -0.5, 0.5),
+                (v_heads, HD, HD),
+                &device,
+            );
+            let (mut s_dec, mut s_gen, mut s_ref) = (s0.clone(), s0.clone(), s0.clone());
+
+            for step in 0..4u64 {
+                let seed = seed + 1 + step * 7;
+                let conv = on_device(
+                    pseudo_random(conv_dim, seed, -2.0, 2.0),
+                    (1, conv_dim),
+                    &device,
+                );
+                let beta = on_device(
+                    pseudo_random(v_heads, seed + 1, 0.01, 0.99),
+                    (1, v_heads),
+                    &device,
+                );
+                let g = on_device(
+                    pseudo_random(v_heads, seed + 2, -0.6, -0.001),
+                    (1, v_heads),
+                    &device,
+                );
+
+                let (o_dec, next_dec) = dispatch::run_delta_scan_decode(
+                    &conv, &beta, &g, &s_dec, k_heads, EPS as f32, 1,
+                )
+                .unwrap();
+                let (o_gen, next_gen) = dispatch::run_delta_scan_default(
+                    &conv, &beta, &g, &s_gen, k_heads, EPS as f32, 1,
+                )
+                .unwrap();
+                let (o_ref, next_ref) = reference_scan(&conv, &beta, &g, &s_ref, k_heads, v_heads);
+
+                let label = format!("decode k={k_heads} v={v_heads} step={step}");
+                assert_eq!(o_dec.dims(), &[1, v_heads, HD]);
+                assert_eq!(next_dec.dims(), &[1, v_heads, HD, HD]);
+                s_dec = next_dec.squeeze(0).unwrap();
+                s_gen = next_gen.squeeze(0).unwrap();
+                assert_close(&o_dec, &o_gen, 1e-5, &format!("{label} out vs general"));
+                assert_close(&s_dec, &s_gen, 1e-5, &format!("{label} state vs general"));
+                assert_close(&o_dec, &o_ref, 1e-5, &format!("{label} out vs reference"));
+                assert_close(
+                    &s_dec,
+                    &next_ref,
+                    1e-5,
+                    &format!("{label} state vs reference"),
+                );
+                s_ref = next_ref;
+            }
+        }
+    }
+
+    /// The decode kernel writes a fresh state buffer, like the general one: the
+    /// state it was handed comes back unchanged, and a re-run of the same
+    /// dispatch reproduces the same bits. A rollback trail holds the incoming
+    /// state (and, once armed, every state the trail recorded), so an in-place
+    /// update here would corrupt a checkpoint rather than fail a test.
+    #[test]
+    fn decode_scan_does_not_mutate_the_incoming_state() {
+        let device = metal_device().unwrap();
+        let (k_heads, v_heads) = (16usize, 48usize);
+        let conv_dim = (2 * k_heads + v_heads) * HD;
+        let conv = on_device(
+            pseudo_random(conv_dim, 0x5100, -2.0, 2.0),
+            (1, conv_dim),
+            &device,
+        );
+        let beta = on_device(
+            pseudo_random(v_heads, 0x5101, 0.01, 0.99),
+            (1, v_heads),
+            &device,
+        );
+        let g = on_device(
+            pseudo_random(v_heads, 0x5102, -0.6, -0.001),
+            (1, v_heads),
+            &device,
+        );
+        let s0 = on_device(
+            pseudo_random(v_heads * HD * HD, 0x5103, -0.5, 0.5),
+            (v_heads, HD, HD),
+            &device,
+        );
+        let before: Vec<f32> = s0.flatten_all().unwrap().to_vec1().unwrap();
+
+        let (o1, s1) =
+            dispatch::run_delta_scan_decode(&conv, &beta, &g, &s0, k_heads, EPS as f32, 1).unwrap();
+        let after: Vec<f32> = s0.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(before, after, "the incoming state was overwritten");
+
+        let (o2, s2) =
+            dispatch::run_delta_scan_decode(&conv, &beta, &g, &s0, k_heads, EPS as f32, 1).unwrap();
+        assert_bits_eq(&o2, &o1, "rerun output");
+        assert_bits_eq(&s2, &s1, "rerun state");
+    }
+
+    /// The decode kernel is the seq == 1 kernel and says so rather than
+    /// mis-indexing: a longer chunk, and a plane count no one-token chunk can
+    /// name, are refused. `run_delta_scan` never sends it either, but the
+    /// entry point is `pub(crate)` and the next caller should not have to know.
+    #[test]
+    fn decode_scan_refuses_a_multi_token_chunk() {
+        let device = metal_device().unwrap();
+        let (k_heads, v_heads) = (16usize, 32usize);
+        let conv_dim = (2 * k_heads + v_heads) * HD;
+        let s0 = Tensor::zeros((v_heads, HD, HD), DType::F32, &device).unwrap();
+        let rows = |seq: usize| {
+            (
+                Tensor::zeros((seq, conv_dim), DType::F32, &device).unwrap(),
+                Tensor::zeros((seq, v_heads), DType::F32, &device).unwrap(),
+            )
+        };
+        let (conv, bg) = rows(3);
+        assert!(
+            dispatch::run_delta_scan_decode(&conv, &bg, &bg, &s0, k_heads, EPS as f32, 1).is_err(),
+            "the decode kernel accepted a three-token chunk"
+        );
+        let (conv1, bg1) = rows(1);
+        assert!(
+            dispatch::run_delta_scan_decode(&conv1, &bg1, &bg1, &s0, k_heads, EPS as f32, 2)
+                .is_err(),
+            "the decode kernel accepted two state planes for one token"
+        );
+        assert!(
+            dispatch::run_delta_scan_decode(&conv1, &bg1, &bg1, &s0, k_heads, EPS as f32, 1)
+                .is_ok()
+        );
+    }
+
     /// The scan leaves the state it was handed untouched: the kernel writes a
     /// fresh buffer rather than updating in place, which is what lets the
     /// caller keep the incoming state alive for a rollback trail (and what
@@ -897,6 +1052,13 @@ mod tests {
         let rows = define("DELTA_TG_ROWS");
         let slice = define("DELTA_S_SLICE");
         let col_blocks = define("DELTA_COL_BLOCKS");
+        let dec_vec = define("DELTA_DEC_VEC");
+        let dec_lanes = define("DELTA_DEC_LANES");
+        let dec_rows = define("DELTA_DEC_ROWS");
+        let dec_slice = define("DELTA_DEC_SLICE");
+        let dec_cols = define("DELTA_DEC_TG_COLS");
+        let dec_blocks = define("DELTA_DEC_COL_BLOCKS");
+        let dec_sgs = define("DELTA_DEC_SGS");
         let kpl = define("DELTA_V2_KPL");
         let sgs = define("DELTA_V2_SGS");
         let col_tgs = define("DELTA_V2_COL_TGS");
@@ -910,6 +1072,12 @@ mod tests {
             dispatch::DELTA_COL_BLOCKS,
             "delta.metal DELTA_COL_BLOCKS and dispatch.rs DELTA_COL_BLOCKS disagree; \
              the v1 scan grid is sized from the Rust copy"
+        );
+        assert_eq!(
+            dec_blocks,
+            dispatch::DELTA_DEC_COL_BLOCKS,
+            "delta.metal DELTA_DEC_COL_BLOCKS and dispatch.rs DELTA_DEC_COL_BLOCKS disagree; \
+             the decode scan grid is sized from the Rust copy"
         );
         assert_eq!(
             sgs,
@@ -929,6 +1097,24 @@ mod tests {
         assert_eq!(rows * cols, d, "the v1 threadgroup must be DELTA_D threads");
         assert_eq!(slice, d / rows, "v1 state rows per thread");
         assert_eq!(col_blocks, d / cols, "v1 threadgroups per head");
+        assert_eq!(
+            dec_vec * dec_lanes,
+            dec_cols,
+            "a decode threadgroup's float4 groups must tile its columns"
+        );
+        assert_eq!(
+            dec_rows * dec_lanes,
+            d,
+            "the decode threadgroup must be DELTA_D threads"
+        );
+        assert_eq!(dec_slice, d / dec_rows, "decode state rows per thread");
+        assert_eq!(dec_blocks, d / dec_cols, "decode threadgroups per head");
+        assert_eq!(dec_sgs * 32, d, "decode simdgroups per threadgroup");
+        assert_eq!(
+            32 % dec_lanes,
+            0,
+            "a simdgroup must hold a whole number of decode column groups"
+        );
         assert_eq!(kpl * 32, d, "a v2 simdgroup's lanes must cover the key dim");
         assert_eq!(col_tgs * sgs, d, "v2 threadgroups per head");
     }
@@ -1023,6 +1209,155 @@ mod tests {
                 bench("l2norm", &mut || {
                     delta_l2norm(&conv, k_heads, EPS as f32).unwrap();
                 });
+            }
+        }
+    }
+
+    /// Isolation timing for the DECODE scan: the seq == 1 step every decoded
+    /// token runs once per DeltaNet layer, and at Flash-Next's 36 of them the
+    /// largest single share of the GDN mixer (`XWEN_GDN_PROFILE`).
+    ///
+    /// Both kernels in ONE process — they are called directly rather than
+    /// through the cached `XWEN_DELTA_DECODE_KERNEL` switch — and the shape is
+    /// a real token's: `XWEN_BENCH_LAYERS` distinct states, each advanced once
+    /// per iteration, so no state is warm from the dispatch before it and the
+    /// rate is AMORTIZED over a token's worth of dispatches instead of measured
+    /// one dispatch at a time (CLAUDE.md's benching rules).
+    ///
+    /// `#[ignore]`d — run on a `pgrep`-verified free GPU with:
+    ///   cargo test --release -p xwen delta_scan_decode_timing -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf bench"]
+    fn delta_scan_decode_timing() {
+        use std::time::Instant;
+
+        let device = metal_device().unwrap();
+        let Device::Metal(mdev) = &device else {
+            unreachable!("metal_device() returned a non-Metal device")
+        };
+        let get = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let (warm, iters) = (get("XWEN_BENCH_WARMUP", 5), get("XWEN_BENCH_ITERS", 20));
+        let layers = get("XWEN_BENCH_LAYERS", 36);
+
+        for &(k_heads, v_heads) in GEOMETRIES.iter() {
+            let conv_dim = (2 * k_heads + v_heads) * HD;
+            let seed = 0x9500 + v_heads as u64;
+            let conv = on_device(
+                pseudo_random(conv_dim, seed, -2.0, 2.0),
+                (1, conv_dim),
+                &device,
+            );
+            let beta = on_device(
+                pseudo_random(v_heads, seed + 1, 0.01, 0.99),
+                (1, v_heads),
+                &device,
+            );
+            let g = on_device(
+                pseudo_random(v_heads, seed + 2, -0.6, -0.001),
+                (1, v_heads),
+                &device,
+            );
+            // The state read once and written once per layer, plus the streaming
+            // operands — the same floor `LinearAttnBlock::byte_floors` declares.
+            let bytes = 4.0
+                * layers as f64
+                * (2.0 * (v_heads * HD * HD) as f64
+                    + conv_dim as f64
+                    + (v_heads * HD) as f64
+                    + 2.0 * v_heads as f64);
+
+            // The floor arm: candle's affine over the same state, which reads
+            // and writes exactly the bytes the scan does and computes nothing.
+            // A scan arm sitting on this number is bandwidth-bound and not
+            // worth another decomposition.
+            {
+                let mut states: Vec<Tensor> = (0..layers)
+                    .map(|l| {
+                        on_device(
+                            pseudo_random(v_heads * HD * HD, seed + 100 + l as u64, -0.5, 0.5),
+                            (v_heads, HD, HD),
+                            &device,
+                        )
+                    })
+                    .collect();
+                let mut token = || {
+                    for l in 0..layers {
+                        states[l] = states[l].affine(1.0, 0.0).unwrap();
+                    }
+                };
+                for _ in 0..warm {
+                    token();
+                    mdev.wait_until_completed().unwrap();
+                }
+                let mut times = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    token();
+                    mdev.wait_until_completed().unwrap();
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let (median, best) = (times[iters / 2], times[0]);
+                let state_bytes = 4.0 * layers as f64 * 2.0 * (v_heads * HD * HD) as f64;
+                eprintln!(
+                    "decode-scan floor   k={k_heads} v={v_heads} layers={layers}: \
+                     median {median:.3} ms/token ({:.1} GB/s) | best {best:.3} ms ({:.1} GB/s)",
+                    state_bytes / (median * 1e6),
+                    state_bytes / (best * 1e6),
+                );
+            }
+
+            for (label, decode) in [("general", false), ("decode ", true)] {
+                let mut states: Vec<Tensor> = (0..layers)
+                    .map(|l| {
+                        on_device(
+                            pseudo_random(v_heads * HD * HD, seed + 100 + l as u64, -0.5, 0.5),
+                            (v_heads, HD, HD),
+                            &device,
+                        )
+                    })
+                    .collect();
+                let mut token = || {
+                    for l in 0..layers {
+                        let next = if decode {
+                            dispatch::run_delta_scan_decode(
+                                &conv, &beta, &g, &states[l], k_heads, EPS as f32, 1,
+                            )
+                        } else {
+                            dispatch::run_delta_scan_default(
+                                &conv, &beta, &g, &states[l], k_heads, EPS as f32, 1,
+                            )
+                        }
+                        .unwrap()
+                        .1;
+                        states[l] = next.squeeze(0).unwrap();
+                    }
+                };
+                for _ in 0..warm {
+                    token();
+                    mdev.wait_until_completed().unwrap();
+                }
+                let mut times = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    token();
+                    mdev.wait_until_completed().unwrap();
+                    times.push(t.elapsed().as_secs_f64() * 1e3);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let median = times[iters / 2];
+                let best = times[0];
+                eprintln!(
+                    "decode-scan {label} k={k_heads} v={v_heads} layers={layers}: \
+                     median {median:.3} ms/token ({:.1} GB/s) | best {best:.3} ms ({:.1} GB/s)",
+                    bytes / (median * 1e6),
+                    bytes / (best * 1e6),
+                );
             }
         }
     }

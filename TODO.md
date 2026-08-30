@@ -2344,3 +2344,35 @@ Snapshots, page-out, rewind and the disk tier learned the qwen4exp recurrent sta
   the QSA planes on top of the K/V ones, and `snapshot_bytes` is now what sizes it. Do
   not quote the one-shot figures as serve figures until a serve run has been measured
   under the usual protocol (interleaved rounds, medians, power mode stated).
+
+## Deferred from the DeltaNet decode-scan pass (2026-08-30)
+
+`kernel_delta_scan_decode` landed as an OPT-IN arm (`XWEN_DELTA_DECODE_KERNEL=1`,
+the general kernel still runs seq == 1 by default) and measured as a wash
+(log.md 2026-08-30 "later still", decisions.md "A decode-specialized scan kernel is a
+WASH"). These are the two things it deliberately did not take.
+- [ ] **The decode scan still double-buffers its state, and making it in-place is not
+  the kernel's call.** `run_delta_scan_decode` allocates a fresh
+  `[v_heads, 128, 128]` f32 buffer per layer per token and leaves the incoming state
+  untouched, which is what lets a rollback trail hold every state it recorded. Writing
+  the same buffer would move the SAME bytes (3.1 MB read + 3.1 MB written either way —
+  the floor arm of `delta_scan_decode_timing` prices exactly that and the scan is
+  already within 1.4x of it), so the only prizes are the pool allocation and whatever
+  the write-allocate costs, and the price is an aliasing promise no op-level function
+  can make on its own: the armed verify trail holds device-side clones of every state
+  (`kv_cache.rs` `advance_linear`), and any future holder — a prefix-cache image that
+  stops materializing, a serve snapshot that keeps a handle — would be corrupted
+  silently rather than loudly. If it is ever worth doing, the shape is a caller-supplied
+  "this state is unaliased" flag plumbed from `LinearAttnBlock::forward_fused` (which
+  knows `cache.linear_trail_armed()`), not an inference inside `dispatch`.
+- [ ] **`XWEN_GDN_PROFILE`'s decode line overstates a step by roughly its dispatch
+  round trip, and the dispatch-floor correction does not recover it.** The scan measured
+  3.79-7.19 ms/token corrected in that line against 1.43 ms/token in an amortized bench
+  of the same work at the same geometry, and the same inflation applies to every step in
+  the line (its raw mixer total, 78 ms, is more than three whole unprofiled tokens). The
+  line is still useful for RANKING steps within one run — which is how the 27B prefill
+  work used it — but a decode figure from it must not be quoted as a cost, and the
+  shares it prints are shares of an inflated total. Either bracket the whole block once
+  and attribute by difference, or run every step under `XWEN_GDN_REPS` and say so on
+  the line; until then treat it like `XWEN_STACK_PROFILE`'s decode stages (CLAUDE.md
+  already says those rank, not time).
