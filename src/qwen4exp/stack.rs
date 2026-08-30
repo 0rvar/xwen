@@ -424,17 +424,20 @@ impl Qwen4ExpParts {
 /// key planes plus the PLE conv window. Read by `warn_if_over_budget`.
 ///
 /// The indexer planes are allocated at `max_ctx` up front rather than grown
-/// with the KV cache (`IndexerCache` has no growth path in P2) — 4 MB per QSA
-/// layer at 8k positions, and the reason this term is reported rather than
-/// assumed small.
+/// with the KV cache (`IndexerCache` has no growth path in P2) — 5 MB per QSA
+/// layer at 8k positions (raw rows plus the block-key plane), and the reason
+/// this term is reported rather than assumed small.
 pub fn extra_state_bytes(cfg: &XwenConfig, max_ctx: usize) -> u64 {
     let Some(q4) = cfg.qwen4exp.as_ref() else {
         return 0;
     };
     let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
     let indexer = n_full
-        * max_ctx as u64
-        * super::indexer::indexer_bytes_per_token(q4.indexer_head_dim) as u64;
+        * super::indexer::indexer_plane_bytes(
+            q4.indexer_head_dim,
+            q4.indexer_compress_ratio,
+            max_ctx,
+        ) as u64;
     let ple = match q4.ple.as_ref() {
         // conv window: `[hc_count * hidden, (kernel - 1) * ngram_size]` f32.
         Some(p) => {

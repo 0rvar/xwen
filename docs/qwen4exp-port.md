@@ -1062,6 +1062,7 @@ decoded tokens, arms interleaved, four rounds, medians:
 | shipped (fused hc, split below 32, Q5_1 `mm_id`) | **795.7** | **43.1** |
 | + PLE row prefetch (ac40526), cold prompt per arm | 774.7-797.9 | **44.5-45.8** |
 | + beta\|alpha fold (0261e17, 2026-08-30), decode arm only | 796-798, unchanged | **46.5-46.7** |
+| by context, after the QSA block-key cache + fused gather (2026-08-30, 64 decoded, thermal protocol): 1937 / 3803 / 7606 tokens | 961-998 / 825-841 / 711-736 | **45.4-46.2 / 32.8-32.9 / 33.5** (was 30.4-30.5 / 30.3 above the 2048 budget) |
 | `XWEN_HC_SPLIT_MAX_N=0` (fused, single kernel) | 793.5 | 35.1 |
 | `XWEN_HC_CLASSIC=1` (candle chains, Q5_1 arm still on) | 438.0 | 37.8 |
 | llama.cpp, same file, same hour | 789 | 41.4 |

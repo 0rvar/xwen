@@ -503,7 +503,10 @@ impl AttnBlock {
                      vector sdpa ignores one), so a caller-supplied mask would be silently \
                      dropped"
                 );
-                (gather_rows(&k_all, rows)?, gather_rows(&v_all, rows)?)
+                (
+                    crate::ops::qsa_gather::gather_rows(&k_all, rows)?,
+                    crate::ops::qsa_gather::gather_rows(&v_all, rows)?,
+                )
             }
             _ => (k_all, v_all),
         };
@@ -684,33 +687,6 @@ impl AttnBlock {
     }
 }
 
-/// Pack the cache rows `rows` names out of a `[heads, len, head_dim]` cache
-/// view into a contiguous `[heads, n_sel, head_dim]` plane — the decode half of
-/// the QSA overlay.
-///
-/// One `index_select` per head, deliberately, rather than one call over the
-/// whole rank-3 view. A cache view is a `narrow` of a `max_ctx`-slot buffer, so
-/// it is strided across the head axis, and candle's Metal `index_select`
-/// MIS-HANDLES a strided source at the pinned rev: `call_index_select` passes
-/// the indexed dimension's SIZE where the kernel's `get_strided_index` expects
-/// the tensor's RANK (candle-metal-kernels indexing.metal), so every gathered
-/// element is read from a garbage offset — silently, with the right shape. A
-/// single head's slice IS contiguous by candle's own rule (a leading axis of
-/// extent 1 is skipped when checking strides), which puts each of these
-/// dispatches on the kernel's correct contiguous path. Head counts here are 2-4,
-/// so this is a handful of dispatches, not a loop that matters.
-fn gather_rows(t: &Tensor, rows: &Tensor) -> Result<Tensor> {
-    let (heads, len, head_dim) = t.dims3()?;
-    let mut packed = Vec::with_capacity(heads);
-    for h in 0..heads {
-        packed.push(
-            t.narrow(0, h, 1)?
-                .reshape((len, head_dim))?
-                .index_select(rows, 0)?,
-        );
-    }
-    Ok(Tensor::stack(&packed, 0)?)
-}
 #[cfg(test)]
 mod tests {
     use super::*;

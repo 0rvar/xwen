@@ -13,6 +13,7 @@ pub mod mv_ext;
 pub mod mv_id;
 mod pipelines;
 pub mod q8;
+pub mod qsa_gather;
 pub mod silu_mul;
 
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
@@ -503,6 +504,23 @@ pub fn attn_glue_classic() -> bool {
 pub fn hc_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_HC_CLASSIC").is_some())
+}
+
+/// Kill switch (`XWEN_QSA_CLASSIC`) for the QSA indexer's fast decode path on
+/// a qwen4exp checkpoint: the cached block-key plane (every complete block's
+/// pooled+normed+roped key built once, `indexer::IndexerCache`) and the fused
+/// K/V row gather (`ops::qsa_gather`). Set, `QsaIndexer::select` recomputes
+/// every block key from the raw rows on each call and the attention gathers
+/// its selected rows through the per-head `index_select` chain. Both arms are
+/// BIT-IDENTICAL by construction (the pool replays candle's strided-reduce
+/// order, the gather is a copy), so this is a fallback, never a parity row.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`hc_classic`, `attn_glue_classic`): any value enables it — only leaving it
+/// unset keeps the fast path.
+pub fn qsa_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_QSA_CLASSIC").is_some())
 }
 
 /// Token count the carrier's grouped norm must be BELOW for `ops::hc_norm` to

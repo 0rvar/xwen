@@ -151,6 +151,9 @@ struct Qwen4ExpCaches {
     /// values — so its 4 query heads (`head_count`) cost nothing per token and
     /// are not recorded here.
     indexer_head_dim: usize,
+    /// Tokens per indexer block (`attention.indexer.compress_ratio` = 4): the
+    /// derived block-key plane holds one key per this many tokens.
+    indexer_compress_ratio: usize,
     /// Layers carrying a PLE block (`ple.layers` — a single layer today).
     ple_layers: usize,
     /// Columns of history the PLE conv keeps: kernel 4 at dilation 3 spans 10
@@ -283,6 +286,7 @@ const QWEN_38_FLASH_NEXT: Checkpoint = Checkpoint {
         conv_kernel: 4,
         extras: Some(Qwen4ExpCaches {
             indexer_head_dim: 128,
+            indexer_compress_ratio: 4,
             ple_layers: 1,
             ple_conv_cols: 9,
             ple_conv_width: 4 * 2560,
@@ -678,8 +682,9 @@ impl Model {
     /// plane: the QSA lightning indexer's raw keys, which have to be kept for
     /// every position because that is what the indexer scores. It is one MQA
     /// key head at 128, held f32 — 512 B/token/layer against the trunk's 2048,
-    /// so leaving it out would under-size an operator's context budget by a
-    /// fifth. The per-token figure comes from
+    /// plus 128 for the derived block-key plane (one f32 key per 4 tokens) —
+    /// so leaving it out would under-size an operator's context budget by
+    /// nearly a quarter. The per-token figure comes from
     /// [`crate::qwen4exp::indexer::indexer_bytes_per_token`], the same function
     /// the allocation itself is sized with, rather than being restated here:
     /// the head count and the dtype are both easy to get wrong from the outside
@@ -688,9 +693,10 @@ impl Model {
         let g = &self.checkpoint().geometry;
         let trunk = g.n_kv_head * g.head_dim * 2 * 2;
         let indexer = match &g.extras {
-            Some(extras) => {
-                crate::qwen4exp::indexer::indexer_bytes_per_token(extras.indexer_head_dim)
-            }
+            Some(extras) => crate::qwen4exp::indexer::indexer_bytes_per_token(
+                extras.indexer_head_dim,
+                extras.indexer_compress_ratio,
+            ),
             None => 0,
         };
         g.full_attn_layers * (trunk + indexer)
@@ -983,18 +989,19 @@ mod tests {
         use crate::qwen4exp::indexer::indexer_bytes_per_token;
 
         // 12 full-attn layers x (2 KV heads x 256 head_dim x K-and-V x 2 bytes
-        // f16 = 2048, plus the indexer's one 128-wide f32 key row = 512).
-        assert_eq!(Model::Qwen38FlashNext.kv_bytes_per_token(), 30 * 1024);
+        // f16 = 2048, plus the indexer's one 128-wide f32 key row = 512, plus
+        // that row's share of the block-key plane, 512 / ratio 4 = 128).
+        assert_eq!(Model::Qwen38FlashNext.kv_bytes_per_token(), 12 * 2688);
         let trunk_only = 12 * 2 * 256 * 2 * 2;
         assert_eq!(
             Model::Qwen38FlashNext.kv_bytes_per_token(),
-            trunk_only + 12 * indexer_bytes_per_token(128)
+            trunk_only + 12 * indexer_bytes_per_token(128, 4)
         );
-        // A quarter more than the trunk's rows, not a rounding error: dropping
-        // it would under-size a context budget by a fifth.
-        assert_eq!(indexer_bytes_per_token(128), 512);
+        // Over a quarter more than the trunk's rows, not a rounding error:
+        // dropping it would under-size a context budget by almost a quarter.
+        assert_eq!(indexer_bytes_per_token(128, 4), 640);
         assert_eq!(
-            trunk_only * 5 / 4,
+            trunk_only * 21 / 16,
             Model::Qwen38FlashNext.kv_bytes_per_token()
         );
 

@@ -2108,6 +2108,30 @@ working doc — spec, traps, phase plan, running log — and stays that. **This 
 the authority for the decisions themselves**; the port doc's own Decisions list is
 retained as the record of what was decided when, and points here.
 
+**Block keys are cached per complete block (2026-08-30).** The QSA indexer's block key
+— mean over `ratio` raw keys, k_norm, rope at the block's first position — is a
+function of that block's rows alone, and those rows are immutable while they sit below
+the cache length (the cache is position-indexed; only a truncation followed by an append
+rewrites a row, and that moves the length below the block first). So `IndexerCache`
+keeps the keys of the first `blocks_ready` complete blocks in a derived plane and
+`select` builds only the new ones, in one batch, instead of recomputing all of them from
+every raw key on every step. Invalidation lives in ONE setter: every `len` write clamps
+`blocks_ready` to `len / ratio`. The one non-clamp is `import_rows`, which resets to 0 —
+the rows below an import are replaced by the image, so a key computed from the old rows
+would silently survive into the new conversation; a full rebuild is one batched call.
+The plane is device-only derived state: not exported, not part of the snapshot format,
+and `indexer_bytes_per_token` reports it amortized (128 B/token at ratio 4) while
+`indexer_plane_bytes` reports the exact allocation. The pool and the per-head score sum
+use `strided_sum`, which replays candle's strided-reduce order — `(n/2)` threads
+accumulating `i ≡ tid (mod width)` in order, then one add — so the fast path is
+bit-identical to the `mean(1)` / `sum(0)` it replaced at extent 4; the identity holds up
+to extent 5 (one or two threads) and is REFUSED above, where candle folds through a
+4-lane `simd_sum` in an order the tree does not reproduce (1 ulp at extent 6, measured).
+The K/V row gather for the decode selection is one Metal kernel per plane
+(`ops::qsa_gather`), a copy and therefore bitwise; a non-Metal source takes the candle
+chain with no switch. `XWEN_QSA_CLASSIC` restores both old paths. Bench and the caveat
+on the prefill difference: log.md 2026-08-30 (QSA decode, steps A+B).
+
 **Third arch, composition over forking.** `Arch::Qwen4Exp` gets its own graph module;
 shared blocks (DeltaNet, attention internals, MoE glue, rope) are reused by composition
 and parameterized only where the math actually differs. The qwen35/qwen35moe forward

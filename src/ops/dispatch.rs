@@ -4289,6 +4289,155 @@ fn check_flash_kv(
 }
 
 // ---------------------------------------------------------------------------
+// QSA decode row gather — see src/ops/qsa_gather.metal.
+
+/// Matches the Metal `qsa_gather_args` struct (src/ops/qsa_gather.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaGatherArgs {
+    heads: i32,
+    len: i32,
+    head_dim: i32,
+    n_sel: i32,
+    src_stride_h: i64,
+    src_stride_r: i64,
+}
+
+/// Pack the rows `rows` (u32 `[n_sel]`) names out of a `[heads, len,
+/// head_dim]` cache view (f16 or f32; rows contiguous, head stride free)
+/// into a contiguous `[heads, n_sel, head_dim]` tensor of the same dtype,
+/// against `kernel_qsa_gather_{f16,f32}`. One threadgroup per (row, head).
+pub(crate) fn run_qsa_gather(t: &Tensor, rows: &Tensor) -> Result<Tensor> {
+    let cdev = t.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("qsa_gather requires its source on a Metal device");
+    };
+    let (heads, len, head_dim) = t.dims3().map_err(|e| {
+        anyhow::anyhow!("qsa_gather source must be rank-3 [heads, len, head_dim]: {e}")
+    })?;
+    let name = match t.dtype() {
+        DType::F16 => "kernel_qsa_gather_f16",
+        DType::F32 => "kernel_qsa_gather_f32",
+        other => bail!("qsa_gather has no kernel for {other:?}"),
+    };
+    if head_dim == 0 || !head_dim.is_multiple_of(4) {
+        bail!("qsa_gather head_dim {head_dim} must be a positive multiple of 4");
+    }
+    let stride = t.layout().stride();
+    if stride[2] != 1 || stride[1] != head_dim {
+        bail!(
+            "qsa_gather source must have contiguous rows (strides [_, {head_dim}, 1]), got {stride:?}"
+        );
+    }
+    if heads > 1 && stride[0] < len * head_dim {
+        bail!(
+            "qsa_gather source head stride {} overlaps its {len} rows",
+            stride[0]
+        );
+    }
+    // The kernel copies through 4-element vector device pointers, which Metal
+    // requires aligned to the vector (8 bytes at f16, 16 at f32): rows are
+    // (head_dim % 4 == 0 above), so only a view start or a head stride that is
+    // not a multiple of 4 elements could break it. The cache views are
+    // (start 0, head stride max_ctx * head_dim); a hand-sliced view lands here.
+    let start = t.layout().start_offset();
+    if !start.is_multiple_of(4) || !stride[0].is_multiple_of(4) {
+        bail!(
+            "qsa_gather source must start and stride heads at multiples of 4 elements (vector \
+             loads), got start {start}, head stride {}",
+            stride[0]
+        );
+    }
+    if rows.dtype() != DType::U32 {
+        bail!("qsa_gather rows must be u32, got {:?}", rows.dtype());
+    }
+    if !rows.is_contiguous() {
+        bail!("qsa_gather rows must be contiguous");
+    }
+    let n_sel = rows.dims1()?;
+    if heads == 0 || len == 0 || n_sel == 0 {
+        bail!(
+            "qsa_gather over an empty source or selection ({heads} heads, {len} rows, {n_sel} selected)"
+        );
+    }
+    if !rows.device().same_device(&cdev) {
+        bail!("qsa_gather rows must live on the source's Metal device");
+    }
+    for (v, what) in [
+        (heads, "heads"),
+        (len, "len"),
+        (head_dim, "head_dim"),
+        (n_sel, "n_sel"),
+    ] {
+        if v > i32::MAX as usize {
+            bail!("qsa_gather {what} {v} overflows i32");
+        }
+    }
+    let out_count = checked_elems(&[heads, n_sel, head_dim], "qsa_gather")?;
+    let i64_stride = |s: usize, what: &str| -> Result<i64> {
+        i64::try_from(s).map_err(|_| anyhow::anyhow!("qsa_gather {what} stride {s} overflows i64"))
+    };
+
+    let pipeline = pipelines::qsa_gather_pipeline(mdev.device(), name)?;
+    let dst = mdev.new_buffer(out_count, t.dtype(), "qsa_gather")?;
+
+    let (t_guard, t_layout) = t.storage_and_layout();
+    let Storage::Metal(t_storage) = &*t_guard else {
+        bail!("qsa_gather source is not on a Metal device");
+    };
+    let (r_guard, r_layout) = rows.storage_and_layout();
+    let Storage::Metal(r_storage) = &*r_guard else {
+        bail!("qsa_gather rows are not on a Metal device");
+    };
+
+    let args = QsaGatherArgs {
+        heads: heads as i32,
+        len: len as i32,
+        head_dim: head_dim as i32,
+        n_sel: n_sel as i32,
+        src_stride_h: i64_stride(stride[0], "head")?,
+        src_stride_r: i64_stride(stride[1], "row")?,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(t_storage.buffer()),
+            t_layout.start_offset() * t.dtype().size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(r_storage.buffer()),
+            r_layout.start_offset() * DType::U32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        // One threadgroup per (selected row, head); a thread per 4-wide vector
+        // of the row, capped at the pipeline's width (the kernel strides).
+        let width = pipeline
+            .max_total_threads_per_threadgroup()
+            .min(256)
+            .min(head_dim / 4)
+            .max(1);
+        encoder.dispatch_thread_groups(mtl_size!(n_sel, heads, 1), mtl_size!(width, 1, 1));
+    }
+    drop(t_guard);
+    drop(r_guard);
+
+    let storage = MetalStorage::new(dst, mdev.clone(), out_count, t.dtype());
+    Ok(Tensor::from_storage(
+        Storage::Metal(storage),
+        (heads, n_sel, head_dim),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Hyper-connections (qwen4exp carrier read/write) — see src/ops/hc.metal.
 // ---------------------------------------------------------------------------
 

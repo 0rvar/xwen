@@ -2491,3 +2491,18 @@ A/B named four things it did not take.
   not cheap) and `ple` +3.2 ms (unexplained, possibly bleed from the adjacent syncs), so
   the fix also needs a single-dispatch gather (or attention reading the row list
   directly). The shipped checkpoints have no indexer and are unaffected. No runtime QSA kill switch exists (`force_dense_qsa` is cfg(test)).
+  **2026-08-30, later: steps A and B SHIPPED** (block-key cache in `IndexerCache`, fused
+  `ops::qsa_gather` kernel, kill switch `XWEN_QSA_CLASSIC`; log.md "QSA decode, steps
+  A+B", decisions.md "Block keys are cached per complete block"). Measured under the
+  thermal protocol: 3.8k 30.5 → 32.9, 7.6k 30.3 → 33.5, below-budget 45.4-45.9 both
+  arms, greedy byte-identical. ~8.5 ms/token of the cliff remains (32.8 → 30.4 ms/step at
+  3.8k against 21.8 below budget). **Step C is next**: a device-side top-k (or fused
+  score+select writing row indices) that removes the 12 per-step score readbacks.
+  - `strided_sum` (the reduce-order replay) refuses extents above 5: candle's reducer
+    folds through a 4-lane `simd_sum` there and the bit-identity breaks (1 ulp at
+    extent 6). Both production extents are 4; a checkpoint with `ratio` or indexer
+    head count above 5 would fail at `select` and needs either the plain `sum` (bounded,
+    not bitwise) or a widened replay.
+  - The fused gather is Metal-only; a non-Metal source (the CPU/oracle attention
+    path) takes the `index_select` chain with no switch. The kernel refuses a view
+    whose start or head stride is not a multiple of 4 elements (vec4 loads).

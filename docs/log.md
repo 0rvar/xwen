@@ -4,6 +4,60 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-30 (QSA decode, steps A+B) — block keys cached per complete block and the K/V row gather fused: Flash-Next decode above the 2048 budget 30.5 → 32.9 at 3.8k, 30.3 → 33.5 at 7.6k
+
+The decode cliff at the QSA budget (TODO.md, measured earlier today: 46 tok/s below 2048
+tokens, ~30 above) had three named costs, and this arc took the first two: the pooled
+block keys were recomputed from EVERY raw key on every step in 12 layers, through a
+`mean(1)` that candle routes to `fast_sum_f32_strided` (one two-thread threadgroup per
+output — ~1.5 M per step at 4k), and the `Rows` gather ran 3 candle dispatches per
+plane per layer. The third — one host readback of the scores per layer, 12 pipeline
+drains per step — is step C and is still there.
+
+**A. Block-key cache.** A complete block's key (pool → k_norm → rope at the block's
+first position) depends only on its own `ratio` raw rows, which never change while they
+sit below the cache length, so `IndexerCache` now carries a derived plane
+`blocks: [max_ctx/ratio, 128] f32` plus `blocks_ready`. `select` builds only the
+blocks `[blocks_ready, n_blocks)`, in one batch: at decode that is no key work on three
+steps of four and one block on the fourth. Every `len` write goes through one private
+`set_len` that clamps `blocks_ready` to `len / ratio` (truncate, rollback, reset);
+`import_rows` resets it to 0 outright, because the rows below the import were replaced,
+not kept. The plane is never exported — an image carries raw rows and the next `select`
+rebuilds in one batch. Pooling and the per-head score sum no longer call candle's
+reduce: `strided_sum` adds the narrows in the reduce's own two-thread order,
+`(r0+r2)+(r1+r3)`, which is bit-identical to `mean(1)` / `sum(0)` at extent 4 (and
+up to 5; refused above, where candle's simd fold orders differently).
+
+**B. Fused gather.** `kernel_qsa_gather_{f16,f32}` (`src/ops/qsa_gather.metal`): one
+threadgroup per (selected row, head), vec4 copies, strides passed in for the head-strided
+cache view. Two dispatches per layer instead of six; a copy, so bitwise.
+
+Kill switch `XWEN_QSA_CLASSIC` runs the old full recompute and the `index_select` chain;
+a scripted test (`cached_block_keys_match_the_classic_recompute`: chunked prefill
+crossing the budget, decode steps, a rollback, a truncate below a block boundary,
+refills, export/import) holds both arms to identical selections and the plane to a
+from-scratch recompute with 0 differing elements. Accounting: `indexer_bytes_per_token`
+now takes the ratio and reports 640 B/token/layer (512 raw + 128 amortized block row);
+`Model::kv_bytes_per_token` on Flash-Next 30720 → 32256.
+
+**Bench** (thermal protocol: anchor arm first and last, arms interleaved classic-then-
+fused per prompt, 60 s pauses between rounds; `--no-draft --raw -n 64 --stats`,
+`pmset -g` printed `powermode 0` before and after):
+
+| prompt | classic decode | fused decode | classic prefill | fused prefill |
+| --- | --- | --- | --- | --- |
+| 1937 (below budget) r1 / r2 | 45.9 / 45.9 | 45.7 / 45.4 | 985.8 / 997.5 | 961.3 / 960.2 |
+| 3803 r1 / r2 | 30.5 / 30.4 | 32.8 / 32.9 | 841.4 / 833.1 | 837.6 / 824.7 |
+| 7606 (one round) | 30.3 | 33.5 | 736.3 | 711.0 |
+| anchor (1937, fused) start → end | | 45.6 → 46.2 | 988.9 → 962.4 | |
+
+Anchor drift +1.3% on decode, within the 3% flag. Greedy text (`--top-k 1`, 3803
+prompt, 64 tokens) byte-identical between arms. Caveat: every round ran classic then
+fused, so the 1-3% lower prefill in the fused arm is order-confounded (the anchor's own
+prefill fell 2.7% across the session with nothing changed) and is not yet a finding.
+Per-step at 3.8k: 32.8 → 30.4 ms against 21.8 ms below budget, so ~8.5 ms of the cliff
+remains, consistent with the 12 readback syncs step C removes.
+
 ## 2026-08-30 (prefill chunk) — the prefill chunk goes per architecture: 2048 on the MoE checkpoints (+10% Flash-Next, +8% 35B-A3B at 3.9k tokens), 512 stays on the dense 27B where 2048 is 5-6% slower
 
 The prefill chunk had been a flat `const PREFILL_CHUNK = 512` in generate.rs and again in

@@ -257,7 +257,7 @@ impl QsaIndexer {
 
     /// A raw-key cache sized for this indexer.
     pub fn new_cache(&self, max_ctx: usize, device: &Device) -> Result<IndexerCache> {
-        IndexerCache::new(max_ctx, self.head_dim, device)
+        IndexerCache::new(max_ctx, self.head_dim, self.ratio, device)
     }
 
     /// Append this chunk's raw keys and decide what its queries may attend to.
@@ -271,6 +271,22 @@ impl QsaIndexer {
         x_normed: &Tensor,
         cache: &mut IndexerCache,
         pos: usize,
+    ) -> Result<QsaSelection> {
+        self.select_with(x_normed, cache, pos, crate::ops::qsa_classic())
+    }
+
+    /// [`Self::select`] with the block-key path chosen by the caller instead of
+    /// by `XWEN_QSA_CLASSIC`: `classic` recomputes every block key from the raw
+    /// rows each call ([`Self::block_keys_classic`]), the default reads them off
+    /// the cache's block plane ([`Self::block_keys_cached`]). The two are
+    /// bit-identical (`cached_block_keys_match_the_classic_recompute`); the
+    /// split exists so one test can run both over one scripted sequence.
+    fn select_with(
+        &self,
+        x_normed: &Tensor,
+        cache: &mut IndexerCache,
+        pos: usize,
+        classic: bool,
     ) -> Result<QsaSelection> {
         let (n, _hidden) = x_normed.dims2()?;
         ensure!(
@@ -309,28 +325,14 @@ impl QsaIndexer {
             DType::F32,
         )?;
 
-        // Block keys, once for the whole chunk (see the module header): mean in
-        // f32 over each complete run of `ratio` raw keys, RMS norm, rope at the
-        // run's first token. The pooled key is deliberately NOT rounded back to
-        // the cache dtype first (ref_qsa "Pooled keys stay f32").
+        // Block keys, `[n_blocks, head_dim]` f32 (see the module header and
+        // `block_keys`).
         let n_blocks = n_kv / self.ratio;
-        let pooled = cache
-            .visible(n_blocks * self.ratio)?
-            .reshape((n_blocks, self.ratio, self.head_dim))?
-            .mean(1)?;
-        let block_pos: Vec<u32> = (0..n_blocks).map(|b| (b * self.ratio) as u32).collect();
-        let block_pos = Tensor::from_vec(block_pos, n_blocks, device)?;
-        let keys = self
-            .rope
-            .rotate_at(
-                &self
-                    .k_norm
-                    .forward(&pooled)?
-                    .reshape((1, n_blocks, self.head_dim))?,
-                &block_pos,
-                DType::F32,
-            )?
-            .reshape((n_blocks, self.head_dim))?;
+        let keys = if classic {
+            self.block_keys_classic(cache, n_blocks)?
+        } else {
+            self.block_keys_cached(cache, n_blocks)?
+        };
 
         // score[q, b] = Σ_heads relu(q_h · k_b) / √head_dim. The relu is per
         // head, BEFORE the sum, so a block every head dislikes scores exactly 0
@@ -342,7 +344,7 @@ impl QsaIndexer {
             .matmul(&keys.t()?)?
             .relu()?
             .reshape((self.n_heads, n, n_blocks))?;
-        let scores = (per_head.sum(0)? * scale)?; // [n, n_blocks]
+        let scores = (strided_sum(&per_head, 0)? * scale)?; // [n, n_blocks]
         let scores = scores.flatten_all()?.to_vec1::<f32>()?;
 
         let sets = self.top_blocks(&scores, n, n_blocks, pos);
@@ -369,6 +371,75 @@ impl QsaIndexer {
             (n, n_kv),
             device,
         )?))
+    }
+
+    /// The keys of blocks `[start, start + m)` from their raw rows: mean in f32
+    /// over each run of `ratio` raw keys, RMS norm, rope at the run's first
+    /// token. The pooled key is deliberately NOT rounded back to the cache dtype
+    /// first (ref_qsa "Pooled keys stay f32"). `[m, head_dim]` f32.
+    ///
+    /// Every step is per-block — the pool reads one block's rows, the norm is
+    /// per row, the rope is per element at that block's own position — so the
+    /// keys of a block range are the same bits whether they are computed alone
+    /// or inside a wider range. That independence is what lets the cached path
+    /// build only the blocks that are new and still agree with the classic
+    /// path's whole-prefix recompute, bit for bit.
+    fn block_keys(&self, cache: &IndexerCache, start: usize, m: usize) -> Result<Tensor> {
+        let device = cache.raw.device();
+        let runs = cache
+            .visible((start + m) * self.ratio)?
+            .narrow(0, start * self.ratio, m * self.ratio)?
+            .reshape((m, self.ratio, self.head_dim))?;
+        let pooled = (strided_sum(&runs, 1)? * (1.0 / self.ratio as f64))?;
+        let block_pos: Vec<u32> = (start..start + m)
+            .map(|b| (b * self.ratio) as u32)
+            .collect();
+        let block_pos = Tensor::from_vec(block_pos, m, device)?;
+        Ok(self
+            .rope
+            .rotate_at(
+                &self
+                    .k_norm
+                    .forward(&pooled)?
+                    .reshape((1, m, self.head_dim))?,
+                &block_pos,
+                DType::F32,
+            )?
+            .reshape((m, self.head_dim))?)
+    }
+
+    /// The `XWEN_QSA_CLASSIC` arm: every complete block's key, recomputed from
+    /// the raw rows on every call.
+    fn block_keys_classic(&self, cache: &IndexerCache, n_blocks: usize) -> Result<Tensor> {
+        self.block_keys(cache, 0, n_blocks)
+    }
+
+    /// The default arm: the first `n_blocks` rows of the cache's block plane,
+    /// after building the ones it does not hold yet — `[blocks_ready, n_blocks)`
+    /// — in ONE batch. A complete block's key depends only on its own `ratio`
+    /// raw rows, which never change while they sit below the cache length, so a
+    /// row of the plane stays valid until a truncation drops below its block
+    /// ([`IndexerCache::set_len`]). At decode that is no key work on three
+    /// steps of four and one block on the fourth; at prefill it is the chunk's
+    /// blocks; after an import it is a one-time rebuild.
+    ///
+    /// The returned tensor is a LIVE narrow over the block plane, not a copy:
+    /// a later append can rewrite rows at or above `blocks_ready`, so it must
+    /// not outlive the `select_with` call that asked for it.
+    fn block_keys_cached(&self, cache: &mut IndexerCache, n_blocks: usize) -> Result<Tensor> {
+        ensure!(
+            cache.ratio == self.ratio,
+            "indexer cache was sized for ratio {}, the indexer's is {}",
+            cache.ratio,
+            self.ratio
+        );
+        if cache.blocks_ready < n_blocks {
+            let start = cache.blocks_ready;
+            let fresh = self.block_keys(cache, start, n_blocks - start)?;
+            cache.blocks.slice_set(&fresh, 0, start)?;
+            cache.blocks_ready = n_blocks;
+        }
+        Ok(cache.blocks.narrow(0, 0, n_blocks)?)
     }
 
     /// The top blocks for each query of a chunk, ascending by block index.
@@ -432,8 +503,74 @@ impl QsaIndexer {
     }
 }
 
+/// Sum `t` over `dim` as narrows added in index order — `((t_0 + t_1) + t_2)
+/// + ...` — instead of `Tensor::sum`.
+///
+/// candle routes a sum over a non-trailing axis of a contiguous tensor to
+/// `fast_sum_f32_strided`, which launches one threadgroup of TWO threads per
+/// output element: over the `[n_blocks, ratio, head_dim]` pool that is
+/// `n_blocks * head_dim` tiny threadgroups per call, the single largest item
+/// on the above-budget decode step. The extents summed here are 4 (the block
+/// ratio, the query head count), so a handful of elementwise adds over
+/// contiguous rows is both cheaper and — with the reduce's own
+/// per-thread-then-tree order reproduced for an extent of 4, `(t_0 + t_2) +
+/// (t_1 + t_3)` — bit-identical to it, which is what keeps the classic and
+/// default arms of `select_with` on the same selections.
+///
+/// Two limits of that identity, one enforced and one noted. Enforced: extents
+/// above 5 are refused — from 4 threads up candle's reducer folds the partials
+/// through a 4-lane `simd_sum`, whose order this tree does not reproduce (a
+/// last-ulp difference, measured at extent 6). Noted: candle seeds each
+/// thread's accumulator from +0.0 where this seeds from the first element, so
+/// an all-`-0.0` slice sums to `-0.0` here and `+0.0` there — a sign of zero
+/// only, and neither caller can produce it (relu'd scores and pooled
+/// projections are never all negative zero).
+fn strided_sum(t: &Tensor, dim: usize) -> Result<Tensor> {
+    let n = t.dim(dim)?;
+    ensure!(n > 0, "strided_sum over an empty axis");
+    ensure!(
+        n <= 5,
+        "strided_sum over an extent of {n}: only extents up to 5 (one or two reduce threads) \
+         reproduce candle's strided reduce bit for bit; above that its 4-lane simd_sum fold \
+         orders the partials differently"
+    );
+    let part = |i: usize| -> Result<Tensor> { Ok(t.narrow(dim, i, 1)?.squeeze(dim)?) };
+    // candle's strided reduce runs `(n / 2).next_power_of_two()` threads
+    // (integer division: 1 thread up to n = 3, 2 at n = 4 and 5, then 4), each
+    // accumulating the elements `i ≡ tid (mod width)` in order, then combines
+    // the per-thread partials. With one or two partials there is exactly one
+    // way to add them, so extents up to 5 reproduce the kernel's bits
+    // (`strided_sum_matches_candle_reduce_bitwise`); from 4 threads up the
+    // kernel folds through `simd_sum`, whose order this halving tree does not
+    // promise to match — a last-ulp difference, and no caller here has an
+    // extent above 4.
+    let width = (n / 2).next_power_of_two().max(1);
+    let mut partial: Vec<Option<Tensor>> = vec![None; width];
+    for i in 0..n {
+        let slot = &mut partial[i % width];
+        *slot = Some(match slot.take() {
+            None => part(i)?,
+            Some(acc) => (acc + part(i)?)?,
+        });
+    }
+    let mut stride = width / 2;
+    while stride > 0 {
+        for tid in 0..stride {
+            let lo = partial[tid].take();
+            let hi = partial[tid + stride].take();
+            partial[tid] = match (lo, hi) {
+                (Some(a), Some(b)) => Some((a + b)?),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+        }
+        stride /= 2;
+    }
+    partial[0].take().context("strided_sum: no partials")
+}
+
 /// One QSA layer's raw indexer keys, `[max_ctx, head_dim]` f32, appended in
-/// position order.
+/// position order, plus the derived plane of complete-block keys.
 ///
 /// This is the `LayerCache::Full` story with one head and no values: every
 /// token writes its own absolute slot, so a rollback is a pure length
@@ -447,27 +584,69 @@ impl QsaIndexer {
 /// f32, not the BF16 the HF implementation caches: the pooled key is used at
 /// f32 anyway (`ref_qsa` D13), and 4 MB per layer at 8k context is not worth a
 /// precision argument.
+///
+/// The block plane (`blocks`, `[max_ctx / ratio, head_dim]` f32) is DERIVED
+/// state — the pooled, normed, roped key of each complete block, filled in
+/// batches by `QsaIndexer::block_keys_cached` and valid for the first
+/// `blocks_ready` rows only. It is never exported: an image carries the raw
+/// rows, and the import leaves `blocks_ready` at 0 so the next `select`
+/// rebuilds the plane in one batch. Every write to `len` goes through
+/// [`Self::set_len`], which is where the plane is invalidated.
 pub struct IndexerCache {
     raw: Tensor,
     len: usize,
+    /// Tokens per block, fixing the block plane's row count and the
+    /// `len -> blocks_ready` clamp.
+    ratio: usize,
+    blocks: Tensor,
+    /// Leading rows of `blocks` that hold a valid key. Rows at or above it are
+    /// stale and never read.
+    blocks_ready: usize,
 }
 
-/// Bytes one more position of context costs in ONE QSA layer's indexer key
-/// plane.
+/// Bytes one more position of context costs in ONE QSA layer's indexer planes:
+/// the raw key row plus its share of the derived block-key plane.
 ///
-/// Two things about that plane make the obvious arithmetic wrong, which is why
-/// this is a function every caller shares rather than a formula each restates.
-/// It is MQA — exactly ONE key head, whatever the query head count is (4 on the
-/// shipped checkpoint) — and [`IndexerCache::new`] allocates it f32, not the
-/// f16 the trunk's KV rows use. 512 bytes per token per QSA layer here, where
-/// reasoning from the query heads and the trunk's dtype gives 1024.
+/// Two things about the raw plane make the obvious arithmetic wrong, which is
+/// why this is a function every caller shares rather than a formula each
+/// restates. It is MQA — exactly ONE key head, whatever the query head count is
+/// (4 on the shipped checkpoint) — and [`IndexerCache::new`] allocates it f32,
+/// not the f16 the trunk's KV rows use. 512 bytes per token per QSA layer
+/// there, where reasoning from the query heads and the trunk's dtype gives
+/// 1024. The block plane adds one f32 key per `ratio` tokens: 128 more at the
+/// shipped ratio of 4, 640 in all.
+///
+/// The block-plane term is AMORTIZED — one row per `ratio` tokens, spread
+/// evenly — and the plane itself is device-only derived state: it is not part
+/// of the host image a page-out or snapshot carries, so this figure sizes
+/// device memory per position, not the bytes a snapshot stores. (The serve
+/// `--init` template's `ctx_gb` estimate is built from it and so now counts
+/// ~4% of device-only bytes; that is the intended reading of a context
+/// budget.) The exact allocation of a whole plane pair is
+/// [`indexer_plane_bytes`].
 ///
 /// Both the size an operator is told to budget for
 /// (`Model::kv_bytes_per_token`) and the size actually allocated
-/// (`super::stack::extra_state_bytes`) come from here, so the two cannot drift.
-pub const fn indexer_bytes_per_token(head_dim: usize) -> usize {
-    // One key head x head_dim x size_of::<f32>().
-    head_dim * 4
+/// (`super::stack::extra_state_bytes`, via [`indexer_plane_bytes`]) rest on the
+/// same row size, so the two cannot drift.
+pub const fn indexer_bytes_per_token(head_dim: usize, ratio: usize) -> usize {
+    // One key head x head_dim x size_of::<f32>(), plus the block plane's row
+    // spread over the ratio tokens it summarizes.
+    head_dim * 4 + head_dim * 4 / ratio
+}
+
+/// Bytes [`IndexerCache::new`] allocates for ONE QSA layer at `max_ctx`: the
+/// raw plane (`max_ctx` rows) plus the block plane (`max_ctx / ratio` rows, at
+/// least one), each row `head_dim` f32. Exact, where
+/// [`indexer_bytes_per_token`] amortizes the block row.
+pub const fn indexer_plane_bytes(head_dim: usize, ratio: usize, max_ctx: usize) -> usize {
+    let row = head_dim * 4;
+    let block_rows = if max_ctx / ratio > 0 {
+        max_ctx / ratio
+    } else {
+        1
+    };
+    max_ctx * row + block_rows * row
 }
 
 /// [`IndexerCache::checkpoint`]'s output. Carries nothing, for the same reason
@@ -477,11 +656,33 @@ pub const fn indexer_bytes_per_token(head_dim: usize) -> usize {
 pub struct IndexerCheckpoint;
 
 impl IndexerCache {
-    pub fn new(max_ctx: usize, head_dim: usize, device: &Device) -> Result<Self> {
+    /// `ratio` is the indexer's block size; the block plane holds `max_ctx /
+    /// ratio` keys (at least one row, so a plane can always be allocated).
+    pub fn new(max_ctx: usize, head_dim: usize, ratio: usize, device: &Device) -> Result<Self> {
+        ensure!(ratio > 0, "indexer cache: block ratio is 0");
         Ok(Self {
             raw: Tensor::zeros((max_ctx, head_dim), DType::F32, device)?,
             len: 0,
+            ratio,
+            blocks: Tensor::zeros(((max_ctx / ratio).max(1), head_dim), DType::F32, device)?,
+            blocks_ready: 0,
         })
+    }
+
+    /// The ONE place `len` changes. A block's cached key is valid only while
+    /// all `ratio` of its raw rows sit below `len` — the next append rewrites
+    /// the rows above it — so every shrink clamps `blocks_ready` to the
+    /// complete blocks that remain. A growth never invalidates anything.
+    fn set_len(&mut self, len: usize) {
+        self.len = len;
+        self.blocks_ready = self.blocks_ready.min(len / self.ratio);
+    }
+
+    /// Complete blocks whose cached key is currently valid (test/diagnostic
+    /// visibility into the derived plane).
+    #[cfg(test)]
+    pub(crate) fn blocks_ready(&self) -> usize {
+        self.blocks_ready
     }
 
     pub fn len(&self) -> usize {
@@ -532,7 +733,7 @@ impl IndexerCache {
             self.capacity()
         );
         self.raw.slice_set(keys, 0, self.len)?;
-        self.len += n;
+        self.set_len(self.len + n);
         Ok(())
     }
 
@@ -565,7 +766,11 @@ impl IndexerCache {
             let rows = crate::kv_cache::f32_tensor(bytes, &[pos, head_dim], device)?;
             self.raw.slice_set(&rows, 0, 0)?;
         }
-        self.len = pos;
+        // The rows below `pos` were just REPLACED, not kept, so no block key
+        // computed from the previous contents survives: a clamp would keep
+        // keys of the conversation this image is overwriting.
+        self.blocks_ready = 0;
+        self.set_len(pos);
         Ok(())
     }
 
@@ -578,12 +783,12 @@ impl IndexerCache {
             "indexer cache holds {} keys; cannot truncate up to {len}",
             self.len
         );
-        self.len = len;
+        self.set_len(len);
         Ok(())
     }
 
     pub fn reset(&mut self) {
-        self.len = 0;
+        self.set_len(0);
     }
 
     /// Arm a rollback over the next `span` tokens. Nothing to record — see
@@ -612,7 +817,7 @@ impl IndexerCache {
              checkpoint reserved from {len0}",
             self.len.saturating_sub(len0)
         );
-        self.len = len0 + commit;
+        self.set_len(len0 + commit);
         Ok(())
     }
 }
@@ -1044,6 +1249,227 @@ mod tests {
         };
         for (i, g) in mask_sets(&m).iter().enumerate() {
             assert_eq!(*g, plain[5 + i], "query {}: after a rollback", 5 + i);
+        }
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// The selection a `select_with` call produced, as comparable bits: the
+    /// mask plane for a chunk, the row list for a step, nothing for `Dense`.
+    fn selection_bits(sel: &QsaSelection) -> Option<Vec<u32>> {
+        match sel {
+            QsaSelection::Dense => None,
+            QsaSelection::Mask(m) => Some(bits(m)),
+            QsaSelection::Rows(r) => Some(r.to_vec1::<u32>().unwrap()),
+        }
+    }
+
+    /// The block plane's valid rows against a from-scratch recompute of the
+    /// same blocks, bit for bit. A call that selected (anything but `Dense`)
+    /// must have left every complete block cached.
+    fn assert_block_plane_matches(
+        ix: &QsaIndexer,
+        cache: &IndexerCache,
+        selected: bool,
+        what: &str,
+    ) {
+        let n_blocks = cache.blocks_ready();
+        assert!(
+            n_blocks <= cache.len() / RATIO,
+            "{what}: ready blocks exceed the length"
+        );
+        if selected {
+            assert_eq!(
+                n_blocks,
+                cache.len() / RATIO,
+                "{what}: every complete block is cached"
+            );
+        }
+        if n_blocks == 0 {
+            return;
+        }
+        let cached = cache.blocks.narrow(0, 0, n_blocks).unwrap();
+        let scratch = ix.block_keys_classic(cache, n_blocks).unwrap();
+        let (c, s) = (bits(&cached), bits(&scratch));
+        let diff = c.iter().zip(&s).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            diff,
+            0,
+            "{what}: {diff} of {} block-key elements differ",
+            c.len()
+        );
+    }
+
+    /// The cached block-key path and the classic full recompute make the same
+    /// selections over one scripted sequence — prefill chunks that cross the
+    /// budget, single-token steps, a rollback, a truncation below a block
+    /// boundary, more steps — and the plane the cached path holds after each
+    /// call equals a from-scratch recompute of those blocks bit for bit.
+    #[test]
+    fn cached_block_keys_match_the_classic_recompute() {
+        let device = metal_device().unwrap();
+        let (ix, _, xt, _) = real_geometry(&device);
+        let extra = rand(0x520, 16 * HIDDEN, -1.0, 1.0);
+        let extra = Tensor::from_vec(extra, (16, HIDDEN), &device).unwrap();
+        let step = |i: usize| extra.narrow(0, i, 1).unwrap().contiguous().unwrap();
+
+        let mut classic = ix.new_cache(8192, &device).unwrap();
+        let mut cached = ix.new_cache(8192, &device).unwrap();
+        fn run(
+            ix: &QsaIndexer,
+            classic: &mut IndexerCache,
+            cached: &mut IndexerCache,
+            x: &Tensor,
+            pos: usize,
+            what: &str,
+        ) -> QsaSelection {
+            let a = ix.select_with(x, classic, pos, true).unwrap();
+            let b = ix.select_with(x, cached, pos, false).unwrap();
+            assert_eq!(selection_bits(&a), selection_bits(&b), "{what}: selection");
+            assert_eq!(classic.len(), cached.len(), "{what}: length");
+            assert_block_plane_matches(ix, cached, !matches!(b, QsaSelection::Dense), what);
+            b
+        }
+
+        // Two prefill chunks: the first below budget (Dense, but the plane
+        // still fills), the second crossing it.
+        let a = xt.narrow(0, 0, 1500).unwrap().contiguous().unwrap();
+        assert!(matches!(
+            run(&ix, &mut classic, &mut cached, &a, 0, "chunk 0..1500"),
+            QsaSelection::Dense
+        ));
+        assert_eq!(cached.blocks_ready(), 0, "a Dense chunk builds no keys");
+        let b = xt
+            .narrow(0, 1500, SEQ - 1500)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        assert!(matches!(
+            run(&ix, &mut classic, &mut cached, &b, 1500, "chunk 1500..2200"),
+            QsaSelection::Mask(_)
+        ));
+        assert_eq!(cached.blocks_ready(), SEQ / RATIO);
+
+        // Five decode steps: a new block completes on one of every four.
+        for i in 0..5 {
+            let pos = SEQ + i;
+            let before = cached.blocks_ready();
+            assert!(matches!(
+                run(&ix, &mut classic, &mut cached, &step(i), pos, "step"),
+                QsaSelection::Rows(_)
+            ));
+            assert_eq!(cached.blocks_ready(), (pos + 1) / RATIO);
+            assert!(cached.blocks_ready() - before <= 1);
+        }
+        // 2205 tokens: 551 complete blocks. Speculate 4 more, keep 2 — the
+        // rollback drops the block that closed at 2208.
+        let ck_c = classic.checkpoint(4).unwrap();
+        let ck_f = cached.checkpoint(4).unwrap();
+        let spec = extra.narrow(0, 5, 4).unwrap().contiguous().unwrap();
+        run(&ix, &mut classic, &mut cached, &spec, 2205, "speculated 4");
+        assert_eq!(cached.blocks_ready(), 2209 / RATIO);
+        classic.rollback(&ck_c, 2205, 4, 2).unwrap();
+        cached.rollback(&ck_f, 2205, 4, 2).unwrap();
+        assert_eq!(cached.len(), 2207);
+        assert_eq!(
+            cached.blocks_ready(),
+            2207 / RATIO,
+            "rollback clamps the plane"
+        );
+        assert_block_plane_matches(&ix, &cached, true, "after rollback");
+
+        // Truncate below a block boundary, then refill those rows with
+        // DIFFERENT tokens: the block that spanned the cut is rebuilt.
+        classic.truncate(2202).unwrap();
+        cached.truncate(2202).unwrap();
+        assert_eq!(cached.blocks_ready(), 550, "truncate clamps the plane");
+        for i in 9..14 {
+            let pos = 2202 + (i - 9);
+            run(
+                &ix,
+                &mut classic,
+                &mut cached,
+                &step(i),
+                pos,
+                "post-truncate step",
+            );
+        }
+        assert_eq!(cached.len(), 2207);
+
+        // A reset empties the plane; an import rebuilds it from the rows.
+        let image = cached.export_rows().unwrap();
+        cached.reset();
+        assert_eq!(cached.blocks_ready(), 0);
+        cached.import_rows(&image, 2207, &device).unwrap();
+        assert_eq!(cached.blocks_ready(), 0, "an import trusts no cached key");
+        run(
+            &ix,
+            &mut classic,
+            &mut cached,
+            &step(14),
+            2207,
+            "post-import step",
+        );
+        assert_eq!(cached.blocks_ready(), 2208 / RATIO);
+    }
+
+    /// `strided_sum` reproduces candle's strided reduce bit for bit at the two
+    /// extents the indexer sums over — the block ratio and the head count —
+    /// and so does the pool it feeds against the `mean(1)` it replaced.
+    #[test]
+    fn strided_sum_matches_candle_reduce_bitwise() {
+        let device = metal_device().unwrap();
+        let runs = Tensor::from_vec(
+            rand(0x530, 300 * RATIO * HEAD_DIM, -3.0, 3.0),
+            (300, RATIO, HEAD_DIM),
+            &device,
+        )
+        .unwrap();
+        let want = runs.mean(1).unwrap();
+        let got = (strided_sum(&runs, 1).unwrap() * (1.0 / RATIO as f64)).unwrap();
+        let (w, g) = (bits(&want), bits(&got));
+        let diff = w.iter().zip(&g).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            diff,
+            0,
+            "pool: {diff} of {} elements differ from mean(1)",
+            w.len()
+        );
+
+        let per_head = Tensor::from_vec(
+            rand(0x531, N_HEADS * 7 * 600, 0.0, 5.0),
+            (N_HEADS, 7, 600),
+            &device,
+        )
+        .unwrap();
+        let want = per_head.sum(0).unwrap();
+        let got = strided_sum(&per_head, 0).unwrap();
+        let (w, g) = (bits(&want), bits(&got));
+        let diff = w.iter().zip(&g).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            diff,
+            0,
+            "scores: {diff} of {} elements differ from sum(0)",
+            w.len()
+        );
+
+        // The other extents a one- or two-thread reduce covers.
+        for n in [1usize, 2, 3, 5] {
+            let t = Tensor::from_vec(rand(0x540 + n as u64, n * 33, -1.0, 1.0), (n, 33), &device)
+                .unwrap();
+            assert_eq!(
+                bits(&t.sum(0).unwrap()),
+                bits(&strided_sum(&t, 0).unwrap()),
+                "extent {n}"
+            );
         }
     }
 

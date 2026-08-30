@@ -130,6 +130,11 @@ const DELTA_SOURCE: &str = include_str!("delta.metal");
 /// one order (see hc.metal). Under the `XWEN_HC_CLASSIC` kill-switch nothing
 /// asks for this library, so it never compiles.
 const HC_SOURCE: &str = include_str!("hc.metal");
+/// Vendored QSA decode row gather (the K/V rows a selection names, packed
+/// into one contiguous plane per head). Own library; a pure copy, so it has
+/// no rounding contract to state. Under `XWEN_QSA_CLASSIC` nothing asks for
+/// it, so it never compiles.
+const QSA_GATHER_SOURCE: &str = include_str!("qsa_gather.metal");
 
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
@@ -347,4 +352,9 @@ pub(crate) fn delta_max_threads(device: &Device, name: &str) -> Result<usize> {
 /// Its own library, compiled lazily on the first carrier read or write.
 pub(crate) fn hc_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, HC_SOURCE, "hc", name)
+}
+
+/// Pipeline for a `qsa_gather.metal` kernel (the QSA decode row gather).
+pub(crate) fn qsa_gather_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, QSA_GATHER_SOURCE, "qsa_gather", name)
 }
