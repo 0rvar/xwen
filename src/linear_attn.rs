@@ -209,6 +209,8 @@ impl LinearAttnBlock {
     /// The fused path: eight dispatches per layer at any sequence length —
     /// three projections, the conv+silu+state kernel, the beta/decay head, the
     /// whole recurrent scan, the gated output norm, and the output projection.
+    /// SEVEN at the small token counts where the beta|alpha projection folds
+    /// into the beta/decay head's own kernel (`ops::delta_ba_fused_applies`).
     ///
     /// A multi-token chunk under an armed rollback trail keeps those eight
     /// scan-side dispatches (the scan writes one state plane per token instead
@@ -239,12 +241,26 @@ impl LinearAttnBlock {
         gdn_profile::step(&mut prof, dev, Step::Conv, bytes.conv)?;
 
         // beta and the decay come from the layer INPUT, not the conv output.
-        let ba = gdn_profile::rep(&prof, || Ok(x_normed.matmul(&self.ba_wt)?))?; // [seq, 2 * v_heads]
-        gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_proj)?;
-        let (beta, g) = gdn_profile::rep(&prof, || {
-            crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)
-        })?;
-        gdn_profile::step(&mut prof, dev, Step::BaHead, bytes.ba_head)?;
+        // At small token counts the projection and the head are ONE kernel and
+        // the block closes a single `ba_proj` step carrying both steps' bytes;
+        // a prefill chunk (or `XWEN_DELTA_BA_CLASSIC`) keeps the candle gemv
+        // and closes both steps, which is what makes the two arms readable
+        // against each other under XWEN_GDN_PROFILE.
+        let (beta, g) = if crate::ops::delta_ba_fused_applies(x_normed, &self.ba_wt) {
+            let pair = gdn_profile::rep(&prof, || {
+                crate::ops::delta_ba_fused(x_normed, &self.ba_wt, &self.ssm_a, &self.dt_bias)
+            })?;
+            gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_fused)?;
+            pair
+        } else {
+            let ba = gdn_profile::rep(&prof, || Ok(x_normed.matmul(&self.ba_wt)?))?; // [seq, 2 * v_heads]
+            gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_proj)?;
+            let pair = gdn_profile::rep(&prof, || {
+                crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)
+            })?;
+            gdn_profile::step(&mut prof, dev, Step::BaHead, bytes.ba_head)?;
+            pair
+        };
 
         let z = gdn_profile::rep(&prof, || self.z_proj.forward(x_normed))?; // [seq, v_dim]
         gdn_profile::step(
@@ -473,6 +489,15 @@ impl LinearAttnBlock {
             // The `[hidden, 2 * v_heads]` f32 weight, which dwarfs its operands.
             ba_proj: f32b(self.ba_wt.elem_count()),
             ba_head: f32b(seq * 2 * vh + 2 * seq * vh + 2 * vh),
+            // The fused arm moves the same weight plane plus the layer input it
+            // contracts and the two vectors it writes; the projection output
+            // the two-dispatch arm materializes never reaches memory.
+            ba_fused: f32b(
+                self.ba_wt.elem_count()
+                    + seq * (self.ba_wt.elem_count() / (2 * vh))
+                    + 2 * seq * vh
+                    + 2 * vh,
+            ),
             // o and z in, the result out.
             gnorm: f32b(3 * seq * vh * hd + hd),
             // Held in the struct so `scan` can size the state planes it writes.
@@ -488,6 +513,8 @@ struct ByteFloors {
     qk_norm: u64,
     ba_proj: u64,
     ba_head: u64,
+    /// The one-dispatch arm's floor: projection and head together.
+    ba_fused: u64,
     gnorm: u64,
     /// One `[v_heads, 128, 128]` f32 state plane.
     state_plane: u64,

@@ -19,8 +19,8 @@ pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, r
 pub use bf16::matmul_bf16;
 pub use combine::combine;
 pub use delta::{
-    DELTA_HEAD_DIM, delta_ba, delta_conv, delta_gnorm, delta_l2norm, delta_scan,
-    delta_scan_with_trail,
+    DELTA_HEAD_DIM, delta_ba, delta_ba_fused, delta_ba_fused_applies, delta_conv, delta_gnorm,
+    delta_l2norm, delta_scan, delta_scan_with_trail,
 };
 pub use dense_mm::{dense_mm_supported, matmul_dense_q};
 pub use dispatch::mv_vendored_supported;
@@ -586,6 +586,27 @@ pub fn delta_classic() -> bool {
 pub fn delta_decode_kernel() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_DELTA_DECODE_KERNEL").is_some())
+}
+
+/// `XWEN_DELTA_BA_CLASSIC=1` splits the fused beta|alpha projection back into
+/// the two dispatches it replaced: a candle f32 gemv over the `[hidden, 2 *
+/// v_heads]` weight, then `kernel_delta_ba` over its output. Only the shape of
+/// that one step changes — both arms run the same `LinearAttnBlock` fused path,
+/// and a prefill chunk takes the gemv either way (the fused kernel is confined
+/// to small token counts, `dispatch::DELTA_BA_MAX_SEQ`).
+///
+/// Like `XWEN_DELTA_CLASSIC` and unlike the combine/act/glue switches, this is
+/// NOT a bit-identity anchor: the fused kernel sums each dot product as
+/// per-thread partials folded in a tree where candle's gemv sums in its own
+/// order, so the two arms agree to ~1e-6 rather than bitwise. The epilogue is
+/// the same Metal helper on both sides.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`delta_classic`, `flash_classic`): any value enables it — only leaving it
+/// unset keeps the fused kernel.
+pub fn delta_ba_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_DELTA_BA_CLASSIC").is_some())
 }
 
 /// `XWEN_DELTA_SCAN_V2=1` runs the gated-DeltaNet recurrence through

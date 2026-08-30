@@ -2972,6 +2972,15 @@ struct DeltaBaArgs {
     v_heads: i32,
 }
 
+/// Matches the Metal `delta_ba_fused_args` struct (src/ops/delta.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DeltaBaFusedArgs {
+    seq: i32,
+    hidden: i32,
+    v_heads: i32,
+}
+
 /// Matches the Metal `delta_gnorm_args` struct (src/ops/delta.metal).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -3047,6 +3056,54 @@ pub(crate) const DELTA_V2_SGS: usize = 4;
 /// the grid below is sized from these copies, so a drift would leave part of a
 /// head's state unowned.
 pub(crate) const DELTA_V2_COL_TGS: usize = 32;
+
+/// Output columns one `kernel_delta_ba_fused_*` threadgroup owns
+/// (`DELTA_BA_COLS` in delta.metal). The column partition needs no
+/// cross-threadgroup reduction, so this alone sets how many threadgroups the
+/// launch has per token tile: `ceil(2 * v_heads / DELTA_BA_COLS)`.
+///
+/// FITTED, 2026-08-30 (`delta_ba_timing`, Flash-Next geometry, decode): 8 gives
+/// 12 threadgroups at 96 columns and 7.4 us; 16 gives 6 and 9.9 us; 4 gives 24
+/// and ties at decode but loses by half at seq 8-32. Narrower than 8 the
+/// per-threadgroup weight run stops filling a cache line on its own and the
+/// blocks sharing one line have to arrive together to make up for it.
+pub(crate) const DELTA_BA_COLS: usize = 8;
+
+/// Row chunks of the hidden dim one `kernel_delta_ba_fused_*` threadgroup
+/// splits its columns' dot products across (`DELTA_BA_ROWS` in delta.metal).
+/// `DELTA_BA_COLS * DELTA_BA_ROWS` is the threadgroup width.
+pub(crate) const DELTA_BA_ROWS: usize = 128;
+
+/// Tokens the `_t4` specialization tiles into one threadgroup
+/// (`DELTA_BA_TOKS` in delta.metal), so a short chunk reads the weight once per
+/// tile instead of once per token. Kept in step with the kernel's own
+/// `#define`s by `ba_fused_geometry_matches_metal` (src/ops/delta.rs): the grid
+/// below is sized from these copies, so a drift would leave columns or tokens
+/// unwritten.
+pub(crate) const DELTA_BA_TOKS: usize = 4;
+
+/// Token ceiling for the fused beta|alpha projection. The kernel reads the
+/// whole `[hidden, 2 * v_heads]` weight once per token TILE, so its advantage
+/// over candle's gemm — which reads it once per chunk — decays with the token
+/// count; above this the gemm wins and the two-dispatch chain is taken instead.
+/// Covers decode (1) and a DFlash verify block (16).
+///
+/// The measured crossover is farther out than 32 — at the Flash-Next geometry
+/// the fused arm is 18.8 us against the chain's 71.7 at seq 32
+/// (`delta_ba_timing`, 2026-08-30) — and this ceiling is deliberately short of
+/// it: prefill chunks are hundreds of tokens, where the fused kernel's
+/// once-per-tile weight read has never been measured and the gemm's reuse is
+/// the whole reason prefill is shaped the way it is.
+pub(crate) const DELTA_BA_MAX_SEQ: usize = 32;
+
+/// V-head ceiling for the fused beta|alpha projection: the shipped geometries
+/// are 48 and 32, and the kernel's grid is `2 * v_heads` columns wide.
+pub(crate) const DELTA_BA_MAX_V_HEADS: usize = 64;
+
+/// Hidden-dim ceiling for the fused beta|alpha projection (shipped: 5120, 2560,
+/// 2048). Each thread walks `hidden / DELTA_BA_ROWS` weight rows, so a far
+/// wider hidden is a shape this launch was not measured at.
+pub(crate) const DELTA_BA_MAX_HIDDEN: usize = 8192;
 
 /// The simdgroup width the delta kernels are written against.
 /// `kernel_delta_scan` reduces q/k through `red[2][DELTA_D / 32]` indexed by
@@ -3256,6 +3313,167 @@ pub(crate) fn run_delta_ba(
         dispatch_linear(encoder, &pipeline, n);
     }
     drop(ba_guard);
+    drop(a_guard);
+    drop(dt_guard);
+
+    Ok((
+        output_tensor(beta, mdev, n, (seq, v_heads)),
+        output_tensor(g, mdev, n, (seq, v_heads)),
+    ))
+}
+
+/// Whether `run_delta_ba_fused` can serve this pair — the predicate the block
+/// consults before choosing between the fused kernel and the candle gemv plus
+/// `kernel_delta_ba`. Everything it checks is a geometry or layout fact the
+/// kernel's grid depends on, so a `false` here is "take the other path", never
+/// an error.
+pub(crate) fn delta_ba_fused_applies(x: &Tensor, w: &Tensor) -> bool {
+    let (Ok((seq, hidden)), Ok((w_rows, two_vh))) = (x.dims2(), w.dims2()) else {
+        return false;
+    };
+    x.device().is_metal()
+        && x.device().same_device(w.device())
+        && x.dtype() == DType::F32
+        && w.dtype() == DType::F32
+        && x.is_contiguous()
+        && w.is_contiguous()
+        && w_rows == hidden
+        && two_vh % 2 == 0
+        && two_vh / 2 <= DELTA_BA_MAX_V_HEADS
+        && two_vh >= 2
+        && (1..=DELTA_BA_MAX_SEQ).contains(&seq)
+        && (1..=DELTA_BA_MAX_HIDDEN).contains(&hidden)
+}
+
+/// The beta|alpha PROJECTION and the beta/decay head in ONE dispatch, against
+/// `kernel_delta_ba_fused_t{1,4}` (delta.metal). `x` is the layer input
+/// `[seq, hidden]` f32, `w` the concatenated `[hidden, 2 * v_heads]` beta|alpha
+/// weight built at load (column block 0 beta, block 1 alpha), `ssm_a` the
+/// pre-baked `-exp(A_log)` and `dt_bias` the dt offset, both `[v_heads]`.
+/// Returns the same `(beta, g)` pair as [`run_delta_ba`] over the gemv output,
+/// with `g` the LOG decay.
+///
+/// This replaces a candle f32 gemv that cost 29 us per layer for 96 dot
+/// products — ~50x off its byte floor — plus the head dispatch behind it. It is
+/// for SMALL token counts only ([`delta_ba_fused_applies`]): the weight is read
+/// once per `DELTA_BA_TOKS`-token tile, so a prefill chunk keeps the gemm.
+///
+/// NOT bit-identical to the gemv + [`run_delta_ba`] chain: the dot product is
+/// summed as `DELTA_BA_ROWS` partials folded in a tree where candle sums in its
+/// own order. The epilogue is the same Metal helper, so that reassociation is
+/// the only difference (graded at 2e-6 in delta.rs).
+pub(crate) fn run_delta_ba_fused(
+    x: &Tensor,
+    w: &Tensor,
+    ssm_a: &Tensor,
+    dt_bias: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("delta_ba_fused requires x on a Metal device");
+    };
+
+    let (seq, hidden) = x
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("x must be rank-2 [seq, hidden]: {e}"))?;
+    let (w_rows, two_vh) = w
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("the beta|alpha weight must be rank-2: {e}"))?;
+    if two_vh % 2 != 0 {
+        bail!("the beta|alpha weight has {two_vh} columns, expected an even 2 * v_heads");
+    }
+    let v_heads = two_vh / 2;
+    check_f32(x, &[seq, hidden], "x")?;
+    check_f32(w, &[w_rows, two_vh], "beta|alpha weight")?;
+    check_f32(ssm_a, &[v_heads], "ssm_a")?;
+    check_f32(dt_bias, &[v_heads], "dt_bias")?;
+    if w_rows != hidden {
+        bail!("the beta|alpha weight has {w_rows} rows, expected x's hidden dim {hidden}");
+    }
+    if seq == 0 || v_heads == 0 || hidden == 0 {
+        bail!("delta_ba_fused needs at least one token, one V-head and one input column");
+    }
+    if seq > DELTA_BA_MAX_SEQ {
+        bail!("delta_ba_fused is for at most {DELTA_BA_MAX_SEQ} tokens, got {seq}");
+    }
+    if v_heads > DELTA_BA_MAX_V_HEADS {
+        bail!("delta_ba_fused is for at most {DELTA_BA_MAX_V_HEADS} V-heads, got {v_heads}");
+    }
+    if hidden > DELTA_BA_MAX_HIDDEN {
+        bail!("delta_ba_fused is for a hidden dim of at most {DELTA_BA_MAX_HIDDEN}, got {hidden}");
+    }
+    for (name, t) in [
+        ("the beta|alpha weight", w),
+        ("ssm_a", ssm_a),
+        ("dt_bias", dt_bias),
+    ] {
+        if !x.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as x");
+        }
+    }
+    let n = checked_elems(&[seq, v_heads], "delta_ba_fused")?;
+    glue_index_fits_i32(checked_elems(&[hidden, two_vh], "delta_ba_fused weight")?)?;
+    glue_index_fits_i32(checked_elems(&[seq, hidden], "delta_ba_fused input")?)?;
+
+    // One token per threadgroup at decode, where the tile clamp folds away.
+    let (kernel, toks) = if seq == 1 {
+        ("kernel_delta_ba_fused_t1", 1)
+    } else {
+        ("kernel_delta_ba_fused_t4", DELTA_BA_TOKS)
+    };
+    let pipeline = pipelines::delta_pipeline(mdev.device(), kernel)?;
+    let width = DELTA_BA_COLS * DELTA_BA_ROWS;
+    if pipeline.max_total_threads_per_threadgroup() < width {
+        bail!(
+            "{kernel} needs {width} threads per threadgroup, the pipeline allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    let beta = mdev.new_buffer(n, DType::F32, "delta_beta")?;
+    let g = mdev.new_buffer(n, DType::F32, "delta_g")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+    let (w_guard, w_layout) = w.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("the beta|alpha weight is not on a Metal device");
+    };
+    let (a_guard, a_layout) = ssm_a.storage_and_layout();
+    let Storage::Metal(a_storage) = &*a_guard else {
+        bail!("ssm_a is not on a Metal device");
+    };
+    let (dt_guard, dt_layout) = dt_bias.storage_and_layout();
+    let Storage::Metal(dt_storage) = &*dt_guard else {
+        bail!("dt_bias is not on a Metal device");
+    };
+
+    let args = DeltaBaFusedArgs {
+        seq: seq as i32,
+        hidden: hidden as i32,
+        v_heads: v_heads as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
+        encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
+        encoder.set_input_buffer(3, Some(a_storage.buffer()), f32_off(a_layout));
+        encoder.set_input_buffer(4, Some(dt_storage.buffer()), f32_off(dt_layout));
+        encoder.set_output_buffer(5, Some(&beta), 0);
+        encoder.set_output_buffer(6, Some(&g), 0);
+        encoder.dispatch_thread_groups(
+            mtl_size!(two_vh.div_ceil(DELTA_BA_COLS), seq.div_ceil(toks), 1),
+            mtl_size!(width, 1, 1),
+        );
+    }
+    drop(x_guard);
+    drop(w_guard);
     drop(a_guard);
     drop(dt_guard);
 

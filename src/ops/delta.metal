@@ -9,6 +9,13 @@
 //                        buffers (no concatenation, no slice_set state write).
 //   kernel_delta_ba      beta = sigmoid(b_raw) and g = ssm_a * softplus(a_raw +
 //                        dt_bias) from ONE fused [hidden, 2*v_heads] projection.
+//   kernel_delta_ba_fused_t{1,4}
+//                        that same head with the projection itself folded in:
+//                        one dispatch reads x and the [hidden, 2*v_heads]
+//                        weight and writes beta and g. Small n only (decode and
+//                        short verify chunks); above the host's threshold the
+//                        candle gemm's weight reuse wins. XWEN_DELTA_BA_CLASSIC
+//                        reverts to the gemv + kernel_delta_ba pair.
 //   kernel_delta_scan    the whole delta-rule recurrence over T timesteps, with
 //                        the head's state slice resident in registers for the
 //                        entire scan: one dispatch per layer per chunk. It folds
@@ -151,6 +158,46 @@ typedef struct {
     int32_t v_heads;
 } delta_ba_args;
 
+// ===========================================================================
+// The beta/decay head. Two entry points over ONE epilogue:
+//   kernel_delta_ba        the epilogue alone, over a projection candle
+//                          already computed (prefill, and the kill switch).
+//   kernel_delta_ba_fused  the [n, hidden] x [hidden, 2*v_heads] projection
+//                          AND the epilogue in one dispatch (small n).
+// The two helpers below are that shared epilogue: the arithmetic that has to
+// round like candle's exists once. Both pin FP contraction and reassociation
+// off and keep the reference's per-op rounding boundaries, which is what makes
+// kernel_delta_ba bit-identical to the candle chain
+// (ba_matches_reference_bitwise); the fused kernel differs from it only in the
+// dot product it computes for itself.
+// ===========================================================================
+
+// candle's usigmoid: recip(1 + exp(-x)).
+static inline float delta_ba_beta(float b_raw) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    return 1.0f / (1 + exp(-b_raw));
+}
+
+// The LOG decay `a * softplus(a_raw + dt_bias)`, softplus in the stable
+// relu + ln(1 + exp(-|x|)) form with the reference's per-op rounding
+// boundaries: candle's affine kernel is an explicit fma, its badd/bmul single
+// f32 operations. `a` is `ssm_a`, pre-baked as -exp(A_log), so the result is
+// <= 0 and the decay the scan exponentiates lands in (0, 1].
+static inline float delta_ba_logdecay(float a_raw, float dt_bias, float a) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const float x = a_raw + dt_bias;
+    const float ax = abs(x);
+    const float sum = x + ax;
+    const float relu = fma(sum, 0.5f, 0.0f);
+    const float e = exp(-ax);
+    const float one_plus = fma(e, 1.0f, 1.0f);
+    const float tail = log(one_plus);
+    const float sp = relu + tail;
+    return sp * a;
+}
+
 // beta and the log-decay from one fused projection. `ba` is [seq, 2*v_heads]:
 // the beta logits occupy the first v_heads columns of a row and the alpha
 // logits the second v_heads — the layout produced by concatenating ssm_beta and
@@ -179,22 +226,158 @@ kernel void kernel_delta_ba(
     const int t = (int) tid / args.v_heads;
     const int base = t * 2 * args.v_heads;
 
-    // candle's usigmoid: recip(1 + exp(-x)).
-    const float b = ba[base + h];
-    beta[tid] = 1.0f / (1 + exp(-b));
+    beta[tid] = delta_ba_beta(ba[base + h]);
+    g[tid] = delta_ba_logdecay(ba[base + args.v_heads + h], dt_bias[h], ssm_a[h]);
+}
 
-    // softplus(a_raw + dt_bias), the stable relu + ln(1 + exp(-|x|)) form, with
-    // the reference's per-op rounding boundaries: candle's affine kernel is an
-    // explicit fma, its badd/bmul single f32 operations.
-    const float x = ba[base + args.v_heads + h] + dt_bias[h];
-    const float ax = abs(x);
-    const float sum = x + ax;
-    const float relu = fma(sum, 0.5f, 0.0f);
-    const float e = exp(-ax);
-    const float one_plus = fma(e, 1.0f, 1.0f);
-    const float tail = log(one_plus);
-    const float sp = relu + tail;
-    g[tid] = sp * ssm_a[h];
+// Matches dispatch.rs DeltaBaFusedArgs (#[repr(C)]).
+typedef struct {
+    int32_t seq;
+    int32_t hidden;
+    int32_t v_heads;
+} delta_ba_fused_args;
+
+// The threadgroup shape of kernel_delta_ba_fused, mirrored by dispatch.rs
+// (DELTA_BA_* there) which sizes the grid from it. COLS x ROWS threads:
+// DELTA_BA_COLS output columns wide, DELTA_BA_ROWS deep in row chunks of the
+// hidden dim, each thread holding one partial dot product per column per token
+// of its tile.
+#define DELTA_BA_COLS 8
+#define DELTA_BA_ROWS 128
+#define DELTA_BA_TOKS 4
+
+static_assert(DELTA_BA_COLS * DELTA_BA_ROWS <= 1024,
+              "a threadgroup is at most 1024 threads");
+static_assert((DELTA_BA_ROWS & (DELTA_BA_ROWS - 1)) == 0,
+              "the partial-sum tree halves DELTA_BA_ROWS to 1");
+static_assert(DELTA_BA_TOKS * DELTA_BA_ROWS * DELTA_BA_COLS * 4 <= 32768,
+              "the partial buffer must fit threadgroup memory");
+
+// The beta|alpha PROJECTION and its epilogue in ONE dispatch: reads x
+// [n, hidden] and the concatenated [hidden, 2*v_heads] weight and writes beta
+// and g directly, so the candle gemv that produced `ba` for kernel_delta_ba
+// disappears along with its dispatch. At decode that gemv was 10% of the whole
+// GDN mixer for a matmul of 96 dot products (docs/log.md).
+//
+// The partition is over OUTPUT COLUMNS, which is the only split of this shape
+// that needs no cross-threadgroup reduction: column c of the weight is read by
+// exactly one threadgroup, and beta (c < v_heads) and g (c >= v_heads) are
+// independent per column. Inside a threadgroup, lane j of a row chunk reads
+// w[i][colbase + j], so the DELTA_BA_COLS lanes of one chunk read one
+// contiguous run of the row-major weight; the DELTA_BA_ROWS chunks then fold
+// their partials through threadgroup memory in a tree.
+//
+// TOKS tokens are tiled into one threadgroup so a multi-token chunk reads the
+// weight once per tile rather than once per token — the whole reason this shape
+// is confined to small n. Above the host's threshold the weight stops fitting
+// the reuse pattern and candle's gemm wins; see dispatch.rs.
+//
+// Deliberately NOT bit-identical to kernel_delta_ba over the same input: the
+// dot product is summed as DELTA_BA_ROWS partials folded in a tree, where
+// candle's gemv sums in its own order. The epilogue is the same helpers, so
+// the only difference is that reassociation (graded at 2e-6 in delta.rs).
+template <int TOKS>
+static inline void delta_ba_fused_body(
+        constant delta_ba_fused_args & args,
+        device const float * x,
+        device const float * w,
+        device const float * ssm_a,
+        device const float * dt_bias,
+        device       float * beta,
+        device       float * g,
+        threadgroup  float * part,
+        uint2 tgid,
+        uint tid) {
+    const int two_vh = 2 * args.v_heads;
+    const int j = (int) (tid % DELTA_BA_COLS);
+    const int r = (int) (tid / DELTA_BA_COLS);
+    const int col = (int) tgid.x * DELTA_BA_COLS + j;
+    const int t0 = (int) tgid.y * TOKS;
+    // At least one, because the grid has ceil(seq / TOKS) tiles in y.
+    const int live = min(TOKS, args.seq - t0);
+
+    // Rows past the tile's end clamp onto its last live token: the duplicate
+    // reads are harmless and their accumulator is never written out, which
+    // keeps `acc` a fully unrolled register array with no branch in the loop.
+    const device float * xp[TOKS];
+    for (int u = 0; u < TOKS; ++u) {
+        xp[u] = x + (size_t) (t0 + min(u, live - 1)) * args.hidden;
+    }
+
+    float acc[TOKS];
+    for (int u = 0; u < TOKS; ++u) {
+        acc[u] = 0.0f;
+    }
+    if (col < two_vh) {
+        device const float * wp = w + col;
+        for (int i = r; i < args.hidden; i += DELTA_BA_ROWS) {
+            const float wv = wp[(size_t) i * two_vh];
+            for (int u = 0; u < TOKS; ++u) {
+                acc[u] = fma(xp[u][i], wv, acc[u]);
+            }
+        }
+    }
+    for (int u = 0; u < TOKS; ++u) {
+        part[(u * DELTA_BA_ROWS + r) * DELTA_BA_COLS + j] = acc[u];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int s = DELTA_BA_ROWS / 2; s > 0; s >>= 1) {
+        if (r < s) {
+            for (int u = 0; u < TOKS; ++u) {
+                part[(u * DELTA_BA_ROWS + r) * DELTA_BA_COLS + j] +=
+                    part[(u * DELTA_BA_ROWS + r + s) * DELTA_BA_COLS + j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (r != 0 || col >= two_vh) {
+        return;
+    }
+    const bool is_beta = col < args.v_heads;
+    const int h = is_beta ? col : col - args.v_heads;
+    for (int u = 0; u < live; ++u) {
+        const float dot = part[(u * DELTA_BA_ROWS) * DELTA_BA_COLS + j];
+        const int idx = (t0 + u) * args.v_heads + h;
+        if (is_beta) {
+            beta[idx] = delta_ba_beta(dot);
+        } else {
+            g[idx] = delta_ba_logdecay(dot, dt_bias[h], ssm_a[h]);
+        }
+    }
+}
+
+// The decode specialization: one token, so no tile clamping survives constant
+// folding and the inner loop is one fma per weight load.
+kernel void kernel_delta_ba_fused_t1(
+        constant delta_ba_fused_args & args [[buffer(0)]],
+        device const float * x              [[buffer(1)]],
+        device const float * w              [[buffer(2)]],
+        device const float * ssm_a          [[buffer(3)]],
+        device const float * dt_bias        [[buffer(4)]],
+        device       float * beta           [[buffer(5)]],
+        device       float * g              [[buffer(6)]],
+        uint2 tgid [[threadgroup_position_in_grid]],
+        uint2 tid  [[thread_position_in_threadgroup]]) {
+    threadgroup float part[1 * DELTA_BA_ROWS * DELTA_BA_COLS];
+    delta_ba_fused_body<1>(args, x, w, ssm_a, dt_bias, beta, g, part, tgid, tid.x);
+}
+
+// The short-chunk specialization: DELTA_BA_TOKS tokens share one pass over the
+// weight.
+kernel void kernel_delta_ba_fused_t4(
+        constant delta_ba_fused_args & args [[buffer(0)]],
+        device const float * x              [[buffer(1)]],
+        device const float * w              [[buffer(2)]],
+        device const float * ssm_a          [[buffer(3)]],
+        device const float * dt_bias        [[buffer(4)]],
+        device       float * beta           [[buffer(5)]],
+        device       float * g              [[buffer(6)]],
+        uint2 tgid [[threadgroup_position_in_grid]],
+        uint2 tid  [[thread_position_in_threadgroup]]) {
+    threadgroup float part[DELTA_BA_TOKS * DELTA_BA_ROWS * DELTA_BA_COLS];
+    delta_ba_fused_body<DELTA_BA_TOKS>(args, x, w, ssm_a, dt_bias, beta, g, part, tgid, tid.x);
 }
 
 // Matches dispatch.rs DeltaGnormArgs (#[repr(C)]).

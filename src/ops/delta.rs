@@ -40,6 +40,36 @@ pub fn delta_ba(ba: &Tensor, ssm_a: &Tensor, dt_bias: &Tensor) -> Result<(Tensor
     dispatch::run_delta_ba(ba, ssm_a, dt_bias)
 }
 
+/// The beta|alpha PROJECTION and that same head in ONE dispatch: `x` is the
+/// layer input `[seq, hidden]` f32, `w` the concatenated `[hidden, 2 *
+/// v_heads]` beta|alpha weight built at load. Returns the same `(beta, g)` as
+/// `delta_ba` over `x.matmul(w)`, with `g` the LOG decay — one kernel instead
+/// of a candle gemv plus [`delta_ba`].
+///
+/// Only for the token counts [`delta_ba_fused_applies`] admits: the kernel
+/// reads the whole weight once per token tile, so a prefill chunk keeps the
+/// gemm. NOT bit-identical to the chain it replaces — the dot product
+/// reassociates against candle's gemv (`ba_fused_matches_the_gemv_chain`
+/// grades it at 2e-6); the epilogue is the same Metal helper, so nothing else
+/// differs.
+pub fn delta_ba_fused(
+    x: &Tensor,
+    w: &Tensor,
+    ssm_a: &Tensor,
+    dt_bias: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    dispatch::run_delta_ba_fused(x, w, ssm_a, dt_bias)
+}
+
+/// Whether [`delta_ba_fused`] can serve this input and weight — the caller's
+/// fork between it and the `matmul` + [`delta_ba`] chain. False under the
+/// `XWEN_DELTA_BA_CLASSIC` kill switch, off a Metal device, on a
+/// non-contiguous or non-f32 operand, and outside the geometry the kernel's
+/// grid is built for (token count, V-heads, hidden dim).
+pub fn delta_ba_fused_applies(x: &Tensor, w: &Tensor) -> bool {
+    !crate::ops::delta_ba_classic() && dispatch::delta_ba_fused_applies(x, w)
+}
+
 /// Gated output RMSNorm: `rms_norm(o, eps) * ssm_norm_weight * gate(z)` per
 /// head, one pass. `o` and `z` are `[seq, v_heads, head_dim]` f32 contiguous,
 /// `w` is `[head_dim]`. The gate multiplies AFTER the weight and outside the
@@ -293,6 +323,146 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The three shipped `(hidden, v_heads)` pairs the fused beta|alpha
+    /// projection runs at: the dense 27B / 3.8-27B (5120, 48), the 35B-A3B
+    /// (2048, 32) and Flash-Next (2560, 48). Two different hidden dims at the
+    /// same V-head count, and two different V-head counts, so a kernel that
+    /// confused the two axes fails on at least one.
+    const BA_GEOMETRIES: [(usize, usize); 3] = [(5120, 48), (2048, 32), (2560, 48)];
+
+    /// The gemv + `delta_ba` chain the fused projection replaces, run through
+    /// candle exactly as `forward_fused` runs it off the fused path.
+    fn reference_ba_chain(
+        x: &Tensor,
+        w: &Tensor,
+        ssm_a: &Tensor,
+        dt_bias: &Tensor,
+    ) -> (Tensor, Tensor) {
+        let ba = x.matmul(w).unwrap();
+        delta_ba(&ba, ssm_a, dt_bias).unwrap()
+    }
+
+    /// Build one geometry's operands: the layer input, the concatenated
+    /// beta|alpha weight, the pre-baked (strictly negative) `ssm_a`, and the dt
+    /// offset.
+    fn ba_operands(
+        hidden: usize,
+        v_heads: usize,
+        seq: usize,
+        seed: u64,
+        device: &Device,
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
+        let x = on_device(
+            pseudo_random(seq * hidden, seed, -2.0, 2.0),
+            (seq, hidden),
+            device,
+        );
+        let w = on_device(
+            pseudo_random(hidden * 2 * v_heads, seed + 1, -0.08, 0.08),
+            (hidden, 2 * v_heads),
+            device,
+        );
+        let a: Vec<f32> = pseudo_random(v_heads, seed + 2, 0.1, 4.0)
+            .into_iter()
+            .map(|v| -v)
+            .collect();
+        let ssm_a = on_device(a, v_heads, device);
+        let dt_bias = on_device(pseudo_random(v_heads, seed + 3, -4.0, 4.0), v_heads, device);
+        (x, w, ssm_a, dt_bias)
+    }
+
+    /// UNIT 2b: the one-dispatch beta|alpha projection must reproduce the gemv
+    /// + `delta_ba` chain it replaces, at every shipped geometry and every
+    /// token-tiling class the kernel distinguishes: one token (the `_t1`
+    /// specialization), a chunk that straddles a tile boundary, an exact tile,
+    /// and the largest chunk the host will hand it.
+    ///
+    /// NOT bit-identity, deliberately: the kernel sums each dot product as
+    /// `DELTA_BA_ROWS` per-thread partials folded in a tree where candle's gemv
+    /// sums in its own order, so f32 reassociation alone separates them. The
+    /// epilogue is the same Metal helper on both sides, so 2e-6 — the bound the
+    /// two reassociating norms carry — is the right class of tolerance: the
+    /// widest geometry's 5120-term dot measures 1.0e-6 on `g`, whose softplus
+    /// passes the dot's absolute error through as a relative one wherever the
+    /// decay is small. Anything looser would stop catching a swapped
+    /// beta/alpha column block or a mis-tiled token, both of which fail here by
+    /// orders of magnitude.
+    #[test]
+    fn ba_fused_matches_the_gemv_chain() {
+        let device = metal_device().unwrap();
+        for (gi, &(hidden, v_heads)) in BA_GEOMETRIES.iter().enumerate() {
+            for &seq in &[1usize, 3, 4, 5, 16, dispatch::DELTA_BA_MAX_SEQ] {
+                let seed = 0x2600 + gi as u64 * 401 + seq as u64;
+                let (x, w, ssm_a, dt_bias) = ba_operands(hidden, v_heads, seq, seed, &device);
+
+                assert!(
+                    crate::ops::delta_ba_fused_applies(&x, &w),
+                    "hidden={hidden} v={v_heads} seq={seq} is a shipped geometry"
+                );
+                let (beta, g) = delta_ba_fused(&x, &w, &ssm_a, &dt_bias).unwrap();
+                let (want_beta, want_g) = reference_ba_chain(&x, &w, &ssm_a, &dt_bias);
+
+                let label = format!("ba_fused hidden={hidden} v={v_heads} seq={seq}");
+                assert_eq!(beta.dims(), &[seq, v_heads]);
+                assert_close(&beta, &want_beta, 2e-6, &format!("{label} beta"));
+                assert_close(&g, &want_g, 2e-6, &format!("{label} g"));
+            }
+        }
+    }
+
+    /// The fused projection is a shape, not a fallback: everything outside the
+    /// geometry its grid is built for must be REFUSED by the dispatch and
+    /// reported as inapplicable by the predicate, so the block takes the gemv
+    /// chain instead of running a kernel that would leave columns or tokens
+    /// unwritten.
+    #[test]
+    fn ba_fused_refuses_a_geometry_its_grid_cannot_cover() {
+        let device = metal_device().unwrap();
+        let (hidden, v_heads) = (2560usize, 48usize);
+        let (x, w, ssm_a, dt_bias) = ba_operands(hidden, v_heads, 1, 0x2700, &device);
+        let f32z = |d: (usize, usize)| Tensor::zeros(d, DType::F32, &device).unwrap();
+        let vec_f32 = |n: usize| Tensor::zeros(n, DType::F32, &device).unwrap();
+
+        // Above the token ceiling the candle gemm's weight reuse wins, so the
+        // kernel is not merely slower there — it is not offered at all.
+        let long = ba_operands(
+            hidden,
+            v_heads,
+            dispatch::DELTA_BA_MAX_SEQ + 1,
+            0x2701,
+            &device,
+        );
+        assert!(!crate::ops::delta_ba_fused_applies(&long.0, &long.1));
+        assert!(delta_ba_fused(&long.0, &long.1, &long.2, &long.3).is_err());
+
+        // An empty chunk encodes a zero-dimension grid.
+        let empty = f32z((0, hidden));
+        assert!(!crate::ops::delta_ba_fused_applies(&empty, &w));
+        assert!(delta_ba_fused(&empty, &w, &ssm_a, &dt_bias).is_err());
+
+        // An odd column count cannot split into beta|alpha.
+        let odd = f32z((hidden, 2 * v_heads - 1));
+        assert!(!crate::ops::delta_ba_fused_applies(&x, &odd));
+        assert!(delta_ba_fused(&x, &odd, &ssm_a, &dt_bias).is_err());
+
+        // A weight whose rows are not x's hidden dim.
+        let short = f32z((hidden - 1, 2 * v_heads));
+        assert!(!crate::ops::delta_ba_fused_applies(&x, &short));
+        assert!(delta_ba_fused(&x, &short, &ssm_a, &dt_bias).is_err());
+
+        // Beyond the V-head and hidden ceilings.
+        let wide = f32z((hidden, 2 * (dispatch::DELTA_BA_MAX_V_HEADS + 1)));
+        assert!(!crate::ops::delta_ba_fused_applies(&x, &wide));
+        let tall_x = f32z((1, dispatch::DELTA_BA_MAX_HIDDEN + 1));
+        let tall_w = f32z((dispatch::DELTA_BA_MAX_HIDDEN + 1, 2 * v_heads));
+        assert!(!crate::ops::delta_ba_fused_applies(&tall_x, &tall_w));
+        assert!(delta_ba_fused(&tall_x, &tall_w, &ssm_a, &dt_bias).is_err());
+
+        // Per-head vectors that do not match the weight's V-head count.
+        assert!(delta_ba_fused(&x, &w, &vec_f32(v_heads + 1), &dt_bias).is_err());
+        assert!(delta_ba_fused(&x, &w, &ssm_a, &vec_f32(v_heads - 1)).is_err());
     }
 
     /// UNIT 3: the fused gated output norm must match the reference's
@@ -1028,25 +1198,64 @@ mod tests {
     /// silent — the kernel would index state rows the grid never covers, or
     /// threadgroups would write past a head's slice — so parse the kernel's
     /// numbers out of the source and compare.
+    /// The integer in delta.metal's `#define <name> <int>`, ignoring any
+    /// trailing comment.
+    fn define(name: &str) -> usize {
+        const SRC: &str = include_str!("delta.metal");
+        SRC.lines()
+            .find_map(|line| {
+                let rest = line.trim_start().strip_prefix("#define ")?;
+                let rest = rest.strip_prefix(name)?;
+                rest.strip_prefix(' ')?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("delta.metal has no `#define {name} <integer>`"))
+    }
+
+    /// The fused beta|alpha projection's threadgroup shape is spelled out
+    /// twice — as `#define`s in delta.metal, which size its partial-sum buffer
+    /// and its reduction tree, and as Rust constants in dispatch.rs, which size
+    /// the grid and the threadgroup. Drift between the two is silent: columns
+    /// or tokens the grid never covers are simply never written.
+    #[test]
+    fn ba_fused_geometry_matches_metal() {
+        assert_eq!(
+            define("DELTA_BA_COLS"),
+            dispatch::DELTA_BA_COLS,
+            "delta.metal DELTA_BA_COLS and dispatch.rs DELTA_BA_COLS disagree; \
+             the launch's column blocks are sized from the Rust copy"
+        );
+        assert_eq!(
+            define("DELTA_BA_ROWS"),
+            dispatch::DELTA_BA_ROWS,
+            "delta.metal DELTA_BA_ROWS and dispatch.rs DELTA_BA_ROWS disagree; \
+             the threadgroup width is sized from the Rust copy"
+        );
+        assert_eq!(
+            define("DELTA_BA_TOKS"),
+            dispatch::DELTA_BA_TOKS,
+            "delta.metal DELTA_BA_TOKS and dispatch.rs DELTA_BA_TOKS disagree; \
+             the launch's token tiles are sized from the Rust copy"
+        );
+        // The same relations the kernel's own static_asserts hold it to.
+        let (cols, rows, toks) = (
+            dispatch::DELTA_BA_COLS,
+            dispatch::DELTA_BA_ROWS,
+            dispatch::DELTA_BA_TOKS,
+        );
+        assert!(cols * rows <= 1024, "a threadgroup is at most 1024 threads");
+        assert_eq!(rows & (rows - 1), 0, "the reduction tree halves the rows");
+        assert!(
+            toks * rows * cols * 4 <= 32768,
+            "the partial buffer must fit threadgroup memory"
+        );
+    }
+
     #[test]
     fn scan_geometry_matches_metal() {
-        const SRC: &str = include_str!("delta.metal");
-
-        /// The integer in `#define <name> <int>`, ignoring any trailing comment.
-        fn define(name: &str) -> usize {
-            SRC.lines()
-                .find_map(|line| {
-                    let rest = line.trim_start().strip_prefix("#define ")?;
-                    let rest = rest.strip_prefix(name)?;
-                    rest.strip_prefix(' ')?
-                        .split_whitespace()
-                        .next()?
-                        .parse()
-                        .ok()
-                })
-                .unwrap_or_else(|| panic!("delta.metal has no `#define {name} <integer>`"))
-        }
-
         let d = define("DELTA_D");
         let cols = define("DELTA_TG_COLS");
         let rows = define("DELTA_TG_ROWS");
@@ -1362,6 +1571,71 @@ mod tests {
         }
     }
 
+    /// Isolation timing for the two beta|alpha arms — the fused one-dispatch
+    /// kernel against the candle gemv plus `delta_ba` it replaces — at every
+    /// shipped geometry, across the token counts that decide where
+    /// `DELTA_BA_MAX_SEQ` belongs. The fused kernel reads the whole weight once
+    /// per token tile and candle's gemm reads it once per chunk, so the fused
+    /// arm's advantage decays with n and the crossover is what this measures.
+    ///
+    /// Multiply a per-call figure by the model's DeltaNet layer count (27B: 48,
+    /// 35B-A3B: 30, Flash-Next: 36) for the step's share of one token.
+    ///
+    /// The FIRST cell printed reads several times high in both arms and is not
+    /// a measurement of the geometry it names — the process's first delta
+    /// dispatches walk a cold buffer pool. Read from the second geometry on, or
+    /// compare cells at the same position across runs.
+    ///
+    /// `#[ignore]`d — run on a `pgrep`-verified free GPU with:
+    ///   cargo test --release -p xwen delta_ba_timing -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf bench"]
+    fn delta_ba_timing() {
+        use std::time::Instant;
+
+        let device = metal_device().unwrap();
+        let get = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let (warm, iters) = (get("XWEN_BENCH_WARMUP", 20), get("XWEN_BENCH_ITERS", 100));
+        let Device::Metal(mdev) = &device else {
+            unreachable!("metal_device() returned a non-Metal device")
+        };
+
+        for &(hidden, v_heads) in BA_GEOMETRIES.iter() {
+            for &seq in &[1usize, 2, 4, 8, 16, 32] {
+                let (x, w, ssm_a, dt_bias) =
+                    ba_operands(hidden, v_heads, seq, 0x9100 + seq as u64, &device);
+                // Amortized: the whole batch of iterations is one sync, so a
+                // per-call figure is not one command buffer's round trip.
+                let bench = |label: &str, f: &mut dyn FnMut()| {
+                    for _ in 0..warm {
+                        f();
+                    }
+                    mdev.wait_until_completed().unwrap();
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        f();
+                    }
+                    mdev.wait_until_completed().unwrap();
+                    let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                    eprintln!("{label} hidden={hidden} v={v_heads} seq={seq}: {us:.2} us/call");
+                };
+
+                bench("ba fused ", &mut || {
+                    delta_ba_fused(&x, &w, &ssm_a, &dt_bias).unwrap();
+                });
+                bench("ba classic", &mut || {
+                    let ba = x.matmul(&w).unwrap();
+                    delta_ba(&ba, &ssm_a, &dt_bias).unwrap();
+                });
+            }
+        }
+    }
+
     /// Every op resolves its operands via `start_offset * dtype_size`; the other
     /// tests build inputs with `Tensor::from_vec` (offset 0). Feed each op a
     /// CONTIGUOUS view that starts mid-buffer and compare against the same view
@@ -1421,6 +1695,17 @@ mod tests {
                 .unwrap(),
             "offset ba g",
         );
+
+        // The fused projection, whose four operands all resolve through
+        // `start_offset`: the layer input, the weight, and both per-head
+        // vectors. Graded against the same views through the gemv chain.
+        let hidden = 512usize;
+        let xv = offset(seq, hidden, 2, 0x7010, -2.0, 2.0);
+        let wv = offset(hidden, 2 * v_heads, 3, 0x7011, -0.08, 0.08);
+        let (fb, fg) = delta_ba_fused(&xv, &wv, &ssm_a, &dt_bias).unwrap();
+        let (wb, wg) = reference_ba_chain(&xv, &wv, &ssm_a, &dt_bias);
+        assert_close(&fb, &wb, 1e-6, "offset ba_fused beta");
+        assert_close(&fg, &wg, 1e-6, "offset ba_fused g");
 
         let conv = offset(seq, conv_dim, 2, 0x7006, -2.0, 2.0);
         let beta = offset(seq, v_heads, 3, 0x7007, 0.01, 0.99);

@@ -358,6 +358,17 @@ prefill arithmetic at all. Like `XWEN_DELTA_SCAN_V2` it has no provenance field,
 `parity-gate.ts` strips it from the run env (`baseEnv()`) — an inherited one would grade
 a kernel the report does not name. Setting it deliberately is fine for an A/B; both sides
 must then set it, and the decode tier is the one it can move.
+`XWEN_DELTA_BA_CLASSIC=1` appears in no row either, and for a different reason: it is
+inside the arm `XWEN_DELTA_CLASSIC=1` already switches away from. It splits the fused
+beta|alpha projection back into the candle gemv plus `kernel_delta_ba` it replaced, so
+it only ever moves the *fused* DeltaNet path — which the reference and strict sides do
+not run — and only at small token counts (`dispatch::DELTA_BA_MAX_SEQ`; a prefill chunk
+takes the gemv either way, so a prefill-only tier could not see it at all). It is a real
+kill switch and NOT a bit-identity anchor: the fused kernel sums each dot product as
+per-thread partials folded in a tree where candle's gemv sums in its own order, so the
+two arms agree to ~1e-6, the same class as `XWEN_DELTA_CLASSIC`. The decode and ppl
+tiers are where it would show. `parity-gate.ts` strips it from the run env with the
+others.
 
 Five more switches exist and appear in NO row of that table, because they affect
 **qwen4exp (Qwen3.8-Flash-Next) only** — a checkpoint the harness cannot yet run at all

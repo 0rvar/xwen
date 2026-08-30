@@ -102,10 +102,14 @@ pub enum Step {
     /// tiles in its load stage, so a fused block leaves this at zero.
     QkNorm,
     /// The fused `beta|alpha` projection (one f32 gemv over `[hidden, 2 *
-    /// v_heads]`), or the reference's two separate ones.
+    /// v_heads]`), or the reference's two separate ones. At the small token
+    /// counts where `ops::delta_ba_fused` applies this step is the WHOLE
+    /// beta/decay path — projection and head in one kernel — and `BaHead`
+    /// records no call at all.
     BaProj,
     /// `beta = sigmoid(..)` and the log decay `g = ssm_a * softplus(..)` from
-    /// that projection's output.
+    /// that projection's output. Absent from a line whose blocks folded it into
+    /// `BaProj`; the two arms are therefore compared as `ba_proj + ba_head`.
     BaHead,
     /// `attn_gate`: the z gate projection.
     GateProj,
