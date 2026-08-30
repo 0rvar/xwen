@@ -2619,3 +2619,15 @@ changed, so everything here is a follow-up rather than a leftover.
   a 32k message cost hundreds of MB of host RAM to save prefill for a client that edits
   prompts in place — a workload nobody here has. Revisit if one shows up; the knob would
   be an interval, defaulted off.
+
+## Deferred from the landscape research (2026-08-30)
+
+- [ ] **Same-machine MLX arm for the 35B-A3B comparison.** Landscape research (2026-08-30,
+  session xwen-da): xwen's Flash-Next numbers have no public Apple Silicon peer (best
+  published same-chip: llama.cpp 33.0 decode on a smaller IQ4_XS; MLX 4-bit needs
+  ~163 GB and does not fit 128 GB), but the 35B-A3B class IS contested — MLX 4-bit on
+  M4 Max measures ~91 decode (one Qwen3.5 sweep says 130). Before ever claiming a lead
+  there, run mlx-lm on THIS machine with the closest 4-bit build of Qwen3.6-35B-A3B,
+  same prompts, thermal protocol. Sources and the full engine survey are in the session
+  log only; re-research before citing (aggregator-tier numbers were discarded as
+  unreliable).
