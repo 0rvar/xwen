@@ -38,13 +38,10 @@ struct Cli {
 /// Which official checkpoint to run.
 #[derive(Parser)]
 struct ModelArgs {
-    /// Which official checkpoint to run: Qwen3.8-Flash-Next (`flash-next` —
-    /// the default, and EXPERIMENTAL; `xwen generate` and `xwen chat` only,
-    /// since `xwen serve` and `xwen batch` both move cache state it cannot
-    /// carry yet), the dense Qwen3.6-27B, the Qwen3.6-35B-A3B MoE, or the dense
-    /// Qwen3.8-27B. `xwen serve` and `xwen batch` default to Qwen3.6-35B-A3B
-    /// instead, because neither can run the default yet. Each checkpoint's full
-    /// name works here too. A `--model <gguf>` path overrides the target file
+    /// Which official checkpoint to run: Qwen3.8-Flash-Next (`flash-next`,
+    /// the default on every surface, still EXPERIMENTAL and without a
+    /// drafter), the dense Qwen3.6-27B, the Qwen3.6-35B-A3B MoE, or the dense
+    /// Qwen3.8-27B. Each checkpoint's full name works here too. A `--model <gguf>` path overrides the target file
     /// outright, and then the FILE says which checkpoint it is: this flag is the
     /// cross-check (it must agree, or startup fails) and the tie-break for a
     /// custom GGUF that names no release — on every surface alike.

@@ -2285,6 +2285,21 @@ Decision: we WILL port it, targeting Q4_K on this machine.
 Snapshots, page-out, rewind and the disk tier learned the qwen4exp recurrent state, and
 `xwen serve` and `xwen batch` opened for Flash-Next (log.md 2026-08-30, decisions.md
 "Qwen3.8-Flash-Next"). These are the pieces that arc deliberately did not take.
+- [ ] **2026-08-30 — Flash-Next cache images have a ~113 MiB floor per snapshot.**
+  Seen in the first real serve smoke (`cache slot 0 paged out at 20 tokens:
+  113 MiB in 1229 ms`): `snapshot_bytes()` is 118 MB regardless of length,
+  and nearly all of it is the DeltaNet delta state (36 layers × [128,128,48]
+  f32 = 113 MB; the PLE image is 0.4 MB) — the same class of cost the 27B
+  carries (48 × 3 MB). Every slot swap moves it and every anchor snapshot
+  holds it in host RAM, so `--cache-slots` sizing on this checkpoint should
+  count ~120 MB per retained snapshot, and `SNAPSHOT_MIN_GAIN = 1024`
+  (engine.rs:57) is doing real work: a system block under 1024 tokens gets no
+  anchor snapshot, which reads like a broken prefix cache and is not (a
+  485-token system prompt gave C `cache_read 0`; 1157 tokens gave 1157).
+  Possible reductions: f16 delta state on the image only (2x), or snapshot
+  the delta state lazily (skip it for anchors that will only ever be
+  rewound-to, since a rewind re-prefills from the anchor anyway — needs the
+  rewind path to tolerate a missing Linear arm).
 
 - [ ] **`IndexerCache` still allocates at `max_ctx` up front and has no growth path,
   and page-in is now a second reason to care.** The trunk's KV grows lazily — the cache
