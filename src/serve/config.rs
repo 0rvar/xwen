@@ -49,12 +49,16 @@ pub const DEFAULT_CACHE_SNAPSHOTS: usize = 4;
 /// Conversations kept warm at once. One of them occupies the GPU cache; the rest
 /// are host-RAM images the engine pages back in when their conversation returns.
 /// 1 reproduces the single-sequence behaviour where a switch evicts whoever was
-/// speaking.
-pub const DEFAULT_CACHE_SLOTS: usize = 4;
-/// The on-disk prefix cache is on by default: the point of the tier is that a
-/// restart costs no re-prefill without anyone having to arrange it, and it is
-/// perf-only and budgeted.
-pub const DEFAULT_DISK_CACHE: bool = true;
+/// speaking. Two by default (2026-08-30, was four): the default checkpoint is
+/// Flash-Next, whose images cost 30 KiB/token plus a 113 MiB DeltaNet floor —
+/// ~8 GB per conversation at its 262144 context — and one host image beside
+/// the live conversation covers the usual two-agents case.
+pub const DEFAULT_CACHE_SLOTS: usize = 2;
+/// The on-disk prefix cache is opt-in (`--disk-cache` / `disk_cache = true`;
+/// was on by default until 2026-08-30): a restart resuming without re-prefill
+/// is worth having, but at Flash-Next image sizes it writes gigabytes per
+/// conversation, which is not something a default should do unasked.
+pub const DEFAULT_DISK_CACHE: bool = false;
 /// Ceiling on everything under `<cache_dir>/kv/`, across every checkpoint, in
 /// GiB. Enforced by deleting the least recently used image.
 pub const DEFAULT_DISK_MAX_GIB: u64 = 64;

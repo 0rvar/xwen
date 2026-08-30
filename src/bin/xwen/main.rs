@@ -559,8 +559,9 @@ struct ServeArgs {
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
     /// Keep warm conversations on disk, so a restart resumes them instead of
-    /// re-prefilling. On by default; this flag overrides a config file that
-    /// turns it off.
+    /// re-prefilling. Off by default (a Flash-Next image is gigabytes per
+    /// conversation, which is SSD wear nobody asked for); this flag overrides a
+    /// config file that turns it off.
     #[arg(long, conflicts_with = "no_disk_cache")]
     disk_cache: bool,
     /// Do not keep warm conversations on disk.

@@ -1010,6 +1010,17 @@ two `p_min` definitions differ (see above) (2026-08-15).
 tier) is inherited as-is**; it is architecture-agnostic. The KV export/import and disk
 tier must additionally carry the recurrent state for the 3-of-4 linear layers — KV cache
 alone no longer reconstructs a prefix. Native endpoint moved `/maxuna/v1/*` →
+
+**Two cache slots and an opt-in disk tier (2026-08-30; were four and on-by-default).**
+Both defaults were set when the default checkpoint's image was a few MB of DeltaNet
+state plus 4 KiB/token. The default is now Flash-Next: 30 KiB/token (2 KV heads at 256
+in f16 plus the QSA indexer's f32 key row, over 12 layers) and a 113 MiB DeltaNet floor,
+so a conversation at the checkpoint's 262144 context is an ~8 GB image. Four slots is
+~33 GB of host RAM beside the model; the disk tier writes that same image per
+conversation, and SSD wear is the operator's cost, not the server's. Two slots keep one
+host image beside the live conversation (the two-agents case); `--disk-cache` /
+`disk_cache = true` turns the tier on for anyone who wants restarts to resume. The
+`--cache-slots` / `[cache] slots` and `--no-disk-cache` surfaces are unchanged.
 `/xwen/v1/*` (2026-07-28).
 
 **One server serves both checkpoints; `--model` is only the default (2026-08-11).**
