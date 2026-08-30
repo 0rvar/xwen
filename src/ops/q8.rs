@@ -223,4 +223,165 @@ mod tests {
         let x = Tensor::from_vec(vec![0f32; 20], (1, 20), &device).unwrap();
         assert!(matmul_q8(&buffer, 0, 64, 20, &x).is_err());
     }
+
+    /// A synthetic `[n_out, k]` q8_0 weight plane as a bare device `Buffer`,
+    /// built from raw block bytes rather than `QTensor::quantize`. Timing does
+    /// not depend on the weight VALUES, and quantizing a 26M-element tensor on
+    /// the CPU once per plane would dominate the bench's wall time; the deltas
+    /// are a fixed, finite half so no denormal/NaN path can perturb the timing.
+    fn synthetic_q8_plane(device: &Device, n_out: usize, k: usize, seed: u64) -> Arc<Buffer> {
+        let blocks = n_out * k / 32;
+        let mut raw = vec![0u8; blocks * 34];
+        let d = half::f16::from_f32(0.0125).to_le_bytes();
+        // One page of quants, tiled: distinct planes are distinct allocations,
+        // which is all the cache-residency arms depend on.
+        let mut pattern = [0u8; 4096];
+        let mut s = seed | 1;
+        for b in pattern.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 33) as u8;
+        }
+        for (b, chunk) in raw.chunks_exact_mut(34).enumerate() {
+            chunk[0] = d[0];
+            chunk[1] = d[1];
+            let off = (b * 32) % (pattern.len() - 32);
+            chunk[2..].copy_from_slice(&pattern[off..off + 32]);
+        }
+        let storage =
+            QStorage::from_data(std::borrow::Cow::Borrowed(&raw), device, GgmlDType::Q8_0).unwrap();
+        match &storage {
+            QStorage::Metal(qms) => Arc::new(qms.buffer().clone()),
+            _ => panic!("expected Metal storage"),
+        }
+    }
+
+    /// Isolation timing for the vendored q8_0 decode gemv
+    /// (`kernel_mul_mv_q8_0_f32_attn`) across output widths at fixed K, and
+    /// across K at fixed output width — the question being why the GDN
+    /// `attn_qkv` plane ([2560 -> 10240]) reads far below the rate its
+    /// same-kernel siblings `attn_gate` ([2560 -> 6144]) and `ssm_out`
+    /// ([6144 -> 2560]) reach in the same decode step.
+    ///
+    /// Two arms per shape, because the answer turns on where the weight bytes
+    /// come from:
+    ///   * `reuse`  — one plane, `BATCH` back-to-back dispatches per sync. The
+    ///     plane is re-read every dispatch, so anything that fits the system
+    ///     cache is served from it and the reported rate is not a DRAM rate.
+    ///   * `rotate` — distinct planes covering ~`WORKING_SET` of weights,
+    ///     dispatched round-robin. No plane can be cache-resident when its turn
+    ///     comes back, which is the situation a real decode step is in (every
+    ///     layer's projection is a different weight and the whole model streams
+    ///     once per token).
+    /// Both are amortized (BATCH dispatches per flush, every output held alive
+    /// to the readback), per this repo's benching rules.
+    ///
+    /// `#[ignore]`d — run on a `pgrep`-verified free GPU with:
+    ///   cargo test --release -p xwen q8_gemv_shape_sweep -- --ignored --nocapture
+    /// `XWEN_BENCH_WARMUP` / `XWEN_BENCH_ITERS` override the loop counts.
+    #[test]
+    #[ignore = "perf bench"]
+    fn q8_gemv_shape_sweep() {
+        use std::time::Instant;
+
+        let device = metal_device().unwrap();
+        let get = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let (warm, rounds) = (get("XWEN_BENCH_WARMUP", 3), get("XWEN_BENCH_ITERS", 15));
+        const BATCH: usize = 32;
+        // Comfortably past any plausible last-level cache on this part, so the
+        // rotating arm is a DRAM measurement.
+        const WORKING_SET: usize = 512 << 20;
+
+        // (n_out, k, label)
+        let shapes: [(usize, usize, &str); 8] = [
+            (2560, 2560, ""),
+            (6144, 2560, "attn_gate"),
+            (8192, 2560, ""),
+            (10240, 2560, "attn_qkv"),
+            (12288, 2560, ""),
+            (2560, 6144, "ssm_out"),
+            (2560, 10240, ""),
+            (6144, 6144, ""),
+        ];
+
+        eprintln!(
+            "q8 gemv sweep: t=1, {BATCH} dispatches/round, {rounds} rounds \
+             (rotate arm holds ~{} MB of planes)",
+            WORKING_SET >> 20
+        );
+        for (n_out, k, label) in shapes {
+            let bytes = (n_out * k / 32 * 34) as f64;
+            let x = Tensor::from_vec(
+                pseudo_random(k, 0x2000 + k as u64, -1.0, 1.0),
+                (1, k),
+                &device,
+            )
+            .unwrap();
+            for (arm, n_planes, batch) in [
+                ("reuse ", 1usize, BATCH),
+                ("rotate", (WORKING_SET / (bytes as usize)).max(2), BATCH),
+                // The condition XWEN_GDN_PROFILE actually measures in: every
+                // step is bracketed by a `device.synchronize()`, so each
+                // dispatch runs alone with nothing before or after it to
+                // overlap with. Included because the production profile's
+                // per-shape rates disagree with the amortized arms, and a
+                // one-dispatch-per-flush arm is the only way to tell a kernel
+                // property from a measurement property.
+                ("synced", (WORKING_SET / (bytes as usize)).max(2), 1),
+            ] {
+                let planes: Vec<Arc<Buffer>> = (0..n_planes)
+                    .map(|i| synthetic_q8_plane(&device, n_out, k, 0x900 + i as u64))
+                    .collect();
+                let mut sink = 0f32;
+                let mut cursor = 0usize;
+                let round = |cursor: &mut usize| {
+                    let outs: Vec<Tensor> = (0..batch)
+                        .map(|_| {
+                            let p = &planes[*cursor % planes.len()];
+                            *cursor += 1;
+                            matmul_q8(p, 0, n_out, k, &x).unwrap()
+                        })
+                        .collect();
+                    // ONE element, not the whole output: the readback is the
+                    // round's only host transfer, and copying `n_out` floats
+                    // would make it scale with the very axis being swept —
+                    // which silently taxes the wide shapes in the
+                    // one-dispatch-per-flush arm, where it is not amortized.
+                    outs.last()
+                        .unwrap()
+                        .narrow(1, 0, 1)
+                        .unwrap()
+                        .to_vec2::<f32>()
+                        .unwrap()[0][0]
+                };
+                for _ in 0..warm {
+                    sink += round(&mut cursor);
+                }
+                let mut times = Vec::with_capacity(rounds);
+                for _ in 0..rounds {
+                    let t = Instant::now();
+                    sink += round(&mut cursor);
+                    times.push(t.elapsed().as_secs_f64() / batch as f64);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = times[times.len() / 2];
+                let best = times[0];
+                eprintln!(
+                    "  [{k:5} -> {n_out:5}] {arm} planes={n_planes:3} batch={batch:2} \
+                     med {:7.1} us {:6.1} GB/s | best {:7.1} us {:6.1} GB/s  {label} (sink {sink:.1})",
+                    med * 1e6,
+                    bytes / med / 1e9,
+                    best * 1e6,
+                    bytes / best / 1e9,
+                );
+                drop(planes);
+            }
+        }
+    }
 }
