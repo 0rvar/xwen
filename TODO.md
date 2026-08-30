@@ -2468,10 +2468,21 @@ A/B named four things it did not take.
   At 2048 rows per chunk the guard is a band of elementwise dispatches per layer that
   decode never pays; fold it into the gemm epilogue or the following norm, whichever the
   profiler ranks higher (rank, do not price — the profilers are sync-inflated).
-- [ ] **Decode falls from 46.7 tok/s at a 530-token prompt to 27.4 at 3.9k context on
-  Flash-Next, and nothing attributes it.** Observed 2026-08-30 in the chunk sweep
-  (128 tokens after the 3851-token prompt, every chunk arm alike, so the chunk is not the
-  cause). The full-attention layers' KV read grows with context but not 1.7x over 3.4k
-  tokens on 25% of the layers; the QSA indexer, the mask upload and the PLE n-gram
-  history are the other context-scaling parts. Being mapped separately; ledgered here so
-  the observation is not lost.
+- [ ] **Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the
+  2048-token QSA budget, then slopes gently: 46.1 tok/s at 1963 tokens, 30.8 at 2045
+  (the run crosses 2048 mid-decode), 30.6 at 2107, 29.4 at 3810, 27.3 at 7620** (2026-08-30,
+  `--no-draft --raw -n 64`, interleaved, `pmset -g` said `powermode 0`). Not KV scaling:
+  below the budget `QsaIndexer::select` short-circuits to Dense (indexer.rs:294-296);
+  above it, attention itself is CAPPED at 2051 gathered keys and every added cost is in
+  the indexer, 12 layers per step: (1) the pooled block keys are recomputed from ALL raw
+  keys every step (indexer.rs:316-320), and the `mean(1)` over [n_blocks,4,128] misses
+  candle's contiguous-reduce test and takes `fast_sum_f32_strided`, which launches one
+  2-thread threadgroup per output — ~1.5 M threadgroups per step at 4k, ~12.6 M at 32k
+  (est. 8-10 ms at 4k, 65-85 ms at 32k: ~10 tok/s at Claude-Code contexts); (2) one
+  host readback sync per layer for the scores (indexer.rs:346), 12 pipeline drains per
+  step, ~3 ms flat; (3) the rope chain + k_norm + score matmul over all blocks, linear.
+  Fix, in order: cache the pooled+normed+roped key per FULL block (immutable once the
+  block is complete; only the tail block is recomputed per step), which kills (1) and
+  (3); then a device-side top-k or fused score+select writing row indices, which kills
+  (2). Bench at 2k/4k/16k/32k. The shipped checkpoints have no indexer and are
+  unaffected. No runtime QSA kill switch exists (`force_dense_qsa` is cfg(test)).

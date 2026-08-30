@@ -393,8 +393,9 @@ tier scores the chunk shape generate really runs. It moves numbers only through
 chunk-boundary accumulation order, not arithmetic, but a candidate dumped at a different
 chunk than its reference is comparing two shapes the report does not name, so
 `parity-gate.ts` strips it from the run env (`baseEnv()`) like the others. The 35B's
-2048 default has NOT yet been graded by the gate (the last full run was at 512, which
-the dense file still runs); the ppl tier is where a chunk change would show first.
+2048 default was graded the same day (7378bb1, 2026-08-30): ALL PASS, 6 tiers, ppl
+Δnll 0.000791 with the candidate provenance recording `seq_len: 2048` — digit-identical
+to the 512-era figure, so the chunk moves the ppl tier by less than the printed precision.
 
 Five more switches exist and appear in NO row of that table, because they affect
 **qwen4exp (Qwen3.8-Flash-Next) only** — a checkpoint the harness cannot yet run at all
