@@ -160,6 +160,60 @@ pub fn ple_profile() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_PLE_PROFILE").is_some())
 }
 
+/// `XWEN_GDN_PROFILE` breaks the `Stage::MixerDelta` bracket into the steps a
+/// gated-DeltaNet block actually runs — the three big projections, the fused
+/// conv, the beta/decay head, the recurrent scan, the gated output norm — and
+/// prints one line per forward with every GDN layer's steps folded together
+/// (`gdn_profile`).
+///
+/// `stack_profile` says the DeltaNet mixer costs N ms; this says which kernel
+/// inside it does. The device steps are bracketed by `Device::synchronize` on
+/// the same contract `stack_profile` uses — a step's figure is completed GPU
+/// work, not enqueue time — and each block opens with a sync, so a backlog
+/// inherited from the caller is charged to the caller rather than to whichever
+/// step first drains it.
+///
+/// The line also carries each step's DECLARED bytes as an achieved GB/s, which
+/// is the difference between "this step moves the bytes it must and is done"
+/// and "this step is nowhere near its own byte floor". It is a floor, not a
+/// hardware peak: this machine's peak bandwidth has never been measured.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`stack_profile`, `ple_profile`): any value enables it. Unset — the normal
+/// case — costs one `Option` check per step and reads no clock at all. The
+/// syncs serialize the block, so a profiled run's absolute throughput means
+/// nothing.
+pub fn gdn_profile() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_GDN_PROFILE").is_some())
+}
+
+/// `XWEN_GDN_REPS=N` makes each `XWEN_GDN_PROFILE` step run its work N times
+/// inside its own bracket, and the line divide by N.
+///
+/// The reason is the floor: a command buffer that carries work costs ~0.2 ms to
+/// commit and wait for on this machine, and at decode most of a DeltaNet
+/// block's steps do LESS GPU work than that, so a one-shot bracket measures the
+/// round trip and reports the kernel. Repeating amortizes it — the floor is
+/// paid once per bracket and divided by N — which is the benching rule this
+/// repo already holds elsewhere (CLAUDE.md: amortized rates, never
+/// per-dispatch).
+///
+/// Every repeated step is a pure function of tensors the block already holds,
+/// so the extra rounds recompute and discard; nothing that advances the cache
+/// is ever repeated. Default 1 (one-shot, floor-dominated at decode). Read once
+/// and cached; inert unless `XWEN_GDN_PROFILE` is also set.
+pub fn gdn_reps() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_GDN_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(1)
+    })
+}
+
 /// `XWEN_PLE_NO_RANDOM` keeps the PLE n-gram table's byte range on the
 /// mapping's default (sequential-ish) readahead instead of tagging it
 /// `MADV_RANDOM`.

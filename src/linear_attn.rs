@@ -38,6 +38,7 @@ use candle_nn::ops::{sigmoid, silu};
 
 use crate::attention::{AttnWeights, Proj};
 use crate::config::{XwenConfig, ZGate};
+use crate::gdn_profile::{self, Step};
 use crate::gguf::Weights;
 use crate::kv_cache::{LayerCache, materialize};
 
@@ -221,27 +222,52 @@ impl LinearAttnBlock {
         let v_dim = self.v_heads * self.head_dim;
         let tail = self.conv_kernel - 1;
 
-        let qkv = self.qkv.forward(x_normed)?; // [seq, conv_dim]
+        // Sub-step timing, off unless XWEN_GDN_PROFILE is set
+        // (ops::gdn_profile). Every hook below is one `Option` check when it is.
+        let dev = x_normed.device();
+        let mut prof = gdn_profile::BlockProfile::start(dev, seq, false, &self.ssm_a)?;
+        let bytes = self.byte_floors(seq);
+
+        let qkv = gdn_profile::rep(&prof, || self.qkv.forward(x_normed))?; // [seq, conv_dim]
+        gdn_profile::step(&mut prof, dev, Step::QkvProj, self.qkv.weight_bytes(seq))?;
+
         let (conv_state, s) = cache.linear_state()?;
-        let (conv, next_conv_state) = crate::ops::delta_conv(&conv_state, &qkv, &self.conv_w)?;
+        gdn_profile::host_step(&mut prof, Step::Glue, 0);
+        let (conv, next_conv_state) = gdn_profile::rep(&prof, || {
+            crate::ops::delta_conv(&conv_state, &qkv, &self.conv_w)
+        })?;
+        gdn_profile::step(&mut prof, dev, Step::Conv, bytes.conv)?;
 
         // beta and the decay come from the layer INPUT, not the conv output.
-        let ba = x_normed.matmul(&self.ba_wt)?; // [seq, 2 * v_heads]
-        let (beta, g) = crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)?;
+        let ba = gdn_profile::rep(&prof, || Ok(x_normed.matmul(&self.ba_wt)?))?; // [seq, 2 * v_heads]
+        gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_proj)?;
+        let (beta, g) = gdn_profile::rep(&prof, || {
+            crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)
+        })?;
+        gdn_profile::step(&mut prof, dev, Step::BaHead, bytes.ba_head)?;
 
-        let z = self.z_proj.forward(x_normed)?; // [seq, v_dim]
+        let z = gdn_profile::rep(&prof, || self.z_proj.forward(x_normed))?; // [seq, v_dim]
+        gdn_profile::step(
+            &mut prof,
+            dev,
+            Step::GateProj,
+            self.z_proj.weight_bytes(seq),
+        )?;
 
         let eps = self.rms_eps as f32;
         let o = if seq > 1 && cache.linear_trail_armed() {
-            let (o, trail) = crate::ops::delta_scan_with_trail(
-                &conv,
-                &beta,
-                &g,
-                &s,
-                self.k_heads,
-                eps,
-                seq, // one state plane per token of the verify span
-            )?;
+            let (o, trail) = gdn_profile::rep(&prof, || {
+                crate::ops::delta_scan_with_trail(
+                    &conv,
+                    &beta,
+                    &g,
+                    &s,
+                    self.k_heads,
+                    eps,
+                    seq, // one state plane per token of the verify span
+                )
+            })?;
+            gdn_profile::step(&mut prof, dev, Step::Scan, bytes.scan(seq))?;
             // The conv window a rollback to token t restarts from is rows
             // t+1..t+1+tail of the carried-window-plus-chunk stream, exactly as
             // the reference records it. The delta entries are views into the
@@ -256,21 +282,36 @@ impl LinearAttnBlock {
                 ));
             }
             cache.advance_linear(seq, states)?;
+            // The trail's copies are device work, so this glue close syncs like
+            // a kernel step: charged to the glue bucket, not to the norm whose
+            // sync would otherwise drain it.
+            gdn_profile::step(&mut prof, dev, Step::Glue, 0)?;
             o
         } else {
-            let (o, next_s) = crate::ops::delta_scan(&conv, &beta, &g, &s, self.k_heads, eps)?;
+            let (o, next_s) = gdn_profile::rep(&prof, || {
+                crate::ops::delta_scan(&conv, &beta, &g, &s, self.k_heads, eps)
+            })?;
+            gdn_profile::step(&mut prof, dev, Step::Scan, bytes.scan(1))?;
             cache.advance_linear(seq, vec![(next_conv_state, next_s)])?;
+            gdn_profile::step(&mut prof, dev, Step::Glue, 0)?;
             o
         };
 
-        let o = crate::ops::delta_gnorm(
-            &o,
-            &z.reshape((seq, self.v_heads, self.head_dim))?,
-            &self.norm_w,
-            self.rms_eps as f32,
-            self.z_gate,
+        let zr = z.reshape((seq, self.v_heads, self.head_dim))?;
+        let o = gdn_profile::rep(&prof, || {
+            crate::ops::delta_gnorm(&o, &zr, &self.norm_w, self.rms_eps as f32, self.z_gate)
+        })?;
+        gdn_profile::step(&mut prof, dev, Step::GnormZgate, bytes.gnorm)?;
+        let or = o.reshape((seq, v_dim))?;
+        let out = gdn_profile::rep(&prof, || self.out_proj.forward(&or))?;
+        gdn_profile::step(
+            &mut prof,
+            dev,
+            Step::OutProj,
+            self.out_proj.weight_bytes(seq),
         )?;
-        self.out_proj.forward(&o.reshape((seq, v_dim))?)
+        gdn_profile::flush(prof);
+        Ok(out)
     }
 
     /// The FROZEN reference scan (see the module header). Never optimize it: it
@@ -283,8 +324,18 @@ impl LinearAttnBlock {
         let (k_dim, v_dim) = (kh * hd, vh * hd);
         let tail = self.conv_kernel - 1;
 
+        // Sub-step timing, off unless XWEN_GDN_PROFILE is set. The reference
+        // path is instrumented too: an A/B against the fused kernels is the
+        // whole point of having the switch, and a step whose two paths cannot
+        // be read side by side cannot be graded.
+        let dev = x_normed.device();
+        let mut prof = gdn_profile::BlockProfile::start(dev, seq, true, &self.ssm_a)?;
+        let bytes = self.byte_floors(seq);
+
         let qkv = self.qkv.forward(x_normed)?; // [seq, conv_dim] f32
+        gdn_profile::step(&mut prof, dev, Step::QkvProj, self.qkv.weight_bytes(seq))?;
         let (conv_state, mut s) = cache.linear_state()?;
+        gdn_profile::host_step(&mut prof, Step::Glue, 0);
 
         // Causal depthwise conv, computed by shifting the carried window in front
         // of this chunk: row t of `stream` is pre-conv column t - tail, so tap j
@@ -301,6 +352,7 @@ impl LinearAttnBlock {
                     .broadcast_mul(&self.conv_w.narrow(0, j, 1)?)?)?;
         }
         let conv = silu(&conv)?; // [seq, conv_dim]
+        gdn_profile::step(&mut prof, dev, Step::Conv, bytes.conv)?;
 
         // q and k arrive at the K-head count and are broadcast up to the V-head
         // count by TILING (head j reads K-head j % k_heads). The GGUF converter
@@ -315,6 +367,7 @@ impl LinearAttnBlock {
         let q = tile_heads(&l2_norm(&heads(0, k_dim, kh)?, self.rms_eps)?, vh)?;
         let k = tile_heads(&l2_norm(&heads(k_dim, k_dim, kh)?, self.rms_eps)?, vh)?;
         let v = heads(2 * k_dim, v_dim, vh)?;
+        gdn_profile::step(&mut prof, dev, Step::QkNorm, bytes.qk_norm)?;
 
         // beta and the decay come from the layer INPUT, not the conv output.
         // `ssm_a` is the pre-baked -exp(A_log), so g is non-positive and the decay
@@ -323,9 +376,17 @@ impl LinearAttnBlock {
         let dt = x_normed
             .matmul(&self.alpha_wt)?
             .broadcast_add(&self.dt_bias)?;
+        gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_proj)?;
         let decay = softplus(&dt)?.broadcast_mul(&self.ssm_a)?.exp()?;
+        gdn_profile::step(&mut prof, dev, Step::BaHead, bytes.ba_head)?;
 
         let z = self.z_proj.forward(x_normed)?; // [seq, v_dim]
+        gdn_profile::step(
+            &mut prof,
+            dev,
+            Step::GateProj,
+            self.z_proj.weight_bytes(seq),
+        )?;
 
         // The scan. One step per token; every intermediate state is a distinct
         // tensor, so recording the whole trail for a rollback costs handles
@@ -352,10 +413,17 @@ impl LinearAttnBlock {
                 states.push((materialize(&stream.narrow(0, t + 1, tail)?)?, s.clone()));
             }
         }
+        gdn_profile::step(
+            &mut prof,
+            dev,
+            Step::Scan,
+            bytes.scan(if record { seq } else { 1 }),
+        )?;
         if !record {
             states.push((materialize(&stream.narrow(0, seq, tail)?)?, s.clone()));
         }
         cache.advance_linear(seq, states)?;
+        gdn_profile::step(&mut prof, dev, Step::Glue, 0)?;
 
         // Gated RMSNorm: normalize over the head dim, scale by ssm_norm.weight,
         // and only THEN multiply by the activated gate. The gate is outside the
@@ -370,7 +438,71 @@ impl LinearAttnBlock {
             ZGate::Sigmoid => sigmoid(&z)?,
         };
         let o = (o * gated_z.reshape((seq, vh, hd))?)?;
-        self.out_proj.forward(&o.reshape((seq, v_dim))?)
+        gdn_profile::step(&mut prof, dev, Step::GnormZgate, bytes.gnorm)?;
+        let out = self.out_proj.forward(&o.reshape((seq, v_dim))?)?;
+        gdn_profile::step(
+            &mut prof,
+            dev,
+            Step::OutProj,
+            self.out_proj.weight_bytes(seq),
+        )?;
+        gdn_profile::flush(prof);
+        Ok(out)
+    }
+
+    /// The bytes each non-projection step of a `seq`-token block must move at
+    /// this layer's geometry, for the `XWEN_GDN_PROFILE` line's achieved-GB/s
+    /// column. Weights, state and the activations the step reads and writes;
+    /// the two projection steps ask their own `Proj`, which alone knows whether
+    /// this token count streams q8_0 bytes or the f16 plane.
+    ///
+    /// Arithmetic only — built unconditionally because it is a handful of
+    /// multiplications, and consulted only when the switch is on.
+    fn byte_floors(&self, seq: usize) -> ByteFloors {
+        let (hd, vh) = (self.head_dim, self.v_heads);
+        let conv_dim = 2 * self.k_heads * hd + vh * hd;
+        let tail = self.conv_kernel - 1;
+        let f32b = |elems: usize| (elems * 4) as u64;
+        ByteFloors {
+            // The fused qkv stream in and out, the carried window in and out,
+            // and the taps.
+            conv: f32b(2 * seq * conv_dim + 2 * tail * conv_dim + self.conv_kernel * conv_dim),
+            // q and k read, normalized and tiled to the V-head count on the way
+            // out. Reference path only; the fused scan does this from registers.
+            qk_norm: f32b(2 * seq * self.k_heads * hd + 2 * seq * vh * hd),
+            // The `[hidden, 2 * v_heads]` f32 weight, which dwarfs its operands.
+            ba_proj: f32b(self.ba_wt.elem_count()),
+            ba_head: f32b(seq * 2 * vh + 2 * seq * vh + 2 * vh),
+            // o and z in, the result out.
+            gnorm: f32b(3 * seq * vh * hd + hd),
+            // Held in the struct so `scan` can size the state planes it writes.
+            state_plane: f32b(vh * hd * hd),
+            scan_io: f32b(seq * conv_dim + seq * vh * hd + 2 * seq * vh),
+        }
+    }
+}
+
+/// Per-step byte floors for one block call — see [`LinearAttnBlock::byte_floors`].
+struct ByteFloors {
+    conv: u64,
+    qk_norm: u64,
+    ba_proj: u64,
+    ba_head: u64,
+    gnorm: u64,
+    /// One `[v_heads, 128, 128]` f32 state plane.
+    state_plane: u64,
+    /// The scan's non-state traffic: the conv stream in, the per-token output
+    /// out, beta and g in.
+    scan_io: u64,
+}
+
+impl ByteFloors {
+    /// The scan's floor when it writes `planes` state planes: the incoming
+    /// state read once, `planes` written, plus its streaming operands. At
+    /// decode this is the layer's dominant non-weight traffic and the reason a
+    /// GDN token costs state bandwidth at all.
+    fn scan(&self, planes: usize) -> u64 {
+        self.state_plane * (1 + planes as u64) + self.scan_io
     }
 }
 

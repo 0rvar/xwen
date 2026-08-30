@@ -153,6 +153,32 @@ impl Proj {
         })
     }
 
+    /// Weight bytes this projection streams for a `seq`-token call — the byte
+    /// floor its matmul cannot go under, for the `XWEN_GDN_PROFILE` line.
+    ///
+    /// It follows `forward`'s routing rather than the storage alone, because
+    /// the two disagree exactly where it matters: a q8_0-stored weight streams
+    /// its q8_0 bytes at decode and its (twice as wide) dequantized f16 plane
+    /// above `Q8_DECODE_MAX_SEQ`. Activation and output bytes are excluded —
+    /// at every shape here they are three orders of magnitude below the weight
+    /// pass, and including them would blur the one quantity the line exists to
+    /// compare against.
+    pub(crate) fn weight_bytes(&self, seq: usize) -> u64 {
+        match self {
+            Proj::Quant(q) => q.weight_bytes(),
+            Proj::DenseF16(w) => (w.elem_count() * DType::F16.size_in_bytes()) as u64,
+            Proj::DenseF16Q8 { f16, q8 } => {
+                if seq <= Q8_DECODE_MAX_SEQ && !crate::ops::attn_dequant() {
+                    let p = &q8.plane;
+                    let blocks = (p.out_dim * p.in_dim) / p.dtype.block_size();
+                    (blocks * p.dtype.type_size()) as u64
+                } else {
+                    (f16.elem_count() * DType::F16.size_in_bytes()) as u64
+                }
+            }
+        }
+    }
+
     /// f32 in, f32 out on every variant; the stored quantized/f16 weights are the
     /// only non-f32 values the matmul ever sees.
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {

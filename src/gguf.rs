@@ -1430,6 +1430,20 @@ pub struct QLinear {
 }
 
 impl QLinear {
+    /// Weight bytes one call streams, for the `XWEN_GDN_PROFILE` byte floor.
+    ///
+    /// Exact when the loader handed out a raw plane (the bytes both the
+    /// quantized matmul and the small-batch kernel read). Without one this is
+    /// the dense-f32 UPPER BOUND, which is what the `XWEN_ATTN_F32` parity path
+    /// actually holds — a quantized-stored weight kept behind a bare `QMatMul`
+    /// would be narrower, and that combination is off every shipped route.
+    pub fn weight_bytes(&self) -> u64 {
+        match &self.plane {
+            Some(p) => ((p.out_dim * p.in_dim) / p.dtype.block_size() * p.dtype.type_size()) as u64,
+            None => (self.in_dim * self.out_dim * 4) as u64,
+        }
+    }
+
     pub fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         // candle's Metal quantized matmul rebuilds the input layout from its
         // SHAPE (quantized/metal.rs, call_quantized_matmul_mm_t) and so silently

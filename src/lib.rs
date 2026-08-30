@@ -5,6 +5,7 @@ pub mod config;
 pub mod constrain;
 pub mod dflash;
 pub mod drafter;
+pub mod gdn_profile;
 pub mod generate;
 pub mod gguf;
 mod host_log;

@@ -637,6 +637,11 @@ impl XwenModel {
         let logits = logits.flatten_all()?; // [vocab]
         crate::stack_profile::stage_end(&mut self.profile, &self.device, Stage::LmHead)?;
         crate::stack_profile::chunk_end(&mut self.profile, &self.device)?;
+        // One `XWEN_GDN_PROFILE` line per forward, holding every DeltaNet
+        // layer's sub-steps folded together. Here rather than in the block
+        // because the block does not know where a forward ends, and a line per
+        // layer would be 36 lines a token.
+        crate::gdn_profile::report();
         if self.tap_enabled {
             taps.push(("result_norm".to_string(), last));
             taps.push(("result_output".to_string(), logits.clone()));
@@ -673,6 +678,7 @@ impl XwenModel {
         let logits = self.lm_head(&normed)?; // [seq, vocab] — QMatMul path (seq > 1)
         crate::stack_profile::stage_end(&mut self.profile, &self.device, Stage::LmHead)?;
         crate::stack_profile::chunk_end(&mut self.profile, &self.device)?;
+        crate::gdn_profile::report();
         Ok(logits)
     }
 
