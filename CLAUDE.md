@@ -210,6 +210,11 @@ kernel-vs-reference invariants and is the fast pre-check.
 - Qwen-specific: the tokenizer has no BOS and chat stops on TWO eos ids — a gen loop
   that only checks 248044 runs through turn boundaries and looks like "the model won't
   stop", which is a config bug, not a sampling bug.
+- Install with `just install` (`cargo install --path . --locked`). Plain
+  `cargo install` IGNORES Cargo.lock: it silently re-resolves all deps, and a
+  drifted metal/objc2 crate set has produced a binary whose Metal-4 kernels fail
+  to compile at runtime (dense_mm.metal, mpp::tensor_ops identifiers
+  undeclared). Same failure smell as the nix-SDK trap above, different cause.
 
 ## Perf state
 
