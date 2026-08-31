@@ -1336,6 +1336,20 @@ tier) is inherited as-is**; it is architecture-agnostic. The KV export/import an
 tier must additionally carry the recurrent state for the 3-of-4 linear layers — KV cache
 alone no longer reconstructs a prefix. Native endpoint moved `/maxuna/v1/*` →
 
+**A mid-conversation system turn demotes to a user turn on the wire dialects
+(2026-08-31).** Harnesses inject system-role messages past the head of the conversation
+— Claude Code's token-budget reminders are the live case — and the Anthropic messages
+spec does not even define a `system` role inside `messages`. The choice was demote
+or relax: the official templates for every checkpoint hard-raise
+`System message must be at the beginning.` in their message loop, so rendering a
+mid-stream system block is formatting the checkpoint's template forbids (llama.cpp,
+applying the template verbatim, 500s on the same request) — relaxing was refused on
+that evidence alone. `push_turn` in both dialects demotes the turn to user in place,
+merging into adjacent user text; position is preserved deliberately (the reminder's
+meaning is positional, and this matches how Claude Code embeds `<system-reminder>`
+blocks in user turns itself). The renderer stays template-faithful and chat.rs's
+refusal remains as the backstop for the direct chat surface.
+
 **Two cache slots and an opt-in disk tier (2026-08-30; were four and on-by-default).**
 Both defaults were set when the default checkpoint's image was a few MB of DeltaNet
 state plus 4 KiB/token. The default is now Flash-Next: 30 KiB/token (2 KV heads at 256

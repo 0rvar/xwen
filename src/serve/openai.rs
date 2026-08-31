@@ -289,7 +289,18 @@ fn join_into(previous: &mut String, text: &str) {
 
 /// Append a turn, merging consecutive same-role turns — the template renders
 /// one block per message, and two user messages in a row mean one turn.
+///
+/// A system turn past the head of the conversation demotes to a user turn: the
+/// template renders exactly one system block, ahead of the conversation, while
+/// harnesses (Claude Code's token-budget reminders) inject system messages
+/// mid-conversation that are addressed to the model like any user text.
 fn push_turn(messages: &mut Vec<Message>, turn: Message) {
+    let turn = match turn {
+        Message::System(text) if !matches!(messages.last(), None | Some(Message::System(_))) => {
+            Message::User(text)
+        }
+        turn => turn,
+    };
     match (messages.last_mut(), turn) {
         (Some(Message::System(previous)), Message::System(text))
         | (Some(Message::User(previous)), Message::User(text)) => join_into(previous, &text),
@@ -2287,6 +2298,24 @@ mod tests {
     fn developer_messages_are_system_messages() {
         let request = prepared(r#"{"messages":[{"role":"developer","content":"Be brief."}]}"#);
         assert_eq!(shape(&request.job.messages), vec!["system:Be brief."]);
+    }
+
+    /// Harnesses inject system turns mid-conversation (Claude Code's
+    /// token-budget reminders). The template renders exactly one system block,
+    /// ahead of the conversation, so a later system turn demotes to a user
+    /// turn and merges into the user text around it.
+    #[test]
+    fn a_system_turn_past_the_head_demotes_to_a_user_turn() {
+        let request = prepared(
+            r#"{"messages":[
+                {"role":"system","content":"Be brief."},
+                {"role":"user","content":"Hi"},
+                {"role":"system","content":"budget note"}]}"#,
+        );
+        assert_eq!(
+            shape(&request.job.messages),
+            vec!["system:Be brief.", "user:Hi\nbudget note"]
+        );
     }
 
     #[test]

@@ -4,6 +4,37 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-08-31 — Serve dialects: a mid-conversation system turn demotes to a user turn, and Claude Code runs against xwen end to end
+
+**Context.** A config-repo session pointed Claude Code at xwen's Anthropic endpoint
+(the rewritten `qwen` launcher; `qwen --review` drives the headless read-only
+reviewer). First real harness traffic immediately hit a wall: Claude Code injects its
+token-budget reminders as `system`-role messages mid-conversation, and both wire
+dialects carried them through to the renderer, whose template-fidelity check refuses a
+system message past index 0.
+
+**The fix, and why not the other one.** `push_turn` in serve/anthropic.rs and
+serve/openai.rs now demotes a system turn past the head of the conversation to a user
+turn, in place, merging into adjacent user text. Relaxing the validation instead was
+considered and refused without needing an experiment: the official templates themselves
+hard-raise `System message must be at the beginning.` in the message loop (both
+vendored dialects; chat_template-qwen38.jinja:106), so a mid-stream `<|im_start|>system`
+block is formatting the checkpoint's own template forbids and llama.cpp would 500 on.
+The renderer stays faithful, chat.rs's refusal stays as the backstop, and the wire
+dialects absorb the harness quirk — the same normalizer-adapts/renderer-never-lies split
+the serve tree already runs on. Demotion is positional on purpose: an
+"N tokens left" reminder means what it means at the turn it arrived in, and in-place
+demotion reproduces exactly how Claude Code embeds `<system-reminder>` blocks in user
+turns anyway. Leading consecutive system messages still merge into the one head system
+block. One test per dialect; serve suite 420/420, chat 38/38; no model math touched, so
+no parity run owed. Verified end to end: a full `qwen --review` session against a live
+server, Qwen answering from actually-read files.
+
+**Also shipped (39db173): `just install`.** Plain `cargo install --path .` ignores
+Cargo.lock — a re-resolved metal/objc2 crate set produced a binary whose Metal-4 kernels
+failed to compile at runtime (dense_mm.metal, mpp::tensor_ops identifiers undeclared).
+The recipe pins `--locked`; the trap is in CLAUDE.md's operational hazards.
+
 ## 2026-08-30 (technique survey) — Perf landscape and technique survey (research, no code): no public Apple Silicon runtime is a peer on Flash-Next, four techniques survive the cut, and candle turns out to already implement MLX-style concurrent encoding
 
 **Context.** Two research passes with nothing built: where xwen actually sits against

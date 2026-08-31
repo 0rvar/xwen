@@ -350,7 +350,18 @@ fn join_into(previous: &mut String, text: &str) {
 /// Append a turn, merging it into the previous one when the roles match. The
 /// template renders one block per message, so two consecutive user messages
 /// would otherwise become two `<user>` turns where the client meant one.
+///
+/// A system turn past the head of the conversation demotes to a user turn: the
+/// template renders exactly one system block, ahead of the conversation, while
+/// harnesses (Claude Code's token-budget reminders) inject system messages
+/// mid-conversation that are addressed to the model like any user text.
 fn push_turn(messages: &mut Vec<Message>, turn: Message) {
+    let turn = match turn {
+        Message::System(text) if !matches!(messages.last(), None | Some(Message::System(_))) => {
+            Message::User(text)
+        }
+        turn => turn,
+    };
     match (messages.last_mut(), turn) {
         (Some(Message::System(previous)), Message::System(text))
         | (Some(Message::User(previous)), Message::User(text)) => join_into(previous, &text),
@@ -1404,6 +1415,26 @@ mod tests {
                 "messages":[{"role":"user","content":"Hi"}]}"#,
         );
         assert_eq!(shape(&blocks.job.messages), shape(&plain.job.messages));
+    }
+
+    /// Claude Code injects its token-budget reminders as `system`-role turns
+    /// mid-conversation. The template renders exactly one system block, ahead
+    /// of the conversation, so a later system turn demotes to a user turn and
+    /// merges into the user text around it.
+    #[test]
+    fn a_system_turn_past_the_head_demotes_to_a_user_turn() {
+        let request = prepared(
+            r#"{"max_tokens":16,"system":"Be brief.","messages":[
+                {"role":"user","content":"Hi"},
+                {"role":"system","content":"<total_tokens>1000 tokens left</total_tokens>"}]}"#,
+        );
+        assert_eq!(
+            shape(&request.job.messages),
+            vec![
+                "system:Be brief.",
+                "user:Hi\n<total_tokens>1000 tokens left</total_tokens>"
+            ]
+        );
     }
 
     /// Thinking blocks ride the history to the renderer even on a superseded
