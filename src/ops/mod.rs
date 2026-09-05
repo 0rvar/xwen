@@ -1,4 +1,5 @@
 pub mod attn_glue;
+pub mod bandwidth;
 pub mod bf16;
 pub mod combine;
 pub mod delta;

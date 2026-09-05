@@ -5712,3 +5712,50 @@ pub(crate) mod testutil {
         out
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct BwArgs {
+    n4: u32,
+    groups: u32,
+}
+
+/// Encodes one bandwidth probe over `n4` float4s starting `src_off` bytes into
+/// `src`: the reduce-only read kernel (one partial sum per threadgroup into `dst`)
+/// when `read`, else a copy into `dst` at `dst_off`. `groups` threadgroups of 256
+/// threads, grid-strided. Bench-only; see `ops::bandwidth`.
+pub(crate) fn run_bw_probe(
+    mdev: &MetalDevice,
+    read: bool,
+    src: &Buffer,
+    src_off: usize,
+    dst: &Buffer,
+    dst_off: usize,
+    n4: usize,
+    groups: usize,
+) -> Result<()> {
+    ensure!(
+        n4 > 0 && u32::try_from(n4).is_ok() && groups > 0 && u32::try_from(groups).is_ok(),
+        "bw probe geometry out of range"
+    );
+    let name = if read {
+        "kernel_bw_read"
+    } else {
+        "kernel_bw_copy"
+    };
+    let pipe = pipelines::bandwidth_pipeline(mdev.device(), name)?;
+    let args = BwArgs {
+        n4: n4 as u32,
+        groups: groups as u32,
+    };
+    let cmd = mdev.command_encoder()?;
+    let ep = &cmd;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipe);
+    encoder.set_bytes(0, &args);
+    encoder.set_input_buffer(1, Some(src), src_off);
+    encoder.set_output_buffer(2, Some(dst), dst_off);
+    encoder.dispatch_thread_groups(mtl_size!(groups, 1, 1), mtl_size!(256, 1, 1));
+    Ok(())
+}

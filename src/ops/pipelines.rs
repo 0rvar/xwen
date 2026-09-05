@@ -131,6 +131,9 @@ const DELTA_SOURCE: &str = include_str!("delta.metal");
 /// asks for this library, so it never compiles.
 const HC_SOURCE: &str = include_str!("hc.metal");
 const PLE_SOURCE: &str = include_str!("ple.metal");
+/// Achievable-bandwidth probes (bench only, `ops::bandwidth`). Never on a model
+/// path, so it compiles only when the bench asks for it.
+const BW_SOURCE: &str = include_str!("bandwidth.metal");
 /// Vendored QSA decode row gather (the K/V rows a selection names, packed
 /// into one contiguous plane per head). Own library; a pure copy, so it has
 /// no rounding contract to state. Under `XWEN_QSA_CLASSIC` nothing asks for
@@ -374,4 +377,9 @@ pub(crate) fn qsa_select_pipeline(device: &Device, name: &str) -> Result<Compute
 /// Pipeline for the PLE grouped gate and dilated convolution tail.
 pub(crate) fn ple_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, PLE_SOURCE, "ple", name)
+}
+
+/// Pipeline for the bandwidth probes.
+pub(crate) fn bandwidth_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, BW_SOURCE, "bandwidth", name)
 }
