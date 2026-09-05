@@ -37,17 +37,64 @@ impl Dialect {
     }
 }
 
+/// What a client says it is, for a history that can answer "which session was
+/// that". Both values are opaque here: whatever the client sent, bounded, and
+/// never parsed at the point it is stored — the shape of the body id has
+/// already changed once between Claude Code releases, and a reader can pick a
+/// session out of an old string long after the writer has stopped knowing how.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientId {
+    /// The request body's own identifier: the Anthropic dialect's
+    /// `metadata.user_id`, the OpenAI dialect's `user`. Undocumented, and its
+    /// shape is not promised.
+    pub client: Option<String>,
+    /// The `x-claude-code-session-id` header, which is the documented
+    /// per-session identifier. `x-claude-code-agent-id` is deliberately not
+    /// read: it rides only subagent requests, so keying on it would split one
+    /// session into a row per agent.
+    pub session: Option<String>,
+}
+
+/// The longest client-supplied identifier that is stored. Nothing legitimate
+/// comes close — a session uuid is 36 characters — and the history is a file a
+/// hostile client would otherwise get to grow a request at a time.
+pub const CLIENT_ID_MAX_CHARS: usize = 128;
+
+impl ClientId {
+    /// Both values as the client sent them, each cut to
+    /// [`CLIENT_ID_MAX_CHARS`] on a character boundary. An empty string is how
+    /// a client spells "not supplied" without dropping the key, and it is
+    /// normalized here rather than in each dialect, so that the two cannot
+    /// drift into disagreeing about what an empty id means.
+    pub fn new(client: Option<String>, session: Option<String>) -> Self {
+        Self {
+            client: bound(client),
+            session: bound(session),
+        }
+    }
+}
+
+fn bound(value: Option<String>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(CLIENT_ID_MAX_CHARS).collect())
+}
+
 /// Who a job belongs to, for correlating the events one request produces.
 ///
 /// The id is assigned once, at submit, and is monotonic for the life of the
 /// process; it never reaches the client and never appears in a log line, so
 /// nothing outside the server depends on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestOrigin {
     pub id: u64,
     pub dialect: Dialect,
     /// Whether the client asked for its reply as a stream.
     pub streaming: bool,
+    /// The body identifier the client sent, when it sent one.
+    pub client: Option<String>,
+    /// The session identifier the client's headers carried, when they did.
+    pub session: Option<String>,
 }
 
 /// One unit of the engine thread's work: a chat generation or a whole batch.
@@ -114,8 +161,18 @@ impl std::fmt::Display for Target {
 impl Job {
     pub fn origin(&self) -> RequestOrigin {
         match self {
-            Job::Generation(job) => job.origin,
-            Job::Batch(job) => job.origin,
+            Job::Generation(job) => job.origin.clone(),
+            Job::Batch(job) => job.origin.clone(),
+        }
+    }
+
+    /// Which request this is, without cloning the identity strings the rest of
+    /// the origin carries. The queue's snapshot wants nothing else and takes it
+    /// under the lock.
+    pub fn origin_id(&self) -> u64 {
+        match self {
+            Job::Generation(job) => job.origin.id,
+            Job::Batch(job) => job.origin.id,
         }
     }
 

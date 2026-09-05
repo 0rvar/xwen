@@ -306,11 +306,15 @@ pub struct BatchStats {
     /// Wall time of the shared prefill plus taking the snapshot.
     pub snapshot_ms: f64,
     pub items: usize,
-    /// Tokens actually forwarded as prefill across the whole batch, and the
-    /// wall time they took: the shared prefix once, every item's tail, and —
-    /// for scored items — every teacher-forced segment and option trial. This
-    /// measures engine WORK, so on a scored batch it exceeds the sum of the
-    /// items' logical prompt sizes.
+    /// Tokens forwarded as prefill across the whole batch, and the wall time
+    /// they took: every item's tail, and — for scored items — every
+    /// teacher-forced segment and option trial. This measures engine WORK, so
+    /// on a scored batch it exceeds the sum of the items' logical prompt sizes.
+    ///
+    /// The shared prefix is NOT among them: it is prefilled before this
+    /// accounting opens, and its tokens and time are `shared_prefix_tokens` and
+    /// `snapshot_ms`. A caller reporting the whole prefill phase has to add both
+    /// halves — see `batch_run_record` in the CLI and the engine's `BatchSummary`.
     pub prefill_tokens: usize,
     pub prefill_ms: f64,
     /// Tokens the items actually DECODED (free text, grammar-constrained

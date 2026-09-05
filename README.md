@@ -357,6 +357,126 @@ the same way and defaults to 131072.
 The default bind is loopback because with no `api_key` the server accepts every request;
 set `host = "0.0.0.0"` (or `--host`) together with an `api_key` to serve the LAN.
 
+## Metrics
+
+Every run appends one JSON line to `$HOME/.local/state/xwen/metrics.jsonl`: what it was,
+what it cost, and who asked for it. `generate`, `chat`, `batch` and every served request
+record themselves, on by default. `XWEN_METRICS_FILE=<path>` records somewhere else and
+`XWEN_METRICS_FILE=off`, in any casing, records nothing; setting the variable to an
+empty string is not setting it and the default path applies. A write that fails prints
+one warning for the life of the process and never fails the run that produced it, and a
+whole record goes out in a single append, so a server and a `generate` recording at the
+same moment interleave records rather than fragments.
+
+A record carries the schema version, the completion timestamp, the surface (`generate`,
+`chat`, `batch`, `serve:anthropic`, `serve:openai`, `serve:native`, `serve:batch`), the
+checkpoint name, prompt / cached / prefill / decode token counts with the seconds each
+phase took, `ok`, and whatever else the surface knows: thinking tokens, drafted and
+accepted positions, batch item count, the client and session ids. Readers ignore fields
+they do not recognize, so an older xwen still reads a newer one's history.
+
+An absent optional means not measured, which is not the same as zero. `thinking_tokens`
+is the one to know: serve always measures it and writes it, 0 included, while `generate`
+and `chat` count thinking only when a think budget is in effect, so a thinking run with
+no budget set records no thinking count at all. Summing the field therefore sums the
+runs that measured it, not the runs that thought.
+
+The checkpoint name is the official full name when the GGUF identifies as one and the
+GGUF's own file stem when it identifies as nothing. Every surface spells it the same
+way, `generate`, `chat` and `batch` included, so `--by model` never splits one file
+across two names. A batch response's own `model` field answers a different question,
+naming the checkpoint the run replies as, and is unchanged.
+
+`xwen stats` reports over the file. `--by day|week|month|model|surface|client|session|all`
+(default `day`), `--since 24h|7d|4w|YYYY-MM-DD` (a date means local midnight), `--model`
+and `--surface` filter exactly, `--client` and `--session` by substring, `--json` prints
+the rows instead of the table, and `--file` reads another history without ever recording
+to it. A bad `--since` is an error before the file is opened, so a typo says so rather
+than reporting an empty history. The label column is measured in display columns, so a
+CJK or emoji label still lines up, and is cut to 48 with a trailing ellipsis; a raw
+client id is the one thing long enough to need it.
+
+```bash
+xwen stats                                    # today and the days before it
+xwen stats --by session --since 7d            # where the week went
+xwen stats --by model --surface serve:openai --json
+```
+
+```
+surface          runs  prompt  cached  hit%  prefill  pf tok/s  decode  dec tok/s  accept%
+serve:batch         1  48,000  31,000  64.6   17,000      2636   1,200      120.0        -
+chat                1   3,120       0   0.0    3,120       612     840       37.5        -
+serve:anthropic     2   9,630   7,800  81.0    1,830       806     836       46.5        -
+generate            1     925       0   0.0      925       701     512       37.6     77.1
+serve:openai        1   7,606   6,144  80.8    1,462       860     301       46.3        -
+---------------  ----  ------  ------  ----  -------  --------  ------  ---------  -------
+total               6  69,281  44,944  64.9   24,337      1445   3,689       52.4     77.1
+```
+
+A rate is the bucket's tokens over the bucket's seconds, never a mean of per-run rates:
+a hundred two-token replies would otherwise outweigh one long generation. `-` marks a
+column nothing in the bucket measured. The table is the whole of stdout; the file, the
+run count, any line that did not parse, and a note if the local offset could not be read
+and the dates fell back to UTC all go to stderr. The history is read as bytes and
+decoded one line at a time, so a torn or non-UTF-8 line is counted as unreadable and
+costs only itself. `--since` on a date refuses a day its month does not have, leap years
+included. A history that does not exist yet prints `no metrics recorded yet (<path>)`
+and exits 0.
+
+**`cached` means something slightly different on each surface.** Serve is the only one
+with prefix reuse, so it is the only one whose cached count comes from a real cache
+read. `generate` prefills from a reset cache and `chat` re-prefills the whole
+conversation every turn, so both record zero by construction. A batch run is ONE record
+covering all its items, and its counts are measured independently rather than derived
+from each other. Cached is the sum of the items' own `cached_prefix_tokens` less the
+shared prefix, which is prefilled once and read back for every item after the first, so
+summing that column alone counts the prefix one time too many. Prefill is what the
+engine really forwarded, shared prefix included: the runner opens its own prefill
+accounting once the prefix is already resident, which is why the recorded seconds are
+its prefill plus its snapshot time. The `/xwen/v1/batch` route folds both halves into
+its summary the same way.
+
+So `prompt = cached + prefill` holds for an ordinary run and is not an invariant. A
+scored batch forwards more than its prompt, every teacher-forced trial being real work
+against no prompt token, and a served job that was abandoned or failed forwards less.
+
+**`ok` means the run reached its own end: an end-of-generation token or its token cap,
+with no error.** Anything else is `ok` false, and the record is still written, because a
+history that dropped its bad runs would show a quiet hour where there was a struggling
+one. So a served job whose client disconnected or whose deadline killed it is `ok`
+false, as is a chat turn cancelled with Ctrl-C mid-generation, alongside the outright
+errors. What those records carry is whatever was really measured, which for an
+interrupted run is the tokens it reached before it stopped. Zero counts mean zero
+measurements, not a convention: a `generate` whose generation errored, say because the
+prompt outgrew `--max-ctx`, a chat turn that died during prefill, a `batch` whose whole
+payload failed, a served batch that never reached the runner.
+
+A served batch that fails before producing a summary is still filed under `serve:batch`,
+the surface coming from the job's own kind at pickup rather than from a summary it never
+wrote. A batch where every item failed is a failed run; one that lost only some of its
+items is not. A CLI `batch` failure records the model as `-`, most whole-request
+failures happening before the payload has named a checkpoint. Every surface records its
+own failures; the one thing that leaves nothing behind is a killed process. `generate`
+installs no signal handler, so Ctrl-C on it writes no record, where a `chat` turn
+cancelled inside the REPL does write one.
+
+`ok` separates populations; it does not filter. Every record a query matches is summed
+into its bucket, unfinished ones included, and the count of them comes back as
+`unfinished` in the `--json` rows. The table has no column for it.
+
+**`session` comes from a header, `client` from the body verbatim.** `session` is the
+`x-claude-code-session-id` request header, Anthropic's documented per-session identifier
+and one Claude Code sends on every request; the Anthropic and OpenAI routes read it, and
+so does `/xwen/v1/batch`, whose payload carries no client id of its own. `client` is the
+body's own id (Anthropic `metadata.user_id`, OpenAI `user`), stored unparsed because its
+format is undocumented and has changed between Claude Code releases: one capture spells
+it `user_…_session_…`, another embeds a JSON `session_id`. Both fields stay
+accept-and-drop, held as raw JSON like `tool_choice`, so a wrongly-typed `metadata` or
+`user` costs at most the client id and is never a 400. `--by session` takes the header
+when there is one, otherwise reads past the last `session_` marker in the client string,
+and labels whatever is left `-`. Both ids are cut to 128 characters. Whether the
+header's id is the same one `claude --resume` shows is not confirmed.
+
 ## Verifying a change
 
 Any change to model math re-runs the parity gate. It compares our forward pass against

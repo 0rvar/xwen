@@ -12,6 +12,7 @@ mod host_log;
 pub mod hub;
 pub mod kv_cache;
 pub mod linear_attn;
+pub mod metrics;
 pub mod model;
 pub mod moe;
 pub mod mtp;

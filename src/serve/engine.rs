@@ -794,7 +794,13 @@ fn engine_loop(
 
         // From here the job is this thread's, and it reports one `JobDone` however it
         // ends. A job dropped at the check above was never picked and reports neither.
-        let mut trace = JobTrace::new(job.origin(), prompt_tokens, Instant::now());
+        let mut trace = JobTrace::new(
+            job.origin(),
+            crate::serve::model_id(&settings, &required),
+            prompt_tokens,
+            matches!(job, Job::Batch(_)),
+            Instant::now(),
+        );
         logger.log(ServeLog::JobPicked {
             origin: job.origin(),
             prompt_tokens,
@@ -941,6 +947,14 @@ fn engine_loop(
             .first_sent
             .get()
             .map(|at| at.saturating_duration_since(trace.picked).as_secs_f64());
+        // The history gets the same numbers the record does. A warning about a
+        // history that cannot be written goes through the logger like every
+        // other line, because on a `--tui` server stderr belongs to the
+        // dashboard.
+        let run = run_record(&trace.record, trace.batch_job);
+        if let Some(warning) = crate::metrics::record_warning(&run) {
+            logger.log(ServeLog::HostLine(warning));
+        }
         logger.log(ServeLog::JobDone(Box::new(trace.record)));
     }
     // The conversation still in the cache is worth as much as any other, so it is
@@ -998,16 +1012,29 @@ struct JobTrace {
     /// while the record's fields are being written around it; reading it out here, once,
     /// is what makes the reported figure survive every way a job can end.
     first_sent: Cell<Option<Instant>>,
+    /// Whether this is a batch job, known at pickup from the job's own variant.
+    /// The record's `batch` summary says the same thing only for a batch that
+    /// RAN: one that failed before the runner returned has no summary and would
+    /// otherwise be reported as the native generation it is not.
+    batch_job: bool,
     record: JobRecord,
 }
 
 impl JobTrace {
-    fn new(origin: RequestOrigin, prompt_tokens: usize, picked: Instant) -> Self {
+    fn new(
+        origin: RequestOrigin,
+        model: String,
+        prompt_tokens: usize,
+        batch_job: bool,
+        picked: Instant,
+    ) -> Self {
         Self {
             picked,
             first_sent: Cell::new(None),
+            batch_job,
             record: JobRecord {
                 origin,
+                model,
                 stop: None,
                 abandoned: None,
                 error: None,
@@ -1024,6 +1051,74 @@ impl JobTrace {
             },
         }
     }
+}
+
+/// One finished job as the metrics history records it.
+///
+/// `batch_job` comes from the job's own variant rather than from the presence of
+/// a summary: a batch that failed before its runner returned has no summary, and
+/// reporting it as the native generation it was submitted on would put it in the
+/// wrong surface with the wrong numbers.
+///
+/// A batch's token counts are the record's own, already summed from the items at
+/// the fold — never derived from each other, because a scored batch forwards
+/// more than its prompt and the difference would go negative. Only its phase
+/// SECONDS come from the summary, the generation-centric spans being zero for a
+/// batch. A batch that never got that far carries the queue's bytes-based prompt
+/// estimate, which is not a measurement and is recorded as nothing rather than
+/// as a number.
+fn run_record(record: &JobRecord, batch_job: bool) -> crate::metrics::RunRecord {
+    // A batch is submitted on the native dialect but is not a native
+    // generation, and the two cost nothing alike: they get their own surfaces.
+    let surface = if batch_job {
+        "serve:batch".to_string()
+    } else {
+        format!("serve:{}", record.origin.dialect.label())
+    };
+    let mut run = crate::metrics::RunRecord::new(surface, record.model.clone());
+    run.client = record.origin.client.clone();
+    run.session = record.origin.session.clone();
+    run.thinking_tokens = Some(record.thinking_tokens);
+    run.drafted = record.spec.map(|spec| spec.drafted);
+    run.accepted = record.spec.map(|spec| spec.accepted);
+    run.items = record.batch.map(|batch| batch.items);
+    // Every item failing is a failed run, however cleanly the machinery around
+    // them worked. A batch that lost some of its items still did the rest.
+    let every_item_failed = record
+        .batch
+        .is_some_and(|batch| batch.items > 0 && batch.failed == batch.items);
+    // A job the client walked away from, or one the deadline or a shutdown cut,
+    // did not reach its own end however healthy the engine was: its counts stop
+    // wherever it was interrupted, and reporting it alongside completed runs
+    // would quietly drag their averages down.
+    run.ok = record.error.is_none() && record.abandoned.is_none() && !every_item_failed;
+    match record.batch {
+        Some(batch) => {
+            run.prompt_tokens = record.prompt_tokens;
+            // The record's own `prefill_tokens` is `prompt - cache_read`, which
+            // the fold keeps so the record's arithmetic closes. That is not the
+            // forwarded work on a scored batch, where teacher-forced trials run
+            // through the model against no prompt token, so the metrics record
+            // takes the measured figure and leaves the two counts independent.
+            run.cached_tokens = record.cache_read;
+            run.prefill_tokens = batch.prefill_tokens;
+            run.prefill_secs = batch.prefill_secs;
+            run.decode_tokens = batch.decode_tokens;
+            run.decode_secs = batch.decode_secs;
+        }
+        // A batch with no summary never reached the runner, so every token
+        // count on it is the estimate it was queued under.
+        None if batch_job => {}
+        None => {
+            run.prompt_tokens = record.prompt_tokens;
+            run.cached_tokens = record.cache_read;
+            run.prefill_tokens = record.prefill_tokens;
+            run.prefill_secs = record.prefill_secs;
+            run.decode_tokens = record.output_tokens;
+            run.decode_secs = record.decode_secs;
+        }
+    }
+    run
 }
 
 /// What one trip through the panic boundary produced.
@@ -1386,8 +1481,14 @@ fn run_batch_job(
         items: response.items.len(),
         failed: response.items.iter().filter(|i| i.error.is_some()).count(),
         secs: response.stats.total_ms / 1000.0,
-        prefill_tokens: response.stats.prefill_tokens,
-        prefill_secs: response.stats.prefill_ms / 1000.0,
+        // The runner's own prefill figures start counting AFTER the shared
+        // prefix has been prefilled, whose tokens and time live in
+        // `shared_prefix_tokens`/`snapshot_ms` instead. The summary is what
+        // reports the whole prefill phase, so both halves are folded back in
+        // together — dropping the tokens would understate the work and
+        // dropping the seconds would overstate the rate.
+        prefill_tokens: response.stats.prefill_tokens + response.stats.shared_prefix_tokens,
+        prefill_secs: (response.stats.prefill_ms + response.stats.snapshot_ms) / 1000.0,
         decode_tokens: response.stats.decode_tokens,
         decode_secs: response.stats.decode_ms / 1000.0,
     });
@@ -4336,6 +4437,244 @@ mod tests {
         PrefixCache::new(capacity)
     }
 
+    /// One finished job, as the metrics history would take it.
+    fn served_record() -> JobRecord {
+        JobRecord {
+            origin: RequestOrigin {
+                id: 3,
+                dialect: crate::serve::types::Dialect::Anthropic,
+                streaming: true,
+                client: Some("user_1a2b_session_9f2c".to_string()),
+                session: Some("9f2ca1b4-0d31".to_string()),
+            },
+            model: "Qwen3.6-35B-A3B".to_string(),
+            stop: Some(StopKind::EndTurn),
+            abandoned: None,
+            error: None,
+            prompt_tokens: 2048,
+            cache_read: 380,
+            prefill_tokens: 1668,
+            prefill_secs: 5.2,
+            output_tokens: 38,
+            thinking_tokens: 12,
+            decode_secs: 3.1,
+            ttft_secs: Some(6.6),
+            spec: None,
+            batch: None,
+        }
+    }
+
+    /// A generation is recorded under the dialect that asked for it, carrying
+    /// whoever asked.
+    #[test]
+    fn a_served_generation_records_its_dialect_and_its_client() {
+        let run = run_record(&served_record(), false);
+        assert_eq!(run.surface, "serve:anthropic");
+        assert_eq!(run.model, "Qwen3.6-35B-A3B");
+        assert_eq!(run.client.as_deref(), Some("user_1a2b_session_9f2c"));
+        assert_eq!(run.session.as_deref(), Some("9f2ca1b4-0d31"));
+        assert_eq!(run.prompt_tokens, 2048);
+        assert_eq!(run.cached_tokens, 380);
+        assert_eq!(run.prefill_tokens, 1668);
+        assert_eq!(run.decode_tokens, 38);
+        assert_eq!(run.thinking_tokens, Some(12));
+        assert!(run.ok);
+    }
+
+    /// A batch is submitted on the native dialect but costs nothing like a
+    /// native generation, so it gets a surface of its own. Its phase figures
+    /// come from the summary, where the tokens and the seconds were measured
+    /// together; the record's own generation spans are zero for a batch.
+    ///
+    /// The token counts stay the record's, which the fold already corrected
+    /// against the items: eight items over a 1000-token shared prefix prefill
+    /// the prefix ONCE and read it back seven times, so 7000 of the 12000
+    /// prompt tokens are cache reads.
+    #[test]
+    fn a_served_batch_records_its_own_surface_and_measured_phases() {
+        let record = JobRecord {
+            batch: Some(crate::serve::log::BatchSummary {
+                items: 8,
+                failed: 0,
+                secs: 217.0,
+                // The shared prefix once (1000) plus each item's 500-token tail.
+                prefill_tokens: 5_000,
+                prefill_secs: 20.0,
+                decode_tokens: 1_200,
+                decode_secs: 10.0,
+            }),
+            origin: RequestOrigin {
+                dialect: crate::serve::types::Dialect::Native,
+                client: None,
+                session: None,
+                ..served_record().origin
+            },
+            // Eight items of 1000 shared + 500 own.
+            prompt_tokens: 12_000,
+            cache_read: 7_000,
+            prefill_tokens: 5_000,
+            ..served_record()
+        };
+        let run = run_record(&record, true);
+        assert_eq!(run.surface, "serve:batch");
+        assert_eq!(run.items, Some(8));
+        assert_eq!(run.prompt_tokens, 12_000);
+        assert_eq!(
+            run.cached_tokens, 7_000,
+            "the shared prefix read back once per item past the first"
+        );
+        assert_eq!(
+            run.prefill_tokens, 5_000,
+            "the shared prefix once, plus every item's own tail"
+        );
+        assert_eq!(
+            run.prompt_tokens,
+            run.cached_tokens + run.prefill_tokens,
+            "a batch that ran to completion read its whole prompt"
+        );
+        assert_eq!(run.prefill_secs, 20.0);
+        assert_eq!(run.decode_tokens, 1_200);
+        assert_eq!(run.decode_secs, 10.0);
+        assert_eq!(run.client, None);
+    }
+
+    /// A batch that failed before its runner returned has no summary, and the
+    /// prompt count it was queued under is the queue's bytes-based estimate.
+    /// It is still a batch — reporting it as the native generation it was
+    /// submitted on would file real failures under the wrong surface — and its
+    /// estimate is recorded as nothing rather than as a measurement.
+    #[test]
+    fn a_batch_that_failed_before_it_ran_reports_no_counts() {
+        let record = JobRecord {
+            batch: None,
+            origin: RequestOrigin {
+                dialect: crate::serve::types::Dialect::Native,
+                ..served_record().origin
+            },
+            error: Some("the batch could not be rendered".to_string()),
+            // What the queue estimated from the payload's bytes.
+            prompt_tokens: 48_000,
+            cache_read: 0,
+            prefill_tokens: 0,
+            output_tokens: 0,
+            ..served_record()
+        };
+        let run = run_record(&record, true);
+        assert_eq!(run.surface, "serve:batch");
+        assert!(!run.ok);
+        assert_eq!(run.prompt_tokens, 0, "an estimate is not a measurement");
+        assert_eq!(run.cached_tokens, 0);
+        assert_eq!(run.prefill_tokens, 0);
+        assert_eq!(run.items, None);
+    }
+
+    /// A SCORED batch forwards more than its prompt: every teacher-forced trial
+    /// runs through the model against no prompt token. The cache figure is
+    /// summed from the items rather than taken as the difference, which would
+    /// saturate to zero and hide a real cache hit.
+    #[test]
+    fn a_scored_batch_forwards_more_than_its_prompt() {
+        let record = JobRecord {
+            batch: Some(crate::serve::log::BatchSummary {
+                items: 8,
+                failed: 0,
+                secs: 300.0,
+                // Engine work: the prefix, the tails, and every scored trial.
+                prefill_tokens: 40_000,
+                prefill_secs: 100.0,
+                decode_tokens: 0,
+                decode_secs: 0.0,
+            }),
+            origin: RequestOrigin {
+                dialect: crate::serve::types::Dialect::Native,
+                ..served_record().origin
+            },
+            prompt_tokens: 12_000,
+            cache_read: 7_000,
+            prefill_tokens: 5_000,
+            ..served_record()
+        };
+        let run = run_record(&record, true);
+        assert_eq!(run.prompt_tokens, 12_000);
+        assert_eq!(run.cached_tokens, 7_000, "the cache hit is unchanged");
+        assert!(
+            run.prefill_tokens > run.prompt_tokens,
+            "scored work exceeds the prompt: {} vs {}",
+            run.prefill_tokens,
+            run.prompt_tokens
+        );
+        assert_eq!(run.prefill_tokens, 40_000);
+    }
+
+    /// Every item failing is a failed run. A batch that lost some of its items
+    /// still did the rest, and its counts are real.
+    #[test]
+    fn a_batch_is_a_failure_only_when_every_item_failed() {
+        let with_failures = |failed| JobRecord {
+            batch: Some(crate::serve::log::BatchSummary {
+                items: 8,
+                failed,
+                secs: 10.0,
+                prefill_tokens: 5_000,
+                prefill_secs: 20.0,
+                decode_tokens: 1_200,
+                decode_secs: 10.0,
+            }),
+            ..served_record()
+        };
+        assert!(run_record(&with_failures(0), true).ok);
+        assert!(run_record(&with_failures(7), true).ok, "seven of eight ran");
+        assert!(!run_record(&with_failures(8), true).ok);
+    }
+
+    /// A run that did not reach its own end is not ok, however healthy the
+    /// engine was: a client that hung up, a deadline and a shutdown all stop
+    /// the counts wherever they were, and a reader averaging over them
+    /// alongside completed runs is averaging over two different things.
+    #[test]
+    fn an_abandoned_job_is_not_a_completed_run() {
+        for reason in [
+            CancelReason::ClientGone,
+            CancelReason::Deadline,
+            CancelReason::Shutdown,
+        ] {
+            let record = JobRecord {
+                abandoned: Some(reason),
+                ..served_record()
+            };
+            let run = run_record(&record, false);
+            assert!(!run.ok, "{reason:?} is not a natural end");
+            assert_eq!(
+                run.decode_tokens, 38,
+                "the tokens it did reach are still recorded"
+            );
+        }
+        assert!(
+            run_record(&served_record(), false).ok,
+            "a job that stopped on its own is ok"
+        );
+    }
+
+    /// A single native request keeps the native surface: only a batch moves.
+    #[test]
+    fn a_native_generation_is_not_a_batch() {
+        let record = JobRecord {
+            origin: RequestOrigin {
+                dialect: crate::serve::types::Dialect::Native,
+                ..served_record().origin
+            },
+            error: Some("the inference engine panicked".to_string()),
+            ..served_record()
+        };
+        let run = run_record(&record, false);
+        assert_eq!(run.surface, "serve:native");
+        assert!(!run.ok, "a job that failed is not a run that succeeded");
+        assert_eq!(
+            run.prompt_tokens, 2_048,
+            "a generation's prompt count is real at pickup, failure or not"
+        );
+    }
+
     /// A turn whose prompt extends the cached conversation prefills only the new tail.
     #[test]
     fn a_growing_conversation_extends_the_cache() {
@@ -6423,8 +6762,12 @@ mod tests {
                 id: 1,
                 dialect: crate::serve::types::Dialect::Anthropic,
                 streaming: true,
+                client: None,
+                session: None,
             },
+            "Qwen3.6-35B-A3B".to_string(),
             4096,
+            false,
             Instant::now(),
         );
         finish_abandoned_before_decode(

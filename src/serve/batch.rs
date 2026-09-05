@@ -15,10 +15,12 @@
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use super::types::{BatchJob, Cancel, CancelGuard, Dialect, EngineEvent, RequestOrigin, Target};
+use super::types::{
+    BatchJob, Cancel, CancelGuard, ClientId, Dialect, EngineEvent, RequestOrigin, Target,
+};
 use super::{ApiError, AppState, EVENT_CHANNEL_CAPACITY, SubmitError, native};
 use crate::batch::{BatchRequest, BatchResponse, DEFAULT_MAX_TOKENS};
 use std::sync::Arc;
@@ -100,6 +102,7 @@ fn submit_batch(
     state: &AppState,
     request: BatchRequest,
     model: Target,
+    who: ClientId,
 ) -> Result<(mpsc::Receiver<EngineEvent>, CancelGuard), SubmitError> {
     let (prompt_tokens, max_tokens) = size_estimates(&request);
     let (events, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -109,6 +112,10 @@ fn submit_batch(
             id: state.next_request_id.fetch_add(1, Ordering::Relaxed),
             dialect: Dialect::Native,
             streaming: false,
+            // The payload carries no client id of its own; the session header
+            // is read here exactly as on the two chat routes.
+            client: who.client,
+            session: who.session,
         },
         request,
         model,
@@ -151,7 +158,11 @@ async fn collect_batch(
     Err(super::EngineFailure::Hangup)
 }
 
-pub(crate) async fn batch(State(state): State<AppState>, body: Bytes) -> Response {
+pub(crate) async fn batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let mut request: BatchRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -177,7 +188,8 @@ pub(crate) async fn batch(State(state): State<AppState>, body: Bytes) -> Respons
     // not claim official weights ran.
     request.model = Some(label);
 
-    let (mut events, guard) = match submit_batch(&state, request, model) {
+    let who = ClientId::new(None, super::session_header(&headers));
+    let (mut events, guard) = match submit_batch(&state, request, model, who) {
         Ok(submitted) => submitted,
         Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
         Err(SubmitError::Overloaded) => {

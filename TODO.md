@@ -2688,3 +2688,73 @@ Hazard that applies to every item above: candle's pooled-buffer recycle fires at
 concurrency change can hand a still-live buffer back to the pool. Grade these with the
 parity gate plus greedy equivalence, never with tok/s alone — a corruption from this
 mechanism is intermittent and looks like a sampling difference.
+
+## Deferred from the metrics arc (2026-09-05)
+
+Shipped that day: per-run JSONL records on every surface and `xwen stats` over them
+(log.md "Per-run metrics on disk"; the choices in decisions.md "Metrics"). Nothing here
+blocks use of the feature; item (a) is the one with a known trigger.
+
+- [ ] **An end-to-end smoke was never run: confirm a real `generate` lands a real line.**
+  The shipping session verified the whole arc with unit tests (26 in `src/metrics.rs`,
+  serve at 442 against 428 before the arc, 11 in the binary, 82 in batch) and a
+  hand-written fixture file, because another model process held the GPU and the standing
+  rule is one large model process at a time. So every piece is tested and the
+  composition — a real run, the real default path, the real file — is not. Run one
+  `xwen generate`, check the line appended to
+  `$HOME/.local/state/xwen/metrics.jsonl`, and check `xwen stats` reports it. Five
+  minutes with the GPU free; do it before trusting any number the history reports.
+- [ ] **The bench and parity scripts record into the same file and skew usage stats.**
+  `scripts/*.ts` drive `generate`, `chat` and serve through the same surfaces everyone
+  else uses, so a sweep's several hundred runs land in the history beside real use, and
+  a `--by day` table taken after a retune reads as a day of heavy inference that nobody
+  did. Recording them was the deliberate default (decisions.md: silent exclusion is the
+  harder mistake to notice), so the fix is one of two shapes and neither is decided:
+  the scripts export `XWEN_METRICS_FILE=off`, which loses the data; or records grow a
+  tag field the scripts set and `xwen stats` filters on, which keeps it and costs a
+  schema field plus a default filter decision. `--surface` and `--since` carve a bench
+  session out by hand today.
+- [ ] **A `[metrics]` table in serve.toml (path, enabled).** `XWEN_METRICS_FILE` is the
+  only control and it reaches all four surfaces, which is why it shipped alone
+  (decisions.md). A server is the one surface with a config file and the one that runs
+  long enough for an operator to want its history somewhere specific — a per-deployment
+  path, or recording off for a server that fronts a benchmark. The table would override
+  the variable for serve only; keep the variable as the surface-wide answer.
+- [ ] **`x-claude-code-agent-id` is not recorded.** Claude Code sends it on subagent
+  requests. It was left out on purpose: recording it as the session would split one
+  session into a row per agent, which is the wrong default for the question `--by
+  session` answers. It is real information though, and "which subagent burned the
+  tokens" is a question this history could answer. If it lands it wants its own field
+  and its own `--by agent`, never a fallback inside `session_key`.
+- [ ] **Whether the header's session id equals the transcript id `claude --resume` shows
+  is unconfirmed.** `x-claude-code-session-id` is documented as a per-session identifier
+  and is what `--by session` keys on, which works regardless. What is not established is
+  that the uuid in the header is the same uuid that names the transcript on disk — if it
+  is, a row of the table maps to a resumable conversation and that is worth documenting;
+  if it is not, nobody should assume it. Settle it by capturing one request's header
+  next to the session id that `claude --resume` lists for the same conversation. Until
+  then no doc claims the two are the same (README says so explicitly).
+- [ ] **The file grows forever; there is no rotation or compaction.** A line is ~250
+  bytes, so this is a slow problem: a hundred runs a day is under 10 MB a year, and the
+  full-scan reader stays comfortable well past that. `--since` bounds what a report
+  reads over, not what the file holds. Nothing in xwen prunes, and that is deliberate
+  for now (the durable-history choice is the whole reason it is not in the cache dir),
+  but a machine left running for years wants either a size-triggered roll to
+  `metrics.jsonl.1` or a compaction that folds records older than N months into daily
+  summaries. Decide when the file is big enough to be worth measuring, not before.
+- [ ] **One UTC offset is applied to every record in a report, so a daylight-saving
+  change buckets runs onto the wrong local day.** `read_utc_offset` shells out to
+  `date +%z` and the answer is read once per report, not once per record, so a report
+  covering both sides of a clock change interprets the far side an hour off. Away from
+  midnight nothing moves; within an hour of it a run lands in the neighbouring day's
+  bucket, and `--since YYYY-MM-DD` picks its cutoff by the same offset. Reading the
+  offset per record would mean a subprocess per line, which is not the fix; the fix is
+  either a real tz lookup (a dependency this arc declined) or reading
+  `/var/db/timezone`-style rules directly. Worth doing when someone is misled by it,
+  which on a machine that mostly runs in one season is not yet.
+- [ ] **The serve TUI does not show a job's model, though `JobRecord` now carries it.**
+  The metrics work added `model` to the job record so a served run could name its
+  checkpoint; the dashboard's job rows still do not display it. On a single-checkpoint
+  server that is nothing, and on a server that lazy-swaps between checkpoints it is the
+  one field that explains a row's rate. Cheap: a column in the job table, the field is
+  already there.

@@ -13,6 +13,7 @@ use xwen::dflash::DflashDrafter;
 use xwen::generate::{Generator, SpecParams};
 use xwen::gguf;
 use xwen::hub::Model;
+use xwen::metrics::{self, RunRecord};
 use xwen::mtp::MtpDrafter;
 use xwen::ops::ExpertRunner;
 use xwen::sampler::SamplerOptions;
@@ -273,6 +274,42 @@ enum Cmd {
     Fetch {
         #[command(flatten)]
         select: ModelArgs,
+    },
+    /// Summarize the per-run metrics history: what every generate, chat, batch
+    /// and served request cost, grouped and totalled.
+    ///
+    /// Every surface appends one record per run to
+    /// `$HOME/.local/state/xwen/metrics.jsonl`. `XWEN_METRICS_FILE` names
+    /// another file, or says `off` (in any casing) to record nothing at all;
+    /// setting it to an empty string counts as not setting it.
+    Stats {
+        /// What a row covers: day|week|month|model|surface|client|session|all.
+        #[arg(long, default_value = "day")]
+        by: String,
+        /// Only runs since this point: `24h`, `7d`, `4w`, or `YYYY-MM-DD`
+        /// (local midnight of that day).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only runs on this checkpoint, named exactly as the table spells it.
+        #[arg(long)]
+        model: Option<String>,
+        /// Only runs on this surface, e.g. `generate` or `serve:openai`.
+        #[arg(long)]
+        surface: Option<String>,
+        /// Only runs whose client id contains this text. A substring, because
+        /// the raw ids are long.
+        #[arg(long)]
+        client: Option<String>,
+        /// Only runs whose session id contains this text.
+        #[arg(long)]
+        session: Option<String>,
+        /// Print the rows as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Read this history instead of the configured one. Reading only —
+        /// nothing is ever recorded to it.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
     /// Dump GGUF metadata and tensor listing.
     Inspect {
@@ -791,16 +828,17 @@ fn one_shot_checkpoint(
     selected: Option<Model>,
     selector: &str,
     default: Model,
-) -> Result<Model> {
+) -> Result<Checkpoint> {
     let Some(path) = model else {
-        return Ok(selected.unwrap_or(default));
+        let model = selected.unwrap_or(default);
+        return Ok(Checkpoint::official(model));
     };
     let gguf = gguf::open(path, &candle_core::Device::Cpu)
         .with_context(|| format!("reading {}", path.display()))?;
     let cfg = XwenConfig::from_gguf(&gguf.content)
         .with_context(|| format!("reading {}", path.display()))?;
     Ok(match cfg.identify(path, selected, selector)? {
-        Identity::Official(model) => model,
+        Identity::Official(model) => Checkpoint::official(model),
         Identity::Assumed(assumed) => {
             // Said out loud because it decides the chat template dialect and the
             // drafter, and on the dense architecture the two 27B releases are a
@@ -811,9 +849,44 @@ fn one_shot_checkpoint(
                 path.display(),
                 assumed.full_name()
             );
-            assumed
+            Checkpoint::assumed(assumed, path)
         }
     })
+}
+
+/// The checkpoint a one-shot run is against, and what to call it.
+///
+/// The two are not the same answer for a file that identifies as nothing: it
+/// RUNS as some official checkpoint's graph, but it is not that checkpoint, and
+/// a history that filed someone's finetune under `Qwen3.6-27B` would be wrong in
+/// a way nothing downstream could undo. `serve` already draws this distinction
+/// (`serve::model_id`), and the label here is the same string for the same file.
+struct Checkpoint {
+    /// What the run executes as: geometry, chat dialect, drafter sidecar.
+    model: Model,
+    /// What the metrics history calls it.
+    label: String,
+}
+
+impl Checkpoint {
+    fn official(model: Model) -> Self {
+        Self {
+            model,
+            label: model.full_name().to_string(),
+        }
+    }
+
+    /// A file that named no checkpoint answers under its own file name, as it
+    /// does on the wire when a server is started with it.
+    fn assumed(model: Model, path: &Path) -> Self {
+        Self {
+            model,
+            label: path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "xwen".to_string()),
+        }
+    }
 }
 
 /// `-m` given: use it verbatim. Omitted: the selected official checkpoint,
@@ -922,13 +995,23 @@ fn run_batch(
     draft: &DraftArgs,
 ) -> Result<()> {
     match batch_request(model, tokenizer, moe_impl, max_ctx, draft) {
-        Ok(response) => {
+        Ok((response, label)) => {
+            metrics::record_quietly(&batch_run_record(&response, &label));
             let mut stdout = std::io::stdout();
             writeln!(stdout, "{}", serde_json::to_string_pretty(&response)?)?;
             stdout.flush()?;
             Ok(())
         }
         Err(error) => {
+            // A whole-request failure is a run that happened and produced
+            // nothing, which is worth more in the history than a gap: the
+            // counts are zero because none were ever measured.
+            // The checkpoint is unknown here: most whole-request failures
+            // happen before the payload has been read far enough to name one.
+            let mut run = RunRecord::new("batch", "-");
+            run.ok = false;
+            metrics::record_quietly(&run);
+
             let document = serde_json::json!({ "error": format!("{error:#}") });
             let mut stdout = std::io::stdout();
             // Written and flushed before the exit: `process::exit` runs no
@@ -940,15 +1023,128 @@ fn run_batch(
     }
 }
 
+/// `xwen stats`: read the metrics history, group it, print it.
+///
+/// The table goes to stdout and everything about it — where it was read from,
+/// how much of it the filters kept, what did not parse — to stderr, so a piped
+/// table is nothing but its own rows.
+fn run_stats(query: &metrics::StatsQuery, json: bool) -> Result<()> {
+    let Some(report) = metrics::report(query)? else {
+        // Stdout stays machine-readable whatever happened: a caller parsing
+        // `--json` gets an empty array rather than a sentence, and the reason
+        // there is nothing to show goes to stderr with the rest of the notes.
+        let note = match metrics::query_path(query) {
+            Some(path) => format!("no metrics recorded yet ({})", path.display()),
+            None => format!("metrics recording is off ({}=off)", metrics::METRICS_ENV),
+        };
+        if json {
+            println!("[]");
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
+        return Ok(());
+    };
+
+    let mut stdout = std::io::stdout();
+    if json {
+        let rows = metrics::rows_json(&report.rows);
+        writeln!(stdout, "{}", serde_json::to_string_pretty(&rows)?)?;
+    } else if report.rows.is_empty() {
+        writeln!(stdout, "no runs match")?;
+    } else {
+        write!(stdout, "{}", metrics::render_table(&report.rows, report.by))?;
+    }
+    stdout.flush()?;
+
+    let mut footer = format!(
+        "\n{} \u{b7} {} run{}",
+        report.path.display(),
+        report.matched,
+        plural(report.matched)
+    );
+    if report.matched != report.records {
+        footer.push_str(&format!(" of {}", report.records));
+    }
+    if report.skipped > 0 {
+        footer.push_str(&format!(
+            " \u{b7} {} unreadable line{}",
+            report.skipped,
+            plural(report.skipped)
+        ));
+    }
+    if !report.local_offset_known {
+        // Otherwise a report bucketed in UTC because the offset could not be
+        // read is indistinguishable from one on a machine that really is UTC.
+        footer.push_str(" \u{b7} dates in UTC (local offset unavailable)");
+    }
+    eprintln!("{footer}");
+    Ok(())
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+/// One whole batch run as the metrics history records it — one record for the
+/// run, not one per item.
+///
+/// The three token counts are measured independently, because on a batch they
+/// are not each other's complement.
+///
+/// The prompt is what the items logically asked for. The prefill is everything
+/// the engine actually FORWARDED, which is `stats.prefill_tokens` plus the
+/// shared prefix: the runner opens its own prefill accounting after the prefix
+/// is already resident and reports that span separately as
+/// `shared_prefix_tokens`/`snapshot_ms`. The seconds are folded the same way, so
+/// the pair still describes a rate that was observed. On a SCORED batch this
+/// exceeds the prompt outright — every teacher-forced trial is real forwarded
+/// work against no prompt token — which is why the cache figure cannot be the
+/// difference between the two and is summed from the items instead: the shared
+/// prefix is prefilled once and restored for each item after, so the sum of the
+/// items' own `cached_prefix_tokens` counts it one time too many.
+fn batch_run_record(response: &BatchResponse, label: &str) -> RunRecord {
+    let mut run = RunRecord::new("batch", label);
+    run.prompt_tokens = response
+        .items
+        .iter()
+        .map(|item| item.usage.prompt_tokens)
+        .sum();
+    let cached_per_item: usize = response
+        .items
+        .iter()
+        .map(|item| item.usage.cached_prefix_tokens)
+        .sum();
+    run.cached_tokens = cached_per_item.saturating_sub(response.stats.shared_prefix_tokens);
+    run.prefill_tokens = response.stats.prefill_tokens + response.stats.shared_prefix_tokens;
+    run.prefill_secs = (response.stats.prefill_ms + response.stats.snapshot_ms) / 1000.0;
+    run.decode_tokens = response.stats.decode_tokens;
+    run.decode_secs = response.stats.decode_ms / 1000.0;
+    run.items = Some(response.stats.items);
+    // Every item failing is a failed run, however cleanly the machinery around
+    // them worked. A batch that lost some of its items still did the rest.
+    let failed = response
+        .items
+        .iter()
+        .filter(|item| item.error.is_some())
+        .count();
+    run.ok = response.items.is_empty() || failed < response.items.len();
+    run
+}
+
 /// Everything `run_batch` does that can fail as a whole request: parse stdin,
 /// resolve the checkpoint the payload names, load it, run the batch.
+///
+/// The metrics label comes back beside the response because the two names can
+/// differ: the response is labelled with the checkpoint the run answers AS,
+/// while a custom GGUF is recorded under its own file name.
 fn batch_request(
     model: Option<PathBuf>,
     tokenizer: Option<PathBuf>,
     moe_impl: &str,
     max_ctx: usize,
     draft: &DraftArgs,
-) -> Result<BatchResponse> {
+) -> Result<(BatchResponse, String)> {
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
     let request: BatchRequest = serde_json::from_str(&input)
@@ -972,12 +1168,13 @@ fn batch_request(
         .transpose()?;
     // `default_servable` rather than `default`, because batch moves cache state
     // and that is the question the rule answers. The two agree today.
-    let size = one_shot_checkpoint(
+    let checkpoint = one_shot_checkpoint(
         model.as_deref(),
         named,
         "the request's \"model\" field",
         Model::default_servable(),
     )?;
+    let size = checkpoint.model;
 
     let load_start = std::time::Instant::now();
     let mut generator = build_generator(
@@ -1008,7 +1205,7 @@ fn batch_request(
         }
     };
     let mut never = || false;
-    xwen::batch::run_batch(
+    let response = xwen::batch::run_batch(
         &mut generator,
         &request,
         load_ms,
@@ -1020,7 +1217,8 @@ fn batch_request(
             progress: &mut progress,
             cancelled: &mut never,
         },
-    )
+    )?;
+    Ok((response, checkpoint.label))
 }
 
 fn expert_runner(name: &str) -> Result<ExpertRunner> {
@@ -1153,6 +1351,27 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Cmd::Stats {
+            by,
+            since,
+            model,
+            surface,
+            client,
+            session,
+            json,
+            file,
+        }) => {
+            let query = metrics::StatsQuery {
+                by: by.parse()?,
+                since,
+                model,
+                surface,
+                client,
+                session,
+                file,
+            };
+            run_stats(&query, json)
+        }
         Some(Cmd::Inspect { model, select }) => {
             let model = resolve_model(model, select.size())?;
             let device = candle_core::Device::Cpu;
@@ -1219,12 +1438,13 @@ fn main() -> Result<()> {
             // Read before the template knobs are resolved: with `--model` the
             // FILE decides which checkpoint this is, and the dialect, the
             // drafter and the effort preamble all key off that answer.
-            let size = one_shot_checkpoint(
+            let checkpoint = one_shot_checkpoint(
                 model.as_deref(),
                 select.model_size,
                 "--model-size",
                 Model::default(),
             )?;
+            let size = checkpoint.model;
             let chat_opts = think.chat_options(size)?;
             let mut generator = build_generator(
                 &resolve_model(model, size)?,
@@ -1265,8 +1485,35 @@ fn main() -> Result<()> {
                     let _ = stdout.flush();
                 },
                 &mut || false,
-            )?;
+            );
+            // A failure is a run that happened and produced nothing, recorded
+            // like the other surfaces record theirs before the error goes on.
+            let gstats = match gstats {
+                Ok(stats) => stats,
+                Err(error) => {
+                    let mut run = RunRecord::new("generate", checkpoint.label.clone());
+                    run.ok = false;
+                    metrics::record_quietly(&run);
+                    return Err(error);
+                }
+            };
             println!();
+
+            // Past here generation returned, which on this command means an EOG
+            // token or the token cap: it polls no cancel, so Ctrl-C kills the
+            // process outright and an interrupted run leaves no record at all.
+            let mut run = RunRecord::new("generate", checkpoint.label.clone());
+            // `generate` prefills from a reset cache, so nothing is ever read
+            // back and the whole prompt is prefill.
+            run.prompt_tokens = gstats.prefill_tokens;
+            run.prefill_tokens = gstats.prefill_tokens;
+            run.prefill_secs = gstats.prefill_secs;
+            run.decode_tokens = gstats.decode_tokens;
+            run.decode_secs = gstats.decode_secs;
+            run.thinking_tokens = gstats.think.map(|think| think.tokens);
+            run.drafted = gstats.spec.map(|spec| spec.drafted);
+            run.accepted = gstats.spec.map(|spec| spec.accepted);
+            metrics::record_quietly(&run);
 
             if stats {
                 eprintln!(
@@ -1405,12 +1652,13 @@ fn main() -> Result<()> {
         }) => {
             // Validated before the 20 GB load, like every startup cross-check.
             think.check_think_budgets(min_think, max_think)?;
-            let size = one_shot_checkpoint(
+            let checkpoint = one_shot_checkpoint(
                 model.as_deref(),
                 select.model_size,
                 "--model-size",
                 Model::default(),
             )?;
+            let size = checkpoint.model;
             let chat_opts = think.chat_options(size)?;
             let mut generator = build_generator(
                 &resolve_model(model, size)?,
@@ -1424,7 +1672,13 @@ fn main() -> Result<()> {
             generator.set_min_think(min_think);
             generator.set_max_think(max_think)?;
             generator.set_banned_strings(&ban_string)?;
-            repl::run(&mut generator, max_tokens, show_thinking, chat_opts)
+            repl::run(
+                &mut generator,
+                max_tokens,
+                show_thinking,
+                chat_opts,
+                &checkpoint.label,
+            )
         }
         Some(Cmd::Batch {
             model,
@@ -1440,7 +1694,143 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xwen::batch::{BatchStats, FinishReason, ItemResponse, Usage};
     use xwen::chat::ChatDialect;
+
+    /// The prefill a batch record reports is the whole prefill phase, which is
+    /// the runner's own figure PLUS the shared prefix: the runner opens its
+    /// accounting after the prefix is already resident and reports that span
+    /// separately. Everything the prompt asked for beyond what was forwarded
+    /// came back out of the snapshot.
+    ///
+    /// Eight items over a 1000-token shared prefix, each with a 500-token tail:
+    /// 12,000 prompt tokens, the prefix prefilled once and read back seven
+    /// times. The caller sets `stats.prefill_tokens` to whatever forwarded work
+    /// it wants to describe.
+    fn scored_response() -> BatchResponse {
+        let item = |id: &str| ItemResponse {
+            id: id.to_string(),
+            content: String::new(),
+            text: String::new(),
+            json: None,
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                prompt_tokens: 1_500,
+                cached_prefix_tokens: 1_000,
+                completion_tokens: 150,
+            },
+            error: None,
+        };
+        BatchResponse {
+            model: "Qwen3.6-35B-A3B".to_string(),
+            stats: BatchStats {
+                shared_prefix_tokens: 1_000,
+                snapshot_ms: 4_000.0,
+                items: 8,
+                prefill_tokens: 4_000,
+                prefill_ms: 16_000.0,
+                decode_tokens: 1_200,
+                decode_ms: 10_000.0,
+                load_ms: 3_000.0,
+                total_ms: 40_000.0,
+            },
+            items: (0..8).map(|n| item(&format!("item-{n}"))).collect(),
+        }
+    }
+
+    #[test]
+    fn a_batch_record_counts_the_shared_prefix_as_prefill_exactly_once() {
+        // The unscored case: forwarded work is the tails and the prefix, and
+        // nothing else, so it comes to exactly what the prompt asked for.
+        let response = scored_response();
+        let run = batch_run_record(&response, "Qwen3.6-35B-A3B");
+        assert_eq!(run.surface, "batch");
+        assert_eq!(run.items, Some(8));
+        assert_eq!(run.prompt_tokens, 12_000);
+        assert_eq!(
+            run.prefill_tokens, 5_000,
+            "the shared prefix once, plus every item's own tail"
+        );
+        assert_eq!(
+            run.cached_tokens, 7_000,
+            "the shared prefix read back once per item past the first"
+        );
+        assert_eq!(
+            run.prompt_tokens,
+            run.cached_tokens + run.prefill_tokens,
+            "a batch that ran to completion read its whole prompt"
+        );
+        assert_eq!(
+            run.prefill_secs, 20.0,
+            "the shared prefill's seconds ride with its tokens"
+        );
+        assert_eq!(run.decode_tokens, 1_200);
+        assert_eq!(run.decode_secs, 10.0);
+    }
+
+    /// A SCORED batch forwards more than its prompt: every teacher-forced trial
+    /// runs through the model against no prompt token. The cache figure is
+    /// summed from the items rather than taken as the difference, which would
+    /// saturate to zero and hide a real cache hit. Same arithmetic the engine
+    /// records for the same run.
+    #[test]
+    fn a_scored_batch_records_more_prefill_than_prompt() {
+        let mut response = scored_response();
+        // Engine work: the tails plus every teacher-forced trial, the shared
+        // prefix excluded as the runner reports it.
+        response.stats.prefill_tokens = 39_000;
+        let run = batch_run_record(&response, "Qwen3.6-35B-A3B");
+        assert_eq!(run.prompt_tokens, 12_000);
+        assert_eq!(run.cached_tokens, 7_000, "the cache hit is unchanged");
+        assert_eq!(run.prefill_tokens, 40_000, "39,000 plus the shared prefix");
+        assert!(
+            run.prefill_tokens > run.prompt_tokens,
+            "scored work exceeds the prompt"
+        );
+    }
+
+    /// Every item failing is a failed run. A batch that lost some of its items
+    /// still did the rest, and its counts are real.
+    #[test]
+    fn a_batch_is_a_failure_only_when_every_item_failed() {
+        let fail = |response: &mut BatchResponse, count: usize| {
+            for item in response.items.iter_mut().take(count) {
+                item.error = Some("no".to_string());
+            }
+        };
+        let mut none_failed = scored_response();
+        fail(&mut none_failed, 0);
+        assert!(batch_run_record(&none_failed, "m").ok);
+
+        let mut some_failed = scored_response();
+        fail(&mut some_failed, 7);
+        assert!(
+            batch_run_record(&some_failed, "m").ok,
+            "seven of eight failing still ran one"
+        );
+
+        let mut all_failed = scored_response();
+        fail(&mut all_failed, 8);
+        assert!(!batch_run_record(&all_failed, "m").ok);
+    }
+
+    /// The record is labelled with the checkpoint the run is against, which for
+    /// a custom GGUF is not the name the response is labelled with: the
+    /// response answers AS the official checkpoint whose graph ran.
+    #[test]
+    fn a_batch_record_takes_the_metrics_label_not_the_response_label() {
+        let response = BatchResponse {
+            model: "Qwen3.6-27B".to_string(),
+            stats: BatchStats::default(),
+            items: Vec::new(),
+        };
+        let run = batch_run_record(&response, "laguna-s-2.1-Q4_K_M");
+        assert_eq!(run.model, "laguna-s-2.1-Q4_K_M");
+        assert_eq!(
+            response.model, "Qwen3.6-27B",
+            "the wire document is untouched"
+        );
+    }
 
     /// With no `--model` file there is nothing to identify, so a one-shot runs
     /// what it was told to — and what "told to nothing" means differs per
@@ -1453,21 +1843,45 @@ mod tests {
     /// re-tested here.
     #[test]
     fn without_a_file_a_one_shot_runs_what_it_was_told_to() {
+        let resolved = |selected, default| {
+            one_shot_checkpoint(None, selected, "--model-size", default).unwrap()
+        };
+        assert_eq!(resolved(None, Model::default()).model, Model::default());
         assert_eq!(
-            one_shot_checkpoint(None, None, "--model-size", Model::default()).unwrap(),
-            Model::default()
-        );
-        assert_eq!(
-            one_shot_checkpoint(None, None, "--model-size", Model::default_servable()).unwrap(),
+            resolved(None, Model::default_servable()).model,
             Model::default_servable()
         );
         // An explicit selection wins over either fallback.
         for default in [Model::default(), Model::default_servable()] {
             assert_eq!(
-                one_shot_checkpoint(None, Some(Model::Qwen27B), "--model-size", default).unwrap(),
+                resolved(Some(Model::Qwen27B), default).model,
                 Model::Qwen27B
             );
         }
+        // With no file to read, the label is the checkpoint the run is against.
+        assert_eq!(
+            resolved(Some(Model::Qwen27B), Model::default()).label,
+            Model::Qwen27B.full_name()
+        );
+    }
+
+    /// A GGUF that identifies as none of the official checkpoints RUNS as one
+    /// of them, but the history must not file it under that name: it answers
+    /// under its own file name, the same string `serve` reports for the same
+    /// file. The identity rule itself needs a real GGUF and is pinned where it
+    /// lives; this covers only the naming.
+    #[test]
+    fn a_file_that_names_no_checkpoint_is_recorded_under_its_own_name() {
+        let assumed = Checkpoint::assumed(
+            Model::Qwen27B,
+            Path::new("/models/laguna-s-2.1-Q4_K_M.gguf"),
+        );
+        assert_eq!(assumed.model, Model::Qwen27B);
+        assert_eq!(assumed.label, "laguna-s-2.1-Q4_K_M");
+        assert_eq!(
+            Checkpoint::official(Model::Qwen27B).label,
+            Model::Qwen27B.full_name()
+        );
     }
 
     /// A checkpoint whose graph has no speculative verify seam refuses a drafter

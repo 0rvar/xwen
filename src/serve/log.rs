@@ -111,6 +111,10 @@ impl fmt::Display for JobPhase {
 #[derive(Debug, Clone)]
 pub struct JobRecord {
     pub origin: RequestOrigin,
+    /// What the job ran as, spelled the way the APIs report it: an official
+    /// checkpoint's full name, or the served file's own id when the server was
+    /// started with a GGUF that is none of them.
+    pub model: String,
     /// What the client was told ended the reply, or `None` when nothing was:
     /// a job abandoned by a departed client is owed no terminal event, and a
     /// failed one gets an error instead.
@@ -1435,9 +1439,12 @@ mod tests {
             id: 7,
             dialect: crate::serve::types::Dialect::Anthropic,
             streaming: true,
+            client: None,
+            session: None,
         };
         let record = JobRecord {
-            origin,
+            origin: origin.clone(),
+            model: "Qwen3.6-35B-A3B".to_string(),
             stop: Some(StopKind::EndTurn),
             abandoned: None,
             error: None,

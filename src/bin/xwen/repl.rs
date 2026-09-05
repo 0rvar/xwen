@@ -33,6 +33,7 @@ use unicode_width::UnicodeWidthChar;
 
 use xwen::chat::{ChatOptions, Message, build_prompt_with_spans};
 use xwen::generate::{GenStats, Generator};
+use xwen::metrics::{self, RunRecord};
 
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
@@ -43,14 +44,16 @@ const PREFIX_W: usize = 2;
 
 /// `opts` carries the checkpoint's template dialect with the run's thinking
 /// and effort knobs already applied; the caller builds it once at startup.
+/// `model_label` is what the metrics history calls the checkpoint.
 pub fn run(
     generator: &mut Generator,
     max_tokens: usize,
     show_thinking: bool,
     opts: ChatOptions,
+    model_label: &str,
 ) -> Result<()> {
     if !std::io::stdin().is_terminal() || !stdout().is_terminal() {
-        return pipe_repl(generator, max_tokens, show_thinking, opts);
+        return pipe_repl(generator, max_tokens, show_thinking, opts, model_label);
     }
 
     let mut show_thinking = show_thinking;
@@ -130,6 +133,12 @@ pub fn run(
                 // Keep the REPL alive (e.g. prompt outgrew max_ctx); drop the
                 // user turn so the conversation state matches what the model saw.
                 messages.pop();
+                // Through `dim_line` like the success arm's warning: raw mode
+                // is still held here, and a bare `eprintln!` would spend the
+                // one warning this process gets on a staircased line.
+                if let Some(warning) = metrics::record_warning(&failed_turn_record(model_label)) {
+                    dim_line(&mut out, &warning)?;
+                }
                 dim_line(&mut out, &format!("error: {err:#}"))?;
             }
             Ok((full, stats)) => {
@@ -153,6 +162,11 @@ pub fn run(
                             Some(reasoning.to_string())
                         },
                     });
+                }
+                // In raw mode a bare newline never returns the carriage, so a
+                // warning goes out the same way every other line here does.
+                if let Some(warning) = metrics::record_warning(&turn_record(model_label, &stats)) {
+                    dim_line(&mut out, &warning)?;
                 }
                 let used = stats.prefill_tokens + stats.decode_tokens;
                 write!(
@@ -814,6 +828,35 @@ fn help(out: &mut Stdout) -> Result<()> {
     Ok(())
 }
 
+/// One chat turn as the metrics history records it. Every turn re-prefills the
+/// whole conversation from position zero, so nothing here is ever a cache read.
+fn turn_record(model_label: &str, stats: &GenStats) -> RunRecord {
+    let mut run = RunRecord::new("chat", model_label);
+    run.prompt_tokens = stats.prefill_tokens;
+    run.prefill_tokens = stats.prefill_tokens;
+    run.prefill_secs = stats.prefill_secs;
+    run.decode_tokens = stats.decode_tokens;
+    run.decode_secs = stats.decode_secs;
+    run.thinking_tokens = stats.think.map(|think| think.tokens);
+    run.drafted = stats.spec.map(|spec| spec.drafted);
+    run.accepted = stats.spec.map(|spec| spec.accepted);
+    // A turn the reader cancelled spent its tokens but did not finish, so it is
+    // recorded with what it reached and marked as not having got there.
+    run.ok = !stats.cancelled;
+    run
+}
+
+/// A turn that errored before it produced anything. Recorded like the serve
+/// side records a failed job: the run happened, and a history that dropped it
+/// would show a quiet hour where there was a struggling one. Its counts are
+/// zero because none were ever measured — a turn that fails here fails before
+/// or during the prefill, and `GenStats` never comes back.
+fn failed_turn_record(model_label: &str) -> RunRecord {
+    let mut run = RunRecord::new("chat", model_label);
+    run.ok = false;
+    run
+}
+
 fn dim_line(out: &mut Stdout, text: &str) -> Result<()> {
     write!(out, "{DIM}{text}{RESET}\r\n\r\n")?;
     out.flush()?;
@@ -829,6 +872,7 @@ fn pipe_repl(
     max_tokens: usize,
     show_thinking: bool,
     opts: ChatOptions,
+    model_label: &str,
 ) -> Result<()> {
     use std::io::BufRead;
 
@@ -855,7 +899,7 @@ fn pipe_repl(
         let mut full = String::new();
         // As in `stream_reply`: with thinking off the reply is all answer text.
         let mut in_think = opts.enable_thinking;
-        generator.generate_with_content_ranges(
+        let stats = generator.generate_with_content_ranges(
             &prompt,
             &content_ranges,
             max_tokens,
@@ -882,8 +926,18 @@ fn pipe_repl(
                 let _ = out.flush();
             },
             &mut || false,
-        )?;
+        );
+        // Unlike the terminal REPL, a failure here ends the session — but the
+        // turn still happened, and it is recorded before the error is returned.
+        let stats = match stats {
+            Ok(stats) => stats,
+            Err(error) => {
+                metrics::record_quietly(&failed_turn_record(model_label));
+                return Err(error);
+            }
+        };
         println!();
+        metrics::record_quietly(&turn_record(model_label, &stats));
 
         let (reasoning, content) = split_thinking(&full);
         messages.push(Message::Assistant {
@@ -897,4 +951,46 @@ fn pipe_repl(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finished(cancelled: bool) -> GenStats {
+        GenStats {
+            prefill_tokens: 320,
+            prefill_secs: 0.5,
+            decode_tokens: 64,
+            decode_secs: 1.6,
+            cancelled,
+            spec: None,
+            think: None,
+        }
+    }
+
+    /// A turn the reader cancelled spent its tokens but did not reach its own
+    /// end, so it is recorded with what it got to and marked as unfinished.
+    /// A turn that errored before producing anything is recorded the same way,
+    /// with nothing measured.
+    #[test]
+    fn a_turn_that_did_not_finish_is_not_a_completed_run() {
+        let done = turn_record("Qwen3.6-27B", &finished(false));
+        assert!(done.ok);
+        assert_eq!(done.decode_tokens, 64);
+
+        let cancelled = turn_record("Qwen3.6-27B", &finished(true));
+        assert!(!cancelled.ok, "a cancelled turn did not reach its end");
+        assert_eq!(
+            cancelled.decode_tokens, 64,
+            "the tokens it did reach are still recorded"
+        );
+
+        let failed = failed_turn_record("Qwen3.6-27B");
+        assert!(!failed.ok);
+        assert_eq!(failed.surface, "chat");
+        assert_eq!(failed.model, "Qwen3.6-27B");
+        assert_eq!(failed.decode_tokens, 0);
+        assert_eq!(failed.prompt_tokens, 0);
+    }
 }

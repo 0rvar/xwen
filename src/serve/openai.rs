@@ -16,13 +16,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::config::{ServeSettings, ToolsMode};
-use super::types::{Dialect, EngineEvent, StopKind};
+use super::types::{ClientId, Dialect, EngineEvent, StopKind};
 use super::{
     ApiError, AppState, Completion, EngineFailure, JobRequest, SseEncoder, SseFrame, SubmitError,
     collect_completion, random_id, sse_response, submit, unix_now,
@@ -159,6 +159,14 @@ pub(crate) struct ChatRequest {
     /// error about its fields.
     pub tool_choice: Option<Value>,
     pub response_format: Option<ResponseFormat>,
+    /// The caller's own name for whoever the request is for. Nothing here
+    /// affects the reply; it is read so the metrics history can say which
+    /// client a run belonged to.
+    ///
+    /// A `Value` for the same reason `tool_choice` is one: this dialect accepts
+    /// and drops what it does not understand, and a field nothing depends on
+    /// must never fail a request. Anything but a string yields no client id.
+    pub user: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1134,7 +1142,21 @@ impl SseEncoder for ChunkStream {
 
 // ---------------------------------------------------------------- handler ---
 
-pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Response {
+/// Who the client says it is: the body's `user` field and the session header.
+pub(crate) fn client_id(request: &ChatRequest, headers: &HeaderMap) -> ClientId {
+    let client = request
+        .user
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    ClientId::new(client, super::session_header(headers))
+}
+
+pub(crate) async fn chat_completions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let mut request: ChatRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -1153,6 +1175,7 @@ pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes)
     // The response echoes the canonical name of the model that answered, not
     // the client's spelling of it.
     request.model = Some(model_name);
+    let who = client_id(&request, &headers);
     let prepared = match prepare(request, &state.settings, &state.model_id, size) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
@@ -1166,7 +1189,7 @@ pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes)
     let id = random_id("chatcmpl-");
     let created = unix_now();
 
-    let (mut events, guard) = match submit(&state, job, Dialect::OpenAi, stream, size) {
+    let (mut events, guard) = match submit(&state, job, Dialect::OpenAi, stream, size, who) {
         Ok(submitted) => submitted,
         Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
         Err(SubmitError::Overloaded) => return overloaded().into_response(),
@@ -1213,7 +1236,9 @@ pub(crate) async fn chat_completions(State(state): State<AppState>, body: Bytes)
 mod tests {
     use super::*;
     use crate::serve::CompletedToolCall;
-    use crate::serve::testutil::{encode_all, payload, render, settings, shape};
+    use crate::serve::testutil::{
+        encode_all, generation, payload, probe_state, render, settings, shape, try_take,
+    };
 
     fn parse(body: &str) -> ChatRequest {
         serde_json::from_str(body).expect("request parses")
@@ -1234,6 +1259,70 @@ mod tests {
         prepare(parse(body), &settings(), "laguna-s-2.1", target())
             .err()
             .expect("request is rejected")
+    }
+
+    /// The session header and the body's `user` field ride the job to the
+    /// engine, which is the only thing either is read for.
+    #[test]
+    fn the_client_and_session_ids_reach_the_job() {
+        let (state, queue) = probe_state(4096);
+        let request = parse(
+            r#"{"max_tokens":16,"user":"analytics-bot",
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::serve::SESSION_HEADER,
+            "9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40"
+                .parse()
+                .expect("a header value"),
+        );
+        let who = client_id(&request, &headers);
+        let prepared =
+            prepare(request, &settings(), "laguna-s-2.1", target()).expect("request prepares");
+        let (_events, _guard) = crate::serve::submit(
+            &state,
+            prepared.job,
+            Dialect::OpenAi,
+            false,
+            state.default_target,
+            who,
+        )
+        .expect("the job submits");
+
+        let job = generation(try_take(&queue).expect("the job reached the queue").job);
+        assert_eq!(job.origin.client.as_deref(), Some("analytics-bot"));
+        assert_eq!(
+            job.origin.session.as_deref(),
+            Some("9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40")
+        );
+
+        // A request that names nobody carries nothing.
+        let bare = parse(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#);
+        assert_eq!(client_id(&bare, &HeaderMap::new()), ClientId::default());
+    }
+
+    /// A wrongly-typed `user` is accepted and dropped, like `tool_choice` and
+    /// every other field this dialect does not understand.
+    #[test]
+    fn a_user_of_the_wrong_shape_is_accepted_and_dropped() {
+        for shape in ["42", "[]", "{}", "null", r#""""#] {
+            let body = format!(
+                r#"{{"max_tokens":16,"user":{shape},
+                    "messages":[{{"role":"user","content":"Hi"}}]}}"#
+            );
+            let request = parse(&body);
+            assert!(
+                prepare(request, &settings(), "laguna-s-2.1", target()).is_ok(),
+                "user {shape} must not fail the request"
+            );
+            let request = parse(&body);
+            assert_eq!(
+                client_id(&request, &HeaderMap::new()).client,
+                None,
+                "user {shape} names no client"
+            );
+        }
     }
 
     fn message(error: &ApiError) -> String {

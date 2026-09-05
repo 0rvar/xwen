@@ -15,13 +15,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::config::{ServeSettings, ToolsMode};
-use super::types::{Dialect, EngineEvent, StopKind};
+use super::types::{ClientId, Dialect, EngineEvent, StopKind};
 use super::{
     ApiError, AppState, Completion, EngineFailure, JobRequest, SseEncoder, SseFrame, SubmitError,
     collect_completion, random_id, sse_response, submit,
@@ -144,6 +144,15 @@ pub(crate) struct MessagesRequest {
     /// believes it requested schema-validated output must not silently get
     /// unconstrained text.
     pub output_format: Option<Value>,
+    /// Client-supplied identity. Nothing here affects the reply; it is read so
+    /// the metrics history can say which client a run belonged to.
+    ///
+    /// A `Value`, like `tools` and `tool_choice` above and for the same reason:
+    /// this dialect accepts and drops what it does not understand, and a field
+    /// nothing depends on must never be the thing that fails a request. A
+    /// `metadata` that is not an object, or whose `user_id` is not a string,
+    /// yields no client id rather than a 400.
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1112,7 +1121,28 @@ impl SseEncoder for MessageStream {
 
 // --------------------------------------------------------------- handlers ---
 
-pub(crate) async fn messages(State(state): State<AppState>, body: Bytes) -> Response {
+/// Who the client says it is: the body's `metadata.user_id` and the session
+/// header. A `user_id` that is not a JSON string is stored as its compact JSON
+/// rather than dropped — the shape has moved before, and a reader looking for a
+/// session marker can find one in either spelling.
+pub(crate) fn client_id(request: &MessagesRequest, headers: &HeaderMap) -> ClientId {
+    let client = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(|value| match value {
+            Value::Null => None,
+            Value::String(text) => Some(text.clone()),
+            other => serde_json::to_string(other).ok(),
+        });
+    ClientId::new(client, super::session_header(headers))
+}
+
+pub(crate) async fn messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let mut request: MessagesRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(e) => {
@@ -1131,13 +1161,14 @@ pub(crate) async fn messages(State(state): State<AppState>, body: Bytes) -> Resp
     // The response echoes the canonical name of the model that answered, not
     // the client's spelling of it.
     request.model = Some(model_name);
+    let who = client_id(&request, &headers);
     let prepared = match prepare(request, &state.settings, &state.model_id) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
     };
     let Prepared { model, stream, job } = prepared;
     let id = random_id("msg_");
-    let (mut events, guard) = match submit(&state, job, Dialect::Anthropic, stream, size) {
+    let (mut events, guard) = match submit(&state, job, Dialect::Anthropic, stream, size, who) {
         Ok(submitted) => submitted,
         Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
         Err(SubmitError::Overloaded) => return overloaded().into_response(),
@@ -1241,7 +1272,9 @@ mod tests {
     use super::*;
     use crate::chat;
     use crate::serve::CompletedToolCall;
-    use crate::serve::testutil::{encode_all, names, payload, render, settings, shape};
+    use crate::serve::testutil::{
+        encode_all, generation, names, payload, probe_state, render, settings, shape, try_take,
+    };
 
     fn parse(body: &str) -> MessagesRequest {
         serde_json::from_str(body).expect("request parses")
@@ -1495,6 +1528,126 @@ mod tests {
         assert_eq!(
             shape(&request.job.messages),
             vec!["user:one\ntwo", "assistant:a\nb"]
+        );
+    }
+
+    /// The session header and the body's `metadata.user_id` ride the job to the
+    /// engine, which is the only thing either is read for: neither touches the
+    /// prompt, the sampling or the reply.
+    #[test]
+    fn the_client_and_session_ids_reach_the_job() {
+        let (state, queue) = probe_state(4096);
+        let request = parse(
+            r#"{"max_tokens":16,"metadata":{"user_id":"user_1a2b_session_9f2c-0d31"},
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::serve::SESSION_HEADER,
+            "9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40"
+                .parse()
+                .expect("a header value"),
+        );
+        let who = client_id(&request, &headers);
+        let prepared = prepare(request, &settings(), "laguna-s-2.1").expect("request prepares");
+        let (_events, _guard) = crate::serve::submit(
+            &state,
+            prepared.job,
+            Dialect::Anthropic,
+            false,
+            state.default_target,
+            who,
+        )
+        .expect("the job submits");
+
+        let job = generation(try_take(&queue).expect("the job reached the queue").job);
+        assert_eq!(
+            job.origin.client.as_deref(),
+            Some("user_1a2b_session_9f2c-0d31")
+        );
+        assert_eq!(
+            job.origin.session.as_deref(),
+            Some("9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40")
+        );
+    }
+
+    /// A `user_id` of any other JSON type is kept as its compact JSON rather
+    /// than dropped: the field is undocumented, its shape has moved before, and
+    /// a reader can still find a session marker in the text.
+    #[test]
+    fn a_non_string_user_id_is_stored_as_its_json() {
+        let request = parse(
+            r#"{"max_tokens":16,"metadata":{"user_id":{"session_id":"9f2c-0d31"}},
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        let who = client_id(&request, &HeaderMap::new());
+        assert_eq!(who.client.as_deref(), Some(r#"{"session_id":"9f2c-0d31"}"#));
+        assert_eq!(who.session, None);
+
+        // Nothing said is nothing stored.
+        let bare = parse(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#);
+        assert_eq!(client_id(&bare, &HeaderMap::new()), ClientId::default());
+    }
+
+    /// A wrongly-typed `metadata` is accepted and dropped, like every other
+    /// field this dialect does not understand. Nothing depends on it, so it must
+    /// never be the thing that fails a request.
+    #[test]
+    fn a_metadata_of_the_wrong_shape_is_accepted_and_dropped() {
+        for shape in [
+            r#""abc""#,
+            "[]",
+            "42",
+            "null",
+            r#"{"user_id":42}"#,
+            r#"{"no_user_id_here":"x"}"#,
+        ] {
+            let body = format!(
+                r#"{{"max_tokens":16,"metadata":{shape},
+                    "messages":[{{"role":"user","content":"Hi"}}]}}"#
+            );
+            let request = parse(&body);
+            let prepared = prepare(request, &settings(), "laguna-s-2.1");
+            assert!(
+                prepared.is_ok(),
+                "metadata {shape} must not fail the request"
+            );
+            let request = parse(&body);
+            let who = client_id(&request, &HeaderMap::new());
+            // A non-string user_id is still stringified; the shapes that carry
+            // no user_id at all yield nothing.
+            if shape == r#"{"user_id":42}"# {
+                assert_eq!(who.client.as_deref(), Some("42"));
+            } else {
+                assert_eq!(who.client, None, "metadata {shape} names no client");
+            }
+        }
+    }
+
+    /// An empty id is how a client spells "not supplied" without dropping the
+    /// key, and both dialects agree it is nobody.
+    #[test]
+    fn an_empty_user_id_is_nobody() {
+        let request = parse(
+            r#"{"max_tokens":16,"metadata":{"user_id":""},
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        assert_eq!(client_id(&request, &HeaderMap::new()).client, None);
+    }
+
+    /// A client-supplied id is bounded before it is stored: the history is a
+    /// file, and this is the one field a caller gets to choose the size of.
+    #[test]
+    fn an_overlong_client_id_is_truncated() {
+        let long = "x".repeat(4096);
+        let request = parse(&format!(
+            r#"{{"max_tokens":16,"metadata":{{"user_id":"{long}"}},
+                "messages":[{{"role":"user","content":"Hi"}}]}}"#
+        ));
+        let who = client_id(&request, &HeaderMap::new());
+        assert_eq!(
+            who.client.expect("a client id").chars().count(),
+            crate::serve::types::CLIENT_ID_MAX_CHARS
         );
     }
 

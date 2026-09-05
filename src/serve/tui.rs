@@ -156,7 +156,7 @@ struct Environment {
 
 impl Environment {
     fn sample(&self) {
-        if let Some(offset) = read_utc_offset() {
+        if let Some(offset) = crate::metrics::read_utc_offset() {
             self.utc_offset.store(offset, Ordering::Relaxed);
         }
         self.sample_power();
@@ -191,24 +191,6 @@ fn read_low_power_mode() -> Option<bool> {
         }
     }
     None
-}
-
-/// This machine's UTC offset in seconds. `std` has no local time and the
-/// dashboard's clock is there to be compared against a client's log, so the
-/// offset is worth a subprocess a minute — which is also what carries a
-/// long-running server across a daylight-saving change.
-fn read_utc_offset() -> Option<i64> {
-    let output = std::process::Command::new("date")
-        .arg("+%z")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let field = text.trim();
-    let (sign, digits) = field.split_at(field.len().checked_sub(4)?);
-    let hours: i64 = digits.get(..2)?.parse().ok()?;
-    let minutes: i64 = digits.get(2..)?.parse().ok()?;
-    let magnitude = hours * 3600 + minutes * 60;
-    Some(if sign == "-" { -magnitude } else { magnitude })
 }
 
 /// A throughput average over ticks as they arrive. The ticks carry no timestamp
@@ -1448,12 +1430,15 @@ mod tests {
             id,
             dialect: Dialect::Anthropic,
             streaming: true,
+            client: None,
+            session: None,
         }
     }
 
     fn record() -> JobRecord {
         JobRecord {
             origin: origin(7),
+            model: "Qwen3.6-35B-A3B".to_string(),
             stop: Some(StopKind::EndTurn),
             abandoned: None,
             error: None,

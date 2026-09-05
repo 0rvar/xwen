@@ -188,7 +188,9 @@ fn report(jobs: &[Queued], logger: &ServeLogger) {
     logger.log(ServeLog::QueueSnapshot(
         jobs.iter()
             .map(|queued| QueueEntry {
-                id: queued.job.origin().id,
+                // `origin()` clones the client-supplied identity strings, which
+                // this runs under the queue lock and only wants an id from.
+                id: queued.job.origin_id(),
                 prompt_tokens: queued.prompt_tokens,
                 queued_at: queued.submitted,
             })
@@ -344,6 +346,8 @@ mod tests {
                     id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                     dialect: Dialect::Anthropic,
                     streaming: true,
+                    client: None,
+                    session: None,
                 },
                 // Named rather than `Model::default()`: what these tests need
                 // is a checkpoint that differs from the 27B they compare

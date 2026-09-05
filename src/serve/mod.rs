@@ -33,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
 use axum::Router;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -49,8 +49,24 @@ use config::ServeSettings;
 use log::{ServeLog, ServeLogger};
 use queue::{JobQueue, Queued, SchedulePolicy};
 use types::{
-    Cancel, CancelGuard, CancelReason, Dialect, EngineEvent, GenerationJob, RequestOrigin, StopKind,
+    Cancel, CancelGuard, CancelReason, ClientId, Dialect, EngineEvent, GenerationJob,
+    RequestOrigin, StopKind,
 };
+
+/// The header Claude Code sets on every request, and the documented way to tell
+/// one session from another. The body's own id is undocumented and has changed
+/// shape between releases, so this is what a session-keyed report is built on.
+pub(crate) const SESSION_HEADER: &str = "x-claude-code-session-id";
+
+/// The session a request declares, or `None` when it declares none or spells it
+/// in bytes that are not text. An empty value is normalized away by
+/// [`ClientId::new`], which owns that rule for both identity fields.
+pub(crate) fn session_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
 
 /// Per-job event channel depth. The engine blocks once a slow client falls this
 /// far behind, which throttles generation to the reader rather than buffering
@@ -238,7 +254,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
 /// left out of it. A GGUF that is none of them has no name but its own, so it
 /// keeps reporting its basename without the extension, e.g.
 /// `laguna-s-2.1-Q4_K_M`.
-fn model_id(settings: &ServeSettings, served: &crate::serve::types::Target) -> String {
+pub(crate) fn model_id(settings: &ServeSettings, served: &crate::serve::types::Target) -> String {
     if !served.served_file {
         return served.model.full_name().to_string();
     }
@@ -982,8 +998,8 @@ fn split_content_ranges(
 /// the queue, so the engine only ever sees a prompt that fits and a rejected
 /// request costs it nothing.
 ///
-/// `dialect` and `streaming` are the caller's own two facts about the request,
-/// and only a handler knows them; they travel with the job as its
+/// `dialect`, `streaming` and `who` are the caller's own facts about the
+/// request, and only a handler knows them; they travel with the job as its
 /// [`RequestOrigin`] so the events one request produces can be told from
 /// another's.
 pub(crate) fn submit(
@@ -992,6 +1008,7 @@ pub(crate) fn submit(
     dialect: Dialect,
     streaming: bool,
     model: crate::serve::types::Target,
+    who: ClientId,
 ) -> std::result::Result<(mpsc::Receiver<EngineEvent>, CancelGuard), SubmitError> {
     if request.max_tokens == 0 {
         return Err(SubmitError::Invalid(
@@ -1050,6 +1067,8 @@ pub(crate) fn submit(
             id: state.next_request_id.fetch_add(1, Ordering::Relaxed),
             dialect,
             streaming,
+            client: who.client,
+            session: who.session,
         },
         model,
         prompt: prompt.tokens,
@@ -1397,6 +1416,53 @@ pub(crate) mod testutil {
             .collect()
     }
 
+    /// Submit-side state over the real tokenizer and a probe queue standing in
+    /// for the engine, so the render+encode+validate path runs without a model.
+    pub(crate) fn probe_state(max_ctx: usize) -> (AppState, Arc<JobQueue>) {
+        let jobs = Arc::new(JobQueue::new(
+            4,
+            SchedulePolicy {
+                schedule: config::Schedule::ShortestPrefill,
+                queue_timeout: Duration::from_secs(300),
+                age_limit: Duration::from_secs(20),
+            },
+            ServeLogger::discarding(),
+        ));
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/tokenizer.json");
+        let state = AppState {
+            jobs: Arc::clone(&jobs),
+            tokenizer: Arc::new(
+                LagunaTokenizer::from_file(path).expect("load reference tokenizer"),
+            ),
+            settings: Arc::new(testutil::settings()),
+            model_loaded: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(Cancel::default()),
+            model_id: "xwen-test".to_string(),
+            // Named, not `Model::default()`: these tests assert rendered
+            // prompts, and the rendering is dialect-keyed to the checkpoint, so
+            // pinning it here is what keeps them reading the dialect they were
+            // written against.
+            default_target: types::Target::served(crate::hub::Model::Qwen35BA3B),
+            max_ctx,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+        (state, jobs)
+    }
+
+    /// What the engine's dequeue would see right now: a non-blocking take with
+    /// nothing cached.
+    pub(crate) fn try_take(queue: &JobQueue) -> Option<Queued> {
+        queue.take(Some(Duration::ZERO), &|_| 0)
+    }
+
+    /// The generation inside a queued job; these tests submit nothing else.
+    pub(crate) fn generation(job: types::Job) -> GenerationJob {
+        match job {
+            types::Job::Generation(job) => *job,
+            types::Job::Batch(_) => panic!("these tests submit no batch jobs"),
+        }
+    }
+
     /// Run a scripted event list through an encoder, as the SSE stream would.
     pub(crate) fn encode_all(
         encoder: &mut impl SseEncoder,
@@ -1431,6 +1497,8 @@ pub(crate) mod testutil {
 mod tests {
     use super::*;
     use axum::body::Bytes;
+
+    use testutil::{generation, probe_state, try_take};
 
     #[test]
     fn no_configured_key_accepts_anything() {
@@ -1729,12 +1797,24 @@ mod tests {
         let chat = |body: &'static str| {
             let state = state.clone();
             async move {
-                openai::chat_completions(State(state), Bytes::from_static(body.as_bytes())).await
+                openai::chat_completions(
+                    State(state),
+                    HeaderMap::new(),
+                    Bytes::from_static(body.as_bytes()),
+                )
+                .await
             }
         };
         let messages = |body: &'static str| {
             let state = state.clone();
-            async move { anthropic::messages(State(state), Bytes::from_static(body.as_bytes())).await }
+            async move {
+                anthropic::messages(
+                    State(state),
+                    HeaderMap::new(),
+                    Bytes::from_static(body.as_bytes()),
+                )
+                .await
+            }
         };
         let count = |body: &'static str| {
             let state = state.clone();
@@ -1967,53 +2047,6 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    /// Submit-side state over the real tokenizer and a probe queue standing in
-    /// for the engine, so the render+encode+validate path runs without a model.
-    fn probe_state(max_ctx: usize) -> (AppState, Arc<JobQueue>) {
-        let jobs = Arc::new(JobQueue::new(
-            4,
-            SchedulePolicy {
-                schedule: config::Schedule::ShortestPrefill,
-                queue_timeout: Duration::from_secs(300),
-                age_limit: Duration::from_secs(20),
-            },
-            ServeLogger::discarding(),
-        ));
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/tokenizer.json");
-        let state = AppState {
-            jobs: Arc::clone(&jobs),
-            tokenizer: Arc::new(
-                LagunaTokenizer::from_file(path).expect("load reference tokenizer"),
-            ),
-            settings: Arc::new(testutil::settings()),
-            model_loaded: Arc::new(AtomicBool::new(false)),
-            shutdown: Arc::new(Cancel::default()),
-            model_id: "xwen-test".to_string(),
-            // Named, not `Model::default()`: these tests assert rendered
-            // prompts, and the rendering is dialect-keyed to the checkpoint, so
-            // pinning it here is what keeps them reading the dialect they were
-            // written against.
-            default_target: types::Target::served(crate::hub::Model::Qwen35BA3B),
-            max_ctx,
-            next_request_id: Arc::new(AtomicU64::new(1)),
-        };
-        (state, jobs)
-    }
-
-    /// What the engine's dequeue would see right now: a non-blocking take with
-    /// nothing cached.
-    fn try_take(queue: &JobQueue) -> Option<Queued> {
-        queue.take(Some(Duration::ZERO), &|_| 0)
-    }
-
-    /// The generation inside a queued job; these tests submit nothing else.
-    fn generation(job: types::Job) -> GenerationJob {
-        match job {
-            types::Job::Generation(job) => *job,
-            types::Job::Batch(_) => panic!("these tests submit no batch jobs"),
-        }
-    }
-
     /// `submit` with the default checkpoint, which is what every call in these
     /// tests means — model selection has its own test below.
     fn submit_default(
@@ -2022,7 +2055,14 @@ mod tests {
         dialect: Dialect,
         streaming: bool,
     ) -> std::result::Result<(mpsc::Receiver<EngineEvent>, CancelGuard), SubmitError> {
-        submit(state, request, dialect, streaming, state.default_target)
+        submit(
+            state,
+            request,
+            dialect,
+            streaming,
+            state.default_target,
+            ClientId::default(),
+        )
     }
 
     fn probe_request(max_tokens: usize) -> JobRequest {

@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::config::ServeSettings;
-use super::types::{Dialect, EngineEvent, StopKind};
+use super::types::{ClientId, Dialect, EngineEvent, StopKind};
 use super::{
     ApiError, AppState, Completion, EngineFailure, JobRequest, SseEncoder, SseFrame, SubmitError,
     collect_completion, random_id, sse_response, submit,
@@ -539,20 +539,28 @@ pub(crate) async fn generate(State(state): State<AppState>, body: Bytes) -> Resp
 
     // This endpoint carries no model name by design; it runs on the default
     // checkpoint. The batch endpoint is the native surface that names one.
-    let (mut events, guard) =
-        match submit(&state, job, Dialect::Native, stream, state.default_target) {
-            Ok(submitted) => submitted,
-            Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
-            Err(SubmitError::Overloaded) => return overloaded().into_response(),
-            Err(SubmitError::EngineGone) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "the inference engine is not running",
-                )
-                .into_response();
-            }
-        };
+    // The native dialect has no client-identity field of its own, so a run here
+    // is recorded without one.
+    let (mut events, guard) = match submit(
+        &state,
+        job,
+        Dialect::Native,
+        stream,
+        state.default_target,
+        ClientId::default(),
+    ) {
+        Ok(submitted) => submitted,
+        Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
+        Err(SubmitError::Overloaded) => return overloaded().into_response(),
+        Err(SubmitError::EngineGone) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "the inference engine is not running",
+            )
+            .into_response();
+        }
+    };
 
     if stream {
         return sse_response(events, guard, GenerationStream::new(id, model));
