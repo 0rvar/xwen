@@ -5,6 +5,66 @@ header (`DONE <date>`, `CLOSED-REFUTED <date>`, …) and a link to the log.md en
 with the results and full arc. Keep closure annotations brief; this is the forward
 ledger, not the results archive. Sub-items are lettered under a numbered parent.
 
+## FIRST: why is Flash-Next so far from its ceilings, and rewrite this ledger from the answer (2026-09-05)
+
+Opened by the owner after the PLE device tail shipped. Every perf item below was priced
+bottom-up from a stage profile; nobody has worked top-down from what the machine can do.
+The arithmetic says the gap is large on both axes, and the ledger has no item that
+explains it, so the diagnosis is the next unit of work, not another kernel.
+
+**The ceilings, as estimated 2026-09-05 (ESTIMATES from ledgered byte counts, none of
+these numbers is measured — replace them).** A decode token moves ~2.5-3 GB of weights
+(~1.5 GB Q4_K experts, ~0.7 GB Q8 hyper-connection, the rest attention/GDN/PLE/lm_head);
+at 22 ms/token that is ~120-140 GB/s effective against a 614 GB/s part whose achievable
+GPU read bandwidth has never been measured here (one shipped kernel was priced at
+510 GB/s amortized). Bandwidth-only bound: 180-220 tok/s; we run 46. Prefill needs
+~9-10 GFLOP/token for ~4-5B active parameters; at 1140 tok/s @3851 that is ~10-11 TFLOP/s
+against a dense gemm kernel that runs 28-36 TFLOP/s in isolation on this machine.
+Gemm-only bound: ~3000 tok/s; realistic with unavoidable glue 2000-2500; we run 1140.
+
+**Working hypotheses to confirm or refute, one per axis.** Decode: the binding
+constraint is dispatch latency, not bytes — ~1000 dispatches/token (576 MoE, 288 GDN,
+the rest attention/PLE/QSA/hc glue, assembled from stale per-stage counts) at the fitted
+8.41 µs/dispatch floor is 8-9 ms of the 22 ms, plus ~1.4 ms of genuinely serial GDN scan.
+Prefill: the binding constraint is unfused, memory-bound glue — the ffn stage is "mostly
+not the expert gemms" (2026-08-30), six elementwise passes over the routed activations
+per layer, ~40 GB of hc weight re-reads per 2048-token chunk, 14 non-gemm dispatches
+per MoE layer — but the last full prefill stage table is from 2026-08-29 at 530 tokens,
+BEFORE the hc fusion and the 2048 chunk, so every share in it is stale.
+
+**Steps.**
+
+1. **Measure achievable bandwidth** so bytes-vs-time arguments have a real peak: a
+   Metal kernel streaming a multi-GB buffer, batched dispatches per sync, several
+   repetitions, read and read+write. Record the figure in AGENTS.md and retire the
+   "never measured" caveat there and in the benching rules.
+2. **Decode budget on today's binary.** Count dispatches per token per stage from the
+   code (not from old profiles), and price the floor: dispatch count × the 8.41 µs fit
+   (re-fit it if the candle rev or the encoder cadence changed). Then bytes per stage
+   from the tensor tables. Budget = floor + bytes/measured-bandwidth + the serial scan;
+   the residual against 22 ms is what nobody has explained. Use amortized benches or
+   GPU timestamps; the sync-bracketing profilers rank, they do not price.
+3. **Prefill budget at the 2048 chunk on today's binary.** Per-stage time from
+   amortized runs or GPU timestamps, plus a bytes-moved audit per layer per chunk
+   (activation passes, weight re-reads, readbacks). Decompose the ffn glue: router,
+   rescale chain, SwiGLU, combine, shared expert, hc down/up — each with its own
+   number. The 2026-08-30 composition finding stopped at "the glue is the majority".
+4. **Rewrite the perf ledger below from the two budgets.** Every live decode and
+   prefill item gets re-ranked by measured share of the gap, items the budgets show to
+   be small are annotated down (never deleted), and the structural levers the budgets
+   expose get items with a priced upper bound: for decode, fewer launches per token
+   (whole-block fusion, or candle's per-dispatch locking on the pinned rev) rather than
+   per-kernel bandwidth; for prefill, whole-chain glue fusion and the hc weight
+   re-read at chunk granularity. Expected from the composition already known:
+   +15-20 tok/s decode if the launch floor or count halves, +20-30% prefill from the
+   glue — both UNPRICED until step 2 and 3 exist.
+
+Entry points: `XWEN_STACK_PROFILE` / `XWEN_GDN_PROFILE` / `XWEN_PLE_PROFILE` for stage
+names only; the amortized bench pattern in `src/ops/*` `#[ignore]` tests (e.g.
+`ops::ple::tests::ple_tail_bench`) for pricing; `scripts/bench.ts` and the 2026-08-30
+FFN-glue log entry for the interleaved end-to-end protocol; TODO.md items (14) and (15)
+below for the dispatch-count facts to re-verify. Thermal protocol per AGENTS.md.
+
 ## Next Flash-Next perf work (2026-09-05)
 
 **DONE as opt-in 2026-09-05** (`XWEN_PLE_DEVICE=1`, multi-token Metal forwards; +12.8% prefill @3851,
