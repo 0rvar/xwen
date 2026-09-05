@@ -75,12 +75,12 @@ with one Q5_K layer, down Q5_1 with five Q8_0 layers), 28.80 GB PLE table (IQ4_N
 
 | class | GB per token | note |
 |---|---|---|
-| gated DeltaNet projections, 36 layers, Q8_0 | 2.247 | `attn_qkv` 27.9 MB + `attn_gate` 16.7 + `ssm_out` 16.7 per layer |
+| gated DeltaNet, 36 layers | 2.247 | `attn_qkv` 27.9 MB + `attn_gate` 16.7 + `ssm_out` 16.7 per layer (Q8_0, 2.206 GB) plus the F32 alpha/beta/conv/norm tensors |
 | routed experts, 10 of 512, 48 layers | 1.504 | 3.13 MB per expert slot on average (the quant mix varies by layer) |
-| hyper-connection up/down, 96 gates | 0.688 | |
+| hyper-connection, 96 gates | 0.688 | up/down Q8_0 plus the F32 norm and inject rows |
 | `output.weight` (Q8_0, 248320×2560) | 0.675 | |
 | full attention, 12 layers | 0.635 | |
-| routers (F32) + shared experts + indexer + PLE key/value | 0.577 | |
+| routers (F32) + shared experts + indexer + PLE key/value | 0.577 | indexer weights counted whether or not the layer executes them (≤0.04) |
 | **total** | **6.33** | plus GDN state 0.23 GB read+write, KV ≤0.05, indexer keys ≤0.03 |
 
 The "~2.5-3 GB per token" in the TODO item was wrong by 2.2x — it dropped the GDN
@@ -121,10 +121,12 @@ carrier seed 6, tail 6. The
   dispatch consumes the previous one's output), so candle's automatic barriers
   serialize most of it; the independent pairs (q/k/v, gate|up) can overlap and are
   part of why the average sits below the gemv intercept.
-- *Not CPU-bound:* `/usr/bin/time -l` differenced between 32 and 256 decoded tokens
-  (two pairs, user 1.89/1.91 → 2.38/2.38 s) gives **2.95 ms user + 0.7 ms sys per
-  token, a 17% CPU duty cycle.** The main thread spends most of the token waiting on the
-  GPU.
+- *Not CPU-bound in the process:* `/usr/bin/time -l` differenced between 32 and 198
+  decoded tokens (the `-n 256` runs stopped at 198; two pairs, user 1.89/1.91 →
+  2.38/2.38 s, sys 8.24/8.23 → 8.36/8.42) gives **2.95 and 2.83 ms user + 0.7 and 1.15
+  ms sys per token, a 17-19% CPU duty cycle.** The main thread spends most of the token
+  waiting on the GPU. This excludes the process's own CPU as the bottleneck; it does
+  not see driver or kernel work outside the process.
 - *Not command-buffer-bound:* `CANDLE_METAL_COMPUTE_PER_BUFFER` 50 (default) / 250 / 10
   read 47.0 / 46.7 / 46.3 tok/s medians over three interleaved rounds — 5x fewer or 5x
   more command buffer commits per token move nothing outside noise. Candle keeps one

@@ -3013,8 +3013,8 @@ kernel still ledgered (2026-08-26, P3 pass 2026-08-29).
 them.** A decode token reads 6.33 GB of weights (GDN projections 2.25, routed experts
 1.50, hc 0.69, lm_head 0.68, full attention 0.64, routers/shexp/indexer/PLE 0.58) plus
 ~0.3 GB of state and KV, which at the measured 537-565 GB/s is 11.7-12.3 ms of a
-21.3 ms token: the bytes-only ceiling is 81-86 tok/s, and no estimate above that is
-to be quoted. The rest of the token is ~1740 dispatches in a mostly dependent chain
+21.3 ms token: the bytes-only ceiling is 81-86 tok/s at the measured rate, and nothing
+above it is reachable without reading fewer bytes per token. The rest of the token is ~1740 dispatches in a mostly dependent chain
 (hc 672, MoE 576, GDN 252, attention ~200, QSA ~24 below budget / ~165 above) at ~4 µs
 average fixed cost (a residual attribution between the 2.5 µs measured floor and the
 8.4 µs gemv intercept), three host syncs (~0.9 ms) and the serial scan (~1.0 ms beyond
