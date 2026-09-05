@@ -162,6 +162,14 @@ pub fn ple_profile() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_PLE_PROFILE").is_some())
 }
 
+/// Restore PLE decode's three independent device-to-host transfers instead of
+/// one staging buffer and one wait. Multi-token prefill always stays classic.
+/// Both paths copy the same f32 values.
+pub fn ple_readback_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_PLE_READBACK_CLASSIC").is_some())
+}
+
 /// `XWEN_GDN_PROFILE` breaks the `Stage::MixerDelta` bracket into the steps a
 /// gated-DeltaNet block actually runs — the three big projections, the fused
 /// conv, the beta/decay head, the recurrent scan, the gated output norm — and

@@ -10,6 +10,19 @@ is the WHY, by topic — every deliberate choice, default, policy, and refuted d
 with its evidence; `docs/log.md` is the chronological narrative both point into;
 `docs/parity.md` is the verification runbook; `TODO.md` is the forward ledger.
 
+Keep those roles separate when finishing work. Put benchmark tables, test results,
+failed experiments and the completed-work narrative in `docs/log.md`; put the
+reasoning behind the resulting choice in `docs/decisions.md`. In `TODO.md`, leave
+only a brief dated completion/refutation annotation and a link to that record,
+alongside the work that remains. Do not duplicate the results or narrative there.
+Existing ledger history is preserved, not deleted or rewritten to clean it up.
+
+Before handing off, make the next live TODO actionable: name the next experiment
+or implementation step, its entry point and prerequisites, and any unresolved
+risks or verification gaps. Clearly distinguish a measured result from an unpriced
+candidate. Link to the evidence rather than making the next agent reconstruct the
+session or repeat an already-completed experiment.
+
 ## Non-negotiables
 
 - Design target: maximum tok/s for Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B GGUF on
@@ -268,6 +281,11 @@ unexplained, and BOTH per-step profilers — `XWEN_STACK_PROFILE`'s decode stage
 them (two figures off the GDN line read 2-3x high against amortized benches of the same
 work), so take every headline from an unprofiled run and price a step with an amortized
 bench or end-to-end tok/s, never with a profiler figure.
+As of 2026-09-05, **PLE decode readbacks are batched at seq == 1 only**
+(`XWEN_PLE_READBACK_CLASSIC` restores the three waits). Multi-token prefill keeps
+its old readbacks; all-length batching had no established prefill gain. The
+qualified decode measurement and the initial all-length sweep's drift flag
+drift flag, live in [the log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
 Prefill at the 2048 chunk is UNCHANGED end-to-end by the 2026-08-30 mm_id tile work
 (work-list grid + NR1 64: +17-23% on the expert gemms in isolation, nothing claimable at
 3803 tokens on either MoE checkpoint), because the prefill `ffn` stage is now mostly

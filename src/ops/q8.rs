@@ -230,6 +230,13 @@ mod tests {
     /// the CPU once per plane would dominate the bench's wall time; the deltas
     /// are a fixed, finite half so no denormal/NaN path can perturb the timing.
     fn synthetic_q8_plane(device: &Device, n_out: usize, k: usize, seed: u64) -> Arc<Buffer> {
+        match synthetic_q8_storage(device, n_out, k, seed) {
+            QStorage::Metal(qms) => Arc::new(qms.buffer().clone()),
+            _ => panic!("expected Metal storage"),
+        }
+    }
+
+    fn synthetic_q8_storage(device: &Device, n_out: usize, k: usize, seed: u64) -> QStorage {
         let blocks = n_out * k / 32;
         let mut raw = vec![0u8; blocks * 34];
         let d = half::f16::from_f32(0.0125).to_le_bytes();
@@ -249,11 +256,58 @@ mod tests {
             let off = (b * 32) % (pattern.len() - 32);
             chunk[2..].copy_from_slice(&pattern[off..off + 32]);
         }
-        let storage =
-            QStorage::from_data(std::borrow::Cow::Borrowed(&raw), device, GgmlDType::Q8_0).unwrap();
-        match &storage {
-            QStorage::Metal(qms) => Arc::new(qms.buffer().clone()),
-            _ => panic!("expected Metal storage"),
+        QStorage::from_data(std::borrow::Cow::Borrowed(&raw), device, GgmlDType::Q8_0).unwrap()
+    }
+
+    /// Flash-Next hc decode: identical weight allocations, rotating 334 MB per
+    /// shape, outputs retained through each sync. Run alone on an idle GPU;
+    /// repeat with 60 s idle between invocations to check thermal drift.
+    #[test]
+    #[ignore = "perf bench"]
+    fn hc_q8_decode_bench() {
+        use candle_core::quantized::QMatMul;
+        use std::time::Instant;
+        let device = metal_device().unwrap();
+        const PLANES: usize = 96;
+        for (n_out, k) in [(320, 10240), (10240, 320)] {
+            let weights: Vec<_> = (0..PLANES)
+                .map(|i| {
+                    let storage = synthetic_q8_storage(&device, n_out, k, i as u64 + 71);
+                    let QStorage::Metal(qms) = &storage else {
+                        unreachable!()
+                    };
+                    let buffer = Arc::new(qms.buffer().clone());
+                    let qt = Arc::new(QTensor::new(storage, (n_out, k)).unwrap());
+                    (buffer, QMatMul::from_arc(qt).unwrap())
+                })
+                .collect();
+            let x = Tensor::from_vec(pseudo_random(k, 71, -1., 1.), (1, k), &device).unwrap();
+            for round in 0..5 {
+                for vendored in if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    device.synchronize().unwrap();
+                    let start = Instant::now();
+                    let mut outputs = Vec::with_capacity(PLANES);
+                    for (buffer, qmm) in &weights {
+                        outputs.push(if vendored {
+                            matmul_q8(buffer, 0, n_out, k, &x).unwrap()
+                        } else {
+                            qmm.forward(&x).unwrap()
+                        });
+                    }
+                    device.synchronize().unwrap();
+                    let us = start.elapsed().as_secs_f64() * 1e6 / PLANES as f64;
+                    if round > 0 {
+                        eprintln!(
+                            "hc [{n_out},{k}] round={round} vendored={vendored}: {us:.3} us/dispatch"
+                        );
+                    }
+                    std::hint::black_box(outputs);
+                }
+            }
         }
     }
 

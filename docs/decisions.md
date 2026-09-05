@@ -2665,6 +2665,29 @@ per-stream gate, signed sqrt, dilated conv and silu run on the host in f32 over 
 `[n, 10240]` copy of the stream — 40 KB/token and one device→host sync per forward at
 layer 1. A known P3 cost taken deliberately for correctness first (2026-08-29).
 
+**PLE decode readbacks share one staging buffer and one wait (2026-09-05).** The
+host-hybrid computation remains the same. Its old implementation did THREE
+`to_vec1` calls, each allocating a staging buffer, encoding a blit and flushing the
+GPU; the earlier "one sync" description above counted the logical boundary rather
+than the actual waits. `readback_inputs` now copies key, value and carrier through
+one candle blit encoder at seq == 1, then calls `flush_and_wait_current` once. At
+the shipped geometry the planes contain 10240 + 2560 + 10240 f32 elements: **90 KiB/token** in
+total, not just the carrier's 40 KiB. It copies bytes without changing any math.
+
+The sources remain owned through completion, including dtype/stride materializations;
+source offsets are honoured and each unequal-length plane has its own destination
+range. The staging allocation uses candle's shared-storage builder and its ordinary
+fence-tracking blit API, then the same completed-buffer CPU copy as candle's own
+readback. Direct CPU access to private GPU source buffers would not be valid.
+
+The decode path requests 90 KiB of staging (rounded to 128 KiB by candle). The initial all-length experiment requested 180 MiB at 2048 tokens (rounded to 256 MiB),
+versus an 80 MiB largest individual transfer before, and had no established
+end-to-end prefill gain. **Multi-token prefill stays on the existing independent
+transfers.** Its batching remains unqualified; the general helper retains full-chunk
+correctness/bench coverage. `XWEN_PLE_READBACK_CLASSIC=1` restores independent
+transfers at decode too for A/B measurement. The parity script strips the switch;
+no numeric provenance field is needed for a bit-preserving copy. The device-side gate/conv remains deferred in TODO.md.
+
 **Refuted: the pre-release architecture priors.** The port was planned five days before
 the card dropped, from a trimmed model-card and forum copy-pastes. Grading them against
 the real config: GDN carried over (true, and byte-identical in geometry to our 27B

@@ -75,7 +75,11 @@ the same file in the same hour as the prefill arm runs 789 and 41.4 — plain,
 no drafter, 530-token prompt, interleaved rounds,
 medians, `powermode 0` with no high-power claim. Take those from unprofiled runs: the
 per-step profilers (`XWEN_STACK_PROFILE`, `XWEN_GDN_PROFILE`) sync-bracket each step, so
-they rank steps and do not price them. See `docs/qwen4exp-port.md`.
+they rank steps and do not price them. Since 2026-09-05, batching PLE's decode
+readbacks adds **+2.7–3.0% decode** in a separate, tightly interleaved 3677-token
+sweep (44.8 → 46.1 tok/s, `powermode 0`); prefill keeps its existing path. Results
+and verification are in [the log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
+See `docs/qwen4exp-port.md` for the architecture port.
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full
 names); the HTTP APIs take the **full names only**. Qwen3.8-27B (added 2026-08-14) runs

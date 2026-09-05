@@ -16,7 +16,11 @@
 //! row dequant run on the CPU straight out of the file mapping (D2). Only the
 //! two projections and the key norm run on the GPU; the gate, the conv and the
 //! silu run on the host in f32 over a downloaded copy of the carrier, which
-//! costs one device→host sync per forward. That is a known P3 cost, taken so
+//! at decode shares one staging buffer and device→host wait with the key and
+//! value (90 KiB/token in total; three separate waits before 2026-09-05).
+//! Multi-token prefill keeps the independent transfers: batching those larger
+//! planes has not demonstrated an end-to-end gain.
+//! That is a known P3 cost, taken so
 //! the first correct version is a short walk from the oracle. `XWEN_PLE_PROFILE`
 //! ([`crate::ops::ple_profile`]) splits one forward into its sub-steps and says
 //! which half of that hybrid the layer's `stack_profile` figure actually is.
@@ -43,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::quantized::GgmlDType;
-use candle_core::{D, DType, Device, Tensor};
+use candle_core::{D, DType, Device, Storage, Tensor};
 
 use super::iq4nl;
 use super::ref_hc::grouped_rms_norm;
@@ -1189,19 +1193,13 @@ impl PleLayer {
         let value = self.value_proj.forward(&emb_t)?;
         ple_step_device(&mut prof, &self.device, "proj")?;
 
-        // --- the one sync per forward (D17). 40 KB per token at the shipped
-        // geometry, and the reason this layer is on P3's list.
-        let key_h = key.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let value_h = value
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let stream_h = stream
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        // No sync of its own: each `to_vec1` commits and waits on the way past,
-        // so the device is already idle here.
+        // At decode, key/carrier width 10240 and value width 2560 (90 KiB)
+        // share one staging allocation and wait. Multi-token prefill keeps the
+        // independent transfers: batching had no qualified end-to-end win there.
+        let [key_h, value_h, stream_h] = readback_inputs(
+            [&key, &value, stream],
+            n != 1 || crate::ops::ple_readback_classic(),
+        )?;
         ple_step(&mut prof, "readback");
 
         // --- host: the per-stream gate, and the conv input's own norm.
@@ -1304,6 +1302,89 @@ impl PleLayer {
         ple_report(&prof, n, &rows, self.table.prefetch_stats());
         Ok(addend)
     }
+}
+
+/// Batch the hybrid layer's readbacks with candle's own blit/flush protocol.
+/// Retain every source and the staging buffer until the GPU has finished: the
+/// buffer pool may recycle an allocation as soon as its last owner drops it.
+fn readback_inputs(inputs: [&Tensor; 3], classic: bool) -> Result<[Vec<f32>; 3]> {
+    let device = inputs[0].device();
+    for t in inputs {
+        ensure!(
+            device.same_device(t.device()),
+            "PLE readback devices differ"
+        );
+    }
+    if classic || !device.is_metal() {
+        let read = |t: &Tensor| -> Result<Vec<f32>> {
+            if t.elem_count() == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?)
+        };
+        return Ok([read(inputs[0])?, read(inputs[1])?, read(inputs[2])?]);
+    }
+    let Device::Metal(mdev) = device else {
+        unreachable!()
+    };
+    let mut offsets = [0usize; 4];
+    for (i, t) in inputs.iter().enumerate() {
+        offsets[i + 1] = offsets[i]
+            .checked_add(t.elem_count())
+            .context("PLE readback size overflow")?;
+    }
+    let count = offsets[3];
+    if count == 0 {
+        return Ok(std::array::from_fn(|_| Vec::new()));
+    }
+    let total = count.checked_mul(4).context("PLE readback size overflow")?;
+    // Materialize strides before opening the blit encoder. Offset-only views
+    // need no copy: the blit below honours each storage start offset.
+    let sources = inputs.map(|t| {
+        if t.elem_count() == 0 {
+            return Ok(t.clone());
+        }
+        t.to_dtype(DType::F32)?.contiguous()
+    });
+    let [a, b, c] = sources;
+    let sources = [a?, b?, c?];
+    let staging = mdev
+        .new_buffer_builder()
+        .with_size(total)
+        .with_label("ple_readback")
+        .build()?;
+    {
+        let mut blit = mdev.blit_command_encoder()?;
+        for (i, t) in sources.iter().enumerate() {
+            if t.elem_count() == 0 {
+                continue;
+            }
+            let (storage, layout) = t.storage_and_layout();
+            let Storage::Metal(storage) = &*storage else {
+                unreachable!()
+            };
+            blit.copy_from_buffer(
+                storage.buffer(),
+                layout.start_offset() * 4,
+                &staging,
+                offsets[i] * 4,
+                t.elem_count() * 4,
+            );
+        }
+    }
+    mdev.flush_and_wait_current()?;
+    let ptr = staging.contents() as *const f32;
+    ensure!(
+        !ptr.is_null(),
+        "PLE readback staging buffer is not CPU accessible"
+    );
+    // SAFETY: candle's staging builder creates CPU-accessible storage, as in
+    // MetalStorage::to_cpu. All three ranges were initialized by completed
+    // blits above; the allocation is aligned for f32 and held through the copy.
+    let packed = unsafe { std::slice::from_raw_parts(ptr, count) };
+    Ok(std::array::from_fn(|i| {
+        packed[offsets[i]..offsets[i + 1]].to_vec()
+    }))
 }
 
 /// One forward's sub-step wall clock, gated on [`crate::ops::ple_profile`].
@@ -1531,6 +1612,110 @@ mod tests {
 
     fn host(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn batched_readback_matches_independent_copies_bitwise() {
+        let device = crate::gguf::metal_device().unwrap();
+        // Production decode and full prefill chunk, plus offset and strided
+        // views. Distinct planes catch wrong source/destination offsets.
+        for (n, width, view) in [(1, 10240, 0), (2048, 10240, 0), (3, 64, 1), (3, 64, 2)] {
+            let inputs: [Tensor; 3] = std::array::from_fn(|plane| {
+                let width = if plane == 1 { width / 4 } else { width };
+                let rows = n + 2;
+                let mut data: Vec<f32> = (0..rows * width)
+                    .map(|i| ((i * 13 + plane * 7) % 257) as f32 - 128.)
+                    .collect();
+                for (i, v) in [
+                    0.0,
+                    -0.0,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::from_bits(0x7fc01234),
+                    f32::from_bits(1),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    data[width + i] = v;
+                }
+                let base = Tensor::from_vec(data, (rows, width), &device).unwrap();
+                let x = base.narrow(0, 1, n).unwrap();
+                match view {
+                    1 => x,
+                    2 => x.t().unwrap(),
+                    _ => x.contiguous().unwrap(),
+                }
+            });
+            let refs = [&inputs[0], &inputs[1], &inputs[2]];
+            let got = readback_inputs(refs, false).unwrap();
+            let want = readback_inputs(refs, true).unwrap();
+            for (a, b) in got.iter().zip(&want) {
+                assert_eq!(a.len(), b.len());
+                assert!(
+                    a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "readback differs n={n} width={width} view={view}"
+                );
+            }
+        }
+        // Dtype conversions are queued before the batch's single flush too.
+        let x = Tensor::from_vec(vec![0.5f32; 128], (2, 64), &device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        assert_eq!(
+            readback_inputs([&x; 3], false).unwrap(),
+            readback_inputs([&x; 3], true).unwrap()
+        );
+        let empty = x.narrow(0, 0, 0).unwrap();
+        assert_eq!(
+            readback_inputs([&x, &empty, &x], false).unwrap(),
+            readback_inputs([&x, &empty, &x], true).unwrap()
+        );
+        assert_eq!(
+            readback_inputs([&empty; 3], false).unwrap(),
+            [Vec::<f32>::new(), Vec::new(), Vec::new()]
+        );
+        let cpu = x.to_device(&Device::Cpu).unwrap();
+        assert!(readback_inputs([&x, &cpu, &x], false).is_err());
+        assert_eq!(
+            readback_inputs([&cpu; 3], false).unwrap(),
+            readback_inputs([&cpu; 3], true).unwrap()
+        );
+    }
+
+    /// Readback is a synchronization boundary by definition: time the complete
+    /// transaction, with producers queued before it, not an isolated blit.
+    #[test]
+    #[ignore = "perf bench"]
+    fn ple_readback_bench() {
+        let device = crate::gguf::metal_device().unwrap();
+        for n in [1, 512, 2048] {
+            let x = Tensor::ones((n, 10240), DType::F32, &device).unwrap();
+            let value = Tensor::ones((n, 2560), DType::F32, &device).unwrap();
+            let repeats = if n == 1 { 32 } else { 3 };
+            for round in 0..5 {
+                for classic in if round % 2 == 0 {
+                    [true, false]
+                } else {
+                    [false, true]
+                } {
+                    device.synchronize().unwrap();
+                    let start = Instant::now();
+                    for _ in 0..repeats {
+                        let a = x.affine(2., 1.).unwrap();
+                        let b = value.affine(3., 2.).unwrap();
+                        std::hint::black_box(readback_inputs([&a, &b, &x], classic).unwrap());
+                    }
+                    if round > 0 {
+                        eprintln!(
+                            "PLE readback n={n} round={round} classic={classic}: {:.3} ms",
+                            start.elapsed().as_secs_f64() * 1000. / repeats as f64
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The device layer's addend against the fixture's own `output`.

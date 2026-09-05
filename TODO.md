@@ -1,9 +1,26 @@
 # Deferred work ledger
 
 Items are never deleted, only annotated with their outcome in the item's own bold
-header (`DONE <date>`, `CLOSED-REFUTED <date>`, …) plus the measurement that closed
-them and a pointer to the log.md entry with the full arc. Sub-items are lettered under
-a numbered parent.
+header (`DONE <date>`, `CLOSED-REFUTED <date>`, …) and a link to the log.md entry
+with the results and full arc. Keep closure annotations brief; this is the forward
+ledger, not the results archive. Sub-items are lettered under a numbered parent.
+
+## Next Flash-Next perf work (2026-09-05)
+
+The next candidate is **PLE's remaining host gate and conv**, item (5) in the P3
+ledger below. Start at `src/qwen4exp/ple.rs::PleLayer::forward`: measure the host
+`gate`/`conv` work at decode and 2048-token prefill after the readback collapse,
+then price a device implementation with an amortized bench before wiring it in.
+The old decode three-readback estimate is superseded; detailed results from this
+pass are in [the log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
+
+A device port must preserve the PLE conv window, n-gram history, checkpoint/partial
+commit and cache-image semantics. `ref_ple.rs` and `ref_hc.rs` remain frozen oracles;
+the PLE tests already cover those state transitions. Keep a classic arm, run the
+Flash-Next forced-replay workflow in `docs/parity.md`, and apply AGENTS.md's thermal
+protocol to end-to-end measurements. No gain has been established for this remaining
+work. The hc Q8 decode substitution is not an alternative default ready to enable:
+its up shape needs a new geometry and its down shape remains unqualified (item (3)).
 
 ## Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29)
 
@@ -2130,8 +2147,11 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     decode the two Q8_0 bottleneck gemms go through `QMatMul`, which has **no
     `mv_ext` plane** at the `hc.rs` qlinear site (gguf.rs:1631-1648) — try
     xwen's own vendored mv path there, the same move that paid on the 27B's
-    projections; **(c)** decode is BIMODAL round over round and unexplained (its
-    own item below); **(4)**
+    projections. **SCREENED 2026-09-05, no route changed:** up needs a different
+    kernel geometry; down still needs qualification. Results in
+    [the PLE arc log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
+    **(c)** decode is BIMODAL
+    round over round and unexplained (its own item below); **(4)**
     QSA top-k runs on the host via `arg_sort` — a device partial-top-k kernel is
     the intended replacement (D16 says selection is computed with candle ops in
     P2 explicitly "top-k kernel is P3"); **(5)** the PLE gate, signed sqrt,
@@ -2143,8 +2163,11 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     the layer's fixed floor is **~0.85 ms**, of which the three device→host
     readbacks are 0.50 and the projections 0.33. **Collapsing the three readbacks
     into one is the cheap first step** and is worth taking before the full
-    device port. Note the rest of the decode cost is NOT this — it is table page
-    faults, item (6); **(6)** PLE prefetch: at prefill every row address is
+    device port. **Decode readback collapse DONE 2026-09-05**; results and verification
+    in [the log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
+    Multi-token readback batching remains unqualified and disabled. The gate,
+    signed sqrt, conv and silu remain on the host. Note the rest of the
+    decode cost is NOT this — it is table page faults, item (6); **(6)** PLE prefetch: at prefill every row address is
     computable from token ids before layer 0 runs (hash, dedupe, batch-fault on a
     background thread), and at decode the moment token t is sampled position
     t+1's ~16 rows are known — touch them while the trunk runs. Never gate the
