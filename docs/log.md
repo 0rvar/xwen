@@ -4,6 +4,77 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-05 — Duplicate-dispatch probe prices Flash-Next prefill in situ: expert gemms 1.09 s of 3.42 s @3851 (32%), MoE glue 0.40, hc gates 0.39, GDN 0.23, shared expert ~0
+
+The instrument the ceiling diagnosis asked for (below). `XWEN_DUP_STAGE=<names>` makes
+the multi-token path encode a named stage's kernel launches `XWEN_DUP_REPS` extra times
+(default 1) with the copies' results dropped, so the prefill wall delta against a plain
+run is that stage's GPU time in situ — no syncs, no host work duplicated, only launchers
+that are pure functions of tensors the caller already holds (`ops::dup`; the router,
+gathers, cache advances and allocations of the surrounding blocks run once). Stages:
+`experts` (the three mm_id gemms), `experts_down`, `moe_glue` (router, activation,
+epilogue), `shexp`, `hc` (norm, both bottleneck gemms, silu, mix, write), `hc_gemm`,
+`gdn` (conv, beta/decay head, scan, gated norm), `gdn_scan`. Commit ab43499; parity.md
+carries the switch row. The delta is a LOWER bound for a stage that leaves the GPU idle
+(candle's encoder barriers only on buffer hazards, so a copy writing a fresh buffer may
+overlap the original); the two-copy experts arm below reads 1.03 s per copy against 1.09
+for one, so at least that stage has little overlap to hide.
+
+**Protocol.** `xwen generate --no-draft --raw -n 4 --stats` on the 3851-token
+`prefill-4k` fixture, Qwen3.8-Flash-Next at the 2048 chunk, ten arms interleaved with the
+order reversed every round, three rounds, 60 s idle between rounds, medians;
+`pmset -g` said `lowpowermode 0` (automatic) throughout. The binary was a detached
+worktree build of ab43499 at /tmp/xwen-bench — an earlier attempt on the main tree's
+binary aborted mid-session because a coding agent's `cargo build` had swapped
+`target/release/xwen` (and its `include_str!` kernels) under the harness; a first,
+unpinned session of five arms is quoted only as a replicate.
+
+| arm (stage duplicated once) | tok/s | wall s | delta s | share of 3.42 s | unpinned replicate |
+|---|---|---|---|---|---|
+| base | 1126.4 | 3.419 | — | — | 1131.1 (3.405 s) |
+| experts (gate, up, down mm_id) | 854.3 | 4.508 | 1.089 | 31.8% | 0.959 (28.2%) |
+| experts, two copies (`XWEN_DUP_REPS=2`) | 703.7 | 5.473 | 2.054 = 1.027/copy | — | — |
+| experts_down | 987.2 | 3.901 | 0.482 | 14.1% | 0.423 (12.4%) |
+| moe_glue (router, activation, epilogue) | 1009.8 | 3.814 | 0.395 | 11.5% | — |
+| shexp (shared expert, both gemms) | 1123.3 | 3.428 | 0.009 | 0.3% | — |
+| hc (norm, down, silu, up, mix, write) | 1011.5 | 3.807 | 0.388 | 11.3% | 0.346 (10.2%) |
+| hc_gemm (the two bottleneck gemms) | 1082.8 | 3.557 | 0.138 | 4.0% | — |
+| gdn (conv, beta/decay, scan, gated norm) | 1055.9 | 3.647 | 0.228 | 6.7% | 0.222 (6.5%) |
+| gdn_scan | 1077.2 | 3.575 | 0.156 | 4.6% | — |
+
+Round-to-round spread on the duplicated arms was under 1% except the experts arms
+(±2-4%); the 4-token decode column is noise at that length and is not quoted.
+
+**What it settles.**
+
+- **The expert gemms are 28-32% of prefill wall (0.96-1.09 s of 3.4 s), inside the
+  ceiling diagnosis's 14-43% bracket** and closer to the amortized bench's 1.44 s than
+  to the full-grid A/B's 0.46. Gate+up together are 0.61 s (18%), down 0.48 s (14%) —
+  the down plane is 44% of the expert time, not "about half". The 0.30 s of weight
+  re-reads sits inside this.
+- **The 2026-08-30 "gemms are a minority of `ffn`" reading is REFUTED.** In situ the
+  `ffn` stage is experts 1.09 + glue 0.40 + shexp 0.01 = 1.50 s (44% of wall) and the
+  gemms are 73% of it. The glue is real — 0.40 s, as much as every hc gate together — but
+  it is the smaller half, and the shared expert is free at prefill (two dense gemms at
+  2048 rows, 0.3%).
+- **The hyper-connection gates are 11% (0.39 s), of which the bottleneck gemms are 4%
+  and the four glue kernels plus the write 7% (0.25 s).** The ledger's "~8% activation
+  traffic" estimate was about right.
+- **GDN kernels are 7% (0.23 s): the chunked scan 4.6%, conv + beta/decay + gated norm
+  2.1%.** The stage profiler's 20% for `mixer_delta` includes its three projections,
+  which the probe does not cover.
+- **Priced: 2.11 s = 62% of wall. Unpriced 1.31 s (38%):** the GDN and attention
+  projections, full attention and QSA selection (12 layers), PLE, embedding, lm_head, and
+  whatever the concurrent encoder hides between stages. Those are the next probe stages if
+  the ranking needs them; attention and QSA mutate caches around their kernels, so the
+  wrap has to sit inside the block.
+
+**How the ledger reads now (TODO.md, prefill).** Expert gemm efficiency stays first at a
+measured 0.96-1.09 s; MoE glue (0.40 s) and the hc glue (0.25 s) are second and third and
+are now priced rather than estimated; the GDN scan (0.16 s) is fourth; the shared expert
+drops off the list. Every one of these is a fusion or kernel-efficiency lever, none is a
+launch-count lever (prefill dispatch floor <1%, unchanged).
+
 ## 2026-09-05 — Ceiling diagnosis for Flash-Next: achievable bandwidth measured at 537-565 GB/s, a decode token is 57% weight bytes and ~33% per-dispatch fixed cost, prefill is not launch-bound
 
 TODO.md's "FIRST" item asked why decode and prefill sit so far under their ceilings

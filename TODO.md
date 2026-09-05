@@ -148,12 +148,23 @@ activation traffic estimated; GDN chunked scan, attention and glue ranked only).
    surrounding block — re-running the router, the gathers or an allocation would put
    their cost into the delta too (Qwen review, 2026-09-05). Neither the stage profiler (2.2x inflation) nor an
    isolated bench (transfer 0.32-0.82) can price a prefill stage.
-2. **Hyper-connection activation traffic: ~8% of wall estimated** (the 84 MB carrier
+   **BUILT AND RUN, same day (ab43499, `XWEN_DUP_STAGE`; log "Duplicate-dispatch
+   probe"): expert gemms 0.96-1.09 s of 3.4 s (28-32%; gate+up 0.61, down 0.48), MoE
+   glue 0.40 s (11.5%), hc gates 0.39 s (gemms 0.14, glue+write 0.25), GDN kernels 0.23 s
+   (scan 0.16), shared expert ~0; 38% unpriced. The bracket is settled at its upper
+   half and the "minority" reading refuted (gemms 73% of `ffn`). The item that remains is
+   the gemm efficiency work itself — the down plane is 44% of the expert time, not half.**
+2. **Hyper-connection activation traffic: ~8% of wall estimated** — MEASURED 0.39 s
+   (11.3%) by the probe, of which the two bottleneck gemms 0.14 and the glue kernels plus
+   the write 0.25 s (7.3%) (the 84 MB carrier
    read/written ~8-10 times per gate). Whole-gate fusion at prefill is the same kernel
    work as decode item 1, paid twice.
 3. **GDN prefill (`mixer_delta`, ranked 2nd at 20% by the profiler, unpriced).** No
    amortized bench exists for the chunked scan at 2048 rows; build one before
-   touching it.
+   touching it. PRICED 2026-09-05 by the probe: the GDN kernels are 0.23 s (6.7%), the
+   scan alone 0.16 s (4.6%); the projections are outside the probe and make up the rest
+   of the profiler's 20%. **MoE glue (router, activation, epilogue) is 0.40 s (11.5%)
+   by the same probe and ranks above this item; the shared expert is 0.3% and drops off.**
 4. **Weight re-reads: 9%, structural.** Every expert is touched per 2048-token chunk
    (~40 rows each), so a chunk reads the whole 82.5 GB trunk. A 4096 chunk would halve
    it in principle, but 4096 was MEASURED SLOWER on 2026-08-30 (745 vs 824 tok/s at
@@ -2676,7 +2687,9 @@ non-gemm items come first. [CONTESTED 2026-09-05 (log "Ceiling diagnosis"): the 
 amortized bench's rates put the expert gemms at ~1.5 s of the 3.41 s wall at 3851 tokens
 (16.7 ms per layer per 2048 rows), i.e. ~44%, and the "minority" reading came off the
 stage profiler, which inflates prefill 2.2x. The re-ranked ledger at the top of this
-file puts the expert gemm first for prefill.]
+file puts the expert gemm first for prefill.] [SETTLED 2026-09-05 by the duplicate-dispatch
+probe: expert gemms 28-32% of wall and 73% of `ffn`; glue 11.5%; log "Duplicate-dispatch
+probe".]
 - [ ] **The f16 rescale chain at prefill** (`moe.rs` `needs_rescale`, the L2 guard that
   keeps the down-projection input inside f16 range on the f16-tile prefill variants).
   At 2048 rows per chunk the guard is a band of elementwise dispatches per layer that
@@ -2866,7 +2879,8 @@ nothing in this repo has done before; treat that as part of their cost.
   [CONTESTED 2026-09-05: that "minority" reading came off the 2.2x-inflated stage
   profiler; two in-situ A/Bs bracket the expert gemms at 14-43% of prefill WALL, and
   the tile work reads −2.8% end to end. The cap is lifted to "unpriced" — see the
-  re-ranked ledger at the top of this file.]
+  re-ranked ledger at the top of this file.] [PRICED 2026-09-05: 28-32% of prefill wall
+  by the duplicate-dispatch probe, log "Duplicate-dispatch probe".]
 - [ ] **Per-resource barrier scoping and dependency-filtered cross-encoder fence waits**
   (candle patch). candle's `auto_barrier` emits a whole-scope barrier over the full
   window since the last one (`encoder.rs:104-149`), and every new encoder waits on every

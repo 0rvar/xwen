@@ -304,9 +304,13 @@ Prefill at the 2048 chunk is UNCHANGED end-to-end by the 2026-08-30 mm_id tile w
 (work-list grid + NR1 64: +17-23% on the expert gemms in isolation, nothing claimable at
 3803 tokens on either MoE checkpoint), because the prefill `ffn` stage is now mostly
 NOT the expert gemms — router, rescale chain, SwiGLU, combine and shared expert are the
-majority (TODO.md's prefill section is re-ranked accordingly). [CONTESTED 2026-09-05:
-that reading came off the 2.2x-inflated stage profiler; two in-situ A/Bs bracket the
-expert gemms at 14-43% of prefill wall and the tile work reads −2.8% end to end.]
+majority (TODO.md's prefill section is re-ranked accordingly). [REFUTED 2026-09-05:
+that reading came off the 2.2x-inflated stage profiler. The duplicate-dispatch probe
+(`XWEN_DUP_STAGE`, log.md "Duplicate-dispatch probe") prices prefill stages in situ with
+no sync: at 3851 tokens the expert gemms are 0.96-1.09 s of 3.4 s (28-32%, 73% of `ffn`),
+MoE glue 0.40 s, hc gates 0.39 s (gemms 0.14), GDN kernels 0.23 s (scan 0.16), shared
+expert ~0; 38% of wall is unpriced (projections, attention, QSA, PLE, lm_head). Price a
+prefill stage with the probe, never with the profiler or an isolated bench.]
 Within-session cross-drafter comparison, 2026-08-15 (the only way to compare the
 two kinds honestly — same machine, same hour): the 3.6-27B's DFlash head runs
 1.50x/1.47x over its own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x
@@ -358,7 +362,10 @@ thermal flag anywhere. The machine thermal-throttles under sustained load as a
 matter of course (owner's word, 2026-08-30), so design rounds around it: short runs,
 arms interleaved tightly (A B A B, never all of A then all of B), ~60 s idle between
 rounds, an anchor arm at the start and end of every session with a >3% drift flag, and
-never a test suite or a second model process alongside a bench. llama.cpp's prefill thermal-boosts harder than xwen's
+never a test suite or a second model process alongside a bench. Bench a PINNED binary
+(a detached-worktree build under /tmp, `--bin` on the harness): a coding agent's `cargo
+build` in the main tree swaps `target/release/xwen` and its `include_str!` kernels under
+a running harness (2026-09-05: a session aborted on a half-written kernel). llama.cpp's prefill thermal-boosts harder than xwen's
 (-17% vs -5% settling) — never read a first-reps prefill ratio as steady state.
 And on a machine shared with other agents, calibrate every prefill run against
 the classic arm's known baseline before believing absolutes: three separate

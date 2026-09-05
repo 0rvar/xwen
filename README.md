@@ -87,7 +87,10 @@ See `docs/qwen4exp-port.md` for the architecture port.
 A ceiling diagnosis the same day (log.md "Ceiling diagnosis") measured this machine's
 achievable bandwidth at 537-565 GB/s and put the bytes-only Flash-Next decode ceiling at
 81-86 tok/s (75-80 at today's plane sizes); a decode token reads 6.33 GB of weights, and
-the rest of it is ~1740 dispatches in a dependent chain.
+the rest of it is ~1740 dispatches in a dependent chain. Prefill stages are priced in situ
+by the duplicate-dispatch probe (`XWEN_DUP_STAGE`, log.md "Duplicate-dispatch probe"): at
+3851 tokens the expert gemms are 28-32% of wall, MoE glue 11.5%, the hyper-connection
+gates 11%, GDN kernels 7%.
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full
 names); the HTTP APIs take the **full names only**. Qwen3.8-27B (added 2026-08-14) runs

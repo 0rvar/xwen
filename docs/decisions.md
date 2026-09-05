@@ -663,8 +663,9 @@ down q5_1 202k → 236k, 35B gate/up 628k → 751k, 35B down 260k → 281k); end
 3803 tokens NOTHING claimable (Flash-Next arms inside one arm's round-to-round spread;
 35B +1.9% in one round), the profiler ranking showing why — `ffn` fell only 3-5%
 because the gemms are a minority of that stage next to the router, rescale chain,
-[CONTESTED 2026-09-05, "Ceilings" below: the profiler that ranked them inflates prefill
-2.2x and two in-situ A/Bs bracket the expert gemms at 14-43% of prefill wall]
+[REFUTED 2026-09-05, "Ceilings" below: the profiler that ranked them inflates prefill
+2.2x; the duplicate-dispatch probe prices the expert gemms at 28-32% of prefill wall and
+73% of the `ffn` stage in situ]
 SwiGLU, combine and shared expert. Shipped anyway as the correct shape of the kernel
 (less idle launch, fewer dequant passes, no accuracy trade), with `XWEN_MM_ID_FULL_GRID`
 and `XWEN_MM_ID_NR1` as kill switch and A/B knob, and the finding re-ranks the prefill
@@ -3042,7 +3043,15 @@ those isolated rates at 0.82 and 0.32 respectively, so the share is **bracketed 
 14-43%**. That makes the expert gemm the largest PRICED prefill candidate and CONTESTS
 the 2026-08-30 "gemms are a minority of `ffn`" reading, which came off the
 sync-inflated stage profiler; the ledger carries the bracket, not a point, until an
-in-situ duplicate-dispatch probe replaces it.
+in-situ duplicate-dispatch probe replaces it. **SETTLED the same day by that probe
+(log.md "Duplicate-dispatch probe"; `XWEN_DUP_STAGE`): the expert gemms are 0.96-1.09 s
+of the 3.4 s wall at 3851 tokens (28-32%), the MoE glue 0.40 s, the hc gates 0.39 s (of
+which the two gemms 0.14), the GDN kernels 0.23 s (scan 0.16), the shared expert ~0. The
+"minority" reading is refuted — the gemms are 73% of the `ffn` stage — and the prefill
+ledger is priced from these figures rather than from the bracket.** Prefill stages are
+priced by the probe from now on: it is the only instrument on this machine that adds no
+sync, and its one caveat is that a stage which leaves the GPU idle can overlap its own
+copy and read low (the two-copy experts arm scaled linearly, 1.03 s per copy).
 
 ## Process
 
