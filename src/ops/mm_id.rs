@@ -334,9 +334,13 @@ mod tests {
                 x_per_row: 8,
             },
         ];
+        // The classic f32 (`_hp`) family at the shipped tuning is the fourth arm:
+        // its ratio to the tensor arm converts an in-situ `XWEN_MM_ID_CLASSIC` A/B
+        // on prefill wall into the expert gemms' share of that wall.
         let arms = [
             (
                 "full-grid NR1 32",
+                MmVariant::Tensor,
                 MmTuning {
                     nr1: Some(32),
                     full_grid: Some(true),
@@ -344,6 +348,7 @@ mod tests {
             ),
             (
                 "work-list NR1 32",
+                MmVariant::Tensor,
                 MmTuning {
                     nr1: Some(32),
                     full_grid: Some(false),
@@ -351,9 +356,18 @@ mod tests {
             ),
             (
                 "work-list NR1 64",
+                MmVariant::Tensor,
                 MmTuning {
                     nr1: Some(64),
                     full_grid: Some(false),
+                },
+            ),
+            (
+                "classic-hp default",
+                MmVariant::ClassicHp,
+                MmTuning {
+                    nr1: None,
+                    full_grid: None,
                 },
             ),
         ];
@@ -367,10 +381,9 @@ mod tests {
                 "{} (E={} n_out={} k={} t={} top_k={}):",
                 g.name, g.n_expert, g.n_out, g.k, g.t, g.top_k
             );
-            for (arm, tuning) in &arms {
-                let run_arm = || {
-                    dispatch::run_mm_tuned(&stack, &x, &ids_t, MmVariant::Tensor, *tuning).unwrap()
-                };
+            for (arm, variant, tuning) in &arms {
+                let run_arm =
+                    || dispatch::run_mm_tuned(&stack, &x, &ids_t, *variant, *tuning).unwrap();
                 for _ in 0..4 {
                     let _ = run_arm();
                 }
