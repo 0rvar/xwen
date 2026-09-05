@@ -79,6 +79,9 @@ they rank steps and do not price them. Since 2026-09-05, batching PLE's decode
 readbacks adds **+2.7–3.0% decode** in a separate, tightly interleaved 3677-token
 sweep (44.8 → 46.1 tok/s, `powermode 0`); prefill keeps its existing path. Results
 and verification are in [the log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
+The same day, `XWEN_PLE_DEVICE=1` moved the PLE gate and conv onto the GPU for
+multi-token prefill: **+12.8% prefill at 3851 tokens (1010 → 1140 tok/s) and +12.9% at
+880**, decode unchanged, still opt-in (decisions.md "PLE gate and conv run on device").
 See `docs/qwen4exp-port.md` for the architecture port.
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full

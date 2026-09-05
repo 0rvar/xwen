@@ -130,6 +130,7 @@ const DELTA_SOURCE: &str = include_str!("delta.metal");
 /// one order (see hc.metal). Under the `XWEN_HC_CLASSIC` kill-switch nothing
 /// asks for this library, so it never compiles.
 const HC_SOURCE: &str = include_str!("hc.metal");
+const PLE_SOURCE: &str = include_str!("ple.metal");
 /// Vendored QSA decode row gather (the K/V rows a selection names, packed
 /// into one contiguous plane per head). Own library; a pure copy, so it has
 /// no rounding contract to state. Under `XWEN_QSA_CLASSIC` nothing asks for
@@ -368,4 +369,9 @@ pub(crate) fn qsa_gather_pipeline(device: &Device, name: &str) -> Result<Compute
 /// Pipeline for the `qsa_select.metal` kernel (the QSA decode block selection).
 pub(crate) fn qsa_select_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, QSA_SELECT_SOURCE, "qsa_select", name)
+}
+
+/// Pipeline for the PLE grouped gate and dilated convolution tail.
+pub(crate) fn ple_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, PLE_SOURCE, "ple", name)
 }

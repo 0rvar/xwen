@@ -5377,6 +5377,149 @@ pub(crate) fn run_hc_write(stream: &Tensor, block_out: &Tensor, inject: &Tensor)
     Ok(output_tensor(dst, mdev, n_elems, (n, width)))
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PleArgs {
+    n: i32,
+    hidden: i32,
+    width: i32,
+    k: i32,
+    dilation: i32,
+    state_len: i32,
+    eps: f32,
+    dot_scale: f32,
+}
+
+/// Stateless PLE tail; the caller owns the channel-major convolution history.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_ple_tail(
+    key: &Tensor,
+    value: &Tensor,
+    stream: &Tensor,
+    query_w: &Tensor,
+    norm_w: &Tensor,
+    conv_w: &Tensor,
+    prior: &Tensor,
+    hidden: usize,
+    dilation: usize,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let Device::Metal(mdev) = stream.device() else {
+        bail!("ple_tail requires Metal inputs");
+    };
+    let (n, width) = stream.dims2()?;
+    let (cw, k) = conv_w.dims2()?;
+    ensure!(
+        n > 0 && hidden > 0 && width > 0 && width.is_multiple_of(hidden),
+        "ple_tail invalid grouped geometry"
+    );
+    ensure!(
+        cw == width && k > 0 && dilation > 0,
+        "ple_tail invalid convolution geometry"
+    );
+    ensure!(
+        eps.is_finite() && eps > 0.0,
+        "ple_tail epsilon must be finite and positive"
+    );
+    let state_len = checked_elems(&[k - 1, dilation], "ple_tail history")?;
+    let count = checked_elems(&[n, width], "ple_tail output")?;
+    let line_len = n
+        .checked_add(state_len)
+        .ok_or_else(|| anyhow::anyhow!("ple_tail history extent overflow"))?;
+    for dims in [
+        &[n, width][..],
+        &[width, k],
+        &[width, state_len],
+        &[k, dilation],
+        &[line_len],
+    ] {
+        glue_index_fits_i32(checked_elems(dims, "ple_tail indexing")?)?;
+    }
+    let operands = [key, value, stream, query_w, norm_w, conv_w, prior];
+    let shapes: [&[usize]; 7] = [
+        &[n, width],
+        &[n, hidden],
+        &[n, width],
+        &[width],
+        &[width],
+        &[width, k],
+        &[width, state_len],
+    ];
+    for (t, shape) in operands.iter().zip(shapes) {
+        check_f32(t, shape, "ple_tail operand")?;
+        ensure!(
+            stream.device().same_device(t.device()),
+            "ple_tail operands must share a Metal device"
+        );
+    }
+    let threads = 256;
+    let gate = pipelines::ple_pipeline(mdev.device(), "kernel_ple_gate")?;
+    let conv = pipelines::ple_pipeline(mdev.device(), "kernel_ple_conv")?;
+    for (name, pipe) in [("kernel_ple_gate", &gate), ("kernel_ple_conv", &conv)] {
+        ensure!(
+            pipe.max_total_threads_per_threadgroup() >= threads,
+            "{name} cannot launch {threads} threads"
+        );
+        check_delta_simd_width(pipe, name)?;
+    }
+    // `gated` is private-pool scratch written by the gate kernel and read by the
+    // conv kernel in the same encoder. It is held until both dispatches are
+    // encoded (the `prepare_mm_id_map0` rule); candle orders the read after the
+    // write and any later reuse of the allocation after the read, and the
+    // private pool never hands it to a CPU-side upload, so it need not outlive
+    // GPU completion the way a readback staging buffer must.
+    let gated = mdev.new_buffer(count, DType::F32, "ple_gated")?;
+    let normed = mdev.new_buffer(count, DType::F32, "ple_normed")?;
+    let out = mdev.new_buffer(count, DType::F32, "ple_out")?;
+    let held: Vec<_> = operands.iter().map(|t| t.storage_and_layout()).collect();
+    let mut buffers = Vec::with_capacity(held.len());
+    for (storage, layout) in &held {
+        let Storage::Metal(storage) = &**storage else {
+            bail!("ple_tail expected Metal storage")
+        };
+        buffers.push((storage.buffer(), f32_off(layout)));
+    }
+    let args = PleArgs {
+        n: n as i32,
+        hidden: hidden as i32,
+        width: width as i32,
+        k: k as i32,
+        dilation: dilation as i32,
+        state_len: state_len as i32,
+        eps,
+        dot_scale: 1.0 / (hidden as f32).sqrt(),
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&gate);
+        encoder.set_bytes(0, &args);
+        for (i, &(buffer, off)) in buffers[..5].iter().enumerate() {
+            encoder.set_input_buffer(i + 1, Some(buffer), off);
+        }
+        encoder.set_output_buffer(6, Some(&gated), 0);
+        encoder.set_output_buffer(7, Some(&normed), 0);
+        encoder.dispatch_thread_groups(mtl_size!(n, width / hidden, 1), mtl_size!(threads, 1, 1));
+        encoder.set_compute_pipeline_state(&conv);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(&gated), 0);
+        encoder.set_input_buffer(2, Some(&normed), 0);
+        encoder.set_input_buffer(3, Some(buffers[6].0), buffers[6].1);
+        encoder.set_input_buffer(4, Some(buffers[5].0), buffers[5].1);
+        encoder.set_output_buffer(5, Some(&out), 0);
+        encoder.dispatch_thread_groups(
+            mtl_size!(count.div_ceil(threads), 1, 1),
+            mtl_size!(threads, 1, 1),
+        );
+    }
+    Ok((
+        output_tensor(out, mdev, count, (n, width)),
+        output_tensor(normed, mdev, count, (n, width)),
+    ))
+}
+
 #[cfg(test)]
 mod combine_guard_tests {
     use super::{combine_index_fits_i32, combine_reduction_width};

@@ -11,17 +11,22 @@
 //! by `tests/fixtures/qwen4exp/ple.json` through the frozen oracle in
 //! [`super::ref_ple`], which this module is graded against.
 //!
-//! **P2 is host-hybrid (docs/qwen4exp-port.md D17).** The table is 28.8 GB of
+//! The table is 28.8 GB of
 //! IQ4_NL that never becomes a device tensor: the hash, the row gather and the
 //! row dequant run on the CPU straight out of the file mapping (D2). Only the
-//! two projections and the key norm run on the GPU; the gate, the conv and the
+//! two projections and the key norm run on the GPU in the classic path;
+//! the gate, the conv and the
 //! silu run on the host in f32 over a downloaded copy of the carrier, which
 //! at decode shares one staging buffer and device→host wait with the key and
 //! value (90 KiB/token in total; three separate waits before 2026-09-05).
 //! Multi-token prefill keeps the independent transfers: batching those larger
-//! planes has not demonstrated an end-to-end gain.
-//! That is a known P3 cost, taken so
-//! the first correct version is a short walk from the oracle. `XWEN_PLE_PROFILE`
+//! planes has not demonstrated an end-to-end gain. The host tail is a known P3
+//! cost, taken so the first correct version is a short walk from the oracle.
+//! `XWEN_PLE_DEVICE` opts multi-token Metal forwards into the device gate and
+//! convolution kernels ([`crate::ops::ple`]). They download only the normalized
+//! rows needed to maintain the host convolution window, or every row while a
+//! checkpoint is armed. Decode keeps the classic tail in both modes.
+//! `XWEN_PLE_PROFILE`
 //! ([`crate::ops::ple_profile`]) splits one forward into its sub-steps and says
 //! which half of that hybrid the layer's `stack_profile` figure actually is.
 //!
@@ -567,7 +572,7 @@ fn worker(
 /// file.
 ///
 /// Both halves are already host-side inside [`PleState`] — the conv window is
-/// computed on the CPU (D17) and the history is token ids — so this is a copy,
+/// retained there after either tail implementation, and the history is token ids — so this is a copy,
 /// not a readback. It carries `state_len` so it describes itself: an image that
 /// reaches a differently-shaped layer is rejected rather than reinterpreted.
 #[derive(Clone, Debug, PartialEq)]
@@ -909,12 +914,16 @@ pub struct PleLayer {
     table: PleTable,
     key_proj: QLinear,
     value_proj: QLinear,
-    /// On device: the key norm is the one norm applied before the download.
+    /// Shared device key norm, applied before either tail implementation.
     key_norm_w: Tensor,
-    /// On the host: applied to the downloaded carrier and to the gated value.
+    /// Host weights retained for the classic tail and decode.
     query_norm_w: Vec<f32>,
     conv_norm_w: Vec<f32>,
     conv_w: Vec<f32>,
+    /// Cached device weights for the prefill tail.
+    query_norm_device: Tensor,
+    conv_norm_device: Tensor,
+    conv_weight_device: Tensor,
     hidden: usize,
     hc_count: usize,
     n_heads: usize,
@@ -1070,6 +1079,9 @@ impl PleLayer {
         );
 
         let key_norm_w = Tensor::from_vec(p.key_norm_w, (1, width), device)?;
+        let query_norm_device = Tensor::from_slice(&p.query_norm_w, width, device)?;
+        let conv_norm_device = Tensor::from_slice(&p.conv_norm_w, width, device)?;
+        let conv_weight_device = Tensor::from_slice(&p.conv_w, (width, p.conv_kernel), device)?;
         Ok(Self {
             hash: p.hash,
             table: p.table,
@@ -1079,6 +1091,9 @@ impl PleLayer {
             query_norm_w: p.query_norm_w,
             conv_norm_w: p.conv_norm_w,
             conv_w: p.conv_w,
+            query_norm_device,
+            conv_norm_device,
+            conv_weight_device,
             hidden: p.hidden,
             hc_count: p.hc_count,
             n_heads,
@@ -1094,9 +1109,9 @@ impl PleLayer {
     ///
     /// The host twin is [`super::ref_hc::grouped_rms_norm`], which accumulates
     /// the sum of squares in f64; this one is candle's f32 reduction, so the
-    /// two agree to roughly f32 rounding rather than exactly. That is the whole
-    /// numerical gap between this layer and the oracle — everything else in the
-    /// forward runs the oracle's own code.
+    /// two agree to roughly f32 rounding rather than exactly. The classic tail
+    /// then uses the oracle's own host arithmetic; the device tail also
+    /// partitions the query/gated norm and key-query dot reductions.
     fn grouped_norm_device(&self, x: &Tensor) -> Result<Tensor> {
         let (n, width) = x.dims2()?;
         let x3 = x.reshape((n, self.hc_count, self.hidden))?;
@@ -1152,6 +1167,16 @@ impl PleLayer {
     /// `state` is read for the pre-chunk history and left holding the new tail,
     /// so consecutive chunks of one sequence reproduce a single-shot run.
     pub fn forward(&self, tokens: &[u32], stream: &Tensor, state: &mut PleState) -> Result<Tensor> {
+        self.forward_with_device(tokens, stream, state, crate::ops::ple_device())
+    }
+
+    fn forward_with_device(
+        &self,
+        tokens: &[u32],
+        stream: &Tensor,
+        state: &mut PleState,
+        device_tail: bool,
+    ) -> Result<Tensor> {
         let n = tokens.len();
         ensure!(n > 0, "PLE forward over an empty token chunk");
         let width = self.width();
@@ -1167,6 +1192,19 @@ impl PleLayer {
             state.conv.len(),
             state.state_len
         );
+        // Fail before touching `state`: `record` would refuse the overflowing token
+        // too, but only after this forward had already advanced the conv window
+        // and recorded part of its trail. Same span rule, checked up front.
+        if let Some(span) = state.armed {
+            ensure!(
+                state
+                    .trail
+                    .len()
+                    .checked_add(n)
+                    .is_some_and(|end| end <= span),
+                "PLE forward exceeds the {span}-token checkpoint span"
+            );
+        }
 
         // Sub-step timing, off unless XWEN_PLE_PROFILE is set (ops::ple_profile).
         let mut prof = FwdProfile::start(&self.device)?;
@@ -1192,6 +1230,35 @@ impl PleLayer {
         let key = self.grouped_norm_device(&self.key_proj.forward(&emb_t)?)?;
         let value = self.value_proj.forward(&emb_t)?;
         ple_step_device(&mut prof, &self.device, "proj")?;
+
+        if device_tail && n > 1 && self.device.is_metal() {
+            let prior = Tensor::from_slice(&state.conv, (width, state_len), &self.device)?;
+            ple_step_device(&mut prof, &self.device, "history_upload")?;
+            let (addend, normalized) = crate::ops::ple::ple_tail(
+                &key,
+                &value,
+                &stream.to_dtype(DType::F32)?.contiguous()?,
+                &self.query_norm_device,
+                &self.conv_norm_device,
+                &self.conv_weight_device,
+                &prior,
+                self.hidden,
+                self.dilation(),
+                self.eps,
+            )?;
+            ple_step_device(&mut prof, &self.device, "device_tail")?;
+            let count = if state.trail_armed() {
+                n
+            } else {
+                n.min(state_len)
+            };
+            let normalized = crate::ops::ple::readback_tail(&normalized, count)?;
+            ple_step(&mut prof, "history_readback");
+            self.commit_device_history(tokens, &normalized, count, state)?;
+            ple_step(&mut prof, "trail");
+            ple_report(&prof, n, &rows, self.table.prefetch_stats());
+            return Ok(addend);
+        }
 
         // At decode, key/carrier width 10240 and value width 2560 (90 KiB)
         // share one staging allocation and wait. Multi-token prefill keeps the
@@ -1302,12 +1369,61 @@ impl PleLayer {
         ple_report(&prof, n, &rows, self.table.prefetch_stats());
         Ok(addend)
     }
+
+    /// Commit compact normalized rows to the host-owned convolution window.
+    /// Armed forwards retain every token's window for partial acceptance;
+    /// ordinary prefill downloads only the final receptive field.
+    fn commit_device_history(
+        &self,
+        tokens: &[u32],
+        normalized: &[f32],
+        rows: usize,
+        state: &mut PleState,
+    ) -> Result<()> {
+        let n = tokens.len();
+        let width = self.width();
+        let state_len = self.conv_state_len();
+        let first = n - rows;
+        let window_at = |end: usize| {
+            let mut window = vec![0.0; width * state_len];
+            for c in 0..width {
+                for j in 0..state_len {
+                    let pos = end + j;
+                    window[c * state_len + j] = if pos < state_len {
+                        state.conv[c * state_len + pos]
+                    } else {
+                        normalized[(pos - state_len - first) * width + c]
+                    };
+                }
+            }
+            window
+        };
+        let next_conv = window_at(n);
+        let trail: Vec<_> = if state.trail_armed() {
+            (1..=n)
+                .map(|end| {
+                    (
+                        self.hash.next_history(&state.history, &tokens[..end]),
+                        window_at(end),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (history, window) in trail {
+            state.record(history, window)?;
+        }
+        state.conv = next_conv;
+        state.history = self.hash.next_history(&state.history, tokens);
+        Ok(())
+    }
 }
 
 /// Batch the hybrid layer's readbacks with candle's own blit/flush protocol.
 /// Retain every source and the staging buffer until the GPU has finished: the
 /// buffer pool may recycle an allocation as soon as its last owner drops it.
-fn readback_inputs(inputs: [&Tensor; 3], classic: bool) -> Result<[Vec<f32>; 3]> {
+pub(crate) fn readback_inputs(inputs: [&Tensor; 3], classic: bool) -> Result<[Vec<f32>; 3]> {
     let device = inputs[0].device();
     for t in inputs {
         ensure!(
@@ -1612,6 +1728,155 @@ mod tests {
 
     fn host(t: &Tensor) -> Vec<f32> {
         t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    fn assert_device_state(a: &PleState, b: &PleState) {
+        assert_eq!(a.history(), b.history());
+        assert_eq!(a.state_len, b.state_len);
+        let error = max_abs(a.conv_window(), b.conv_window());
+        assert!(error <= 1e-5, "device tail conv state error {error:e}");
+    }
+
+    #[test]
+    fn device_prefill_preserves_checkpoint_images_and_decode_continuation() {
+        let device = crate::gguf::metal_device().unwrap();
+        let j = fixture();
+        let layer = layer(&j, &device);
+        let tokens = vec_u32(&j["layer_case"]["input_ids"]);
+        let values = flat_f32(&j["layer_case"]["hidden_stream_in"]);
+        let stream = Tensor::from_slice(&values, (tokens.len(), layer.width()), &device).unwrap();
+        let prefix = stream.narrow(0, 0, 2).unwrap();
+        let block = stream.narrow(0, 2, 3).unwrap();
+        for commit in 0..=3 {
+            let mut classic = layer.new_state();
+            let mut candidate = layer.new_state();
+            let a = layer
+                .forward_with_device(&tokens[..2], &prefix, &mut classic, false)
+                .unwrap();
+            let b = layer
+                .forward_with_device(&tokens[..2], &prefix, &mut candidate, true)
+                .unwrap();
+            assert!(max_abs(&host(&a), &host(&b)) <= 1e-5);
+            assert_device_state(&classic, &candidate);
+            let a_snap = classic.checkpoint(3);
+            let b_snap = candidate.checkpoint(3);
+            let a = layer
+                .forward_with_device(&tokens[2..5], &block, &mut classic, false)
+                .unwrap();
+            let b = layer
+                .forward_with_device(&tokens[2..5], &block, &mut candidate, true)
+                .unwrap();
+            assert!(max_abs(&host(&a), &host(&b)) <= 1e-5);
+            classic.rollback(&a_snap, 3, commit).unwrap();
+            candidate.rollback(&b_snap, 3, commit).unwrap();
+            assert_device_state(&classic, &candidate);
+            let image = candidate.image();
+            let mut restored = layer.new_state();
+            restored.restore(&image, 2 + commit).unwrap();
+            let next = stream.narrow(0, 0, 1).unwrap();
+            let a = layer
+                .forward_with_device(&tokens[..1], &next, &mut classic, false)
+                .unwrap();
+            let b = layer
+                .forward_with_device(&tokens[..1], &next, &mut candidate, true)
+                .unwrap();
+            let c = layer
+                .forward_with_device(&tokens[..1], &next, &mut restored, false)
+                .unwrap();
+            assert!(max_abs(&host(&a), &host(&b)) <= 1e-5);
+            assert_eq!(
+                host(&b),
+                host(&c),
+                "decode uses the same classic tail from the restored image"
+            );
+            assert_eq!(candidate.image(), restored.image());
+            assert_device_state(&classic, &candidate);
+        }
+        let mut state = layer.new_state();
+        state.checkpoint(1);
+        let before = state.image();
+        assert!(
+            layer
+                .forward_with_device(&tokens[..2], &prefix, &mut state, true)
+                .is_err()
+        );
+        assert_eq!(before, state.image());
+        assert!(state.trail.is_empty());
+    }
+
+    #[test]
+    fn device_prefill_2048_matches_classic_at_full_tail_width() {
+        fn pseudo_random(n: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
+            let mut rng = lcg(seed);
+            (0..n).map(|_| lo + (rng() + 0.5) * (hi - lo)).collect()
+        }
+        let device = crate::gguf::metal_device().unwrap();
+        let (hidden, width, emb_dim, head_dim, n) = (2560, 10240, 32, 16, 2048);
+        let layer = PleLayer::from_parts(
+            PleParts {
+                hash: PleHashRef {
+                    ngram_size: 3,
+                    heads_per_ngram: 1,
+                    multipliers: vec![11, 23, 31],
+                    head_vocab_sizes: vec![7, 7],
+                    head_offsets: vec![0, 8],
+                    eos: 7,
+                },
+                table: PleTable::from_f32(&pseudo_random(16 * head_dim, 501, -0.5, 0.5), head_dim)
+                    .unwrap(),
+                key_proj: exact_linear(
+                    &pseudo_random(width * emb_dim, 502, -0.1, 0.1),
+                    width,
+                    emb_dim,
+                    &device,
+                ),
+                value_proj: exact_linear(
+                    &pseudo_random(hidden * emb_dim, 503, -0.1, 0.1),
+                    hidden,
+                    emb_dim,
+                    &device,
+                ),
+                key_norm_w: pseudo_random(width, 504, 0.9, 1.1),
+                query_norm_w: pseudo_random(width, 505, 0.9, 1.1),
+                conv_norm_w: pseudo_random(width, 506, 0.9, 1.1),
+                conv_w: pseudo_random(width * 4, 507, -0.5, 0.5),
+                hidden,
+                hc_count: 4,
+                head_dim,
+                conv_kernel: 4,
+                eps: 1e-6,
+            },
+            &device,
+        )
+        .unwrap();
+        let tokens: Vec<_> = (0..n).map(|i| (i % 19) as u32).collect();
+        let stream = Tensor::from_vec(
+            pseudo_random(n * width, 508, -2.0, 2.0),
+            (n, width),
+            &device,
+        )
+        .unwrap();
+        let mut classic = layer.new_state();
+        let mut candidate = layer.new_state();
+        let a = layer
+            .forward_with_device(&tokens, &stream, &mut classic, false)
+            .unwrap();
+        let b = layer
+            .forward_with_device(&tokens, &stream, &mut candidate, true)
+            .unwrap();
+        let error = max_abs(&host(&a), &host(&b));
+        assert!(error <= 1e-5, "2048-token device addend max abs {error:e}");
+        assert_device_state(&classic, &candidate);
+        assert!(candidate.trail.is_empty());
+        let next = stream.narrow(0, 0, 1).unwrap();
+        let a = layer
+            .forward_with_device(&tokens[..1], &next, &mut classic, false)
+            .unwrap();
+        let b = layer
+            .forward_with_device(&tokens[..1], &next, &mut candidate, true)
+            .unwrap();
+        assert!(max_abs(&host(&a), &host(&b)) <= 1e-5);
+        assert_device_state(&classic, &candidate);
     }
 
     #[test]

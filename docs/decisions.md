@@ -2686,7 +2686,29 @@ end-to-end prefill gain. **Multi-token prefill stays on the existing independent
 transfers.** Its batching remains unqualified; the general helper retains full-chunk
 correctness/bench coverage. `XWEN_PLE_READBACK_CLASSIC=1` restores independent
 transfers at decode too for A/B measurement. The parity script strips the switch;
-no numeric provenance field is needed for a bit-preserving copy. The device-side gate/conv remains deferred in TODO.md.
+no numeric provenance field is needed for a bit-preserving copy. The device-side gate/conv landed the same day as an opt-in (next paragraph).
+
+**PLE gate and conv run on device for multi-token forwards, opt-in for now (2026-09-05).**
+`XWEN_PLE_DEVICE` moves the per-stream gate, signed sqrt, gated norm, dilated conv and
+silu onto two Metal kernels (`ops/ple.metal`) for Metal forwards with `n > 1`; decode
+keeps the host tail because its 0.13 ms/token has no qualified gain behind it. The conv
+window stays host-owned: only the last `min(n, 9)` normalized rows come back (all `n`
+while a checkpoint is armed), so snapshots, rollback, images and the disk tier are
+byte-for-byte what the classic path produces. Measured +12.8% Flash-Next prefill at 3851
+tokens and +12.9% at 880, decode flat (log.md 2026-09-05, gate and conv). The kernels
+match the host tail on real inputs to 6e-7 abs / 8e-7 rel L2.
+
+Why it is not the default yet: it fails the Flash-Next forced-replay stand-in gate as
+written, one hard mismatch at long-mixed step 4, and a control shows that gate cannot
+tell this change from a benign reordering of one host f32 dot product, which reproduces
+the identical hard mismatch. The direct real-input comparison is the instrument for a
+re-implementation of host math; the replay is the instrument for changes whose only
+reference is llama.cpp. Flipping the default is the owner's call and a one-line change.
+Design choices kept: safe math mode so the gate's `isnan` guard survives; reductions
+partitioned across simdgroups while every scalar product keeps the oracle's order;
+`partial[32]` sized for the most simdgroups a threadgroup can hold rather than for the
+256-thread launch; the `gated` scratch dropped after encoding (private pool, fenced
+read-after-write, no CPU writer), where a readback staging buffer must outlive the wait.
 
 **Refuted: the pre-release architecture priors.** The port was planned five days before
 the card dropped, from a trimmed model-card and forum copy-pastes. Grading them against

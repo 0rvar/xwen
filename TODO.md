@@ -7,7 +7,18 @@ ledger, not the results archive. Sub-items are lettered under a numbered parent.
 
 ## Next Flash-Next perf work (2026-09-05)
 
-The next candidate is **PLE's remaining host gate and conv**, item (5) in the P3
+**DONE as opt-in 2026-09-05** (`XWEN_PLE_DEVICE=1`, multi-token Metal forwards; +12.8% prefill @3851,
++12.9% @880, decode flat): [log](docs/log.md#2026-09-05--ple-gate-and-conv-move-to-device-for-multi-token-prefill-flash-next-prefill-12-13-at-880-and-3851-tokens-opt-in-behind-xwen_ple_device).
+Live follow-ups: (a) **flip the default** (owner's call: the arm fails the forced-replay
+stand-in on long-mixed step 4, which a benign reorder of one host dot fails identically; the
+real-input comparison is 6e-7). Rename the switch to a host/`*_CLASSIC` kill switch, update
+`parity-gate.ts`'s strip list and parity.md's row, re-run the three-fixture replay for the
+record; (b) decode tail on device is UNPRICED (0.13 ms/token of host work against the extra
+readback it would need; the batched readback already lands the carrier); (c) the conv kernel's
+per-element `exp` under safe math and the armed-path strided window rebuild are unpriced and
+unreachable-at-default respectively.
+
+The next candidate was **PLE's remaining host gate and conv**, item (5) in the P3
 ledger below. Start at `src/qwen4exp/ple.rs::PleLayer::forward`: measure the host
 `gate`/`conv` work at decode and 2048-token prefill after the readback collapse,
 then price a device implementation with an amortized bench before wiring it in.
@@ -2165,8 +2176,10 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     into one is the cheap first step** and is worth taking before the full
     device port. **Decode readback collapse DONE 2026-09-05**; results and verification
     in [the log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
-    Multi-token readback batching remains unqualified and disabled. The gate,
-    signed sqrt, conv and silu remain on the host. Note the rest of the
+    Multi-token readback batching remains unqualified and disabled. **Gate,
+    signed sqrt, conv and silu on device for multi-token forwards: DONE as opt-in
+    2026-09-05** (`XWEN_PLE_DEVICE`, +12.8% prefill @3851; see the 2026-09-05 section
+    at the top of this file for the default flip and the decode tail, both live). Note the rest of the
     decode cost is NOT this — it is table page faults, item (6); **(6)** PLE prefetch: at prefill every row address is
     computable from token ids before layer 0 runs (hash, dedupe, batch-fault on a
     background thread), and at decode the moment token t is sampled position

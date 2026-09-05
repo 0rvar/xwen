@@ -448,6 +448,7 @@ report does not name.
 | `XWEN_QSA_HOST_TOPK=1` | reverts the QSA indexer's device-side block selection at decode (`ops::qsa_select`, `kernel_qsa_select`: radix top-k over the score bits plus the block-to-row expansion, one dispatch per layer) to the per-layer score readback and the host `top_blocks` + `expand_into` — the readback that drained the pipeline 12 times per step; `XWEN_QSA_CLASSIC` implies it | a real kill switch, but both arms produce the SAME ROWS by construction for EVERY input, contract or not: host and kernel rank through one `score_key` (bit pattern of a non-negative float; sign bit or NaN → 0), score descending then block index ascending (`device_select_matches_host_top_blocks_bitwise`, `device_select_tie_quota_spans_stripes`, `device_select_matches_host_on_nan_and_negative_scores`, and the three-arm `cached_block_keys_match_the_classic_recompute`), so it can never move a parity number; it only matters above the 2048-token indexer budget |
 | `XWEN_HC_SPLIT_MAX_N=<n>` | token-count ceiling below which the hc norm takes the split launch (default 32; `0` pins the single kernel, a large value pins the split pair) | an A/B knob, not a kill switch — both launch shapes compute the SAME BITS (`split_matches_single_bitwise`), so it can never move a parity number |
 | `XWEN_PLE_PROFILE=1` | one stderr line per forward with the PLE layer's sub-step timings | instrumentation; zero cost unset, and it adds syncs that inflate decode |
+| `XWEN_PLE_DEVICE=1` | runs the PLE gate, signed sqrt, gated norm, dilated conv and silu on device (`ops/ple.metal`) for Metal forwards with `n > 1`, reading back only the conv window rows; decode always keeps the host tail | bounded, not bitwise: the simdgroup-partitioned f32 reductions differ from the host's sequential/f64 sums at ulp scale (6e-7 abs on real inputs). Stripped by `parity-gate.ts`. On the Flash-Next forced-replay stand-in it produces one hard mismatch (long-mixed step 4) that a benign reordering of one host dot product reproduces exactly, so that instrument does not grade it (log.md 2026-09-05, gate and conv) |
 | `XWEN_PLE_READBACK_CLASSIC=1` | restores PLE decode's three separate staging transfers and waits instead of one batched blit and wait; multi-token prefill always stays classic | non-numeric: identical f32 bytes, tested at decode and full 2048-token chunk sizes, with unequal plane lengths, strided/offset views, dtype conversion and empty inputs (`batched_readback_matches_independent_copies_bitwise`). Flash-Next only; stripped by name |
 | `XWEN_PLE_NO_PREFETCH=1` | disables the advisory PLE row prefetch thread | non-numeric — the prefetch only faults pages early |
 | `XWEN_PLE_NO_RANDOM=1` | skips `MADV_RANDOM` on the PLE table's byte range | non-numeric, same reason |
@@ -846,7 +847,12 @@ the fixture and the frozen bound — recalibrate.
   four, that checkpoint's math is graded by **forced replay against llama.cpp**
   (`logits-dump --replay` along the oracle's own greedy trajectory — the decode tier's
   methodology with llama.cpp standing in for the blocked reference runner; method and
-  numbers in docs/qwen4exp-parity-2026-08-29.md). Two things follow even after the
+  numbers in docs/qwen4exp-parity-2026-08-29.md). **Known limit of that stand-in
+  (2026-09-05):** on long-mixed, step 4 flips to a hard mismatch (oracle margin 1.83)
+  under a reordering of one host f32 dot product with no other change, so a hard
+  mismatch there does not by itself indict a kernel; pair it with a direct
+  classic-vs-candidate comparison on the real inputs (log.md 2026-09-05, gate and
+  conv). Two things follow even after the
   panic is fixed: the floors here are calibrated on the ggml-org Q4_K_M mix and that
   file is unsloth UD-Q4_K_XL, so they need re-deriving for it, and it has no
   reference-ppl fixture. All ledgered in TODO.md.

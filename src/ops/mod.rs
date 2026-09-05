@@ -12,6 +12,7 @@ pub mod moe_glue;
 pub mod mv_ext;
 pub mod mv_id;
 mod pipelines;
+pub mod ple;
 pub mod q8;
 pub mod qsa_gather;
 pub mod qsa_select;
@@ -168,6 +169,14 @@ pub fn ple_profile() -> bool {
 pub fn ple_readback_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_PLE_READBACK_CLASSIC").is_some())
+}
+
+/// Opt in to PLE's device tail for multi-token Metal forwards. Decode keeps
+/// the host tail and its batched readback. Presence-based, like the other
+/// kernel experiment switches.
+pub fn ple_device() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_PLE_DEVICE").is_some())
 }
 
 /// `XWEN_GDN_PROFILE` breaks the `Stage::MixerDelta` bracket into the steps a
