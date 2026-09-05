@@ -13,7 +13,7 @@ The arithmetic says the gap is large on both axes, and the ledger has no item th
 explains it, so the diagnosis is the next unit of work, not another kernel.
 
 **RESULT, same day — steps 1-3 DONE, step 4 is the section that follows this one**
-([log](docs/log.md#2026-09-05--ceiling-diagnosis-for-flash-next-achievable-bandwidth-measured-at-537-565-gbs-decode-is-57-bytes--43-dispatch-floor-prefill-is-not-launch-bound),
+([log](docs/log.md#2026-09-05--ceiling-diagnosis-for-flash-next-achievable-bandwidth-measured-at-537-565-gbs-a-decode-token-is-57-weight-bytes-and-33-per-dispatch-fixed-cost-prefill-is-not-launch-bound),
 decisions.md "Achievable bandwidth is MEASURED" and "Ceilings"). Achievable bandwidth:
 **537-565 GB/s streaming read** (median of 5 interleaved rounds, 575-580 best; copy
 ~517; a 32 MB weight plane 528-537; 2.4-2.7 µs fixed cost per back-to-back dispatch),
@@ -96,7 +96,8 @@ decode dispatch ≈ 4 µs (≈0.02% of a token), a removed sync ≈ 0.3 ms (≈1
 measured rate (we run 47); prefill 2300-3000 tok/s gemm-only at 28-36 TFLOP/s (we run
 1129-1140 @3851).
 
-**Decode (21.3 ms/token = 12.0 bytes + ~7.0 dispatch fixed cost + 0.9 syncs + 1.4 scan).**
+**Decode (21.3 ms/token = 12.0 bytes + ~7.4 dispatch fixed cost + 0.9 syncs + 1.0 scan
+beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/dispatch).**
 1. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest
    population.** 7 per gate (norm, inject head — separate on the decode split arm —,
    down gemv, silu-quarter, up gemv, mix, write) × 96 gates. A fused norm+head+down
@@ -106,8 +107,9 @@ measured rate (we run 47); prefill 2300-3000 tok/s gemm-only at 28-36 TFLOP/s (w
    ledger.
 2. **MoE FFN: 576 dispatches/token (30%).** 12 per layer; the glue is already fused and
    the dual gate|up kernel is refuted (decisions.md `XWEN_MOE_DUAL`), so what is left
-   is shape-level: router+softmax+topk as one kernel (−2/layer), shexp's four
-   dispatches as one (−3/layer) → −240 ≈ −1.0 ms, +5%. Item (15).
+   is shape-level: the router is already one projection plus one fused kernel, so
+   folding the projection in is −1/layer; shexp's four dispatches as one is −3/layer →
+   −192 ≈ −0.8 ms, +3.6%. Item (15).
 3. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line
    earlier.** One drain per token for data that never left the CPU; pass the ids down
    instead. ≈ +0.3 ms, +1.4%, no math change; run the Flash-Next replay check anyway.
@@ -124,9 +126,9 @@ measured rate (we run 47); prefill 2300-3000 tok/s gemm-only at 28-36 TFLOP/s (w
    95-97% of a pure read. (14)'s "+11-15 tok/s if the layer reached bandwidth" stays
    withdrawn; the vendored mv path for hc (P3 (3)) is bytes-at-rate already.
 
-**Prefill (3.41 s @3851 = ~1.5 expert gemms + 0.30 weight re-reads + ~0.26 hc
-activation traffic + GDN chunked scan + attention + glue; only the first two are
-priced, the hc figure is estimated, the rest is ranked).**
+**Prefill (3.41 s @3851: expert gemms 0.46-1.44 s bracketed, of which the 0.30 s of
+weight re-reads is a floor INSIDE that time rather than a separate term; ~0.25 s hc
+activation traffic estimated; GDN chunked scan, attention and glue ranked only).**
 1. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (amortized
    `mm_id_launch_shape_throughput` at t=2048: gate/up 3.9 ms + down 8.2 ms per layer
    per chunk = 1.44 s at 3851 tokens = 43%; the classic-tile A/B implies ~35%, the

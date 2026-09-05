@@ -2331,8 +2331,11 @@ measured on planes whose bytes are free. Machine in the owner's "automatic" mode
 from peak" rule is retired: a bytes/time argument divides by the measured range and
 says so. Second, the 8.41 µs intercept fitted to the Q8_0 gemv on 2026-08-30 is that
 kernel's ramp and tail, not the launch floor; a per-dispatch budget uses ~2.5 µs for
-glue kernels, ~8 µs for gemv-shaped ones, and the decode budget closes at ~4 µs
-average over the mix. Third, "is the GPU the bottleneck" is a measured question:
+glue kernels, ~8 µs for gemv-shaped ones, and the decode budget's residual back-solves
+to ~4 µs average over the mix (an attribution, bracketed by those two measurements,
+not a third measurement). The floor is a dependent-chain figure: candle's encoder is
+`MTLDispatchType::Concurrent` with automatic barriers between dependent dispatches,
+and a decode step is mostly such a chain. Third, "is the GPU the bottleneck" is a measured question:
 `/usr/bin/time -l` differenced between two run lengths gives CPU seconds per token
 (decode 3.7 ms of a 21.3 ms token; prefill 0.6 ms of 0.885), so neither phase is
 CPU-bound and candle's command-buffer granularity (`CANDLE_METAL_COMPUTE_PER_BUFFER`
@@ -3011,14 +3014,17 @@ them.** A decode token reads 6.33 GB of weights (GDN projections 2.25, routed ex
 1.50, hc 0.69, lm_head 0.68, full attention 0.64, routers/shexp/indexer/PLE 0.58) plus
 ~0.3 GB of state and KV, which at the measured 537-565 GB/s is 11.7-12.3 ms of a
 21.3 ms token: the bytes-only ceiling is 81-86 tok/s, and no estimate above that is
-to be quoted. The rest of the token is ~1740 serialized dispatches (hc 672, MoE 576,
-GDN 252, attention ~200, QSA ~24 below budget / ~165 above) at ~4 µs average fixed
-cost, three host syncs (~0.9 ms) and the serial scan (~1.4 ms). So the decode lever
+to be quoted. The rest of the token is ~1740 dispatches in a mostly dependent chain
+(hc 672, MoE 576, GDN 252, attention ~200, QSA ~24 below budget / ~165 above) at ~4 µs
+average fixed cost (a residual attribution between the 2.5 µs measured floor and the
+8.4 µs gemv intercept), three host syncs (~0.9 ms) and the serial scan (~1.0 ms beyond
+its bytes). So the decode lever
 is dispatch COUNT — the budget prices a removed dispatch at ~4 µs and a removed sync
 at ~0.3 ms — never per-kernel bandwidth, which the big planes already reach at 95-97%
 of a pure read. Prefill at the 2048 chunk is 12.07 GFLOP per token; 3851 tokens run at
 13.7 TFLOP/s end to end against 28-36 for the dense gemm in isolation, weight re-reads
-are 9% of wall (every expert is touched per chunk), the dispatch floor is under 1%,
+are 9% of wall (every expert is touched per chunk — a lower bound inside the gemm time,
+not additive to it), the dispatch floor is under 1%,
 and the expert gemms cost 1.44 s of the 3.41 s by the amortized mm_id bench at their
 real geometry (~12 TFLOP/s, dequant-bound by the 2026-08-30 code reading) — but two
 in-situ A/Bs on prefill wall (classic tiles, and the pre-2026-08-30 full grid) transfer

@@ -312,10 +312,12 @@ KV (4 KiB/token against 40).
 **Flash-Next ceilings (2026-09-05, log.md "Ceiling diagnosis"; decisions.md
 "Ceilings").** A decode token reads 6.33 GB of weights (+~0.3 GB state/KV) = 11.7-12.3
 ms of its 21.3 at the measured bandwidth, so the bytes-only ceiling is **81-86 tok/s**;
-the other ~9 ms is ~1740 serialized dispatches (hc 672, MoE 576, GDN 252) at ~4 µs
-average plus 3 syncs and the serial scan. Decode is not CPU-bound (3.7 ms CPU per
+the other ~9 ms is ~1740 dispatches in a mostly dependent chain (hc 672, MoE 576,
+GDN 252) at ~4 µs average (a residual between the measured 2.5 µs floor and the 8.4 µs
+gemv intercept) plus 3 syncs and the serial scan. Decode is not CPU-bound (3.7 ms CPU per
 token) and not command-buffer-bound. Prefill at 3851 runs 13.7 TFLOP/s end to end on
-12.07 GFLOP/token; the dispatch floor is <1%, weight re-reads 9%, and the expert gemms
+12.07 GFLOP/token; the dispatch floor is <1%, weight re-reads 9% (inside the gemm
+time, a lower bound), and the expert gemms
 14-43% (amortized bench 43%, two in-situ A/Bs bracket it lower; ~12 TFLOP/s isolated,
 dequant-bound by the 2026-08-30 code reading). Levers are dispatch COUNT for decode and
 the expert gemm + hc glue for prefill; never per-kernel bandwidth.

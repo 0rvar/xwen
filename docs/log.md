@@ -4,7 +4,7 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-09-05 — Ceiling diagnosis for Flash-Next: achievable bandwidth measured at 537-565 GB/s, a decode token is 57% weight bytes and ~33% serialized dispatch floor, prefill is not launch-bound
+## 2026-09-05 — Ceiling diagnosis for Flash-Next: achievable bandwidth measured at 537-565 GB/s, a decode token is 57% weight bytes and ~33% per-dispatch fixed cost, prefill is not launch-bound
 
 TODO.md's "FIRST" item asked why decode and prefill sit so far under their ceilings
 and to rewrite the perf ledger from the answer. Steps 1-3 (measure bandwidth, decode
@@ -48,10 +48,19 @@ arms, 524-541 at 32 MB, 519 on the 1 GB copy and 511 on the 4 MB copy. Reading:
   The shipped Q8_0 gemv reads the same plane at 510 (log 2026-08-30), so the big decode
   gemvs are at 95-97% of what a pure read achieves at that size. Per-kernel bandwidth
   is not where decode's time goes.
-- **The per-dispatch floor inside one encoder is 2.4-2.7 µs** (the 4 KB / 64 KB / 256 KB
-  arms, whose bytes are free). The 8.41 µs intercept fitted to the Q8_0 gemv on
+- **The per-dispatch floor for a dependent chain inside one encoder is 2.4-2.7 µs** (the
+  4 KB / 64 KB / 256 KB arms, whose bytes are free and cache-resident — 512 × 4 KB is
+  2 MB — so they isolate the fixed cost). Every read probe writes the same `out` buffer,
+  and candle's encoder is `MTLDispatchType::Concurrent` with an automatic memory barrier
+  before any dispatch whose buffers overlap a previous output (candle
+  `encoder.rs::auto_barrier`), so consecutive probes are barrier-separated exactly the
+  way a decode step's dependent dispatches are; the figure is that regime's floor, not
+  an independent-dispatch one. The 8.41 µs intercept fitted to the Q8_0 gemv on
   2026-08-30 is therefore mostly that kernel's own ramp and tail, not a launch cost: a
-  4 MiB read costs 10.2 µs, of which 7.5 is bytes at 560 GB/s and ~2.7 is fixed.
+  4 MiB read costs 10.2 µs, of which 7.5 is bytes at 560 GB/s and ~2.7 is fixed. The
+  timing brackets host encoding and candle's command-buffer rotation (every 50
+  dispatches) as well; at the large arms that is noise, at the tiny arms it is part of
+  the cadence being measured.
 - The 4 MB copy is bimodal (508 GB/s in one round, 34-38 in four) and unexplained; the
   1 GB and 32 MB copies are not. Noted, not used.
 - The first attempt died before any kernel ran: `Tensor::arange` for f32 builds its
@@ -101,11 +110,17 @@ carrier seed 6, tail 6. The
   ledger's "~1000 dispatches/token" was understated 1.75x; the missing mass is the hc
   carrier, the largest population in the model.
 - *Fixed cost bracket:* 1740 × 2.5 µs = 4.4 ms at the tiny-kernel floor; 1740 × 8.4 =
-  14.6 ms at the gemv intercept. What closes the budget: 21.3 − 12.0 (bytes) − 0.9 (3
-  syncs at ~0.3 ms each, from the readback batching's +2.85% for two removed waits) −
-  1.4 (serial scan, amortized, ledgered) ≈ 7.0 ms ≈ **~4 µs of fixed cost per dispatch
-  on average** — between the two brackets, as it should be for a mix of tiny glue
-  kernels and gemvs.
+  14.6 ms at the gemv intercept. What closes the budget: 21.3 − 12.0 (bytes, which
+  already include the scan's 0.23 GB of state) − 0.9 (3 syncs at ~0.3 ms each, from the
+  readback batching's +2.85% for two removed waits) − 1.0 (the serial scan's amortized
+  1.4 ms less its own bytes; its 36 launches are inside the 1740) ≈ 7.4 ms ≈ **~4 µs of
+  fixed cost per dispatch on average**. That average is a RESIDUAL ATTRIBUTION, not an
+  independent measurement: the independent anchors are the 2.5 µs tiny-kernel floor
+  and the 8.4 µs gemv intercept, and the residual lands between them, as it should for
+  a mix of tiny glue kernels and gemvs. A decode step is mostly a dependent chain (each
+  dispatch consumes the previous one's output), so candle's automatic barriers
+  serialize most of it; the independent pairs (q/k/v, gate|up) can overlap and are
+  part of why the average sits below the gemv intercept.
 - *Not CPU-bound:* `/usr/bin/time -l` differenced between 32 and 256 decoded tokens
   (two pairs, user 1.89/1.91 → 2.38/2.38 s) gives **2.95 ms user + 0.7 ms sys per
   token, a 17% CPU duty cycle.** The main thread spends most of the token waiting on the
@@ -113,8 +128,8 @@ carrier seed 6, tail 6. The
 - *Not command-buffer-bound:* `CANDLE_METAL_COMPUTE_PER_BUFFER` 50 (default) / 250 / 10
   read 47.0 / 46.7 / 46.3 tok/s medians over three interleaved rounds — 5x fewer or 5x
   more command buffer commits per token move nothing outside noise. Candle keeps one
-  compute encoder open and serializes dispatches within it; the cost is per dispatch,
-  not per commit.
+  compute encoder open across dispatches (concurrent dispatch type, automatic barriers
+  between dependent ones); the cost is per dispatch, not per commit.
 - *Stage ranking (sync-inflated, rank only; decode is 11.3 tok/s under the profiler):*
   `ffn` 20.7%, `mixer_delta` 19.3%, `ffn_norm` 13.3%, `attn_norm` 13.0%,
   `residual_attn` 10.1%, `residual_ffn` 9.7%, `mixer_full_attn` 5.4%, `ple` 3.8%,
@@ -122,7 +137,8 @@ carrier seed 6, tail 6. The
   the 672-dispatch population showing through the bracket inflation.
 
 **Decode diagnosis.** At the measured bandwidth the token is 57% bytes and ~33%
-serialized per-dispatch fixed cost, with ~4% syncs and ~7% serial scan. Nothing is
+residual attributed to per-dispatch fixed cost in a mostly dependent chain, with ~4%
+syncs and ~5% serial scan beyond its bytes. Nothing is
 "far below peak": the gap to the bytes-only ceiling (81-86 tok/s) is the dispatch count.
 Realistic levers, priced at ~4 µs per dispatch removed: halving the count (−870) is
 −3.5 ms → ~56 tok/s (+9); a whole-block fusion that brought it near 400 would be
@@ -140,9 +156,13 @@ remove (~0.3 ms, +1.4%).
   so the achieved figure is a lower bound. Gemm-only ceiling at the 28-36 TFLOP/s the dense gemm reaches in
   isolation: 2300-3000 tok/s.
 - *Weight bytes:* at 2048 rows per chunk every expert is touched (2048 × 10 / 512 ≈ 40
-  rows each), so each chunk reads the whole 82.5 GB trunk once: 165 GB for two chunks =
-  **0.30 s at 550 GB/s, 9% of wall.** This is also why 2048 beat 512: per 2048 tokens,
-  four 512-row chunks read the trunk four times (330 GB against 82.5).
+  rows each under uniform routing, and any expert with one row costs its full weight
+  read; real routing is skewed but leaves an expert untouched only rarely), so each
+  chunk reads the whole 82.5 GB trunk once: 165 GB for two chunks = **0.30 s at 550
+  GB/s, 9% of wall — a LOWER BOUND on the gemm time, not a term to add to it**: the
+  expert gemm's weight reads are inside its measured time. It is also part of why 2048
+  beat 512: per 2048 tokens, four 512-row chunks read the trunk four times (330 GB
+  against 82.5).
 - *Expert gemms from the amortized bench (`mm_id_launch_shape_throughput`, t=2048, 40
   dispatches per sync, log 2026-08-30 "mm_id tiles"):* gate/up 512k tok/s = 4.0 ms per
   plane per 2048 rows, down 236k = 8.7 ms → 16.7 ms per layer per chunk → 48 layers ×
