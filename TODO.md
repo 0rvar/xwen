@@ -25,7 +25,8 @@ tok/s**, not 180-220; the remaining ~9 ms is **1740 dispatches** (not ~1000: hc 
 576, GDN 252, attention ~200) at ~4 µs average fixed cost, 3 host syncs (~0.9 ms) and
 the serial scan (~1.4 ms). Not CPU-bound (3.7 ms CPU/token), not command-buffer-bound
 (`CANDLE_METAL_COMPUTE_PER_BUFFER` 10/50/250 within noise). Prefill: **12.07
-GFLOP/token** (not 9-10), 13.7 TFLOP/s achieved at 3851 (not 10-11), dispatch floor <1%,
+GFLOP/token** (not 9-10), 13.7 TFLOP/s achieved at 3851 (not 10-11), dispatch floor <1%
+(on an estimated ~1650 dispatches per chunk; no prefill count was taken),
 weight re-reads 9% (every expert per 2048 chunk), expert gemms **14-43% of wall**
 (1.44 s of 3.41 by the amortized mm_id bench; two in-situ A/Bs transfer the isolated
 rates at 0.82 and 0.32) — contesting the 2026-08-30 "gemms are a minority" reading,
@@ -141,7 +142,9 @@ activation traffic estimated; GDN chunked scan, attention and glue ranked only).
    bracket: an in-situ duplicate-dispatch probe** — a presence switch that encodes a
    stage's kernels twice (the expert gemms first, then the hc gates, the GDN chunked
    scan) so the wall delta IS that stage's in-situ time; no math change when unset,
-   Flash-Next replay check anyway. Neither the stage profiler (2.2x inflation) nor an
+   Flash-Next replay check anyway. Duplicate only the kernel dispatches, never the
+   surrounding block — re-running the router, the gathers or an allocation would put
+   their cost into the delta too (Qwen review, 2026-09-05). Neither the stage profiler (2.2x inflation) nor an
    isolated bench (transfer 0.32-0.82) can price a prefill stage.
 2. **Hyper-connection activation traffic: ~8% of wall estimated** (the 84 MB carrier
    read/written ~8-10 times per gate). Whole-gate fusion at prefill is the same kernel

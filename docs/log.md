@@ -102,7 +102,9 @@ runs at this prompt).**
   the bytes-only ceiling with today's plane sizes**, and that ~1 ms belongs to
   small-plane bandwidth, not to the dispatch residual below.
 - *Dispatches:* traced from today's code (`/tmp/agent-report-decode-dispatches.md`):
-  **1740 compute dispatches per token below the 2048 indexer budget, ~1905 above**, and
+  **1740 compute dispatches per token below the 2048 indexer budget, ~1880-1970 above**
+  (1740 − 24 + ~165 = 1881 on most steps, more on the every-fourth step that rebuilds
+  the block keys), and
   **3 host syncs** — the token-id readback before the layer loop
   (`stack.rs:511`, ids the host uploaded one line earlier), the batched PLE readback
   mid-layer 1 (`ple.rs:1492`), and the sampler's logit row. By population:
