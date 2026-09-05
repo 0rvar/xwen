@@ -299,13 +299,26 @@ Prefill at the 2048 chunk is UNCHANGED end-to-end by the 2026-08-30 mm_id tile w
 (work-list grid + NR1 64: +17-23% on the expert gemms in isolation, nothing claimable at
 3803 tokens on either MoE checkpoint), because the prefill `ffn` stage is now mostly
 NOT the expert gemms — router, rescale chain, SwiGLU, combine and shared expert are the
-majority (TODO.md's prefill section is re-ranked accordingly).
+majority (TODO.md's prefill section is re-ranked accordingly). [CONTESTED 2026-09-05:
+that reading came off the 2.2x-inflated stage profiler; two in-situ A/Bs bracket the
+expert gemms at 14-43% of prefill wall and the tile work reads −2.8% end to end.]
 Within-session cross-drafter comparison, 2026-08-15 (the only way to compare the
 two kinds honestly — same machine, same hour): the 3.6-27B's DFlash head runs
 1.50x/1.47x over its own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x
 over its own. Same trunk geometry, so the block drafter is still the stronger
 drafter; the MTP head closes most of the gap and is worth roughly ten times less
 KV (4 KiB/token against 40).
+
+**Flash-Next ceilings (2026-09-05, log.md "Ceiling diagnosis"; decisions.md
+"Ceilings").** A decode token reads 6.33 GB of weights (+~0.3 GB state/KV) = 11.7-12.3
+ms of its 21.3 at the measured bandwidth, so the bytes-only ceiling is **81-86 tok/s**;
+the other ~9 ms is ~1740 serialized dispatches (hc 672, MoE 576, GDN 252) at ~4 µs
+average plus 3 syncs and the serial scan. Decode is not CPU-bound (3.7 ms CPU per
+token) and not command-buffer-bound. Prefill at 3851 runs 13.7 TFLOP/s end to end on
+12.07 GFLOP/token; the dispatch floor is <1%, weight re-reads 9%, and the expert gemms
+14-43% (amortized bench 43%, two in-situ A/Bs bracket it lower; ~12 TFLOP/s isolated,
+dequant-bound by the 2026-08-30 code reading). Levers are dispatch COUNT for decode and
+the expert gemm + hc glue for prefill; never per-kernel bandwidth.
 
 **The 27B prefill gap is CLOSED (P8c, 2026-07-29).** It was never the DeltaNet
 scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill
@@ -321,11 +334,16 @@ the f32 oracle — matmul2d's reduced-precision path, the same trade the attenti
 prefill gemm made); it is pinned off on both sides of the strict parity tier and
 graded by mm/decode/ppl.
 
-Benching rules this machine has already enforced the hard way. Peak memory
-bandwidth here has NEVER been measured — do not argue "far below peak" from the
-614 GB/s figure; compare bytes-moved against time between two arms instead (the
-Q4_K FFN gemm reads 3.6x fewer weight bytes than the f16 one and takes 2.4x
-longer, which settles bandwidth-vs-kernel without a peak). Use AMORTIZED rates
+Benching rules this machine has already enforced the hard way. Achievable
+bandwidth IS measured (2026-09-05, `ops::bandwidth::tests::bandwidth_sweep`,
+"automatic" power mode, `lowpowermode 0`): streaming read 537-565 GB/s median
+(575-580 best rounds, 87-94% of the 614 nominal), copy ~517, a 32 MB weight plane
+528-537, and a 2.4-2.7 µs fixed cost per back-to-back dispatch inside one encoder.
+Argue bytes-moved against THAT range, never the nominal figure, and remember the
+Q8_0 gemv's 8.41 µs intercept is kernel ramp, not launch floor (a decode budget
+closes at ~4 µs average per dispatch). Between two arms, still compare bytes-moved
+against time (the Q4_K FFN gemm reads 3.6x fewer weight bytes than the f16 one and
+takes 2.4x longer, which settles bandwidth-vs-kernel without any peak). Use AMORTIZED rates
 (BATCH dispatches per sync, outputs held alive), never per-dispatch: a budget
 built from per-dispatch numbers sums to 127% of wall. Keep the duty cycle low —
 the same shape measured 23% slower in a 36 s run than in a 9 s one, with no

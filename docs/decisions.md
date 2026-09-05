@@ -663,6 +663,8 @@ down q5_1 202k → 236k, 35B gate/up 628k → 751k, 35B down 260k → 281k); end
 3803 tokens NOTHING claimable (Flash-Next arms inside one arm's round-to-round spread;
 35B +1.9% in one round), the profiler ranking showing why — `ffn` fell only 3-5%
 because the gemms are a minority of that stage next to the router, rescale chain,
+[CONTESTED 2026-09-05, "Ceilings" below: the profiler that ranked them inflates prefill
+2.2x and two in-situ A/Bs bracket the expert gemms at 14-43% of prefill wall]
 SwiGLU, combine and shared expert. Shipped anyway as the correct shape of the kernel
 (less idle launch, fewer dequant passes, no accuracy trade), with `XWEN_MM_ID_FULL_GRID`
 and `XWEN_MM_ID_NR1` as kill switch and A/B knob, and the finding re-ranks the prefill
@@ -853,8 +855,10 @@ its own fit, `t = 157 µs + bytes / 476 GB/s`, so that condition also costs ~21%
 marginal rate on top of the floor.
 
 The 604 GB/s is a marginal slope differenced between two arms of the same bench, NOT an
-appeal to a peak-bandwidth figure — this machine's peak has never been measured and the
-repo rule forbids arguing from the nominal one. Machine conditions, stated because they
+appeal to a peak-bandwidth figure — at the time this machine's peak had never been
+measured and the repo rule forbade arguing from the nominal one (MEASURED 2026-09-05:
+537-565 GB/s streaming read, see "Measurement discipline"; the 604 slope sits 7-12%
+above that range). Machine conditions, stated because they
 were not ideal: `pgrep` was clean at the START of the session and not re-verified per
 run; at least one other agent was on the machine during part of it (the unstable
 `[2560 → 2560]` cell is the visible contention); the four cells the conclusion rests on
@@ -2315,6 +2319,27 @@ session actually produced, verbatim, and read it BEFORE the runs; an after-the-f
 reading does not establish what was in force during them. Neither key ever licenses a
 high-power claim.
 
+**Achievable bandwidth is MEASURED, not quoted, since 2026-09-05: argue bytes-moved
+against 537-565 GB/s, and price a dispatch at 2.5 µs of floor plus its own ramp.**
+`ops::bandwidth::tests::bandwidth_sweep` (log.md 2026-09-05 "Ceiling diagnosis")
+streams a 2 GB device buffer with a reduce-only read and a copy, amortized and
+interleaved under the thermal protocol: streaming read 537-565 GB/s median (575-580
+best rounds; 87-94% of the 614 nominal), copy ~517 GB/s of bytes touched, a 32 MB plane
+528-537, and a fixed cost of 2.4-2.7 µs per back-to-back dispatch inside one encoder,
+measured on planes whose bytes are free. Machine in the owner's "automatic" mode,
+`lowpowermode 0`. Three consequences. First, the old "never measured, do not argue
+from peak" rule is retired: a bytes/time argument divides by the measured range and
+says so. Second, the 8.41 µs intercept fitted to the Q8_0 gemv on 2026-08-30 is that
+kernel's ramp and tail, not the launch floor; a per-dispatch budget uses ~2.5 µs for
+glue kernels, ~8 µs for gemv-shaped ones, and the decode budget closes at ~4 µs
+average over the mix. Third, "is the GPU the bottleneck" is a measured question:
+`/usr/bin/time -l` differenced between two run lengths gives CPU seconds per token
+(decode 3.7 ms of a 21.3 ms token; prefill 0.6 ms of 0.885), so neither phase is
+CPU-bound and candle's command-buffer granularity (`CANDLE_METAL_COMPUTE_PER_BUFFER`
+10 / 50 / 250) moves nothing. The stack profiler's inflation was re-measured the same
+day at 2.2x on prefill (511 vs 1129 tok/s at 3851 tokens), so it ranks prefill stages
+too and prices neither phase — the same rule as decode, now with the number.
+
 **A/B perf comparisons must INTERLEAVE the two arms, and a sequential matrix is not a
 valid A/B.** Measured 2026-07-28 while benching the fused DeltaNet kernels: a
 back-to-back matrix of eight `xwen generate` runs drifts **20–35% slower** end to end,
@@ -2980,6 +3005,28 @@ forced-replay steps and zero hard mismatches; P3's first pass closed the prefill
 took decode past llama.cpp the same day (1.01x prefill, 1.04x decode at a 530-token
 prompt, 186/192 forced replay), with the device-side PLE gate/conv and the QSA top-k
 kernel still ledgered (2026-08-26, P3 pass 2026-08-29).
+
+**Ceilings, as of 2026-09-05 (log.md "Ceiling diagnosis"), and how the ledger reads
+them.** A decode token reads 6.33 GB of weights (GDN projections 2.25, routed experts
+1.50, hc 0.69, lm_head 0.68, full attention 0.64, routers/shexp/indexer/PLE 0.58) plus
+~0.3 GB of state and KV, which at the measured 537-565 GB/s is 11.7-12.3 ms of a
+21.3 ms token: the bytes-only ceiling is 81-86 tok/s, and no estimate above that is
+to be quoted. The rest of the token is ~1740 serialized dispatches (hc 672, MoE 576,
+GDN 252, attention ~200, QSA ~24 below budget / ~165 above) at ~4 µs average fixed
+cost, three host syncs (~0.9 ms) and the serial scan (~1.4 ms). So the decode lever
+is dispatch COUNT — the budget prices a removed dispatch at ~4 µs and a removed sync
+at ~0.3 ms — never per-kernel bandwidth, which the big planes already reach at 95-97%
+of a pure read. Prefill at the 2048 chunk is 12.07 GFLOP per token; 3851 tokens run at
+13.7 TFLOP/s end to end against 28-36 for the dense gemm in isolation, weight re-reads
+are 9% of wall (every expert is touched per chunk), the dispatch floor is under 1%,
+and the expert gemms cost 1.44 s of the 3.41 s by the amortized mm_id bench at their
+real geometry (~12 TFLOP/s, dequant-bound by the 2026-08-30 code reading) — but two
+in-situ A/Bs on prefill wall (classic tiles, and the pre-2026-08-30 full grid) transfer
+those isolated rates at 0.82 and 0.32 respectively, so the share is **bracketed at
+14-43%**. That makes the expert gemm the largest single prefill candidate and CONTESTS
+the 2026-08-30 "gemms are a minority of `ffn`" reading, which came off the
+sync-inflated stage profiler; the ledger carries the bracket, not a point, until an
+in-situ duplicate-dispatch probe replaces it.
 
 ## Process
 

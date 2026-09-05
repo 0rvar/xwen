@@ -12,8 +12,29 @@ bottom-up from a stage profile; nobody has worked top-down from what the machine
 The arithmetic says the gap is large on both axes, and the ledger has no item that
 explains it, so the diagnosis is the next unit of work, not another kernel.
 
-**The ceilings, as estimated 2026-09-05 (ESTIMATES from ledgered byte counts, none of
-these numbers is measured — replace them).** A decode token moves ~2.5-3 GB of weights
+**RESULT, same day — steps 1-3 DONE, step 4 is the section that follows this one**
+([log](docs/log.md#2026-09-05--ceiling-diagnosis-for-flash-next-achievable-bandwidth-measured-at-537-565-gbs-decode-is-57-bytes--43-dispatch-floor-prefill-is-not-launch-bound),
+decisions.md "Achievable bandwidth is MEASURED" and "Ceilings"). Achievable bandwidth:
+**537-565 GB/s streaming read** (median of 5 interleaved rounds, 575-580 best; copy
+~517; a 32 MB weight plane 528-537; 2.4-2.7 µs fixed cost per back-to-back dispatch),
+`ops::bandwidth::tests::bandwidth_sweep`, "automatic" power mode, `lowpowermode 0`.
+Decode: a token reads **6.33 GB** of weights (not 2.5-3 — the estimate below dropped the
+2.25 GB of GDN projections) = 11.7-12.3 ms of 21.3, so the **bytes-only ceiling is 81-86
+tok/s**, not 180-220; the remaining ~9 ms is **1740 dispatches** (not ~1000: hc 672, MoE
+576, GDN 252, attention ~200) at ~4 µs average fixed cost, 3 host syncs (~0.9 ms) and
+the serial scan (~1.4 ms). Not CPU-bound (3.7 ms CPU/token), not command-buffer-bound
+(`CANDLE_METAL_COMPUTE_PER_BUFFER` 10/50/250 within noise). Prefill: **12.07
+GFLOP/token** (not 9-10), 13.7 TFLOP/s achieved at 3851 (not 10-11), dispatch floor <1%,
+weight re-reads 9% (every expert per 2048 chunk), expert gemms **14-43% of wall**
+(1.44 s of 3.41 by the amortized mm_id bench; two in-situ A/Bs transfer the isolated
+rates at 0.82 and 0.32) — contesting the 2026-08-30 "gemms are a minority" reading,
+which came off the 2.2x-inflated stage profiler. Both working
+hypotheses below were half right: decode IS dispatch-bound for its non-byte half, but
+the byte half is twice what was assumed; prefill glue is real but the expert gemm, not
+the glue, is the largest single item.
+
+**The ceilings, as estimated 2026-09-05 (SUPERSEDED by the result above — kept as the
+record of what was assumed; every number here was wrong by 1.3-2.5x).** A decode token moves ~2.5-3 GB of weights
 (~1.5 GB Q4_K experts, ~0.7 GB Q8 hyper-connection, the rest attention/GDN/PLE/lm_head);
 at 22 ms/token that is ~120-140 GB/s effective against a 614 GB/s part whose achievable
 GPU read bandwidth has never been measured here (one shipped kernel was priced at
@@ -64,6 +85,72 @@ names only; the amortized bench pattern in `src/ops/*` `#[ignore]` tests (e.g.
 `ops::ple::tests::ple_tail_bench`) for pricing; `scripts/bench.ts` and the 2026-08-30
 FFN-glue log entry for the interleaved end-to-end protocol; TODO.md items (14) and (15)
 below for the dispatch-count facts to re-verify. Thermal protocol per AGENTS.md.
+
+## Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4)
+
+Every item below exists elsewhere in this file; this section is the ranking, priced
+from the log's decode and prefill budgets, and it supersedes the ranking prose in the
+P3 ledger and the prefill-chunk section without deleting either. Prices: a removed
+decode dispatch ≈ 4 µs (≈0.02% of a token), a removed sync ≈ 0.3 ms (≈1.4%), bytes at
+537-565 GB/s. Ceilings that may be quoted: decode 81-86 tok/s bytes-only at the
+measured rate (we run 47); prefill 2300-3000 tok/s gemm-only at 28-36 TFLOP/s (we run
+1129-1140 @3851).
+
+**Decode (21.3 ms/token = 12.0 bytes + ~7.0 dispatch fixed cost + 0.9 syncs + 1.4 scan).**
+1. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest
+   population.** 7 per gate (norm, inject head — separate on the decode split arm —,
+   down gemv, silu-quarter, up gemv, mix, write) × 96 gates. A fused norm+head+down
+   is −192 (≈ −0.8 ms, +4%); folding the write into the mix or the next norm is −96
+   (+2%); a single-kernel gate would approach −480 (≈ −1.9 ms, +10%). Bytes are 0.69
+   GB (1.2 ms) and already near rate. UNPRICED in situ — the hc items (3)(a) in the P3
+   ledger.
+2. **MoE FFN: 576 dispatches/token (30%).** 12 per layer; the glue is already fused and
+   the dual gate|up kernel is refuted (decisions.md `XWEN_MOE_DUAL`), so what is left
+   is shape-level: router+softmax+topk as one kernel (−2/layer), shexp's four
+   dispatches as one (−3/layer) → −240 ≈ −1.0 ms, +5%. Item (15).
+3. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line
+   earlier.** One drain per token for data that never left the CPU; pass the ids down
+   instead. ≈ +0.3 ms, +1.4%, no math change; run the Flash-Next replay check anyway.
+   NEW item, unstarted.
+4. **GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger.** At 4 µs
+   each −36 is ≈ 0.15 ms (+0.7%), not the +1-2% the 8.41 µs arithmetic gave; the
+   three-projection merge (−72) ≈ +1.4% and needs its A/B. Re-priced DOWN.
+5. **Above the 2048 indexer budget: +165 dispatches** ≈ 0.66 ms at 4 µs, most of the
+   remaining ~1 ms/step of the closed cliff; **the QSA scores tail** (5 elementwise
+   dispatches × 12 layers feeding `qsa_select`, absorbable) is another 60 ≈ 0.24 ms.
+6. **PLE decode tail on device** (P3 (5)(b)): 0.13 ms of host work against one more
+   readback — unpriced, small.
+7. **Per-kernel bandwidth work on the big planes: ≈ 0.** The 28 MB gemv streams at
+   95-97% of a pure read. (14)'s "+11-15 tok/s if the layer reached bandwidth" stays
+   withdrawn; the vendored mv path for hc (P3 (3)) is bytes-at-rate already.
+
+**Prefill (3.41 s @3851 = ~1.5 expert gemms + 0.30 weight re-reads + ~0.26 hc
+activation traffic + GDN chunked scan + attention + glue; only the first two are
+priced, the hc figure is estimated, the rest is ranked).**
+1. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (amortized
+   `mm_id_launch_shape_throughput` at t=2048: gate/up 3.9 ms + down 8.2 ms per layer
+   per chunk = 1.44 s at 3851 tokens = 43%; the classic-tile A/B implies ~35%, the
+   full-grid A/B ~14%; log "Ceiling diagnosis"). The down plane (Q5_1, about half the
+   per-layer time) is the half to attack: a dequant that is not re-done per token tile,
+   or an f16-cached expert tile — both unpriced; "dequant-bound" is the 2026-08-30 code
+   reading, not a measurement. This item was ranked BELOW the glue on 2026-08-30 on the
+   strength of the inflated profiler. **FIRST, build the instrument that settles the
+   bracket: an in-situ duplicate-dispatch probe** — a presence switch that encodes a
+   stage's kernels twice (the expert gemms first, then the hc gates, the GDN chunked
+   scan) so the wall delta IS that stage's in-situ time; no math change when unset,
+   Flash-Next replay check anyway. Neither the stage profiler (2.2x inflation) nor an
+   isolated bench (transfer 0.32-0.82) can price a prefill stage.
+2. **Hyper-connection activation traffic: ~8% of wall estimated** (the 84 MB carrier
+   read/written ~8-10 times per gate). Whole-gate fusion at prefill is the same kernel
+   work as decode item 1, paid twice.
+3. **GDN prefill (`mixer_delta`, ranked 2nd at 20% by the profiler, unpriced).** No
+   amortized bench exists for the chunked scan at 2048 rows; build one before
+   touching it.
+4. **Weight re-reads: 9%, structural.** Every expert is touched per 2048-token chunk
+   (~40 rows each), so a chunk reads the whole 82.5 GB trunk. A 4096 chunk would halve
+   it in principle, but 4096 was MEASURED SLOWER on 2026-08-30 (745 vs 824 tok/s at
+   2048; decisions.md "Prefill chunk"), so chunk size alone does not recover it.
+5. **Dispatch count: <1%.** Nothing to gain from launch-count work at prefill.
 
 ## Next Flash-Next perf work (2026-09-05)
 
@@ -2094,7 +2181,11 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     1.9, lm_head 1.2, hc writes / qsa_select / embed under the profiler floor).
     These are attributions and byte counts, NOT measurements of the fixes;
     peak bandwidth has never been measured on this machine, so every ceiling
-    below is against the nominal figure and may be optimistic.**
+    below is against the nominal figure and may be optimistic.** [MEASURED
+    2026-09-05: 537-565 GB/s streaming read; the whole-token byte floor below is
+    6.33 GB, not 5.5 (routers, shared experts, indexer and PLE add 0.58), so the
+    bytes-only ceiling is 81-86 tok/s; the re-ranked ledger at the top of this
+    file supersedes the ranking prose here.]
     (5) PLE readback collapse (three `to_vec1` → one): saves ~0.3 of the
     0.52 ms readback → **+0.5-0.7 tok/s**; PLE gate/conv/readback all on
     device (proj stays): PLE 1.06 → ~0.45 ms → **+1.2 tok/s decode, +5-6%
@@ -2155,9 +2246,13 @@ Decision: we WILL port it, targeting Q4_K on this machine.
       `XWEN_DELTA_DECODE_KERNEL=1`; the general kernel already moves the state
       at 525-564 GB/s marginal, within 1.4x of a candle copy of the same bytes
       (its own ledger section below).
-    The GDN block issues **288 dispatches per decoded token** and the sweep's
+    The GDN block issues **288 dispatches per decoded token** [252 since the
+    beta|alpha fold; recounted 2026-09-05] and the sweep's
     fit prices a dispatch at **8.41 µs of fixed cost regardless of size**, so
-    36 dispatches ≈ 0.3 ms ≈ **~+1.5%** of a ~21.4 ms token. On the 35B-A3B the
+    36 dispatches ≈ 0.3 ms ≈ **~+1.5%** of a ~21.4 ms token [RE-PRICED
+    2026-09-05: the launch floor measured on byte-free dispatches is 2.4-2.7 µs
+    and the decode budget closes at ~4 µs average, so −36 is ≈ 0.15 ms ≈ +0.7%;
+    the 8.41 intercept is the gemv's own ramp]. On the 35B-A3B the
     same arithmetic roughly doubles (30 layers against an 8.7 ms token), which
     is what the ba fold's +8.8% there against +4.6-4.8% here already showed. That arithmetic,
     not a bandwidth headroom argument, is what sizes what remains — three
@@ -2182,8 +2277,11 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     per expert), `kernel_moe_silu_mul`, the four shexp dispatches, the shexp
     gate matmul, and `kernel_moe_epilogue`. All 48 layers carry an MoE FFN, so
     **576 MoE dispatches per token** — twice the GDN block's 288, and the
-    largest single dispatch population in the model. At 8.41 µs that is ~4.8 ms
-    of a ~21 ms token in launch cost alone, which is most of why `ffn` reads
+    largest single dispatch population in the model [recounted 2026-09-05: the GDN
+    block is 252 now, and the hc carrier at 672 on the decode split arm is the
+    largest population, MoE second]. At 8.41 µs that is ~4.8 ms
+    of a ~21 ms token in launch cost alone [~2.3 ms at the ~4 µs average the
+    2026-09-05 budget closes at], which is most of why `ffn` reads
     ≈190 GB/s effective. But the glue is already fused (24 → 14 dispatches in
     2026-07-29's pass, and again since), and `XWEN_MOE_GLUE_CLASSIC` costs ~21
     per layer, so what is left is the six matvec/matmul dispatches per layer
@@ -2566,7 +2664,11 @@ the dense ones (decisions.md "Prefill chunk", log.md 2026-08-30 "prefill chunk")
 A/B named four things it did not take. **Re-ranked 2026-08-30 after the mm_id tile pass**
 (log.md "mm_id tiles"): the expert gemms are a MINORITY of the prefill `ffn` stage (a
 17-23% isolated gemm gain moved `ffn` 3-5% and prefill wall not at all), so the two
-non-gemm items come first.
+non-gemm items come first. [CONTESTED 2026-09-05 (log "Ceiling diagnosis"): the same
+amortized bench's rates put the expert gemms at ~1.5 s of the 3.41 s wall at 3851 tokens
+(16.7 ms per layer per 2048 rows), i.e. ~44%, and the "minority" reading came off the
+stage profiler, which inflates prefill 2.2x. The re-ranked ledger at the top of this
+file puts the expert gemm first for prefill.]
 - [ ] **The f16 rescale chain at prefill** (`moe.rs` `needs_rescale`, the L2 guard that
   keeps the down-projection input inside f16 range on the f16-tile prefill variants).
   At 2048 rows per chunk the guard is a band of elementwise dispatches per layer that
