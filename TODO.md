@@ -109,6 +109,20 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    (+2%); a single-kernel gate would approach −480 (≈ −1.9 ms, +10%). Bytes are 0.69
    GB (1.2 ms) and already near rate. UNPRICED in situ — the hc items (3)(a) in the P3
    ledger.
+   **DONE, same day (dd50397; log "Fused hyper-connection decode gate"): −384, not −192 —
+   `kernel_hc_gate_down` (norm + head + down + silu) and `kernel_hc_gate_up_mix` (up +
+   sigmoid + mix), 7 → 3 per gate, 672 → 288 per token; decode 47.0 → 51.2 median (+9%,
+   +5-10% per round) against a +7.8% prediction; replay check PASS with
+   `XWEN_HC_GATE_CLASSIC=1` as control.** Still open here: (a) the write folded into
+   the next gate's norm, −96 (the carrier must still be materialized for the next write);
+   (b) `HC_GATE_ROWS_PER_TG` = 8 and kernel A's register shape are UNSWEPT — 4 and 16
+   are one-constant A/Bs, and a silent spill would show only as tok/s; (c) the tail
+   mixer's two launches; (d) provenance: schema v10 records `hc_gate` but no reader
+   (`tests/parity.rs`, `parity-gate.ts`) enforces it, because no graded checkpoint has a
+   hyper-connection — pin it when a qwen4exp tier exists (Codex review); (e) the 2..8
+   token window now runs the fused gate's numerics (closer to the oracle than the QMatMul
+   window it replaces; `XWEN_HC_GATE_FUSED_MAX_N=1` restores) — a deliberate change,
+   recorded in decisions.md, not a bug.
 2. **MoE FFN: 576 dispatches/token (30%).** 12 per layer; the glue is already fused and
    the dual gate|up kernel is refuted (decisions.md `XWEN_MOE_DUAL`), so what is left
    is shape-level: the router is already one projection plus one fused kernel, so
@@ -172,6 +186,16 @@ activation traffic estimated; GDN chunked scan, attention and glue ranked only).
 5. **Dispatch count: <1%.** Nothing to gain from launch-count work at prefill.
 
 ## Next Flash-Next perf work (2026-09-05)
+
+**DONE 2026-09-05, decode: the fused hc gate** (dd50397, decode item 1 of the re-ranked
+ledger above, +9% plain decode). **Next decode candidate by the same budget: the MoE
+glue population (576 launches; −192 by folding the router projection and the shared
+expert's four dispatches; ledger item 2), then the token-id readback sync (item 3,
+~+1.4%), then the QSA tail above the indexer budget (item 5).** Prefill: the
+duplicate-dispatch probe has priced the stages (log "Duplicate-dispatch probe"); the
+expert gemm (0.96-1.09 s of 3.4 s) is the item, the down plane's dequant the first
+experiment, and `XWEN_DUP_STAGE=experts_down` is how to price any change to it in situ.
+
 
 **DONE as opt-in 2026-09-05** (`XWEN_PLE_DEVICE=1`, multi-token Metal forwards; +12.8% prefill @3851,
 +12.9% @880, decode flat): [log](docs/log.md#2026-09-05--ple-gate-and-conv-move-to-device-for-multi-token-prefill-flash-next-prefill-12-13-at-880-and-3851-tokens-on-by-default-xwen_ple_tail_classic-restores-the-host-tail).

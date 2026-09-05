@@ -280,7 +280,10 @@ worth +7-11% — lift it to **~960-980 @3803 and ~860 @7606**, the same sweep's
 all-classic arms reading 865-872 / 766; **decode by context, same day, after the
 QSA block-key cache, fused gather and device-side selection (2026-08-30): 46 below the
 2048 indexer budget and 44-45 at 3.8k-32k, plain — 30 before the arc, 33 after the
-cache alone; the cliff is closed, TODO.md keeps the follow-ups**) —
+cache alone; the cliff is closed, TODO.md keeps the follow-ups; **and 51.2 at 596 tokens
+as of 2026-09-05 with the fused hc decode gate — 3 dispatches per gate instead of 7,
+`XWEN_HC_GATE_CLASSIC` restores 7 — against 47.0 classic in the same rounds, +9% median,
++5-10% round by round, prefill unchanged**) —
 interleaved rounds, medians, the fold measured in two sessions,
 against llama.cpp's 789 / 41.4 on the same file in the same hour as the 2026-08-29 arm
 (`pmset -g` said `powermode 0` that session — still no high-power
@@ -329,7 +332,9 @@ token) and not command-buffer-bound. Prefill at 3851 runs 13.7 TFLOP/s end to en
 time, a lower bound), and the expert gemms
 14-43% (amortized bench 43%, two in-situ A/Bs bracket it lower; ~12 TFLOP/s isolated,
 dequant-bound by the 2026-08-30 code reading). Levers are dispatch COUNT for decode and
-the expert gemm + hc glue for prefill; never per-kernel bandwidth.
+the expert gemm + hc glue for prefill; never per-kernel bandwidth. The fused hc gate (2026-09-05) removed 384 launches and
+measured +9% against the budget's +7.8%, so the attribution is confirmed in situ; the hc
+population is now 288 and ~1356 launches remain per token below the indexer budget.
 
 **The 27B prefill gap is CLOSED (P8c, 2026-07-29).** It was never the DeltaNet
 scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill

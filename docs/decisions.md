@@ -2964,6 +2964,32 @@ token grid alone fills the machine; the split pair costs an extra read of the no
 carrier and buys `hc_count` times the parallelism, which only pays while the machine is
 otherwise idle (2026-08-29).
 
+**At decode the whole read gate is two launches, and it keeps the wide grid (2026-09-05).**
+`kernel_hc_gate_down` folds the grouped norm, the injection head, the Q8_0 down projection
+and the silu activation into one dispatch; `kernel_hc_gate_up_mix` folds the Q8_0 up
+projection, the sigmoid and the stream mean into another; the write stays. 7 → 3
+dispatches per gate, 672 → 288 per token, measured +9% plain decode (47.0 → 51.2 median,
++5-10% round by round; log.md "Fused hyper-connection decode gate"). The design rule it
+obeys is the one the split arm established: never one threadgroup on a whole token. Kernel A
+runs 41 threadgroups and each RECOMPUTES the per-stream scales from a cache-resident
+re-read of the carrier and the norm weight rather than consuming a materialized `normed` —
+redundant work bought the launch it saved, which is the trade the decode budget says to
+make (a launch is ~4 µs of fixed cost, a cached 80 KiB re-read is not). Kernel B puts a
+column's streams in adjacent lanes so the mean is a shuffle, not threadgroup memory. Both
+are BOUNDED against the split path (the long dots are reassociated), graded at 1e-5
+against `ref_hc` where they measure ~1.5e-7; `XWEN_HC_GATE_CLASSIC` is the kill switch
+and the replay check's control arm, `XWEN_HC_GATE_FUSED_MAX_N` (8, inclusive) the
+ceiling. **Deliberate numeric change in the 2..8-token window:** `without_mv_ext` froze
+that window to candle's `QMatMul` matmul, whose half-precision activation tiles sit
+1.7e-5 from the oracle at n = 3; the fused gate sits 1.6e-7 there. The fence's purpose —
+that `XWEN_HC_CLASSIC` promises the candle chain — is intact, because the fused gate is
+inside `read_fused` and both switches revert it; what changed is that the window's
+default numerics are now the more accurate ones, and `XWEN_HC_GATE_FUSED_MAX_N=1`
+restores the old ones for anyone who needs them verbatim. The tail mixer takes the same
+kernels without the head threadgroup. This is the first lever pulled from the ceiling
+diagnosis, and it landed on its prediction (−384 launches × ~4 µs ≈ +7.8%, measured +9%).
+
+
 **PLE rows are prefetched, advisorily, and never gated on the gate.** The decode cost of
 the PLE layer is page faults on the 16 IQ4_NL rows a token hashes to — flat per token,
 ~4.7% page-cache hits, i.e. essentially no reuse — not driver overhead, which is what the
@@ -3032,7 +3058,9 @@ average fixed cost (a residual attribution between the 2.5 µs measured floor an
 its bytes). So the decode lever
 is dispatch COUNT — the budget prices a removed dispatch at ~4 µs and a removed sync
 at ~0.3 ms — never per-kernel bandwidth, which the big planes already reach at 95-97%
-of a pure read. Prefill at the 2048 chunk is 12.07 GFLOP per token; 3851 tokens run at
+of a pure read. The first lever pulled on that reading, the fused hc decode gate (−384
+launches, "At decode the whole read gate is two launches" above), measured +9% against a
++7.8% prediction — the attribution holds. Prefill at the 2048 chunk is 12.07 GFLOP per token; 3851 tokens run at
 13.7 TFLOP/s end to end against 28-36 for the dense gemm in isolation, weight re-reads
 are 9% of wall (every expert is touched per chunk — a lower bound inside the gemm time,
 not additive to it), the dispatch floor is under 1%,
