@@ -22,10 +22,11 @@
 //! Multi-token prefill keeps the independent transfers: batching those larger
 //! planes has not demonstrated an end-to-end gain. The host tail is a known P3
 //! cost, taken so the first correct version is a short walk from the oracle.
-//! `XWEN_PLE_DEVICE` opts multi-token Metal forwards into the device gate and
-//! convolution kernels ([`crate::ops::ple`]). They download only the normalized
-//! rows needed to maintain the host convolution window, or every row while a
-//! checkpoint is armed. Decode keeps the classic tail in both modes.
+//! Since 2026-09-05 multi-token Metal forwards run the gate and convolution on
+//! device ([`crate::ops::ple`]); `XWEN_PLE_TAIL_CLASSIC` restores the host
+//! tail. The device path downloads only the normalized rows needed to maintain
+//! the host convolution window, or every row while a checkpoint is armed.
+//! Decode keeps the host tail in both modes.
 //! `XWEN_PLE_PROFILE`
 //! ([`crate::ops::ple_profile`]) splits one forward into its sub-steps and says
 //! which half of that hybrid the layer's `stack_profile` figure actually is.
@@ -916,11 +917,11 @@ pub struct PleLayer {
     value_proj: QLinear,
     /// Shared device key norm, applied before either tail implementation.
     key_norm_w: Tensor,
-    /// Host weights retained for the classic tail and decode.
+    /// Host weights for the host tail (decode, and `XWEN_PLE_TAIL_CLASSIC`).
     query_norm_w: Vec<f32>,
     conv_norm_w: Vec<f32>,
     conv_w: Vec<f32>,
-    /// Cached device weights for the prefill tail.
+    /// Device weights for the multi-token tail kernels.
     query_norm_device: Tensor,
     conv_norm_device: Tensor,
     conv_weight_device: Tensor,
@@ -1167,7 +1168,7 @@ impl PleLayer {
     /// `state` is read for the pre-chunk history and left holding the new tail,
     /// so consecutive chunks of one sequence reproduce a single-shot run.
     pub fn forward(&self, tokens: &[u32], stream: &Tensor, state: &mut PleState) -> Result<Tensor> {
-        self.forward_with_device(tokens, stream, state, crate::ops::ple_device())
+        self.forward_with_device(tokens, stream, state, !crate::ops::ple_tail_classic())
     }
 
     fn forward_with_device(

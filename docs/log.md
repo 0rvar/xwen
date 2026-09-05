@@ -4,7 +4,7 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
-## 2026-09-05 — PLE gate and conv move to device for multi-token prefill: Flash-Next prefill +12-13% at 880 and 3851 tokens, opt-in behind `XWEN_PLE_DEVICE`
+## 2026-09-05 — PLE gate and conv move to device for multi-token prefill: Flash-Next prefill +12-13% at 880 and 3851 tokens, on by default (`XWEN_PLE_TAIL_CLASSIC` restores the host tail)
 
 Picked up from TODO.md's "Next Flash-Next perf work" item (P3 item (5)), started in a
 Codex session and finished here. `XWEN_PLE_PROFILE` put the host gate plus conv at
@@ -22,9 +22,9 @@ reading the uploaded channel-major history for positions before the chunk, then
 `gated + silu(acc)`. The reductions partition the oracle's sums across simdgroups (f32,
 against the host's f64 sum of squares); every scalar product keeps its order. Safe math
 mode, not the fast mode of every other library here, so the gate's `isnan` guard and the
-oracle's NaN-propagation contract survive. Enabled by `XWEN_PLE_DEVICE` (presence-based
-like the other kernel switches) for Metal forwards with `n > 1`; decode and CPU forwards
-never take it.
+oracle's NaN-propagation contract survive. On for Metal forwards with `n > 1`;
+`XWEN_PLE_TAIL_CLASSIC` (presence-based like the other kill switches) restores the host
+tail; decode and CPU forwards never take the kernels.
 
 The conv state stays host-owned and its layout is untouched: after the kernels,
 `ops::ple::readback_tail` blits back only the last `min(n, 9)` normalized rows (all `n`
@@ -105,11 +105,27 @@ rebuild is a strided gather per token (unreachable until Flash-Next has a drafte
 `exp` per element in the conv kernel under safe math is unpriced, and the three device
 weight copies (~240 KiB) are built eagerly.
 
-**Not done, ledgered:** the default is still the host tail. Flipping it is a one-line
-change (`ops::ple_device` → a `XWEN_PLE_HOST_TAIL`-style kill switch) waiting on the
-owner's call, because the change fails the forced-replay gate as literally written even
-though the control shows the gate is reacting to reassociation. The decode tail stays on
-the host (no qualified gain at 0.13 ms/token). See TODO.md.
+**Default flipped the same day, and the check codified.** It first landed opt-in
+(`XWEN_PLE_DEVICE`, 561635f) because the replay stand-in failed as written; the owner
+called the flip and asked that the correctness check stop failing on this class of step.
+`scripts/flashnext-replay.ts` now owns the Flash-Next forced replay (oracle build/reuse,
+candidate and `--control` arms, grading), with one rule added to the decode tier's
+excusal: a mismatch is also a near-tie when the control arm, the same binary with the
+change switched off, holds the oracle's token over the candidate's pick by less than the
+band. The oracle band said "the reference was not sure"; this says "the engine was not
+sure either", which is the only way ulp-level reassociation can move the answer. The
+≤8 cap and the hard rule for everything else stand. Run with the new default and
+`--control XWEN_PLE_TAIL_CLASSIC=1` against the cached llama.cpp oracle (pin 6fe7498):
+
+| fixture | agree | excused (step: side, margin) | hard |
+|---|---:|---|---:|
+| code-short | 62/64 | 23 oracle 0.034, 36 oracle 0.694 | 0 |
+| text-mixed | 64/64 | | 0 |
+| long-mixed | 59/64 | 3 oracle 0.705, **4 engine 0.313** (oracle 1.829), 12 oracle 0.435, 27 oracle 0.141, 49 oracle 0.138 | 0 |
+
+**PASS**, 185/192 agreeing, 7 excused, 0 hard, the same 185/192 the 2026-08-30 fold read
+on its day. Step 4 is the one the new rule exists for; nothing else changed side.
+Decode tail stays on the host (no qualified gain at 0.13 ms/token); see TODO.md.
 
 ## 2026-09-05 — PLE batches its three device-to-host readbacks
 

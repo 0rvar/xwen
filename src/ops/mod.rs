@@ -171,12 +171,13 @@ pub fn ple_readback_classic() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_PLE_READBACK_CLASSIC").is_some())
 }
 
-/// Opt in to PLE's device tail for multi-token Metal forwards. Decode keeps
-/// the host tail and its batched readback. Presence-based, like the other
-/// kernel experiment switches.
-pub fn ple_device() -> bool {
+/// `XWEN_PLE_TAIL_CLASSIC` keeps PLE's gate and conv on the host for
+/// multi-token Metal forwards instead of the device kernels (`ops::ple`,
+/// the default since 2026-09-05). Decode always runs the host tail with its
+/// batched readback. Presence-based, like the other kill switches.
+pub fn ple_tail_classic() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("XWEN_PLE_DEVICE").is_some())
+    *V.get_or_init(|| std::env::var_os("XWEN_PLE_TAIL_CLASSIC").is_some())
 }
 
 /// `XWEN_GDN_PROFILE` breaks the `Stage::MixerDelta` bracket into the steps a

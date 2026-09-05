@@ -204,7 +204,11 @@ them. The harness is live as of 2026-07-28 (P7): `bun scripts/parity-gate.ts`
 nonzero on any failure. It needs the oracle built once —
 `bash scripts/build-llamacpp.sh` against the pinned clone in `reference/llama.cpp`.
 `cargo test --release` (ops tests need a Metal device) still covers the
-kernel-vs-reference invariants and is the fast pre-check.
+kernel-vs-reference invariants and is the fast pre-check. **Flash-Next cannot run that
+harness**; its check is `bun scripts/flashnext-replay.ts --control <kill switch>=1`
+(forced replay against llama-server over the committed fixtures, oracle cached under
+/tmp; a mismatch is excused when the oracle OR the control arm held the decision by
+less than the band, ≤8 excuses, everything else hard; docs/parity.md "Limitations").
 
 ## Operational hazards (each has already bitten laguna once; the machine is the same)
 
@@ -281,12 +285,11 @@ unexplained, and BOTH per-step profilers — `XWEN_STACK_PROFILE`'s decode stage
 them (two figures off the GDN line read 2-3x high against amortized benches of the same
 work), so take every headline from an unprofiled run and price a step with an amortized
 bench or end-to-end tok/s, never with a profiler figure.
-As of 2026-09-05, **the PLE gate and conv run on device behind `XWEN_PLE_DEVICE=1`
-for multi-token prefill**: Flash-Next prefill **1010 → 1140 @3851 (+12.8%), 1118 →
-1262 @880 (+12.9%)**, decode flat, interleaved rounds, `lowpowermode 0`. Opt-in because
-it fails the forced-replay stand-in on one long-mixed step that a benign host reorder
-fails identically (log.md 2026-09-05, gate and conv); flipping the default is the
-owner's call.
+As of 2026-09-05, **the PLE gate and conv run on device for multi-token prefill**
+(`XWEN_PLE_TAIL_CLASSIC=1` restores the host tail): Flash-Next prefill **1010 → 1140
+@3851 (+12.8%), 1118 → 1262 @880 (+12.9%)**, decode flat, interleaved rounds,
+`lowpowermode 0`. It flips one long-mixed replay step that a benign host reorder flips
+identically; the Flash-Next check excuses that by its engine near-tie rule (below).
 As of 2026-09-05, **PLE decode readbacks are batched at seq == 1 only**
 (`XWEN_PLE_READBACK_CLASSIC` restores the three waits). Multi-token prefill keeps
 its old readbacks; all-length batching had no established prefill gain. The

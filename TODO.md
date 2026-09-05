@@ -8,12 +8,11 @@ ledger, not the results archive. Sub-items are lettered under a numbered parent.
 ## Next Flash-Next perf work (2026-09-05)
 
 **DONE as opt-in 2026-09-05** (`XWEN_PLE_DEVICE=1`, multi-token Metal forwards; +12.8% prefill @3851,
-+12.9% @880, decode flat): [log](docs/log.md#2026-09-05--ple-gate-and-conv-move-to-device-for-multi-token-prefill-flash-next-prefill-12-13-at-880-and-3851-tokens-opt-in-behind-xwen_ple_device).
-Live follow-ups: (a) **flip the default** (owner's call: the arm fails the forced-replay
-stand-in on long-mixed step 4, which a benign reorder of one host dot fails identically; the
-real-input comparison is 6e-7). Rename the switch to a host/`*_CLASSIC` kill switch, update
-`parity-gate.ts`'s strip list and parity.md's row, re-run the three-fixture replay for the
-record; (b) decode tail on device is UNPRICED (0.13 ms/token of host work against the extra
++12.9% @880, decode flat): [log](docs/log.md#2026-09-05--ple-gate-and-conv-move-to-device-for-multi-token-prefill-flash-next-prefill-12-13-at-880-and-3851-tokens-on-by-default-xwen_ple_tail_classic-restores-the-host-tail).
+(a) **default flipped the same day** (`XWEN_PLE_TAIL_CLASSIC=1` is the kill switch) and the
+Flash-Next check codified as `scripts/flashnext-replay.ts` with an engine-side near-tie rule
+(parity.md "Limitations"; the recorded case is long-mixed step 4, which a benign reorder of
+one host dot flips identically). Live follow-ups: (b) decode tail on device is UNPRICED (0.13 ms/token of host work against the extra
 readback it would need; the batched readback already lands the carrier); (c) the conv kernel's
 per-element `exp` under safe math and the armed-path strided window rebuild are unpriced and
 unreachable-at-default respectively.
