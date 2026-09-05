@@ -14,6 +14,10 @@ parity size="35b":
 # Install the xwen binary. --locked is load-bearing: `cargo install` ignores
 # Cargo.lock by default, and a re-resolved metal/objc2 crate set has produced
 # a binary whose Metal-4 kernels fail to compile at runtime (dense_mm.metal,
-# mpp::tensor_ops identifiers undeclared). See CLAUDE.md "Operational hazards".
+# mpp::tensor_ops identifiers undeclared). See AGENTS.md "Operational hazards".
 install:
     cargo install --path . --locked
+
+launch:
+    cargo install --path . --locked
+    xwen serve --host 0.0.0.0

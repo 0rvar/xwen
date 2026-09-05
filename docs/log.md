@@ -4,6 +4,12 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-05 — Shared agent instructions live in AGENTS.md
+
+Moved the root agent context from `CLAUDE.md` to `AGENTS.md`, preserving the
+instructions. `CLAUDE.md` imports it with `@AGENTS.md` so both entry points use the
+same source. Updated the README and justfile references to the canonical file.
+
 ## 2026-09-05 — Per-run metrics on disk and `xwen stats`: every surface appends a JSONL record, aggregated by day/model/surface/session
 
 **Context.** Nothing in xwen remembered a run after it finished. The `--stats` line and

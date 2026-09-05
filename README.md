@@ -12,7 +12,7 @@ end (greedy, chat template, thinking split, clean stops), and the 3.6 pair passe
 parity gate against upstream llama.cpp on identical GGUF weights (`docs/parity.md`) —
 Qwen3.8-27B runs that same dense graph. Flash-Next has no harness of its own yet and was
 verified by forced replay against llama.cpp (`docs/qwen4exp-port.md`). Decode rates are
-in Speculative decoding below and in CLAUDE.md's Perf state. See `TODO.md` for the
+in Speculative decoding below and in AGENTS.md's Perf state. See `TODO.md` for the
 priority ledger and `docs/log.md` for the narrative.
 
 ## Docs
@@ -20,7 +20,7 @@ priority ledger and `docs/log.md` for the narrative.
 - `docs/decisions.md` — every deliberate choice and refuted direction, with evidence
 - `docs/log.md` — dated engineering narrative
 - `docs/parity.md` — verification runbook (vs upstream llama.cpp)
-- `CLAUDE.md` — agent context: ground truth, architecture cheat sheet, hazards
+- `AGENTS.md` — agent context: ground truth, architecture cheat sheet, hazards
 - `TODO.md` — deferred-work ledger
 
 ## Build
