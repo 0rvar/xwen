@@ -240,7 +240,12 @@ NOT low-power mode; high-power mode is never positively confirmable and must not
 claimed. **The KEY SET CHANGED at some point: this used to emit no `powermode` key,
 and on 2026-08-29/30 two agents saw `pmset -g` print `powermode 0` and NO
 `lowpowermode` key. Report the line verbatim as of the session; still never claim
-high-power mode from either key.** Interleaved protocol; full history in log.md). Plain (--no-draft), measured inside the
+high-power mode from either key.** [2026-09-05: the two names are one key printed
+differently by different shells — the bench shell said `lowpowermode 2` while the
+owner's terminal said `powermode 2` in the same second, after the owner switched to
+high performance; 0 was automatic. The mode moved nothing measurable (decode 47.0 →
+47.3, prefill 1140 → 1139, streaming read +4-5% at most; log.md "Ceiling diagnosis"),
+so figures measured on automatic stand.] Interleaved protocol; full history in log.md). Plain (--no-draft), measured inside the
 sweeps that graded each: **35B-A3B decode 114 tok/s as of 0261e17** (2026-08-30, the
 beta|alpha fold, +8.8% over the 105.1 arm of the same session; was 104-107 through
 2026-08-08), 27B 24.8-25.3, 3.8-27B 23.7-24.8. The fold has NOT been re-swept with

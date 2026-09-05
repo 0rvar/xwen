@@ -18,7 +18,9 @@ decisions.md "Achievable bandwidth is MEASURED" and "Ceilings"). Achievable band
 **537-565 GB/s streaming read** (median of 5 interleaved rounds, 575-580 best; copy
 ~517; a 32 MB weight plane 528-537; 2.4-2.7 µs fixed cost per back-to-back dispatch in
 a dependent chain, host encode included),
-`ops::bandwidth::tests::bandwidth_sweep`, "automatic" power mode, `lowpowermode 0`.
+`ops::bandwidth::tests::bandwidth_sweep`, "automatic" power mode, `lowpowermode 0`;
+re-run in high performance mode (`lowpowermode 2` / `powermode 2`) the sweep, decode
+and prefill all landed inside the automatic-mode spread, so the mode is not a lever.
 Decode: a token reads **6.33 GB** of weights (not 2.5-3 — the estimate below dropped the
 2.25 GB of GDN projections) = 11.7-12.3 ms of 21.3, so the **bytes-only ceiling is 81-86
 tok/s**, not 180-220; the remaining ~9 ms is **1740 dispatches** (not ~1000: hc 672, MoE

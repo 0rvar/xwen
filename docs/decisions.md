@@ -2317,7 +2317,14 @@ this machine is not stable — it used to print `lowpowermode` and no `powermode
 2026-08-29/30 it printed `powermode 0` and no `lowpowermode`. Quote whichever line the
 session actually produced, verbatim, and read it BEFORE the runs; an after-the-fact
 reading does not establish what was in force during them. Neither key ever licenses a
-high-power claim.
+high-power claim. AMENDED 2026-09-05: the two names are one key. With the owner's mode
+switched to high performance, the bench shell printed `lowpowermode 2` and the owner's
+terminal printed `powermode 2` in the same second (0 all day before in the bench
+shell, on automatic); which name a shell prints is unexplained, the value is what moves.
+And the mode did not move the numbers: bandwidth sweep, plain decode and 3851-token
+prefill re-run in high performance mode landed inside the automatic-mode spread (log.md
+2026-09-05 "Ceiling diagnosis"), so absolute figures measured on automatic stand, and a
+run still quotes the line it saw.
 
 **Achievable bandwidth is MEASURED, not quoted, since 2026-09-05: argue bytes-moved
 against 537-565 GB/s, and price a dispatch at 2.5 µs of floor plus its own ramp.**

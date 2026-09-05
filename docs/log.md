@@ -63,6 +63,18 @@ arms, 524-541 at 32 MB, 519 on the 1 GB copy and 511 on the 4 MB copy. Reading:
   the cadence being measured.
 - The 4 MB copy is bimodal (508 GB/s in one round, 34-38 in four) and unexplained; the
   1 GB and 32 MB copies are not. Noted, not used.
+- **High performance mode changes none of it (same evening, owner switched the mode;
+  every `pmset -g` from the bench shell then read `lowpowermode 2` where it had read
+  `lowpowermode 0` all day, and the owner's own terminal read `powermode 2` at the same
+  moment — two names for one key, same value, from different shells; the docs'
+  "the key set changed at some point" was this).** Same sweep, 5 rounds: read 2 GB
+  562/568 GB/s (4096/16384 groups; 537/540 before), 256 MB 564 (565), 32 MB 516/533
+  (528/537), 4 MB 421 (412), tiny-plane floor 2.3-2.4 µs (2.4-2.7), copy 1 GB 511 (517).
+  Plain decode at the 596-token prompt 47.3 tok/s median (47.3 / 48.6 / 46.9) against
+  47.0; prefill @3851 1139.2 (1137.3 / 1146.5 / 1139.2) against 1140.5. Everything is
+  inside the automatic-mode spread except the 2 GB read arms, +4-5%. The mode is not a
+  lever for these workloads, and every figure in this entry stands as measured in
+  automatic mode.
 - The first attempt died before any kernel ran: `Tensor::arange` for f32 builds its
   values on the host by repeated `+= 1.0`, which stops advancing at 2^24, so a 512M
   arange never terminates and grew past the machine's memory until jetsam killed it.
