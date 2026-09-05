@@ -80,12 +80,14 @@ readbacks adds **+2.7–3.0% decode** in a separate, tightly interleaved 3677-to
 sweep (44.8 → 46.1 tok/s, `powermode 0`); prefill keeps its existing path. Results
 and verification are in [the log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
 The same day, `XWEN_PLE_DEVICE=1` moved the PLE gate and conv onto the GPU for
-multi-token prefill (a 2026-09-05 ceiling diagnosis in the log then measured this
-machine's achievable bandwidth at 537-565 GB/s and put the bytes-only decode ceiling at
-81-86 tok/s, the rest of a token being ~1740 serialized dispatches): **+12.8% prefill at 3851 tokens (1010 → 1140 tok/s) and +12.9% at
+multi-token prefill: **+12.8% prefill at 3851 tokens (1010 → 1140 tok/s) and +12.9% at
 880**, decode unchanged; it is the default, `XWEN_PLE_TAIL_CLASSIC=1` restores the host
 tail (decisions.md "PLE gate and conv run on device").
 See `docs/qwen4exp-port.md` for the architecture port.
+A ceiling diagnosis the same day (log.md "Ceiling diagnosis") measured this machine's
+achievable bandwidth at 537-565 GB/s and put the bytes-only Flash-Next decode ceiling at
+81-86 tok/s (75-80 at today's plane sizes); a decode token reads 6.33 GB of weights, and
+the rest of it is ~1740 dispatches in a dependent chain.
 
 **Two vocabularies, deliberately.** The CLI takes the short aliases above (and the full
 names); the HTTP APIs take the **full names only**. Qwen3.8-27B (added 2026-08-14) runs

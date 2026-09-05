@@ -2333,12 +2333,15 @@ says so. Second, the 8.41 µs intercept fitted to the Q8_0 gemv on 2026-08-30 is
 kernel's ramp and tail, not the launch floor; a per-dispatch budget uses ~2.5 µs for
 glue kernels, ~8 µs for gemv-shaped ones, and the decode budget's residual back-solves
 to ~4 µs average over the mix (an attribution, bracketed by those two measurements,
-not a third measurement). The floor is a dependent-chain figure: candle's encoder is
-`MTLDispatchType::Concurrent` with automatic barriers between dependent dispatches,
-and a decode step is mostly such a chain. Third, "is the GPU the bottleneck" is a measured question:
+not a third measurement). The floor is a dependent-chain figure that includes host
+encode cadence: candle's encoder is `MTLDispatchType::Concurrent` with automatic
+barriers between dependent dispatches, a decode step is mostly such a chain, and the
+probe cannot say whether the 2.4-2.7 µs is GPU drain-and-fill or the CPU encoding
+(1740 × 2.4 µs ≈ 4.2 ms against 3.7 ms of measured process CPU per token). Third, "is the GPU the bottleneck" is a measured question:
 `/usr/bin/time -l` differenced between two run lengths gives CPU seconds per token
-(decode 3.7 ms of a 21.3 ms token; prefill 0.6 ms of 0.885), so neither phase is
-CPU-bound and candle's command-buffer granularity (`CANDLE_METAL_COMPUTE_PER_BUFFER`
+(decode 3.7 ms of a 21.3 ms token; prefill 0.6 ms of 0.885), so decode is not
+CPU-bound in-process — prefill's 68% duty, sys-dominated, leaves a host-side question
+open — and candle's command-buffer granularity (`CANDLE_METAL_COMPUTE_PER_BUFFER`
 10 / 50 / 250) moves nothing. The stack profiler's inflation was re-measured the same
 day at 2.2x on prefill (511 vs 1129 tok/s at 3851 tokens), so it ranks prefill stages
 too and prices neither phase — the same rule as decode, now with the number.
@@ -3029,7 +3032,7 @@ and the expert gemms cost 1.44 s of the 3.41 s by the amortized mm_id bench at t
 real geometry (~12 TFLOP/s, dequant-bound by the 2026-08-30 code reading) — but two
 in-situ A/Bs on prefill wall (classic tiles, and the pre-2026-08-30 full grid) transfer
 those isolated rates at 0.82 and 0.32 respectively, so the share is **bracketed at
-14-43%**. That makes the expert gemm the largest single prefill candidate and CONTESTS
+14-43%**. That makes the expert gemm the largest PRICED prefill candidate and CONTESTS
 the 2026-08-30 "gemms are a minority of `ffn`" reading, which came off the
 sync-inflated stage profiler; the ledger carries the bracket, not a point, until an
 in-situ duplicate-dispatch probe replaces it.

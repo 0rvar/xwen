@@ -95,8 +95,12 @@ prompt: 47.0 tok/s median = 21.3 ms/token; 46.0-48.3 across all of the day's pla
 runs at this prompt).**
 
 - *Bytes:* 6.6 GB at 537-565 GB/s = **11.7-12.3 ms, 55-58% of the token.** The
-  bytes-only ceiling at the measured rate is **81-86 tok/s**, not the 180-220 the item
-  estimated.
+  bytes-only ceiling at the streaming rate is **81-86 tok/s**, not the 180-220 the item
+  estimated. Priced at each plane size's own measured rate it is lower: the hc (3.5 MB
+  planes, ~412 GB/s) and the router/shexp/indexer/attention-k,v planes (1-5 MB, 250-412)
+  are ~1.3 GB reading ~1 ms slower than the streaming figure says, so **~75-80 tok/s is
+  the bytes-only ceiling with today's plane sizes**, and that ~1 ms belongs to
+  small-plane bandwidth, not to the dispatch residual below.
 - *Dispatches:* traced from today's code (`/tmp/agent-report-decode-dispatches.md`):
   **1740 compute dispatches per token below the 2048 indexer budget, ~1905 above**, and
   **3 host syncs** — the token-id readback before the layer loop
@@ -120,7 +124,13 @@ carrier seed 6, tail 6. The
   a mix of tiny glue kernels and gemvs. A decode step is mostly a dependent chain (each
   dispatch consumes the previous one's output), so candle's automatic barriers
   serialize most of it; the independent pairs (q/k/v, gate|up) can overlap and are
-  part of why the average sits below the gemv intercept.
+  part of why the average sits below the gemv intercept. One more caveat on the floor
+  itself: the probe brackets host encoding, and 1740 × 2.4 µs ≈ 4.2 ms is close to the
+  3.7 ms of process CPU a decode token costs, so the 2.4-2.7 µs may be the CPU's encode
+  cadence rather than GPU drain-and-fill; the probe cannot separate the two. The test
+  that would: process CPU time of the tiny arm against its wall (CPU ≈ wall means the
+  floor is encode-side, and candle's per-dispatch locking — TODO.md survey item — is the
+  lever).
 - *Not CPU-bound in the process:* `/usr/bin/time -l` differenced between 32 and 198
   decoded tokens (the `-n 256` runs stopped at 198; two pairs, user 1.89/1.91 →
   2.38/2.38 s, sys 8.24/8.23 → 8.36/8.42) gives **2.95 and 2.83 ms user + 0.7 and 1.15
@@ -177,8 +187,12 @@ remove (~0.3 ms, +1.4%).
 - *Dispatch floor:* ~1650 dispatches per chunk (the decode count less the split arm's
   96 injection dispatches; no separate prefill count was taken) × 2 chunks × 2.5-8 µs =
   8-26 ms, **under 1% of wall.** Prefill is not launch-bound at any plausible count.
-- *Not CPU-bound:* differenced 880 → 3851 tokens, 0.11 ms user + 0.5 ms sys per prefill
-  token against 0.885 ms wall per token.
+- *Host side NOT cleared for prefill:* differenced 880 → 3851 tokens, 0.11 ms user +
+  0.5 ms sys per prefill token against 0.885 ms wall — a 68% process duty cycle,
+  sys-dominated (the process sits at ~108 GB resident on a 128 GB machine, so page
+  traffic on the mmapped weights is the likely source). Decode's 17% clears the host;
+  prefill's does not, and whether that sys time is on the critical path is an open
+  question the duplicate-dispatch probe would also answer.
 - *Stage ranking (`XWEN_STACK_PROFILE`, rank only — it read 511 tok/s against 1129
   unprofiled, a 2.2x inflation, so it does not price prefill either, contrary to what
   this session first assumed):* `ffn` 32.2%, `mixer_delta` 20.3%, `mixer_full_attn`
@@ -220,12 +234,21 @@ is 32% of its predicted +0.30 s (and it is a real, reproducible −2.8%, where t
 in-situ time under the assumption that each kernel family's isolated ratio transfers:
 the classic A/B implies **~1.18 s (35% of the 3.37 s wall)**, the full-grid A/B implies
 **~0.46 s (14%)**, and the raw amortized figure is 1.44 s (43%). So the expert gemms'
-share of prefill wall is **bracketed at 14-43%** — the largest single candidate either
-way, but not settled, and the 2026-08-30 "gemms are a minority of `ffn`" reading is
+share of prefill wall is **bracketed at 14-43%** — the largest PRICED candidate (GDN
+prefill, ranked second by the profiler and unpriced, could be comparable at the low
+end), but not settled, and the 2026-08-30 "gemms are a minority of `ffn`" reading is
 CONTESTED rather than refuted: that reading came off the 2.2x-inflated stage profiler,
 whose inflation falls hardest on the many-small-dispatch glue stages and so understates
 the gemms, while the full-grid A/B says the work-list/NR1-64 advantage measured on
-uniform synthetic routing mostly does not survive real routing. The instrument that
+uniform synthetic routing mostly does not survive real routing. Two caveats cut the
+other way and apply to both arms: the classic arm is NOT a pure gemm swap — `ClassicHp`
+is outside `casts_activation_f16` (`ops/mod.rs`), so `needs_rescale` is false and the
+classic arm takes the fused MoE epilogue the shipped f16-tile arm cannot (`moe.rs`),
+which makes its glue cheaper and its +1.12 s an UNDERSTATEMENT of the gemm delta (the
+share implied by that arm is ≥35%, not =35%); and the uniform-routing discount that
+explains the full-grid arm applies equally to the 43% upper bound, which comes from the
+same uniform-routing bench — a bench that, unlike the A/Bs, runs one 40-dispatch pass
+per arm with no rounds or idle. The instrument that
 settles it is an in-situ duplicate-dispatch probe (encode a stage's kernels twice
 behind a switch, read the wall delta), ledgered in TODO.md as the next step; neither
 the stage profiler nor an isolated bench can.

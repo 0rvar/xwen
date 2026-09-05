@@ -16,7 +16,8 @@ explains it, so the diagnosis is the next unit of work, not another kernel.
 ([log](docs/log.md#2026-09-05--ceiling-diagnosis-for-flash-next-achievable-bandwidth-measured-at-537-565-gbs-a-decode-token-is-57-weight-bytes-and-33-per-dispatch-fixed-cost-prefill-is-not-launch-bound),
 decisions.md "Achievable bandwidth is MEASURED" and "Ceilings"). Achievable bandwidth:
 **537-565 GB/s streaming read** (median of 5 interleaved rounds, 575-580 best; copy
-~517; a 32 MB weight plane 528-537; 2.4-2.7 µs fixed cost per back-to-back dispatch),
+~517; a 32 MB weight plane 528-537; 2.4-2.7 µs fixed cost per back-to-back dispatch in
+a dependent chain, host encode included),
 `ops::bandwidth::tests::bandwidth_sweep`, "automatic" power mode, `lowpowermode 0`.
 Decode: a token reads **6.33 GB** of weights (not 2.5-3 — the estimate below dropped the
 2.25 GB of GDN projections) = 11.7-12.3 ms of 21.3, so the **bytes-only ceiling is 81-86
@@ -2857,6 +2858,10 @@ nothing in this repo has done before; treat that as part of their cost.
   prefill `ffn` stage — the 2026-08-30 mm_id pass moved them +17-23% in isolation and
   the stage fell 3-5%. So a few percent of `ffn` at best, and the non-gemm parts of that
   stage (router, combine, SwiGLU glue) rank above it. Estimate unknown but capped low.
+  [CONTESTED 2026-09-05: that "minority" reading came off the 2.2x-inflated stage
+  profiler; two in-situ A/Bs bracket the expert gemms at 14-43% of prefill WALL, and
+  the tile work reads −2.8% end to end. The cap is lifted to "unpriced" — see the
+  re-ranked ledger at the top of this file.]
 - [ ] **Per-resource barrier scoping and dependency-filtered cross-encoder fence waits**
   (candle patch). candle's `auto_barrier` emits a whole-scope barrier over the full
   window since the last one (`encoder.rs:104-149`), and every new encoder waits on every
@@ -2871,7 +2876,11 @@ nothing in this repo has done before; treat that as part of their cost.
   survey item that **attacks the fitted 8.41 µs dispatch floor directly** rather than
   working around it, and the floor is what every dispatch-count fusion on the ledger is
   ultimately buying against. Estimate unknown — nobody has profiled the CPU side of a
-  dispatch here, and it should be profiled before it is patched.
+  dispatch here, and it should be profiled before it is patched. [2026-09-05: the floor
+  measured on byte-free dispatches is 2.4-2.7 µs (the 8.41 is the gemv's own ramp), and
+  1740 × 2.4 µs ≈ 4.2 ms is close to the 3.7 ms of process CPU per decode token, so the
+  CPU side of a dispatch may BE that floor. Profile it first, as this item says; the
+  cheap test is process CPU against wall on `bandwidth_sweep`'s tiny arms.]
 - [x] **`CANDLE_METAL_COMPUTE_PER_BUFFER` default (50, per DISPATCH not per op —
   `commands.rs:18,162`): REFUTED 2026-08-30, keep 50.** The decode-side A/B (Flash-Next,
   3 rounds rotated, 60 s idles, anchors clean, `powermode 0`): 1000 lost every cell,
