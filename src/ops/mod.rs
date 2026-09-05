@@ -30,7 +30,10 @@ pub use dense_mm::{dense_mm_supported, matmul_dense_q};
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
 pub use flash::flash_attn;
-pub use hc::{hc_mix, hc_norm, hc_norm_supported, hc_silu_quarter, hc_write};
+pub use hc::{
+    hc_gate_down, hc_gate_fused_supported, hc_gate_up_mix, hc_mix, hc_norm, hc_norm_supported,
+    hc_silu_quarter, hc_write,
+};
 pub use mm_id::mul_mm_id;
 pub use moe_glue::{moe_epilogue, moe_router, moe_router_supported};
 pub use mv_ext::{matmul_mv_ext, mv_ext_supported};
@@ -745,14 +748,22 @@ pub fn attn_glue_classic() -> bool {
 /// `XWEN_HC_CLASSIC=1` reverts the qwen4exp hyper-connection gates — the
 /// carrier's grouped norm and injection head (`ops::hc_norm`), the bottleneck
 /// activation (`ops::hc_silu_quarter`), the stream mix (`ops::hc_mix`) and the
-/// write-back (`ops::hc_write`) — to the candle chains they replace. ONE switch
-/// covers all four, because they are one fused read gate and its write side.
+/// write-back (`ops::hc_write`) — to the candle chains they replace. It is the
+/// OUTERMOST of the two hc switches: reverting the read gate takes the fused
+/// decode gate (`ops::hc_gate_down` / `ops::hc_gate_up_mix`) with it, since that
+/// is a branch inside the fused read. `XWEN_HC_GATE_CLASSIC` reverts the decode
+/// gate alone, back to the five kernels named above plus the two `QLinear`
+/// matmuls.
 ///
 /// The activation and the write-back are bit-identical to their chains by
 /// construction; the norm and the mix partition reductions those chains run in
-/// one order, so they are bounded rather than bitwise (hc.metal, and the
-/// tolerances the hc.rs tests grade at). The two Q8_0 bottleneck matmuls are
-/// outside the switch — both paths run the same `QLinear`.
+/// one order, and the decode gate reassociates both bottleneck dot products, so
+/// those are bounded rather than bitwise (hc.metal, and the tolerances the hc.rs
+/// tests grade at). Which paths the two Q8_0 bottleneck matmuls are inside
+/// depends on the token count: above the fused gate's ceiling both arms run the
+/// same `QLinear` and the matmuls are outside this switch entirely, while at or
+/// below it (decode, and the small-batch window by default) the fused gate
+/// computes them itself and this switch is what puts them back on `QLinear`.
 ///
 /// PRESENCE-BASED and cached (read once), like the sibling switches
 /// (`combine_classic`, `attn_glue_classic`): any value enables it — only leaving
@@ -826,6 +837,75 @@ pub fn hc_split_max_n() -> usize {
             .and_then(|s| s.parse().ok())
             .unwrap_or(HC_SPLIT_MAX_N)
     })
+}
+
+/// Token count a hyper-connection gate must be at or below for the read to take
+/// the FUSED DECODE GATE — `kernel_hc_gate_down` and `kernel_hc_gate_up_mix`,
+/// three dispatches per gate with the write-back — instead of the seven-dispatch
+/// split path (norm, head, down gemv, activation, up gemv, mix, write).
+///
+/// The fused pair trades bytes for launches: each of its threadgroups re-reads
+/// the carrier row and the norm weight for its token, and it swallows the two
+/// q8_0 projections, so it only pays where launch latency dominates. A decode
+/// step is one token; the ceiling is set at the small-batch window's width
+/// rather than at 1 so a short speculative or ragged batch takes it too.
+///
+/// Inclusive, unlike [`HC_SPLIT_MAX_N`]: the fused gate covers `n == 1`, which
+/// an exclusive bound of 1 would exclude.
+pub const HC_GATE_FUSED_MAX_N: usize = 8;
+
+/// Effective fused-gate ceiling: `XWEN_HC_GATE_FUSED_MAX_N=<n>` overrides the
+/// default (an A/B knob for the threshold — `0` keeps every batch on the split
+/// path, which is what the kill switch does and is why
+/// [`hc_gate_fused_enabled`] reads both, a large value pushes the fused gate
+/// into prefill token counts it was not shaped for). Value-parsed, read once and
+/// cached; unset or unparsable falls back to [`HC_GATE_FUSED_MAX_N`].
+pub fn hc_gate_fused_max_n() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_HC_GATE_FUSED_MAX_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(HC_GATE_FUSED_MAX_N)
+    })
+}
+
+/// `XWEN_HC_GATE_CLASSIC=1` reverts the fused decode gate — `ops::hc_gate_down`
+/// and `ops::hc_gate_up_mix`, which fold the grouped norm, the injection head,
+/// both q8_0 bottleneck projections, the activation and the mix into two
+/// dispatches — back to the SEVEN-dispatch split path: `ops::hc_norm`'s split
+/// pair, the two `QLinear` matmuls, `ops::hc_silu_quarter` and `ops::hc_mix`.
+/// The write-back is outside it and unchanged either way.
+///
+/// This is a real kill switch and NOT a bit-identity anchor: both fused kernels
+/// reassociate reductions the split path runs in another order (the down rows
+/// fold per-thread `simd_sum` partials where the gemv folds its own partition,
+/// the stream mean runs as a simd-shuffle butterfly, and the per-stream
+/// statistics are partitioned per q8_0 block), so they are bounded-close, the
+/// same class as `XWEN_HC_CLASSIC`. Flash-Next only, and no parity tier grades
+/// it: `scripts/flashnext-replay.ts --control XWEN_HC_GATE_CLASSIC=1` is the
+/// check. `XWEN_HC_CLASSIC` disables it too — the fused gate is the fused read
+/// path's small-batch arm, and the older switch promises the candle chains.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`hc_classic`, `attn_glue_classic`): any value enables it — only leaving it
+/// unset keeps the fused gate.
+pub fn hc_gate_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_HC_GATE_CLASSIC").is_some())
+}
+
+/// Whether the fused decode gate can run in this process AT ALL: neither kill
+/// switch set, and a ceiling that admits at least one token. The read path asks
+/// this and then compares its own token count against [`hc_gate_fused_max_n`];
+/// the parity dump's `hc_gate` provenance label asks it alone.
+///
+/// One function because the two must agree. `XWEN_HC_GATE_FUSED_MAX_N=0`
+/// disables the gate exactly as the kill switch does, so a label that read only
+/// the switch would stamp "fused" on a dump that never dispatched the kernels —
+/// which is the failure mode the `delta` field exists to prevent.
+pub fn hc_gate_fused_enabled() -> bool {
+    !hc_classic() && !hc_gate_classic() && hc_gate_fused_max_n() >= 1
 }
 
 /// `XWEN_FLASH_CLASSIC=1` reverts the prefill (seq > 1) attention from the

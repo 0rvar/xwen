@@ -5,9 +5,12 @@
 //! chains they replace, while the norm and the mix are bounded — each
 //! partitions across threads a reduction the reference runs in one order.
 //!
-//! The two Q8_0 bottleneck matmuls are NOT here: they stay on
-//! `QLinear`/`QMatMul`, which is what the up projection's raw pre-sigmoid
-//! logits feeding [`hc_mix`] are.
+//! The two Q8_0 bottleneck matmuls stay on `QLinear`/`QMatMul` for the
+//! four-kernel read gate — the up projection's raw pre-sigmoid logits feeding
+//! [`hc_mix`] are that matmul's output. The FUSED DECODE GATE
+//! ([`hc_gate_down`], [`hc_gate_up_mix`], `XWEN_HC_GATE_CLASSIC`) swallows them
+//! too, reading the q8_0 blocks directly, for the small token counts where the
+//! seven launch latencies cost more than the bytes do.
 //!
 //! `src/qwen4exp/hc.rs` is the caller and `src/qwen4exp/ref_hc.rs` the frozen
 //! CPU oracle both paths grade against; the kill-switch back to the candle
@@ -15,7 +18,9 @@
 
 use anyhow::Result;
 use candle_core::Tensor;
+use candle_core::quantized::GgmlDType;
 
+use crate::gguf::QuantPlane;
 use crate::ops::dispatch;
 
 /// Whether the fused read kernels cover this gate's geometry. The bounds are
@@ -73,6 +78,76 @@ pub fn hc_mix(up: &Tensor, normed: &Tensor, hc_count: usize, hidden: usize) -> R
     dispatch::run_hc_mix(up, normed, hc_count, hidden)
 }
 
+/// Whether the FUSED DECODE GATE covers this gate's geometry and bottleneck
+/// dtype — the two kernels that swallow the norm, the head, both q8_0
+/// projections and all the glue between them into three dispatches per gate.
+/// The bounds are the kernels' (q8_0 weights, a power-of-two stream count, a
+/// carrier that tiles the fixed thread partition, a bottleneck that fits
+/// threadgroup memory), so a gate outside them keeps the seven-dispatch split
+/// path rather than failing. See [`hc_gate_down`] for the split.
+pub fn hc_gate_fused_supported(
+    hc_count: usize,
+    hidden: usize,
+    low_rank: usize,
+    dtype: GgmlDType,
+) -> bool {
+    dispatch::hc_gate_fused_supported(hc_count, hidden, low_rank, dtype)
+}
+
+/// First half of the fused decode gate: the grouped norm, the injection head,
+/// the q8_0 down projection and `silu(·/hc_count)`, in ONE dispatch.
+///
+/// `stream` is the raw carrier `[n, hc_count · hidden]` f32, `norm_w` the
+/// full-width multiply-ready norm weight, `inject_w` the dense
+/// `[hc_count, hc_count · hidden]` head (`None` on the tail mixer) and `down`
+/// the `[low_rank, hc_count · hidden]` q8_0 projection's raw device bytes.
+/// Returns the bottleneck activation `[n, low_rank]`, the write strengths
+/// `[n, hc_count]` when there is a head, and the per-stream scales
+/// `[n, hc_count]` — which [`hc_gate_up_mix`] needs, because neither kernel
+/// materializes the normed carrier the split path passes between its launches.
+///
+/// BOUNDED against that path, not bitwise: the down rows fold per-thread
+/// partials through `simd_sum` where the gemv folds its own partition, and the
+/// per-stream statistics are partitioned per q8_0 block rather than per strided
+/// slice. `XWEN_HC_GATE_CLASSIC` restores it.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_gate_down(
+    stream: &Tensor,
+    norm_w: &Tensor,
+    inject_w: Option<&Tensor>,
+    down: &QuantPlane,
+    hc_count: usize,
+    hidden: usize,
+    low_rank: usize,
+    eps: f32,
+) -> Result<(Tensor, Option<Tensor>, Tensor)> {
+    dispatch::run_hc_gate_down(
+        stream, norm_w, inject_w, down, hc_count, hidden, low_rank, eps,
+    )
+}
+
+/// Second half of the fused decode gate: the q8_0 up projection, its sigmoid and
+/// the mix-and-collapse, in ONE dispatch. `low` and `scales` are
+/// [`hc_gate_down`]'s outputs; `stream` and `norm_w` are what the normed carrier
+/// is rebuilt from, one element per thread. Returns `[n, hidden]`.
+///
+/// BOUNDED against `hc_mix`: the `hc_count`-term mean runs as a
+/// `simd_shuffle_xor` butterfly over adjacent lanes where that kernel runs a
+/// serial loop.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_gate_up_mix(
+    low: &Tensor,
+    up: &QuantPlane,
+    stream: &Tensor,
+    norm_w: &Tensor,
+    scales: &Tensor,
+    hc_count: usize,
+    hidden: usize,
+    low_rank: usize,
+) -> Result<Tensor> {
+    dispatch::run_hc_gate_up_mix(low, up, stream, norm_w, scales, hc_count, hidden, low_rank)
+}
+
 /// The write-back onto the RAW carrier: `new[s·hidden+j] = stream[s·hidden+j] +
 /// block_out[j] · inject[s]`, one pass, OUT OF PLACE (the caller's carrier is
 /// never mutated, so a tap or a snapshot holding it stays valid). `stream` is
@@ -89,7 +164,8 @@ mod tests {
     use crate::gguf::metal_device;
     use crate::ops::dispatch::testutil::{pseudo_random, rel_l2};
     use crate::qwen4exp::ref_hc::{GatedResidualRef, grouped_rms_norm_batch};
-    use candle_core::{DType, Device, Tensor};
+    use candle_core::quantized::{QStorage, QTensor};
+    use candle_core::{DType, Device, Module, Tensor};
     use candle_nn::ops::{sigmoid, silu};
 
     /// The checkpoint's real hyper-connection geometry (Flash-Next): four
@@ -797,6 +873,503 @@ mod tests {
              bound is what keeps a carrier inside the kernel's accumulator array",
             dispatch::HC_MAX_STREAMS,
         );
+    }
+
+    /// A `[n_out, k]` weight quantized to q8_0, returned as the raw-bytes
+    /// `QuantPlane` the gate kernels read, the `QTensor` the `QMatMul` split
+    /// chain reads, and the dequantized f32 values the frozen oracle needs. All
+    /// three view ONE quantization of one source, so a difference between the
+    /// three paths is the path's and never the quantizer's.
+    fn build_q8_plane(
+        dev: &Device,
+        n_out: usize,
+        k: usize,
+        data: &[f32],
+    ) -> (QuantPlane, std::sync::Arc<QTensor>, Vec<f32>) {
+        let cpu = Device::Cpu;
+        let dense = Tensor::from_vec(data.to_vec(), (n_out, k), &cpu).unwrap();
+        let qcpu = QTensor::quantize(&dense, GgmlDType::Q8_0).unwrap();
+        let deq = qcpu
+            .dequantize(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Upload the quantized bytes ONCE and retain the buffer before the
+        // storage moves into the QTensor.
+        let storage = QStorage::from_data(qcpu.data().unwrap(), dev, GgmlDType::Q8_0).unwrap();
+        let QStorage::Metal(qms) = &storage else {
+            panic!("expected Metal quantized storage")
+        };
+        let buffer = std::sync::Arc::new(qms.buffer().clone());
+        let qtensor = std::sync::Arc::new(QTensor::new(storage, (n_out, k)).unwrap());
+        (
+            QuantPlane {
+                buffer,
+                base_off: 0,
+                dtype: GgmlDType::Q8_0,
+                out_dim: n_out,
+                in_dim: k,
+            },
+            qtensor,
+            deq,
+        )
+    }
+
+    /// The per-stream `1/sqrt(mean(x^2) + eps)` the grouped norm is built on,
+    /// summed sequentially in f32 on the host. The kernel partitions that sum
+    /// over threads, so this is a bounded reference for its `scales` output, not
+    /// a bitwise one.
+    fn host_scales(stream: &[f32], hc_count: usize, hidden: usize) -> Vec<f32> {
+        let width = hc_count * hidden;
+        let n = stream.len() / width;
+        let mut out = Vec::with_capacity(n * hc_count);
+        for t in 0..n {
+            for s in 0..hc_count {
+                let base = t * width + s * hidden;
+                let mut acc = 0.0f32;
+                for j in 0..hidden {
+                    let v = stream[base + j];
+                    acc += v * v;
+                }
+                out.push(1.0 / (acc / hidden as f32 + EPS).sqrt());
+            }
+        }
+        out
+    }
+
+    /// One gate's weights at a geometry the fused decode gate covers, with the
+    /// bottleneck stored q8_0 the way the checkpoint stores it.
+    struct GateWeights {
+        norm_w: Tensor,
+        inject_w: Tensor,
+        down: QuantPlane,
+        up: QuantPlane,
+        down_q: std::sync::Arc<QTensor>,
+        up_q: std::sync::Arc<QTensor>,
+        reference: GatedResidualRef,
+    }
+
+    fn gate_weights(dev: &Device, hc_count: usize, hidden: usize, low_rank: usize) -> GateWeights {
+        let width = hc_count * hidden;
+        let norm_w_v: Vec<f32> = pseudo_random(width, 0xF1, -0.5, 0.5)
+            .iter()
+            .map(|v| 1.0 + 0.1 * v)
+            .collect();
+        let inject_w_v = pseudo_random(hc_count * width, 0xF2, -0.02, 0.02);
+        let (down, down_q, down_deq) = build_q8_plane(
+            dev,
+            low_rank,
+            width,
+            &pseudo_random(low_rank * width, 0xF3, -0.03, 0.03),
+        );
+        let (up, up_q, up_deq) = build_q8_plane(
+            dev,
+            width,
+            low_rank,
+            &pseudo_random(width * low_rank, 0xF4, -0.05, 0.05),
+        );
+        GateWeights {
+            norm_w: Tensor::from_vec(norm_w_v.clone(), width, &Device::Cpu)
+                .unwrap()
+                .to_device(dev)
+                .unwrap(),
+            inject_w: t2(inject_w_v.clone(), hc_count, width, dev),
+            down,
+            up,
+            down_q,
+            up_q,
+            // The oracle is frozen and takes dense f32 weights, so it gets the
+            // dequantized bytes the kernels actually read.
+            reference: GatedResidualRef {
+                hc_count,
+                hidden,
+                low_rank,
+                norm_w: norm_w_v,
+                down_w: down_deq,
+                up_w: up_deq,
+                inject_w: inject_w_v,
+            },
+        }
+    }
+
+    /// The split path the fused gate replaces, over the SAME quantized bytes:
+    /// the split norm arm, both bottleneck projections through `QMatMul`, the
+    /// activation and the mix. Spelled out rather than called into qwen4exp so
+    /// an edit to the production chain shows up here as a failure instead of
+    /// silently moving the target.
+    fn split_chain(
+        w: &GateWeights,
+        stream: &Tensor,
+        with_inject: bool,
+        hc_count: usize,
+        hidden: usize,
+    ) -> (Tensor, Option<Tensor>) {
+        let (normed, inject) = hc_norm_arm(
+            true,
+            stream,
+            &w.norm_w,
+            with_inject.then_some(&w.inject_w),
+            hc_count,
+            hidden,
+        );
+        let mm = |qt: &std::sync::Arc<QTensor>, x: &Tensor| {
+            candle_core::quantized::QMatMul::from_arc(qt.clone())
+                .unwrap()
+                .forward(x)
+                .unwrap()
+        };
+        let low = hc_silu_quarter(&mm(&w.down_q, &normed), hc_count).unwrap();
+        let mixed = hc_mix(&mm(&w.up_q, &low), &normed, hc_count, hidden).unwrap();
+        (mixed, inject)
+    }
+
+    /// The fused decode gate at the checkpoint's real geometry, graded against
+    /// BOTH the seven-dispatch split path it replaces and the frozen CPU oracle.
+    ///
+    /// Both dot products are reassociated against that path — the down rows fold
+    /// per-thread simd_sum partials where the gemv folds its own partition, and
+    /// the stream mean is a simd-shuffle butterfly where `hc_mix` runs a serial
+    /// loop — so this is bounded at the tolerance the classic path is held to,
+    /// never bitwise.
+    #[test]
+    fn gate_fused_matches_reference() {
+        let dev = metal_device().unwrap();
+        let width = HC * HIDDEN;
+        assert!(hc_gate_fused_supported(
+            HC,
+            HIDDEN,
+            LOW_RANK,
+            GgmlDType::Q8_0
+        ));
+        let w = gate_weights(&dev, HC, HIDDEN, LOW_RANK);
+
+        for &n in &[1usize, 3] {
+            let stream_v = pseudo_random(n * width, 0xF5 + n as u64, -2.0, 2.0);
+            let stream = t2(stream_v.clone(), n, width, &dev);
+
+            let (low, inject, scales) = hc_gate_down(
+                &stream,
+                &w.norm_w,
+                Some(&w.inject_w),
+                &w.down,
+                HC,
+                HIDDEN,
+                LOW_RANK,
+                EPS,
+            )
+            .unwrap();
+            let inject = inject.expect("a gate with an injection head returns one");
+            let mixed = hc_gate_up_mix(
+                &low, &w.up, &stream, &w.norm_w, &scales, HC, HIDDEN, LOW_RANK,
+            )
+            .unwrap();
+            assert_eq!(mixed.dims(), &[n, HIDDEN]);
+            assert_eq!(inject.dims(), &[n, HC]);
+            assert_eq!(scales.dims(), &[n, HC]);
+
+            // The scales are an interface between the two kernels, not a
+            // by-product: the second rebuilds the normed carrier from them, so a
+            // wrong one is a silently wrong mix rather than a failure.
+            assert_rel_l2(
+                &scales,
+                &host_scales(&stream_v, HC, HIDDEN),
+                1e-6,
+                &format!("fused gate scales n={n}"),
+            );
+
+            let (c_mixed, c_inject) = split_chain(&w, &stream, true, HC, HIDDEN);
+            // At one token the split path's two projections are f32 gemvs and
+            // the two paths differ only by dot-product association (measured
+            // 7e-8). Above one token `QMatMul` takes its matmul kernel, whose
+            // activation tiles are half precision, and it is the SPLIT path
+            // that moves away from the oracle (1.7e-5 at n = 3 against 1.6e-7
+            // for the fused gate), so the cross-path bound is that path's own
+            // class there; the oracle bound below is the one that holds the
+            // fused gate.
+            let split_tol = if n == 1 { 1e-6 } else { 5e-5 };
+            assert_rel_l2(
+                &mixed,
+                &flat(&c_mixed),
+                split_tol,
+                &format!("fused gate mixed vs the split path n={n}"),
+            );
+            assert_rel_l2(
+                &inject,
+                &flat(&c_inject.unwrap()),
+                1e-5,
+                &format!("fused gate inject vs the split path n={n}"),
+            );
+
+            let (r_mixed, r_inject) = w.reference.read_batch(&stream_v, EPS);
+            assert_rel_l2(
+                &mixed,
+                &r_mixed,
+                1e-5,
+                &format!("fused gate mixed vs ref_hc n={n}"),
+            );
+            assert_rel_l2(
+                &inject,
+                &r_inject,
+                1e-5,
+                &format!("fused gate inject vs ref_hc n={n}"),
+            );
+        }
+    }
+
+    /// The tail mixer's arm: no injection head, so the grid carries no head
+    /// threadgroup and nothing comes back for the write-back to scale. The mix
+    /// is unaffected — dropping the head changes only whether an injection is
+    /// produced.
+    #[test]
+    fn gate_fused_tail_arm_has_no_inject() {
+        let dev = metal_device().unwrap();
+        let width = HC * HIDDEN;
+        let w = gate_weights(&dev, HC, HIDDEN, LOW_RANK);
+        let stream_v = pseudo_random(width, 0xF6, -2.0, 2.0);
+        let stream = t2(stream_v.clone(), 1, width, &dev);
+
+        let (low, inject, scales) =
+            hc_gate_down(&stream, &w.norm_w, None, &w.down, HC, HIDDEN, LOW_RANK, EPS).unwrap();
+        assert!(inject.is_none(), "the tail mixer has no injection head");
+        let mixed = hc_gate_up_mix(
+            &low, &w.up, &stream, &w.norm_w, &scales, HC, HIDDEN, LOW_RANK,
+        )
+        .unwrap();
+
+        let (c_mixed, c_inject) = split_chain(&w, &stream, false, HC, HIDDEN);
+        assert!(c_inject.is_none());
+        assert_rel_l2(
+            &mixed,
+            &flat(&c_mixed),
+            1e-5,
+            "headless fused gate vs the split path",
+        );
+        // And the same answer the gated arm gives on the same carrier: the head
+        // must not feed the mix.
+        let (g_low, _, g_scales) = hc_gate_down(
+            &stream,
+            &w.norm_w,
+            Some(&w.inject_w),
+            &w.down,
+            HC,
+            HIDDEN,
+            LOW_RANK,
+            EPS,
+        )
+        .unwrap();
+        assert_f32_bits_eq(&low, &g_low, "headless vs gated bottleneck activation");
+        assert_f32_bits_eq(&scales, &g_scales, "headless vs gated scales");
+    }
+
+    /// Both kernels must honour operands that start at a nonzero storage offset:
+    /// the carrier (a narrowed batch), and the bottleneck activation the second
+    /// kernel reads back from the first.
+    #[test]
+    fn gate_fused_honours_offset_views() {
+        let dev = metal_device().unwrap();
+        let width = HC * HIDDEN;
+        let (n, skip) = (2usize, 3usize);
+        let w = gate_weights(&dev, HC, HIDDEN, LOW_RANK);
+
+        let big = t2(
+            pseudo_random((n + skip + 1) * width, 0xF7, -2.0, 2.0),
+            n + skip + 1,
+            width,
+            &dev,
+        );
+        let view = big.narrow(0, skip, n).unwrap();
+        assert_ne!(
+            view.layout().start_offset(),
+            0,
+            "the narrowed view must actually carry an offset"
+        );
+        let copy = t2(flat(&view), n, width, &dev);
+
+        let run = |stream: &Tensor| {
+            let (low, inject, scales) = hc_gate_down(
+                stream,
+                &w.norm_w,
+                Some(&w.inject_w),
+                &w.down,
+                HC,
+                HIDDEN,
+                LOW_RANK,
+                EPS,
+            )
+            .unwrap();
+            // Offset the bottleneck activation too: pad it with a leading row
+            // and hand the second kernel the narrowed view of that.
+            let padded = Tensor::cat(
+                &[
+                    &Tensor::zeros((1, LOW_RANK), DType::F32, &dev).unwrap(),
+                    &low,
+                ],
+                0,
+            )
+            .unwrap();
+            let low_view = padded.narrow(0, 1, stream.dim(0).unwrap()).unwrap();
+            assert_ne!(low_view.layout().start_offset(), 0);
+            let mixed = hc_gate_up_mix(
+                &low_view, &w.up, stream, &w.norm_w, &scales, HC, HIDDEN, LOW_RANK,
+            )
+            .unwrap();
+            (mixed, inject.unwrap(), scales)
+        };
+
+        let (v_mixed, v_inject, v_scales) = run(&view);
+        let (c_mixed, c_inject, c_scales) = run(&copy);
+        assert_f32_bits_eq(
+            &v_mixed,
+            &c_mixed,
+            "fused gate mixed over an offset carrier",
+        );
+        assert_f32_bits_eq(
+            &v_inject,
+            &c_inject,
+            "fused gate inject over an offset carrier",
+        );
+        assert_f32_bits_eq(
+            &v_scales,
+            &c_scales,
+            "fused gate scales over an offset carrier",
+        );
+    }
+
+    /// Geometry outside the kernels' bounds is refused by the predicate the
+    /// caller asks — which is what keeps such a gate on the split path — and the
+    /// launchers hard-error rather than computing something on a partition that
+    /// does not tile. Each case below breaks exactly one bound.
+    #[test]
+    fn gate_fused_refuses_unsupported_geometry() {
+        let dev = metal_device().unwrap();
+        // `hidden` not a whole number of q8_0 blocks: a carrier block would
+        // straddle two streams and the per-stream statistics would mix.
+        assert!(!hc_gate_fused_supported(4, 2560 + 16, 320, GgmlDType::Q8_0));
+        // The carrier's block count must tile the fixed thread partition ...
+        assert!(!hc_gate_fused_supported(4, 2560 - 32, 320, GgmlDType::Q8_0));
+        // ... by no more blocks per thread than the register bound allows
+        // (3 * 160 blocks here).
+        assert!(!hc_gate_fused_supported(4, 3840, 320, GgmlDType::Q8_0));
+        // A stream count that is not a power of two has no shuffle butterfly.
+        assert!(!hc_gate_fused_supported(3, 2560, 320, GgmlDType::Q8_0));
+        // A bottleneck wider than the staged threadgroup array.
+        assert!(!hc_gate_fused_supported(4, 2560, 2048, GgmlDType::Q8_0));
+        // Any dtype but q8_0: the kernels read that block layout directly.
+        assert!(!hc_gate_fused_supported(4, 2560, 320, GgmlDType::Q4K));
+        assert!(hc_gate_fused_supported(4, 2560, 320, GgmlDType::Q8_0));
+
+        // The launchers refuse what the predicate refuses. The plane here is a
+        // real q8_0 weight of a covered shape; the GEOMETRY passed alongside it
+        // is the unsupported one.
+        let w = gate_weights(&dev, HC, HIDDEN, LOW_RANK);
+        let stream = t2(
+            pseudo_random(HC * HIDDEN, 0xF8, -1.0, 1.0),
+            1,
+            HC * HIDDEN,
+            &dev,
+        );
+        assert!(hc_gate_down(&stream, &w.norm_w, None, &w.down, 3, HIDDEN, LOW_RANK, EPS).is_err());
+        let (low, _, scales) =
+            hc_gate_down(&stream, &w.norm_w, None, &w.down, HC, HIDDEN, LOW_RANK, EPS).unwrap();
+        assert!(
+            hc_gate_up_mix(
+                &low, &w.up, &stream, &w.norm_w, &scales, 3, HIDDEN, LOW_RANK
+            )
+            .is_err()
+        );
+        // And a plane whose shape contradicts the geometry, which would
+        // otherwise index off the end of the weight.
+        assert!(
+            hc_gate_up_mix(
+                &low, &w.down, &stream, &w.norm_w, &scales, HC, HIDDEN, LOW_RANK
+            )
+            .is_err()
+        );
+
+        // A plane whose declared shape AGREES with the geometry but outruns its
+        // own allocation. Nothing else in the call carries the weight's length —
+        // it is raw bytes, not a tensor — so without the buffer bound the
+        // kernels would read off the end of device memory.
+        let (small, _, _) = build_q8_plane(
+            &dev,
+            32,
+            LOW_RANK,
+            &pseudo_random(32 * LOW_RANK, 0xF9, -1.0, 1.0),
+        );
+        let lying_down = QuantPlane {
+            out_dim: LOW_RANK,
+            in_dim: HC * HIDDEN,
+            ..small.clone()
+        };
+        assert!(
+            hc_gate_down(
+                &stream,
+                &w.norm_w,
+                None,
+                &lying_down,
+                HC,
+                HIDDEN,
+                LOW_RANK,
+                EPS
+            )
+            .is_err()
+        );
+        let lying_up = QuantPlane {
+            out_dim: HC * HIDDEN,
+            in_dim: LOW_RANK,
+            ..small
+        };
+        assert!(
+            hc_gate_up_mix(
+                &low, &lying_up, &stream, &w.norm_w, &scales, HC, HIDDEN, LOW_RANK
+            )
+            .is_err()
+        );
+    }
+
+    /// The fused gate's launch geometry is spelled out in BOTH languages — a
+    /// `#define` shaping the kernels' threadgroups, register arrays and staged
+    /// threadgroup memory, and the host constants that size the grid and refuse
+    /// a geometry those bounds do not cover. Nothing links them, and moving only
+    /// one side would produce a launch whose threads and arrays disagree with no
+    /// diagnostic, so this test is the link (same shape as
+    /// `hc_max_streams_matches_metal`).
+    #[test]
+    fn hc_gate_constants_match_metal() {
+        const SRC: &str = include_str!("hc.metal");
+        let parse = |name: &str| -> usize {
+            let mut found = None;
+            for line in SRC.lines() {
+                if let Some(rest) = line.trim().strip_prefix(&format!("#define {name} ")) {
+                    assert!(found.is_none(), "hc.metal defines {name} more than once");
+                    found = Some(
+                        rest.trim()
+                            .parse::<usize>()
+                            .unwrap_or_else(|_| panic!("{name} must be a plain integer literal")),
+                    );
+                }
+            }
+            found.unwrap_or_else(|| panic!("hc.metal must #define {name}"))
+        };
+        for (name, host) in [
+            ("HC_GATE_THREADS", dispatch::HC_GATE_THREADS),
+            (
+                "HC_GATE_MAX_BLK_PER_THREAD",
+                dispatch::HC_GATE_MAX_BLK_PER_THREAD,
+            ),
+            ("HC_GATE_ROWS_PER_TG", dispatch::HC_GATE_ROWS_PER_TG),
+            ("HC_GATE_MIX_THREADS", dispatch::HC_GATE_MIX_THREADS),
+            ("HC_GATE_MAX_LOW_RANK", dispatch::HC_GATE_MAX_LOW_RANK),
+        ] {
+            assert_eq!(
+                parse(name),
+                host,
+                "hc.metal's {name} ({}) and dispatch.rs's ({host}) must agree",
+                parse(name),
+            );
+        }
     }
 
     /// The widest carrier the host admits. The shipped geometry is 4 streams,

@@ -1558,6 +1558,16 @@ impl QLinear {
         Ok(lin)
     }
 
+    /// The weight's raw quantized bytes, when the loader retained the
+    /// allocation (`qlinear_with_buffer`) and a vendored kernel is instantiated
+    /// for the dtype — `None` otherwise, and the caller then keeps whatever path
+    /// it had. For the kernels that read the GGUF block layout themselves rather
+    /// than going through `forward`/`forward_gemm`: the fused hyper-connection
+    /// decode gate (`ops::hc_gate_down`) is the one that does.
+    pub fn plane(&self) -> Option<&QuantPlane> {
+        self.plane.as_ref()
+    }
+
     /// The same layer with the small-batch mv_ext window disabled: `forward`
     /// is candle's `QMatMul` at every token count (bitwise the plane-less
     /// loader's behavior), while `forward_gemm` keeps the plane. For

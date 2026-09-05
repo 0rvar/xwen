@@ -14,7 +14,7 @@
 //! `build_hc_combine` (`reference/llama.cpp/src/models/qwen4exp.cpp`) is the
 //! executable ground truth both follow.
 //!
-//! Two implementations live here. The CLASSIC one is a plain candle op per
+//! Three implementations live here. The CLASSIC one is a plain candle op per
 //! step — three dispatched matmuls plus a dozen elementwise passes per read,
 //! three more per write — and is kept verbatim as the `XWEN_HC_CLASSIC`
 //! kill-switch and provenance anchor. The DEFAULT one keeps the two Q8_0
@@ -24,8 +24,15 @@
 //! mix-and-collapse, and the write-back. Four gates per layer over 48 layers is
 //! why: the candle chain is 34% of prefill wall.
 //!
-//! The fused path is taken only for a geometry the kernels cover
-//! (`ops::hc_norm_supported`); anything else falls back rather than failing.
+//! The third is the FUSED DECODE GATE, taken at the small token counts where
+//! launch latency and not bandwidth is what the gate costs: two kernels
+//! (`ops::hc_gate_down`, `ops::hc_gate_up_mix`) that swallow the bottleneck
+//! matmuls as well, three dispatches per gate with the write-back instead of
+//! seven. `XWEN_HC_GATE_CLASSIC` restores the seven.
+//!
+//! Each fused path is taken only for a geometry its kernels cover
+//! (`ops::hc_norm_supported`, `ops::hc_gate_fused_supported`); anything else
+//! falls back rather than failing.
 
 use anyhow::{Context, Result, bail, ensure};
 use candle_core::{DType, Tensor};
@@ -101,12 +108,19 @@ impl HcRead {
         let hidden = cfg.hidden;
 
         let norm_w = w.dense_f32(&format!("{prefix}_norm"))?;
-        // Loaded through the buffer-retaining path so each carries a plane for
-        // the fused read's prefill gemm (`forward_gemm`); the plane views the
-        // QMatMul allocation, so it costs no device memory (each of the two
-        // q8_0 tensors is ~3.3 MB). `without_mv_ext` keeps `forward` off the
-        // small-batch window the plane would otherwise open at 2..8 tokens, so
-        // every hc path — `XWEN_HC_CLASSIC` included — stays on QMatMul there.
+        // Loaded through the buffer-retaining path so each carries a plane the
+        // fused read reads two ways: the prefill gemm (`forward_gemm`) and the
+        // fused decode gate, which walks the q8_0 blocks itself. The plane views
+        // the QMatMul allocation, so it costs no device memory (each of the two
+        // q8_0 tensors is ~3.3 MB).
+        //
+        // `without_mv_ext` keeps `forward` off the small-batch window the plane
+        // would otherwise open at 2..8 tokens. That window is the fused decode
+        // gate's by default now, but the fence still holds where it matters: no
+        // hc path reaches `matmul_mv_ext`, so turning the gate off
+        // (`XWEN_HC_CLASSIC`, `XWEN_HC_GATE_CLASSIC`, or a lower
+        // `XWEN_HC_GATE_FUSED_MAX_N`) lands back on exactly the QMatMul the
+        // switches promise rather than on a third path.
         let down = w
             .qlinear_with_buffer(&format!("{prefix}_down"))?
             .0
@@ -380,6 +394,54 @@ impl HcRead {
     /// it, so no full-width sigmoid pass is materialized).
     fn read_fused(&self, stream: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
         let rows = stream.dim(0)?;
+        // At the token counts a decode step runs, the seven launch latencies
+        // below cost more than the bytes they save: the fused gate folds all of
+        // them, both bottleneck matmuls included, into two dispatches. It needs
+        // the projections as raw q8_0 planes and a geometry that tiles its fixed
+        // thread partition; anything else keeps the split path.
+        //
+        // Both calls sit under the `dup` probe like the split path's, so a
+        // probed run in the 2..8-token window prices whichever arm it took. The
+        // bottleneck gemms have no `HcGemm` bracket of their own here — they are
+        // inside these two kernels, and there is no dispatch to repeat
+        // separately.
+        if crate::ops::hc_gate_fused_enabled()
+            && rows <= crate::ops::hc_gate_fused_max_n()
+            && let (Some(down), Some(up)) = (self.down.plane(), self.up.plane())
+            && crate::ops::hc_gate_fused_supported(
+                self.hc_count,
+                self.hidden,
+                self.low_rank,
+                down.dtype,
+            )
+            && up.dtype == down.dtype
+        {
+            let (low, inject, scales) = crate::ops::dup(crate::ops::DupStage::Hc, rows, || {
+                crate::ops::hc_gate_down(
+                    stream,
+                    &self.norm_w,
+                    self.inject_dense.as_ref(),
+                    down,
+                    self.hc_count,
+                    self.hidden,
+                    self.low_rank,
+                    self.eps as f32,
+                )
+            })?;
+            let mixed = crate::ops::dup(crate::ops::DupStage::Hc, rows, || {
+                crate::ops::hc_gate_up_mix(
+                    &low,
+                    up,
+                    stream,
+                    &self.norm_w,
+                    &scales,
+                    self.hc_count,
+                    self.hidden,
+                    self.low_rank,
+                )
+            })?;
+            return Ok((mixed, inject));
+        }
         let (normed, inject) = crate::ops::dup(crate::ops::DupStage::Hc, rows, || {
             crate::ops::hc_norm(
                 stream,
@@ -902,6 +964,158 @@ mod tests {
                 "hc_write element {i} differs (got {g:?}, want {w:?})"
             );
         }
+    }
+
+    /// A gate weight quantized q8_0 the way the checkpoint stores it, as a
+    /// `QLinear` that also carries the raw plane the fused decode gate reads.
+    fn q8_linear(dev: &Device, out_dim: usize, in_dim: usize, data: &[f32]) -> QLinear {
+        use candle_core::quantized::{GgmlDType, QStorage, QTensor};
+        use std::sync::Arc;
+        let dense = Tensor::from_vec(data.to_vec(), (out_dim, in_dim), &Device::Cpu).unwrap();
+        let qcpu = QTensor::quantize(&dense, GgmlDType::Q8_0).unwrap();
+        // One upload, two views — the plane and the QMatMul read identical
+        // bytes, exactly as `Weights::qlinear_with_buffer` pairs them.
+        let storage = QStorage::from_data(qcpu.data().unwrap(), dev, GgmlDType::Q8_0).unwrap();
+        let QStorage::Metal(qms) = &storage else {
+            panic!("expected Metal quantized storage")
+        };
+        let buffer = Arc::new(qms.buffer().clone());
+        let qt = Arc::new(QTensor::new(storage, (out_dim, in_dim)).unwrap());
+        QLinear::from_qtensor_with_buffer(qt, buffer)
+            .unwrap()
+            .without_mv_ext()
+    }
+
+    /// The live read path at a DECODE token count, where it takes the fused
+    /// gate: two dispatches for the grouped norm, the injection head, both q8_0
+    /// bottleneck projections, the activation and the mix, where the split path
+    /// spends six.
+    ///
+    /// The expected value is the CANDLE chain over the same quantized bytes —
+    /// `grouped_norm`, both projections through `QLinear`/`QMatMul`, candle's
+    /// silu and sigmoid — not the vendored split kernels. That is the classic
+    /// path `XWEN_HC_CLASSIC` restores, and grading against it holds the fused
+    /// gate to the same target the four-kernel read gate is held to by
+    /// `read_matches_the_candle_chain` one test above. It is spelled out rather
+    /// than called so an edit to either shows up as a failure instead of
+    /// silently moving the target. The fused kernels reassociate both dot
+    /// products, so this is 1e-5 and not the 1e-6 that test grades at. Under
+    /// `XWEN_HC_GATE_CLASSIC` (or `XWEN_HC_CLASSIC`) the two sides are nearly
+    /// the same code and this mostly re-proves the transcription, which is why
+    /// the reachability assertions below are not optional.
+    #[test]
+    fn read_fuses_the_gate_at_decode() {
+        let dev = dev();
+        let (hc_count, hidden, low_rank, n) = (4usize, 2560usize, 320usize, 1usize);
+        let width = hc_count * hidden;
+        let eps = 1e-6f64;
+
+        let norm_w: Vec<f32> = seeded(width, 777).iter().map(|v| 1.0 + 0.1 * v).collect();
+        let inject_v = seeded(hc_count * width, 888);
+        let inject_dense = tensor2(&inject_v, hc_count, width, &dev);
+        let inject_lin = QLinear::from_qtensor(std::sync::Arc::new(
+            candle_core::quantized::QTensor::quantize(
+                &inject_dense,
+                candle_core::quantized::GgmlDType::F32,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        let gate = HcRead::assemble(
+            hc_count,
+            hidden,
+            low_rank,
+            eps,
+            Tensor::from_slice(&norm_w, width, &dev).unwrap(),
+            q8_linear(&dev, low_rank, width, &seeded(low_rank * width, 999)),
+            q8_linear(&dev, width, low_rank, &seeded(width * low_rank, 1010)),
+            Some(inject_lin),
+            Some(inject_dense),
+        )
+        .unwrap();
+        // The branch under test is reachable only with both projections planed
+        // and the geometry covered; without that this test would grade the
+        // candle chain against itself. The token count is checked against the
+        // SHIPPED ceiling rather than the effective one, so pinning the classic
+        // arm through `XWEN_HC_GATE_FUSED_MAX_N=0` leaves the transcription
+        // check standing exactly as the kill switch does.
+        assert!(gate.down.plane().is_some() && gate.up.plane().is_some());
+        assert!(crate::ops::hc_gate_fused_supported(
+            hc_count,
+            hidden,
+            low_rank,
+            gate.down.plane().unwrap().dtype,
+        ));
+        assert!(n <= crate::ops::HC_GATE_FUSED_MAX_N);
+
+        let stream = tensor2(&seeded(n * width, 1111), n, width, &dev);
+        // ... and the fused READ path has to be taken at all, since the gate is
+        // a branch inside it. `fused` covers the kill switch, the device, the
+        // carrier's contiguity and the norm kernel's own geometry bound; it says
+        // nothing about the planes or the gate's geometry, so it stands
+        // alongside the three assertions above rather than replacing them.
+        assert!(
+            gate.fused(&stream),
+            "the fused read path must be reachable, or this grades the candle \
+             chain against itself"
+        );
+        let (mixed, inject) = gate.read(&stream).unwrap();
+        let inject = inject.expect("a block gate has an injection head");
+
+        let inv_hc = 1.0 / hc_count as f64;
+        let normed = gate.grouped_norm(&stream).unwrap();
+        let low = silu(
+            &gate
+                .down
+                .forward(&normed)
+                .unwrap()
+                .affine(inv_hc, 0.0)
+                .unwrap(),
+        )
+        .unwrap();
+        let mix = sigmoid(&gate.up.forward(&low).unwrap()).unwrap();
+        let want_mixed = (mix * &normed)
+            .unwrap()
+            .reshape((n, hc_count, hidden))
+            .unwrap()
+            .sum(1)
+            .unwrap()
+            .affine(inv_hc, 0.0)
+            .unwrap();
+        let want_inject = sigmoid(
+            &gate
+                .inject
+                .as_ref()
+                .unwrap()
+                .forward(&normed)
+                .unwrap()
+                .affine(inv_hc, 0.0)
+                .unwrap(),
+        )
+        .unwrap()
+        .affine(2.0, 0.0)
+        .unwrap();
+
+        let e = rel_l2(&flat(&mixed), &flat(&want_mixed));
+        assert!(e <= 1e-5, "fused gate mixed vs the split path: rel_l2 {e}");
+        let e = rel_l2(&flat(&inject), &flat(&want_inject));
+        assert!(e <= 1e-5, "fused gate inject vs the split path: rel_l2 {e}");
+
+        // The tail mixer takes the same kernels with no head threadgroup.
+        let tail = HcRead::assemble(
+            hc_count,
+            hidden,
+            low_rank,
+            eps,
+            Tensor::from_slice(&norm_w, width, &dev).unwrap(),
+            q8_linear(&dev, low_rank, width, &seeded(low_rank * width, 999)),
+            q8_linear(&dev, width, low_rank, &seeded(width * low_rank, 1010)),
+            None,
+            None,
+        )
+        .unwrap();
+        let e = rel_l2(&flat(&tail.mix(&stream).unwrap()), &flat(&want_mixed));
+        assert!(e <= 1e-5, "fused tail mixer vs the split path: rel_l2 {e}");
     }
 
     /// The carrier is seeded by TILING the embedding — `[x, x, x, x]` — not by

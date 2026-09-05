@@ -16,7 +16,7 @@ use candle_metal_kernels::source::Source;
 use candle_metal_kernels::utils::EncoderProvider;
 
 use crate::config::ZGate;
-use crate::gguf::ExpertStack;
+use crate::gguf::{ExpertStack, QuantPlane};
 use crate::ops::{MmVariant, pipelines};
 
 /// Build an `MTLSize` without naming `objc2_metal::MTLSize` — xwen does not
@@ -4901,6 +4901,75 @@ pub(crate) fn run_qsa_select(
 /// spelled out in both languages, so keep them in step.
 pub(crate) const HC_MAX_STREAMS: usize = 8;
 
+/// Threads per threadgroup in `kernel_hc_gate_down` — five simdgroups, and a
+/// divisor of the 320 q8_0 blocks a production carrier row holds.
+pub(crate) const HC_GATE_THREADS: usize = 160;
+
+/// q8_0 blocks of the carrier ONE thread of `kernel_hc_gate_down` stages in
+/// registers. It bounds the kernel's register footprint (32 floats per block),
+/// so a carrier wider than `HC_GATE_THREADS * HC_GATE_MAX_BLK_PER_THREAD` blocks
+/// is refused rather than run at whatever occupancy it would spill to.
+pub(crate) const HC_GATE_MAX_BLK_PER_THREAD: usize = 2;
+
+/// Down-projection output rows one threadgroup of `kernel_hc_gate_down`
+/// computes, sharing one pass over the staged carrier. The per-row accumulators
+/// are registers, which is what bounds it.
+pub(crate) const HC_GATE_ROWS_PER_TG: usize = 8;
+
+/// Threads per threadgroup in `kernel_hc_gate_up_mix`: `hc_count` adjacent lanes
+/// take the streams of one carrier column, so a threadgroup covers
+/// `HC_GATE_MIX_THREADS / hc_count` columns.
+pub(crate) const HC_GATE_MIX_THREADS: usize = 256;
+
+/// The widest bottleneck `kernel_hc_gate_up_mix` stages in threadgroup memory
+/// (one f32 per `low_rank` column, read by every thread of the threadgroup).
+pub(crate) const HC_GATE_MAX_LOW_RANK: usize = 1024;
+
+/// Whether the fused decode gate covers this geometry and weight dtype. Every
+/// bound is a kernel's, and a gate outside them keeps the seven-dispatch split
+/// path rather than failing:
+///
+/// * both bottleneck projections q8_0 — the two gate kernels read the GGUF
+///   block layout directly rather than through `QMatMul`;
+/// * `hc_count` a power of two dividing [`HC_GATE_MIX_THREADS`], and at most
+///   [`HC_MAX_STREAMS`], so the mix's stream fold is a simd_shuffle butterfly
+///   over adjacent lanes of one simdgroup;
+/// * `hidden` a whole number of q8_0 blocks, so each block of the carrier
+///   belongs to exactly one stream and the per-stream statistics stay disjoint;
+/// * the carrier a whole number of `HC_GATE_THREADS`-block passes, at most
+///   [`HC_GATE_MAX_BLK_PER_THREAD`] of them — the register bound above;
+/// * `low_rank` a whole number of blocks (the up projection's k) and no wider
+///   than [`HC_GATE_MAX_LOW_RANK`] — the threadgroup-memory bound above.
+pub(crate) fn hc_gate_fused_supported(
+    hc_count: usize,
+    hidden: usize,
+    low_rank: usize,
+    dtype: GgmlDType,
+) -> bool {
+    if dtype != GgmlDType::Q8_0 {
+        return false;
+    }
+    let block = GgmlDType::Q8_0.block_size();
+    if hc_count == 0
+        || hc_count > HC_MAX_STREAMS
+        || !hc_count.is_power_of_two()
+        || !HC_GATE_MIX_THREADS.is_multiple_of(hc_count)
+    {
+        return false;
+    }
+    if hidden == 0 || !hidden.is_multiple_of(block) {
+        return false;
+    }
+    if low_rank == 0 || !low_rank.is_multiple_of(block) || low_rank > HC_GATE_MAX_LOW_RANK {
+        return false;
+    }
+    let Some(width) = hc_count.checked_mul(hidden) else {
+        return false;
+    };
+    let nblk = width / block;
+    nblk.is_multiple_of(HC_GATE_THREADS) && nblk / HC_GATE_THREADS <= HC_GATE_MAX_BLK_PER_THREAD
+}
+
 /// Threadgroup width for `kernel_hc_norm`: the largest multiple of the simd
 /// width up to 256 that DIVIDES `hidden`. Dividing is what keeps each thread's
 /// strided walk inside a single stream, which is what makes the `hc_count`
@@ -5375,6 +5444,375 @@ pub(crate) fn run_hc_write(stream: &Tensor, block_out: &Tensor, inject: &Tensor)
     drop(i_guard);
 
     Ok(output_tensor(dst, mdev, n_elems, (n, width)))
+}
+
+/// The plane's declared shape must fit the allocation it views.
+///
+/// Both gate kernels index the weight by row and block with no bound of their
+/// own — a q8_0 plane is raw bytes, not a `Tensor`, so nothing else in the call
+/// carries its length. Every f32 operand is shape-checked by `check_f32` and the
+/// projections' `out_dim`/`in_dim` are checked against the geometry, but a plane
+/// whose declared shape outruns its buffer would pass both of those and read off
+/// the end of device memory.
+fn check_plane_fits(plane: &QuantPlane, what: &str) -> Result<()> {
+    let dt = plane.dtype;
+    // `in_dim` is a whole number of blocks by the time this runs
+    // (`hc_gate_fused_supported` and the shape check above).
+    let Some(need) = (plane.in_dim / dt.block_size())
+        .checked_mul(dt.type_size())
+        .and_then(|row| row.checked_mul(plane.out_dim))
+        .and_then(|body| body.checked_add(plane.base_off))
+    else {
+        bail!(
+            "the {what} plane's [{}, {}] {dt:?} shape overflows a byte count",
+            plane.out_dim,
+            plane.in_dim
+        );
+    };
+    let have = plane.buffer.length();
+    if need > have {
+        bail!(
+            "the {what} plane declares [{}, {}] {dt:?} at offset {}, which needs {need} bytes of \
+             a {have}-byte buffer",
+            plane.out_dim,
+            plane.in_dim,
+            plane.base_off
+        );
+    }
+    Ok(())
+}
+
+/// Matches the Metal `hc_gate_down_args` struct (src/ops/hc.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HcGateDownArgs {
+    hc_count: i32,
+    hidden: i32,
+    width: i32,
+    low_rank: i32,
+    nblk: i32,
+    n_down_tg: i32,
+    eps: f32,
+    inv_hc: f32,
+}
+
+/// Matches the Metal `hc_gate_up_args` struct (src/ops/hc.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HcGateUpArgs {
+    hc_count: i32,
+    hidden: i32,
+    width: i32,
+    low_rank: i32,
+    nblk_low: i32,
+    inv_hc: f32,
+}
+
+/// The first half of the fused decode gate against `kernel_hc_gate_down`
+/// (hc.metal): the carrier's grouped RMS norm, the injection head, the q8_0 down
+/// projection and the bottleneck activation, in ONE dispatch where the split
+/// path spends four.
+///
+/// `stream` is the raw carrier `[n, hc_count * hidden]` f32, `norm_w` the
+/// `[hc_count * hidden]` multiply-ready norm weight, `inject_w` the dense
+/// `[hc_count, hc_count * hidden]` head (`None` on the tail mixer) and `down`
+/// the `[low_rank, hc_count * hidden]` q8_0 projection's raw bytes. Returns
+/// `silu((down . normed) / hc_count)` as `[n, low_rank]`, the write strengths
+/// `[n, hc_count]` when there is a head, and the per-stream `[n, hc_count]`
+/// scales — which are not a debugging output but [`run_hc_gate_up_mix`]'s way of
+/// rebuilding `normed` without either kernel materializing it.
+///
+/// Geometry outside [`hc_gate_fused_supported`] is an error here: the caller
+/// asks that predicate first and keeps the split path when it says no.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_hc_gate_down(
+    stream: &Tensor,
+    norm_w: &Tensor,
+    inject_w: Option<&Tensor>,
+    down: &QuantPlane,
+    hc_count: usize,
+    hidden: usize,
+    low_rank: usize,
+    eps: f32,
+) -> Result<(Tensor, Option<Tensor>, Tensor)> {
+    let cdev = stream.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("hc_gate_down requires the carrier on a Metal device");
+    };
+    if !hc_gate_fused_supported(hc_count, hidden, low_rank, down.dtype) {
+        bail!(
+            "hc_gate_down does not cover hc_count {hc_count}, hidden {hidden}, low_rank \
+             {low_rank}, {:?} weights",
+            down.dtype
+        );
+    }
+    let width = checked_elems(&[hc_count, hidden], "hc_gate carrier width")?;
+    let (n, row) = stream
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("the carrier must be rank-2 [n, hc_count * hidden]: {e}"))?;
+    if n == 0 {
+        bail!("hc_gate_down needs at least one token");
+    }
+    if row != width {
+        bail!("the carrier is {row} wide, expected hc_count * hidden = {width}");
+    }
+    if down.out_dim != low_rank || down.in_dim != width {
+        bail!(
+            "the down projection is [{}, {}], expected [{low_rank}, {width}]",
+            down.out_dim,
+            down.in_dim
+        );
+    }
+    check_f32(stream, &[n, width], "carrier")?;
+    check_f32(norm_w, &[width], "hc norm weight")?;
+    if let Some(inject_w) = inject_w {
+        check_f32(inject_w, &[hc_count, width], "hc injection head")?;
+    }
+    for (name, t) in [
+        Some(("hc norm weight", norm_w)),
+        inject_w.map(|t| ("hc injection head", t)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !stream.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as the carrier");
+        }
+    }
+    // The kernel indexes the weight through `device const hc_block_q8_0 *`,
+    // whose alignment is that of its `half` scale. Rows are whole blocks, so
+    // only the bound base offset could break it.
+    if !down.base_off.is_multiple_of(2) {
+        bail!(
+            "hc_gate_down needs a 2-byte-aligned weight view, got offset {}",
+            down.base_off
+        );
+    }
+    check_plane_fits(down, "hc down projection")?;
+    glue_index_fits_i32(checked_elems(&[n, width], "hc_gate carrier")?)?;
+    let n_low = checked_elems(&[n, low_rank], "hc_gate bottleneck")?;
+    let n_inject = checked_elems(&[n, hc_count], "hc_gate injection")?;
+
+    let pipeline = pipelines::hc_pipeline(mdev.device(), "kernel_hc_gate_down")?;
+    if pipeline.max_total_threads_per_threadgroup() < HC_GATE_THREADS {
+        bail!(
+            "kernel_hc_gate_down needs {HC_GATE_THREADS} threads per threadgroup, the pipeline \
+             allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    check_delta_simd_width(&pipeline, "kernel_hc_gate_down")?;
+
+    let low = mdev.new_buffer(n_low, DType::F32, "hc_gate_low")?;
+    // Allocated whether or not there is a head: the kernel takes both output
+    // bindings, and a headless launch has no threadgroup that writes this one.
+    let inject = mdev.new_buffer(
+        if inject_w.is_some() { n_inject } else { 1 },
+        DType::F32,
+        "hc_gate_inject",
+    )?;
+    let scales = mdev.new_buffer(n_inject, DType::F32, "hc_gate_scales")?;
+
+    let (x_guard, x_layout) = stream.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("the carrier is not on a Metal device");
+    };
+    let (w_guard, w_layout) = norm_w.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("the hc norm weight is not on a Metal device");
+    };
+    let inj_parts = inject_w.map(|t| t.storage_and_layout());
+
+    let n_down_tg = low_rank.div_ceil(HC_GATE_ROWS_PER_TG);
+    let args = HcGateDownArgs {
+        hc_count: hc_count as i32,
+        hidden: hidden as i32,
+        width: width as i32,
+        low_rank: low_rank as i32,
+        nblk: (width / GgmlDType::Q8_0.block_size()) as i32,
+        n_down_tg: n_down_tg as i32,
+        eps,
+        // The classic chain scales by candle's `affine(1/hc_count, 0)`, a
+        // MULTIPLY; matching it keeps the two paths' rounding identical where
+        // 1/hc_count is not exact.
+        inv_hc: (1.0 / hc_count as f64) as f32,
+    };
+    {
+        let inj_bind = match &inj_parts {
+            Some((guard, layout)) => {
+                let Storage::Metal(storage) = &**guard else {
+                    bail!("the hc injection head is not on a Metal device");
+                };
+                Some((storage.buffer(), f32_off(layout)))
+            }
+            None => None,
+        };
+        // The headless arm binds the norm weight into the injection slot: no
+        // threadgroup of that launch dereferences it, and a bound buffer keeps
+        // the argument table uniform across both grids.
+        let (inj_buf, inj_off) = inj_bind.unwrap_or((w_storage.buffer(), f32_off(w_layout)));
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
+        encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
+        encoder.set_input_buffer(3, Some(inj_buf), inj_off);
+        encoder.set_input_buffer(4, Some(&down.buffer), down.base_off);
+        encoder.set_output_buffer(5, Some(&low), 0);
+        encoder.set_output_buffer(6, Some(&inject), 0);
+        encoder.set_output_buffer(7, Some(&scales), 0);
+        // One threadgroup per (row tile of the down weight, token), plus one for
+        // the injection head where there is one.
+        let grid_x = n_down_tg + usize::from(inject_w.is_some());
+        encoder.dispatch_thread_groups(mtl_size!(grid_x, n, 1), mtl_size!(HC_GATE_THREADS, 1, 1));
+    }
+    drop(x_guard);
+    drop(w_guard);
+    drop(inj_parts);
+
+    let low = output_tensor(low, mdev, n_low, (n, low_rank));
+    let scales = output_tensor(scales, mdev, n_inject, (n, hc_count));
+    let inject = inject_w.map(|_| output_tensor(inject, mdev, n_inject, (n, hc_count)));
+    Ok((low, inject, scales))
+}
+
+/// The second half of the fused decode gate against `kernel_hc_gate_up_mix`
+/// (hc.metal): the q8_0 up projection, its sigmoid, and the mix and collapse, in
+/// ONE dispatch where the split path spends two.
+///
+/// `low` is [`run_hc_gate_down`]'s `[n, low_rank]` bottleneck activation, `up`
+/// the `[hc_count * hidden, low_rank]` q8_0 projection's raw bytes, and
+/// `stream` / `norm_w` / `scales` are what the normed carrier is rebuilt from
+/// per element. Returns `[n, hidden]`, the vector the block runs on:
+/// `mean_s sigmoid(up[s*hidden+j] . low) * normed[s*hidden+j]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_hc_gate_up_mix(
+    low: &Tensor,
+    up: &QuantPlane,
+    stream: &Tensor,
+    norm_w: &Tensor,
+    scales: &Tensor,
+    hc_count: usize,
+    hidden: usize,
+    low_rank: usize,
+) -> Result<Tensor> {
+    let cdev = stream.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("hc_gate_up_mix requires the carrier on a Metal device");
+    };
+    if !hc_gate_fused_supported(hc_count, hidden, low_rank, up.dtype) {
+        bail!(
+            "hc_gate_up_mix does not cover hc_count {hc_count}, hidden {hidden}, low_rank \
+             {low_rank}, {:?} weights",
+            up.dtype
+        );
+    }
+    let width = checked_elems(&[hc_count, hidden], "hc_gate carrier width")?;
+    let (n, row) = stream
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("the carrier must be rank-2 [n, hc_count * hidden]: {e}"))?;
+    if n == 0 {
+        bail!("hc_gate_up_mix needs at least one token");
+    }
+    if row != width {
+        bail!("the carrier is {row} wide, expected hc_count * hidden = {width}");
+    }
+    if up.out_dim != width || up.in_dim != low_rank {
+        bail!(
+            "the up projection is [{}, {}], expected [{width}, {low_rank}]",
+            up.out_dim,
+            up.in_dim
+        );
+    }
+    check_f32(stream, &[n, width], "carrier")?;
+    check_f32(norm_w, &[width], "hc norm weight")?;
+    check_f32(low, &[n, low_rank], "hc bottleneck activation")?;
+    check_f32(scales, &[n, hc_count], "hc stream scales")?;
+    for (name, t) in [
+        ("hc norm weight", norm_w),
+        ("hc bottleneck activation", low),
+        ("hc stream scales", scales),
+    ] {
+        if !stream.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as the carrier");
+        }
+    }
+    if !up.base_off.is_multiple_of(2) {
+        bail!(
+            "hc_gate_up_mix needs a 2-byte-aligned weight view, got offset {}",
+            up.base_off
+        );
+    }
+    check_plane_fits(up, "hc up projection")?;
+    glue_index_fits_i32(checked_elems(&[n, width], "hc_gate carrier")?)?;
+    let n_out = checked_elems(&[n, hidden], "hc_gate mixed")?;
+
+    let pipeline = pipelines::hc_pipeline(mdev.device(), "kernel_hc_gate_up_mix")?;
+    if pipeline.max_total_threads_per_threadgroup() < HC_GATE_MIX_THREADS {
+        bail!(
+            "kernel_hc_gate_up_mix needs {HC_GATE_MIX_THREADS} threads per threadgroup, the \
+             pipeline allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    check_delta_simd_width(&pipeline, "kernel_hc_gate_up_mix")?;
+
+    let dst = mdev.new_buffer(n_out, DType::F32, "hc_gate_mixed")?;
+
+    let (l_guard, l_layout) = low.storage_and_layout();
+    let Storage::Metal(l_storage) = &*l_guard else {
+        bail!("the hc bottleneck activation is not on a Metal device");
+    };
+    let (x_guard, x_layout) = stream.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("the carrier is not on a Metal device");
+    };
+    let (w_guard, w_layout) = norm_w.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("the hc norm weight is not on a Metal device");
+    };
+    let (s_guard, s_layout) = scales.storage_and_layout();
+    let Storage::Metal(s_storage) = &*s_guard else {
+        bail!("the hc stream scales are not on a Metal device");
+    };
+
+    let args = HcGateUpArgs {
+        hc_count: hc_count as i32,
+        hidden: hidden as i32,
+        width: width as i32,
+        low_rank: low_rank as i32,
+        nblk_low: (low_rank / GgmlDType::Q8_0.block_size()) as i32,
+        inv_hc: (1.0 / hc_count as f64) as f32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(l_storage.buffer()), f32_off(l_layout));
+        encoder.set_input_buffer(2, Some(&up.buffer), up.base_off);
+        encoder.set_input_buffer(3, Some(x_storage.buffer()), f32_off(x_layout));
+        encoder.set_input_buffer(4, Some(w_storage.buffer()), f32_off(w_layout));
+        encoder.set_input_buffer(5, Some(s_storage.buffer()), f32_off(s_layout));
+        encoder.set_output_buffer(6, Some(&dst), 0);
+        // One threadgroup per (column tile of the carrier, token); each covers
+        // HC_GATE_MIX_THREADS / hc_count columns.
+        encoder.dispatch_thread_groups(
+            mtl_size!(hidden.div_ceil(HC_GATE_MIX_THREADS / hc_count), n, 1),
+            mtl_size!(HC_GATE_MIX_THREADS, 1, 1),
+        );
+    }
+    drop(l_guard);
+    drop(x_guard);
+    drop(w_guard);
+    drop(s_guard);
+
+    Ok(output_tensor(dst, mdev, n_out, (n, hidden)))
 }
 
 #[repr(C)]

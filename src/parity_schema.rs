@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 9;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 10;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -96,6 +96,19 @@ pub struct ProvenanceField {
 /// grandfather "classic": no pre-v9 binary had the fold or the routes. All
 /// three are load-bearing like `dense_mm` — the fold's sum order is not
 /// candle's, and the gemm routes carry dense_mm's reduced-precision class.
+///
+/// Version 10: hc_gate (the hyper-connection gate's DECODE route: "fused" for
+/// the two kernels that fold the grouped norm, the injection head, both q8_0
+/// bottleneck projections, the activation and the mix into two dispatches,
+/// "classic" for the seven-dispatch split path under XWEN_HC_GATE_CLASSIC,
+/// XWEN_HC_CLASSIC or a zero XWEN_HC_GATE_FUSED_MAX_N — `ops::hc_gate_fused_enabled`
+/// is the one predicate both the label and the read path ask). Grandfather
+/// "classic": no pre-v10 binary had the kernels.
+/// Bounded rather than bit-identical, like `hc_gemm` — both fused dot products
+/// reassociate — and like it, ungradeable until qwen4exp has a tier: the
+/// checkpoints the gate runs have no hyper-connections at all, so this is a
+/// configured-path label there and NO tier pins it. Pin it alongside
+/// `XWEN_HC_CLASSIC` when Flash-Next becomes gradeable (docs/parity.md).
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_impl",
@@ -190,6 +203,11 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "hc_gemm",
         introduced: 9,
+        grandfather: Some("classic"),
+    },
+    ProvenanceField {
+        name: "hc_gate",
+        introduced: 10,
         grandfather: Some("classic"),
     },
 ];
@@ -292,6 +310,12 @@ mod tests {
             assert_eq!(resolve_missing(f, 8), Some("classic"), "{f}");
             assert_eq!(resolve_missing(f, 9), None, "{f}");
         }
+        // hc_gate introduced at v10: v1..v9 dumps missing it resolve to
+        // "classic" (no earlier binary had the fused gate kernels); missing at
+        // v10 fails.
+        assert_eq!(resolve_missing("hc_gate", 1), Some("classic"));
+        assert_eq!(resolve_missing("hc_gate", 9), Some("classic"));
+        assert_eq!(resolve_missing("hc_gate", 10), None);
         // Baseline fields are required at every version.
         assert_eq!(resolve_missing("attn_dtype", 1), None);
         assert_eq!(resolve_missing("attn_dtype", 2), None);

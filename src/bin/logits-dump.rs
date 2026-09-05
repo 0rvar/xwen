@@ -409,6 +409,19 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
         } else {
             "fused"
         },
+        // The hyper-connection gate's DECODE route: "fused" for the two
+        // kernels that fold the norm, the head, both bottleneck projections,
+        // the activation and the mix into two dispatches, "classic" for the
+        // seven-dispatch split path. Env-derived; a configured-path label on
+        // checkpoints without hyper-connections, which is every checkpoint the
+        // parity gate can run. `hc_gate_fused_enabled` is the SAME predicate the
+        // read path gates on, so a ceiling of zero reads "classic" here rather
+        // than labelling a run that never dispatched the kernels.
+        "hc_gate": if xwen::ops::hc_gate_fused_enabled() {
+            "fused"
+        } else {
+            "classic"
+        },
         // The hyper-connection bottleneck's two projections at prefill:
         // "classic" when both stay on QMatMul (XWEN_HC_GEMM_QMATMUL=both, or
         // XWEN_DENSE_MM_CLASSIC), "fused" when both take the dense gemm, and
