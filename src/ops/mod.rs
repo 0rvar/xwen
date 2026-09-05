@@ -235,6 +235,173 @@ pub fn gdn_reps() -> usize {
     })
 }
 
+/// A stage the duplicate-dispatch probe can re-encode (`ops::dup`).
+///
+/// Each variant names a group of kernel launches inside one forward, not a
+/// source module: `Experts` covers the three expert gemms, `ExpertsDown` the
+/// down projection alone, and so on. The nesting is deliberate — a call site
+/// may belong to two stages so that one prices a whole group and the other
+/// isolates a member of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DupStage {
+    /// The three routed-expert gemms (gate, up, down).
+    Experts,
+    /// The routed-expert down projection alone.
+    ExpertsDown,
+    /// The MoE glue around the experts: router, SwiGLU activation, combine and
+    /// block epilogue.
+    MoeGlue,
+    /// The shared expert's projections.
+    Shexp,
+    /// Every hyper-connection kernel: grouped norm, both bottleneck gemms, the
+    /// scaled silu, the mix, and the carrier write.
+    Hc,
+    /// The two hyper-connection bottleneck gemms alone.
+    HcGemm,
+    /// Every gated-DeltaNet device step: conv, beta/decay head, scan, gated norm.
+    Gdn,
+    /// The gated-DeltaNet recurrent scan alone.
+    GdnScan,
+}
+
+impl DupStage {
+    /// The `XWEN_DUP_STAGE` token for each stage, in declaration order.
+    const NAMES: [(&'static str, DupStage); 8] = [
+        ("experts", DupStage::Experts),
+        ("experts_down", DupStage::ExpertsDown),
+        ("moe_glue", DupStage::MoeGlue),
+        ("shexp", DupStage::Shexp),
+        ("hc", DupStage::Hc),
+        ("hc_gemm", DupStage::HcGemm),
+        ("gdn", DupStage::Gdn),
+        ("gdn_scan", DupStage::GdnScan),
+    ];
+
+    fn from_name(name: &str) -> Option<DupStage> {
+        Self::NAMES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, s)| *s)
+    }
+}
+
+/// Parses an `XWEN_DUP_STAGE` value: a comma-separated list of stage names,
+/// whitespace around each ignored, empty entries skipped, duplicates collapsed.
+/// An unrecognized name is an error naming the known set rather than a silently
+/// ignored entry — a misspelled stage would otherwise report a plain run's wall
+/// clock as the stage's cost, which reads as "this stage is free".
+fn parse_dup_stages(spec: &str) -> Result<Vec<DupStage>, String> {
+    let mut out = Vec::new();
+    for name in spec.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        match DupStage::from_name(name) {
+            Some(stage) => {
+                if !out.contains(&stage) {
+                    out.push(stage);
+                }
+            }
+            None => {
+                let known: Vec<&str> = DupStage::NAMES.iter().map(|(n, _)| *n).collect();
+                return Err(format!(
+                    "XWEN_DUP_STAGE: unknown stage {name:?}; known stages are {}",
+                    known.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The stages `XWEN_DUP_STAGE` selects, VALUE-parsed and read once. Unset is an
+/// empty list, which is the no-op configuration. A malformed value is a
+/// startup-class error surfaced at the first probed dispatch, in the shape
+/// `mm_id_nr1_env` uses.
+fn dup_stages() -> anyhow::Result<&'static [DupStage]> {
+    static V: OnceLock<Result<Vec<DupStage>, String>> = OnceLock::new();
+    match V.get_or_init(|| match std::env::var("XWEN_DUP_STAGE") {
+        Ok(spec) => parse_dup_stages(&spec),
+        Err(_) => Ok(Vec::new()),
+    }) {
+        Ok(stages) => Ok(stages.as_slice()),
+        Err(e) => Err(anyhow::anyhow!(e.clone())),
+    }
+}
+
+/// `XWEN_DUP_REPS=N`: how many EXTRA copies of a selected dispatch to encode.
+/// Value-parsed and read once; unset, unparsable or below 1 falls back to 1, so
+/// the default probe doubles the selected work. Inert unless `XWEN_DUP_STAGE`
+/// names a stage.
+fn dup_reps() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_DUP_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(1)
+    })
+}
+
+/// Runs `f` once for its result, then `XWEN_DUP_REPS` more times with the
+/// results dropped when `stage` is selected by `XWEN_DUP_STAGE` and `n > 1`
+/// (the probe prices prefill only; a decode dispatch is latency-bound and the
+/// copies would overlap). `n` is the token count of the chunk at the call site.
+///
+/// The instrument this exists for: run a prefill twice, once plain and once
+/// with a stage selected, and the wall-clock difference is that stage's GPU
+/// time IN SITU — inside the real dependency chain, with no added syncs, which
+/// is what separates it from `stack_profile` and `gdn_profile` (both sync per
+/// step and so price the round trip alongside the kernel). Divide the delta by
+/// `XWEN_DUP_REPS`.
+///
+/// Read the delta as a LOWER BOUND for a stage that does not saturate the
+/// machine: candle's concurrent encoder barriers only on buffer hazards, so a
+/// copy that writes a fresh buffer may overlap the original wherever the stage
+/// leaves the GPU idle. A stage that does saturate it gets its true in-situ
+/// time.
+///
+/// Only ever wrapped around a launcher that is a pure function of tensors the
+/// caller already holds and that allocates its own output, so the copies are
+/// discardable: nothing that advances a cache, mutates host state, or is read
+/// through a shared scratch buffer goes inside. The FIRST result is the one
+/// returned, so the copies cannot influence the math.
+///
+/// With `XWEN_GDN_PROFILE` set, the GDN steps sit inside `gdn_profile::rep` as
+/// well and the two repeat counts multiply.
+///
+/// Unset — the normal case — this is one atomic load and one call.
+pub fn dup<T>(
+    stage: DupStage,
+    n: usize,
+    f: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let stages = dup_stages()?;
+    dup_with(stages, dup_reps(), stage, n, f)
+}
+
+/// [`dup`] over an explicit configuration, so the repeat rule is testable
+/// without touching the process environment (the env is read once per process
+/// and would make the tests order-dependent).
+fn dup_with<T>(
+    stages: &[DupStage],
+    reps: usize,
+    stage: DupStage,
+    n: usize,
+    mut f: impl FnMut() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if n <= 1 || !stages.contains(&stage) {
+        return f();
+    }
+    let out = f()?;
+    for _ in 0..reps {
+        let _ = f()?;
+    }
+    Ok(out)
+}
+
 /// `XWEN_PLE_NO_RANDOM` keeps the PLE n-gram table's byte range on the
 /// mapping's default (sequential-ish) readahead instead of tagging it
 /// `MADV_RANDOM`.
@@ -938,4 +1105,67 @@ pub(crate) fn mm_id_variant() -> MmVariant {
 pub enum ExpertRunner {
     Fused,
     Reference,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Counts calls so a test can assert how many times `dup` ran the closure.
+    fn counting<'a>(calls: &'a Cell<usize>) -> impl FnMut() -> anyhow::Result<usize> + 'a {
+        move || {
+            calls.set(calls.get() + 1);
+            Ok(calls.get())
+        }
+    }
+
+    #[test]
+    fn dup_repeats_only_a_selected_stage_over_more_than_one_token() {
+        let stages = [DupStage::Experts];
+
+        // Selected, multi-token: the real call plus `reps` discarded copies.
+        let calls = Cell::new(0);
+        let out = dup_with(&stages, 2, DupStage::Experts, 64, counting(&calls)).unwrap();
+        assert_eq!(calls.get(), 3);
+        // The FIRST result is what the caller gets; the copies never replace it.
+        assert_eq!(out, 1);
+
+        // A stage nobody selected runs once whatever the token count.
+        let calls = Cell::new(0);
+        dup_with(&stages, 2, DupStage::GdnScan, 64, counting(&calls)).unwrap();
+        assert_eq!(calls.get(), 1);
+
+        // Decode (n == 1) runs once even for a selected stage.
+        let calls = Cell::new(0);
+        dup_with(&stages, 2, DupStage::Experts, 1, counting(&calls)).unwrap();
+        assert_eq!(calls.get(), 1);
+
+        // The empty configuration — the unset environment — never repeats.
+        let calls = Cell::new(0);
+        dup_with(&[], 4, DupStage::Experts, 64, counting(&calls)).unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn dup_stage_names_parse_and_an_unknown_one_is_an_error() {
+        assert_eq!(
+            parse_dup_stages("experts,gdn_scan").unwrap(),
+            vec![DupStage::Experts, DupStage::GdnScan]
+        );
+        // Whitespace, empty entries and repeats are all tolerated.
+        assert_eq!(
+            parse_dup_stages(" hc , , hc_gemm , hc ").unwrap(),
+            vec![DupStage::Hc, DupStage::HcGemm]
+        );
+        assert_eq!(parse_dup_stages("").unwrap(), vec![]);
+        // Every documented name resolves.
+        for (name, stage) in DupStage::NAMES {
+            assert_eq!(parse_dup_stages(name).unwrap(), vec![stage]);
+        }
+
+        let err = parse_dup_stages("experts,ffn").unwrap_err();
+        assert!(err.contains("ffn"), "{err}");
+        assert!(err.contains("experts_down"), "{err}");
+    }
 }

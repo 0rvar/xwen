@@ -379,32 +379,47 @@ impl HcRead {
     /// one pass over the up projection's RAW logits (the sigmoid is folded into
     /// it, so no full-width sigmoid pass is materialized).
     fn read_fused(&self, stream: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
-        let (normed, inject) = crate::ops::hc_norm(
-            stream,
-            &self.norm_w,
-            self.inject_dense.as_ref(),
-            self.hc_count,
-            self.hidden,
-            self.eps as f32,
-        )?;
+        let rows = stream.dim(0)?;
+        let (normed, inject) = crate::ops::dup(crate::ops::DupStage::Hc, rows, || {
+            crate::ops::hc_norm(
+                stream,
+                &self.norm_w,
+                self.inject_dense.as_ref(),
+                self.hc_count,
+                self.hidden,
+                self.eps as f32,
+            )
+        })?;
         // The bottleneck's two matmuls take the vendored dense gemm at prefill
         // (`QLinear::forward_gemm`, above `dense_mm_min_seq()`), each arm
         // separately revocable by `XWEN_HC_GEMM_QMATMUL` because their shapes
         // differ (down k = hc_count*hidden, up k = low_rank). Decode is the same
         // `QMatMul` gemv either way.
         let arms = crate::ops::hc_gemm_qmatmul();
-        let low_in = if arms.down_on_qmatmul() {
-            self.down.forward(&normed)?
-        } else {
-            self.down.forward_gemm(&normed)?
-        };
-        let low = crate::ops::hc_silu_quarter(&low_in, self.hc_count)?;
-        let up = if arms.up_on_qmatmul() {
-            self.up.forward(&low)?
-        } else {
-            self.up.forward_gemm(&low)?
-        };
-        let mixed = crate::ops::hc_mix(&up, &normed, self.hc_count, self.hidden)?;
+        let low_in = crate::ops::dup(crate::ops::DupStage::Hc, rows, || {
+            crate::ops::dup(crate::ops::DupStage::HcGemm, rows, || {
+                if arms.down_on_qmatmul() {
+                    Ok(self.down.forward(&normed)?)
+                } else {
+                    Ok(self.down.forward_gemm(&normed)?)
+                }
+            })
+        })?;
+        let low = crate::ops::dup(crate::ops::DupStage::Hc, rows, || {
+            crate::ops::hc_silu_quarter(&low_in, self.hc_count)
+        })?;
+        let up = crate::ops::dup(crate::ops::DupStage::Hc, rows, || {
+            crate::ops::dup(crate::ops::DupStage::HcGemm, rows, || {
+                if arms.up_on_qmatmul() {
+                    Ok(self.up.forward(&low)?)
+                } else {
+                    Ok(self.up.forward_gemm(&low)?)
+                }
+            })
+        })?;
+        let mixed = crate::ops::dup(crate::ops::DupStage::Hc, rows, || {
+            crate::ops::hc_mix(&up, &normed, self.hc_count, self.hidden)
+        })?;
         Ok((mixed, inject))
     }
 
@@ -452,7 +467,9 @@ pub fn hc_write(stream: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<
             .iter()
             .all(|t| t.dtype() == DType::F32 && t.is_contiguous())
     {
-        return crate::ops::hc_write(stream, block_out, inject);
+        return crate::ops::dup(crate::ops::DupStage::Hc, n, || {
+            crate::ops::hc_write(stream, block_out, inject)
+        });
     }
     let scaled = block_out
         .reshape((n, 1, hidden))?

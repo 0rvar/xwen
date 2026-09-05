@@ -95,7 +95,9 @@ impl MoeBlock {
         if self.glue_fused(x_normed) {
             // One kernel for softmax + arg-sort + gather + sum + clamp + divide,
             // bit-identical to the candle chain below (ops::moe_glue).
-            return crate::ops::moe_router(&logits, self.n_expert_used, self.sum_floor);
+            return crate::ops::dup(crate::ops::DupStage::MoeGlue, x_normed.dim(0)?, || {
+                crate::ops::moe_router(&logits, self.n_expert_used, self.sum_floor)
+            });
         }
         route_from_logits(&logits, self.n_expert_used, self.sum_floor)
     }
@@ -112,9 +114,16 @@ impl MoeBlock {
         if self.glue_fused(x_normed)
             && let Some(down) = self.experts.project(x_normed, &ids)?
         {
-            let shexp = self.shared.swiglu_out(x_normed)?;
-            let gate = self.shared.gate_logits(x_normed)?;
-            return crate::ops::moe_epilogue(&down, &weights, &shexp, &gate);
+            let seq = x_normed.dim(0)?;
+            let shexp = crate::ops::dup(crate::ops::DupStage::Shexp, seq, || {
+                self.shared.swiglu_out(x_normed)
+            })?;
+            let gate = crate::ops::dup(crate::ops::DupStage::Shexp, seq, || {
+                self.shared.gate_logits(x_normed)
+            })?;
+            return crate::ops::dup(crate::ops::DupStage::MoeGlue, seq, || {
+                crate::ops::moe_epilogue(&down, &weights, &shexp, &gate)
+            });
         }
 
         let routed = self.experts.forward(x_normed, &ids, &weights)?;
@@ -332,8 +341,12 @@ impl FusedExperts {
             return Ok((matmul(&self.down, &act, ids)?, None));
         }
 
-        let gate = matmul(&self.gate, &x_g, ids)?; // [seq, top_k, expert_ff]
-        let up = matmul(&self.up, &x_g, ids)?; // [seq, top_k, expert_ff]
+        let gate = crate::ops::dup(crate::ops::DupStage::Experts, seq, || {
+            matmul(&self.gate, &x_g, ids)
+        })?; // [seq, top_k, expert_ff]
+        let up = crate::ops::dup(crate::ops::DupStage::Experts, seq, || {
+            matmul(&self.up, &x_g, ids)
+        })?; // [seq, top_k, expert_ff]
 
         // The down projection consumes the SwiGLU activation. Some mm_id variants
         // stage that activation as f16, where a large value would overflow, and
@@ -370,25 +383,38 @@ impl FusedExperts {
             let fold = !crate::ops::act_l2_classic()
                 && !crate::ops::act_classic()
                 && crate::ops::silu_mul_l2_supported(expert_ff);
-            let (act_s, col_l2) = if fold {
-                crate::ops::silu_mul_l2(&gate, &up, f16_safe as f32, 1e-8, 1e30)?
-            } else {
-                let act = Self::activation(&gate, &up)?;
-                let col_l2 = act
-                    .sqr()?
-                    .sum_keepdim(2)?
-                    .sqrt()?
-                    .clamp(1e-8_f32, 1e30_f32)?; // [seq, top_k, 1]
-                ((&act * f16_safe)?.broadcast_div(&col_l2)?, col_l2)
-            };
-            let down = matmul(&self.down, &act_s, ids)?; // [seq, top_k, hidden]
+            let (act_s, col_l2) = crate::ops::dup(crate::ops::DupStage::MoeGlue, seq, || {
+                if fold {
+                    crate::ops::silu_mul_l2(&gate, &up, f16_safe as f32, 1e-8, 1e30)
+                } else {
+                    let act = Self::activation(&gate, &up)?;
+                    let col_l2 = act
+                        .sqr()?
+                        .sum_keepdim(2)?
+                        .sqrt()?
+                        .clamp(1e-8_f32, 1e30_f32)?; // [seq, top_k, 1]
+                    Ok(((&act * f16_safe)?.broadcast_div(&col_l2)?, col_l2))
+                }
+            })?;
+            let down = crate::ops::dup(crate::ops::DupStage::Experts, seq, || {
+                crate::ops::dup(crate::ops::DupStage::ExpertsDown, seq, || {
+                    matmul(&self.down, &act_s, ids)
+                })
+            })?; // [seq, top_k, hidden]
             return Ok((down, Some(col_l2)));
         }
 
         // Default: f32 down projection (mv_id or mm_id-hp) — no f16 cast, so the
         // activation feeds the down matmul directly, no rescale needed.
-        let act = Self::activation(&gate, &up)?; // [seq, top_k, expert_ff]
-        Ok((matmul(&self.down, &act, ids)?, None))
+        let act = crate::ops::dup(crate::ops::DupStage::MoeGlue, seq, || {
+            Self::activation(&gate, &up)
+        })?; // [seq, top_k, expert_ff]
+        let down = crate::ops::dup(crate::ops::DupStage::Experts, seq, || {
+            crate::ops::dup(crate::ops::DupStage::ExpertsDown, seq, || {
+                matmul(&self.down, &act, ids)
+            })
+        })?;
+        Ok((down, None))
     }
 
     /// `silu(gate) * up`, fused (`ops::silu_mul`) unless `XWEN_ACT_CLASSIC` keeps
@@ -424,7 +450,9 @@ impl ExpertFfn for FusedExperts {
             let w = w.reshape((seq, top_k, 1))?;
             return Ok(down.broadcast_mul(&w)?.sum(1)?);
         }
-        crate::ops::combine(&down, col_l2.as_ref(), &w)
+        crate::ops::dup(crate::ops::DupStage::MoeGlue, seq, || {
+            crate::ops::combine(&down, col_l2.as_ref(), &w)
+        })
     }
 
     /// The uncombined down projection, for the fused block epilogue. Declines

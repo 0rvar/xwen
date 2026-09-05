@@ -236,7 +236,9 @@ impl LinearAttnBlock {
         let (conv_state, s) = cache.linear_state()?;
         gdn_profile::host_step(&mut prof, Step::Glue, 0);
         let (conv, next_conv_state) = gdn_profile::rep(&prof, || {
-            crate::ops::delta_conv(&conv_state, &qkv, &self.conv_w)
+            crate::ops::dup(crate::ops::DupStage::Gdn, seq, || {
+                crate::ops::delta_conv(&conv_state, &qkv, &self.conv_w)
+            })
         })?;
         gdn_profile::step(&mut prof, dev, Step::Conv, bytes.conv)?;
 
@@ -248,15 +250,23 @@ impl LinearAttnBlock {
         // against each other under XWEN_GDN_PROFILE.
         let (beta, g) = if crate::ops::delta_ba_fused_applies(x_normed, &self.ba_wt) {
             let pair = gdn_profile::rep(&prof, || {
-                crate::ops::delta_ba_fused(x_normed, &self.ba_wt, &self.ssm_a, &self.dt_bias)
+                crate::ops::dup(crate::ops::DupStage::Gdn, seq, || {
+                    crate::ops::delta_ba_fused(x_normed, &self.ba_wt, &self.ssm_a, &self.dt_bias)
+                })
             })?;
             gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_fused)?;
             pair
         } else {
-            let ba = gdn_profile::rep(&prof, || Ok(x_normed.matmul(&self.ba_wt)?))?; // [seq, 2 * v_heads]
+            let ba = gdn_profile::rep(&prof, || {
+                crate::ops::dup(crate::ops::DupStage::Gdn, seq, || {
+                    Ok(x_normed.matmul(&self.ba_wt)?)
+                })
+            })?; // [seq, 2 * v_heads]
             gdn_profile::step(&mut prof, dev, Step::BaProj, bytes.ba_proj)?;
             let pair = gdn_profile::rep(&prof, || {
-                crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)
+                crate::ops::dup(crate::ops::DupStage::Gdn, seq, || {
+                    crate::ops::delta_ba(&ba, &self.ssm_a, &self.dt_bias)
+                })
             })?;
             gdn_profile::step(&mut prof, dev, Step::BaHead, bytes.ba_head)?;
             pair
@@ -273,15 +283,19 @@ impl LinearAttnBlock {
         let eps = self.rms_eps as f32;
         let o = if seq > 1 && cache.linear_trail_armed() {
             let (o, trail) = gdn_profile::rep(&prof, || {
-                crate::ops::delta_scan_with_trail(
-                    &conv,
-                    &beta,
-                    &g,
-                    &s,
-                    self.k_heads,
-                    eps,
-                    seq, // one state plane per token of the verify span
-                )
+                crate::ops::dup(crate::ops::DupStage::Gdn, seq, || {
+                    crate::ops::dup(crate::ops::DupStage::GdnScan, seq, || {
+                        crate::ops::delta_scan_with_trail(
+                            &conv,
+                            &beta,
+                            &g,
+                            &s,
+                            self.k_heads,
+                            eps,
+                            seq, // one state plane per token of the verify span
+                        )
+                    })
+                })
             })?;
             gdn_profile::step(&mut prof, dev, Step::Scan, bytes.scan(seq))?;
             // The conv window a rollback to token t restarts from is rows
@@ -305,7 +319,11 @@ impl LinearAttnBlock {
             o
         } else {
             let (o, next_s) = gdn_profile::rep(&prof, || {
-                crate::ops::delta_scan(&conv, &beta, &g, &s, self.k_heads, eps)
+                crate::ops::dup(crate::ops::DupStage::Gdn, seq, || {
+                    crate::ops::dup(crate::ops::DupStage::GdnScan, seq, || {
+                        crate::ops::delta_scan(&conv, &beta, &g, &s, self.k_heads, eps)
+                    })
+                })
             })?;
             gdn_profile::step(&mut prof, dev, Step::Scan, bytes.scan(1))?;
             cache.advance_linear(seq, vec![(next_conv_state, next_s)])?;
@@ -315,7 +333,9 @@ impl LinearAttnBlock {
 
         let zr = z.reshape((seq, self.v_heads, self.head_dim))?;
         let o = gdn_profile::rep(&prof, || {
-            crate::ops::delta_gnorm(&o, &zr, &self.norm_w, self.rms_eps as f32, self.z_gate)
+            crate::ops::dup(crate::ops::DupStage::Gdn, seq, || {
+                crate::ops::delta_gnorm(&o, &zr, &self.norm_w, self.rms_eps as f32, self.z_gate)
+            })
         })?;
         gdn_profile::step(&mut prof, dev, Step::GnormZgate, bytes.gnorm)?;
         let or = o.reshape((seq, v_dim))?;
