@@ -562,7 +562,9 @@ impl AttnBlock {
                     "QsaSelection::Mask is the prefill overlay; at seq 1 candle's vector sdpa \
                      ignores the mask and attends densely instead — use Rows"
                 );
-                Some(PrefillMask::from_raw(m.clone(), self.n_head)?)
+                Some(crate::ops::dup(crate::ops::DupStage::QsaMask, seq, || {
+                    PrefillMask::from_raw(m.clone(), self.n_head)
+                })?)
             }
             _ => None,
         };
@@ -578,8 +580,24 @@ impl AttnBlock {
         //    construction.
         //  - non-Metal: the explicit f32 fallback (CPU tests, reference oracle),
         //    consuming the raw `[seq, k_seq]` additive mask.
-        let attn = if matches!(x_normed.device(), Device::Metal(_)) {
-            self.sdpa_attention(&q, &k_all, &v_all, mask.map(|m| &m.sdpa), scale)?
+        let attn = if let Some(QsaSelection::Sparse(sp)) = qsa {
+            // The tile-batched sparse route (ops::qsa_tiles): the mask is not
+            // materialized for sdpa at all, the union's columns are.
+            ensure!(
+                seq > 1,
+                "QsaSelection::Sparse is the prefill overlay; at seq 1 use Rows"
+            );
+            ensure!(
+                matches!(x_normed.device(), Device::Metal(_)),
+                "QsaSelection::Sparse is Metal-only"
+            );
+            crate::ops::dup(crate::ops::DupStage::Sdpa, seq, || {
+                crate::ops::qsa_tiles::attend(&q, &k_all, &v_all, sp, scale, crate::ops::qsa_tile())
+            })?
+        } else if matches!(x_normed.device(), Device::Metal(_)) {
+            crate::ops::dup(crate::ops::DupStage::Sdpa, seq, || {
+                self.sdpa_attention(&q, &k_all, &v_all, mask.map(|m| &m.sdpa), scale)
+            })?
         } else {
             self.manual_attention(&q, &k_all, &v_all, mask.map(|m| &m.raw), scale, seq)?
         }; // [n_head, seq, head_dim] f32 — except the fused-glue decode route,
@@ -1716,6 +1734,79 @@ mod tests {
             "the row-restricted decode diverged from the naive reference by {err} \
              on values of magnitude {mag}"
         );
+    }
+
+    /// The tile-batched sparse route (`ops::qsa_tiles`) attends over the
+    /// union's columns only and reproduces the dense-over-the-mask route on a
+    /// real selection: a 2560-token dense prefix, then a 100-query chunk whose
+    /// mask and block lists come from `select_mask_lists` over random scores
+    /// at a 256-token budget. The two routes sum the same terms in a different
+    /// order, so the comparison is a tolerance at f16 output precision, not
+    /// bit equality. With 100 queries the shipped tile size leaves the last
+    /// tile padded, so padding rows are covered too.
+    #[test]
+    fn sparse_tiles_reproduce_the_dense_mask_route() {
+        let dev = metal_device().unwrap();
+        // qsa_block's rope table stops at 256 positions; this test prefills
+        // past 2560, so it builds the same block over a longer table.
+        let (n_head, n_kv_head, hd, hidden) = (4usize, 2usize, 256usize, 512usize);
+        let cfg = test_cfg(n_head, n_kv_head, hd, hidden, 64);
+        let rope = Arc::new(Rope::new(cfg.rope(), 4096, &dev).unwrap());
+        let w = raw_weights(n_head, n_kv_head, hd, hidden, &dev);
+        let block = build_block(&w, &cfg, 0, rope, &dev, AttnWeights::DequantF32);
+        // n_kv 2660 (whole blocks), 2661..2663 (a tail of 1..3 positions) and
+        // 3073 (a tail, and 768 complete blocks — a multiple of 32, so the
+        // tail block's id is the first bit of a fresh bitmap word).
+        for &n in &[100usize, 101, 102, 103, 513] {
+            let (prefix, ratio, budget) = (2560usize, 4usize, 256usize);
+            let n_kv = prefix + n;
+            let n_blocks = n_kv / ratio;
+            let x0 = dense(prefix, cfg.hidden, 95, &dev);
+            let x1 = dense(n, cfg.hidden, 96, &dev);
+            let scores = dense(n, n_blocks, 97, &dev).relu().unwrap();
+            let (mask, blocks, nsel) =
+                crate::ops::qsa_select::select_mask_lists(&scores, prefix, ratio, budget / ratio)
+                    .unwrap();
+
+            let run = |qsa: &QsaSelection| {
+                let mut cache = LayerCache::new(&cfg, 0, 4096, &dev).unwrap();
+                let m0 = block.prefill_mask(&cache, prefix, 0).unwrap();
+                block
+                    .forward(&x0, &mut cache, 0, m0.as_ref(), None)
+                    .unwrap();
+                let m1 = block.prefill_mask(&cache, n, prefix).unwrap();
+                block
+                    .forward(&x1, &mut cache, prefix, m1.as_ref(), Some(qsa))
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let dense_out = run(&QsaSelection::Mask(mask.clone()));
+            let sparse = QsaSelection::Sparse(crate::ops::qsa_tiles::SparsePrefill {
+                mask,
+                blocks,
+                nsel,
+                ratio,
+                n_blocks,
+            });
+            let sparse_out = run(&sparse);
+            let mag = dense_out.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let err = dense_out
+                .iter()
+                .zip(&sparse_out)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                err <= 4e-3 * mag,
+                "n {n}: sparse tiles diverged from the dense mask route by {err} on values of magnitude {mag}"
+            );
+            assert!(
+                sparse_out.iter().all(|v| v.is_finite()),
+                "n {n}: the sparse route produced a non-finite value"
+            );
+        }
     }
 
     /// A prefill `Mask` replaces the causal mask rather than composing with it,

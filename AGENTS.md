@@ -294,7 +294,8 @@ and **Flash-Next 52.9 at 596 tokens** (it ships no drafter, so it decodes plain)
 dense pair as last fitted: **27B 24.8-25.3 plain, 37.5-38.2 drafted on code**
 (2026-08-08), **3.8-27B 23.7-24.8 plain, 34.4-35.7 drafted on code** (2026-08-15).
 Prefill: **35B 3081-3090 at 3803 tokens** and **Flash-Next 1140 at 3851** (2026-08-30 and
-2026-09-05), the dense **27B 702 at 880 tokens** (2026-07-29; recorded as "at 925" until
+2026-09-05), **Flash-Next 428-456 at 131424** (2026-09-06, sparse-tile attention; 231 that
+morning), the dense **27B 702 at 880 tokens** (2026-07-29; recorded as "at 925" until
 2026-09-06, which is the bench fixture's NAME and not its token count). Read a drafted or an A/B figure
 only against the arm measured in its own session.
 

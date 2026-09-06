@@ -214,6 +214,12 @@ kernel void kernel_qsa_select(
 // A row is written in two orderings: `-inf` over the whole row first, then
 // zeros over the tail and the selected blocks, with a device-memory barrier
 // between so no thread's background store lands over another's zero.
+//
+// It also writes each query's selected blocks as a list, `blocks[i, 0..nsel[i])`
+// ascending: the selected blocks in index order, then the tail's (incomplete)
+// block if the query has a tail. That list is what the tile-batched sparse
+// attention (qsa_tiles.metal) unions per query tile, so it never has to read
+// the mask back to learn what the mask says.
 
 // Matches dispatch.rs QsaSelectMaskArgs (#[repr(C)]).
 typedef struct {
@@ -222,12 +228,15 @@ typedef struct {
     int32_t pos;       // absolute position of query 0
     int32_t ratio;     // positions per block
     int32_t keep_max;  // budget / ratio
+    int32_t cap;       // block-list row stride, keep_max + 1
 } qsa_select_mask_args;
 
 kernel void kernel_qsa_select_mask(
         constant qsa_select_mask_args & args [[buffer(0)]],
         device const float * scores          [[buffer(1)]],
         device float * mask                  [[buffer(2)]],
+        device uint32_t * blocks             [[buffer(3)]],
+        device uint32_t * nsel               [[buffer(4)]],
         uint3 tgid [[threadgroup_position_in_grid]],
         uint tid   [[thread_index_in_threadgroup]],
         uint3 tg3  [[threads_per_threadgroup]],
@@ -249,6 +258,14 @@ kernel void kernel_qsa_select_mask(
 
     device const float * row_scores = scores + (size_t) i * n_blocks;
     device float * row = mask + (size_t) i * n_kv;
+    device uint32_t * list = blocks + (size_t) i * (uint) args.cap;
+    const uint tail_len = visible % ratio;
+    if (tid == 0) {
+        nsel[i] = keep + (tail_len != 0 ? 1u : 0u);
+        if (tail_len != 0) {
+            list[keep] = visible / ratio;
+        }
+    }
 
     for (uint t = tid; t < n_kv; t += width) {
         row[t] = -INFINITY;
@@ -270,6 +287,9 @@ kernel void kernel_qsa_select_mask(
     if (keep >= nb) {
         for (uint t = lo * ratio; t < hi * ratio; t++) {
             row[t] = 0.0f;
+        }
+        for (uint b = lo; b < hi; b++) {
+            list[b] = b;
         }
         return;
     }
@@ -315,13 +335,18 @@ kernel void kernel_qsa_select_mask(
     const uint need_eq = need;
 
     // ---- emit: every key above T, and the first need_eq keys equal to it
-    // in block-index order ----
+    // in block-index order; the list slot comes from a scan of the emitted
+    // counts, as in kernel_qsa_select ----
+    uint c_gt = 0;
     uint c_eq = 0;
     for (uint b = lo; b < hi; b++) {
-        c_eq += (score_key(row_scores[b]) == T) ? 1u : 0u;
+        const uint key = score_key(row_scores[b]);
+        c_gt += (key > T) ? 1u : 0u;
+        c_eq += (key == T) ? 1u : 0u;
     }
     const uint eq_prefix = tg_exclusive_scan(c_eq, simd_tot, lane, sg);
     const uint sel_eq = (eq_prefix >= need_eq) ? 0u : min(c_eq, need_eq - eq_prefix);
+    uint slot = tg_exclusive_scan(c_gt + sel_eq, simd_tot, lane, sg);
 
     uint taken = 0;
     for (uint b = lo; b < hi; b++) {
@@ -335,6 +360,8 @@ kernel void kernel_qsa_select_mask(
             for (uint j = 0; j < ratio; j++) {
                 row[b * ratio + j] = 0.0f;
             }
+            list[slot] = b;
+            slot++;
         }
     }
 }

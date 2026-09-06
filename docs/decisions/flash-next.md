@@ -85,6 +85,36 @@ arm's 42 GB came from. Same bits as the host fill for every row, held by
 byte-identical on both arms; the tables are in
 [the record](../records/qsa-device-mask.md).
 
+**And the QSA layers attend sparsely at prefill (2026-09-06, the same evening).** The
+selection had been buying correctness and nothing else at prefill: candle's sdpa ran over
+every column of the cache under the mask, and the duplicate-dispatch probe at 128k put
+that attention at 52% of the Flash-Next wall (240.7 s of 465.9) — the same cost class as
+the 35B's dense layers (77-81% of its 200 s). Three decisions inside the route:
+
+1. *Tiles, not per-query gathers, and T = 32.* A per-query gather of 2048 rows is 4 GB
+   of K/V traffic per layer per chunk; a tile of T queries gathers the UNION of their
+   selections once. The unions are large — neighbouring queries do not pick the same
+   blocks — and `XWEN_QSA_UNION_STATS` measured them: at 64k a 32-query tile needs
+   18-37% of the blocks, a 64-query tile 25-51%, so the attention columns over the 64k
+   prefill are 36% of dense at T=32 and 45% at T=64; T=16 would be 28% but the sdpa's
+   query tile is 32 rows and the rest would be padding. 32 ships.
+2. *Reuse candle's batched sdpa rather than write an attention kernel.* The tiles are the
+   batch dimension, the gathered rows the keys, and a tile-local mask keeps every
+   column a query must not see at -inf. That is dense masked attention's answer up to
+   summation order, which is why `XWEN_QSA_ATTN_CLASSIC` is a parity row and not a
+   bitwise switch: held to the dense route at 4e-3 of magnitude in a test, and to it by
+   a 64/64 forced greedy replay at 4096 tokens.
+3. *One readback stays: the tile counts.* A fixed-shape batched sdpa needs S on the
+   host, so `n_tiles` u32 come back per layer-chunk. It waits on this layer's selection
+   only, and the route still took the 128k prefill from 445-466 s to 288-307 s.
+
+The route is gated by context length: below the crossover the attention is cheap and the
+route's dispatches cost more than they save: -6% at 8k, -10% at 16k, -2.5% at 32k, then
++13-17% at 64k and +47-59% at 128k. `XWEN_QSA_SPARSE_MIN_KV` defaults to 49152, the
+midpoint of the last loss and the first win, and below it the dense route runs — which
+keeps every shorter prefill on the bitwise path.
+[Record](../records/qsa-sparse-prefill.md).
+
 **Third arch, composition over forking.** `Arch::Qwen4Exp` gets its own graph module;
 shared blocks (DeltaNet, attention internals, MoE glue, rope) are reused by composition
 and parameterized only where the math actually differs. The qwen35/qwen35moe forward

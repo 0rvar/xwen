@@ -41,7 +41,21 @@ pub fn select_rows(scores: &Tensor, keep: usize, ratio: usize, tail: usize) -> R
 /// the same bits as `QsaIndexer::top_blocks` + `expand_into` + the host
 /// fill. `n_blocks * ratio` must fit within `pos + n`.
 pub fn select_mask(scores: &Tensor, pos: usize, ratio: usize, keep_max: usize) -> Result<Tensor> {
-    dispatch::run_qsa_select_mask(scores, pos, ratio, keep_max)
+    Ok(dispatch::run_qsa_select_mask(scores, pos, ratio, keep_max)?.mask)
+}
+
+/// [`select_mask`] plus the per-query block lists the same kernel writes:
+/// `(mask, blocks [n, keep_max + 1] u32, nsel [n] u32)`, row `i`'s selected
+/// blocks ascending in `blocks[i, 0..nsel[i])`, the tail's incomplete block
+/// last when the query has a tail.
+pub fn select_mask_lists(
+    scores: &Tensor,
+    pos: usize,
+    ratio: usize,
+    keep_max: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let out = dispatch::run_qsa_select_mask(scores, pos, ratio, keep_max)?;
+    Ok((out.mask, out.blocks, out.nsel))
 }
 
 #[cfg(test)]

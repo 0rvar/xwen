@@ -58,6 +58,7 @@ entry is what would find the rest) and the syncs plus the serial scan.]
 7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
 8. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line earlier** (Decode performance, measured): +0.3 ms/token, +1.4%, no math change and no new kernel
 9. **GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger** (Decode performance, measured): the three-projection merge is -72 dispatches, about +1.4%
+10. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
 
 ## Decode performance
 
@@ -246,7 +247,7 @@ entry is what would find the rest) and the syncs plus the serial scan.]
    by the same probe and ranks above this item; the shared expert is 0.3% and drops off.**
   From: Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4).
 
-- [ ] [unpriced] **Prefill runs candle sdpa with a materialized mask, not the vendored
+- [ ] [measured] **Prefill runs candle sdpa with a materialized mask, not the vendored
   flash kernel.** `flash.metal` is compiled at `BD == 128` and Qwen 3.6 is head
   dim 256, so the in-kernel mask path is unreachable and `model.rs` materializes
   the `[1, n_head, seq, k_seq]` f16 mask on every prefill again — the allocation
@@ -256,6 +257,9 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   Folded in 2026-09-06: a fused sigmoid-gate kernel at the attention gate site (~2-3
   dispatches) rides along with the BD 256 flash instantiation; neither is sized against a
   measured bounty ([record](docs/records/27b-prefill-residual.md)).
+  Priced 2026-09-06: the probe's new `sdpa` stage reads 156-161 s of the 35B's 200 s
+  128k prefill (77-81%) and ~90-100 s of Flash-Next's 288-307 s after the sparse tiles
+  ([record](docs/records/qsa-sparse-prefill.md)). Promoted to the Front the same day.
   From: Deferred from the P2-P4 model-core retarget (2026-07-28).
 
 - [ ] [measured] **+350 to +560 µs/token of prefill cost lives OUTSIDE every measured stage, and it

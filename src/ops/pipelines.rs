@@ -153,6 +153,10 @@ const QSA_GATHER_SOURCE: &str = include_str!("qsa_gather.metal");
 /// compiles.
 const QSA_SELECT_SOURCE: &str = include_str!("qsa_select.metal");
 
+/// The QSA tile-batched sparse prefill attention glue (union, gathers, query
+/// tiling; `src/ops/qsa_tiles.metal`). Own library, integer and copy work only.
+const QSA_TILES_SOURCE: &str = include_str!("qsa_tiles.metal");
+
 /// The concatenated source for the TensorHp library: the shared mm_id template
 /// portion plus the split-out `_t_hp` instantiations. Built once on first use,
 /// so the (potentially unsupported) float-cooperative-tensor code is only ever
@@ -384,6 +388,11 @@ pub(crate) fn qsa_gather_pipeline(device: &Device, name: &str) -> Result<Compute
 /// Pipeline for the `qsa_select.metal` kernel (the QSA decode block selection).
 pub(crate) fn qsa_select_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, QSA_SELECT_SOURCE, "qsa_select", name)
+}
+
+/// Pipeline for the `qsa_tiles.metal` kernels.
+pub(crate) fn qsa_tiles_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, QSA_TILES_SOURCE, "qsa_tiles", name)
 }
 
 /// Pipeline for the PLE grouped gate and dilated convolution tail.

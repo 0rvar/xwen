@@ -4,6 +4,24 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-06 — QSA layers attend sparsely at prefill: 128k prefill 282-296 → 428-456 tok/s
+
+The probe the device-mask record asked for, and the route it justified, the same evening.
+Three new `XWEN_DUP_STAGE` stages (`sdpa`, `qsa_score`, `qsa_mask`) at 128k: duplicating
+the attention kernel added 240.7 s to a 465.9 s Flash-Next prefill (52% of wall) and
+156-161 s to the 35B's 200 s (77-81%), while the indexer's scoring and mask read at the
+noise floor — the sparse layers were running dense attention over 131k columns and
+keeping 2048. `ops::qsa_tiles` fixes that: per tile of 32 queries the union of selected
+blocks (a bitmap kernel), its K/V rows and mask gathered, one batched sdpa over the
+tiles; the union statistics (`XWEN_QSA_UNION_STATS`) put a 32-query tile at 18-37% of
+the blocks at 64k and chose the tile size. 128k prefill 445-466 s → 288-307 s, decode
+unchanged, peak 28 → 31 GB; forced greedy replay against the dense route 64/64 at 4096
+tokens. below 64k it does not pay (-10% at 16k, -2.5% at 32k, +13-17% at 64k), so it runs from
+49152 positions up (`XWEN_QSA_SPARSE_MIN_KV`), the dense route staying the bitwise one
+below that.
+`XWEN_QSA_ATTN_CLASSIC=1` is the dense route back, a parity row rather than a bitwise
+switch. [Record](records/qsa-sparse-prefill.md), [decision](decisions/flash-next.md).
+
 ## 2026-09-06 — QSA prefill selection and mask on the device: 128k prefill 231 → 284-296 tok/s, peak 59 → 28 GB
 
 The Front-1 item, priced first as it asked. `XWEN_QSA_TIMER` timed the host round trip

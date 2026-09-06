@@ -18,6 +18,7 @@ pub mod ple;
 pub mod q8;
 pub mod qsa_gather;
 pub mod qsa_select;
+pub mod qsa_tiles;
 pub mod silu_mul;
 
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
@@ -274,11 +275,20 @@ pub enum DupStage {
     Gdn,
     /// The gated-DeltaNet recurrent scan alone.
     GdnScan,
+    /// The multi-token attention kernel (candle's sdpa over the materialized
+    /// mask) on every full-attention layer, both architectures.
+    Sdpa,
+    /// The QSA indexer's block scoring: the query-against-block-keys gemm,
+    /// relu and head sum, per above-budget prefill chunk.
+    QsaScore,
+    /// The QSA prefill overlay: the device selection-and-mask kernel plus the
+    /// f16 copy `PrefillMask::from_raw` makes of the plane for sdpa.
+    QsaMask,
 }
 
 impl DupStage {
     /// The `XWEN_DUP_STAGE` token for each stage, in declaration order.
-    const NAMES: [(&'static str, DupStage); 9] = [
+    const NAMES: [(&'static str, DupStage); 12] = [
         ("experts", DupStage::Experts),
         ("experts_down", DupStage::ExpertsDown),
         ("router_proj", DupStage::RouterProj),
@@ -288,6 +298,9 @@ impl DupStage {
         ("hc_gemm", DupStage::HcGemm),
         ("gdn", DupStage::Gdn),
         ("gdn_scan", DupStage::GdnScan),
+        ("sdpa", DupStage::Sdpa),
+        ("qsa_score", DupStage::QsaScore),
+        ("qsa_mask", DupStage::QsaMask),
     ];
 
     fn from_name(name: &str) -> Option<DupStage> {
@@ -1015,6 +1028,54 @@ pub fn qsa_host_mask() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_QSA_HOST_MASK").is_some())
 }
+
+/// Kill switch (`XWEN_QSA_ATTN_CLASSIC`) for the tile-batched sparse prefill
+/// attention on QSA layers (`ops::qsa_tiles`): set, an above-budget prefill
+/// chunk attends densely over the whole cache under its `[n, n_kv]` mask, as
+/// every prefill did before 2026-09-06. `XWEN_QSA_CLASSIC` and
+/// `XWEN_QSA_HOST_MASK` imply it (the host arm has no block lists). Not a
+/// bitwise switch: the sparse route sums the same terms in another order.
+pub fn qsa_attn_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_QSA_ATTN_CLASSIC").is_some())
+}
+
+/// `XWEN_QSA_TILE=<n>`: queries per tile on the sparse prefill route, a
+/// multiple of 32. Value-parsed and read once; unset or invalid is the default.
+pub fn qsa_tile() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_QSA_TILE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n >= 32 && n % 32 == 0)
+            .unwrap_or(QSA_TILE_DEFAULT)
+    })
+}
+
+/// The shipped tile size (see docs/records/qsa-sparse-prefill.md for the
+/// union statistics that chose it).
+pub const QSA_TILE_DEFAULT: usize = 32;
+
+/// `XWEN_QSA_SPARSE_MIN_KV=<n>`: the cache length (positions, including the
+/// chunk) at or above which an above-budget prefill chunk takes the sparse
+/// tile route; below it the dense route over the mask runs, because there the
+/// attention is cheap and the route's gathers and its readback cost more than
+/// they save (-10% at 16k, -2.5% at 32k, +47-59% at 128k on 2026-09-06). `0`
+/// takes the route everywhere above budget. Value-parsed and read once.
+pub fn qsa_sparse_min_kv() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_QSA_SPARSE_MIN_KV")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(QSA_SPARSE_MIN_KV_DEFAULT)
+    })
+}
+
+/// The shipped crossover: between the 32k loss and the 64k win measured on
+/// 2026-09-06 (docs/records/qsa-sparse-prefill.md).
+pub const QSA_SPARSE_MIN_KV_DEFAULT: usize = 49152;
 
 /// Instrument (`XWEN_QSA_TIMER`) for the QSA indexer's prefill host round
 /// trip: each above-budget prefill chunk on each QSA layer drains the device,

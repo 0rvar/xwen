@@ -85,6 +85,10 @@ pub enum QsaSelection {
     /// hidden. Causality is ALREADY in it (a selected set is a subset of the
     /// prefix), so it replaces the causal mask rather than composing with it.
     Mask(Tensor),
+    /// Prefill overlay with the per-query block lists beside the mask, for
+    /// the tile-batched sparse attention (`ops::qsa_tiles`); the mask inside
+    /// is exactly what `Mask` would have carried.
+    Sparse(crate::ops::qsa_tiles::SparsePrefill),
     /// Decode overlay: `u32 [n_sel]`, the selected token indices ascending. The
     /// attention gathers exactly these K/V rows and runs maskless — candle's
     /// vector sdpa silently ignores a mask, so a mask is not an option at
@@ -292,6 +296,7 @@ impl QsaIndexer {
             classic,
             classic || crate::ops::qsa_host_topk(),
             classic || crate::ops::qsa_host_mask(),
+            !(classic || crate::ops::qsa_host_mask() || crate::ops::qsa_attn_classic()),
         )
     }
 
@@ -304,7 +309,11 @@ impl QsaIndexer {
     /// default selects on device (`ops::qsa_select`); `host_mask` does the
     /// same for a prefill chunk, reading the score plane back and uploading a
     /// host-filled mask, where the default writes the mask on device
-    /// (`ops::qsa_select::select_mask`). Each pair is bit-identical
+    /// (`ops::qsa_select::select_mask`); `sparse_attn` hands the device mask
+    /// over as [`QsaSelection::Sparse`] with its block lists, for the
+    /// tile-batched attention, instead of as [`QsaSelection::Mask`] — the
+    /// mask bits are the same either way, and only from
+    /// `XWEN_QSA_SPARSE_MIN_KV` positions up. Each pair is bit-identical
     /// (`cached_block_keys_match_the_classic_recompute`,
     /// `device_select_matches_host_top_blocks_bitwise`,
     /// `device_mask_matches_host_mask_bitwise`); the split exists so one test
@@ -317,6 +326,7 @@ impl QsaIndexer {
         classic: bool,
         host_topk: bool,
         host_mask: bool,
+        sparse_attn: bool,
     ) -> Result<QsaSelection> {
         let (n, _hidden) = x_normed.dims2()?;
         ensure!(
@@ -369,24 +379,40 @@ impl QsaIndexer {
         // rather than going negative — which is why exact ties are ordinary at
         // long context and the tie rule below is load-bearing.
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let per_head = q
-            .reshape((self.n_heads * n, self.head_dim))?
-            .matmul(&keys.t()?)?
-            .relu()?
-            .reshape((self.n_heads, n, n_blocks))?;
-        let scores = (strided_sum(&per_head, 0)? * scale)?; // [n, n_blocks]
+        let scores = crate::ops::dup(crate::ops::DupStage::QsaScore, n, || {
+            let per_head = q
+                .reshape((self.n_heads * n, self.head_dim))?
+                .matmul(&keys.t()?)?
+                .relu()?
+                .reshape((self.n_heads, n, n_blocks))?;
+            Ok((strided_sum(&per_head, 0)? * scale)?) // [n, n_blocks]
+        })?;
 
         // On device, no readback: the CPU keeps encoding the next layer while
         // the GPU is still on this one. A decode step selects into a row
         // list; a prefill chunk selects every query and writes the
         // `[n, n_kv]` additive mask in one dispatch.
         if n > 1 && !host_mask && matches!(device, Device::Metal(_)) {
-            let mask = crate::ops::qsa_select::select_mask(
-                &scores.contiguous()?,
-                pos,
-                self.ratio,
-                self.budget / self.ratio,
-            )?;
+            let (mask, blocks, nsel) = crate::ops::dup(crate::ops::DupStage::QsaMask, n, || {
+                crate::ops::qsa_select::select_mask_lists(
+                    &scores.contiguous()?,
+                    pos,
+                    self.ratio,
+                    self.budget / self.ratio,
+                )
+            })?;
+            if std::env::var_os("XWEN_QSA_UNION_STATS").is_some() {
+                union_stats(&mask, pos, n, n_blocks, self.ratio)?;
+            }
+            if sparse_attn && n_kv >= crate::ops::qsa_sparse_min_kv() {
+                return Ok(QsaSelection::Sparse(crate::ops::qsa_tiles::SparsePrefill {
+                    mask,
+                    blocks,
+                    nsel,
+                    ratio: self.ratio,
+                    n_blocks,
+                }));
+            }
             return Ok(QsaSelection::Mask(mask));
         }
         if n == 1 && !host_topk && matches!(device, Device::Metal(_)) {
@@ -584,6 +610,49 @@ impl QsaIndexer {
             out.push(t as u32);
         }
     }
+}
+
+/// `XWEN_QSA_UNION_STATS`: for a chunk's device mask, how many DISTINCT blocks
+/// each tile of T consecutive queries selects between them, for a few T — the
+/// number that prices a tile-batched sparse attention (the union is what such
+/// a route would gather and attend over). Reads the mask back; an instrument.
+fn union_stats(mask: &Tensor, pos: usize, n: usize, n_blocks: usize, ratio: usize) -> Result<()> {
+    let n_kv = pos + n;
+    let m = mask.flatten_all()?.to_vec1::<f32>()?;
+    let mut line = format!("[qsa-union pos={pos} n={n} n_blocks={n_blocks}]");
+    for t in [16usize, 32, 64, 128, 256] {
+        let mut sum = 0usize;
+        let mut max = 0usize;
+        let mut tiles = 0usize;
+        let mut seen = vec![false; n_blocks + 1];
+        for start in (0..n).step_by(t) {
+            seen.iter_mut().for_each(|s| *s = false);
+            let mut count = 0usize;
+            for i in start..(start + t).min(n) {
+                let row = &m[i * n_kv..(i + 1) * n_kv];
+                for (c, v) in row.iter().enumerate() {
+                    if *v == 0.0 {
+                        let b = c / ratio;
+                        if !seen[b] {
+                            seen[b] = true;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            sum += count;
+            max = max.max(count);
+            tiles += 1;
+        }
+        line.push_str(&format!(
+            " T={t}: mean {:.0} max {max} ({:.1}% / {:.1}% of blocks)",
+            sum as f64 / tiles as f64,
+            100.0 * sum as f64 / tiles as f64 / n_blocks as f64,
+            100.0 * max as f64 / n_blocks as f64
+        ));
+    }
+    crate::host_log::host_line(line);
+    Ok(())
 }
 
 /// One prefill chunk's host round trip on one QSA layer, as `select_with`
@@ -1479,6 +1548,7 @@ mod tests {
         match sel {
             QsaSelection::Dense => None,
             QsaSelection::Mask(m) => Some(bits(m)),
+            QsaSelection::Sparse(sp) => Some(bits(&sp.mask)),
             QsaSelection::Rows(r) => Some(r.to_vec1::<u32>().unwrap()),
         }
     }
@@ -1547,9 +1617,15 @@ mod tests {
             pos: usize,
             what: &str,
         ) -> QsaSelection {
-            let a = ix.select_with(x, classic, pos, true, true, true).unwrap();
-            let h = ix.select_with(x, host, pos, false, true, true).unwrap();
-            let b = ix.select_with(x, cached, pos, false, false, false).unwrap();
+            let a = ix
+                .select_with(x, classic, pos, true, true, true, false)
+                .unwrap();
+            let h = ix
+                .select_with(x, host, pos, false, true, true, false)
+                .unwrap();
+            let b = ix
+                .select_with(x, cached, pos, false, false, false, true)
+                .unwrap();
             assert_eq!(
                 selection_bits(&a),
                 selection_bits(&h),
@@ -1949,6 +2025,55 @@ mod tests {
             .map(f32::to_bits)
             .collect();
         assert_eq!(got, want, "NaN and negative scores");
+    }
+
+    /// The block lists `kernel_qsa_select_mask` writes beside the mask name,
+    /// per query, exactly the host's selected set ascending plus the tail's
+    /// incomplete block when the query has a tail — the same shapes as the
+    /// mask sweep, since a list that disagreed with the mask would make the
+    /// tile union miss a column the mask allows.
+    #[test]
+    fn device_block_lists_match_host_top_blocks() {
+        let device = metal_device().unwrap();
+        for (ci, &(budget, pos, n)) in [
+            (16usize, 0usize, 6usize),
+            (16, 13, 100),
+            (64, 2044, 40),
+            (2048, 30000, 300),
+            (2048, 129376, 2048),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let ix = selector(budget, RATIO, &device);
+            let n_blocks = (pos + n) / RATIO;
+            let scores = tied_scores(0xB00 + ci as u64, n * n_blocks);
+            let sets = ix.top_blocks(&scores, n, n_blocks, pos);
+            let t = Tensor::from_vec(scores, (n, n_blocks), &device).unwrap();
+            let (_, blocks, nsel) =
+                crate::ops::qsa_select::select_mask_lists(&t, pos, RATIO, budget / RATIO).unwrap();
+            let cap = budget / RATIO + 1;
+            assert_eq!(blocks.dims(), &[n, cap]);
+            let blocks = blocks.to_vec2::<u32>().unwrap();
+            let nsel = nsel.to_vec1::<u32>().unwrap();
+            for i in 0..n {
+                let visible = pos + i + 1;
+                let mut want: Vec<u32> = sets[i].iter().map(|b| *b as u32).collect();
+                if visible % RATIO != 0 {
+                    want.push((visible / RATIO) as u32);
+                }
+                assert_eq!(
+                    nsel[i] as usize,
+                    want.len(),
+                    "budget {budget} pos {pos} query {i}: nsel"
+                );
+                assert_eq!(
+                    &blocks[i][..want.len()],
+                    &want[..],
+                    "budget {budget} pos {pos} query {i}: list"
+                );
+            }
+        }
     }
 
     /// The equal-to-threshold quota spans many threads' stripes: every score

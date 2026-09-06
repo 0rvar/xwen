@@ -5325,6 +5325,20 @@ struct QsaSelectMaskArgs {
     pos: i32,
     ratio: i32,
     keep_max: i32,
+    cap: i32,
+}
+
+/// What `kernel_qsa_select_mask` writes for one chunk: the additive mask and,
+/// beside it, each query's selected blocks as a list.
+pub(crate) struct QsaSelectMaskOut {
+    /// `[n, pos + n]` f32, `-inf` hidden and `0` visible.
+    pub mask: Tensor,
+    /// `[n, keep_max + 1]` u32: query `i`'s selected blocks ascending in
+    /// `blocks[i, 0..nsel[i])`, its tail's incomplete block last when it has
+    /// a tail; slots past `nsel[i]` are unwritten.
+    pub blocks: Tensor,
+    /// `[n]` u32, the list lengths.
+    pub nsel: Tensor,
 }
 
 /// The prefill overlay of one chunk on device: for each of the `n` queries of
@@ -5332,15 +5346,15 @@ struct QsaSelectMaskArgs {
 /// the top-`min(keep_max, nb_i)` of its first `nb_i = min((pos + i + 1) /
 /// ratio, n_blocks)` block scores, expanded into an additive f32 mask row
 /// `[pos + n]` — `-inf` everywhere, `0` at the selected blocks' positions and
-/// at the query's raw tail — against `kernel_qsa_select_mask`. Returns the
-/// `[n, pos + n]` plane, the same bits `QsaIndexer::top_blocks` +
-/// `expand_into` + the host fill would produce. One threadgroup per query.
+/// at the query's raw tail — against `kernel_qsa_select_mask`, plus the
+/// per-query block lists. The mask is the same bits `QsaIndexer::top_blocks`
+/// + `expand_into` + the host fill would produce. One threadgroup per query.
 pub(crate) fn run_qsa_select_mask(
     scores: &Tensor,
     pos: usize,
     ratio: usize,
     keep_max: usize,
-) -> Result<Tensor> {
+) -> Result<QsaSelectMaskOut> {
     let cdev = scores.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("qsa_select_mask requires its scores on a Metal device");
@@ -5367,18 +5381,21 @@ pub(crate) fn run_qsa_select_mask(
     if checked_elems(&[n_blocks, ratio], "qsa_select_mask")? > n_kv {
         bail!("qsa_select_mask scores {n_blocks} blocks of {ratio}, beyond the {n_kv} positions");
     }
+    let cap = keep_max + 1;
     for (v, what) in [
         (n_blocks, "n_blocks"),
         (n_kv, "n_kv"),
         (pos, "pos"),
         (ratio, "ratio"),
         (keep_max, "keep_max"),
+        (cap, "cap"),
     ] {
         if v > i32::MAX as usize {
             bail!("qsa_select_mask {what} {v} overflows i32");
         }
     }
     let n_elems = checked_elems(&[n, n_kv], "qsa_select_mask")?;
+    let n_list = checked_elems(&[n, cap], "qsa_select_mask")?;
 
     let pipeline = pipelines::qsa_select_pipeline(mdev.device(), "kernel_qsa_select_mask")?;
     let width = pipeline
@@ -5393,6 +5410,8 @@ pub(crate) fn run_qsa_select_mask(
     // rounds to a power of two and reuses any free buffer at least this
     // large — so a prefill walk's ever-different chunk shapes share buffers.
     let dst = mdev.new_buffer(n_elems, DType::F32, "qsa_select_mask")?;
+    let blocks = mdev.new_buffer(n_list, DType::U32, "qsa_select_mask_blocks")?;
+    let nsel = mdev.new_buffer(n, DType::U32, "qsa_select_mask_nsel")?;
 
     let (s_guard, s_layout) = scores.storage_and_layout();
     let Storage::Metal(s_storage) = &*s_guard else {
@@ -5404,6 +5423,7 @@ pub(crate) fn run_qsa_select_mask(
         pos: pos as i32,
         ratio: ratio as i32,
         keep_max: keep_max as i32,
+        cap: cap as i32,
     };
     {
         let cmd = mdev.command_encoder()?;
@@ -5418,14 +5438,390 @@ pub(crate) fn run_qsa_select_mask(
             s_layout.start_offset() * DType::F32.size_in_bytes(),
         );
         encoder.set_output_buffer(2, Some(&dst), 0);
+        encoder.set_output_buffer(3, Some(&blocks), 0);
+        encoder.set_output_buffer(4, Some(&nsel), 0);
         encoder.dispatch_thread_groups(mtl_size(n, 1, 1), mtl_size(width, 1, 1));
     }
     drop(s_guard);
 
-    let storage = MetalStorage::new(dst, mdev.clone(), n_elems, DType::F32);
+    let tensor = |buf, count, shape: Shape, dtype| {
+        Tensor::from_storage(
+            Storage::Metal(MetalStorage::new(buf, mdev.clone(), count, dtype)),
+            shape,
+            candle_core::op::BackpropOp::none(),
+            false,
+        )
+    };
+    Ok(QsaSelectMaskOut {
+        mask: tensor(dst, n_elems, (n, n_kv).into(), DType::F32),
+        blocks: tensor(blocks, n_list, (n, cap).into(), DType::U32),
+        nsel: tensor(nsel, n, n.into(), DType::U32),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// QSA tile-batched sparse prefill attention — see src/ops/qsa_tiles.metal.
+
+/// Blocks the tile union's threadgroup bitmap can hold (`QSA_TILES_MAX_BLOCKS`
+/// there): a 262144-token context at ratio 4.
+pub(crate) const QSA_TILES_MAX_BLOCKS: usize = 65536;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaTileUnionArgs {
+    n: i32,
+    t: i32,
+    cap_in: i32,
+    n_blocks: i32,
+    cap_out: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaTileGatherArgs {
+    n: i32,
+    t: i32,
+    n_tiles: i32,
+    s: i32,
+    ratio: i32,
+    cap_out: i32,
+    heads: i32,
+    head_dim: i32,
+    len: i32,
+    src_stride_h: i64,
+    src_stride_r: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaTileMaskArgs {
+    n: i32,
+    t: i32,
+    n_tiles: i32,
+    s: i32,
+    ratio: i32,
+    cap_out: i32,
+    n_kv: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaTileQArgs {
+    n: i32,
+    t: i32,
+    n_tiles: i32,
+    heads: i32,
+    head_dim: i32,
+}
+
+fn metal_of<'a>(
+    t: &'a Tensor,
+    what: &str,
+) -> Result<(std::sync::RwLockReadGuard<'a, Storage>, candle_core::Layout)> {
+    let (g, l) = t.storage_and_layout();
+    if !matches!(&*g, Storage::Metal(_)) {
+        bail!("{what} is not on a Metal device");
+    }
+    Ok((g, l.clone()))
+}
+
+fn metal_buf<'a>(g: &'a std::sync::RwLockReadGuard<'a, Storage>) -> &'a Buffer {
+    match &**g {
+        Storage::Metal(m) => m.buffer(),
+        _ => unreachable!("checked by metal_of"),
+    }
+}
+
+/// Per tile of `t` consecutive queries, the DISTINCT blocks its queries'
+/// lists name, ascending, and how many: `(union [n_tiles, cap_out] u32,
+/// count [n_tiles] u32)` where `cap_out = min(n_blocks, t * cap_in)`. One
+/// threadgroup per tile, a bitmap over `n_blocks` in threadgroup memory —
+/// `n_blocks` being every id a list may hold, so the caller passes the
+/// CEILING of `n_kv / ratio` (the tail's incomplete block has an id), not
+/// the scored count. An id at or past it is silently dropped by the bitmap.
+pub(crate) fn run_qsa_tile_union(
+    blocks: &Tensor,
+    nsel: &Tensor,
+    t: usize,
+    n_blocks: usize,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = blocks.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("qsa_tile_union requires its lists on a Metal device");
+    };
+    let (n, cap_in) = blocks.dims2()?;
+    if blocks.dtype() != DType::U32 || nsel.dtype() != DType::U32 {
+        bail!("qsa_tile_union lists must be u32");
+    }
+    if !blocks.is_contiguous() || !nsel.is_contiguous() || nsel.dims1()? != n {
+        bail!("qsa_tile_union lists must be contiguous [n, cap] and [n]");
+    }
+    if n == 0 || t == 0 || n_blocks == 0 {
+        bail!("qsa_tile_union over n {n}, tile {t}, blocks {n_blocks}");
+    }
+    if n_blocks > QSA_TILES_MAX_BLOCKS {
+        bail!("qsa_tile_union: {n_blocks} blocks exceed the bitmap's {QSA_TILES_MAX_BLOCKS}");
+    }
+    let n_tiles = n.div_ceil(t);
+    let cap_out = n_blocks.min(checked_elems(&[t, cap_in], "qsa_tile_union")?);
+    for (v, what) in [(n, "n"), (t, "t"), (cap_in, "cap_in"), (cap_out, "cap_out")] {
+        if v > i32::MAX as usize {
+            bail!("qsa_tile_union {what} {v} overflows i32");
+        }
+    }
+    let n_out = checked_elems(&[n_tiles, cap_out], "qsa_tile_union")?;
+
+    let pipeline = pipelines::qsa_tiles_pipeline(mdev.device(), "kernel_qsa_tile_union")?;
+    let width = pipeline.max_total_threads_per_threadgroup().min(1024);
+    if width < 32 {
+        bail!("qsa_tile_union pipeline admits only {width} threads per threadgroup");
+    }
+    let width = width - width % 32;
+    let out = mdev.new_buffer(n_out, DType::U32, "qsa_tile_union")?;
+    let count = mdev.new_buffer(n_tiles, DType::U32, "qsa_tile_count")?;
+
+    let (bg, bl) = metal_of(blocks, "qsa_tile_union blocks")?;
+    let (sg, sl) = metal_of(nsel, "qsa_tile_union nsel")?;
+    let args = QsaTileUnionArgs {
+        n: n as i32,
+        t: t as i32,
+        cap_in: cap_in as i32,
+        n_blocks: n_blocks as i32,
+        cap_out: cap_out as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(metal_buf(&bg)), bl.start_offset() * 4);
+        encoder.set_input_buffer(2, Some(metal_buf(&sg)), sl.start_offset() * 4);
+        encoder.set_output_buffer(3, Some(&out), 0);
+        encoder.set_output_buffer(4, Some(&count), 0);
+        encoder.dispatch_thread_groups(mtl_size(n_tiles, 1, 1), mtl_size(width, 1, 1));
+    }
+    drop(bg);
+    drop(sg);
+    let tensor = |buf, cnt, shape: Shape| {
+        Tensor::from_storage(
+            Storage::Metal(MetalStorage::new(buf, mdev.clone(), cnt, DType::U32)),
+            shape,
+            candle_core::op::BackpropOp::none(),
+            false,
+        )
+    };
+    Ok((
+        tensor(out, n_out, (n_tiles, cap_out).into()),
+        tensor(count, n_tiles, n_tiles.into()),
+    ))
+}
+
+/// The union's K and V rows per tile, packed `[n_tiles, heads, s, head_dim]`
+/// f16 each, from `[heads, len, head_dim]` f16 cache views (head-strided
+/// allowed). Column `j` of a tile is row `union[tile, j / ratio] * ratio + j %
+/// ratio`; columns at or past `count[tile] * ratio` copy row 0 and are for the
+/// mask to hide.
+pub(crate) fn run_qsa_tile_gather_kv(
+    union: &Tensor,
+    count: &Tensor,
+    k_all: &Tensor,
+    v_all: &Tensor,
+    n: usize,
+    t: usize,
+    s: usize,
+    ratio: usize,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = k_all.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("qsa_tile_gather requires Metal");
+    };
+    let (n_tiles, cap_out) = union.dims2()?;
+    let (heads, len, head_dim) = k_all.dims3()?;
+    if v_all.dims3()? != (heads, len, head_dim) {
+        bail!("qsa_tile_gather k/v shapes differ");
+    }
+    if k_all.dtype() != DType::F16 || v_all.dtype() != DType::F16 {
+        bail!("qsa_tile_gather needs f16 k/v");
+    }
+    if head_dim % 4 != 0 || s == 0 || ratio == 0 || n_tiles != n.div_ceil(t) {
+        bail!(
+            "qsa_tile_gather bad geometry: head_dim {head_dim}, s {s}, ratio {ratio}, n_tiles {n_tiles}"
+        );
+    }
+    let (kg, kl) = metal_of(k_all, "qsa_tile_gather k")?;
+    let (vg, vl) = metal_of(v_all, "qsa_tile_gather v")?;
+    if kl.stride() != vl.stride() || kl.stride()[2] != 1 {
+        bail!("qsa_tile_gather: k/v strides must match and rows be contiguous");
+    }
+    if kl.start_offset() != vl.start_offset() {
+        bail!("qsa_tile_gather: k/v start offsets differ");
+    }
+    // The kernel copies as half4: rows and the view start must sit on
+    // 4-element boundaries.
+    if kl.start_offset() % 4 != 0 || kl.stride()[0] % 4 != 0 || kl.stride()[1] % 4 != 0 {
+        bail!("qsa_tile_gather: k/v view is not 4-element aligned");
+    }
+    let (ug, ul) = metal_of(union, "qsa_tile_gather union")?;
+    let (cg, cl) = metal_of(count, "qsa_tile_gather count")?;
+    let n_out = checked_elems(&[n_tiles, heads, s, head_dim], "qsa_tile_gather")?;
+    let k_dst = mdev.new_buffer(n_out, DType::F16, "qsa_tile_k")?;
+    let v_dst = mdev.new_buffer(n_out, DType::F16, "qsa_tile_v")?;
+    let args = QsaTileGatherArgs {
+        n: n as i32,
+        t: t as i32,
+        n_tiles: n_tiles as i32,
+        s: s as i32,
+        ratio: ratio as i32,
+        cap_out: cap_out as i32,
+        heads: heads as i32,
+        head_dim: head_dim as i32,
+        len: len as i32,
+        src_stride_h: kl.stride()[0] as i64,
+        src_stride_r: kl.stride()[1] as i64,
+    };
+    let pipeline = pipelines::qsa_tiles_pipeline(mdev.device(), "kernel_qsa_tile_gather_kv")?;
+    let width = (head_dim / 4)
+        .min(pipeline.max_total_threads_per_threadgroup())
+        .max(1);
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(metal_buf(&ug)), ul.start_offset() * 4);
+        encoder.set_input_buffer(2, Some(metal_buf(&cg)), cl.start_offset() * 4);
+        encoder.set_input_buffer(3, Some(metal_buf(&kg)), kl.start_offset() * 2);
+        encoder.set_input_buffer(4, Some(metal_buf(&vg)), vl.start_offset() * 2);
+        encoder.set_output_buffer(5, Some(&k_dst), 0);
+        encoder.set_output_buffer(6, Some(&v_dst), 0);
+        encoder.dispatch_thread_groups(mtl_size(s, n_tiles, heads), mtl_size(width, 1, 1));
+    }
+    drop(kg);
+    drop(vg);
+    drop(ug);
+    drop(cg);
+    let tensor = |buf| {
+        Tensor::from_storage(
+            Storage::Metal(MetalStorage::new(buf, mdev.clone(), n_out, DType::F16)),
+            (n_tiles, heads, s, head_dim),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )
+    };
+    Ok((tensor(k_dst), tensor(v_dst)))
+}
+
+/// The tiles' `[n_tiles, 1, t, s]` f16 additive mask off the chunk's full
+/// `[n, n_kv]` f32 mask at the union's columns; padding columns `-inf`,
+/// padding query rows copying row `n - 1`.
+pub(crate) fn run_qsa_tile_mask(
+    union: &Tensor,
+    count: &Tensor,
+    mask: &Tensor,
+    t: usize,
+    s: usize,
+    ratio: usize,
+) -> Result<Tensor> {
+    let cdev = mask.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("qsa_tile_mask requires Metal");
+    };
+    let (n_tiles, cap_out) = union.dims2()?;
+    let (n, n_kv) = mask.dims2()?;
+    if mask.dtype() != DType::F32 || !mask.is_contiguous() {
+        bail!("qsa_tile_mask needs a contiguous f32 mask");
+    }
+    if n_tiles != n.div_ceil(t) || s == 0 {
+        bail!("qsa_tile_mask bad geometry");
+    }
+    let (ug, ul) = metal_of(union, "qsa_tile_mask union")?;
+    let (cg, cl) = metal_of(count, "qsa_tile_mask count")?;
+    let (mg, ml) = metal_of(mask, "qsa_tile_mask mask")?;
+    let n_out = checked_elems(&[n_tiles, t, s], "qsa_tile_mask")?;
+    let out = mdev.new_buffer(n_out, DType::F16, "qsa_tile_mask")?;
+    let args = QsaTileMaskArgs {
+        n: n as i32,
+        t: t as i32,
+        n_tiles: n_tiles as i32,
+        s: s as i32,
+        ratio: ratio as i32,
+        cap_out: cap_out as i32,
+        n_kv: n_kv as i32,
+    };
+    let pipeline = pipelines::qsa_tiles_pipeline(mdev.device(), "kernel_qsa_tile_mask")?;
+    let wx = 64usize.min(s);
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(metal_buf(&ug)), ul.start_offset() * 4);
+        encoder.set_input_buffer(2, Some(metal_buf(&cg)), cl.start_offset() * 4);
+        encoder.set_input_buffer(3, Some(metal_buf(&mg)), ml.start_offset() * 4);
+        encoder.set_output_buffer(4, Some(&out), 0);
+        encoder.dispatch_thread_groups(mtl_size(s.div_ceil(wx), t, n_tiles), mtl_size(wx, 1, 1));
+    }
+    drop(ug);
+    drop(cg);
+    drop(mg);
     Ok(Tensor::from_storage(
-        Storage::Metal(storage),
-        (n, n_kv),
+        Storage::Metal(MetalStorage::new(out, mdev.clone(), n_out, DType::F16)),
+        (n_tiles, 1, t, s),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// `[heads, n, head_dim]` f32 queries re-laid as `[n_tiles, heads, t,
+/// head_dim]` f16, padding rows copying query `n - 1`.
+pub(crate) fn run_qsa_tile_q(q: &Tensor, t: usize) -> Result<Tensor> {
+    let cdev = q.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("qsa_tile_q requires Metal");
+    };
+    let (heads, n, head_dim) = q.dims3()?;
+    if q.dtype() != DType::F32 || !q.is_contiguous() || head_dim % 4 != 0 || n == 0 || t == 0 {
+        bail!("qsa_tile_q needs contiguous f32 [heads, n, head_dim] with head_dim % 4 == 0");
+    }
+    let n_tiles = n.div_ceil(t);
+    let (qg, ql) = metal_of(q, "qsa_tile_q q")?;
+    if ql.start_offset() % 4 != 0 {
+        bail!("qsa_tile_q: q view is not 4-element aligned");
+    }
+    let n_out = checked_elems(&[n_tiles, heads, t, head_dim], "qsa_tile_q")?;
+    let out = mdev.new_buffer(n_out, DType::F16, "qsa_tile_q")?;
+    let args = QsaTileQArgs {
+        n: n as i32,
+        t: t as i32,
+        n_tiles: n_tiles as i32,
+        heads: heads as i32,
+        head_dim: head_dim as i32,
+    };
+    let pipeline = pipelines::qsa_tiles_pipeline(mdev.device(), "kernel_qsa_tile_q")?;
+    let width = (head_dim / 4)
+        .min(pipeline.max_total_threads_per_threadgroup())
+        .max(1);
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(metal_buf(&qg)), ql.start_offset() * 4);
+        encoder.set_output_buffer(2, Some(&out), 0);
+        encoder.dispatch_thread_groups(mtl_size(t, n_tiles, heads), mtl_size(width, 1, 1));
+    }
+    drop(qg);
+    Ok(Tensor::from_storage(
+        Storage::Metal(MetalStorage::new(out, mdev.clone(), n_out, DType::F16)),
+        (n_tiles, heads, t, head_dim),
         candle_core::op::BackpropOp::none(),
         false,
     ))
