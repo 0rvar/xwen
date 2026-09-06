@@ -39,7 +39,7 @@ pins classic and the reference oracle runs classic too. Schema v12 records `rout
 
 The cost is memory. The router plane is now held twice, transposed for candle and as
 loaded for the gemv: ~251 MB on Flash-Next (512 × 2560 × 4 B × 48 layers) and ~8 MB on the
-35B. Open, and ledgered by the fix commit in progress.
+35B. Open, and ledgered by the fix commit f5dbffd.
 
 **Protocol, both A/Bs.** A pinned binary built in a detached worktree under /tmp at
 24c4069, so no `cargo build` in the main tree could swap it or its `include_str!` kernels
@@ -113,7 +113,7 @@ offset-alignment conditions; the kernel test compares against candle on the CPU 
 than on Metal; two reference-dump recipes in docs/parity.md would now produce a dump the
 gate rejects, because the oracle pin is load-bearing; a code comment misdescribes the
 doubled plane as ledgered and as a cost only the classic arm pays; and `mod f32` shadows
-the primitive type name. A fix commit is in progress, renaming the module to `f32_mv`, and
+the primitive type name. The fix commit f5dbffd landed the same day, renaming the module to `f32_mv`, and
 has not landed.
 
 **Decision: shipped on by default.** +10.3% on the 35B and +4.8% on Flash-Next, ahead in

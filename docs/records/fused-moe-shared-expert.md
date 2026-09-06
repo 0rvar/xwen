@@ -145,7 +145,7 @@ than the planed `QLinear` route production takes; the offset test leaves four bi
 zero; the `fused_shexp` predicate in the docs was missing three launcher conditions; two
 parity rows overstate `XWEN_SHEXP_QMATMUL` / `XWEN_MV_EXT_CLASSIC`; and the `moe_shexp`
 provenance label comes from the env predicate rather than from observed execution, so it
-records intent rather than what ran. A fix commit is in progress and has not landed.
+records intent rather than what ran. The fix commit landed the same day as 2c56d16.
 
 **Decision: shipped on by default.** +1.6% on the 35B in every round, +0.6-0.8% on
 Flash-Next, no loss anywhere, both checks pass. Open items, all ledgered: the

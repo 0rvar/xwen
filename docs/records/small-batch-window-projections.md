@@ -93,6 +93,14 @@ its fixed nsg=2 / nxpsg=8 geometry may not pay for that — but it is a hypothes
 flooring the Proj window at t>=3 is ledgered as needing its own A/B rather than shipped
 off this one.
 
+**A clean negative on the span-48 lm_head doubling, from the same A/B** (added to this
+record 2026-09-06 from the TODO.md annotation that held it). Span 48 is unchanged between
+the two arms: both read ~505-540 ms across all ten runs, medians 526.39 (HEAD) against
+521.97 (coverage), a 0.8% difference in the coverage arm's favour and well inside the
+run-to-run spread. That is expected, since the window ends at 8, and it is recorded
+because it rules out the projection routing as a contributor — whatever doubles the
+lm_head at span 48 is untouched by everything shipped so far.
+
 **Fixed in passing: `parity-gate.ts`'s model-process guard false-positived on this
 agent harness.** `isModelProcess` parsed every line of `pgrep -fl` output as a record,
 and an argv containing embedded newlines (the harness wraps commands as

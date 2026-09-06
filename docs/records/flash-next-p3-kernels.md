@@ -29,7 +29,11 @@ of 48 layers by the 640-column rule, `FusedExperts::use_mm` is all-or-nothing pe
 so one unsupported down plane sent all three expert planes of those layers through
 per-token `mul_mv_id` at prefill. `block_q5_1` and `dequantize_q5_1` are copied verbatim
 from the pinned llama.cpp and the tile loader was already 32-block generic through Q8_0,
-so the arm is small; it is instantiated for the classic, `_hp` and `_t` families. The ffn
+so the arm is small; it is instantiated for the classic, `_hp` and `_t` families and
+deliberately NOT `_t_hp`, because nothing routes a Q5_1 plane there, and Q5_1 joined the
+`mm_id` oracle test dtypes at 9/9 on GPU (those two details added to this record
+2026-09-06 from the TODO.md annotation that held them). The 880-token pair of the same
+A/B reads 250 → 490. The ffn
 stage went 2887 → 1031 µs/token and the gap to llama.cpp 3.30x → 1.78x. Decode did not
 move (37.7), which is expected — decode still takes candle's baked
 `kernel_mul_mv_id_q5_1_f32`. `XWEN_NO_MM_ID=1` is **not** the baseline for this arm: it
