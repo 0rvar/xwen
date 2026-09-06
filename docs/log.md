@@ -4,6 +4,22 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-06 — QSA prefill selection and mask on the device: 128k prefill 231 → 284-296 tok/s, peak 59 → 28 GB
+
+The Front-1 item, priced first as it asked. `XWEN_QSA_TIMER` timed the host round trip
+segment by segment on the 131072-token Flash-Next prefill: 102-106 s of GPU-idle in a
+563 s wall (readback 21, host top-k 42-44, fill 10, upload 30-31; 105 GB of scores read
+back, 421 GB of masks uploaded over 768 round trips). `kernel_qsa_select_mask` then
+runs the decode selector one threadgroup per query and writes each query's mask row in
+place, same bits as the host fill (pinned over fourteen shapes plus the scripted
+sequence); `XWEN_QSA_HOST_MASK=1` is the kill switch. A/B on the same prompt: 569 s →
+445-466 s over four repetitions, +22-28% at 128k, decode unchanged, peak footprint 59 →
+28 GB; at 8k the same switch reads +15.7%, and a greedy 8k run decodes byte-identically
+on both arms. The residual
+128k growth is now the sparse layers' sdpa computing every masked column, recorded
+as not taken with a probe as its reopen condition.
+[Record](records/qsa-device-mask.md), [decision](decisions/flash-next.md).
+
 ## 2026-09-06 — Drafting off by default on the 35B-A3B
 
 A policy change, no math touched. Two independent measurements the same day read the

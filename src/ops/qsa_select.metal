@@ -198,3 +198,143 @@ kernel void kernel_qsa_select(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// QSA prefill selection + mask: one threadgroup per QUERY of a chunk, writing
+// that query's row of the `[n, n_kv]` additive f32 mask the attention consumes
+// (`-inf` everywhere, `0` at the selected positions) straight from its row of
+// the `[n, n_blocks]` score plane. The selection per row is the decode kernel's
+// exactly — same keys, same radix threshold, same tie rank — with the row's
+// own `nb` (query `i` at absolute position `pos + i` sees `(pos + i + 1) /
+// ratio` complete blocks) and `keep = min(keep_max, nb)`; the compaction scan
+// is not needed, since a mask is written by POSITION, not by slot. It must
+// reproduce `QsaIndexer::top_blocks` + `expand_into` + the host fill bit for
+// bit (`device_mask_matches_host_mask_bitwise`).
+//
+// A row is written in two orderings: `-inf` over the whole row first, then
+// zeros over the tail and the selected blocks, with a device-memory barrier
+// between so no thread's background store lands over another's zero.
+
+// Matches dispatch.rs QsaSelectMaskArgs (#[repr(C)]).
+typedef struct {
+    int32_t n_blocks;  // score row stride: blocks scored per query, >= 1
+    int32_t n_kv;      // mask row stride: pos + n
+    int32_t pos;       // absolute position of query 0
+    int32_t ratio;     // positions per block
+    int32_t keep_max;  // budget / ratio
+} qsa_select_mask_args;
+
+kernel void kernel_qsa_select_mask(
+        constant qsa_select_mask_args & args [[buffer(0)]],
+        device const float * scores          [[buffer(1)]],
+        device float * mask                  [[buffer(2)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint tid   [[thread_index_in_threadgroup]],
+        uint3 tg3  [[threads_per_threadgroup]],
+        uint lane  [[thread_index_in_simdgroup]],
+        uint sg    [[simdgroup_index_in_threadgroup]]) {
+    threadgroup atomic_uint hist[256];
+    threadgroup uint simd_tot[QSA_SELECT_MAX_SIMDGROUPS];
+    threadgroup uint sh_prefix;
+    threadgroup uint sh_need;
+
+    const uint width = tg3.x;
+    const uint i = tgid.x;
+    const uint n_blocks = (uint) args.n_blocks;
+    const uint n_kv = (uint) args.n_kv;
+    const uint ratio = (uint) args.ratio;
+    const uint visible = (uint) args.pos + i + 1;
+    const uint nb = min(visible / ratio, n_blocks);
+    const uint keep = min((uint) args.keep_max, nb);
+
+    device const float * row_scores = scores + (size_t) i * n_blocks;
+    device float * row = mask + (size_t) i * n_kv;
+
+    for (uint t = tid; t < n_kv; t += width) {
+        row[t] = -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // The tail: the positions above the last complete block, always visible.
+    for (uint t = visible - visible % ratio + tid; t < visible; t += width) {
+        row[t] = 0.0f;
+    }
+    if (keep == 0) {
+        return;
+    }
+
+    const uint chunk = (nb + width - 1) / width;
+    const uint lo = min(tid * chunk, nb);
+    const uint hi = min(lo + chunk, nb);
+
+    if (keep >= nb) {
+        for (uint t = lo * ratio; t < hi * ratio; t++) {
+            row[t] = 0.0f;
+        }
+        return;
+    }
+
+    // ---- threshold: MSB-first radix select, as in kernel_qsa_select ----
+    uint prefix = 0;
+    uint kmask = 0;
+    uint need = keep;
+    for (uint pass = 0; pass < 4; pass++) {
+        const uint shift = 24 - 8 * pass;
+        for (uint b = tid; b < 256; b += width) {
+            atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint b = lo; b < hi; b++) {
+            const uint key = score_key(row_scores[b]);
+            if ((key & kmask) == prefix) {
+                atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFFu], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            uint acc = 0;
+            uint digit = 0;
+            for (int bin = 255; bin >= 0; bin--) {
+                const uint c = atomic_load_explicit(&hist[bin], memory_order_relaxed);
+                if (acc + c >= need) {
+                    digit = (uint) bin;
+                    need -= acc;
+                    break;
+                }
+                acc += c;
+            }
+            sh_prefix = prefix | (digit << shift);
+            sh_need = need;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = sh_prefix;
+        need = sh_need;
+        kmask |= 0xFFu << shift;
+    }
+    const uint T = prefix;
+    const uint need_eq = need;
+
+    // ---- emit: every key above T, and the first need_eq keys equal to it
+    // in block-index order ----
+    uint c_eq = 0;
+    for (uint b = lo; b < hi; b++) {
+        c_eq += (score_key(row_scores[b]) == T) ? 1u : 0u;
+    }
+    const uint eq_prefix = tg_exclusive_scan(c_eq, simd_tot, lane, sg);
+    const uint sel_eq = (eq_prefix >= need_eq) ? 0u : min(c_eq, need_eq - eq_prefix);
+
+    uint taken = 0;
+    for (uint b = lo; b < hi; b++) {
+        const uint key = score_key(row_scores[b]);
+        bool emit = key > T;
+        if (key == T && taken < sel_eq) {
+            emit = true;
+            taken++;
+        }
+        if (emit) {
+            for (uint j = 0; j < ratio; j++) {
+                row[b * ratio + j] = 0.0f;
+            }
+        }
+    }
+}

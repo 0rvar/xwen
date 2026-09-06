@@ -1005,6 +1005,28 @@ pub fn qsa_host_topk() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_QSA_HOST_TOPK").is_some())
 }
 
+/// Kill switch (`XWEN_QSA_HOST_MASK`) for the QSA indexer's device-side
+/// prefill selection and mask (`ops::qsa_select::select_mask`,
+/// `kernel_qsa_select_mask`): set, an above-budget prefill chunk reads its
+/// score plane back, selects on the host and uploads a host-filled mask, as
+/// every prefill did before 2026-09-06 — the arm `XWEN_QSA_TIMER` prices.
+/// `XWEN_QSA_CLASSIC` implies it.
+pub fn qsa_host_mask() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_QSA_HOST_MASK").is_some())
+}
+
+/// Instrument (`XWEN_QSA_TIMER`) for the QSA indexer's prefill host round
+/// trip: each above-budget prefill chunk on each QSA layer drains the device,
+/// then times the score readback, the host selection, the mask fill and the
+/// upload separately, and `XwenModel::dump_stack_profile` prints the totals
+/// after the prefill. Measurement only: the selection is unchanged, and the
+/// extra sync is one the readback would have made anyway.
+pub fn qsa_timer() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_QSA_TIMER").is_some())
+}
+
 /// Token count the carrier's grouped norm must be BELOW for `ops::hc_norm` to
 /// take the split launch — `kernel_hc_norm_split` plus, on a gated block,
 /// `kernel_hc_inject`, one threadgroup per (token, stream) each — instead of

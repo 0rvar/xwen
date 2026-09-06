@@ -5316,6 +5316,121 @@ pub(crate) fn run_qsa_select(
     ))
 }
 
+/// Matches the Metal `qsa_select_mask_args` struct (src/ops/qsa_select.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaSelectMaskArgs {
+    n_blocks: i32,
+    n_kv: i32,
+    pos: i32,
+    ratio: i32,
+    keep_max: i32,
+}
+
+/// The prefill overlay of one chunk on device: for each of the `n` queries of
+/// `scores` (f32 `[n, n_blocks]`, query `i` at absolute position `pos + i`),
+/// the top-`min(keep_max, nb_i)` of its first `nb_i = min((pos + i + 1) /
+/// ratio, n_blocks)` block scores, expanded into an additive f32 mask row
+/// `[pos + n]` — `-inf` everywhere, `0` at the selected blocks' positions and
+/// at the query's raw tail — against `kernel_qsa_select_mask`. Returns the
+/// `[n, pos + n]` plane, the same bits `QsaIndexer::top_blocks` +
+/// `expand_into` + the host fill would produce. One threadgroup per query.
+pub(crate) fn run_qsa_select_mask(
+    scores: &Tensor,
+    pos: usize,
+    ratio: usize,
+    keep_max: usize,
+) -> Result<Tensor> {
+    let cdev = scores.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("qsa_select_mask requires its scores on a Metal device");
+    };
+    if scores.dtype() != DType::F32 {
+        bail!(
+            "qsa_select_mask scores must be f32, got {:?}",
+            scores.dtype()
+        );
+    }
+    if !scores.is_contiguous() {
+        bail!("qsa_select_mask scores must be contiguous");
+    }
+    let (n, n_blocks) = scores.dims2()?;
+    if n == 0 || n_blocks == 0 {
+        bail!("qsa_select_mask over an empty [{n}, {n_blocks}] score plane");
+    }
+    if ratio == 0 {
+        bail!("qsa_select_mask block ratio must be nonzero");
+    }
+    let Some(n_kv) = pos.checked_add(n) else {
+        bail!("qsa_select_mask position {pos} plus {n} queries overflows");
+    };
+    if checked_elems(&[n_blocks, ratio], "qsa_select_mask")? > n_kv {
+        bail!("qsa_select_mask scores {n_blocks} blocks of {ratio}, beyond the {n_kv} positions");
+    }
+    for (v, what) in [
+        (n_blocks, "n_blocks"),
+        (n_kv, "n_kv"),
+        (pos, "pos"),
+        (ratio, "ratio"),
+        (keep_max, "keep_max"),
+    ] {
+        if v > i32::MAX as usize {
+            bail!("qsa_select_mask {what} {v} overflows i32");
+        }
+    }
+    let n_elems = checked_elems(&[n, n_kv], "qsa_select_mask")?;
+
+    let pipeline = pipelines::qsa_select_pipeline(mdev.device(), "kernel_qsa_select_mask")?;
+    let width = pipeline
+        .max_total_threads_per_threadgroup()
+        .min(QSA_SELECT_MAX_THREADS);
+    if width < 32 {
+        bail!("qsa_select_mask pipeline admits only {width} threads per threadgroup");
+    }
+    let width = width - width % 32;
+    // Unlike the host arm's `Tensor::from_vec` (an exact-size buffer the pool
+    // never hands out again), this goes through candle's allocator, which
+    // rounds to a power of two and reuses any free buffer at least this
+    // large — so a prefill walk's ever-different chunk shapes share buffers.
+    let dst = mdev.new_buffer(n_elems, DType::F32, "qsa_select_mask")?;
+
+    let (s_guard, s_layout) = scores.storage_and_layout();
+    let Storage::Metal(s_storage) = &*s_guard else {
+        bail!("qsa_select_mask scores are not on a Metal device");
+    };
+    let args = QsaSelectMaskArgs {
+        n_blocks: n_blocks as i32,
+        n_kv: n_kv as i32,
+        pos: pos as i32,
+        ratio: ratio as i32,
+        keep_max: keep_max as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(s_storage.buffer()),
+            s_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(2, Some(&dst), 0);
+        encoder.dispatch_thread_groups(mtl_size(n, 1, 1), mtl_size(width, 1, 1));
+    }
+    drop(s_guard);
+
+    let storage = MetalStorage::new(dst, mdev.clone(), n_elems, DType::F32);
+    Ok(Tensor::from_storage(
+        Storage::Metal(storage),
+        (n, n_kv),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Hyper-connections (qwen4exp carrier read/write) — see src/ops/hc.metal.
 // ---------------------------------------------------------------------------

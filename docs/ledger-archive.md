@@ -2929,3 +2929,26 @@ blocks use of the feature; item (a) is the one with a known trigger.
   the next chunk's mask while the GPU is still on this one. This is a memory item.
   [Record](records/long-context-envelope.md).
   From: Deferred from the long-context envelope arc (2026-09-06).
+
+[Shipped 2026-09-06 by the arc recorded in docs/records/qsa-device-mask.md: the prefill selection and the mask now build on the device (`kernel_qsa_select_mask`, kill switch `XWEN_QSA_HOST_MASK`), and the round trip was priced first with `XWEN_QSA_TIMER`. No open remainder here; the decode-side cousins stay folded into «Above the 2048 indexer budget: +165 dispatches» in TODO.md "Decode performance".]
+
+- [ ] [measured] **QSA prefill selection round-trips through the host per sparse layer per chunk, and it is the Flash-Next long-context tax.** Flash-Next prefill falls 925 → 584 → 403 → 231 tok/s from 8k to
+  128k (2026-09-06, [record](records/long-context-envelope.md)), i.e. 1.08 → 4.33
+  ms/token, three times the growth the 35B-A3B shows over the same range (0.43 → 1.50),
+  while Flash-Next decode stays flat (47 → 42). The only work Flash-Next does that the 35B
+  does not is the sparse selection: per QSA layer per 2048-token chunk, `select_with`
+  (`qwen4exp/indexer.rs`) reads the score plane back to the host, fills an `n x n_kv`
+  f32 mask there, uploads it and converts to f16 — roughly a gigabyte each way per layer
+  per chunk at 128k, twelve layers, sixty-four chunks — and unlike the causal mask it is
+  on the critical path, because the GPU waits for the readback before the mask exists.
+  That is why the causal-mask A/B priced at 0% of wall (candle builds that one ahead of
+  the GPU) and why that result does not transfer here. The same path is the 42 GB of
+  Flash-Next's 59 GB peak at 128k that the device causal mask did not move (no two
+  `Tensor::from_vec` allocations ask the pool for the same size, so none is recycled).
+  Unpriced as a share of wall: the 128k profile was skipped. Step one is an hour's timer
+  around the readback, fill and upload at 128k; if it confirms, build the selection and
+  the -inf plane with scattered zeros on the device, same values, behind a kill switch,
+  no readback. The decode-side cousins (device partial top-k, cooperative threshold
+  walk) are folded into «Above the 2048 indexer budget: +165 dispatches» in "Decode
+  performance"; the retired per-chunk readback item's reopen condition is this number.
+  From: Deferred from the long-context envelope arc (2026-09-06).

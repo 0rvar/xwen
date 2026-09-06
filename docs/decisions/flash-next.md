@@ -65,6 +65,26 @@ row buffer it writes is what the attention's gather reads. Four decisions inside
    Bench: log.md 2026-08-30 (QSA decode, step C) — 33 → 44-45 tok/s at 3.8k-32k, the
    cliff closed.
 
+**Prefill selection and its mask run on the device too (2026-09-06), and decision 3
+above is superseded.** "Prefill stays on the host" rested on the readback buying the
+mask assembly for free, and at 128k it does not: timed segment by segment with
+`XWEN_QSA_TIMER` (an explicit drain, then the readback, the host top-k, the fill and the
+upload, each on its own clock), the round trip idled the GPU for 102-106 s of a 563 s
+131072-token prefill — 768 round trips, 105 GB of scores read back and 421 GB of masks
+uploaded, the host top-k alone 41-44 s of it. `kernel_qsa_select_mask` is the decode
+kernel's radix select run one threadgroup per query over the `[n, n_blocks]` score
+plane, writing each query's row of the `[n, n_kv]` additive mask in place (`-inf`
+first, a device-memory barrier, then zeros over the tail and the selected blocks); no
+compaction scan, since a mask is written by position. The mask comes out of candle's
+allocator (power-of-two sizes, any free buffer at least as large is reused) rather than
+the exact-size, never-reused buffers `Tensor::from_vec` makes, which is where the host
+arm's 42 GB came from. Same bits as the host fill for every row, held by
+`device_mask_matches_host_mask_bitwise` (tail-only rows, identity rows, the shipped
+512-block keep at 30k, 65k and 131k, a final partial chunk, NaN and negative scores);
+`XWEN_QSA_HOST_MASK` restores the host arm and `XWEN_QSA_CLASSIC` implies it. +22-28% at 128k (569 → 445-466 s), +15.7% at 8k, peak 59 → 28 GB, a greedy 8k run
+byte-identical on both arms; the tables are in
+[the record](../records/qsa-device-mask.md).
+
 **Third arch, composition over forking.** `Arch::Qwen4Exp` gets its own graph module;
 shared blocks (DeltaNet, attention internals, MoE glue, rope) are reused by composition
 and parameterized only where the math actually differs. The qwen35/qwen35moe forward

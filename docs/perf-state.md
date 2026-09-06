@@ -46,6 +46,7 @@ reasoning behind the choice that produced it lives in [decisions](decisions.md).
 | Qwen3.8-Flash-Next | plain decode, 2..8-token forwards | 149.7 tok/s at chunk 8, 108.9 at 4, 68.1 at 2; the `XWEN_HC_GATE_CLASSIC` arm read 93.2 / 69.5 / 38.6, so +57-76% | 2026-09-06, every forward forced to n tokens with `XWEN_PREFILL_CHUNK` | not recorded |
 | Qwen3.8-Flash-Next | drafted decode | none; the checkpoint ships no drafter and decodes plain, saying so | | |
 | Qwen3.8-Flash-Next | serve decode | 42-47 tok/s through 32k, at parity with `generate` | 2026-08-30 | `powermode 0` |
+| Qwen3.8-Flash-Next | prefill @131424 | 282-296 tok/s, peak footprint 28 GB (231 tok/s and 59 GB before the device-side QSA prefill selection and mask, +22-28%; the 8243 row moved 948 → 1097 in the same arc) | 2026-09-06, [record](records/qsa-device-mask.md) | `lowpowermode 0` |
 | Qwen3.8-Flash-Next | prefill @3851 | 1140 tok/s (1010 before the device-side PLE gate and conv, +12.8%) | 2026-09-05 | `lowpowermode 0` |
 | Qwen3.8-Flash-Next | prefill @880 | 1262 tok/s (1118 before it, +12.9%) | 2026-09-05 | `lowpowermode 0` |
 | Qwen3.8-Flash-Next | prefill @530 | ~796 tok/s | 2026-08-29, after the P3 kernel pass | `powermode 0` |
@@ -113,12 +114,14 @@ CPU; treat the absolutes as this session's and the shape as the finding.
 | 8243 | 925 | 8.9 s | 47.1 | 20.0 GB |
 | 32921 | 584 | 56.3 s | 46.0 | 20.0 GB |
 | 65596 | 403 | 162.7 s | 46.9 | 27.0 GB |
-| 131424 | 231 | 569.3 s | 41.9 | 59.0 GB |
+| 131424 | 282-296 | 444.8-465.7 s | 40.9-42.1 | 28.0 GB |
 
-The 131424 row is one repetition, and it comes from the working-tree build's
-`XWEN_HOST_MASK=1` control arm rather than the pinned one — the same mask values by
-construction, measured in the prefill-mask A/B. Its device-mask twin read 230.9 / 42.1 /
-59.0, so the row is the same either way.
+The 131424 row was retaken later on 2026-09-06 by [the QSA device-mask
+arc](records/qsa-device-mask.md), two repetitions; on the host-selection path the
+envelope measured it at 231 / 569.3 s / 41.9 / 59.0 GB. The other three rows predate that
+arc and their prefill figures are conservative: the same arc's greedy check read the 8243
+row at 947.8 on the host arm against 1096.5 on the device arm, +15.7%, one repetition
+each.
 
 Three things to read off these:
 
@@ -129,16 +132,18 @@ Three things to read off these:
   extends to 64k unchanged. On the 35B, long-context decode is a different regime from
   the headline 127.0 and should never be quoted from it.
 - **Prefill falls on both, and it is the wall an operator actually hits.** A maximal
-  prefill is 197 s on the 35B and 569 s on Flash-Next, which is slower per token at every
-  length. The 231 tok/s floor is what `queue_timeout` is now derived from
-  (decisions/serving.md).
+  prefill is 197 s on the 35B and was 569 s on Flash-Next, 445-463 s since the QSA
+  device mask the same day; Flash-Next is still slower per token at every length. The
+  231 tok/s floor is what `queue_timeout` is derived from (decisions/serving.md), and it
+  stays at 231 on purpose: a floor that only rises keeps the timeout conservative.
 - **Peak footprint quadrupled on the 35B**, 12.0 to 50.5 GB, on weights of 20.4 GB and a
   KV cache of 2.6 GB at 131072 — so ~28 GB of the peak was neither. It was the prefill
   mask, and building it on the device fixed it: the same 131072 run now peaks at a flat
   **17 GB against 42-69 GB** on the host path, measured in the same binary with
-  `XWEN_HOST_MASK=1` as the control arm. Flash-Next does not move (59 GB either way)
-  because its QSA indexer builds its own host mask per sparse layer per chunk, which is
-  what the remaining 42 GB there is. See
+  `XWEN_HOST_MASK=1` as the control arm. Flash-Next did not move (59 GB either way)
+  because its QSA indexer built its own host mask per sparse layer per chunk; that mask
+  moved to the device later the same day and the peak is 28 GB since
+  ([the QSA device-mask record](records/qsa-device-mask.md)). See
   [the long-context envelope record](records/long-context-envelope.md).
 
 The prefill-mask A/B itself, one repetition per arm on the working-tree build, both arms

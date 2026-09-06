@@ -25,9 +25,14 @@
 //!   drained the pipeline once per token for a readback of a few KB, and the
 //!   GPU idled while the CPU encoded the next layer. `XWEN_QSA_HOST_TOPK`
 //!   restores the readback.
-//! - **A prefill chunk selects on the HOST**, off a `[n_q, n_blocks]` score
-//!   readback, because its overlay is materialized as a `[n_q, n_kv]` additive
-//!   mask anyway, so the round trip buys the assembly for free.
+//! - **A prefill chunk selects ON DEVICE too**, `kernel_qsa_select_mask`
+//!   (`ops::qsa_select::select_mask`): one threadgroup per query, the same
+//!   radix select per row, writing the `[n_q, n_kv]` additive mask the
+//!   attention consumes straight into place. Before it (until 2026-09-06),
+//!   the chunk read its score plane back, selected on the host, filled the
+//!   mask there and uploaded it — 102-106 s of GPU-idle time in a 563 s
+//!   131072-token prefill, priced with `XWEN_QSA_TIMER` on that arm, which
+//!   `XWEN_QSA_HOST_MASK` restores.
 //!
 //! Both paths implement one tie rule, and it is a set-identity property: a
 //! total order (score descending, block index ascending) that the host states
@@ -38,13 +43,12 @@
 //! edge case. The kernel is held to the host's rows bit for bit
 //! (`device_select_matches_host_top_blocks_bitwise`).
 //!
-//! The prefill cost is real and known: at 2200 tokens the readback is ~5 MB
-//! and the mask upload ~19 MB (the f32 `[n_q, n_kv]` plane), per QSA layer per
-//! forward, plus the ~9.7 MB f16 copy `PrefillMask::from_raw` makes of it for
-//! sdpa. That f16 copy is ONE plane broadcast across the heads, not one per
-//! head — see `from_raw`, where materializing it would be 232 MB at this
-//! length. A device-side mask assembly is the remaining replacement (TODO.md);
-//! the selection sets it must reproduce are pinned by the tests below.
+//! What the prefill overlay still costs is the plane itself: the f32
+//! `[n_q, n_kv]` mask (1 GB per QSA layer per 2048-token chunk at 131072) and
+//! the f16 copy `PrefillMask::from_raw` makes of it for sdpa. That f16 copy is
+//! ONE plane broadcast across the heads, not one per head — see `from_raw`,
+//! where materializing it would be 232 MB at 2200 tokens. The selection sets
+//! both arms must reproduce are pinned by the tests below.
 //!
 //! # Blocks are query-independent
 //!
@@ -57,6 +61,7 @@
 //! blocks are cut from the sequence, never from the chunk.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use candle_core::quantized::GgmlDType;
@@ -286,19 +291,24 @@ impl QsaIndexer {
             pos,
             classic,
             classic || crate::ops::qsa_host_topk(),
+            classic || crate::ops::qsa_host_mask(),
         )
     }
 
-    /// [`Self::select`] with the two decode paths chosen by the caller instead
-    /// of by `XWEN_QSA_CLASSIC` / `XWEN_QSA_HOST_TOPK`: `classic` recomputes
-    /// every block key from the raw rows each call
+    /// [`Self::select`] with the three paths chosen by the caller instead of
+    /// by `XWEN_QSA_CLASSIC` / `XWEN_QSA_HOST_TOPK` / `XWEN_QSA_HOST_MASK`:
+    /// `classic` recomputes every block key from the raw rows each call
     /// ([`Self::block_keys_classic`]), the default reads them off the cache's
     /// block plane ([`Self::block_keys_cached`]); `host_topk` reads a decode
     /// step's scores back and selects on the host ([`Self::top_blocks`]), the
-    /// default selects on device (`ops::qsa_select`). Each pair is
-    /// bit-identical (`cached_block_keys_match_the_classic_recompute`,
-    /// `device_select_matches_host_top_blocks_bitwise`); the split exists so
-    /// one test can run the arms over one scripted sequence.
+    /// default selects on device (`ops::qsa_select`); `host_mask` does the
+    /// same for a prefill chunk, reading the score plane back and uploading a
+    /// host-filled mask, where the default writes the mask on device
+    /// (`ops::qsa_select::select_mask`). Each pair is bit-identical
+    /// (`cached_block_keys_match_the_classic_recompute`,
+    /// `device_select_matches_host_top_blocks_bitwise`,
+    /// `device_mask_matches_host_mask_bitwise`); the split exists so one test
+    /// can run the arms over one scripted sequence.
     fn select_with(
         &self,
         x_normed: &Tensor,
@@ -306,6 +316,7 @@ impl QsaIndexer {
         pos: usize,
         classic: bool,
         host_topk: bool,
+        host_mask: bool,
     ) -> Result<QsaSelection> {
         let (n, _hidden) = x_normed.dims2()?;
         ensure!(
@@ -365,9 +376,19 @@ impl QsaIndexer {
             .reshape((self.n_heads, n, n_blocks))?;
         let scores = (strided_sum(&per_head, 0)? * scale)?; // [n, n_blocks]
 
-        // A decode step selects on device: no readback, so the CPU keeps
-        // encoding the next layer while the GPU is still on this one. The
-        // prefill overlay is a host-assembled mask and keeps the readback.
+        // On device, no readback: the CPU keeps encoding the next layer while
+        // the GPU is still on this one. A decode step selects into a row
+        // list; a prefill chunk selects every query and writes the
+        // `[n, n_kv]` additive mask in one dispatch.
+        if n > 1 && !host_mask && matches!(device, Device::Metal(_)) {
+            let mask = crate::ops::qsa_select::select_mask(
+                &scores.contiguous()?,
+                pos,
+                self.ratio,
+                self.budget / self.ratio,
+            )?;
+            return Ok(QsaSelection::Mask(mask));
+        }
         if n == 1 && !host_topk && matches!(device, Device::Metal(_)) {
             let keep = (self.budget / self.ratio).min(n_blocks);
             // At a single-token step `n_kv == pos + 1` (the cache length was
@@ -383,8 +404,23 @@ impl QsaIndexer {
             return Ok(QsaSelection::Rows(rows));
         }
 
+        // The host round trip, timed segment by segment under
+        // `XWEN_QSA_TIMER`. The explicit sync first drains the device work
+        // queued ahead of the readback, so `readback` below is the copy
+        // alone and not the GPU compute the readback happens to wait for.
+        // Everything after the sync until the upload returns is time the GPU
+        // sits idle with nothing queued: that sum is the round trip's cost.
+        let timer = crate::ops::qsa_timer() && n > 1;
+        let t_sync = timer.then(|| {
+            let t = Instant::now();
+            let _ = device.synchronize();
+            t.elapsed()
+        });
+        let t0 = Instant::now();
         let scores = scores.flatten_all()?.to_vec1::<f32>()?;
+        let t1 = Instant::now();
         let sets = self.top_blocks(&scores, n, n_blocks, pos);
+        let t2 = Instant::now();
 
         if n == 1 {
             let mut rows: Vec<u32> = Vec::with_capacity(sets[0].len() * self.ratio + self.ratio);
@@ -403,11 +439,21 @@ impl QsaIndexer {
                 row[t as usize] = 0.0;
             }
         }
-        Ok(QsaSelection::Mask(Tensor::from_vec(
-            mask,
-            (n, n_kv),
-            device,
-        )?))
+        let t3 = Instant::now();
+        let mask = Tensor::from_vec(mask, (n, n_kv), device)?;
+        if let Some(sync) = t_sync {
+            qsa_timer::record(QsaTimerSample {
+                sync,
+                readback: t1 - t0,
+                select: t2 - t1,
+                fill: t3 - t2,
+                upload: t3.elapsed(),
+                score_bytes: n * n_blocks * 4,
+                mask_bytes: n * n_kv * 4,
+                n_kv,
+            });
+        }
+        Ok(QsaSelection::Mask(mask))
     }
 
     /// The keys of blocks `[start, start + m)` from their raw rows: mean in f32
@@ -536,6 +582,112 @@ impl QsaIndexer {
         let visible = q_pos + 1;
         for t in (visible - visible % self.ratio)..visible {
             out.push(t as u32);
+        }
+    }
+}
+
+/// One prefill chunk's host round trip on one QSA layer, as `select_with`
+/// measured it under `XWEN_QSA_TIMER`.
+pub(crate) struct QsaTimerSample {
+    /// The device work queued ahead of the readback; NOT part of the cost,
+    /// reported so the sync can be told apart from the copy.
+    pub sync: Duration,
+    pub readback: Duration,
+    pub select: Duration,
+    pub fill: Duration,
+    pub upload: Duration,
+    pub score_bytes: usize,
+    pub mask_bytes: usize,
+    pub n_kv: usize,
+}
+
+/// The `XWEN_QSA_TIMER` accumulator: every prefill-chunk round trip since the
+/// process started, summed by segment, plus the largest chunk seen. Reported by
+/// [`qsa_timer::report`], which `XwenModel::dump_stack_profile` calls after a
+/// prefill, and reset there so a second prefill starts a fresh total.
+pub(crate) mod qsa_timer {
+    use super::QsaTimerSample;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Totals {
+        calls: usize,
+        sync: Duration,
+        readback: Duration,
+        select: Duration,
+        fill: Duration,
+        upload: Duration,
+        score_bytes: usize,
+        mask_bytes: usize,
+        largest: Option<QsaTimerSample>,
+    }
+
+    static TOTALS: Mutex<Totals> = Mutex::new(Totals {
+        calls: 0,
+        sync: Duration::ZERO,
+        readback: Duration::ZERO,
+        select: Duration::ZERO,
+        fill: Duration::ZERO,
+        upload: Duration::ZERO,
+        score_bytes: 0,
+        mask_bytes: 0,
+        largest: None,
+    });
+
+    pub(crate) fn record(s: QsaTimerSample) {
+        let mut t = TOTALS.lock().unwrap();
+        t.calls += 1;
+        t.sync += s.sync;
+        t.readback += s.readback;
+        t.select += s.select;
+        t.fill += s.fill;
+        t.upload += s.upload;
+        t.score_bytes += s.score_bytes;
+        t.mask_bytes += s.mask_bytes;
+        if t.largest.as_ref().is_none_or(|l| l.n_kv < s.n_kv) {
+            t.largest = Some(s);
+        }
+    }
+
+    /// Print the totals since the last report and reset them. Nothing is
+    /// printed when no round trip was timed, so a run below budget, a decode
+    /// phase and a build without the flag stay silent.
+    pub(crate) fn report(label: &str) {
+        let t = std::mem::take(&mut *TOTALS.lock().unwrap());
+        if t.calls == 0 {
+            return;
+        }
+        let idle = t.readback + t.select + t.fill + t.upload;
+        let secs = |d: Duration| d.as_secs_f64();
+        let gb = |b: usize| b as f64 / 1e9;
+        crate::host_log::host_line(format!(
+            "[qsa-timer {label}] {} round trips: gpu-idle {:.2} s = readback {:.2} + select {:.2} + \
+             fill {:.2} + upload {:.2}; sync-wait {:.2} s (queued device work, not idle); \
+             scores {:.2} GB read back, masks {:.2} GB uploaded",
+            t.calls,
+            secs(idle),
+            secs(t.readback),
+            secs(t.select),
+            secs(t.fill),
+            secs(t.upload),
+            secs(t.sync),
+            gb(t.score_bytes),
+            gb(t.mask_bytes),
+        ));
+        if let Some(l) = t.largest {
+            crate::host_log::host_line(format!(
+                "[qsa-timer {label}] largest chunk (n_kv {}): readback {:.1} ms ({:.0} MB), select \
+                 {:.1} ms, fill {:.1} ms, upload {:.1} ms ({:.0} MB), sync-wait {:.1} ms",
+                l.n_kv,
+                l.readback.as_secs_f64() * 1e3,
+                l.score_bytes as f64 / 1e6,
+                l.select.as_secs_f64() * 1e3,
+                l.fill.as_secs_f64() * 1e3,
+                l.upload.as_secs_f64() * 1e3,
+                l.mask_bytes as f64 / 1e6,
+                l.sync.as_secs_f64() * 1e3,
+            ));
         }
     }
 }
@@ -1395,9 +1547,9 @@ mod tests {
             pos: usize,
             what: &str,
         ) -> QsaSelection {
-            let a = ix.select_with(x, classic, pos, true, true).unwrap();
-            let h = ix.select_with(x, host, pos, false, true).unwrap();
-            let b = ix.select_with(x, cached, pos, false, false).unwrap();
+            let a = ix.select_with(x, classic, pos, true, true, true).unwrap();
+            let h = ix.select_with(x, host, pos, false, true, true).unwrap();
+            let b = ix.select_with(x, cached, pos, false, false, false).unwrap();
             assert_eq!(
                 selection_bits(&a),
                 selection_bits(&h),
@@ -1406,7 +1558,7 @@ mod tests {
             assert_eq!(
                 selection_bits(&h),
                 selection_bits(&b),
-                "{what}: selection, host vs device top-k"
+                "{what}: selection, host vs device selection"
             );
             assert_eq!(classic.len(), cached.len(), "{what}: length");
             assert_eq!(host.len(), cached.len(), "{what}: length");
@@ -1667,6 +1819,136 @@ mod tests {
             let got = device_rows(&scores, keep, RATIO, 2, &device);
             assert_eq!(got, want, "keep {keep}");
         }
+    }
+
+    /// The host prefill overlay over a `[n, n_blocks]` score plane, exactly as
+    /// `select_with`'s host arm fills it: `top_blocks` per query, then
+    /// `expand_into` scattered as zeros over a `-inf` row.
+    fn host_mask(
+        ix: &QsaIndexer,
+        scores: &[f32],
+        n: usize,
+        n_blocks: usize,
+        pos: usize,
+    ) -> Vec<u32> {
+        let n_kv = pos + n;
+        let sets = ix.top_blocks(scores, n, n_blocks, pos);
+        let mut mask = vec![f32::NEG_INFINITY; n * n_kv];
+        let mut tokens = Vec::new();
+        for (i, blocks) in sets.iter().enumerate() {
+            tokens.clear();
+            ix.expand_into(blocks, pos + i, &mut tokens);
+            for &t in &tokens {
+                mask[i * n_kv + t as usize] = 0.0;
+            }
+        }
+        mask.into_iter().map(f32::to_bits).collect()
+    }
+
+    /// `kernel_qsa_select_mask` writes exactly the plane the host arm fills,
+    /// bit for bit, over chunk shapes a prefill walk produces: queries whose
+    /// visible prefix is shorter than one block (nothing selected, only the
+    /// tail), chunks that straddle the budget (identity rows above keep-less
+    /// rows), the shipped 512-block keep over a long prefix, a full 2048-token
+    /// chunk, and a final partial chunk — on scores with many exact ties, and
+    /// once on scores outside the contract (NaN, negative), which both arms
+    /// key as zero.
+    #[test]
+    fn device_mask_matches_host_mask_bitwise() {
+        let device = metal_device().unwrap();
+        // (budget, pos, n)
+        let cases: &[(usize, usize, usize)] = &[
+            (16, 0, 6),
+            (16, 0, 16),
+            (16, 5, 40),
+            (16, 13, 100),
+            (64, 2044, 40),
+            (2048, 2000, 96),
+            (2048, 30000, 2048),
+            (2048, 65536, 64),
+            (2048, 131072, 352),
+            // one block per thread, then one thread short and one over
+            (2048, 4092, 16),
+            (2048, 4096, 16),
+            (2048, 4100, 16),
+            // a full chunk ending at 128k
+            (2048, 129376, 2048),
+        ];
+        for (ci, &(budget, pos, n)) in cases.iter().enumerate() {
+            let ix = selector(budget, RATIO, &device);
+            let n_blocks = (pos + n) / RATIO;
+            let scores = tied_scores(0xA00 + ci as u64, n * n_blocks);
+            let want = host_mask(&ix, &scores, n, n_blocks, pos);
+            let t = Tensor::from_vec(scores, (n, n_blocks), &device).unwrap();
+            let got: Vec<u32> = crate::ops::qsa_select::select_mask(&t, pos, RATIO, budget / RATIO)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "budget {budget} pos {pos} n {n}: shape"
+            );
+            if let Some(at) = got.iter().zip(&want).position(|(g, w)| g != w) {
+                panic!(
+                    "budget {budget} pos {pos} n {n}: first mismatch at query {} position {}",
+                    at / (pos + n),
+                    at % (pos + n)
+                );
+            }
+        }
+
+        // Every score equal: the threshold is that value and the quota is the
+        // whole keep, which must go to the lowest block indices of each row.
+        for &value in &[0.0f32, 0.5] {
+            let (budget, pos, n) = (2048, 6000, 40);
+            let ix = selector(budget, RATIO, &device);
+            let n_blocks = (pos + n) / RATIO;
+            let scores = vec![value; n * n_blocks];
+            let want = host_mask(&ix, &scores, n, n_blocks, pos);
+            let t = Tensor::from_vec(scores, (n, n_blocks), &device).unwrap();
+            let got: Vec<u32> = crate::ops::qsa_select::select_mask(&t, pos, RATIO, budget / RATIO)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            assert_eq!(got, want, "all scores {value}");
+        }
+
+        let (budget, pos, n) = (64, 400, 24);
+        let ix = selector(budget, RATIO, &device);
+        let n_blocks = (pos + n) / RATIO;
+        let mut scores = rand(0xA90, n * n_blocks, -2.0, 2.0);
+        for (i, s) in scores.iter_mut().enumerate() {
+            match i % 7 {
+                0 => *s = f32::NAN,
+                1 => *s = -f32::NAN,
+                2 => *s = 0.0,
+                3 => *s = -0.0,
+                _ => {}
+            }
+        }
+        let want = host_mask(&ix, &scores, n, n_blocks, pos);
+        let t = Tensor::from_vec(scores, (n, n_blocks), &device).unwrap();
+        let got: Vec<u32> = crate::ops::qsa_select::select_mask(&t, pos, RATIO, budget / RATIO)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect();
+        assert_eq!(got, want, "NaN and negative scores");
     }
 
     /// The equal-to-threshold quota spans many threads' stripes: every score

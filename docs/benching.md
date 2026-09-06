@@ -105,6 +105,16 @@ cost.
 
 Price a prefill stage with the probe, never with the profiler or an isolated bench.
 
+**A host round trip is priced by timing its segments, not by the probe** (`XWEN_QSA_TIMER`,
+2026-09-06). The probe cannot see time the GPU spends idle waiting on the host, which is
+exactly what a readback-fill-upload cycle costs. The timer drains the device once before
+the readback, so the copy is timed apart from the compute it would otherwise wait for,
+then times selection, fill and upload on the host and prints the totals after the
+prefill; the sum of those four is GPU-idle time and is the cost. Used once, on the QSA
+prefill mask's host arm at 128k (`XWEN_QSA_HOST_MASK=1` restores that arm): 102-106 s
+of a 563 s prefill, and the device path that replaced it is
+[the record](records/qsa-device-mask.md).
+
 **At decode the probe reads differently** (`XWEN_DUP_DECODE`, 2026-09-06). A decode copy
 has no buffer hazard against its original, so a delta above zero is only a FLOOR for that
 stage, and a delta of about zero means the stage overlaps itself, never that it is free.

@@ -746,6 +746,7 @@ impl XwenModel {
         if let Some(p) = &self.profile {
             p.dump(label);
         }
+        crate::qwen4exp::indexer::qsa_timer::report(label);
     }
 
     /// Declare which phase the forwards from here on belong to, for the

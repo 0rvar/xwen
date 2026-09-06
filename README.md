@@ -450,9 +450,11 @@ inside its own window rather than past its rope table.
 default covers two maximal prefills at the slowest rate this machine has been measured
 at, which is 2640 s at the default 262144 and never less than 300. It is said once at
 startup. The point is that a request arriving behind one long prefill is not dropped for
-saturation while the server is working normally — a 131072-token prompt is 567 s of
-prefill on the default checkpoint before its own decode starts, so the flat 300 s this
-replaced dropped queued requests while the server worked normally. Naming
+saturation while the server is working normally — a 131072-token prompt was 567 s of
+prefill on the default checkpoint before its own decode starts (445-463 s since the QSA
+prefill selection moved to the device on 2026-09-06; the derivation keeps the slower
+floor), so the flat 300 s this replaced dropped queued requests while the server worked
+normally. Naming
 `queue_timeout` explicitly still wins, and a queued streaming request costs almost
 nothing to hold.
 
