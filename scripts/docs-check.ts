@@ -12,6 +12,11 @@
 //   3. Every prose reference of the form `log.md "X"` / `decisions.md "X"` finds
 //      X somewhere under the file it names (log.md + docs/records, decisions.md +
 //      docs/decisions), as a substring — the repo quotes names, not slugs.
+//   4. TODO.md keeps its shape: the Front has at most ten entries and each names an
+//      item; every area item opens with one of the four state tags and carries a
+//      `From:` line whose heading exists in docs/ledger-archive.md; no item runs past
+//      40 lines. Also prints the age histogram (latest date in each item), which is
+//      informational: the 30-day triage rule is a judgement, not a failure.
 import { readdirSync, readFileSync, statSync, existsSync } from "fs";
 import { join, dirname, resolve, relative } from "path";
 const root = resolve(import.meta.dir, "..");
@@ -70,6 +75,41 @@ for (const f of [...mdFiles, ...srcFiles]) {
     const c = which === "log" ? logCorpus : decCorpus;
     if (!c.includes(name)) failures.push(`${relative(root, f)}: ${which}.md "${name}" not found`);
   }
+}
+// 4. ledger shape
+{
+  const todo = readFileSync(join(root, "TODO.md"), "utf8").split("\n");
+  const archiveHeadings = new Set(headings.get(join(root, "docs/ledger-archive.md")) ?? []);
+  const TAGS = ["measured", "unpriced", "blocked", "small"];
+  const MAX_ITEM_LINES = 40; const FRONT_CAP = 10;
+  type Item = { start: number; lines: string[]; area: string };
+  const items: Item[] = []; const frontTitles: string[] = [];
+  let section = ""; let cur: Item | null = null;
+  const finish = () => { if (cur) { while (cur.lines.length && cur.lines[cur.lines.length - 1].trim() === "") cur.lines.pop(); items.push(cur); } cur = null; };
+  todo.forEach((l, i) => {
+    if (l.startsWith("## ")) { finish(); section = l.slice(3); return; }
+    if (section.startsWith("Front")) { const m = l.match(/^\d+\. \*\*(.+?)\*\*/); if (m) frontTitles.push(m[1]); return; }
+    if (!section) return;
+    if (/^- /.test(l)) { finish(); cur = { start: i + 1, lines: [l], area: section }; return; }
+    if (cur) cur.lines.push(l);
+  });
+  finish();
+  if (frontTitles.length > FRONT_CAP) failures.push(`TODO.md: Front has ${frontTitles.length} entries, cap is ${FRONT_CAP}`);
+  for (const t of frontTitles) { const hits = items.filter((it) => it.lines.slice(0, 2).map((l) => l.trim()).join(" ").includes(`**${t}`)); if (hits.length !== 1) failures.push(`TODO.md: Front entry "${t.slice(0, 60)}" matches ${hits.length} items`); }
+  const ages: number[] = []; const today = new Date().getTime();
+  for (const it of items) {
+    const head = it.lines[0];
+    const m = head.match(/^- \[ \] \[(\w+)\] /);
+    if (!m || !TAGS.includes(m[1])) failures.push(`TODO.md:${it.start}: item lacks a state tag [${TAGS.join("|")}]`);
+    const from = it.lines.map((l) => l.match(/^\s*From: (.+)\.$/)).find(Boolean);
+    if (!from) failures.push(`TODO.md:${it.start}: item lacks a From: line`);
+    else if (!archiveHeadings.has(from[1])) failures.push(`TODO.md:${it.start}: From: "${from[1].slice(0, 60)}" is no heading in docs/ledger-archive.md`);
+    if (it.lines.length > MAX_ITEM_LINES) failures.push(`TODO.md:${it.start}: item runs ${it.lines.length} lines, limit ${MAX_ITEM_LINES}`);
+    const dates = it.lines.join(" ").match(/\b20\d\d-\d\d-\d\d\b/g) ?? [];
+    if (dates.length) ages.push(Math.floor((today - new Date(dates.sort().at(-1)!).getTime()) / 86400000));
+  }
+  const bucket = (lo: number, hi: number) => ages.filter((a) => a >= lo && a < hi).length;
+  console.log(`ledger: ${items.length} open items, front ${frontTitles.length}/${FRONT_CAP}; age by latest date: <7d ${bucket(0, 7)}, 7-30d ${bucket(7, 30)}, 30-60d ${bucket(30, 60)}, 60d+ ${bucket(60, 1e9)}, undated ${items.length - ages.length}`);
 }
 if (failures.length) { console.error(`docs-check: ${failures.length} failure(s)`); for (const x of failures) console.error("  " + x); process.exit(1); }
 console.log(`docs-check: ok (${mdFiles.length} markdown files, ${srcFiles.length} source files scanned)`);
