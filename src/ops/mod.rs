@@ -6,6 +6,7 @@ pub mod delta;
 pub mod dense_mm;
 mod dispatch;
 pub mod f16;
+pub mod f32;
 pub mod flash;
 pub mod hc;
 pub mod mm_id;
@@ -29,6 +30,7 @@ pub use delta::{
 pub use dense_mm::{dense_mm_supported, matmul_dense_q};
 pub use dispatch::mv_vendored_supported;
 pub use f16::matmul_f16;
+pub use f32::{matmul_f32, matmul_f32_supported};
 pub use flash::flash_attn;
 pub use hc::{
     hc_gate_down, hc_gate_fused_supported, hc_gate_up_mix, hc_mix, hc_norm, hc_norm_supported,
@@ -825,6 +827,85 @@ pub fn moe_shexp_fused_max_n() -> usize {
 /// kernels.
 pub fn moe_shexp_fused_enabled() -> bool {
     !moe_glue_classic() && !moe_shexp_classic() && moe_shexp_fused_max_n() >= 1
+}
+
+/// `XWEN_ROUTER_MV_CLASSIC=1` reverts the MoE ROUTER PROJECTION — the vendored
+/// f32 gemv (`ops::matmul_f32`, `kernel_mul_mv_f32_f32_v`) over the
+/// `[n_expert, hidden]` `ffn_gate_inp` plane — to candle's `Tensor::matmul`
+/// over the `[hidden, n_expert]` transpose held alongside it.
+///
+/// What it buys: candle's mlx `gemv_t` tile pick gives a one-token router
+/// product EIGHT threadgroups for the whole 5.24 MB plane on Flash-Next (the
+/// 35B-A3B's 2048 x 256 also lands on 8), each streaming ~655 KB serially; the
+/// vendored gemv runs `ceil(n_expert/2) x t` threadgroups over the same bytes,
+/// 256 at 512 experts. Per decode token that is 252 MB of router weight (48
+/// layers on Flash-Next, 4.0% of the token's 6.33 GB) moved on an occupied
+/// kernel instead of an idle one.
+///
+/// A real kill switch and NOT a bit-identity anchor. Both arms multiply the
+/// same f32 operands and accumulate in f32 — the only difference is SUMMATION
+/// ORDER (the gemv folds four simdgroups' partials through threadgroup memory;
+/// mlx's gemv folds an 8-lane shuffle ladder over 320-term serial partials) —
+/// so the logits are bounded-close, not bitwise. Routing is top-k over those
+/// logits and top-k is DISCRETE, so a near-tie between two experts can flip
+/// which one is selected. That is why the strict parity tier pins this switch
+/// on both sides and mm/decode/ppl grade the gemv.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`moe_shexp_classic`, `moe_glue_classic`): any value enables it — only
+/// leaving it unset keeps the gemv.
+pub fn router_mv_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_ROUTER_MV_CLASSIC").is_some())
+}
+
+/// Token count an MoE block must be at or below for its ROUTER PROJECTION to
+/// take the vendored f32 gemv instead of candle's `matmul`.
+///
+/// Same trade as [`MOE_SHEXP_FUSED_MAX_N`]: the gemv re-reads the whole router
+/// plane once per token row (its grid's second axis IS the token count), which
+/// is free at one token and pointless at a prefill chunk, where candle's tiled
+/// gemm reads the plane once for all rows. The ceiling sits at the small-batch
+/// window's width so a short speculative or ragged batch takes it too — and at
+/// 8 it is exactly the gemv's own hard limit, above which `ops::matmul_f32`
+/// errors rather than falling back.
+///
+/// INCLUSIVE, like [`MOE_SHEXP_FUSED_MAX_N`]: the gemv covers `n == 1`, which
+/// an exclusive bound of 1 would exclude.
+pub const ROUTER_MV_MAX_N: usize = 8;
+
+/// Effective router-gemv ceiling: `XWEN_ROUTER_MV_MAX_N=<n>` overrides the
+/// default (an A/B knob for the threshold — `0` keeps every batch on candle,
+/// which is what the kill switch does and is why [`router_mv_enabled`] reads
+/// both; a value above [`ROUTER_MV_MAX_N`] cannot widen the window, since
+/// `ops::matmul_f32_supported` refuses past 8 and the block then keeps candle).
+/// Value-parsed, read once and cached; unset or unparsable falls back to
+/// [`ROUTER_MV_MAX_N`].
+pub fn router_mv_max_n() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_ROUTER_MV_MAX_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(ROUTER_MV_MAX_N)
+    })
+}
+
+/// Whether the router gemv can run in this process AT ALL: the kill switch
+/// unset, and a ceiling that admits at least one token. `MoeBlock::router_mv`
+/// asks this and then compares its own token count against
+/// [`router_mv_max_n`]; the parity dump's `router_mv` provenance label asks it
+/// alone.
+///
+/// One function because the two must agree — `XWEN_ROUTER_MV_MAX_N=0` disables
+/// the gemv exactly as the kill switch does, so a label that read only the
+/// switch would stamp "mv" on a dump that never dispatched the kernel.
+///
+/// Unlike [`moe_shexp_fused_enabled`] this does NOT read `moe_glue_classic`:
+/// the router projection runs before the routing decision and is dispatched
+/// whether or not the fused glue kernels follow it.
+pub fn router_mv_enabled() -> bool {
+    !router_mv_classic() && router_mv_max_n() >= 1
 }
 
 /// `XWEN_ATTN_GLUE_CLASSIC=1` reverts the attention glue — the fused softplus

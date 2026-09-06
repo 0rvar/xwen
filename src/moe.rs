@@ -44,6 +44,18 @@ pub trait ExpertFfn: Send {
 /// would rank and weight the experts differently. The shared expert runs in
 /// parallel and is added in, scaled by its own scalar sigmoid gate.
 pub struct MoeBlock {
+    /// Router weight in its GGUF orientation, `[n_expert, hidden]` — what
+    /// `dense_f32("ffn_gate_inp")` hands over, held so the vendored f32 gemv
+    /// (`ops::matmul_f32`, which wants `[n_out, k]` like every other xwen
+    /// kernel) can read it directly at decode.
+    ///
+    /// Kept ALONGSIDE `router_t` rather than instead of it, so the candle
+    /// fallback path is byte-for-byte the one that shipped before the gemv.
+    /// The cost is holding the plane twice — 5.24 MB per layer, ~250 MB across
+    /// Flash-Next's 48 — which is ledgered (TODO.md), not fixed here: dropping
+    /// the transpose entirely means the `XWEN_ROUTER_MV_CLASSIC` arm has to
+    /// rebuild it, and that arm is the strict parity tier's.
+    router: Tensor,
     /// Router weight, pre-transposed to `[hidden, n_expert]` and made contiguous
     /// once at load so the per-forward routing matmul needs no transpose/copy.
     router_t: Tensor,
@@ -60,7 +72,8 @@ pub struct MoeBlock {
 impl MoeBlock {
     /// `w` positioned at the block prefix. `runner` picks Fused vs Reference experts.
     pub fn new(w: &Weights, cfg: &XwenConfig, runner: ExpertRunner) -> Result<Self> {
-        let router_t = w.dense_f32("ffn_gate_inp")?.t()?.contiguous()?;
+        let router = w.dense_f32("ffn_gate_inp")?;
+        let router_t = router.t()?.contiguous()?;
         let n_expert = router_t.dim(1)?;
         let experts: Box<dyn ExpertFfn> = match runner {
             ExpertRunner::Reference => Box::new(ReferenceExperts::new(w)?),
@@ -68,6 +81,7 @@ impl MoeBlock {
         };
         let shared = SharedExpert::new(w)?;
         Ok(Self {
+            router,
             router_t,
             experts,
             shared,
@@ -89,10 +103,46 @@ impl MoeBlock {
             && crate::ops::moe_router_supported(self.n_expert, self.n_expert_used)
     }
 
+    /// Whether the ROUTER PROJECTION takes the vendored f32 gemv
+    /// (`ops::matmul_f32` over the `[n_expert, hidden]` plane) rather than
+    /// candle's `matmul` over the `[hidden, n_expert]` transpose: the kill
+    /// switch unset, a token count at or below the ceiling, a Metal device, and
+    /// operands the kernel can bind.
+    ///
+    /// The bounds are the kernel's, so a block outside them keeps candle rather
+    /// than failing — which means every condition the launcher hard-errors on
+    /// has to be asked here. Callable from the tests as the single reachability
+    /// predicate, the way `fused_shexp` is.
+    ///
+    /// Independent of `glue_fused`: the projection produces the logits the
+    /// routing decision then consumes, so it runs on both sides of
+    /// `XWEN_MOE_GLUE_CLASSIC`.
+    pub(crate) fn router_mv(&self, x: &Tensor) -> bool {
+        let Ok(seq) = x.dim(0) else {
+            return false;
+        };
+        if !crate::ops::router_mv_enabled() || seq > crate::ops::router_mv_max_n() {
+            return false;
+        }
+        if !x.device().is_metal() || x.dtype() != DType::F32 || !x.is_contiguous() {
+            return false;
+        }
+        let Ok((n_expert, hidden)) = self.router.dims2() else {
+            return false;
+        };
+        self.router.dtype() == DType::F32
+            && self.router.is_contiguous()
+            && x.device().same_device(self.router.device())
+            && x.dims() == [seq, hidden]
+            && n_expert == self.n_expert
+            && crate::ops::matmul_f32_supported(seq, hidden, n_expert)
+    }
+
     /// Returns (ids [seq, top_k] u32 on-device, weights [seq, top_k] f32).
     pub fn route(&self, x_normed: &Tensor) -> Result<(Tensor, Tensor)> {
+        let mv = self.router_mv(x_normed);
         let logits = crate::ops::dup(crate::ops::DupStage::RouterProj, x_normed.dim(0)?, || {
-            route_logits(&self.router_t, x_normed)
+            route_logits(&self.router, &self.router_t, x_normed, mv)
         })?;
         if self.glue_fused(x_normed) {
             // One kernel for softmax + arg-sort + gather + sum + clamp + divide,
@@ -232,11 +282,22 @@ impl MoeBlock {
     }
 }
 
-/// Router projection: `logits[t, e] = <x[t], router[e]>`, computed in f32.
-/// `router_t` is the `[hidden, n_expert]` transpose of the ggml `ffn_gate_inp`
-/// weight, precomputed once at load; result is `[seq, n_expert]`.
-fn route_logits(router_t: &Tensor, x: &Tensor) -> Result<Tensor> {
+/// Router projection: `logits[t, e] = <x[t], router[e]>`, computed in f32;
+/// result is `[seq, n_expert]`.
+///
+/// Two arms over the same weights. `mv` takes the vendored f32 gemv over
+/// `router`, the `[n_expert, hidden]` GGUF-orientation plane — candle sends a
+/// one-token f32 product to an mlx gemv that occupies eight threadgroups for
+/// the whole plane, and this one occupies `ceil(n_expert/2)`. Otherwise the
+/// original candle matmul over `router_t`, the `[hidden, n_expert]` transpose
+/// precomputed once at load. `MoeBlock::router_mv` decides, and it is the
+/// caller's job to have asked it — this function does no fallback, so a `true`
+/// the kernel cannot honour surfaces as an error instead of a silent reroute.
+fn route_logits(router: &Tensor, router_t: &Tensor, x: &Tensor, mv: bool) -> Result<Tensor> {
     let x = x.to_dtype(DType::F32)?;
+    if mv {
+        return crate::ops::matmul_f32(router, &x);
+    }
     Ok(x.matmul(router_t)?)
 }
 
@@ -1032,18 +1093,14 @@ mod tests {
         let w = Weights::from_gguf(gguf);
         let blk = w.pp("blk.0");
 
-        let router_t = blk
-            .dense_f32("ffn_gate_inp")
-            .unwrap()
-            .t()
-            .unwrap()
-            .contiguous()
-            .unwrap();
+        let router = blk.dense_f32("ffn_gate_inp").unwrap();
+        let router_t = router.t().unwrap().contiguous().unwrap();
         let n_expert = router_t.dim(1).unwrap();
         let shared = SharedExpert::new(&blk).expect("loading the fixture's shared expert");
         let hidden = shared.gate_row().dim(0).unwrap();
         (
             MoeBlock {
+                router,
                 router_t,
                 experts: Box::new(StubExperts { hidden }),
                 shared,
@@ -1195,16 +1252,112 @@ mod tests {
     /// the same logits in directly.
     #[test]
     fn router_matmul_matches_direct_logits() {
-        // hidden == n_expert with an identity router, so logits == x.
+        // hidden == n_expert with an identity router, so logits == x — and the
+        // identity is its own transpose, so one tensor serves both arms. A CPU
+        // fixture, so the candle arm is the one under test here.
         let router = Tensor::eye(8, DType::F32, &Device::Cpu).unwrap();
         let x = logits_row();
 
-        let logits = route_logits(&router, &x).unwrap();
+        let logits = route_logits(&router, &router, &x, false).unwrap();
         let direct: Vec<f32> = x.flatten_all().unwrap().to_vec1().unwrap();
         let viamm: Vec<f32> = logits.flatten_all().unwrap().to_vec1().unwrap();
         for (a, b) in viamm.iter().zip(direct.iter()) {
             assert_close(*a as f64, *b as f64, 1e-6);
         }
+    }
+
+    /// Relative L2 error between two equal-length readbacks.
+    fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        let num: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| ((*x - *y) as f64).powi(2))
+            .sum();
+        let den: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum();
+        (num.sqrt() / den.sqrt().max(1e-30)) as f32
+    }
+
+    /// At one token the router projection must take the vendored f32 gemv, not
+    /// candle's `matmul` — and decode is one token, which is the whole point.
+    ///
+    /// Pinned BITWISE against `ops::matmul_f32` called directly on the block's
+    /// own `[n_expert, hidden]` plane: the two arms agree only to a tolerance,
+    /// so a bitwise match with one of them is proof of WHICH ran where a
+    /// tolerance check would pass either way. The tolerance check is the second
+    /// half — the candle arm over the transpose must land within 1e-5, both
+    /// arms being f32 products accumulated in f32 and differing only in
+    /// summation order.
+    #[test]
+    fn route_logits_takes_the_mv_kernel_at_decode() {
+        let device = crate::gguf::metal_device().expect("the router gemv needs Metal");
+        let (block, _dir) = shexp_block("router_mv_decode", &device);
+        let x = shexp_input(&block, 1, 0x7001, &device);
+
+        // Spelled out condition by condition: `router_mv` is a conjunction, and
+        // a bare false says nothing about which of its clauses moved.
+        assert!(crate::ops::router_mv_enabled(), "no switch is set");
+        let (n_expert, hidden) = block.router.dims2().unwrap();
+        assert!(
+            crate::ops::matmul_f32_supported(1, hidden, n_expert),
+            "[{n_expert}x{hidden}] at one token is outside the gemv's bounds"
+        );
+        assert!(block.router_mv(&x), "the fixture is inside every bound");
+
+        let got = route_logits(&block.router, &block.router_t, &x, block.router_mv(&x)).unwrap();
+        let want = crate::ops::matmul_f32(&block.router, &x).unwrap();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "at one token the router projection must run the gemv, bit for bit"
+        );
+
+        let candle = route_logits(&block.router, &block.router_t, &x, false).unwrap();
+        let (g, c) = (
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            candle.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        let rel = rel_l2(&g, &c);
+        eprintln!("router gemv vs candle at n=1: rel_l2 {rel:.3e}");
+        assert!(rel < 1e-5, "gemv vs candle router logits rel_l2 {rel}");
+    }
+
+    /// The ceiling is a real edge, not a comment: at `ROUTER_MV_MAX_N` tokens
+    /// the router projection takes the gemv, and at one more it takes candle's
+    /// matmul. Both sides pinned bitwise against the arm they should have taken.
+    #[test]
+    fn the_router_mv_ends_at_its_ceiling() {
+        let device = crate::gguf::metal_device().expect("the router gemv needs Metal");
+        let (block, _dir) = shexp_block("router_mv_ceiling", &device);
+        let ceiling = crate::ops::ROUTER_MV_MAX_N;
+
+        let x = shexp_input(&block, ceiling, 0x8002, &device);
+        assert!(
+            block.router_mv(&x),
+            "n = {ceiling} must still take the gemv"
+        );
+        let got = route_logits(&block.router, &block.router_t, &x, block.router_mv(&x)).unwrap();
+        let want = crate::ops::matmul_f32(&block.router, &x).unwrap();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "at n = {ceiling} the router projection must run the gemv, bit for bit"
+        );
+
+        // One token past it: candle's matmul over the transpose. The gemv is not
+        // merely unused there, it is unusable — `matmul_f32` errors rather than
+        // silently rerouting, which is what makes the predicate load-bearing.
+        let n = ceiling + 1;
+        let x = shexp_input(&block, n, 0x9003, &device);
+        assert!(!block.router_mv(&x), "n = {n} is past the ceiling");
+        assert!(crate::ops::matmul_f32(&block.router, &x).is_err());
+        let got = route_logits(&block.router, &block.router_t, &x, block.router_mv(&x)).unwrap();
+        let want = x.matmul(&block.router_t).unwrap();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "at n = {n} the router projection must run candle's matmul, bit for bit"
+        );
     }
 
     /// Deterministic pseudo-random f32 tensor in roughly `[-scale, scale]`, so
@@ -1443,14 +1596,12 @@ mod tests {
                 .to_device(&device)
                 .unwrap(),
         };
+        let router = det_tensor(&[n_expert, hidden], 0x10, 0.4)
+            .to_device(&device)
+            .unwrap();
         let block = MoeBlock {
-            router_t: det_tensor(&[n_expert, hidden], 0x10, 0.4)
-                .to_device(&device)
-                .unwrap()
-                .t()
-                .unwrap()
-                .contiguous()
-                .unwrap(),
+            router_t: router.t().unwrap().contiguous().unwrap(),
+            router,
             experts: Box::new(FusedExperts {
                 gate: stack(expert_ff, hidden, 0x01),
                 up: stack(expert_ff, hidden, 0x02),
@@ -1473,7 +1624,10 @@ mod tests {
 
         // Reference: the candle routing chain, the candle broadcast/sum combine,
         // the candle silu+mul shared expert, then routed + shared.
-        let logits = route_logits(&block.router_t, &x).unwrap();
+        // The router projection takes whichever arm the block itself would, so
+        // this stays a test of the fused GLUE against candle rather than of the
+        // router gemv (which `route_logits_takes_the_mv_kernel_at_decode` owns).
+        let logits = route_logits(&block.router, &block.router_t, &x, block.router_mv(&x)).unwrap();
         let (ids, weights) = route_from_logits(&logits, top_k, WEIGHTS_SUM_FLOOR as f32).unwrap();
         let down = block.experts.project(&x, &ids).unwrap().unwrap();
         let routed = down
@@ -1813,13 +1967,10 @@ mod tests {
         /// spread out and top-10 selection varies with the input.
         fn build_moe_layer(il: usize, dev: &Device) -> (RmsNorm, MoeBlock) {
             let s = 0x5000 + il as u64 * 64;
-            let router_t = det_tensor(&[N_EXPERT, HIDDEN], s + 10, 0.02)
+            let router = det_tensor(&[N_EXPERT, HIDDEN], s + 10, 0.02)
                 .to_device(dev)
-                .unwrap()
-                .t()
-                .unwrap()
-                .contiguous()
                 .unwrap();
+            let router_t = router.t().unwrap().contiguous().unwrap();
             let experts = FusedExperts {
                 gate: tiled_stack(dev, EXPERT_FF, HIDDEN, s + 1),
                 up: tiled_stack(dev, EXPERT_FF, HIDDEN, s + 2),
@@ -1857,6 +2008,7 @@ mod tests {
                     .unwrap(),
             };
             let block = MoeBlock {
+                router,
                 router_t,
                 experts: Box::new(experts),
                 shared,

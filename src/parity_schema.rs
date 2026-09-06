@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 11;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 12;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -122,6 +122,18 @@ pub struct ProvenanceField {
 /// gradeable today, the 35B-A3B being an MoE checkpoint the gate runs: the
 /// strict tier pins XWEN_MOE_SHEXP_CLASSIC on both sides and mm/decode/ppl
 /// grade the fused route.
+///
+/// Version 12: router_mv (the MoE ROUTER PROJECTION's route: "mv" for the
+/// vendored f32 gemv over the `[n_expert, hidden]` `ffn_gate_inp` plane,
+/// "classic" for candle's `matmul` over the `[hidden, n_expert]` transpose
+/// under XWEN_ROUTER_MV_CLASSIC or a zero XWEN_ROUTER_MV_MAX_N —
+/// `ops::router_mv_enabled` is the one predicate both the label and
+/// `MoeBlock::route` ask). Grandfather "classic": no pre-v12 binary had the
+/// kernel. Load-bearing and bounded like `moe_shexp`, and gradeable the same
+/// way — but note WHY the bound matters more here than the ~1e-7 residual
+/// suggests: the logits feed a top-k, which is DISCRETE, so a near-tie between
+/// two experts can flip the selection outright. The strict tier pins
+/// XWEN_ROUTER_MV_CLASSIC on both sides and mm/decode/ppl grade the gemv.
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_impl",
@@ -226,6 +238,11 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_shexp",
         introduced: 11,
+        grandfather: Some("classic"),
+    },
+    ProvenanceField {
+        name: "router_mv",
+        introduced: 12,
         grandfather: Some("classic"),
     },
 ];
@@ -340,6 +357,11 @@ mod tests {
         assert_eq!(resolve_missing("moe_shexp", 1), Some("classic"));
         assert_eq!(resolve_missing("moe_shexp", 10), Some("classic"));
         assert_eq!(resolve_missing("moe_shexp", 11), None);
+        // router_mv introduced at v12: v1..v11 dumps missing it resolve to
+        // "classic" (no earlier binary had the router gemv); missing at v12 fails.
+        assert_eq!(resolve_missing("router_mv", 1), Some("classic"));
+        assert_eq!(resolve_missing("router_mv", 11), Some("classic"));
+        assert_eq!(resolve_missing("router_mv", 12), None);
         // Baseline fields are required at every version.
         assert_eq!(resolve_missing("attn_dtype", 1), None);
         assert_eq!(resolve_missing("attn_dtype", 2), None);

@@ -439,6 +439,21 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
         } else {
             "classic"
         },
+        // The MoE ROUTER PROJECTION's route: "mv" for the vendored f32 gemv
+        // over the [n_expert, hidden] ffn_gate_inp plane, "classic" for candle's
+        // matmul over the [hidden, n_expert] transpose. UNLIKE `moe_shexp` this
+        // is NOT keyed on the expert runner: the router projection happens
+        // before the routing decision, so the Reference oracle dispatches it
+        // too and only XWEN_ROUTER_MV_CLASSIC (which the gate pins on the
+        // oracle's side) takes it back to candle. `router_mv_enabled` is the
+        // SAME predicate MoeBlock::route gates on, so a ceiling of zero reads
+        // "classic" here rather than labelling a run that never dispatched the
+        // kernel.
+        "router_mv": if xwen::ops::router_mv_enabled() {
+            "mv"
+        } else {
+            "classic"
+        },
         // The hyper-connection bottleneck's two projections at prefill:
         // "classic" when both stay on QMatMul (XWEN_HC_GEMM_QMATMUL=both, or
         // XWEN_DENSE_MM_CLASSIC), "fused" when both take the dense gemm, and

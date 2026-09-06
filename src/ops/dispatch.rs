@@ -1663,6 +1663,24 @@ pub(crate) fn run_matmul_bf16_variant(
     run_matmul_dense_variant(weight, x, kernel, DenseWeight::Bf16)
 }
 
+/// Dense f32-weight x f32-activation mat-vec — `ops::matmul_f32`'s launcher.
+/// GEMV ONLY: `run_matmul_dense_variant` hard-errors on the F32 family above
+/// `F16_MM_MIN_SEQ` tokens (there is no `kernel_mul_mm_f32_f32_v`), because the
+/// caller — the MoE router projection — routes larger batches back to candle.
+pub(crate) fn run_matmul_f32(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
+    run_matmul_dense_variant(weight, x, F16MmKernel::Classic, DenseWeight::F32)
+}
+
+/// Shape half of `ops::matmul_f32`'s admission test: the token window the gemv
+/// covers, plus the two vector-load divisibility rules
+/// `run_matmul_dense_variant` enforces (`k % 32 == 0` for the float4 K walk with
+/// no tail, `n_out % 4 == 0` shared with the f16 family). Dtype, device and
+/// contiguity are the CALLER's to check — they are tensor properties, and the
+/// MoE block asks them next to its own the way `MoeBlock::fused_shexp` does.
+pub(crate) fn matmul_f32_shape_supported(t: usize, k: usize, n_out: usize) -> bool {
+    t >= 1 && t <= F16_MM_MIN_SEQ && k.is_multiple_of(32) && n_out.is_multiple_of(4)
+}
+
 /// The weight element type of the dense mixed-dtype matmul family: which dtype
 /// the input tensor must carry and which kernel library the dispatch selects.
 /// Both are 2-byte types consumed by structurally identical kernels (the bf16
@@ -1672,6 +1690,10 @@ pub(crate) fn run_matmul_bf16_variant(
 enum DenseWeight {
     F16,
     Bf16,
+    /// The MoE router plane. GEMV-ONLY — there is no f32 tiled gemm in the
+    /// family, so the mm branch bails; `ops::matmul_f32`'s contract says so and
+    /// its caller keeps larger batches on candle.
+    F32,
 }
 
 impl DenseWeight {
@@ -1679,6 +1701,7 @@ impl DenseWeight {
         match self {
             DenseWeight::F16 => DType::F16,
             DenseWeight::Bf16 => DType::BF16,
+            DenseWeight::F32 => DType::F32,
         }
     }
 
@@ -1687,13 +1710,17 @@ impl DenseWeight {
         match self {
             DenseWeight::F16 => "matmul_f16",
             DenseWeight::Bf16 => "matmul_bf16",
+            DenseWeight::F32 => "matmul_f32",
         }
     }
 }
 
-/// Shared body of `run_matmul_f16_variant` / `run_matmul_bf16_variant`: the
-/// family picks the required weight dtype and the kernel library; everything
-/// else (args, offsets, grids, smem) is identical between the two.
+/// Shared body of `run_matmul_f16_variant` / `run_matmul_bf16_variant` /
+/// `run_matmul_f32`: the family picks the required weight dtype and the kernel
+/// library; everything else (args, offsets, grids, smem) is identical across
+/// the three, the gemv kernels being line-for-line twins. The F32 family has a
+/// gemv only, so it hard-errors in the mm branch instead of selecting a
+/// pipeline there.
 fn run_matmul_dense_variant(
     weight: &Tensor,
     x: &Tensor,
@@ -1844,6 +1871,13 @@ fn run_matmul_dense_variant(
                 (F16MmKernel::TensorMixed, DenseWeight::Bf16) => {
                     bail!("the TensorMixed probe exists only for f16 weights")
                 }
+                // f32.metal carries the gemv alone: the MoE router is the only
+                // f32 matmul plane and it stays on candle above this token
+                // count, so no f32 tiled gemm was ever written.
+                (_, DenseWeight::F32) => bail!(
+                    "matmul_f32 is a gemv only: t ({t}) must be <= {F16_MM_MIN_SEQ}, \
+                     larger batches belong on candle's matmul"
+                ),
             };
             encoder.set_compute_pipeline_state(&pipeline);
             encoder.set_bytes(0, &args);
@@ -1892,6 +1926,9 @@ fn run_matmul_dense_variant(
                 }
                 DenseWeight::Bf16 => {
                     pipelines::bf16_pipeline(mdev.device(), "kernel_mul_mv_bf16_f32_v")?
+                }
+                DenseWeight::F32 => {
+                    pipelines::f32_pipeline(mdev.device(), "kernel_mul_mv_f32_f32_v")?
                 }
             };
             encoder.set_compute_pipeline_state(&pipeline);

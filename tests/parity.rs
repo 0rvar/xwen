@@ -308,6 +308,11 @@ struct Provenance {
     /// shexp-aware epilogue, "classic" for the five-dispatch chain). Introduced
     /// at schema version 11 with grandfather "classic".
     moe_shexp: Option<String>,
+    /// The MoE ROUTER PROJECTION's route ("mv" for the vendored f32 gemv over
+    /// the `[n_expert, hidden]` `ffn_gate_inp` plane, "classic" for candle's
+    /// matmul over the `[hidden, n_expert]` transpose). Introduced at schema
+    /// version 12 with grandfather "classic".
+    router_mv: Option<String>,
 }
 
 impl Provenance {
@@ -528,6 +533,16 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
                 Some(d) => Some(
                     d.as_str()
                         .context("provenance `moe_shexp` is not a string")?
+                        .to_string(),
+                ),
+                None => None,
+            },
+            // v12: absent in pre-v12 dumps (grandfathered to "classic" by the
+            // version-aware check); present-but-not-a-string is malformed.
+            router_mv: match p.get("router_mv") {
+                Some(d) => Some(
+                    d.as_str()
+                        .context("provenance `router_mv` is not a string")?
                         .to_string(),
                 ),
                 None => None,
@@ -1028,6 +1043,19 @@ fn check_moe_shexp(p: &Provenance, side: &str, want: &str) -> Result<()> {
     check_field(p, side, "moe_shexp", p.moe_shexp.as_deref(), want)
 }
 
+/// `want` is "classic" for the Reference-oracle side and for strict-tier
+/// candidates (both run under `XWEN_ROUTER_MV_CLASSIC=1`), "mv" for the
+/// mm/decode/ppl candidates. Load-bearing like `check_moe_shexp`, and the ONE
+/// place the reasoning differs from it: the oracle does not avoid this path by
+/// construction — the router projection runs before the routing decision, so
+/// `--moe-impl reference` dispatches it too and only the pinned switch takes it
+/// back to candle. The residual is pure f32 reassociation (~1e-7), but it feeds
+/// a DISCRETE top-k, so a near-tie can flip an expert. Introduced at schema
+/// version 12 with grandfather "classic".
+fn check_router_mv(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "router_mv", p.router_mv.as_deref(), want)
+}
+
 /// Enforce the attention DECODE-projection path recorded in one side's provenance.
 /// The reference oracle and strict-tier candidates run under `XWEN_ATTN_F32=1`,
 /// so the whole block is the dequant-f32 QMatMul → "f32-bypass" (`want = Some`).
@@ -1140,6 +1168,11 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             // dot it folds, and the oracle cannot reach it at all
             // (--moe-impl reference, XWEN_MOE_GLUE_CLASSIC).
             check_moe_shexp(p, "reference dump", "classic")?;
+            // v12, same reasoning with one difference: the oracle DOES reach
+            // the router projection (it runs before the routing decision), so
+            // "classic" here is the pinned XWEN_ROUTER_MV_CLASSIC and nothing
+            // structural.
+            check_router_mv(p, "reference dump", "classic")?;
             // The oracle's XWEN_ATTN_F32 makes the whole attention block the
             // dequant-f32 QMatMul, so its decode projections are "f32-bypass" too
             // (redundant with attn_mm, but pinned for symmetry / stale-dump defence).
@@ -1389,6 +1422,18 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
         // shared expert reassociates its dots), mm/decode grade the shipped
         // route.
         check_moe_shexp(p, "candidate dump", want_v9)?;
+        // v12's router_mv takes the same tier mapping, with its own vocabulary:
+        // strict candidates run under XWEN_ROUTER_MV_CLASSIC=1 (the gemv
+        // reassociates the router dots, and top-k is discrete), mm/decode grade
+        // the shipped gemv.
+        check_router_mv(
+            p,
+            "candidate dump",
+            match tier {
+                Tier::Strict => "classic",
+                Tier::Mm | Tier::Decode => "mv",
+            },
+        )?;
     }
 
     // EVERY tier also pins the CANDIDATE's attention decode-projection path:
@@ -1742,6 +1787,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_shexp_gemm(p, "reference-greedy.json", "classic")?;
             check_hc_gemm(p, "reference-greedy.json", "classic")?;
             check_moe_shexp(p, "reference-greedy.json", "classic")?;
+            check_router_mv(p, "reference-greedy.json", "classic")?;
             check_attn_decode(p, "reference-greedy.json", Some("f32-bypass"))?;
         }
         Some(p) => bail!(
@@ -1777,6 +1823,9 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             // shared expert: every generated token is one row, inside its
             // ceiling.
             check_moe_shexp(p, "candidate-greedy.json", "fused")?;
+            // Likewise the router gemv: one row per generated token, inside its
+            // own ceiling, so decode is where the shipped route is graded.
+            check_router_mv(p, "candidate-greedy.json", "mv")?;
             // The decode gate grades the shipped decode gemv: "f16" (official) or
             // "q8" (UD) both pass; XWEN_PARITY_EXPECT_ATTN_DECODE pins one.
             check_attn_decode(
@@ -2120,6 +2169,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_shexp_gemm(p, "reference-ppl.json", "classic")?;
             check_hc_gemm(p, "reference-ppl.json", "classic")?;
             check_moe_shexp(p, "reference-ppl.json", "classic")?;
+            check_router_mv(p, "reference-ppl.json", "classic")?;
             check_attn_decode(p, "reference-ppl.json", Some("f32-bypass"))?;
         }
         Some(p) => bail!(
@@ -2152,6 +2202,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_shexp_gemm(p, "candidate-ppl.json", "fused")?;
             check_hc_gemm(p, "candidate-ppl.json", "fused")?;
             check_moe_shexp(p, "candidate-ppl.json", "fused")?;
+            check_router_mv(p, "candidate-ppl.json", "mv")?;
             check_attn_decode(p, "candidate-ppl.json", expected_attn_decode().as_deref())?;
         }
         Some(p) => bail!(
@@ -2414,6 +2465,14 @@ fn prov(moe_impl: &str) -> Provenance {
                 "classic"
             } else {
                 "fused"
+            }
+            .to_string(),
+        ),
+        router_mv: Some(
+            if moe_impl == "reference" {
+                "classic"
+            } else {
+                "mv"
             }
             .to_string(),
         ),
@@ -3755,6 +3814,7 @@ fn compare_pins_candidate_attn_decode_per_tier() {
     p.shexp_gemm = Some("classic".to_string());
     p.hc_gemm = Some("classic".to_string());
     p.moe_shexp = Some("classic".to_string());
+    p.router_mv = Some("classic".to_string());
     // attn_decode defaults to "f16" — wrong for strict (expects "f32-bypass").
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict)
         .unwrap_err()
@@ -3940,6 +4000,9 @@ fn load_dump_defaults_missing_schema_version_to_v1() {
     assert_eq!(prov.moe_shexp, None);
     check_moe_shexp(&prov, "reference dump", "classic")
         .expect("missing moe_shexp at v1 must grandfather to classic");
+    assert_eq!(prov.router_mv, None);
+    check_router_mv(&prov, "reference dump", "classic")
+        .expect("missing router_mv at v1 must grandfather to classic");
 }
 
 #[test]
@@ -4012,6 +4075,7 @@ fn committed_ppl_reference_fixtures_stay_valid() {
         check_shexp_gemm(&p, &name, "classic").unwrap();
         check_hc_gemm(&p, &name, "classic").unwrap();
         check_moe_shexp(&p, &name, "classic").unwrap();
+        check_router_mv(&p, &name, "classic").unwrap();
         checked += 1;
     }
     assert!(

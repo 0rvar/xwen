@@ -58,6 +58,13 @@ const BF16_SOURCE: &str = include_str!("bf16.metal");
 /// `f16.metal`/`f16_t.metal` split: `bf16.metal` stays Metal-4-free and the
 /// attention libraries stay bfloat-free.
 const BF16_T_SOURCE: &str = include_str!("bf16_t.metal");
+/// Vendored f32-weight x f32-activation mat-vec kernel — the f32 twin of
+/// `f16.metal`'s decode gemv, dispatched for the MoE ROUTER projection at 1..8
+/// tokens (candle's mlx gemv gives that plane only 8 threadgroups). Separate
+/// from `f16.metal` for the same isolation reason `bf16.metal` and `mv.metal`
+/// are separate from it: router-critical vs attention-critical, so neither can
+/// break the other. Compiled lazily on first router-gemv dispatch.
+const F32_SOURCE: &str = include_str!("f32.metal");
 /// Vendored Metal-4 cooperative-tensor attention prefill gemm (the tensor
 /// analogue of `f16.metal`'s classic `kernel_mul_mm_f16_f32_v`). Separate from
 /// `f16.metal` so that file stays Metal-4-free: this library is compiled lazily,
@@ -281,6 +288,11 @@ pub(crate) fn bf16_pipeline(device: &Device, name: &str) -> Result<ComputePipeli
 /// `bf16.metal` carries no Metal-4 dependency.
 pub(crate) fn bf16_t_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, BF16_T_SOURCE, "bf16_t", name)
+}
+
+/// Pipeline for an `f32.metal` kernel (vendored f32-weight MoE router gemv).
+pub(crate) fn f32_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, F32_SOURCE, "f32", name)
 }
 
 /// Pipeline for an `f16_t.metal` kernel (Metal-4 cooperative-tensor attention
