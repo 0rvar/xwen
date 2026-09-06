@@ -38,7 +38,7 @@ use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Paragraph, Row, 
 use super::QuitSignal;
 use super::config::ServeSettings;
 use super::log::{JobRecord, QueueEntry, ServeLog, SinkMessage, SlotSummary};
-use super::types::{RequestOrigin, StopKind};
+use super::types::{RequestOrigin, ResidentModel, StopKind};
 
 /// How long the loop parks before redrawing anyway. The uptime, the queue ages
 /// and the deadline countdown all move on their own, so a quiet server still
@@ -99,6 +99,12 @@ static SURRENDERED: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone)]
 pub struct Vitals {
     pub model_id: String,
+    /// Which checkpoint the engine is HOLDING, as opposed to which file this
+    /// server was started with. The cell is the engine's own, read once a frame
+    /// rather than pushed: an unload and a swap both change the answer, and
+    /// polling the truth cannot go stale between two events the way a folded
+    /// copy can.
+    pub resident: Arc<ResidentModel>,
     /// The checkpoint's size on disk, or `None` if it could not be read.
     pub model_bytes: Option<u64>,
     pub context_length: usize,
@@ -121,9 +127,10 @@ pub struct Vitals {
 }
 
 impl Vitals {
-    pub fn new(model_id: String, settings: &ServeSettings) -> Self {
+    pub fn new(model_id: String, settings: &ServeSettings, resident: Arc<ResidentModel>) -> Self {
         Self {
             model_id,
+            resident,
             model_bytes: file_size(&settings.model),
             context_length: settings.context_length,
             port: settings.port,
@@ -131,6 +138,19 @@ impl Vitals {
             draft_configured: settings.draft.is_on(),
             disk_cache: settings.disk_cache && settings.cache_dir.is_some(),
         }
+    }
+
+    /// What the header's resident cell says. `None` when nothing is loaded;
+    /// `Some(name)` naming the checkpoint the same way `/v1/models` and the
+    /// history rows do, which for the served file is its own id rather than the
+    /// official checkpoint it runs as.
+    fn resident_name(&self) -> Option<String> {
+        let target = self.resident.get()?;
+        Some(if target.served_file {
+            self.model_id.clone()
+        } else {
+            target.model.full_name().to_string()
+        })
     }
 }
 
@@ -740,6 +760,17 @@ fn header_line(app: &Dashboard, now: Instant) -> Paragraph<'static> {
     if let Some(bytes) = app.vitals.model_bytes {
         parts.push(giga(bytes));
     }
+    // The first cell names the FILE this server was started with and never
+    // changes; this one names what is in memory right now. On the ordinary
+    // single-checkpoint server the two agree and repeating the name would be
+    // noise, so it reads a bare `loaded` — the cell earns its width on an
+    // unloaded server and on a swap, which are the two states nothing outside
+    // the log used to report.
+    parts.push(match app.vitals.resident_name() {
+        Some(name) if name == app.vitals.model_id => "loaded".to_string(),
+        Some(name) => format!("loaded {name}"),
+        None => "unloaded".to_string(),
+    });
     parts.push(format!(
         "draft {}",
         if app.vitals.draft { "ON" } else { "off" }
@@ -1010,6 +1041,10 @@ fn draw_history(frame: &mut Frame, app: &Dashboard, area: Rect) {
             Row::new(vec![
                 clock(finished.at, offset),
                 record.origin.dialect.label().to_string(),
+                // On a single-checkpoint server every row says the same thing;
+                // on one that swaps, this is the field that explains why two
+                // rows ran at different rates.
+                record.model.clone(),
                 token_flow(record),
                 outcome(record),
                 prefill_cell(record),
@@ -1021,6 +1056,10 @@ fn draw_history(frame: &mut Frame, app: &Dashboard, area: Rect) {
     let widths = [
         Constraint::Length(8),
         Constraint::Length(9),
+        // Wide enough for the longest official name (`Qwen3.8-Flash-Next`);
+        // a longer custom file id is cut by the table rather than pushing the
+        // numbers off the pane.
+        Constraint::Length(18),
         Constraint::Length(20),
         Constraint::Length(13),
         Constraint::Length(17),
@@ -1034,6 +1073,7 @@ fn draw_history(frame: &mut Frame, app: &Dashboard, area: Rect) {
                 Row::new(vec![
                     "time",
                     "api",
+                    "model",
                     "cached+new→out",
                     "outcome",
                     "prefill",
@@ -1410,8 +1450,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn vitals() -> Vitals {
+        // A server whose own file is loaded, which is the ordinary state and
+        // the one every other test in here is written against.
+        let resident = Arc::new(ResidentModel::new());
+        resident.store(crate::serve::types::Target::served(
+            crate::hub::Model::Qwen35BA3B,
+        ));
         Vitals {
             model_id: "laguna-s-2.1-Q4_K_M".to_string(),
+            resident,
             model_bytes: Some(68_200_000_000),
             context_length: 262_144,
             port: 5241,
@@ -1896,6 +1943,56 @@ mod tests {
             app.apply(event, Instant::now(), SystemTime::UNIX_EPOCH);
         }
         assert!(app.logs.is_empty());
+    }
+
+    /// The header's resident cell reads the engine's own cell, so a swap and an
+    /// idle unload both show up in the header without an event being routed to
+    /// the dashboard at all. It says a bare `loaded` while the resident
+    /// checkpoint IS the served file, which is the ordinary server and where
+    /// repeating the name would be noise.
+    #[test]
+    fn the_header_names_the_resident_checkpoint_when_it_is_not_the_served_file() {
+        let mut app = dashboard();
+        let text = frame(&mut app, Vec::new());
+        assert!(
+            text.contains("loaded") && !text.contains("unloaded"),
+            "the served file is resident, so the cell does not repeat its name: {text}"
+        );
+
+        // Swapped out for an official checkpoint from the hub: the cell names it.
+        app.vitals
+            .resident
+            .store(crate::serve::types::Target::official(
+                crate::hub::Model::Qwen3827B,
+            ));
+        let text = frame(&mut app, Vec::new());
+        assert!(text.contains("loaded Qwen3.8-27B"), "{text}");
+
+        // An idle unload: nothing is resident, and the header says so rather
+        // than going on naming the model it used to hold.
+        app.vitals.resident.clear();
+        let text = frame(&mut app, Vec::new());
+        assert!(text.contains("unloaded"), "{text}");
+    }
+
+    /// A finished row names the checkpoint it ran on. On a server that swaps
+    /// between checkpoints it is the one column that explains why two rows read
+    /// different rates.
+    #[test]
+    fn a_history_row_names_the_checkpoint_the_job_ran_on() {
+        let mut app = dashboard();
+        let mut swapped = record();
+        swapped.model = "Qwen3.8-27B".to_string();
+        let text = frame(
+            &mut app,
+            vec![
+                ServeLog::JobDone(Box::new(record())),
+                ServeLog::JobDone(Box::new(swapped)),
+            ],
+        );
+        assert!(text.contains("model"), "the column has a header: {text}");
+        assert!(text.contains("Qwen3.6-35B-A3B"), "{text}");
+        assert!(text.contains("Qwen3.8-27B"), "{text}");
     }
 
     /// The rings are bounded: a server that runs for a week holds the same

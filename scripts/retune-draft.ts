@@ -523,6 +523,9 @@ function childEnv(): Record<string, string> {
   }
   if (HF_CACHE_ROOT) e.HF_HUB_CACHE = HF_CACHE_ROOT;
   e.XWEN_BENCH = "1";
+  // A sweep is hundreds of runs nobody asked for: tagged, they stay in the
+  // metrics history and out of `xwen stats`' default table.
+  e.XWEN_METRICS_TAG = "bench";
   return e;
 }
 

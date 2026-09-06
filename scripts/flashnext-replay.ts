@@ -91,6 +91,10 @@ const baseEnv: Record<string, string> = {};
 for (const [k, v] of Object.entries(process.env)) {
   if (v !== undefined && !k.startsWith("XWEN_")) baseEnv[k] = v;
 }
+// Set after the XWEN_ strip, which is what every other var here is subject to.
+// logits-dump writes no metrics record today, so this changes nothing now; it
+// is here so that a replay run can never reach the history as real use.
+baseEnv.XWEN_METRICS_TAG = "bench";
 
 async function run(cmd: string[], env = baseEnv): Promise<string> {
   const p = Bun.spawn(cmd, { cwd: root, env, stdout: "pipe", stderr: "pipe" });

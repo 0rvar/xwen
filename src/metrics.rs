@@ -28,6 +28,12 @@ pub const METRICS_RELATIVE_PATH: &str = ".local/state/xwen/metrics.jsonl";
 /// An empty value counts as unset and resolves the default path.
 pub const METRICS_ENV: &str = "XWEN_METRICS_FILE";
 
+/// Tags every record this process writes as harness-driven rather than real
+/// use. The scripts that drive the binary export it (`bench` for the bench and
+/// tuning sweeps, `parity` for the gate); nothing else sets it, and an empty
+/// value counts as unset.
+pub const TAG_ENV: &str = "XWEN_METRICS_TAG";
+
 /// The current record schema. Readers accept any version and ignore fields they
 /// do not know, so a newer xwen's history stays readable by an older one.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -100,6 +106,19 @@ pub struct RunRecord {
     /// one row however many agents worked inside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// What kind of run this was, for a history that mixes real use with the
+    /// runs a harness drove. `None` is a real run — a person or a client asked
+    /// for it — and every tagged value names the harness that did
+    /// (`bench`, `parity`). Set from [`TAG_ENV`] at the moment the record is
+    /// stamped, so a script exports it once and every surface it drives records
+    /// it without knowing the field exists.
+    ///
+    /// `xwen stats` leaves tagged records out of its default report: a sweep's
+    /// several hundred runs would otherwise read as a day of inference nobody
+    /// did. The exclusion is always stated in the footer, never silent, and
+    /// `--all-tags` puts them back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     /// Whether the run reached its own natural end: an end-of-generation token
     /// or its token cap, with no error.
     ///
@@ -134,9 +153,27 @@ impl RunRecord {
             client: None,
             session: None,
             agent: None,
+            tag: tag_from_env(),
             ok: true,
         }
     }
+}
+
+/// The tag this process stamps on every record it writes, read from
+/// [`TAG_ENV`]. Read per record rather than cached: a record is written once
+/// per run, and a cached value would be one more thing to get wrong in a test.
+pub fn tag_from_env() -> Option<String> {
+    tag_from(std::env::var_os(TAG_ENV).as_deref())
+}
+
+/// [`tag_from_env`] over a value rather than the process environment, which is
+/// what makes the rule testable — the same reason [`metrics_path_from`] exists.
+/// An empty value is how a shell spells "unset" by accident and names no tag.
+pub fn tag_from(env: Option<&OsStr>) -> Option<String> {
+    env.and_then(OsStr::to_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// The label `--by session`, `--by client` and `--by agent` use for a run that
@@ -525,6 +562,35 @@ pub fn parse_since(spec: &str, now: u64, utc_offset: i64) -> Result<u64> {
     }
 }
 
+/// Which population of the history a report covers.
+///
+/// The history records everything, harness runs included — silent exclusion at
+/// write time is the harder mistake to notice (decisions.md "Metrics"). The
+/// separation therefore happens at read time, and the default is the question
+/// the table is nearly always asked: what did real use cost.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TagFilter {
+    /// Untagged records only: real use, with every harness run left out. The
+    /// count left out is reported, so the exclusion is never silent.
+    #[default]
+    Untagged,
+    /// One tag's records and nothing else, for reading a sweep on its own.
+    Only(String),
+    /// Everything in the file, tagged and untagged alike.
+    All,
+}
+
+impl TagFilter {
+    /// Whether this record belongs in the report.
+    pub fn keeps(&self, rec: &RunRecord) -> bool {
+        match self {
+            TagFilter::All => true,
+            TagFilter::Untagged => rec.tag.is_none(),
+            TagFilter::Only(want) => rec.tag.as_deref() == Some(want.as_str()),
+        }
+    }
+}
+
 /// What `xwen stats` was asked for.
 #[derive(Debug, Clone)]
 pub struct StatsQuery {
@@ -539,6 +605,9 @@ pub struct StatsQuery {
     pub client: Option<String>,
     /// Substring of the derived session key, matched the same way.
     pub session: Option<String>,
+    /// Which population to report on. Defaults to real use alone; see
+    /// [`TagFilter`].
+    pub tag: TagFilter,
     /// Read this file instead of the configured one. Reading only: nothing
     /// records to a `--file` path.
     pub file: Option<PathBuf>,
@@ -553,6 +622,7 @@ impl Default for StatsQuery {
             surface: None,
             client: None,
             session: None,
+            tag: TagFilter::default(),
             file: None,
         }
     }
@@ -718,6 +788,11 @@ pub struct StatsReport {
     pub records: usize,
     /// Records the filters kept.
     pub matched: usize,
+    /// Records the tag filter alone left out, counted before any other filter
+    /// narrowed the file. A default report of a history a sweep has run
+    /// through says this out loud rather than quietly reporting fewer runs
+    /// than the file holds.
+    pub excluded_by_tag: usize,
     pub skipped: usize,
     /// Whether the machine's UTC offset could be read. When it could not, the
     /// rows were bucketed in UTC — which is a correct report of the wrong days,
@@ -751,9 +826,18 @@ pub fn report(query: &StatsQuery) -> Result<Option<StatsReport>> {
         return Ok(None);
     }
     let records = history.records.len();
+    // Counted over the whole file, before `--since` or any other filter has
+    // narrowed it: the footer's claim is "this many records in this file are
+    // not real use", which is a property of the file rather than of the query.
+    let excluded_by_tag = history
+        .records
+        .iter()
+        .filter(|rec| !query.tag.keeps(rec))
+        .count();
     let kept: Vec<RunRecord> = history
         .records
         .into_iter()
+        .filter(|rec| query.tag.keeps(rec))
         .filter(|rec| since.is_none_or(|since| rec.ts >= since))
         .filter(|rec| query.model.as_ref().is_none_or(|want| &rec.model == want))
         .filter(|rec| {
@@ -783,6 +867,7 @@ pub fn report(query: &StatsQuery) -> Result<Option<StatsReport>> {
         rows: aggregate(kept.into_iter(), query.by, utc_offset),
         records,
         matched,
+        excluded_by_tag,
         skipped: history.skipped,
         local_offset_known: local_offset.is_some(),
     }))
@@ -994,6 +1079,10 @@ mod tests {
             ts,
             surface: surface.to_string(),
             model: model.to_string(),
+            // Explicit, because `RunRecord::new` reads the tag out of the
+            // process environment: a runner with `XWEN_METRICS_TAG` exported
+            // would otherwise hand every one of these tests a tagged record.
+            tag: None,
             ..RunRecord::new(surface, model)
         }
     }
@@ -1013,9 +1102,84 @@ mod tests {
         rec.accepted = Some(160);
         rec.session = Some("9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40".to_string());
         rec.agent = Some("explore-metrics".to_string());
+        rec.tag = Some("bench".to_string());
         let line = serde_json::to_string(&rec).expect("a record serializes");
+        assert!(line.contains(r#""tag":"bench""#));
         let back: RunRecord = serde_json::from_str(&line).expect("a record parses");
         assert_eq!(rec, back);
+    }
+
+    /// The tag comes from the environment at the moment the record is stamped,
+    /// so a script exports it once and every surface it drives records it.
+    /// A value that is only whitespace, or empty, names no tag: that is how a
+    /// shell spells "unset" by accident, and it must not invent a tag called
+    /// nothing that the default report would then hide runs under.
+    #[test]
+    fn the_tag_comes_from_the_environment_and_an_empty_value_is_no_tag() {
+        use std::ffi::OsString;
+        assert_eq!(
+            tag_from(Some(&OsString::from("bench"))),
+            Some("bench".into())
+        );
+        assert_eq!(
+            tag_from(Some(&OsString::from("  parity "))),
+            Some("parity".into())
+        );
+        assert_eq!(tag_from(Some(&OsString::from(""))), None);
+        assert_eq!(tag_from(Some(&OsString::from("   "))), None);
+        assert_eq!(tag_from(None), None);
+    }
+
+    /// Three populations out of one file. The default is real use; `--tag`
+    /// reads one harness on its own; `--all-tags` is the whole file. The
+    /// excluded count is the file's, not the query's, so it is stable under
+    /// the other filters — it is what the footer promises a reader.
+    #[test]
+    fn the_tag_filter_separates_harness_runs_from_real_use() {
+        let mut real = run(10, "generate", "Qwen3.8-27B");
+        real.decode_tokens = 10;
+        let mut benched = run(20, "generate", "Qwen3.8-27B");
+        benched.tag = Some("bench".to_string());
+        benched.decode_tokens = 20;
+        let mut gated = run(30, "generate", "Qwen3.8-27B");
+        gated.tag = Some("parity".to_string());
+        gated.decode_tokens = 40;
+
+        let path = scratch("tags.jsonl");
+        for rec in [&real, &benched, &gated] {
+            append(&path, rec).expect("a record appends");
+        }
+        let asked = |tag: TagFilter| {
+            report(&StatsQuery {
+                by: GroupBy::All,
+                tag,
+                file: Some(path.clone()),
+                ..StatsQuery::default()
+            })
+            .expect("the history reads")
+            .expect("a history")
+        };
+
+        let default = asked(TagFilter::Untagged);
+        assert_eq!(default.matched, 1, "only the run a person asked for");
+        assert_eq!(default.rows[0].decode_tokens, 10);
+        assert_eq!(
+            default.excluded_by_tag, 2,
+            "and the report says how many it left out"
+        );
+
+        let bench = asked(TagFilter::Only("bench".to_string()));
+        assert_eq!(bench.matched, 1);
+        assert_eq!(bench.rows[0].decode_tokens, 20);
+        assert_eq!(
+            bench.excluded_by_tag, 2,
+            "the real run and the other harness are both outside this report"
+        );
+
+        let all = asked(TagFilter::All);
+        assert_eq!(all.matched, 3);
+        assert_eq!(all.rows[0].decode_tokens, 70);
+        assert_eq!(all.excluded_by_tag, 0, "nothing is excluded by --all-tags");
     }
 
     /// Absent optional fields stay absent on the wire, and a reader accepts a
@@ -1029,6 +1193,10 @@ mod tests {
         assert!(!line.contains("drafted"));
         assert!(!line.contains("items"));
         assert!(!line.contains("agent"));
+        assert!(
+            !line.contains("tag"),
+            "an untagged run is real use and writes no tag key"
+        );
         let back: RunRecord = serde_json::from_str(&line).expect("a record parses");
         assert_eq!(
             back.agent, None,

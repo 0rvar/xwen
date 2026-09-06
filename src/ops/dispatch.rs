@@ -19,18 +19,23 @@ use crate::config::ZGate;
 use crate::gguf::{ExpertStack, QuantPlane};
 use crate::ops::{MmVariant, pipelines};
 
-/// Build an `MTLSize` without naming `objc2_metal::MTLSize` — xwen does not
-/// depend on objc2-metal directly, and a function cannot return the unnameable
-/// type. `get_block_dims(1,1,1)` returns `MTLSize { 1, 1, 1 }`; its three fields
-/// are public, so we overwrite them with the grid we want.
-macro_rules! mtl_size {
-    ($w:expr, $h:expr, $d:expr) => {{
-        let mut sz = candle_metal_kernels::utils::get_block_dims(1, 1, 1);
-        sz.width = $w;
-        sz.height = $h;
-        sz.depth = $d;
-        sz
-    }};
+/// A grid or threadgroup size, spelled once so every dispatch below reads the
+/// same way.
+///
+/// This was a macro that built the value by calling candle's `get_block_dims`
+/// and overwriting all three of its fields, on the stated grounds that
+/// `objc2_metal::MTLSize` could not be named here. It can: the objc2 crates are
+/// direct dependencies, `=`-pinned to exactly what the pinned candle rev
+/// resolves (Cargo.toml), so this is the same type candle's own signatures use
+/// and a plain struct literal builds it. The round trip through `get_block_dims`
+/// computed nothing that survived — every field it returned was overwritten —
+/// so nothing about any dispatch changed when it went.
+const fn mtl_size(width: usize, height: usize, depth: usize) -> objc2_metal::MTLSize {
+    objc2_metal::MTLSize {
+        width,
+        height,
+        depth,
+    }
 }
 
 /// Everything a single indexed dispatch needs, resolved to raw device buffers.
@@ -572,8 +577,8 @@ pub(crate) fn encode_mul_mv_id_vendored(
     }
 
     // grid.z walks every (token, slot) pair; threads are `nsg` simdgroups of 32.
-    let grid = mtl_size!(geom.row_blocks(d.n_out), 1, d.top_k * d.t);
-    let threads = mtl_size!(32, geom.nsg, 1);
+    let grid = mtl_size(geom.row_blocks(d.n_out), 1, d.top_k * d.t);
+    let threads = mtl_size(32, geom.nsg, 1);
     encoder.dispatch_thread_groups(grid, threads);
     Ok(())
 }
@@ -649,8 +654,8 @@ pub(crate) fn encode_mul_mv_id(
 
     // grid.x groups the n_out rows into `align`-wide blocks; grid.z walks all
     // top_k*t (token, slot) pairs (the id wrapper decodes z into token+slot).
-    let grid = mtl_size!(d.n_out.div_ceil(geom.align), 1, d.top_k * d.t);
-    let threads = mtl_size!(geom.nth0, geom.nth1, 1);
+    let grid = mtl_size(d.n_out.div_ceil(geom.align), 1, d.top_k * d.t);
+    let threads = mtl_size(geom.nth0, geom.nth1, 1);
     encoder.dispatch_thread_groups(grid, threads);
     Ok(())
 }
@@ -828,7 +833,7 @@ fn encode_map0(
     encoder.set_output_buffer(3, Some(scratch), ids_map_off);
     encoder.set_output_buffer(4, Some(scratch), work_off);
     encoder.set_threadgroup_memory_length(0, map0_smem);
-    encoder.dispatch_thread_groups(mtl_size!(1, 1, 1), mtl_size!(ntg, 1, 1));
+    encoder.dispatch_thread_groups(mtl_size(1, 1, 1), mtl_size(ntg, 1, 1));
     Ok(())
 }
 
@@ -933,15 +938,15 @@ fn encode_mm(
     // map0's work list (bounded by mm_tiles_max, the tail early-returns) or,
     // on the full grid, nr1-wide token tiles with one z-slab per expert.
     let grid = if full_grid {
-        mtl_size!(d.t.div_ceil(nr1), d.n_out.div_ceil(64), d.n_expert)
+        mtl_size(d.t.div_ceil(nr1), d.n_out.div_ceil(64), d.n_expert)
     } else {
-        mtl_size!(
+        mtl_size(
             mm_tiles_max(d.n_expert, d.t, d.top_k, nr1),
             d.n_out.div_ceil(64),
-            1
+            1,
         )
     };
-    encoder.dispatch_thread_groups(grid, mtl_size!(128, 1, 1));
+    encoder.dispatch_thread_groups(grid, mtl_size(128, 1, 1));
     Ok(())
 }
 
@@ -1407,8 +1412,8 @@ pub(crate) fn run_mv_id_dual(
         );
         encoder.set_input_buffer(5, Some(up_buf), up.base_off);
 
-        let grid = mtl_size!(geom.row_blocks(gate.n_out), 1, top_k * t);
-        let threads = mtl_size!(32, geom.nsg, 1);
+        let grid = mtl_size(geom.row_blocks(gate.n_out), 1, top_k * t);
+        let threads = mtl_size(32, geom.nsg, 1);
         encoder.dispatch_thread_groups(grid, threads);
     }
     drop(x_guard);
@@ -1584,8 +1589,8 @@ pub(crate) fn run_plain_mv(
         // grid.x per MvVendoredGeom (K-quant: ceil(n_out/(nr0*nsg)); q8_0:
         // ceil(n_out/nr0)); grid.y = one column per token row (nr1 == 1 for the
         // quant mv path); threads `nsg` simdgroups.
-        let grid = mtl_size!(geom.row_blocks(n_out), t, 1);
-        let threads = mtl_size!(32, geom.nsg, 1);
+        let grid = mtl_size(geom.row_blocks(n_out), t, 1);
+        let threads = mtl_size(32, geom.nsg, 1);
         encoder.dispatch_thread_groups(grid, threads);
     }
     drop(x_guard);
@@ -1908,7 +1913,7 @@ fn run_matmul_dense_variant(
             encoder.set_input_buffer(2, Some(x_buf), x_off);
             encoder.set_output_buffer(3, Some(&dst), 0);
             encoder.set_threadgroup_memory_length(0, smem);
-            let grid = mtl_size!(t.div_ceil(n_tile), n_out.div_ceil(64), 1);
+            let grid = mtl_size(t.div_ceil(n_tile), n_out.div_ceil(64), 1);
             // threadsPerThreadgroup is (32, 4, 1) — ggml's (SIMD width, nsg, 1)
             // shape for every mul_mm dispatch. Thread linearization is identical
             // to a flat (128, 1, 1) (tiitg = x + 32*y; simdgroup packing from the
@@ -1917,7 +1922,7 @@ fn run_matmul_dense_variant(
             // shape measures a consistent few percent faster on the large
             // projection shapes (amortized bench, 9216x3072: ~1.79 -> ~1.71
             // ms/dispatch).
-            encoder.dispatch_thread_groups(grid, mtl_size!(32, 4, 1));
+            encoder.dispatch_thread_groups(grid, mtl_size(32, 4, 1));
         } else {
             // gemv: NR0 rows per threadgroup, NSG simdgroups splitting K, one
             // grid.y column per token; smem is the cross-simdgroup reduce
@@ -1960,8 +1965,8 @@ fn run_matmul_dense_variant(
             encoder.set_input_buffer(2, Some(x_buf), x_off);
             encoder.set_output_buffer(3, Some(&dst), 0);
             encoder.set_threadgroup_memory_length(0, MV_F16_NR0 * 32 * DType::F32.size_in_bytes());
-            let grid = mtl_size!(n_out.div_ceil(MV_F16_NR0), t, 1);
-            encoder.dispatch_thread_groups(grid, mtl_size!(32, MV_F16_NSG, 1));
+            let grid = mtl_size(n_out.div_ceil(MV_F16_NR0), t, 1);
+            encoder.dispatch_thread_groups(grid, mtl_size(32, MV_F16_NSG, 1));
         }
     }
     drop(w_guard);
@@ -2059,8 +2064,8 @@ pub(crate) fn run_matmul_q8(
 
         // grid.x = ceil(n_out / N_R0); grid.y = one column per token; threads are
         // N_SG simdgroups of 32 splitting the K reduction.
-        let grid = mtl_size!(n_out.div_ceil(MV_Q8_NR0), t, 1);
-        encoder.dispatch_thread_groups(grid, mtl_size!(32, MV_Q8_NSG, 1));
+        let grid = mtl_size(n_out.div_ceil(MV_Q8_NR0), t, 1);
+        encoder.dispatch_thread_groups(grid, mtl_size(32, MV_Q8_NSG, 1));
     }
     drop(x_guard);
 
@@ -2230,8 +2235,8 @@ pub(crate) fn run_matmul_mv_ext(
         // No threadgroup memory: the reduction is a shuffle ladder inside each
         // simdgroup. grid.x covers the weight rows R0PTG at a time, grid.y the
         // token rows r1ptg at a time; threads are ggml's (SIMD width, nsg, 1).
-        let grid = mtl_size!(n_out.div_ceil(MV_EXT_R0PTG), t.div_ceil(r1ptg), 1);
-        encoder.dispatch_thread_groups(grid, mtl_size!(32, MV_EXT_NSG, 1));
+        let grid = mtl_size(n_out.div_ceil(MV_EXT_R0PTG), t.div_ceil(r1ptg), 1);
+        encoder.dispatch_thread_groups(grid, mtl_size(32, MV_EXT_NSG, 1));
     }
     drop(x_guard);
 
@@ -2366,8 +2371,8 @@ pub(crate) fn run_matmul_dense_q_mm(
         encoder.set_threadgroup_memory_length(0, DENSE_MM_A_TILE_SMEM);
         // 64(out) x 128(token) tiles; (32, 4, 1) threads is ggml's (SIMD width,
         // nsg, 1) shape for every mul_mm dispatch.
-        let grid = mtl_size!(t.div_ceil(DENSE_MM_NR1), n_out.div_ceil(DENSE_MM_NR0), 1);
-        encoder.dispatch_thread_groups(grid, mtl_size!(32, 4, 1));
+        let grid = mtl_size(t.div_ceil(DENSE_MM_NR1), n_out.div_ceil(DENSE_MM_NR0), 1);
+        encoder.dispatch_thread_groups(grid, mtl_size(32, 4, 1));
     }
     drop(x_guard);
 
@@ -2526,7 +2531,7 @@ pub(crate) fn run_combine(
             encoder.set_input_buffer(2, Some(w_buf), w_off);
             encoder.set_output_buffer(3, Some(&dst), 0);
         }
-        encoder.dispatch_thread_groups(mtl_size!(out_length, 1, 1), mtl_size!(width, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(out_length, 1, 1), mtl_size(width, 1, 1));
     }
     drop(down_guard);
     drop(w_guard);
@@ -2705,10 +2710,7 @@ pub(crate) fn run_silu_mul_l2(
         );
         encoder.set_output_buffer(3, Some(&act_s), 0);
         encoder.set_output_buffer(4, Some(&col_l2), 0);
-        encoder.dispatch_thread_groups(
-            mtl_size!(n_rows, 1, 1),
-            mtl_size!(SILU_MUL_L2_THREADS, 1, 1),
-        );
+        encoder.dispatch_thread_groups(mtl_size(n_rows, 1, 1), mtl_size(SILU_MUL_L2_THREADS, 1, 1));
     }
     drop(gate_guard);
     drop(up_guard);
@@ -2856,7 +2858,7 @@ pub(crate) fn run_moe_router(
         encoder.set_input_buffer(1, Some(logits_storage.buffer()), f32_off(logits_layout));
         encoder.set_output_buffer(2, Some(&ids), 0);
         encoder.set_output_buffer(3, Some(&weights), 0);
-        encoder.dispatch_thread_groups(mtl_size!(seq, 1, 1), mtl_size!(n_expert_pad, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(seq, 1, 1), mtl_size(n_expert_pad, 1, 1));
     }
     drop(logits_guard);
 
@@ -2964,7 +2966,7 @@ pub(crate) fn run_moe_epilogue(
         encoder.set_input_buffer(3, Some(sh_storage.buffer()), f32_off(sh_layout));
         encoder.set_input_buffer(4, Some(g_storage.buffer()), f32_off(g_layout));
         encoder.set_output_buffer(5, Some(&dst), 0);
-        encoder.dispatch_thread_groups(mtl_size!(out_length, 1, 1), mtl_size!(width, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(out_length, 1, 1), mtl_size(width, 1, 1));
     }
     drop(down_guard);
     drop(w_guard);
@@ -3189,8 +3191,8 @@ pub(crate) fn run_moe_shexp_gate_up(
         // One threadgroup per (row tile of the two projections, token), plus one
         // for the gate logit.
         encoder.dispatch_thread_groups(
-            mtl_size!(n_row_tg + 1, n, 1),
-            mtl_size!(MOE_SHEXP_THREADS, 1, 1),
+            mtl_size(n_row_tg + 1, n, 1),
+            mtl_size(MOE_SHEXP_THREADS, 1, 1),
         );
     }
     drop(x_guard);
@@ -3324,8 +3326,8 @@ pub(crate) fn run_moe_epilogue_shexp(
         // kernel_moe_epilogue's grid, unchanged: one threadgroup per output
         // element, now a full simdgroup wide.
         encoder.dispatch_thread_groups(
-            mtl_size!(out_length, 1, 1),
-            mtl_size!(MOE_SHEXP_EPILOGUE_THREADS, 1, 1),
+            mtl_size(out_length, 1, 1),
+            mtl_size(MOE_SHEXP_EPILOGUE_THREADS, 1, 1),
         );
     }
     drop(down_guard);
@@ -3404,8 +3406,8 @@ fn dispatch_linear(
     n: usize,
 ) {
     let width = pipeline.max_total_threads_per_threadgroup().min(256);
-    let grid = mtl_size!(n.div_ceil(width), 1, 1);
-    let threads = mtl_size!(width, 1, 1);
+    let grid = mtl_size(n.div_ceil(width), 1, 1);
+    let threads = mtl_size(width, 1, 1);
     encoder.dispatch_thread_groups(grid, threads);
 }
 
@@ -4262,8 +4264,8 @@ pub(crate) fn run_delta_ba_fused(
         encoder.set_output_buffer(5, Some(&beta), 0);
         encoder.set_output_buffer(6, Some(&g), 0);
         encoder.dispatch_thread_groups(
-            mtl_size!(two_vh.div_ceil(DELTA_BA_COLS), seq.div_ceil(toks), 1),
-            mtl_size!(width, 1, 1),
+            mtl_size(two_vh.div_ceil(DELTA_BA_COLS), seq.div_ceil(toks), 1),
+            mtl_size(width, 1, 1),
         );
     }
     drop(x_guard);
@@ -4364,7 +4366,7 @@ pub(crate) fn run_delta_gnorm(
         encoder.set_input_buffer(2, Some(z_storage.buffer()), f32_off(z_layout));
         encoder.set_input_buffer(3, Some(w_storage.buffer()), f32_off(w_layout));
         encoder.set_output_buffer(4, Some(&dst), 0);
-        encoder.dispatch_thread_groups(mtl_size!(seq * v_heads, 1, 1), mtl_size!(head_dim, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(seq * v_heads, 1, 1), mtl_size(head_dim, 1, 1));
     }
     drop(o_guard);
     drop(z_guard);
@@ -4436,8 +4438,8 @@ pub(crate) fn run_delta_l2norm(conv: &Tensor, k_heads: usize, eps: f32) -> Resul
         encoder.set_input_buffer(1, Some(conv_storage.buffer()), f32_off(conv_layout));
         encoder.set_output_buffer(2, Some(&dst), 0);
         encoder.dispatch_thread_groups(
-            mtl_size!(seq * 2 * k_heads, 1, 1),
-            mtl_size!(DELTA_HEAD_DIM, 1, 1),
+            mtl_size(seq * 2 * k_heads, 1, 1),
+            mtl_size(DELTA_HEAD_DIM, 1, 1),
         );
     }
     drop(conv_guard);
@@ -4629,8 +4631,8 @@ fn run_delta_scan_v2(
         encoder.set_output_buffer(6, Some(&out), 0);
         encoder.set_output_buffer(7, Some(&s_out), 0);
         encoder.dispatch_thread_groups(
-            mtl_size!(DELTA_V2_COL_TGS, v_heads, 1),
-            mtl_size!(DELTA_SIMD_WIDTH, DELTA_V2_SGS, 1),
+            mtl_size(DELTA_V2_COL_TGS, v_heads, 1),
+            mtl_size(DELTA_SIMD_WIDTH, DELTA_V2_SGS, 1),
         );
     }
     drop(qk_guard);
@@ -4740,8 +4742,8 @@ pub(crate) fn run_delta_scan_decode(
         encoder.set_output_buffer(5, Some(&out), 0);
         encoder.set_output_buffer(6, Some(&s_out), 0);
         encoder.dispatch_thread_groups(
-            mtl_size!(v_heads * DELTA_DEC_COL_BLOCKS, 1, 1),
-            mtl_size!(DELTA_HEAD_DIM, 1, 1),
+            mtl_size(v_heads * DELTA_DEC_COL_BLOCKS, 1, 1),
+            mtl_size(DELTA_HEAD_DIM, 1, 1),
         );
     }
     drop(conv_guard);
@@ -4830,8 +4832,8 @@ pub(crate) fn run_delta_scan_default(
         encoder.set_output_buffer(5, Some(&out), 0);
         encoder.set_output_buffer(6, Some(&s_out), 0);
         encoder.dispatch_thread_groups(
-            mtl_size!(v_heads * DELTA_COL_BLOCKS, 1, 1),
-            mtl_size!(DELTA_HEAD_DIM, 1, 1),
+            mtl_size(v_heads * DELTA_COL_BLOCKS, 1, 1),
+            mtl_size(DELTA_HEAD_DIM, 1, 1),
         );
     }
     drop(conv_guard);
@@ -5010,8 +5012,8 @@ pub(crate) fn run_flash_attn(
         );
         encoder.set_output_buffer(4, Some(&dst), 0);
         // One threadgroup per (query block, query head); 4 simdgroups.
-        let grid = mtl_size!(nq, n_head, 1);
-        encoder.dispatch_thread_groups(grid, mtl_size!(32, 4, 1));
+        let grid = mtl_size(nq, n_head, 1);
+        encoder.dispatch_thread_groups(grid, mtl_size(32, 4, 1));
     }
     drop(q_guard);
     drop(k_guard);
@@ -5192,7 +5194,7 @@ pub(crate) fn run_qsa_gather(t: &Tensor, rows: &Tensor) -> Result<Tensor> {
             .min(256)
             .min(head_dim / 4)
             .max(1);
-        encoder.dispatch_thread_groups(mtl_size!(n_sel, heads, 1), mtl_size!(width, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(n_sel, heads, 1), mtl_size(width, 1, 1));
     }
     drop(t_guard);
     drop(r_guard);
@@ -5301,7 +5303,7 @@ pub(crate) fn run_qsa_select(
             s_layout.start_offset() * DType::F32.size_in_bytes(),
         );
         encoder.set_output_buffer(2, Some(&dst), 0);
-        encoder.dispatch_thread_groups(mtl_size!(1, 1, 1), mtl_size!(width, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(1, 1, 1), mtl_size(width, 1, 1));
     }
     drop(s_guard);
 
@@ -5611,7 +5613,7 @@ pub(crate) fn run_hc_norm_with(
         let ep = &cmd;
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
-        let tg = mtl_size!(threads, 1, 1);
+        let tg = mtl_size(threads, 1, 1);
         if split {
             // One threadgroup per (token, stream) for the norm, and — with a
             // head — one per (token, injection row) for the gate. The gate
@@ -5623,14 +5625,14 @@ pub(crate) fn run_hc_norm_with(
             encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
             encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
             encoder.set_output_buffer(3, Some(&normed), 0);
-            encoder.dispatch_thread_groups(mtl_size!(n, hc_count, 1), tg);
+            encoder.dispatch_thread_groups(mtl_size(n, hc_count, 1), tg);
             if let Some((inj_buf, inj_off)) = inj_bind {
                 encoder.set_compute_pipeline_state(&pipes[1]);
                 encoder.set_bytes(0, &args);
                 encoder.set_input_buffer(1, Some(inj_buf), inj_off);
                 encoder.set_input_buffer(2, Some(&normed), 0);
                 encoder.set_output_buffer(3, Some(&inject), 0);
-                encoder.dispatch_thread_groups(mtl_size!(n, hc_count, 1), tg);
+                encoder.dispatch_thread_groups(mtl_size(n, hc_count, 1), tg);
             }
         } else {
             // The unused-head arm binds the norm weight into the injection
@@ -5644,7 +5646,7 @@ pub(crate) fn run_hc_norm_with(
             encoder.set_input_buffer(3, Some(inj_buf), inj_off);
             encoder.set_output_buffer(4, Some(&normed), 0);
             encoder.set_output_buffer(5, Some(&inject), 0);
-            encoder.dispatch_thread_groups(mtl_size!(n, 1, 1), tg);
+            encoder.dispatch_thread_groups(mtl_size(n, 1, 1), tg);
         }
     }
     drop(x_guard);
@@ -6089,7 +6091,7 @@ pub(crate) fn run_hc_gate_down(
         // One threadgroup per (row tile of the down weight, token), plus one for
         // the injection head where there is one.
         let grid_x = n_down_tg + usize::from(inject_w.is_some());
-        encoder.dispatch_thread_groups(mtl_size!(grid_x, n, 1), mtl_size!(HC_GATE_THREADS, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(grid_x, n, 1), mtl_size(HC_GATE_THREADS, 1, 1));
     }
     drop(x_guard);
     drop(w_guard);
@@ -6225,8 +6227,8 @@ pub(crate) fn run_hc_gate_up_mix(
         // One threadgroup per (column tile of the carrier, token); each covers
         // HC_GATE_MIX_THREADS / hc_count columns.
         encoder.dispatch_thread_groups(
-            mtl_size!(hidden.div_ceil(HC_GATE_MIX_THREADS / hc_count), n, 1),
-            mtl_size!(HC_GATE_MIX_THREADS, 1, 1),
+            mtl_size(hidden.div_ceil(HC_GATE_MIX_THREADS / hc_count), n, 1),
+            mtl_size(HC_GATE_MIX_THREADS, 1, 1),
         );
     }
     drop(l_guard);
@@ -6361,7 +6363,7 @@ pub(crate) fn run_ple_tail(
         }
         encoder.set_output_buffer(6, Some(&gated), 0);
         encoder.set_output_buffer(7, Some(&normed), 0);
-        encoder.dispatch_thread_groups(mtl_size!(n, width / hidden, 1), mtl_size!(threads, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(n, width / hidden, 1), mtl_size(threads, 1, 1));
         encoder.set_compute_pipeline_state(&conv);
         encoder.set_bytes(0, &args);
         encoder.set_input_buffer(1, Some(&gated), 0);
@@ -6370,8 +6372,8 @@ pub(crate) fn run_ple_tail(
         encoder.set_input_buffer(4, Some(buffers[5].0), buffers[5].1);
         encoder.set_output_buffer(5, Some(&out), 0);
         encoder.dispatch_thread_groups(
-            mtl_size!(count.div_ceil(threads), 1, 1),
-            mtl_size!(threads, 1, 1),
+            mtl_size(count.div_ceil(threads), 1, 1),
+            mtl_size(threads, 1, 1),
         );
     }
     Ok((
@@ -6616,6 +6618,6 @@ pub(crate) fn run_bw_probe(
     encoder.set_bytes(0, &args);
     encoder.set_input_buffer(1, Some(src), src_off);
     encoder.set_output_buffer(2, Some(dst), dst_off);
-    encoder.dispatch_thread_groups(mtl_size!(groups, 1, 1), mtl_size!(256, 1, 1));
+    encoder.dispatch_thread_groups(mtl_size(groups, 1, 1), mtl_size(256, 1, 1));
     Ok(())
 }

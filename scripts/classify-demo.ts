@@ -491,7 +491,16 @@ async function connect(): Promise<Server> {
       String(port),
       ...(noDraft ? ["--no-draft"] : []),
     ],
-    { cwd: repo, stdout: "inherit", stderr: "inherit" },
+    {
+      cwd: repo,
+      // The demo's own server: its runs are a scripted eval set, not use, so
+      // they are tagged out of `xwen stats`' default table. A demo that
+      // ATTACHED to an already-running server cannot do this — that server's
+      // own environment decides what its records are tagged with.
+      env: { ...process.env, XWEN_METRICS_TAG: "demo" },
+      stdout: "inherit",
+      stderr: "inherit",
+    },
   );
   const url = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 15_000;

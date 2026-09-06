@@ -205,6 +205,27 @@ already carve a bench session out after the fact. Whether the scripts should set
 `XWEN_METRICS_FILE=off` or tag their records is ledgered rather than decided here
 (2026-09-05).
 
+**Tag at write time, filter at read time, and say what was filtered.** This supersedes
+the paragraph above, which left the choice open, and it keeps the half of it that was
+right: nothing is excluded at write time, so the file still holds every run and
+`XWEN_METRICS_FILE=off` stays the escape hatch nobody has to use. What changed is that
+"visible the moment someone groups by day" turned out to be too weak a defence. A retune
+sweep is several hundred runs, and the day it ran reads as a day of heavy inference
+until a reader thinks to ask; the over-count is only visible to someone who already
+suspects it. So a record grows an optional `tag`, set from `XWEN_METRICS_TAG` when the
+record is stamped, and `xwen stats` leaves tagged records out by default. The two
+properties that make this different from excluding at write time are both load-bearing:
+the data is still there, so `--tag bench` reads a sweep on its own and `--all-tags`
+reads the file as it was written; and the exclusion is never silent, the stderr footer
+naming the count it left out and the flag that puts it back. The alternative of a
+`surface` value per harness was rejected — a bench run really is a `generate` run, and
+overloading the field would have made `--by surface` answer a different question than it
+does today. The tag is set from the environment inside `RunRecord::new` rather than at
+each call site, so a script exports it once and every surface it drives records it
+without knowing the field exists; the cost is that a script driving an already-running
+server cannot tag its records at all, that server's own environment being what decides
+(2026-09-06).
+
 **Records carry a `v` and readers ignore fields they do not know.** The schema will
 gain fields — per-item batch rows, a request id, whatever the next surface measures —
 and the file is append-only, so old records and new ones sit in the same file forever
