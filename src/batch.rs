@@ -82,7 +82,7 @@ use crate::generate::{GenEvent, Generator};
 use crate::hub::Model;
 use crate::kv_cache::CacheSnapshot;
 use crate::sampler::SamplerOptions;
-use crate::tokenizer::LagunaTokenizer;
+use crate::tokenizer::{LagunaTokenizer, Specials};
 
 /// Shortest shared prefix worth a snapshot. Below this the snapshot/restore
 /// bookkeeping costs more than re-prefilling the tokens it would save.
@@ -725,7 +725,11 @@ fn run_item(
         return assemble_scored(generator, item, plan);
     }
     // Set unconditionally: `None` is what clears the previous item's grammar.
-    generator.set_grammar(item_grammar(factory, item)?);
+    generator.set_grammar(item_grammar(
+        factory,
+        item,
+        *generator.tokenizer().specials(),
+    )?);
 
     let prompt_len = item.tokens.len();
     let mut content = String::new();
@@ -809,13 +813,16 @@ fn run_item(
 fn item_grammar(
     factory: Option<&ConstraintFactory>,
     item: &Prepared,
+    specials: Specials,
 ) -> Result<Option<GrammarState>> {
     let Some(schema) = &item.schema else {
         return Ok(None);
     };
     let factory =
         factory.ok_or_else(|| anyhow!("batch: an item wants a schema but no factory was built"))?;
-    let mut state = factory.compile(schema)?.into_state(item.starts_in_thinking);
+    let mut state = factory
+        .compile(schema)?
+        .into_state(item.starts_in_thinking, specials);
     if item.prefix_len > 0 {
         // A response prefix is already part of the answer document; feeding it
         // in is what makes the first mask continue it. A prefix can only be
@@ -1463,11 +1470,12 @@ fn decode_reasoning(
     let mut text = String::new();
     let mut ids = Vec::new();
     let outcome;
+    let think_close = generator.tokenizer().specials().think_close;
     {
         let mut on_event = |event: GenEvent| {
             ids.push(event.id());
             text.push_str(event.text());
-            if event.id() == LagunaTokenizer::THINK_CLOSE {
+            if event.id() == think_close {
                 closed.set(true);
             }
         };
@@ -1902,10 +1910,10 @@ fn resolve_render(
     dialect: ChatDialect,
 ) -> Result<(ChatOptions, Option<Continuation>)> {
     let effort = item.reasoning_effort.or(defaults.reasoning_effort);
-    if effort.is_some() && dialect == ChatDialect::Qwen36 {
+    if effort.is_some() && !dialect.supports_reasoning_effort() {
         bail!(
-            "reasoning_effort: {label} renders the Qwen 3.6 chat template, which has no \
-             reasoning_effort parameter (it is a Qwen 3.8 template feature)"
+            "reasoning_effort: {label} renders a chat template with no reasoning_effort \
+             parameter (it is a Qwen 3.8 template feature)"
         );
     }
     let thinking = item

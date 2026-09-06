@@ -47,7 +47,7 @@ use llguidance::{Matcher, ParserFactory};
 use toktrie::{SimpleVob, TokEnv};
 use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 
-use crate::tokenizer::{EMBEDDED_TOKENIZER_JSON, LagunaTokenizer};
+use crate::tokenizer::{EMBEDDED_TOKENIZER_JSON, LagunaTokenizer, Specials};
 
 /// Token trie + parser factory over the embedded vocabulary. Build once and
 /// share (`Arc`-clone is cheap; the factory itself is `Send + Sync`).
@@ -59,6 +59,12 @@ pub struct ConstraintFactory {
 /// (~150 ms) and kept for the life of the process. The server always runs the
 /// embedded tokenizer (`serve/engine.rs::load_tokenizer`), so this is always
 /// the right trie for a served request.
+///
+/// A trie is tied to one vocabulary: its token bytes, its stop ids and its
+/// mask width all come from the file it was built over. A checkpoint on a
+/// different vocabulary needs its own factory, built through
+/// [`ConstraintFactory::new`] over that checkpoint's `tokenizer.json` and its
+/// own logit width, and cannot borrow this one.
 pub fn shared() -> Result<&'static ConstraintFactory> {
     static SHARED: OnceLock<std::result::Result<ConstraintFactory, String>> = OnceLock::new();
     match SHARED.get_or_init(|| ConstraintFactory::embedded().map_err(|e| format!("{e:#}"))) {
@@ -80,34 +86,33 @@ impl ConstraintFactory {
     /// so the padded ids are unreachable by construction, which is what they
     /// should be.
     pub fn embedded() -> Result<Self> {
-        Self::new(LagunaTokenizer::PADDED_VOCAB)
+        Self::new(
+            EMBEDDED_TOKENIZER_JSON,
+            &LagunaTokenizer::EOG,
+            LagunaTokenizer::PADDED_VOCAB,
+        )
     }
 
-    /// Builds the trie from the same embedded `tokenizer.json` bytes the real
-    /// tokenizer parses, so the two views cannot drift. `expected_vocab` is the
-    /// model's logit width; the mask must cover exactly that many ids.
-    pub fn new(expected_vocab: usize) -> Result<Self> {
-        Self::new_from(Some(expected_vocab))
-    }
-
-    fn new_from(expected_vocab: Option<usize>) -> Result<Self> {
-        let mut bt = ByteTokenizer::from_json_bytes(EMBEDDED_TOKENIZER_JSON)
+    /// Builds the trie over one vocabulary. `tokenizer_json` are the same bytes
+    /// the real tokenizer parses, so the two views cannot drift; `eos` are that
+    /// vocabulary's end-of-generation ids (`Specials::eog`); `expected_vocab`
+    /// is the model's logit width, which the mask must cover exactly.
+    pub fn new(tokenizer_json: &[u8], eos: &[u32], expected_vocab: usize) -> Result<Self> {
+        let mut bt = ByteTokenizer::from_json_bytes(tokenizer_json)
             .map_err(|e| anyhow!("constrain: building the grammar token trie failed: {e}"))?;
         // Chat ends on either EOG id, and llguidance's auto-detection settles
         // on one stop token. Naming both keeps the grammar offering a stop the
         // decode loop will actually act on; leaving it to the scan lets a
         // constrained run reach max_tokens with the value long since complete.
-        bt.set_eos_tokens(&LagunaTokenizer::EOG);
-        let env: TokEnv = ByteTokenizerEnv::new(bt, expected_vocab)
+        bt.set_eos_tokens(eos);
+        let env: TokEnv = ByteTokenizerEnv::new(bt, Some(expected_vocab))
             .map_err(|e| anyhow!("constrain: sizing the token trie failed: {e}"))?
             .to_env();
-        if let Some(expected) = expected_vocab {
-            ensure!(
-                env.tok_trie().vocab_size() == expected,
-                "constrain: trie holds {} tokens but the model's vocabulary is {expected}",
-                env.tok_trie().vocab_size(),
-            );
-        }
+        ensure!(
+            env.tok_trie().vocab_size() == expected_vocab,
+            "constrain: trie holds {} tokens but the model's vocabulary is {expected_vocab}",
+            env.tok_trie().vocab_size(),
+        );
         let mut factory = ParserFactory::new_simple(&env)
             .map_err(|e| anyhow!("constrain: building the parser factory failed: {e}"))?;
         // llguidance logs straight to stderr by default. Under `serve` stderr
@@ -155,10 +160,13 @@ impl Grammar {
 
     /// Turns the compiled grammar into decode-loop state. `in_thinking` says
     /// whether generation starts inside a `<think>` block; if so the state
-    /// stays dormant until `</think>` commits.
-    pub fn into_state(self, in_thinking: bool) -> GrammarState {
+    /// stays dormant until `</think>` commits. `specials` are the running
+    /// vocabulary's marker ids, which is what the state watches the committed
+    /// stream for — the ids differ between checkpoint families.
+    pub fn into_state(self, in_thinking: bool, specials: Specials) -> GrammarState {
         GrammarState {
             matcher: self.matcher,
+            specials,
             active: !in_thinking,
             done: false,
             mask: None,
@@ -176,6 +184,9 @@ impl Grammar {
 /// [`is_done`]: GrammarState::is_done
 pub struct GrammarState {
     matcher: Matcher,
+    /// The running vocabulary's marker ids: which committed token arms the
+    /// state, and which ones are stops the matcher must never be fed.
+    specials: Specials,
     /// False while the model is still thinking; nothing is masked or consumed
     /// until `</think>` commits.
     active: bool,
@@ -240,11 +251,11 @@ impl GrammarState {
     /// never fed to the matcher — the loops break on them, and the mask only
     /// offers them when stopping is already legal.
     pub fn on_committed(&mut self, token: u32) -> Result<()> {
-        if self.done || LagunaTokenizer::EOG.contains(&token) {
+        if self.done || self.specials.eog().contains(&token) {
             return Ok(());
         }
         if !self.active {
-            if token == LagunaTokenizer::THINK_CLOSE {
+            if token == self.specials.think_close {
                 self.active = true;
             }
             return Ok(());
@@ -291,6 +302,15 @@ mod tests {
         })
     }
 
+    /// The embedded vocabulary's marker ids, which every state under test runs
+    /// against. Pinned to the constants by
+    /// `tokenizer::tests::the_embedded_vocabulary_resolves_to_the_named_constants`,
+    /// so the assertions below may keep naming the constants.
+    fn embedded_specials() -> Specials {
+        static SPECIALS: OnceLock<Specials> = OnceLock::new();
+        *SPECIALS.get_or_init(|| *LagunaTokenizer::embedded().unwrap().specials())
+    }
+
     fn bit(words: &[u32], id: u32) -> bool {
         words
             .get((id / 32) as usize)
@@ -304,7 +324,10 @@ mod tests {
     fn walks_a_valid_document_and_completes() {
         let tok = LagunaTokenizer::embedded().unwrap();
         let ids = tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(false, embedded_specials());
         for (i, &id) in ids.iter().enumerate() {
             let words = state
                 .mask_words()
@@ -344,7 +367,10 @@ mod tests {
     fn the_mask_spans_the_models_logit_width() {
         let tok = LagunaTokenizer::embedded().unwrap();
         assert!(LagunaTokenizer::PADDED_VOCAB > tok.vocab_size());
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(false, embedded_specials());
         let words = state
             .mask_words()
             .unwrap()
@@ -367,7 +393,10 @@ mod tests {
     #[test]
     fn no_control_token_is_ever_offered() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(false, embedded_specials());
         let ids = tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap();
         let mut widest = 0;
         for (step, &id) in ids.iter().enumerate() {
@@ -403,7 +432,10 @@ mod tests {
         let close_bracket = tok.encode("]").unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(close_bracket.len(), 1);
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(false, embedded_specials());
         let words = state.mask_words().unwrap().unwrap();
         assert!(bit(words, open[0]), "opening brace must be legal");
         assert!(!bit(words, close_bracket[0]), "']' cannot open an object");
@@ -414,7 +446,10 @@ mod tests {
     #[test]
     fn stays_dormant_until_think_close() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(true);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(true, embedded_specials());
         assert!(state.mask_words().unwrap().is_none());
         // Arbitrary thinking-text tokens pass through without touching the
         // grammar.
@@ -434,7 +469,10 @@ mod tests {
     #[test]
     fn consume_prefix_continues_the_document() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(false, embedded_specials());
         state
             .consume_prefix(&tok.encode("{\"name\": \"laguna\",").unwrap())
             .unwrap();
@@ -460,7 +498,10 @@ mod tests {
     #[test]
     fn an_invalid_prefix_names_where_it_diverged() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(false, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{\"name\": [1").unwrap())
             .expect_err("an array is not a string");
@@ -473,7 +514,10 @@ mod tests {
     #[test]
     fn a_prefix_that_completes_the_document_is_refused() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(false, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap())
             .expect_err("a complete value leaves nothing to generate");
@@ -485,7 +529,10 @@ mod tests {
     #[test]
     fn consume_prefix_on_a_dormant_state_errors() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(true);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(true, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{").unwrap())
             .expect_err("a dormant grammar has nothing to consume with");
@@ -514,7 +561,10 @@ mod tests {
         let ids = tok
             .encode("{\"anything\": [1, {\"nested\": null}]}")
             .unwrap();
-        let mut state = factory().compile_any_object().unwrap().into_state(false);
+        let mut state = factory()
+            .compile_any_object()
+            .unwrap()
+            .into_state(false, embedded_specials());
         for &id in &ids {
             let words = state.mask_words().unwrap().unwrap();
             assert!(bit(words, id), "token {id} missing from json_object mask");

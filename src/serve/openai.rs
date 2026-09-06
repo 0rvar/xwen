@@ -826,19 +826,18 @@ pub(crate) fn prepare(
 
     let messages = normalize(&request, settings.tools_mode)?;
     let kwargs = template_kwargs(request.chat_template_kwargs.as_ref())?;
-    // The kwarg is the raw template parameter, and the resolved target's 3.6
-    // template has no such parameter: honoring the request is impossible and
+    // The kwarg is the raw template parameter, and only the 3.8 template takes
+    // one: honoring the request is impossible on every other target, and
     // dropping it is the silent-prompt-change this module's strict kwargs
     // exist to prevent (the CLI's --reasoning-effort applies the same rule).
     // The TOP-LEVEL field stays accepted here — it carries budget semantics on
     // every checkpoint — and so does a server-wide configured effort, which is
     // an operator default, not a request.
-    if kwargs.reasoning_effort.is_some()
-        && target.model.chat_dialect() == crate::chat::ChatDialect::Qwen36
+    if kwargs.reasoning_effort.is_some() && !target.model.chat_dialect().supports_reasoning_effort()
     {
         return Err(bad_request(format!(
-            "chat_template_kwargs.reasoning_effort: {} renders the Qwen 3.6 chat template, \
-             which has no reasoning_effort parameter (it is a Qwen 3.8 template feature); \
+            "chat_template_kwargs.reasoning_effort: {} renders a chat template with no \
+             reasoning_effort parameter (it is a Qwen 3.8 template feature); \
              for a reasoning budget on this model, use the top-level reasoning_effort field",
             request.model.as_deref().unwrap_or(default_model),
         )));

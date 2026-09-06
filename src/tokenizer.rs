@@ -59,8 +59,82 @@ fn byte_level_inverse() -> std::collections::HashMap<char, u8> {
     inverse
 }
 
+/// The ids of the structural markers a ChatML vocabulary is built around,
+/// resolved from the tokenizer's own added vocabulary by token TEXT.
+///
+/// Every marker is a single added token in every Qwen vocabulary, but the ids
+/// differ between checkpoint families (Qwen 3.6/3.8 number them in the 248k
+/// range, Qwen3 in the 151k one), so code that recognizes a marker by id must
+/// read it from the tokenizer it is running against rather than from a
+/// compile-time constant. The struct is `Copy`, so a caller that needs the ids
+/// past the tokenizer's borrow takes a copy and carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Specials {
+    /// `<|endoftext|>` — the document terminator, and the id used wherever a
+    /// slot must be filled with something inert. One of the two EOG ids.
+    pub endoftext: u32,
+    /// `<|im_start|>` — opens a ChatML turn header.
+    pub im_start: u32,
+    /// `<|im_end|>` — closes a ChatML turn. The other EOG id.
+    pub im_end: u32,
+    /// `<think>` — opens the reasoning block.
+    pub think_open: u32,
+    /// `</think>` — closes it. Generation code gates on this by id (the think
+    /// budget's exit, the grammar's activation edge, the reasoning/answer
+    /// split), which is why it must be the running vocabulary's own.
+    pub think_close: u32,
+    /// `<tool_call>` / `</tool_call>` — bracket one function call the assistant
+    /// wrote. The call's body is ordinary text, not vocabulary entries.
+    pub tool_call_open: u32,
+    pub tool_call_close: u32,
+    /// `<tool_response>` / `</tool_response>` — bracket one tool result inside
+    /// the user turn that carries results back to the model.
+    pub tool_response_open: u32,
+    pub tool_response_close: u32,
+}
+
+impl Specials {
+    /// End-of-generation tokens: `<|im_end|>` ends the assistant's turn,
+    /// `<|endoftext|>` ends the document. Generation stops on EITHER; watching
+    /// only one lets decoding run past the turn boundary and continue the
+    /// conversation on its own. The order matches
+    /// [`LagunaTokenizer::EOG`], which callers that compare the two rely on.
+    pub fn eog(&self) -> [u32; 2] {
+        [self.im_end, self.endoftext]
+    }
+
+    /// Padding / fallback id. No Qwen vocabulary has a dedicated pad entry, so
+    /// `<|endoftext|>` serves.
+    pub fn pad(&self) -> u32 {
+        self.endoftext
+    }
+
+    /// Resolve every marker through an added-vocabulary lookup. A vocabulary
+    /// missing one has no rendering for the chat template and is refused by
+    /// name rather than silently running with a wrong id.
+    fn resolve(lookup: impl Fn(&str) -> Option<u32>) -> Result<Self> {
+        let id = |text: &str| -> Result<u32> {
+            lookup(text)
+                .ok_or_else(|| anyhow!("the tokenizer's added vocabulary has no {text:?} token"))
+        };
+        Ok(Self {
+            endoftext: id("<|endoftext|>")?,
+            im_start: id("<|im_start|>")?,
+            im_end: id("<|im_end|>")?,
+            think_open: id("<think>")?,
+            think_close: id("</think>")?,
+            tool_call_open: id("<tool_call>")?,
+            tool_call_close: id("</tool_call>")?,
+            tool_response_open: id("<tool_response>")?,
+            tool_response_close: id("</tool_response>")?,
+        })
+    }
+}
+
 pub struct LagunaTokenizer {
     inner: tokenizers::Tokenizer,
+    /// This vocabulary's structural marker ids. Resolved once at load.
+    specials: Specials,
     /// Added-token strings with their ids, sorted longest-first so a scan that
     /// takes the first hit at a position implements the same leftmost-longest
     /// discipline as the added-vocabulary matcher inside `inner`.
@@ -82,6 +156,12 @@ pub struct LagunaTokenizer {
 }
 
 impl LagunaTokenizer {
+    // The embedded (Qwen 3.6/3.8) vocabulary's marker ids, as compile-time
+    // constants. They are the numbers `specials()` resolves for that
+    // vocabulary and no other, so decode-time code reads [`Specials`] instead;
+    // these serve the checks that pin the embedded file's numbering and the
+    // GGUF metadata fold in `config.rs`, which runs before any tokenizer is
+    // loaded.
     /// `<|endoftext|>` — the document terminator, and the id used wherever a
     /// slot must be filled with something inert (padding, an out-of-range
     /// fallback). It is one of the two end-of-generation ids.
@@ -127,22 +207,26 @@ impl LagunaTokenizer {
     pub fn embedded() -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_bytes(EMBEDDED_TOKENIZER_JSON)
             .map_err(|e| anyhow!("failed to parse the embedded tokenizer: {e}"))?;
-        Ok(Self::from_inner(inner))
+        Self::from_inner(inner)
     }
 
+    /// Any checkpoint's `tokenizer.json`. Nothing here is specific to one
+    /// vocabulary: the marker ids come out of the file's own added vocabulary
+    /// ([`Specials`]) and the token count out of the model itself, so a
+    /// checkpoint that ships its tokenizer alongside its weights loads through
+    /// this and needs nothing embedded in the binary.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(path.as_ref())
             .map_err(|e| anyhow!("failed to load tokenizer from {:?}: {e}", path.as_ref()))?;
-        Ok(Self::from_inner(inner))
+        Self::from_inner(inner)
+            .map_err(|e| e.context(format!("tokenizer {:?}", path.as_ref().display())))
     }
 
-    fn from_inner(inner: tokenizers::Tokenizer) -> Self {
-        let mut markers: Vec<(String, u32)> = inner
-            .get_added_vocabulary()
-            .get_vocab()
-            .iter()
-            .map(|(text, &id)| (text.clone(), id))
-            .collect();
+    fn from_inner(inner: tokenizers::Tokenizer) -> Result<Self> {
+        let vocab = inner.get_added_vocabulary().get_vocab();
+        let specials = Specials::resolve(|text| vocab.get(text).copied())?;
+        let mut markers: Vec<(String, u32)> =
+            vocab.iter().map(|(text, &id)| (text.clone(), id)).collect();
         // Longest first (ties broken lexically for determinism): the scanner
         // takes the first match at a position, which must be the longest one.
         markers.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
@@ -152,13 +236,23 @@ impl LagunaTokenizer {
                 marker_first_bytes[byte as usize] = true;
             }
         }
-        Self {
+        Ok(Self {
             inner,
+            specials,
             markers,
             marker_first_bytes,
             plain: OnceLock::new(),
             decoded: OnceLock::new(),
-        }
+        })
+    }
+
+    /// This vocabulary's structural marker ids. Anything that recognizes a
+    /// marker by id reads it from here, so the same code runs against any Qwen
+    /// vocabulary; the `LagunaTokenizer` constants are the embedded 3.6/3.8
+    /// vocabulary's copy of the same numbers and exist for the checks that pin
+    /// them.
+    pub fn specials(&self) -> &Specials {
+        &self.specials
     }
 
     /// Load the vocab embedded in the GGUF metadata (no tokenizer.json needed).
@@ -454,6 +548,157 @@ mod tests {
     fn tokenizer() -> LagunaTokenizer {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/tokenizer.json");
         LagunaTokenizer::from_file(path).expect("load reference tokenizer")
+    }
+
+    /// The Qwen3 `tokenizer.json`, from the HF cache. Every Qwen3-4B
+    /// checkpoint ships the same file (base, Instruct-2507 and the Z-Image
+    /// text encoder are sha256-identical), so any one of them serves; the
+    /// tests that need it skip themselves when none is downloaded.
+    fn qwen3_tokenizer_path() -> Option<std::path::PathBuf> {
+        let hub = std::env::var_os("HF_HUB_CACHE")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HF_HOME").map(|home| std::path::PathBuf::from(home).join("hub"))
+            })
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".cache/huggingface/hub"))
+            })?;
+        for repo in [
+            "models--Qwen--Qwen3-4B",
+            "models--Qwen--Qwen3-4B-Instruct-2507",
+        ] {
+            let snapshots = hub.join(repo).join("snapshots");
+            let Ok(entries) = std::fs::read_dir(&snapshots) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("tokenizer.json");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    /// The embedded vocabulary's markers resolve to exactly the constants that
+    /// named them before the ids became per-tokenizer data. This is what makes
+    /// the migration to [`Specials`] a no-op for the shipped checkpoints: the
+    /// two sources have to agree, id for id.
+    #[test]
+    fn the_embedded_vocabulary_resolves_to_the_named_constants() {
+        let t = tokenizer();
+        let s = *t.specials();
+        assert_eq!(s.endoftext, LagunaTokenizer::ENDOFTEXT);
+        assert_eq!(s.im_start, LagunaTokenizer::IM_START);
+        assert_eq!(s.im_end, LagunaTokenizer::IM_END);
+        assert_eq!(s.think_open, LagunaTokenizer::THINK_OPEN);
+        assert_eq!(s.think_close, LagunaTokenizer::THINK_CLOSE);
+        assert_eq!(s.tool_call_open, LagunaTokenizer::TOOL_CALL_OPEN);
+        assert_eq!(s.tool_call_close, LagunaTokenizer::TOOL_CALL_CLOSE);
+        assert_eq!(s.tool_response_open, LagunaTokenizer::TOOL_RESPONSE_OPEN);
+        assert_eq!(s.tool_response_close, LagunaTokenizer::TOOL_RESPONSE_CLOSE);
+        assert_eq!(s.eog(), LagunaTokenizer::EOG);
+        assert_eq!(s.pad(), LagunaTokenizer::PAD);
+    }
+
+    /// The Qwen3 vocabulary numbers the same markers in its own range, and
+    /// nothing in the loader assumes the 248k one. These are the ids
+    /// `Qwen/Qwen3-4B`'s `tokenizer.json` declares.
+    #[test]
+    fn the_qwen3_vocabulary_resolves_to_its_own_ids() {
+        let Some(path) = qwen3_tokenizer_path() else {
+            eprintln!("skipping: no Qwen3-4B tokenizer.json in the HF cache");
+            return;
+        };
+        let t = LagunaTokenizer::from_file(&path).expect("load the Qwen3 tokenizer");
+        let s = *t.specials();
+        assert_eq!(s.endoftext, 151_643);
+        assert_eq!(s.im_start, 151_644);
+        assert_eq!(s.im_end, 151_645);
+        assert_eq!(s.tool_call_open, 151_657);
+        assert_eq!(s.tool_call_close, 151_658);
+        assert_eq!(s.tool_response_open, 151_665);
+        assert_eq!(s.tool_response_close, 151_666);
+        assert_eq!(s.think_open, 151_667);
+        assert_eq!(s.think_close, 151_668);
+        assert_eq!(s.eog(), [151_645, 151_643]);
+    }
+
+    /// Every fixture prompt encodes to the ids llama.cpp's own tokenizer gave
+    /// it, and decodes back to the text it came from.
+    ///
+    /// The ids are the ORACLE's, produced by
+    /// `llama-tokenize -m Qwen3-4B-BF16.gguf --ids --no-bos --stdin`
+    /// (`scripts/qwen3-fixtures.ts` regenerates the file), so this is a
+    /// cross-implementation check and not xwen agreeing with itself. The corpus
+    /// covers prose, code, JSON, dense punctuation, whitespace runs, CJK,
+    /// emoji with zero-width joiners, right-to-left script, the chat markers as
+    /// literal text, and one prompt past a thousand tokens.
+    #[test]
+    fn the_qwen3_fixture_prompts_round_trip_against_the_oracles_ids() {
+        let Some(path) = qwen3_tokenizer_path() else {
+            eprintln!("skipping: no Qwen3-4B tokenizer.json in the HF cache");
+            return;
+        };
+        let t = LagunaTokenizer::from_file(&path).expect("load the Qwen3 tokenizer");
+        let fixtures = include_str!("../tests/fixtures/qwen3-prompts.json");
+        let fixtures: serde_json::Value =
+            serde_json::from_str(fixtures).expect("the fixture file is JSON");
+        let prompts = fixtures["prompts"]
+            .as_array()
+            .expect("the fixture file holds a prompt array");
+        assert_eq!(prompts.len(), 20, "the fixture corpus is twenty prompts");
+        let mut longest = 0;
+        for prompt in prompts {
+            let id = prompt["id"].as_str().expect("every prompt has an id");
+            let text = prompt["text"].as_str().expect("every prompt has text");
+            let expected: Vec<u32> = prompt["ids"]
+                .as_array()
+                .expect("every prompt has ids")
+                .iter()
+                .map(|v| v.as_u64().expect("an id is a number") as u32)
+                .collect();
+            longest = longest.max(expected.len());
+            assert_eq!(t.encode(text).unwrap(), expected, "encode differs on {id}");
+            assert_eq!(t.decode(&expected).unwrap(), text, "decode differs on {id}");
+        }
+        assert!(
+            longest > 1000,
+            "the corpus must exercise a long input; longest is {longest} tokens"
+        );
+    }
+
+    /// Every Qwen `tokenizer.json` declares an NFC normalizer, which the HF
+    /// `tokenizers` runtime this wrapper is built on applies before the
+    /// pre-tokenizer. llama.cpp's GGUF tokenizer implements no normalizers at
+    /// all, so on text that is not already in NFC the two disagree — and there
+    /// the model's own training pipeline, which is the HF one, is what xwen
+    /// follows.
+    ///
+    /// The consequence for callers: `encode` is not injective over
+    /// canonically-equivalent spellings, so `decode(encode(text))` returns the
+    /// NFC form and not necessarily `text`. Prompt fixtures are therefore held
+    /// in NFC (`scripts/qwen3-fixtures.ts` refuses anything else), because an
+    /// oracle comparison on decomposed text would be measuring this and not the
+    /// vocabulary.
+    ///
+    /// Checked on the embedded vocabulary, whose normalizer is the same one, so
+    /// this holds with or without a Qwen3 checkpoint in the cache.
+    #[test]
+    fn the_hf_pipeline_normalizes_where_llama_cpp_does_not() {
+        let t = tokenizer();
+        let composed = "é";
+        let decomposed = "e\u{301}";
+        assert_ne!(composed, decomposed, "the two spellings differ as bytes");
+        assert_eq!(
+            t.encode(decomposed).unwrap(),
+            t.encode(composed).unwrap(),
+            "the NFC normalizer must fold the decomposed spelling"
+        );
+        let ids = t.encode(decomposed).unwrap();
+        assert_eq!(t.decode(&ids).unwrap(), composed);
     }
 
     /// `decoded_vocab` must reverse the byte-level alphabet exactly: for any

@@ -1136,10 +1136,13 @@ pub(crate) fn submit(
     // keeps the grammar dormant until `</think>` commits. A response prefix the
     // header already wrote is fed in ahead of the first draw, so the mask
     // continues that document instead of starting a second one.
+    // The marker ids the grammar watches for come from the tokenizer the
+    // request was encoded with, so the arming edge is that vocabulary's own.
+    let specials = *state.tokenizer.specials();
     let grammar = match request.grammar {
         None => None,
         Some(grammar) => {
-            let mut state = grammar.into_state(prompt.starts_in_thinking);
+            let mut state = grammar.into_state(prompt.starts_in_thinking, specials);
             if prompt.prefix_len > 0 {
                 debug_assert!(
                     !prompt.starts_in_thinking,

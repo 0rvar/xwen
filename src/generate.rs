@@ -812,6 +812,10 @@ struct ThinkBudget {
     /// Encoded paragraph break, prefixed to an injection that would otherwise
     /// start in the middle of a line.
     paragraph: Vec<u32>,
+    /// The running vocabulary's `</think>` id: what the pull biases towards
+    /// and what disarms the schedule. `u32::MAX` on a disabled controller,
+    /// which never compares against it.
+    think_close: u32,
     /// Forced tokens still to be drawn, in order.
     queue: VecDeque<u32>,
     /// The schedule's own clock: tokens the MODEL chose while armed. Tokens the
@@ -934,6 +938,7 @@ impl ThinkBudget {
             wrapup: Vec::new(),
             transition: Vec::new(),
             paragraph: Vec::new(),
+            think_close: u32::MAX,
             queue: VecDeque::new(),
             clock: 0,
             forced_pending: false,
@@ -965,6 +970,7 @@ impl ThinkBudget {
             wrapup,
             transition,
             paragraph,
+            think_close,
         } = statics;
         Self {
             budget,
@@ -973,6 +979,7 @@ impl ThinkBudget {
             wrapup,
             transition,
             paragraph,
+            think_close,
             ..Self::off()
         }
     }
@@ -1104,7 +1111,7 @@ impl ThinkBudget {
                 .extend(self.wait_ids.iter().map(|&id| (id, bias)));
         }
         let alpha = Self::PULL_MAX * ramp(x, Self::PULL_LO, 1.0);
-        let pull = (alpha > 0.0).then_some((LagunaTokenizer::THINK_CLOSE, alpha));
+        let pull = (alpha > 0.0).then_some((self.think_close, alpha));
         ThinkControl {
             bias: &self.bias_buf,
             pull,
@@ -1133,7 +1140,7 @@ impl ThinkBudget {
             self.clock += 1;
             self.awaiting_natural = false;
         }
-        if token == LagunaTokenizer::THINK_CLOSE {
+        if token == self.think_close {
             self.armed = false;
             self.closed_at = Some(t);
         }
@@ -1168,17 +1175,22 @@ struct ThinkStatics {
     wrapup: Vec<u32>,
     transition: Vec<u32>,
     paragraph: Vec<u32>,
+    /// This vocabulary's `</think>`: the id the schedule pulls towards, forces
+    /// as the tail of its transition, and disarms on.
+    think_close: u32,
 }
 
 impl ThinkStatics {
     fn new(tokenizer: &LagunaTokenizer) -> Result<Self> {
+        let think_close = tokenizer.specials().think_close;
         let mut transition = tokenizer.encode(ThinkBudget::TRANSITION_TEXT)?;
-        transition.push(LagunaTokenizer::THINK_CLOSE);
+        transition.push(think_close);
         Ok(Self {
             wait_ids: scan_wait_tokens(tokenizer)?,
             wrapup: tokenizer.encode(ThinkBudget::WRAPUP_TEXT)?,
             transition,
             paragraph: tokenizer.encode(ThinkBudget::PARAGRAPH_TEXT)?,
+            think_close,
         })
     }
 }
@@ -1342,7 +1354,7 @@ fn scan_wait_tokens(tokenizer: &LagunaTokenizer) -> Result<Vec<u32>> {
 fn scan_banned(tokenizer: &LagunaTokenizer, eog: &[u32], pattern: &str) -> Result<Vec<u32>> {
     ensure!(!pattern.is_empty(), "--ban-string cannot be empty");
     let mut protected = tokenizer.added_token_ids();
-    protected.push(LagunaTokenizer::PAD);
+    protected.push(tokenizer.specials().pad());
     protected.extend_from_slice(eog);
     protected.sort_unstable();
     protected.dedup();
@@ -1494,7 +1506,7 @@ impl Generator {
     fn ban_ids(&self, with_think_exit: bool) -> Vec<u32> {
         let mut ban = self.blacklist.clone();
         if with_think_exit && self.min_think > 0 {
-            ban.push(LagunaTokenizer::THINK_CLOSE);
+            ban.push(self.tokenizer.specials().think_close);
             ban.extend_from_slice(self.sampler.eog_ids());
         }
         ban
@@ -2230,6 +2242,9 @@ impl Generator {
         let target_max_ctx = model.max_ctx();
         let draft_ctx = drafter.max_ctx();
 
+        // The reasoning/answer boundary is a vocabulary fact, read once per call:
+        // the decode stream holds the tokenizer for the rest of the loop.
+        let think_close = tokenizer.specials().think_close;
         let decode_start = Instant::now();
         let mut stream = tokenizer.decode_stream();
         let mut stats = SpecStats::default();
@@ -2312,6 +2327,7 @@ impl Generator {
             on_event(section_event(
                 id_last,
                 chunk.unwrap_or_default(),
+                think_close,
                 &mut in_thinking,
                 &mut thinking_tokens,
             ));
@@ -2536,6 +2552,7 @@ impl Generator {
                 on_event(section_event(
                     tok,
                     chunk.unwrap_or_default(),
+                    think_close,
                     &mut in_thinking,
                     &mut thinking_tokens,
                 ));
@@ -2717,6 +2734,9 @@ impl Generator {
         let target_max_ctx = model.max_ctx();
         let draft_ctx = head.max_ctx();
 
+        // The reasoning/answer boundary is a vocabulary fact, read once per call:
+        // the decode stream holds the tokenizer for the rest of the loop.
+        let think_close = tokenizer.specials().think_close;
         let decode_start = Instant::now();
         let mut stream = tokenizer.decode_stream();
         let mut stats = SpecStats::default();
@@ -2795,6 +2815,7 @@ impl Generator {
             on_event(section_event(
                 id_last,
                 chunk.unwrap_or_default(),
+                think_close,
                 &mut in_thinking,
                 &mut thinking_tokens,
             ));
@@ -2962,6 +2983,7 @@ impl Generator {
                 on_event(section_event(
                     tok,
                     chunk.unwrap_or_default(),
+                    think_close,
                     &mut in_thinking,
                     &mut thinking_tokens,
                 ));
@@ -3088,6 +3110,9 @@ impl Generator {
         let mut decoded = 0usize;
         let mut thinking_tokens = 0usize;
         let mut in_thinking = starts_in_thinking;
+        // The reasoning/answer boundary is a vocabulary fact, read once per call
+        // so the emit loop below does not reborrow the tokenizer per token.
+        let think_close = self.tokenizer.specials().think_close;
         let mut hit_eog = false;
         let mut cancelled = false;
         while decoded < max_new {
@@ -3136,6 +3161,7 @@ impl Generator {
             on_event(section_event(
                 token,
                 text,
+                think_close,
                 &mut in_thinking,
                 &mut thinking_tokens,
             ));
@@ -4136,6 +4162,7 @@ fn retained_commits(committed: usize, emitted: usize, hit_eog: bool) -> usize {
 fn section_event(
     token: u32,
     text: String,
+    think_close: u32,
     in_thinking: &mut bool,
     thinking_tokens: &mut usize,
 ) -> GenEvent {
@@ -4143,7 +4170,7 @@ fn section_event(
         return GenEvent::TextTok { id: token, text };
     }
     *thinking_tokens += 1;
-    if token != LagunaTokenizer::THINK_CLOSE {
+    if token != think_close {
         return GenEvent::ThinkingTok { id: token, text };
     }
     *in_thinking = false;
@@ -4521,7 +4548,13 @@ mod tests {
         let mut in_thinking = true;
         let mut thinking = 0usize;
 
-        let event = section_event(7, "step one".into(), &mut in_thinking, &mut thinking);
+        let event = section_event(
+            7,
+            "step one".into(),
+            LagunaTokenizer::THINK_CLOSE,
+            &mut in_thinking,
+            &mut thinking,
+        );
         assert!(matches!(event, GenEvent::ThinkingTok { id: 7, .. }));
         assert_eq!(event.text(), "step one");
         assert!(in_thinking);
@@ -4530,6 +4563,7 @@ mod tests {
         let event = section_event(
             LagunaTokenizer::THINK_CLOSE,
             "done.</think>".into(),
+            LagunaTokenizer::THINK_CLOSE,
             &mut in_thinking,
             &mut thinking,
         );
@@ -4538,7 +4572,13 @@ mod tests {
         assert!(!in_thinking);
         assert_eq!(thinking, 2);
 
-        let event = section_event(9, "the answer".into(), &mut in_thinking, &mut thinking);
+        let event = section_event(
+            9,
+            "the answer".into(),
+            LagunaTokenizer::THINK_CLOSE,
+            &mut in_thinking,
+            &mut thinking,
+        );
         assert!(matches!(event, GenEvent::TextTok { id: 9, .. }));
         assert_eq!(event.text(), "the answer");
         assert_eq!(thinking, 2);
@@ -4553,6 +4593,7 @@ mod tests {
         let event = section_event(
             LagunaTokenizer::THINK_CLOSE,
             "</think>".into(),
+            LagunaTokenizer::THINK_CLOSE,
             &mut in_thinking,
             &mut thinking,
         );
@@ -4567,7 +4608,13 @@ mod tests {
     fn section_event_counts_withheld_tokens() {
         let mut in_thinking = true;
         let mut thinking = 0usize;
-        let event = section_event(42, String::new(), &mut in_thinking, &mut thinking);
+        let event = section_event(
+            42,
+            String::new(),
+            LagunaTokenizer::THINK_CLOSE,
+            &mut in_thinking,
+            &mut thinking,
+        );
         assert_eq!(event.id(), 42);
         assert!(event.text().is_empty());
         assert_eq!(thinking, 1);
@@ -5078,6 +5125,10 @@ mod tests {
             wait_ids: WAIT.to_vec(),
             wrapup: WRAPUP.to_vec(),
             transition: TRANSITION.to_vec(),
+            // The embedded vocabulary's `</think>`, which is what `TRANSITION`
+            // ends in and what the assertions below name. A live controller
+            // takes it from the tokenizer it was built against.
+            think_close: LagunaTokenizer::THINK_CLOSE,
             ..ThinkBudget::off()
         }
     }

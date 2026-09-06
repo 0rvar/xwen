@@ -284,17 +284,17 @@ pub(crate) fn prepare(
     // Absent fields follow the operator's server policy, like the compat
     // dialects; explicit fields override it.
     let enable_thinking = request.thinking.unwrap_or(settings.thinking_force);
-    // The field is the raw template parameter, and the target's 3.6 template
-    // has no such parameter: this API refuses fields it would ignore, the same
-    // rule the OpenAI dialect's effort kwarg and the CLI's --reasoning-effort
-    // follow. The server-wide configured effort is an operator default, not a
-    // request, and stays inert-but-legal below.
+    // The field is the raw template parameter, and only the 3.8 template takes
+    // one: this API refuses fields it would ignore, the same rule the OpenAI
+    // dialect's effort kwarg and the CLI's --reasoning-effort follow. The
+    // server-wide configured effort is an operator default, not a request, and
+    // stays inert-but-legal below.
     if request.reasoning_effort.is_some()
-        && target.model.chat_dialect() == crate::chat::ChatDialect::Qwen36
+        && !target.model.chat_dialect().supports_reasoning_effort()
     {
         return Err(bad_request(format!(
-            "reasoning_effort: {} renders the Qwen 3.6 chat template, which has no \
-             reasoning_effort parameter (it is a Qwen 3.8 template feature)",
+            "reasoning_effort: {} renders a chat template with no reasoning_effort \
+             parameter (it is a Qwen 3.8 template feature)",
             target.model.full_name(),
         )));
     }
