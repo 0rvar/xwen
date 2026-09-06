@@ -1,0 +1,65 @@
+{
+  "note": "Z-Image text-encoder reference prompts. Token counts are AFTER the Qwen3 chat template (add_generation_prompt=True, enable_thinking=True); the pipeline truncates to 512.",
+  "prompts": [
+    {
+      "idx": 0,
+      "label": "short",
+      "text": "a red bicycle"
+    },
+    {
+      "idx": 1,
+      "label": "portrait-golden-hour",
+      "text": "A cinematic portrait of an elderly fisherman mending nets on a weathered wooden dock at golden hour, warm rim light from the low sun, shallow depth of field, 85mm lens, soft bokeh of harbour lanterns behind him, muted teal and amber colour grade, fine film grain, photorealistic."
+    },
+    {
+      "idx": 2,
+      "label": "product-studio",
+      "text": "Studio product photograph of a matte black ceramic teapot on a seamless light grey backdrop, three-point softbox lighting, a subtle reflection on the sweep, crisp edges, high key, 100mm macro lens at f/8, commercial catalogue style."
+    },
+    {
+      "idx": 3,
+      "label": "landscape-storm",
+      "text": "Wide-angle landscape of a basalt coastline under a bruised storm sky, long exposure smoothing the surf into mist, cold blue-hour palette, dramatic side light breaking through the cloud deck, 16mm lens on a tripod, high dynamic range."
+    },
+    {
+      "idx": 4,
+      "label": "cjk",
+      "text": "一只橘猫蜷缩在窗台上，午后的阳光斜斜地洒进来，窗外是下着小雨的老街，水彩风格，柔和的暖色调，浅景深。"
+    },
+    {
+      "idx": 5,
+      "label": "emoji-punct",
+      "text": "A cozy corner café at midnight ☕️🌙 — rain streaking the window; neon signs (pink & teal) bleeding across the wet glass. \"Open 24h\"! Moody, cinematic, 35mm."
+    },
+    {
+      "idx": 6,
+      "label": "multi-sentence",
+      "text": "A rain-soaked night market winds between narrow tenement blocks. Steam rises from a dozen food stalls and catches the light of paper lanterns strung overhead. A vendor in a yellow oilskin ladles broth into a bowl while three customers wait under a dripping awning, their faces lit from below. Puddles on the cobbles hold the reflected signage in broken colour. A delivery cyclist threads between the stalls with a crate of bottles on his back rack, and a shopkeeper is winding down a shutter at the far end of the lane. Shot from across the street with a 50mm lens, wide open, so the foreground crowd falls away into soft shapes and the vendor stays sharp. Grade the image cool in the shadows and warm in the highlights, with heavy atmosphere and a slight halation on the brightest lamps. Keep the frame busy but readable, with the vendor placed on the right third."
+    },
+    {
+      "idx": 7,
+      "label": "literal-think-tag",
+      "text": "An illustration of a philosopher's cluttered study where the chalkboard reads <think> on one line and </think> on the next in looping script, dusty light beams from a high window, oil painting texture, muted ochre palette."
+    },
+    {
+      "idx": 8,
+      "label": "watercolour-fox",
+      "text": "Delicate watercolour illustration of a fox curled asleep among autumn ferns, loose wet-on-wet washes, visible cold-press paper texture, a limited palette of burnt sienna and sap green, soft edges, generous negative space."
+    },
+    {
+      "idx": 9,
+      "label": "scifi-station",
+      "text": "Concept art of a derelict orbital station drifting above a banded gas giant, volumetric god rays through shattered viewports, hard science-fiction detailing, cool cyan key light with warm ember accents, matte painting, ultra-wide composition."
+    },
+    {
+      "idx": 10,
+      "label": "exactly-512",
+      "text": "A sprawling matte painting of a terraced hill city at the end of a long summer day, seen from a footpath on the opposite slope. The city climbs in seven tiers of ochre stone, each tier separated by a retaining wall thick with bougainvillea, and each wall pierced by a stair that zigzags down toward the river. On the lowest tier a market is packing up: canvas awnings half rolled, crates of apricots and figs stacked beside a parked three-wheeled truck, a woman in a blue apron sweeping husks into the gutter. Above her, laundry lines cross the alleys in loops, and the low sun turns every hanging sheet into a lantern. On the third tier a bell tower of pale limestone throws a long shadow across a courtyard where four boys are kicking a ball against a mural that has faded to pink and grey. Higher still the houses thin out into olive terraces, then into scrub, then into a bare ridge where a single cypress stands against the sky. The river below is wide and slow and the colour of weak tea, spanned by a stone bridge with five arches; a barge is passing beneath the middle arch, trailing a wake that catches the light. Swifts are working the air above the water in tight arcs. Far off, beyond the ridge, a bank of thunderheads is building, lit orange along the top and bruised violet underneath, and the first cold breath of that weather is just beginning to move the cypress. The light is the specific gold of the last twenty minutes before sunset, raking almost horizontally across the stone so that every surface shows its texture and every window on the west face burns. Render it as a traditional oil-on-panel matte painting in the manner of studio backdrops from the nineteen-forties: deep aerial perspective with the far ridge going blue and soft, sharp brushwork in the foreground foliage, warm highlights laid over a cool underpainting, and no visible figures larger than a thumbnail. Composition is a wide horizontal, roughly two to one, with the bell tower on the left third and the thunderheads filling the upper right. Palette restricted to ochre, sienna, olive and slate blue, with a single accent of the bougainvillea magenta. High detail throughout, no text and no watermark, museum reproduction quality, even illumination of the canvas, faint craquelure in the varnish. The overall mood here is warm, patient and a little melancholy."
+    },
+    {
+      "idx": 11,
+      "label": "over-512",
+      "text": "An extremely detailed isometric cutaway illustration of a working lighthouse and its keeper's cottage on a granite islet, drawn as though the seaward wall had been lifted away so that every interior is visible at once. At the base of the tower is the oil store: copper drums on a slate floor, a brass funnel hanging from a nail, a coil of tarred rope, and a wheelbarrow with one wheel missing. Above it the winding stair spirals up past a narrow window where a gull has built a nest on the sill. On the second landing the keeper's workshop holds a vice bolted to a bench, a wall of labelled tins, a half-repaired barometer with its case open, and a pot-bellied stove venting through the outer wall. The third landing is the watch room: a chart table with parallel rules and dividers, a logbook open to a page of pencilled entries, a speaking tube, and a wet-weather coat dripping onto the boards. At the top sits the lantern room itself, all glazing bars and prisms, the first-order Fresnel lens suspended in its mercury bath, the clockwork weight descending through the tower on its cable, and the keeper standing with an oil can, one hand on the rail, looking out. The cottage beside the tower is cut away in the same manner: a kitchen with a scrubbed table and a kettle beginning to steam, a bedroom under the eaves with a quilt turned back, and a cellar of preserves. Outside, the islet is all wet rock and thrift, a slipway with a clinker-built boat hauled clear, a flagpole, and a small vegetable plot walled against the wind. The sea around it is heavy and green, breaking white on the outer ledges, and a squall is drawing across the middle distance with a rainbow standing in front of it. Draw the whole thing in fine ink line with flat watercolour washes, in the tradition of mid-century technical cutaway illustration for boys' annuals: confident contour lines, cross hatching only in the deepest recesses, an even north-west light that casts short soft shadows, and a restrained palette of sea green, rust, bone white and slate. Label nothing. Keep the perspective a true isometric with no vanishing point, keep every object legible at thumbnail size, and let the composition read from the oil store at the lower left to the lantern at the upper right along a clear diagonal. Include small human touches throughout: a mug left on the chart table, boots by the cottage door, a cat asleep on the workshop bench, and washing pegged out that is blowing almost horizontal in the wind. Show the weather doing real work: the washing line bowed, the gull hunkered down, spray carried up over the low wall of the vegetable plot, and the smoke from the stove pipe torn flat the moment it leaves the tower. Give the sea a proper swell with troughs deep enough to hide the boat, and let one long wave be breaking against the seaward ledge in a sheet of white that reaches halfway up the granite"
+    }
+  ]
+}
