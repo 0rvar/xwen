@@ -361,27 +361,26 @@ impl Model {
         }
     }
 
-    /// The presence penalty this checkpoint's model card asks for in
-    /// NON-THINKING mode: 1.5 on Qwen3.8-Flash-Next, which is the first card to
-    /// name a penalty at all, and 0.0 on the other three. Thinking mode asks
-    /// for none anywhere.
+    /// The presence penalty this checkpoint's model card asks for in the given
+    /// chat mode. Non-thinking is 1.5 on all four; thinking is 1.5 on
+    /// Qwen3.6-35B-A3B alone and 0.0 on the other three.
+    ///
+    /// This is the one card value that is NOT shared across the checkpoints,
+    /// which is why it sits here on `Model` rather than beside temperature and
+    /// top-p on `SamplerOptions::recommended`. Everything that resolves a
+    /// request's sampling reads it through
+    /// [`crate::sampler::SamplerOptions::recommended_for`], which is the single
+    /// place the checkpoint and the mode meet.
     ///
     /// Hardcoded here for the same reason the second stop id is: the GGUF
     /// converters only know `repetition_penalty`, so no converted file carries
     /// a presence-penalty key at any spelling, and a value read from the file
     /// would be a value that is never there.
-    ///
-    /// NOTHING APPLIES THIS YET (P4, ledgered in docs/qwen4exp-port.md). It is
-    /// not on [`crate::sampler::SamplerOptions`], because
-    /// `SamplerOptions::recommended` resolves a mode without a checkpoint in
-    /// hand and no dialect call site has one resolved at that point — closing
-    /// that is the same threading P4 needs to stop dropping request-supplied
-    /// penalties. Until then a non-thinking Flash-Next reply samples without it.
     pub const fn recommended_presence_penalty(self, thinking: bool) -> f64 {
         match (self, thinking) {
+            (Model::Qwen35BA3B, true) => 1.5,
             (_, true) => 0.0,
-            (Model::Qwen38FlashNext, false) => 1.5,
-            (_, false) => 0.0,
+            (_, false) => 1.5,
         }
     }
 
@@ -1176,24 +1175,18 @@ mod tests {
         assert_eq!(Model::Qwen38FlashNext.drafter_kind(), None);
     }
 
-    /// The one card value that is not shared across the checkpoints. Pinned
-    /// here because nothing reads it yet (P4): without a test, a registry fact
-    /// no code path touches would rot unnoticed until the sampler wiring lands.
+    /// The one card value that is not shared across the checkpoints, and the
+    /// only sampling default that has to be resolved with a checkpoint in hand.
     #[test]
-    fn only_the_qwen4exp_card_asks_for_a_presence_penalty() {
-        assert_eq!(
-            Model::Qwen38FlashNext.recommended_presence_penalty(false),
-            1.5
-        );
-        // Thinking mode asks for no penalty on any checkpoint, this one
-        // included — the card keys it to the non-thinking set alone.
-        assert_eq!(
-            Model::Qwen38FlashNext.recommended_presence_penalty(true),
-            0.0
-        );
+    fn the_presence_penalty_is_per_checkpoint_and_per_mode() {
+        // Every card asks for 1.5 in non-thinking mode.
         for model in MODELS {
-            if model != Model::Qwen38FlashNext {
-                assert_eq!(model.recommended_presence_penalty(false), 0.0, "{model:?}");
+            assert_eq!(model.recommended_presence_penalty(false), 1.5, "{model:?}");
+        }
+        // Thinking mode is where they part: only the 35B-A3B card carries one.
+        assert_eq!(Model::Qwen35BA3B.recommended_presence_penalty(true), 1.5);
+        for model in MODELS {
+            if model != Model::Qwen35BA3B {
                 assert_eq!(model.recommended_presence_penalty(true), 0.0, "{model:?}");
             }
         }

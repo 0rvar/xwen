@@ -582,9 +582,20 @@ pub(crate) fn resolve_thinking(
 
 /// Sampling for one request: whatever it asked for, over the server's
 /// configured defaults, over the model card's recommendation for the request's
-/// resolved thinking mode (temp 1.0 / top_p 0.95 thinking, 0.7 / 0.80 not).
-fn sampling(request: &MessagesRequest, settings: &ServeSettings, thinking: bool) -> SamplerOptions {
-    let recommended = SamplerOptions::recommended(thinking);
+/// resolved thinking mode (temp 1.0 / top_p 0.95 thinking, 0.7 / 0.80 not) and
+/// for `target`, which is what the presence penalty is keyed to on top of the
+/// mode.
+///
+/// This API has no presence-penalty field of its own — the Messages API does
+/// not define one — so a request here takes the server-wide setting, or the
+/// checkpoint default when that is unset.
+fn sampling(
+    request: &MessagesRequest,
+    settings: &ServeSettings,
+    target: crate::serve::types::Target,
+    thinking: bool,
+) -> SamplerOptions {
+    let recommended = SamplerOptions::recommended_for(target.model, thinking);
     SamplerOptions {
         temperature: request
             .temperature
@@ -598,6 +609,9 @@ fn sampling(request: &MessagesRequest, settings: &ServeSettings, thinking: bool)
             .top_p
             .or(settings.top_p)
             .unwrap_or(recommended.top_p),
+        presence_penalty: settings
+            .presence_penalty
+            .unwrap_or(recommended.presence_penalty),
         seed: recommended.seed,
     }
 }
@@ -744,6 +758,7 @@ pub(crate) fn prepare(
     request: MessagesRequest,
     settings: &ServeSettings,
     default_model: &str,
+    target: crate::serve::types::Target,
 ) -> Result<Prepared, ApiError> {
     let tools = resolve_tools(&request, settings.tools_mode)?;
     if request.output_format.is_some() {
@@ -774,7 +789,7 @@ pub(crate) fn prepare(
             .unwrap_or_else(|| default_model.to_string()),
         stream: request.stream.unwrap_or(false),
         job: JobRequest {
-            sampling: sampling(&request, settings, enable_thinking),
+            sampling: sampling(&request, settings, target, enable_thinking),
             messages,
             enable_thinking,
             // This API has no fields for the template knobs, so the encode
@@ -1166,7 +1181,7 @@ pub(crate) async fn messages(
     // the client's spelling of it.
     request.model = Some(model_name);
     let who = client_id(&request, &headers);
-    let prepared = match prepare(request, &state.settings, &state.model_id) {
+    let prepared = match prepare(request, &state.settings, &state.model_id, size) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
     };
@@ -1284,23 +1299,27 @@ mod tests {
         serde_json::from_str(body).expect("request parses")
     }
 
+    fn target() -> crate::serve::types::Target {
+        crate::serve::types::Target::official(crate::hub::Model::Qwen3827B)
+    }
+
     fn prepared(body: &str) -> Prepared {
-        prepare(parse(body), &settings(), "laguna-s-2.1").expect("request prepares")
+        prepare(parse(body), &settings(), "laguna-s-2.1", target()).expect("request prepares")
     }
 
     fn rejected(body: &str) -> ApiError {
-        prepare(parse(body), &settings(), "laguna-s-2.1")
+        prepare(parse(body), &settings(), "laguna-s-2.1", target())
             .err()
             .expect("request is rejected")
     }
 
     fn prepared_in(body: &str, mode: ToolsMode) -> Prepared {
-        prepare(parse(body), &tools(mode), "laguna-s-2.1")
+        prepare(parse(body), &tools(mode), "laguna-s-2.1", target())
             .unwrap_or_else(|e| panic!("request prepares under {mode}: {}", message(&e)))
     }
 
     fn rejected_in(body: &str, mode: ToolsMode) -> ApiError {
-        prepare(parse(body), &tools(mode), "laguna-s-2.1")
+        prepare(parse(body), &tools(mode), "laguna-s-2.1", target())
             .err()
             .unwrap_or_else(|| panic!("request is rejected under {mode}"))
     }
@@ -1557,7 +1576,8 @@ mod tests {
             "explore-metrics".parse().expect("a header value"),
         );
         let who = client_id(&request, &headers);
-        let prepared = prepare(request, &settings(), "laguna-s-2.1").expect("request prepares");
+        let prepared =
+            prepare(request, &settings(), "laguna-s-2.1", target()).expect("request prepares");
         let (_events, _guard) = crate::serve::submit(
             &state,
             prepared.job,
@@ -1616,7 +1636,7 @@ mod tests {
                     "messages":[{{"role":"user","content":"Hi"}}]}}"#
             );
             let request = parse(&body);
-            let prepared = prepare(request, &settings(), "laguna-s-2.1");
+            let prepared = prepare(request, &settings(), "laguna-s-2.1", target());
             assert!(
                 prepared.is_ok(),
                 "metadata {shape} must not fail the request"
@@ -1712,6 +1732,7 @@ mod tests {
             ),
             &tools(ToolsMode::Reject),
             "laguna-s-2.1",
+            target(),
         )
         .err()
         .expect("a tools request is rejected in reject mode");
@@ -1742,10 +1763,16 @@ mod tests {
             )),
             &tools(ToolsMode::Strip),
             "laguna-s-2.1",
+            target(),
         )
         .expect("strip mode accepts tool definitions");
-        let toolless = prepare(parse(&body("")), &tools(ToolsMode::Strip), "laguna-s-2.1")
-            .expect("a request with no tools prepares");
+        let toolless = prepare(
+            parse(&body("")),
+            &tools(ToolsMode::Strip),
+            "laguna-s-2.1",
+            target(),
+        )
+        .expect("a request with no tools prepares");
         assert_eq!(shape(&stripped.job.messages), vec!["user:Hi"]);
         assert_eq!(shape(&stripped.job.messages), shape(&toolless.job.messages));
         // Including the definitions themselves: nothing about them reaches the
@@ -1852,6 +1879,7 @@ mod tests {
                 )),
                 &tools(ToolsMode::Native),
                 "laguna-s-2.1",
+                target(),
             )
             .expect("a call with no arguments prepares");
             assert_eq!(calls(&request.job.messages), vec!["f()"]);
@@ -2401,6 +2429,7 @@ mod tests {
             ),
             &pinned,
             "m",
+            target(),
         )
         .unwrap();
         assert_eq!(configured.job.sampling.temperature, 0.5);
@@ -2417,6 +2446,31 @@ mod tests {
         assert_eq!(asked.job.sampling.top_p, 0.8);
         assert_eq!(asked.job.sampling.top_k, 5);
         assert_eq!(asked.job.stop_sequences, vec!["STOP".to_string()]);
+    }
+
+    /// This API defines no presence-penalty field, so a request cannot set one:
+    /// the value comes from the server setting, or from the target
+    /// checkpoint's card for the resolved mode when nothing is pinned.
+    #[test]
+    fn the_presence_penalty_takes_the_server_default_or_the_card() {
+        let body = r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#;
+        // Thinking on, and the 3.8 card asks for no penalty there.
+        assert_eq!(prepared(body).job.sampling.presence_penalty, 0.0);
+        let a3b = crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B);
+        let on_a3b = prepare(parse(body), &settings(), "m", a3b).unwrap();
+        assert_eq!(on_a3b.job.sampling.presence_penalty, 1.5);
+
+        // Thinking off: every card asks for 1.5.
+        let instruct = prepared(
+            r#"{"max_tokens":16,"thinking":{"type":"disabled"},
+                "messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        assert_eq!(instruct.job.sampling.presence_penalty, 1.5);
+
+        let mut pinned = settings();
+        pinned.presence_penalty = Some(0.25);
+        let configured = prepare(parse(body), &pinned, "m", a3b).unwrap();
+        assert_eq!(configured.job.sampling.presence_penalty, 0.25);
     }
 
     /// `prepare` echoes the `model` string it is handed, and the handler is what

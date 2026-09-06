@@ -46,6 +46,7 @@
 //   bun scripts/spec-equivalence.ts --models 27b        # one model
 //   bun scripts/spec-equivalence.ts --models 3.8-27b    # the MTP arm alone
 //   bun scripts/spec-equivalence.ts --modes sampled --n 256
+//   bun scripts/spec-equivalence.ts --presence-penalty 0   # pin the penalty on both arms
 
 import { mkdirSync, writeFileSync, statSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -69,6 +70,17 @@ const nTokens = opt("n", "128");
 const greedyPMin = opt("p-min", "0.3");
 const seed = opt("seed", "42");
 const temp = opt("temp", "0.8");
+// Passthrough for the sampler's presence penalty, mirroring --temp. Unset, both
+// arms take the checkpoint's own mode default, which is what ships — and since
+// this harness sends a RAW prompt, that is the THINKING default (1.5 on the
+// 35B-A3B, 0 elsewhere). Both arms always get the same value: the property under
+// test is that drafting is lossless, so the penalty has to be live on both sides
+// or the comparison is between two different samplers. Pin it to 0 to reproduce
+// the pre-penalty behaviour.
+const presencePenalty = args.includes("--presence-penalty")
+  ? opt("presence-penalty", "0")
+  : null;
+const penaltyArgs = presencePenalty === null ? [] : ["--presence-penalty", presencePenalty];
 const outDir = opt("out-dir", "/tmp/xwen-spec-equivalence");
 mkdirSync(outDir, { recursive: true });
 
@@ -149,7 +161,13 @@ function generate(model: string, prompt: string, extra: string[], file: string):
       "--stats",
       ...extra,
     ],
-    { cwd: repo, stdin: "ignore", maxBuffer: 64 * 1024 * 1024 },
+    {
+      cwd: repo,
+      stdin: "ignore",
+      // Harness-driven, so the runs stay out of `xwen stats`' default table.
+      env: { ...process.env, XWEN_METRICS_TAG: "bench" },
+      maxBuffer: 64 * 1024 * 1024,
+    },
   );
   const out = proc.stdout.toString();
   const err = proc.stderr.toString();
@@ -176,17 +194,21 @@ guardNoModelProcess();
 let failures = 0;
 for (const model of models) {
   for (const mode of modes) {
-    const specArgs =
-      mode === "greedy"
+    const specArgs = [
+      ...(mode === "greedy"
         ? ["--temp", "0", "--draft", "official", "--draft-p-min", greedyPMin]
         : [
             "--temp", temp,
             "--draft", "official",
             "--draft-p-min", "0",
             "--draft-pause-margin", "0",
-          ];
-    const plainArgs =
-      mode === "greedy" ? ["--temp", "0", "--no-draft"] : ["--temp", temp, "--no-draft"];
+          ]),
+      ...penaltyArgs,
+    ];
+    const plainArgs = [
+      ...(mode === "greedy" ? ["--temp", "0", "--no-draft"] : ["--temp", temp, "--no-draft"]),
+      ...penaltyArgs,
+    ];
 
     for (const [name, prompt] of Object.entries(prompts)) {
       const tag = `${model}-${mode}-${name}`;

@@ -19,6 +19,20 @@ use xwen::ops::ExpertRunner;
 use xwen::sampler::SamplerOptions;
 use xwen::serve::config::{CliOverrides, DraftMode, ServeToml};
 
+/// The `--max-ctx` default on every one-shot surface — `generate`, `chat` and
+/// `batch` — which had three separate copies of the number and no way to keep
+/// them agreeing. A ceiling, not an allocation: the KV cache starts at
+/// `KV_INITIAL_CTX` positions and doubles on demand, so this costs memory only
+/// when a prompt actually reaches it.
+///
+/// It is deliberately BELOW the 262144 the blessed checkpoints were converted
+/// with, and below serve's own default: a one-shot run has no operator watching
+/// a dashboard, and 131072 is the length the envelope has been measured at
+/// (docs/perf-state.md, "Long context"). `XwenModel::load` clamps whatever this
+/// resolves to against the file's `n_ctx_train`, so a checkpoint converted
+/// smaller is trimmed rather than run past its rope table.
+const DEFAULT_MAX_CTX: usize = 131072;
+
 #[derive(Parser)]
 #[command(
     name = "xwen",
@@ -80,20 +94,33 @@ struct SamplingArgs {
     /// --no-think).
     #[arg(long)]
     top_p: Option<f64>,
+    /// Presence penalty: subtracted from the logit of every token the reply has
+    /// already produced, once per distinct token, and 0 to turn it off. The
+    /// default is the checkpoint's own — 1.5 with --no-think everywhere; with
+    /// thinking, 1.5 on Qwen3.6-35B-A3B and 0 on the rest.
+    #[arg(long)]
+    presence_penalty: Option<f64>,
     #[arg(long, default_value_t = 42)]
     seed: u64,
 }
 
 impl SamplingArgs {
-    /// Resolve the flags over the recommended set for `thinking`. A caller
-    /// with no chat mode at all (a raw prompt) passes `true`: the thinking set
-    /// is the historical default, so those paths sample as they always have.
-    fn options(&self, thinking: bool) -> SamplerOptions {
-        let recommended = SamplerOptions::recommended(thinking);
+    /// Resolve the flags over the recommended set for `model` in `thinking`
+    /// mode. A caller with no chat mode at all (a raw prompt) passes `true`:
+    /// the thinking set is the historical default, so those paths sample as
+    /// they always have.
+    ///
+    /// The checkpoint is a parameter because one of the card values — the
+    /// presence penalty — differs between them; the other three do not.
+    fn options(&self, model: Model, thinking: bool) -> SamplerOptions {
+        let recommended = SamplerOptions::recommended_for(model, thinking);
         SamplerOptions {
             temperature: self.temp.unwrap_or(recommended.temperature),
             top_k: self.top_k.unwrap_or(recommended.top_k),
             top_p: self.top_p.unwrap_or(recommended.top_p),
+            presence_penalty: self
+                .presence_penalty
+                .unwrap_or(recommended.presence_penalty),
             seed: self.seed,
         }
     }
@@ -282,6 +309,10 @@ enum Cmd {
     /// `$HOME/.local/state/xwen/metrics.jsonl`. `XWEN_METRICS_FILE` names
     /// another file, or says `off` (in any casing) to record nothing at all;
     /// setting it to an empty string counts as not setting it.
+    ///
+    /// A run recorded under `XWEN_METRICS_TAG` was driven by a harness rather
+    /// than asked for: the bench and parity scripts set it, and this report
+    /// leaves those runs out unless `--tag` or `--all-tags` asks for them.
     Stats {
         /// What a row covers: day|week|month|model|surface|client|session|agent|all.
         #[arg(long, default_value = "day")]
@@ -303,6 +334,14 @@ enum Cmd {
         /// Only runs whose session id contains this text.
         #[arg(long)]
         session: Option<String>,
+        /// Only runs a harness recorded under this tag (`bench`, `parity`),
+        /// instead of the real use the default report covers.
+        #[arg(long, conflicts_with = "all_tags")]
+        tag: Option<String>,
+        /// Report on every run in the history, the harness-driven ones
+        /// included. The default leaves them out and says how many.
+        #[arg(long)]
+        all_tags: bool,
         /// Print the rows as JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -343,7 +382,7 @@ enum Cmd {
         /// Context ceiling in tokens. A ceiling, not an allocation: the KV
         /// cache starts small and grows on demand, so a large value costs
         /// memory only when a prompt actually reaches it.
-        #[arg(long, default_value_t = 131072)]
+        #[arg(long, default_value_t = DEFAULT_MAX_CTX)]
         max_ctx: usize,
         /// Skip the chat template and feed the prompt raw (no BOS — Qwen never
         /// prepends one).
@@ -398,7 +437,7 @@ enum Cmd {
         /// Context ceiling in tokens. A ceiling, not an allocation: the KV
         /// cache starts small and grows on demand, so a large value costs
         /// memory only when a prompt actually reaches it.
-        #[arg(long, default_value_t = 131072)]
+        #[arg(long, default_value_t = DEFAULT_MAX_CTX)]
         max_ctx: usize,
         /// Show the model's <think> reasoning (dimmed) instead of hiding it.
         #[arg(long)]
@@ -465,7 +504,7 @@ enum Cmd {
         /// Context ceiling in tokens. A ceiling, not an allocation: the KV
         /// cache starts small and grows on demand, so a large value costs
         /// memory only when a prompt actually reaches it.
-        #[arg(long, default_value_t = 131072)]
+        #[arg(long, default_value_t = DEFAULT_MAX_CTX)]
         max_ctx: usize,
         #[command(flatten)]
         draft: DraftArgs,
@@ -569,6 +608,12 @@ struct ServeArgs {
     /// applies (0.95 thinking / 0.80 not); setting this pins both modes.
     #[arg(long)]
     top_p: Option<f64>,
+    /// Default presence penalty for requests that omit one. Unset, the
+    /// checkpoint's own mode default applies (1.5 without thinking on every
+    /// checkpoint; with thinking, 1.5 on Qwen3.6-35B-A3B and 0 on the rest);
+    /// setting this pins both modes.
+    #[arg(long)]
+    presence_penalty: Option<f64>,
     /// Default template reasoning-effort for requests that name none
     /// (low|medium|xhigh; default: the template's own, xhigh). Rendered by
     /// the Qwen 3.8 chat template; inert on the 3.6 checkpoints.
@@ -680,6 +725,7 @@ impl ServeArgs {
             temperature: self.temp,
             top_k: self.top_k,
             top_p: self.top_p,
+            presence_penalty: self.presence_penalty,
             reasoning_effort: self.reasoning_effort.clone(),
             cache_snapshots: self.cache_snapshots,
             cache_slots: self.cache_slots,
@@ -1066,6 +1112,32 @@ fn run_stats(query: &metrics::StatsQuery, json: bool) -> Result<()> {
     if report.matched != report.records {
         footer.push_str(&format!(" of {}", report.records));
     }
+    if report.excluded_by_tag > 0 {
+        // Never silent: a history a sweep has run through holds hundreds of
+        // records this report is not counting, and a reader comparing the
+        // matched count against the file would otherwise have no way to know
+        // why they disagree. What was left out depends on which way the filter
+        // was pointed — under `--tag` the excluded runs are mostly real use —
+        // so the line names the population rather than always saying "harness".
+        let excluded = match &query.tag {
+            metrics::TagFilter::Untagged => format!(
+                "{} harness run{} excluded (--all-tags to include)",
+                report.excluded_by_tag,
+                plural(report.excluded_by_tag)
+            ),
+            metrics::TagFilter::Only(tag) => format!(
+                "{} run{} outside --tag {tag} excluded",
+                report.excluded_by_tag,
+                plural(report.excluded_by_tag)
+            ),
+            // Nothing is excluded by tag under `--all-tags`, so this arm is
+            // unreachable while `excluded_by_tag` is above zero.
+            metrics::TagFilter::All => String::new(),
+        };
+        if !excluded.is_empty() {
+            footer.push_str(&format!(" \u{b7} {excluded}"));
+        }
+    }
     if report.skipped > 0 {
         footer.push_str(&format!(
             " \u{b7} {} unreadable line{}",
@@ -1212,7 +1284,7 @@ fn batch_request(
         // The checkpoint the payload named, under its canonical name whichever
         // spelling the document used.
         size.full_name(),
-        size.chat_dialect(),
+        size,
         &mut xwen::batch::BatchHooks {
             progress: &mut progress,
             cancelled: &mut never,
@@ -1358,6 +1430,8 @@ fn main() -> Result<()> {
             surface,
             client,
             session,
+            tag,
+            all_tags,
             json,
             file,
         }) => {
@@ -1368,6 +1442,11 @@ fn main() -> Result<()> {
                 surface,
                 client,
                 session,
+                tag: match (tag, all_tags) {
+                    (Some(tag), _) => metrics::TagFilter::Only(tag),
+                    (None, true) => metrics::TagFilter::All,
+                    (None, false) => metrics::TagFilter::Untagged,
+                },
                 file,
             };
             run_stats(&query, json)
@@ -1455,8 +1534,9 @@ fn main() -> Result<()> {
                 // The mode-dependent sampling defaults follow the resolved
                 // thinking state; a raw prompt has no mode and keeps the
                 // (thinking-set) historical default, --no-think being rejected
-                // above.
-                sampling.options(!think.no_think),
+                // above. The checkpoint is threaded in for the one default that
+                // is keyed to it, the presence penalty.
+                sampling.options(size, !think.no_think),
                 Some(&draft),
             )?;
             generator.set_min_think(min_think);
@@ -1666,7 +1746,7 @@ fn main() -> Result<()> {
                 tokenizer.as_deref(),
                 &moe_impl,
                 max_ctx,
-                sampling.options(!think.no_think),
+                sampling.options(size, !think.no_think),
                 Some(&draft),
             )?;
             generator.set_min_think(min_think);
@@ -1931,14 +2011,15 @@ mod tests {
             temp: None,
             top_k: None,
             top_p: None,
+            presence_penalty: None,
             seed: 42,
         };
-        let thinking = unset.options(true);
+        let thinking = unset.options(Model::Qwen27B, true);
         assert_eq!(
             (thinking.temperature, thinking.top_k, thinking.top_p),
             (1.0, 20, 0.95)
         );
-        let instruct = unset.options(false);
+        let instruct = unset.options(Model::Qwen27B, false);
         assert_eq!(
             (instruct.temperature, instruct.top_k, instruct.top_p),
             (0.7, 20, 0.80)
@@ -1948,13 +2029,47 @@ mod tests {
             temp: Some(0.5),
             top_k: None,
             top_p: Some(0.9),
+            presence_penalty: None,
             seed: 7,
         };
-        let resolved = pinned.options(false);
+        let resolved = pinned.options(Model::Qwen27B, false);
         assert_eq!(resolved.temperature, 0.5);
         assert_eq!(resolved.top_k, 20, "an unset flag keeps the mode default");
         assert_eq!(resolved.top_p, 0.9);
         assert_eq!(resolved.seed, 7);
+    }
+
+    // The presence penalty is the one card value keyed to the CHECKPOINT as
+    // well as the mode, so the same unset flags resolve differently per model.
+    #[test]
+    fn the_presence_penalty_default_follows_the_checkpoint_and_the_mode() {
+        let unset = SamplingArgs {
+            temp: None,
+            top_k: None,
+            top_p: None,
+            presence_penalty: None,
+            seed: 42,
+        };
+        for size in [Model::Qwen27B, Model::Qwen3827B, Model::Qwen38FlashNext] {
+            assert_eq!(
+                unset.options(size, true).presence_penalty,
+                0.0,
+                "{size:?} asks for no penalty while thinking"
+            );
+            assert_eq!(unset.options(size, false).presence_penalty, 1.5, "{size:?}");
+        }
+        // The 35B-A3B card is the one that asks for a penalty in both modes.
+        assert_eq!(unset.options(Model::Qwen35BA3B, true).presence_penalty, 1.5);
+
+        // An explicit flag wins over the card, a zero included.
+        let off = SamplingArgs {
+            temp: None,
+            top_k: None,
+            top_p: None,
+            presence_penalty: Some(0.0),
+            seed: 42,
+        };
+        assert_eq!(off.options(Model::Qwen35BA3B, true).presence_penalty, 0.0);
     }
 
     // --reasoning-effort is a 3.8 template parameter: supplied on a 3.6

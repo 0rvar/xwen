@@ -96,10 +96,18 @@ pub const DEFAULT_MAX_TOKENS: usize = 512;
 /// reproducible and two runs of the same request can be compared token for
 /// token. `top_k`/`top_p`/`seed` are inert at temperature 0 and carry the
 /// values a request would land on if it raised the temperature alone.
+///
+/// `presence_penalty` is NOT one of these: it is not inert at temperature 0
+/// (greedy takes the argmax of the penalized row), and unlike the three above
+/// its default is the checkpoint's own card value for the item's thinking
+/// mode. [`resolve_sampling`] fills it in from there, and a batch stays
+/// reproducible either way because the penalty is a deterministic function of
+/// what the reply has already emitted.
 pub const BATCH_SAMPLING: SamplerOptions = SamplerOptions {
     temperature: 0.0,
     top_k: 20,
     top_p: 0.95,
+    presence_penalty: 0.0,
     seed: 42,
 };
 
@@ -199,6 +207,12 @@ pub struct SamplingSpec {
     pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
+    /// Subtracted from the logit of every token the item's reply has already
+    /// produced, once per distinct token. Absent takes the checkpoint's card
+    /// value for the item's resolved thinking mode, not the batch default
+    /// above — see [`BATCH_SAMPLING`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
 }
@@ -463,15 +477,17 @@ const CANCELLED: &str = "the batch was cancelled before this item completed";
 /// that is the id the server answers under, which for a GGUF that is none of the
 /// official checkpoints is its own file name and not a checkpoint's.
 ///
-/// `dialect` is the loaded checkpoint's chat dialect
-/// (`hub::Model::chat_dialect`), which decides how every item's conversation
-/// renders — passed by the caller for the same reason `label` is.
+/// `model` is the loaded checkpoint, passed by the caller for the same reason
+/// `label` is: the caller is the one that resolved which weights are actually
+/// loaded, and a custom GGUF runs as its architecture's checkpoint. It decides
+/// two things here — the chat dialect every item's conversation renders under,
+/// and the card presence penalty an item that names none samples with.
 pub fn run_batch(
     generator: &mut Generator,
     req: &BatchRequest,
     load_ms: f64,
     label: &str,
-    dialect: ChatDialect,
+    model: Model,
     hooks: &mut BatchHooks<'_>,
 ) -> Result<BatchResponse> {
     let started = Instant::now();
@@ -503,7 +519,7 @@ pub fn run_batch(
                 &req.defaults,
                 shared_text,
                 label,
-                dialect,
+                model,
             )
             .map_err(|error| format!("{error:#}"))
         })
@@ -697,6 +713,7 @@ fn run_item(
         temperature: item.sampling.temperature,
         top_k: item.sampling.top_k,
         top_p: item.sampling.top_p,
+        presence_penalty: item.sampling.presence_penalty,
         seed: item.sampling.seed,
     });
     if let Some(plan) = &item.scored {
@@ -1561,10 +1578,19 @@ fn score_field(
 /// Runs `Sampler`'s pipeline over the option set the way the sampler runs it over
 /// the vocabulary — temperature, then top-k, then a nucleus cut measured on the
 /// renormalized survivors — so that a scored field and a decoded answer answer to
-/// the same knobs. A `top_k` of at most one collapses to greedy there
-/// (`Sampler::new`) and collapses to greedy here.
+/// the same knobs. A `top_k` of exactly one collapses to greedy there
+/// (`Sampler::new`) and collapses to greedy here; a `top_k` of zero is "no
+/// top-k cut" in both places, so it keeps every option for the nucleus cut.
+///
+/// `presence_penalty` is deliberately NOT among the knobs this shares. The
+/// penalty is measured over the tokens a reply has emitted, and this path
+/// emits none: it teacher-forces each candidate value and picks between whole
+/// options by their scores. There is nothing here for a per-token penalty to
+/// mean, so a scored field is drawn unpenalized however the item set it. Free
+/// decoding inside the same batch item still is penalized — it runs through
+/// the ordinary decode loops.
 fn select_option(scores: &[f64], sampling: &SamplerOptions, rng: &mut StdRng) -> Result<usize> {
-    if sampling.temperature <= 0.0 || sampling.top_k <= 1 {
+    if sampling.temperature <= 0.0 || sampling.top_k == 1 {
         return Ok(argmax_index(scores));
     }
     let probs = renormalize(scores, sampling.temperature);
@@ -1572,7 +1598,9 @@ fn select_option(scores: &[f64], sampling: &SamplerOptions, rng: &mut StdRng) ->
     // first — the direction `top_k_desc` breaks them in.
     let mut ranked: Vec<(usize, f64)> = probs.iter().copied().enumerate().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked.truncate(sampling.top_k);
+    if sampling.top_k > 0 {
+        ranked.truncate(sampling.top_k);
+    }
     truncate_nucleus(&mut ranked, sampling.top_p);
     let weights: Vec<f64> = ranked.iter().map(|(_, prob)| *prob).collect();
     let picked = WeightedIndex::new(&weights)
@@ -1746,8 +1774,9 @@ fn prepare_item(
     defaults: &ItemDefaults,
     shared_prefix: Option<&str>,
     label: &str,
-    dialect: ChatDialect,
+    model: Model,
 ) -> Result<Prepared> {
+    let dialect = model.chat_dialect();
     ensure!(
         shared_prefix.is_none() || !item.messages.is_empty(),
         "the request's shared_prefix has no first message to prepend to; this item has none"
@@ -1800,7 +1829,14 @@ fn prepare_item(
         prefix_text,
         starts_in_thinking,
         max_tokens,
-        sampling: resolve_sampling(defaults.sampling.as_ref(), item.sampling.as_ref()),
+        // The item's own thinking state is what its penalty default is keyed
+        // to, and `resolve_render` has just settled it.
+        sampling: resolve_sampling(
+            model,
+            opts.enable_thinking,
+            defaults.sampling.as_ref(),
+            item.sampling.as_ref(),
+        ),
         // A scored schema never reaches the grammar compiler: llguidance has
         // never heard of `include_score`, and the scored path masks nothing.
         schema: match scored {
@@ -1903,11 +1939,21 @@ fn resolve_render(
 }
 
 /// Layer a request's sampling overrides onto the batch default.
+///
+/// The presence penalty starts from the card rather than from
+/// [`BATCH_SAMPLING`]: it is the one sampling value keyed to the checkpoint and
+/// the item's thinking mode, and batch resolves it the way every other surface
+/// does (`SamplerOptions::recommended_for`).
 fn resolve_sampling(
+    model: Model,
+    thinking: bool,
     defaults: Option<&SamplingSpec>,
     item: Option<&SamplingSpec>,
 ) -> SamplerOptions {
-    let mut opts = BATCH_SAMPLING;
+    let mut opts = SamplerOptions {
+        presence_penalty: SamplerOptions::recommended_for(model, thinking).presence_penalty,
+        ..BATCH_SAMPLING
+    };
     for spec in [defaults, item].into_iter().flatten() {
         if let Some(temperature) = spec.temperature {
             opts.temperature = temperature;
@@ -1917,6 +1963,9 @@ fn resolve_sampling(
         }
         if let Some(top_k) = spec.top_k {
             opts.top_k = top_k;
+        }
+        if let Some(presence_penalty) = spec.presence_penalty {
+            opts.presence_penalty = presence_penalty;
         }
         if let Some(seed) = spec.seed {
             opts.seed = seed;
@@ -2110,15 +2159,22 @@ mod tests {
     // override layers apply in order without either restating the whole set.
     #[test]
     fn sampling_layers_default_then_item() {
-        let plain = resolve_sampling(None, None);
+        let plain = resolve_sampling(Model::Qwen35BA3B, true, None, None);
         assert_eq!(plain.temperature, 0.0);
+        // The one value that does NOT come from BATCH_SAMPLING: the card's,
+        // for this checkpoint in this mode.
+        assert_eq!(plain.presence_penalty, 1.5);
+        assert_eq!(
+            resolve_sampling(Model::Qwen27B, true, None, None).presence_penalty,
+            0.0
+        );
 
         let defaults = SamplingSpec {
             temperature: Some(0.7),
             seed: Some(7),
             ..Default::default()
         };
-        let layered = resolve_sampling(Some(&defaults), None);
+        let layered = resolve_sampling(Model::Qwen35BA3B, true, Some(&defaults), None);
         assert_eq!(layered.temperature, 0.7);
         assert_eq!(layered.seed, 7);
         assert_eq!(layered.top_k, BATCH_SAMPLING.top_k);
@@ -2127,10 +2183,20 @@ mod tests {
             temperature: Some(0.0),
             ..Default::default()
         };
-        let both = resolve_sampling(Some(&defaults), Some(&item));
+        let both = resolve_sampling(Model::Qwen35BA3B, true, Some(&defaults), Some(&item));
         assert_eq!(both.temperature, 0.0);
         // Untouched by the item, so the default layer still shows through.
         assert_eq!(both.seed, 7);
+
+        // An explicit penalty beats the card, including a zero.
+        let off = SamplingSpec {
+            presence_penalty: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_sampling(Model::Qwen35BA3B, true, None, Some(&off)).presence_penalty,
+            0.0
+        );
     }
 
     // Thinking is off unless a request asks for it, which is the divergence
@@ -3010,6 +3076,7 @@ mod tests {
             temperature,
             top_k,
             top_p,
+            presence_penalty: 0.0,
             seed: 7,
         }
     }
@@ -3043,6 +3110,24 @@ mod tests {
         let open = sampling(4.0, 20, 1.0);
         let reached = (0..400).any(|_| select_option(&scores, &open, &mut rng).unwrap() >= 2);
         assert!(reached, "a wide draw should reach past the top two");
+    }
+
+    // `top_k = 0` is "no top-k cut" here exactly as it is in the vocabulary
+    // sampler, and `top_k = 1` is greedy. The two used to mean the same thing
+    // (both collapsed to greedy), so this is the pair that pins them apart.
+    #[test]
+    fn a_zero_top_k_keeps_every_option_and_one_is_greedy() {
+        let scores = [-0.1, -1.0, -2.0, -8.0];
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let greedy = sampling(4.0, 1, 1.0);
+        for _ in 0..50 {
+            assert_eq!(select_option(&scores, &greedy, &mut rng).unwrap(), 0);
+        }
+
+        let uncut = sampling(4.0, 0, 1.0);
+        let reached = (0..400).any(|_| select_option(&scores, &uncut, &mut rng).unwrap() >= 2);
+        assert!(reached, "top_k 0 must not cut the option set");
     }
 
     // The nucleus cut measures mass renormalized over the candidates, keeps the
@@ -3082,7 +3167,7 @@ mod tests {
                 &defaults,
                 None,
                 "Qwen3.6-35B-A3B",
-                ChatDialect::Qwen36,
+                Model::Qwen35BA3B,
             )
             .err()
             .expect("a budget past the context has nowhere to decode")
@@ -3100,7 +3185,7 @@ mod tests {
                 &defaults,
                 None,
                 "Qwen3.6-35B-A3B",
-                ChatDialect::Qwen36
+                Model::Qwen35BA3B
             )
             .is_ok()
         );
@@ -3138,7 +3223,7 @@ mod tests {
             &defaults,
             Some("A long shared story.\n\n"),
             "Qwen3.6-35B-A3B",
-            ChatDialect::Qwen36,
+            Model::Qwen35BA3B,
         )
         .unwrap();
         let spelled_out = prepare_item(
@@ -3148,7 +3233,7 @@ mod tests {
             &defaults,
             None,
             "Qwen3.6-35B-A3B",
-            ChatDialect::Qwen36,
+            Model::Qwen35BA3B,
         )
         .unwrap();
         assert_eq!(with_prefix.tokens, spelled_out.tokens);
@@ -3168,7 +3253,7 @@ mod tests {
             &ItemDefaults::default(),
             Some("story"),
             "Qwen3.6-35B-A3B",
-            ChatDialect::Qwen36,
+            Model::Qwen35BA3B,
         )
         .err()
         .expect("no first message to prepend to")

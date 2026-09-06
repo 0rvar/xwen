@@ -6,7 +6,6 @@ use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -20,8 +19,8 @@ use super::disk_tier::{DiskCache, DiskCandidate};
 use super::log::{JobPhase, JobRecord, ServeLog, ServeLogger, SlotSummary};
 use super::queue::{JobQueue, Queued};
 use super::types::{
-    BatchJob, Cancel, CancelReason, EngineEvent, GenerationJob, Job, RequestOrigin, StopKind,
-    Target,
+    BatchJob, Cancel, CancelReason, EngineEvent, GenerationJob, Job, RequestOrigin, ResidentModel,
+    StopKind, Target,
 };
 use crate::XwenConfig;
 use crate::batch::{BatchHooks, BatchProgress};
@@ -61,6 +60,28 @@ const SNAPSHOT_MIN_GAIN: usize = 1024;
 /// conversation's image only ever gets this window, so it must fit several such
 /// writes, not one.
 const DISK_FLUSH_GRACE: Duration = Duration::from_secs(25);
+
+/// What the disk tier writes at, in bytes per second, as a FLOOR rather than a
+/// typical rate. Measured 2026-09-06 alongside the long-context envelope
+/// (docs/perf-state.md, "Long context"): the page-out lines report their own
+/// bytes and milliseconds, and this is the slowest of them rounded down.
+///
+/// It exists only to turn an image size into a wait, so being pessimistic costs
+/// a shutdown a few seconds it will not use and being optimistic costs the next
+/// server a re-prefill.
+const DISK_WRITE_FLOOR_BYTES_PER_SEC: u64 = 700 * 1024 * 1024;
+
+/// How long to wait for `pending` bytes of queued images to land.
+///
+/// [`DISK_FLUSH_GRACE`] was sized on ONE ~4.2 GiB image and is the floor here,
+/// not the answer: a 131072-token conversation images several times that, and a
+/// shutdown that also splits a stored segment queues more than one. So the wait
+/// is the pending bytes at the measured write floor, and never less than the
+/// grace. It stays bounded — an image that does not land costs a re-prefill,
+/// nothing more — and the expiry is still reported rather than retried.
+fn disk_flush_budget(pending: u64) -> Duration {
+    Duration::from_secs(pending / DISK_WRITE_FLOOR_BYTES_PER_SEC).max(DISK_FLUSH_GRACE)
+}
 
 /// How long one event may fail to reach the client before the connection counts
 /// as dead. A slow reader filling the channel is ordinary backpressure and
@@ -246,7 +267,8 @@ fn startup_drafter(settings: &ServeSettings, served: Target) -> Option<std::path
 
 /// Spawns the dedicated inference thread. The thread lazily loads whichever checkpoint
 /// the picked job names (the default one for the compat dialects, any for the batch
-/// route), flips `model_loaded` on load/unload, swaps checkpoints when a job needs the
+/// route), stamps the resident checkpoint on load and clears it on unload, swaps
+/// checkpoints when a job needs the
 /// other one, and drops the model after `idle_unload` of inactivity (None = never).
 /// `default_target` is what `settings.model` is: the official checkpoint it identified
 /// as, or — for a GGUF that identified as none of them — the served file running as its
@@ -257,22 +279,13 @@ pub fn spawn_engine(
     settings: ServeSettings,
     default_target: Target,
     jobs: Arc<JobQueue>,
-    model_loaded: Arc<AtomicBool>,
+    resident: Arc<ResidentModel>,
     shutdown: Arc<Cancel>,
     logger: ServeLogger,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(ENGINE_THREAD.to_string())
-        .spawn(move || {
-            engine_loop(
-                settings,
-                default_target,
-                jobs,
-                model_loaded,
-                shutdown,
-                logger,
-            )
-        })
+        .spawn(move || engine_loop(settings, default_target, jobs, resident, shutdown, logger))
         .expect("spawning the inference thread")
 }
 
@@ -465,11 +478,14 @@ impl EngineState {
         // Every job replaces this through `set_sampler`; the config defaults only cover
         // the window between load and the first draw (unpinned keys take the
         // standard thinking-mode set, since no request mode exists yet).
-        let defaults = SamplerOptions::default();
+        let defaults = SamplerOptions::recommended_for(size.model, true);
         let sampling = SamplerOptions {
             temperature: settings.temperature.unwrap_or(defaults.temperature),
             top_k: settings.top_k.unwrap_or(defaults.top_k),
             top_p: settings.top_p.unwrap_or(defaults.top_p),
+            presence_penalty: settings
+                .presence_penalty
+                .unwrap_or(defaults.presence_penalty),
             seed: defaults.seed,
         };
         let mut generator = Generator::load(
@@ -651,12 +667,12 @@ fn resolved_p_min(settings: &ServeSettings, size: hub::Model) -> f32 {
 /// `EngineGone` — a clean 500 — instead.
 struct EngineExitGuard {
     jobs: Arc<JobQueue>,
-    model_loaded: Arc<AtomicBool>,
+    resident: Arc<ResidentModel>,
 }
 
 impl Drop for EngineExitGuard {
     fn drop(&mut self) {
-        self.model_loaded.store(false, Ordering::Relaxed);
+        self.resident.clear();
         self.jobs.close();
     }
 }
@@ -665,13 +681,13 @@ fn engine_loop(
     settings: ServeSettings,
     default_target: Target,
     jobs: Arc<JobQueue>,
-    model_loaded: Arc<AtomicBool>,
+    resident: Arc<ResidentModel>,
     shutdown: Arc<Cancel>,
     logger: ServeLogger,
 ) {
     let _exit = EngineExitGuard {
         jobs: Arc::clone(&jobs),
-        model_loaded: Arc::clone(&model_loaded),
+        resident: Arc::clone(&resident),
     };
     // Opened before the first job — the scan is what lets that job find a warm
     // store — and kept across idle unloads: the tier is bound to the checkpoint on
@@ -738,7 +754,7 @@ fn engine_loop(
             let held_disk = state.as_ref().map(|held| held.size).and_then(&disk_for);
             store_live_conversation(state.as_mut(), held_disk, &logger);
             state = None;
-            model_loaded.store(false, Ordering::Relaxed);
+            resident.clear();
             // The warm conversations went with the model.
             logger.log(ServeLog::SlotsSnapshot(Vec::new()));
             // The measured span is reported alongside the configured one so that a
@@ -772,7 +788,7 @@ fn engine_loop(
             });
             store_live_conversation(state.as_mut(), disk_for(held), &logger);
             state = None;
-            model_loaded.store(false, Ordering::Relaxed);
+            resident.clear();
             // The warm conversations went with the model.
             logger.log(ServeLog::SlotsSnapshot(Vec::new()));
         }
@@ -852,7 +868,7 @@ fn engine_loop(
                 // ever executes with the state installed, so a panic between
                 // building the state and installing it can never leave `/health`
                 // claiming a model nobody holds.
-                model_loaded.store(true, Ordering::Relaxed);
+                resident.store(required);
                 match job {
                     Job::Generation(job) => run_job(
                         engine,
@@ -936,7 +952,7 @@ fn engine_loop(
         }
         if drop_model {
             state = None;
-            model_loaded.store(false, Ordering::Relaxed);
+            resident.clear();
             // The warm conversations went with the model.
             logger.log(ServeLog::SlotsSnapshot(Vec::new()));
         }
@@ -964,7 +980,7 @@ fn engine_loop(
     let held_disk = state.as_ref().map(|held| held.size).and_then(&disk_for);
     store_live_conversation(state.as_mut(), held_disk, &logger);
     if let Some(disk) = disk.as_ref() {
-        disk.flush(DISK_FLUSH_GRACE);
+        disk.flush(disk_flush_budget(disk.pending_bytes()));
     }
 }
 
@@ -1448,7 +1464,7 @@ fn run_batch_job(
         &job.request,
         load_ms,
         &label,
-        job.model.model.chat_dialect(),
+        job.model.model,
         &mut BatchHooks {
             progress: &mut progress,
             cancelled: &mut cancelled,
@@ -7140,10 +7156,11 @@ mod tests {
             },
             ServeLogger::discarding(),
         ));
-        let model_loaded = Arc::new(AtomicBool::new(true));
+        let resident = Arc::new(ResidentModel::new());
+        resident.store(Target::official(crate::hub::Model::Qwen35BA3B));
         let guard = EngineExitGuard {
             jobs: Arc::clone(&jobs),
-            model_loaded: Arc::clone(&model_loaded),
+            resident: Arc::clone(&resident),
         };
         assert!(!jobs.is_closed());
 
@@ -7155,8 +7172,13 @@ mod tests {
         assert!(unwound.is_err());
         assert!(jobs.is_closed(), "the exit guard closes the queue");
         assert!(
-            !model_loaded.load(Ordering::Relaxed),
+            !resident.is_loaded(),
             "the exit guard stops /health claiming a model nobody serves"
+        );
+        assert_eq!(
+            resident.get(),
+            None,
+            "and it leaves no checkpoint name behind either"
         );
     }
 
@@ -8521,5 +8543,31 @@ mod tests {
                 .is_some_and(|w| w.contains("262144"))
         );
         assert!(resolve_context_length(0, 262144).is_err());
+    }
+
+    /// The shutdown flush waits for what it actually has queued. The fixed grace
+    /// it replaced was sized on one ~4.2 GiB image; a long conversation images
+    /// several times that, and a shutdown that splits a stored segment queues
+    /// more than one image at once.
+    #[test]
+    fn the_disk_flush_budget_grows_with_what_is_queued() {
+        // Nothing pending, or an image small enough to land inside the grace:
+        // the grace is the floor and the answer.
+        assert_eq!(disk_flush_budget(0), DISK_FLUSH_GRACE);
+        assert_eq!(disk_flush_budget(4 * 1024 * 1024 * 1024), DISK_FLUSH_GRACE);
+        // A 32 GiB queue is past it, and gets the time its own bytes need.
+        let big = 32u64 * 1024 * 1024 * 1024;
+        assert!(disk_flush_budget(big) > DISK_FLUSH_GRACE);
+        assert_eq!(
+            disk_flush_budget(big),
+            Duration::from_secs(big / DISK_WRITE_FLOOR_BYTES_PER_SEC)
+        );
+        // Monotone in the queue size, which is the property the caller relies on.
+        let mut last = Duration::ZERO;
+        for gib in [0u64, 1, 4, 16, 64, 256] {
+            let now = disk_flush_budget(gib * 1024 * 1024 * 1024);
+            assert!(now >= last, "{gib} GiB went backwards");
+            last = now;
+        }
     }
 }

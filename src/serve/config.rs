@@ -79,9 +79,48 @@ pub const DEFAULT_TOOLS_MODE: ToolsMode = ToolsMode::Native;
 /// frames hold the connection), while a refusal sends the client into its
 /// retry-or-give-up policy.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 16;
-/// Seconds a request may wait in the queue before it is dropped with an error
-/// instead of served stale.
+/// Floor on the seconds a request may wait in the queue before it is dropped
+/// with an error instead of served stale. What ships is
+/// [`default_queue_timeout_secs`] over the configured context length; this is
+/// the value that formula can never go below, and the value a server whose
+/// context is short enough gets outright.
 pub const DEFAULT_QUEUE_TIMEOUT_SECS: u64 = 300;
+
+/// The slowest prefill this machine has been measured at, in tokens per second,
+/// at the longest prompt anyone has run through it.
+///
+/// Measured 2026-09-06 on the long-context sweep (docs/perf-state.md, "Long
+/// context"): Qwen3.8-Flash-Next reads 232 tok/s at a 131072-token prompt, the
+/// slowest of the checkpoints benchmarked there and the DEFAULT one, where the
+/// 35B-A3B reads 668. Rounded down to 200, because prefill cost per token keeps
+/// climbing past the length that was measured and a server may be configured
+/// well past it. Deliberately a floor rather than a typical rate: it exists to
+/// bound a wait, and being pessimistic here costs a queued client nothing while
+/// being optimistic drops it.
+const SLOWEST_PREFILL_TOKENS_PER_SEC: u64 = 200;
+
+/// Seconds a queued request may wait, derived from what the server could be busy
+/// with when it arrives.
+///
+/// The old flat 300 was sized against nothing in particular and is well under one
+/// maximal prefill on this machine: a 131072-token prompt is 567 s of prefill on
+/// the default checkpoint before its own decode starts, so a request arriving
+/// behind one was dropped for saturation while the server worked normally. The
+/// derived value covers TWO such prefills — the one running plus one already
+/// queued ahead — which is the shape of the case the timeout is there to
+/// survive.
+///
+/// The explicit `queue_timeout` key still wins; this only moves the default.
+pub fn default_queue_timeout_secs(context_length: usize) -> u64 {
+    let one_prefill = context_length as u64 / SLOWEST_PREFILL_TOKENS_PER_SEC;
+    // Rounded to a whole minute, UP rather than down: a default that reads
+    // `1080` says "eighteen minutes" where `1048` says nothing, and rounding the
+    // other way would put the value back under the two prefills it exists to
+    // cover (at 131072 the pair is 524 s, and rounding down to five minutes
+    // would land on 300 — exactly the flat value this replaced).
+    let derived = (2 * one_prefill).div_ceil(60) * 60;
+    derived.max(DEFAULT_QUEUE_TIMEOUT_SECS)
+}
 /// Watchdog throughput floors (tokens/second) for a job's wall-clock ceiling,
 /// deliberately ~2x below measured low-power-mode throughput so the ceiling
 /// only ever catches a wedged generation, never a slow one. These are not
@@ -325,6 +364,7 @@ pub struct SamplingToml {
     pub temperature: Option<f64>,
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
+    pub presence_penalty: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -428,6 +468,7 @@ pub struct CliOverrides {
     pub temperature: Option<f64>,
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
+    pub presence_penalty: Option<f64>,
     /// Raw text; parsed during the merge so errors name the flag.
     pub reasoning_effort: Option<String>,
     pub cache_snapshots: Option<usize>,
@@ -503,6 +544,11 @@ pub struct ServeSettings {
     pub temperature: Option<f64>,
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
+    /// Unlike the three above, the mode default this falls back to is keyed to
+    /// the SERVED CHECKPOINT as well as the request's thinking state
+    /// (`Model::recommended_presence_penalty`). Setting it here pins one number
+    /// for both modes, as the others do.
+    pub presence_penalty: Option<f64>,
     pub cache_snapshots: usize,
     /// Conversations kept warm at once, at least 1.
     pub cache_slots: usize,
@@ -653,6 +699,14 @@ pub fn resolve(
         "draft"
     };
 
+    // The context length the queue timeout is derived from, resolved ahead of
+    // the struct so it can feed two fields. Plain precedence, no warning of its
+    // own: the `pick` below emits whatever this shadows.
+    let resolved_context_length = cli
+        .context_length
+        .or(file.context_length)
+        .unwrap_or(DEFAULT_CONTEXT_LENGTH);
+
     let settings = ServeSettings {
         model,
         host: pick(
@@ -744,7 +798,7 @@ pub fn resolve(
             "queue_timeout",
             cli.queue_timeout,
             file.queue_timeout,
-            DEFAULT_QUEUE_TIMEOUT_SECS,
+            default_queue_timeout_secs(resolved_context_length),
             origin,
             &mut warnings,
         )),
@@ -880,6 +934,14 @@ pub fn resolve(
             "sampling.top_p",
             cli.top_p,
             file.sampling.top_p,
+            origin,
+            &mut warnings,
+        ),
+        presence_penalty: pick_opt(
+            "presence-penalty",
+            "sampling.presence_penalty",
+            cli.presence_penalty,
+            file.sampling.presence_penalty,
             origin,
             &mut warnings,
         ),
@@ -1223,7 +1285,7 @@ pub fn init_template() -> String {
     let openai = DEFAULT_OPENAI;
     let tools_mode = DEFAULT_TOOLS_MODE;
     let queue_capacity = DEFAULT_QUEUE_CAPACITY;
-    let queue_timeout = DEFAULT_QUEUE_TIMEOUT_SECS;
+    let queue_timeout = default_queue_timeout_secs(ctx);
     let prefill_rate = DEFAULT_REQUEST_PREFILL_RATE;
     let decode_rate = DEFAULT_REQUEST_DECODE_RATE;
     let request_slack = DEFAULT_REQUEST_SLACK_SECS;
@@ -1241,6 +1303,10 @@ pub fn init_template() -> String {
     let temp_instruct = format!("{:?}", instruct_sampling.temperature);
     let top_p_instruct = format!("{:?}", instruct_sampling.top_p);
     let top_k = thinking_sampling.top_k;
+    // The one card value that is per checkpoint, so the template quotes the
+    // model it was generated for rather than a shared pair.
+    let penalty_think = format!("{:?}", TEMPLATE_MODEL.recommended_presence_penalty(true));
+    let penalty_instruct = format!("{:?}", TEMPLATE_MODEL.recommended_presence_penalty(false));
     let snapshots = DEFAULT_CACHE_SNAPSHOTS;
     let snapshot_mib = snapshot_bytes / (1024 * 1024);
     let snapshots_mib = snapshots * snapshot_mib;
@@ -1350,7 +1416,8 @@ queue_capacity = {queue_capacity}
 
 # Drop a request that has waited this long in the queue, in seconds. The client
 # gets an error naming the wait; by then it has usually given up and retried
-# anyway.
+# anyway. The default is derived from context_length — two maximal prefills at
+# the slowest rate this machine has been measured at — and never below 300.
 queue_timeout = {queue_timeout}
 
 # Wall-clock ceiling for one request, derived from its size:
@@ -1450,9 +1517,16 @@ default_budget = {think_budget}
 # which is keyed to thinking on/off: temp {temp_think} / top_p {top_p_think} with thinking,
 # temp {temp_instruct} / top_p {top_p_instruct} without, top_k {top_k} either way. Setting a key here
 # pins one number for both modes on every request that omits it.
+#
+# presence_penalty is the one default that also depends on which checkpoint is
+# loaded: {penalty_think} with thinking and {penalty_instruct} without, on the model this file was
+# generated for. It subtracts that much from the logit of every token the reply
+# has already produced, once per distinct token; 0 turns it off. top_k = 0
+# means no top-k cut at all, and top_k = 1 is greedy.
 # temperature = {temp_think}
 # top_k = {top_k}
 # top_p = {top_p_think}
+# presence_penalty = {penalty_think}
 
 [cache]
 # KV snapshots kept at turn boundaries, so a conversation that edits or retries
@@ -1590,6 +1664,41 @@ mod tests {
         settings
     }
 
+    /// The queue timeout follows the context length, and never drops below the
+    /// 300 s floor however short the context is. The point of the derivation is
+    /// that a request arriving behind one maximal prefill is not dropped for
+    /// saturation while the server is working normally, so the value has to
+    /// cover two of them.
+    #[test]
+    fn the_queue_timeout_default_covers_two_maximal_prefills() {
+        // A context short enough that two prefills fit inside the floor.
+        assert_eq!(default_queue_timeout_secs(1024), DEFAULT_QUEUE_TIMEOUT_SECS);
+        assert_eq!(default_queue_timeout_secs(8192), DEFAULT_QUEUE_TIMEOUT_SECS);
+        assert_eq!(
+            default_queue_timeout_secs(16384),
+            DEFAULT_QUEUE_TIMEOUT_SECS
+        );
+        // Past that it grows with the context, rounded up to a whole minute.
+        assert_eq!(default_queue_timeout_secs(131072), 1320);
+        assert_eq!(default_queue_timeout_secs(262144), 2640);
+        assert_eq!(default_queue_timeout_secs(524288), 5280);
+        // And it never falls under the two prefills it exists to cover.
+        for ctx in [65536usize, 131072, 262144, 524288] {
+            let two_prefills = 2 * ctx as u64 / SLOWEST_PREFILL_TOKENS_PER_SEC;
+            assert!(
+                default_queue_timeout_secs(ctx) >= two_prefills,
+                "short at {ctx}"
+            );
+        }
+        // Monotone, which is the only property a caller reasons about.
+        let mut last = 0;
+        for ctx in [1024, 8192, 65536, 131072, 262144, 524288] {
+            let now = default_queue_timeout_secs(ctx);
+            assert!(now >= last, "{ctx} went backwards: {now} < {last}");
+            last = now;
+        }
+    }
+
     #[test]
     fn defaults_are_the_documented_values() {
         let s = defaults();
@@ -1601,7 +1710,13 @@ mod tests {
         assert_eq!(s.api_key, None);
         assert_eq!(s.tools_mode, ToolsMode::Native);
         assert_eq!(s.queue_capacity, DEFAULT_QUEUE_CAPACITY);
-        assert_eq!(s.queue_timeout, Duration::from_secs(300));
+        // Derived from the context length, not the 300 s floor: at the default
+        // 262144 one maximal prefill is ~1310 s at the measured floor rate.
+        assert_eq!(
+            s.queue_timeout,
+            Duration::from_secs(default_queue_timeout_secs(DEFAULT_CONTEXT_LENGTH))
+        );
+        assert_eq!(s.queue_timeout, Duration::from_secs(2640));
         assert_eq!(s.request_prefill_rate, DEFAULT_REQUEST_PREFILL_RATE);
         assert_eq!(s.request_decode_rate, DEFAULT_REQUEST_DECODE_RATE);
         assert_eq!(s.request_slack, Duration::from_secs(30));
@@ -2446,13 +2561,31 @@ mod tests {
             (settings.temperature, settings.top_k, settings.top_p),
             (None, None, None)
         );
+        assert_eq!(settings.presence_penalty, None);
 
-        let file: ServeToml = toml::from_str("[sampling]\ntop_k = 40\ntop_p = 0.9\n").unwrap();
+        let file: ServeToml =
+            toml::from_str("[sampling]\ntop_k = 40\ntop_p = 0.9\npresence_penalty = 1.5\n")
+                .unwrap();
         let (settings, warnings) = resolve(&file, None, &model_only()).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(settings.temperature, None);
         assert_eq!(settings.top_k, Some(40));
         assert_eq!(settings.top_p, Some(0.9));
+        assert_eq!(settings.presence_penalty, Some(1.5));
+
+        // A zero is a pin, not an absence: it is how an operator turns the
+        // checkpoint's own default off server-wide.
+        let off: ServeToml = toml::from_str("[sampling]\npresence_penalty = 0.0\n").unwrap();
+        let (settings, _) = resolve(&off, None, &model_only()).unwrap();
+        assert_eq!(settings.presence_penalty, Some(0.0));
+
+        // And the flag beats the file, like every other sampling key.
+        let cli = CliOverrides {
+            presence_penalty: Some(0.25),
+            ..model_only()
+        };
+        let (settings, _) = resolve(&file, None, &cli).unwrap();
+        assert_eq!(settings.presence_penalty, Some(0.25));
     }
 
     #[test]

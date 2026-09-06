@@ -1,9 +1,11 @@
 //! OpenAI Chat Completions API surface: POST /v1/chat/completions.
 //!
 //! Same permissiveness as the Anthropic handler: unknown fields are ignored,
-//! and the parameters this engine has no equivalent for (penalties, logprobs,
-//! `min_p`, `repeat_penalty`) are accepted and dropped rather than rejected,
-//! since a client sending them still gets a correct completion. The exception
+//! and the parameters this engine has no equivalent for (`frequency_penalty`,
+//! logprobs, `min_p`, `repeat_penalty`) are accepted and dropped rather than
+//! rejected, since a client sending them still gets a correct completion.
+//! `presence_penalty` is NOT in that list — it is honored, and unset it takes
+//! the served checkpoint's own mode default. The exception
 //! is `chat_template_kwargs`: its keys change the rendered prompt itself, so an
 //! unknown key or a wrong type there is a 400 rather than a silent drop. What
 //! cannot be served correctly — JSON-mode, more than one choice, a
@@ -143,6 +145,11 @@ pub(crate) struct ChatRequest {
     /// Not an OpenAI parameter, but the local-server convention, and this
     /// engine samples with it.
     pub top_k: Option<usize>,
+    /// Subtracted from the logit of every token the reply has already
+    /// produced, once per distinct token. OpenAI's field, and the only one of
+    /// the penalty family this engine implements: `frequency_penalty` and
+    /// `repetition_penalty` are still accepted and dropped.
+    pub presence_penalty: Option<f64>,
     pub stop: Option<Stop>,
     pub seed: Option<u64>,
     pub stream: Option<bool>,
@@ -847,7 +854,7 @@ pub(crate) fn prepare(
     // Request over server config over the model card's recommendation for the
     // RESOLVED thinking mode: the card keys sampling to thinking on/off, and
     // only now is the mode known.
-    let recommended = SamplerOptions::recommended(enable_thinking);
+    let recommended = SamplerOptions::recommended_for(target.model, enable_thinking);
     let sampling = SamplerOptions {
         temperature: request
             .temperature
@@ -861,6 +868,10 @@ pub(crate) fn prepare(
             .top_p
             .or(settings.top_p)
             .unwrap_or(recommended.top_p),
+        presence_penalty: request
+            .presence_penalty
+            .or(settings.presence_penalty)
+            .unwrap_or(recommended.presence_penalty),
         seed: request.seed.unwrap_or(recommended.seed),
     };
 
@@ -2428,10 +2439,18 @@ mod tests {
     #[test]
     fn unsupported_knobs_are_accepted_and_dropped() {
         let request = prepared(&format!(
-            r#"{{"presence_penalty":0.5,"frequency_penalty":0.5,"logprobs":true,
+            r#"{{"frequency_penalty":0.5,"logprobs":true,
                  "min_p":0.05,"repeat_penalty":1.1,"user":"someone",{USER}}}"#
         ));
         assert_eq!(shape(&request.job.messages), vec!["user:Hi"]);
+    }
+
+    /// `presence_penalty` used to sit in the dropped list above. It is the one
+    /// penalty this engine samples with, so a request that sends it gets it.
+    #[test]
+    fn the_presence_penalty_is_consumed_not_dropped() {
+        let request = prepared(&format!(r#"{{"presence_penalty":0.25,{USER}}}"#));
+        assert_eq!(request.job.sampling.presence_penalty, 0.25);
     }
 
     #[test]
@@ -2439,19 +2458,60 @@ mod tests {
         // Nothing pinned server-side: the default is the resolved mode's
         // recommendation (thinking here, since thinking_force is on).
         let defaults = prepared(&format!(r#"{{{USER}}}"#));
-        let recommended = SamplerOptions::recommended(true);
+        let recommended = SamplerOptions::recommended_for(target().model, true);
         assert_eq!(defaults.job.sampling.temperature, recommended.temperature);
         assert_eq!(defaults.job.sampling.top_p, recommended.top_p);
         assert_eq!(defaults.job.sampling.top_k, recommended.top_k);
         assert_eq!(defaults.job.sampling.seed, recommended.seed);
+        assert_eq!(
+            defaults.job.sampling.presence_penalty,
+            recommended.presence_penalty
+        );
 
         let asked = prepared(&format!(
-            r#"{{"temperature":0.3,"top_p":0.7,"top_k":8,"seed":1234,{USER}}}"#
+            r#"{{"temperature":0.3,"top_p":0.7,"top_k":8,"presence_penalty":1.25,"seed":1234,{USER}}}"#
         ));
         assert_eq!(asked.job.sampling.temperature, 0.3);
         assert_eq!(asked.job.sampling.top_p, 0.7);
         assert_eq!(asked.job.sampling.top_k, 8);
+        assert_eq!(asked.job.sampling.presence_penalty, 1.25);
         assert_eq!(asked.job.sampling.seed, 1234);
+    }
+
+    /// The penalty default is the one sampling value keyed to the checkpoint
+    /// as well as the mode, and this dialect resolves it from the TARGET the
+    /// handler picked — not from the server's default model.
+    #[test]
+    fn the_penalty_default_follows_the_targeted_checkpoint_and_mode() {
+        let body = format!(r#"{{{USER}}}"#);
+        let thinking_38 =
+            prepare(parse(&body), &settings(), "m", target()).expect("request prepares");
+        assert_eq!(thinking_38.job.sampling.presence_penalty, 0.0);
+
+        let a3b = crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B);
+        let thinking_a3b = prepare(parse(&body), &settings(), "m", a3b).expect("request prepares");
+        assert_eq!(thinking_a3b.job.sampling.presence_penalty, 1.5);
+
+        // Thinking off: every card asks for 1.5.
+        let no_think = format!(r#"{{"chat_template_kwargs":{{"enable_thinking":false}},{USER}}}"#);
+        let instruct =
+            prepare(parse(&no_think), &settings(), "m", target()).expect("request prepares");
+        assert_eq!(instruct.job.sampling.presence_penalty, 1.5);
+
+        // A server-wide pin beats the card in both modes, and a request beats
+        // the pin.
+        let mut pinned = settings();
+        pinned.presence_penalty = Some(0.25);
+        let served = prepare(parse(&body), &pinned, "m", a3b).expect("request prepares");
+        assert_eq!(served.job.sampling.presence_penalty, 0.25);
+        let asked = prepare(
+            parse(&format!(r#"{{"presence_penalty":0.0,{USER}}}"#)),
+            &pinned,
+            "m",
+            a3b,
+        )
+        .expect("request prepares");
+        assert_eq!(asked.job.sampling.presence_penalty, 0.0);
     }
 
     /// `prepare` echoes the `model` string it is handed, and the handler is what

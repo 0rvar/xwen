@@ -4,6 +4,10 @@ use rand::SeedableRng;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::rngs::StdRng;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use crate::hub::Model;
 
 /// Sampling per generation_config.json defaults: temp 1.0, top_k 20, top_p 0.95.
 /// Top-k then top-p, plus dual-EOG stop detection.
@@ -21,6 +25,10 @@ use rand::rngs::StdRng;
 pub struct Sampler {
     strategy: Strategy,
     rng: StdRng,
+    /// Subtracted once from the logit of every id the current reply has already
+    /// emitted (see [`PresenceHistory`]). Zero — the default — is applied
+    /// nowhere and costs nothing: the draw keeps the device-softmax fast path.
+    presence_penalty: f32,
     eog: Vec<u32>,
     /// The number of leading ids that carry text. The output layer is wider
     /// than the tokenizer: the rows past this bound are padding, decode to
@@ -35,8 +43,18 @@ enum Strategy {
 
 pub struct SamplerOptions {
     pub temperature: f64,
+    /// Top-k truncation. `0` means no cut at all — the whole encodable
+    /// vocabulary stays eligible and only top-p narrows it — and `1` is
+    /// greedy. Both spellings match llama.cpp's and vLLM's.
     pub top_k: usize,
     pub top_p: f64,
+    /// Subtracted once from the logit of every id already emitted in the
+    /// current reply, before temperature and before any cut (vLLM's
+    /// semantics). `0.0` disables it. Keyed to the checkpoint AND the chat
+    /// mode, unlike the three above, which is why the resolved default comes
+    /// from [`SamplerOptions::recommended_for`] and not
+    /// [`SamplerOptions::recommended`].
+    pub presence_penalty: f64,
     pub seed: u64,
 }
 
@@ -46,17 +64,26 @@ impl Default for SamplerOptions {
             temperature: 1.0,
             top_k: 20,
             top_p: 0.95,
+            presence_penalty: 0.0,
             seed: 42,
         }
     }
 }
 
 impl SamplerOptions {
-    /// The model card's recommended sampling for each chat mode: thinking is
-    /// temp 1.0 / top_p 0.95, instruct (non-thinking) is temp 0.7 / top_p 0.80,
-    /// top_k 20 either way. The cards key the recommendation to thinking on/off
-    /// alone — all three checkpoints share both sets. The seed is this
-    /// runtime's own fixed default; the cards name none.
+    /// The model card's recommended sampling for each chat mode, minus the one
+    /// value that is not shared across the checkpoints: thinking is temp 1.0 /
+    /// top_p 0.95, instruct (non-thinking) is temp 0.7 / top_p 0.80, top_k 20
+    /// either way. The cards key those three to thinking on/off alone — all
+    /// four checkpoints share both sets. The seed is this runtime's own fixed
+    /// default; the cards name none.
+    ///
+    /// The presence penalty is left at zero here because the cards do NOT
+    /// share it (Qwen3.6-35B-A3B is the only one asking for one while
+    /// thinking). Every request-resolution path wants
+    /// [`SamplerOptions::recommended_for`] instead; this one exists for the
+    /// callers with no checkpoint in hand, which today is the generated
+    /// serve.toml's prose about the mode defaults.
     ///
     /// [`Default`] is the thinking set: it is what every path without a chat
     /// mode (raw prompts, benches) samples with, as it always has.
@@ -65,14 +92,201 @@ impl SamplerOptions {
             temperature: if thinking { 1.0 } else { 0.7 },
             top_k: 20,
             top_p: if thinking { 0.95 } else { 0.80 },
+            presence_penalty: 0.0,
             seed: 42,
+        }
+    }
+
+    /// The full card recommendation for one checkpoint in one chat mode: the
+    /// shared triple above plus that checkpoint's own presence penalty
+    /// ([`Model::recommended_presence_penalty`]).
+    ///
+    /// THE resolution helper. Every surface that layers explicit values over
+    /// the card — the CLI's `SamplingArgs`, all three serve dialects, the batch
+    /// payload — resolves against this one function, so a checkpoint's defaults
+    /// cannot drift between them.
+    pub fn recommended_for(model: Model, thinking: bool) -> Self {
+        Self {
+            presence_penalty: model.recommended_presence_penalty(thinking),
+            ..Self::recommended(thinking)
         }
     }
 }
 
-/// Post-logit adjustments applied to a single draw, all on the CPU copy of the
-/// logits and in this order: `allowed` -> `banned` -> `bias` -> `pull` ->
-/// `force`.
+/// The ids the current reply has already emitted, which is what the presence
+/// penalty is measured over.
+///
+/// `presence_penalty` p subtracts p from the logit of every id recorded here,
+/// once each however many times it was emitted — vLLM's semantics, which is
+/// what the model cards' number is quoted against. The scope is the CURRENT
+/// reply: the prompt and every earlier turn sit outside it, reasoning tokens
+/// sit inside it. One is built per decode call, like `PauseController`, so a
+/// served conversation's next turn starts clean.
+///
+/// The speculative loops sample verify rows they may not keep, so the history
+/// is truncated back to the emitted count at the end of every round (see
+/// [`PresenceHistory::truncate`]). Without that a drafted reply would penalize
+/// tokens a plain one never emitted, and the two would diverge under the same
+/// seed.
+///
+/// Recording is unconditional and costs a `Vec` push plus one hash update per
+/// token — nanoseconds against a ~17 ms decode step. What a zero penalty
+/// really saves is downstream: [`PresenceHistory::is_active`] stays false, the
+/// draw never asks for the id list, the device-side copy below is never built,
+/// and `SampleControl::is_noop` keeps the device-softmax fast path.
+pub struct PresenceHistory {
+    penalty: f32,
+    emitted: Vec<u32>,
+    counts: HashMap<u32, u32>,
+    /// The distinct ids of `emitted`, in first-seen order. Maintained as they
+    /// are pushed rather than rebuilt per draw: a draw reads the whole list and
+    /// the list changes at most once per token.
+    unique: Vec<u32>,
+    /// Bumped on every change to `unique`, so the cached device copy can tell
+    /// "the same set" from "a set of the same size".
+    generation: u64,
+    /// The `(ids, deltas)` pair the on-device form scatters, held across every
+    /// draw that shares a unique set — the upload is 8 bytes per distinct id
+    /// and rebuilding it per token would be pure waste. Behind a `RefCell`
+    /// because a draw holds the history by shared reference.
+    device: RefCell<Option<DevicePenalty>>,
+}
+
+/// A [`PresenceHistory`]'s unique ids and their `-p` deltas, uploaded once per
+/// change of the unique set.
+struct DevicePenalty {
+    generation: u64,
+    ids: Tensor,
+    deltas: Tensor,
+}
+
+impl PresenceHistory {
+    /// An empty history that applies `penalty` (`0.0` disables it).
+    pub fn new(penalty: f64) -> Self {
+        Self {
+            penalty: penalty as f32,
+            emitted: Vec::new(),
+            counts: HashMap::new(),
+            unique: Vec::new(),
+            generation: 0,
+            device: RefCell::new(None),
+        }
+    }
+
+    /// Record one emitted token.
+    pub fn push(&mut self, id: u32) {
+        self.emitted.push(id);
+        let count = self.counts.entry(id).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            self.unique.push(id);
+            self.generation += 1;
+        }
+    }
+
+    /// Drop everything past the first `len` emitted tokens.
+    ///
+    /// The speculative rounds' rollback: a round samples every verify row it
+    /// walks but retains only the ones it emits, so the caller truncates to the
+    /// emitted count and the history ends the round holding exactly the reply
+    /// so far.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.emitted.len() {
+            return;
+        }
+        let mut set_changed = false;
+        for id in self.emitted.drain(len..) {
+            if let Some(count) = self.counts.get_mut(&id) {
+                *count -= 1;
+                if *count == 0 {
+                    self.counts.remove(&id);
+                    set_changed = true;
+                }
+            }
+        }
+        if set_changed {
+            let counts = &self.counts;
+            self.unique.retain(|id| counts.contains_key(id));
+            self.generation += 1;
+        }
+    }
+
+    /// How many tokens the reply has emitted so far.
+    pub fn len(&self) -> usize {
+        self.emitted.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.emitted.is_empty()
+    }
+
+    /// The distinct emitted ids, in first-seen order.
+    pub fn unique_ids(&self) -> &[u32] {
+        &self.unique
+    }
+
+    /// True when this history would actually change a logit row.
+    pub fn is_active(&self) -> bool {
+        self.penalty != 0.0 && !self.unique.is_empty()
+    }
+
+    /// The penalty subtracted per distinct emitted id.
+    pub fn penalty(&self) -> f32 {
+        self.penalty
+    }
+
+    /// `logits - p` at every emitted id, computed where the logits already are.
+    ///
+    /// The point of the device form is what it does NOT do: the CPU form has to
+    /// pull the whole ~993 KB logit row across the bus and softmax it on the
+    /// CPU, which costs more than the rest of the sampler tail put together,
+    /// and the penalty is on by default. A scatter-add plus the device softmax
+    /// keeps the default path exactly as fast as an unpenalized one.
+    ///
+    /// `encodable` is the row's width; ids at or past it are dropped, matching
+    /// how `apply_control` skips out-of-range bans. Every id here came out of
+    /// this sampler in the first place, so that filter never fires — it is
+    /// there because an out-of-range index would be a silent out-of-bounds
+    /// write in the Metal kernel rather than an error.
+    fn apply_on_device(&self, logits: &Tensor, encodable: usize) -> Result<Tensor> {
+        let device = logits.device();
+        let mut cached = self.device.borrow_mut();
+        let fresh = cached
+            .as_ref()
+            .is_some_and(|c| c.generation == self.generation && c.ids.device().same_device(device));
+        if !fresh {
+            let ids: Vec<u32> = self
+                .unique
+                .iter()
+                .copied()
+                .filter(|&id| (id as usize) < encodable)
+                .collect();
+            let n = ids.len();
+            let deltas = vec![-self.penalty; n];
+            *cached = Some(DevicePenalty {
+                generation: self.generation,
+                ids: Tensor::from_vec(ids, (n,), device)?,
+                deltas: Tensor::from_vec(deltas, (n,), device)?,
+            });
+        }
+        let entry = cached.as_ref().expect("just built");
+        if entry.ids.dim(0)? == 0 {
+            // Only reachable if every emitted id sat past the row, which cannot
+            // happen; a zero-width scatter is a degenerate dispatch, so hand
+            // back the row rather than find out what the kernel does with one.
+            return Ok(logits.clone());
+        }
+        Ok(logits.index_add(&entry.ids, &entry.deltas, 0)?)
+    }
+}
+
+/// Post-logit adjustments applied to a single draw, in this order:
+/// `presence` -> `allowed` -> `banned` -> `bias` -> `pull` -> `force`.
+///
+/// All but the first are computed on the CPU copy of the logits. The presence
+/// penalty is the exception on the default decode path: when it is the only
+/// active adjustment and the logits are on Metal it is scattered into them
+/// there, and the row never leaves the device before the softmax.
 ///
 /// The pieces compose the way their names suggest. The allow-mask and the bans
 /// are both absolute (-inf), so no bias or pull can revive an excluded id;
@@ -84,6 +298,12 @@ impl SamplerOptions {
 /// among legal tokens only, and a seeded run reproduces exactly.
 #[derive(Default)]
 pub struct SampleControl<'a> {
+    /// The reply's emitted-token history, from which the presence penalty is
+    /// computed. `None`, or a history whose penalty is zero, changes nothing.
+    /// Applied FIRST, so the exclusions below still win outright: an id the
+    /// allow-mask or the ban list sends to -inf is excluded whether or not it
+    /// was penalized on the way there.
+    pub presence: Option<&'a PresenceHistory>,
     /// Allow-bitmask over the vocabulary: bit `t` (word `t / 32`, bit
     /// `t % 32`) set means token `t` may be drawn; every clear bit goes to
     /// -inf. `None` allows everything. The mask must cover every encodable id
@@ -112,11 +332,23 @@ impl SampleControl<'_> {
     /// True when nothing would change, so the draw can softmax on the device
     /// and skip the CPU adjustment pass entirely (the default generation path).
     fn is_noop(&self) -> bool {
+        self.penalty().is_none() && self.only_penalty()
+    }
+
+    /// True when every adjustment BUT the presence penalty is absent — the
+    /// case the on-device scatter covers, and the one a default-on penalty
+    /// spends most of a reply in.
+    fn only_penalty(&self) -> bool {
         self.allowed.is_none()
             && self.banned.is_empty()
             && self.bias.is_empty()
             && self.pull.is_none()
             && self.force.is_none()
+    }
+
+    /// The history to penalize by, or `None` when it would change nothing.
+    fn penalty(&self) -> Option<&PresenceHistory> {
+        self.presence.filter(|h| h.is_active())
     }
 }
 
@@ -128,10 +360,13 @@ impl Sampler {
     /// tokenizer cannot decode into the generated text. Everything at or above
     /// the bound is dropped before the draw.
     pub fn new(opts: SamplerOptions, eog_tokens: Vec<u32>, encodable: usize) -> Self {
-        // A zero (or negative) temperature, or a top-k that keeps at most one
-        // candidate, collapses to greedy decoding; otherwise apply top-k then
-        // top-p filtering at the configured temperature.
-        let strategy = if opts.temperature <= 0.0 || opts.top_k <= 1 {
+        // A zero (or negative) temperature, or a top-k of exactly one,
+        // collapses to greedy decoding; otherwise apply top-k then top-p
+        // filtering at the configured temperature. A top-k of ZERO is the
+        // opposite of greedy — llama.cpp's and vLLM's spelling of "no top-k
+        // cut" — and reaches `candidate_set`, which keeps the whole
+        // vocabulary for the top-p cut to narrow.
+        let strategy = if opts.temperature <= 0.0 || opts.top_k == 1 {
             Strategy::ArgMax
         } else {
             Strategy::TopKThenTopP {
@@ -143,9 +378,18 @@ impl Sampler {
         Self {
             strategy,
             rng: StdRng::seed_from_u64(opts.seed),
+            presence_penalty: opts.presence_penalty as f32,
             eog: eog_tokens,
             encodable,
         }
+    }
+
+    /// A fresh [`PresenceHistory`] carrying this sampler's penalty, for one
+    /// reply. Every decode loop builds one at the top and feeds it through
+    /// `SampleControl::presence`; a sampler configured with no penalty hands
+    /// back an inert one.
+    pub fn presence_history(&self) -> PresenceHistory {
+        PresenceHistory::new(self.presence_penalty as f64)
     }
 
     /// The encodable bound this sampler draws within (see [`Sampler::new`]).
@@ -171,16 +415,18 @@ impl Sampler {
         )
     }
 
-    /// Draw one token with the adjustments in `ctl` applied to the CPU copy of
-    /// the logits. Every path ends in exactly one weighted draw — the invariant
-    /// the speculative decode loop depends on, since its output only matches
-    /// plain decode's while the RNG advances once per committed token. (Greedy
-    /// decoding never touches the RNG, in either loop.)
+    /// Draw one token with the adjustments in `ctl` applied. Every path ends in
+    /// exactly one weighted draw — the invariant the speculative decode loop
+    /// depends on, since its output only matches plain decode's while the RNG
+    /// advances once per committed token. (Greedy decoding never touches the
+    /// RNG, in either loop.)
     ///
-    /// The logits cross the bus exactly once per call: an unadjusted stochastic
-    /// draw softmaxes on the device and reads back probabilities, an adjusted
-    /// one reads back raw logits and softmaxes on the CPU after applying the
-    /// controls. Neither reads twice.
+    /// The logits cross the bus exactly once per call, in one of three shapes:
+    /// an unadjusted stochastic draw softmaxes on the device and reads back
+    /// probabilities; a presence-penalty-only one on Metal scatters the penalty
+    /// into the row first and then does the same; anything else reads back raw
+    /// logits and softmaxes on the CPU after applying the controls there. None
+    /// of them reads twice.
     ///
     /// The row is cut to the encodable ids first, so the padding rows of the
     /// output layer take part in nothing: not the softmax denominator, not the
@@ -213,13 +459,26 @@ impl Sampler {
         // Probabilities over the whole encodable vocabulary. The top-p cut
         // renormalizes over the top-k survivors, so only their ratios reach the
         // outcome and the shared denominator cancels — see `truncate_top_p`.
-        let probs = if ctl.is_noop() {
+        // The presence penalty is on by default, so "penalty and nothing else"
+        // is the shape most of a reply's draws take. Scattering it into the row
+        // where the row already lives keeps that shape on the device-softmax
+        // path; falling back to the CPU form would cost a ~993 KB readback and
+        // a CPU exp loop on every token. The two forms subtract the same f32
+        // from the same entries, so they agree bit for bit.
+        let on_device = match ctl.penalty() {
+            _ if ctl.is_noop() => Some(logits.clone()),
+            Some(history) if ctl.only_penalty() && logits.device().is_metal() => {
+                Some(history.apply_on_device(&logits, self.encodable)?)
+            }
+            _ => None,
+        };
+        let probs = if let Some(row) = on_device {
             // Multiplying by exactly 1.0 is the identity in f32, so the default
             // temperature skips the scaling pass outright.
             let scaled = if temperature == 1.0 {
-                logits
+                row
             } else {
-                (logits / temperature)?
+                (row / temperature)?
             };
             read_back(&candle_nn::ops::softmax_last_dim(&scaled)?)?
         } else {
@@ -313,6 +572,10 @@ fn softmax_in_place(values: &mut [f32], temperature: f64) {
 /// weight. `probs` is the softmax over the whole encodable vocabulary; a zeroed
 /// weight is a candidate the top-p cut removed.
 ///
+/// `k == 0` is "no top-k cut" and takes the same branch a `k` wider than the
+/// vocabulary does. (`k == 1` never arrives: it is greedy, and `Sampler::new`
+/// resolved it to `ArgMax`.)
+///
 /// Order of operations: vocabulary-wide softmax, then top-k, then top-p over
 /// the survivors renormalized to sum to one — `top_p` is a threshold on mass
 /// relative to the top-k set, which is llama.cpp's convention and HF's. The
@@ -320,7 +583,7 @@ fn softmax_in_place(values: &mut [f32], temperature: f64) {
 /// `cur_p->p` is: they are what the cut was measured against. The draw
 /// normalizes anyway, so the scale reaches nothing but the threshold.
 fn candidate_set(probs: &[f32], k: usize, top_p: f32) -> Result<Vec<(f32, u32)>> {
-    let mut candidates = if k >= probs.len() {
+    let mut candidates = if k == 0 || k >= probs.len() {
         // Nothing for top-k to remove: the whole vocabulary is the candidate
         // set the top-p cut then applies to.
         ensure!(
@@ -429,8 +692,19 @@ fn truncate_top_p(candidates: &mut [(f32, u32)], top_p: f32) {
 }
 
 /// Apply `ctl`'s adjustments to the CPU copy of the logits, in the documented
-/// order: `allowed` -> `banned` -> `bias` -> `pull` -> `force`.
+/// order: `presence` -> `allowed` -> `banned` -> `bias` -> `pull` -> `force`.
 fn apply_control(values: &mut [f32], ctl: &SampleControl) -> Result<()> {
+    if let Some(history) = ctl.penalty() {
+        // One subtraction per DISTINCT emitted id, however many times it was
+        // emitted — vLLM's presence penalty, not a frequency penalty. An id
+        // past the row (there are none in practice) is skipped, as a ban is.
+        let penalty = history.penalty();
+        for &id in history.unique_ids() {
+            if let Some(v) = values.get_mut(id as usize) {
+                *v -= penalty;
+            }
+        }
+    }
     if let Some(words) = ctl.allowed {
         // A mask narrower than the vocabulary would silently ban the tail —
         // ids the caller never considered — so the widths must agree.
@@ -530,6 +804,7 @@ mod tests {
             temperature: 1.0,
             top_k: 20,
             top_p: 1.0,
+            presence_penalty: 0.0,
             seed: 1234,
         };
         let l = logits(&[0.5, 1.5, 0.2, 2.5, 1.0]);
@@ -549,6 +824,7 @@ mod tests {
                     temperature: 0.0,
                     top_k: 20,
                     top_p: 1.0,
+                    presence_penalty: 0.0,
                     seed,
                 },
                 vec![],
@@ -567,6 +843,7 @@ mod tests {
                 temperature: 1.0,
                 top_k: 1,
                 top_p: 1.0,
+                presence_penalty: 0.0,
                 seed: 7,
             },
             vec![],
@@ -586,6 +863,7 @@ mod tests {
                 temperature: 1.0,
                 top_k: 2,
                 top_p: 1.0,
+                presence_penalty: 0.0,
                 seed: 2024,
             },
             vec![],
@@ -610,6 +888,7 @@ mod tests {
                 temperature: 0.0,
                 top_k: 20,
                 top_p: 1.0,
+                presence_penalty: 0.0,
                 seed: 7,
             },
             vec![],
@@ -628,6 +907,7 @@ mod tests {
                 temperature: 1.0,
                 top_k: 20,
                 top_p: 1.0,
+                presence_penalty: 0.0,
                 seed,
             },
             vec![],
@@ -641,6 +921,7 @@ mod tests {
                 temperature: 0.0,
                 top_k: 20,
                 top_p: 1.0,
+                presence_penalty: 0.0,
                 seed,
             },
             vec![],
@@ -1197,6 +1478,7 @@ mod tests {
                 temperature: TEMP,
                 top_k: K,
                 top_p: P,
+                presence_penalty: 0.0,
                 seed: SEED,
             },
             vec![],
@@ -1245,6 +1527,7 @@ mod tests {
                 temperature: TEMP,
                 top_k: K,
                 top_p: P,
+                presence_penalty: 0.0,
                 seed: SEED,
             },
             vec![],
@@ -1406,6 +1689,7 @@ mod tests {
                                 temperature: TEMP,
                                 top_k: k,
                                 top_p: p,
+                                presence_penalty: 0.0,
                                 seed: SEED,
                             },
                             vec![],
@@ -1611,5 +1895,352 @@ mod tests {
         let l = logits(&[0.1, f32::NEG_INFINITY, 3.0, 0.2]);
         assert_eq!(greedy(7, 4).sample(&l).unwrap(), 2);
         assert!(stochastic(7, 4).sample(&l).unwrap() != 1);
+    }
+
+    // ------------------------------------------------ presence penalty ---
+
+    fn penalized(penalty: f64, temperature: f64, n: usize) -> Sampler {
+        Sampler::new(
+            SamplerOptions {
+                temperature,
+                top_k: 20,
+                top_p: 1.0,
+                presence_penalty: penalty,
+                seed: 7,
+            },
+            vec![],
+            n,
+        )
+    }
+
+    // The history is a multiset of emitted tokens with a set of distinct ids
+    // over it: a repeat adds nothing new to the set, and a truncation only
+    // drops an id once its last occurrence is gone.
+    #[test]
+    fn the_history_tracks_distinct_ids_across_pushes_and_truncations() {
+        let mut h = PresenceHistory::new(1.5);
+        assert!(h.is_empty());
+        assert!(!h.is_active(), "an empty history changes nothing");
+
+        for id in [3u32, 7, 3, 9, 7] {
+            h.push(id);
+        }
+        assert_eq!(h.len(), 5);
+        assert_eq!(h.unique_ids(), &[3, 7, 9]);
+        assert!(h.is_active());
+
+        // Dropping one of two 7s keeps 7 in the set; dropping 9's only copy
+        // takes it out, and the remaining order is preserved.
+        h.truncate(4);
+        assert_eq!(h.unique_ids(), &[3, 7, 9]);
+        h.truncate(3);
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.unique_ids(), &[3, 7]);
+
+        // Truncating to at or past the length is a no-op.
+        h.truncate(3);
+        h.truncate(99);
+        assert_eq!(h.unique_ids(), &[3, 7]);
+
+        h.truncate(0);
+        assert!(h.is_empty());
+        assert_eq!(h.unique_ids(), &[] as &[u32]);
+        assert!(!h.is_active());
+    }
+
+    // A zero penalty is inert whatever the history holds, so the draw keeps
+    // the device-softmax fast path.
+    #[test]
+    fn a_zero_penalty_is_never_active() {
+        let mut h = PresenceHistory::new(0.0);
+        h.push(1);
+        h.push(2);
+        assert!(!h.is_active());
+        let ctl = SampleControl {
+            presence: Some(&h),
+            ..SampleControl::default()
+        };
+        assert!(ctl.is_noop());
+    }
+
+    // The penalty moves the greedy pick: id 2 leads by 1.0, so a 1.5 penalty on
+    // it hands the draw to the runner-up — and only to the ids in the history.
+    #[test]
+    fn the_penalty_changes_the_greedy_pick_on_the_cpu_path() {
+        let l = logits(&[0.1, 4.0, 5.0, 0.2]);
+        let mut h = PresenceHistory::new(1.5);
+        h.push(2);
+        let mut s = penalized(1.5, 0.0, 4);
+        let ctl = SampleControl {
+            presence: Some(&h),
+            ..SampleControl::default()
+        };
+        assert_eq!(s.sample_controlled(&l, &ctl).unwrap(), 1);
+
+        // Unpenalized, and penalized at an id that is not leading, the argmax
+        // stays where it was.
+        assert_eq!(penalized(0.0, 0.0, 4).sample(&l).unwrap(), 2);
+        let mut elsewhere = PresenceHistory::new(1.5);
+        elsewhere.push(0);
+        let ctl = SampleControl {
+            presence: Some(&elsewhere),
+            ..SampleControl::default()
+        };
+        assert_eq!(
+            penalized(1.5, 0.0, 4).sample_controlled(&l, &ctl).unwrap(),
+            2
+        );
+    }
+
+    // One subtraction per DISTINCT id, however many times it was emitted —
+    // vLLM's presence penalty, not a frequency penalty. Emitting id 2 three
+    // times must not cost it 4.5.
+    #[test]
+    fn repeats_do_not_deepen_the_penalty() {
+        let l = logits(&[0.1, 4.0, 5.0, 0.2]);
+        let mut h = PresenceHistory::new(0.5);
+        for _ in 0..3 {
+            h.push(2);
+        }
+        let ctl = SampleControl {
+            presence: Some(&h),
+            ..SampleControl::default()
+        };
+        // 5.0 - 0.5 still leads 4.0; a frequency penalty would have taken it to
+        // 3.5 and lost.
+        assert_eq!(
+            penalized(0.5, 0.0, 4).sample_controlled(&l, &ctl).unwrap(),
+            2
+        );
+    }
+
+    // The penalty is applied FIRST, and the exclusions still win outright: a
+    // banned id stays out whether or not it was penalized on the way there, and
+    // a ban can hand the draw to an id the penalty had pushed down.
+    #[test]
+    fn the_penalty_composes_with_the_other_controls() {
+        let l = logits(&[0.1, 4.0, 5.0, 0.2]);
+        let mut h = PresenceHistory::new(1.5);
+        h.push(1);
+        let ctl = SampleControl {
+            presence: Some(&h),
+            banned: &[2],
+            ..SampleControl::default()
+        };
+        // 2 is banned and 1 is penalized to 2.5, which still beats 0.2 and 0.1.
+        assert_eq!(
+            penalized(1.5, 0.0, 4).sample_controlled(&l, &ctl).unwrap(),
+            1
+        );
+
+        // A forced id is drawn however deeply the penalty pushed it.
+        let ctl = SampleControl {
+            presence: Some(&h),
+            force: Some(1),
+            ..SampleControl::default()
+        };
+        assert_eq!(
+            penalized(9.0, 0.0, 4).sample_controlled(&l, &ctl).unwrap(),
+            1
+        );
+    }
+
+    // Ids past the encodable bound are skipped rather than erroring, the way a
+    // ban past the vocabulary is. Nothing produces one — every id in a history
+    // came out of this sampler — but the on-device form would otherwise write
+    // out of bounds instead of raising.
+    #[test]
+    fn a_history_id_past_the_vocabulary_is_skipped() {
+        let l = logits(&[0.1, 4.0, 5.0, 0.2]);
+        let mut h = PresenceHistory::new(1.5);
+        h.push(99);
+        let ctl = SampleControl {
+            presence: Some(&h),
+            ..SampleControl::default()
+        };
+        assert_eq!(
+            penalized(1.5, 0.0, 4).sample_controlled(&l, &ctl).unwrap(),
+            2
+        );
+    }
+
+    // top_k = 0 is "no top-k cut", the opposite of greedy: with top_p at 1.0
+    // every id keeps its mass, so a wide flat row can return something other
+    // than the argmax. top_k = 1 is greedy and returns the argmax at any seed.
+    #[test]
+    fn top_k_zero_keeps_the_whole_vocabulary_and_one_is_greedy() {
+        // A near-flat row: id 0 leads, but only just, so an uncut draw reaches
+        // the rest and a greedy one cannot.
+        let mut row = vec![1.0f32; 64];
+        row[0] = 1.05;
+        let l = logits(&row);
+
+        let at = |top_k: usize, seed: u64| {
+            Sampler::new(
+                SamplerOptions {
+                    temperature: 1.0,
+                    top_k,
+                    top_p: 1.0,
+                    presence_penalty: 0.0,
+                    seed,
+                },
+                vec![],
+                64,
+            )
+        };
+
+        let drawn: Vec<u32> = (0..8).map(|seed| at(0, seed).sample(&l).unwrap()).collect();
+        assert!(
+            drawn.iter().any(|&id| id != 0),
+            "top_k 0 must not collapse to the argmax: {drawn:?}"
+        );
+
+        for seed in 0..8u64 {
+            assert_eq!(
+                at(1, seed).sample(&l).unwrap(),
+                0,
+                "top_k 1 is greedy at every seed"
+            );
+        }
+    }
+
+    // The on-device scatter and the CPU loop subtract the same f32 from the
+    // same entries, so the two paths must agree bit for bit — that equality is
+    // what lets the default-on penalty keep the device-softmax fast path
+    // without changing what a reply says.
+    #[test]
+    fn the_device_penalty_matches_the_cpu_penalty() {
+        let Ok(device) = crate::gguf::metal_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // A wide row with structure, so the drawn token actually depends on the
+        // penalized values rather than on one dominant entry.
+        let n = 4096usize;
+        let row: Vec<f32> = (0..n).map(|i| ((i * 37 % 101) as f32) / 25.0).collect();
+        let mut h = PresenceHistory::new(1.5);
+        for id in (0..n as u32).step_by(7).take(300) {
+            h.push(id);
+        }
+
+        let on_device = Tensor::from_vec(row.clone(), (n,), &device).unwrap();
+        let penalized_device: Vec<f32> = h
+            .apply_on_device(&on_device, n)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let mut penalized_cpu = row.clone();
+        apply_control(
+            &mut penalized_cpu,
+            &SampleControl {
+                presence: Some(&h),
+                ..SampleControl::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            penalized_device, penalized_cpu,
+            "bitwise, not approximately"
+        );
+
+        // And the whole draw agrees across the two devices at the same seed:
+        // the Metal row takes the on-device scatter plus the device softmax,
+        // the CPU row the readback form.
+        fn ctl(h: &PresenceHistory) -> SampleControl<'_> {
+            SampleControl {
+                presence: Some(h),
+                ..SampleControl::default()
+            }
+        }
+        let cpu_row = Tensor::from_vec(row, (n,), &Device::Cpu).unwrap();
+        for seed in 0..4u64 {
+            let opts = || SamplerOptions {
+                temperature: 1.0,
+                top_k: 20,
+                top_p: 0.95,
+                presence_penalty: 1.5,
+                seed,
+            };
+            let metal = Sampler::new(opts(), vec![], n)
+                .sample_controlled(&on_device, &ctl(&h))
+                .unwrap();
+            let cpu = Sampler::new(opts(), vec![], n)
+                .sample_controlled(&cpu_row, &ctl(&h))
+                .unwrap();
+            assert_eq!(metal, cpu, "seed {seed}");
+        }
+    }
+
+    // The cached device tensors are rebuilt when the unique set changes and
+    // reused when it does not — including across a truncation that leaves the
+    // set the same size but different.
+    #[test]
+    fn the_device_id_cache_follows_the_unique_set() {
+        let Ok(device) = crate::gguf::metal_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let row = Tensor::from_vec(vec![0f32; 16], (16,), &device).unwrap();
+        let mut h = PresenceHistory::new(1.0);
+        h.push(2);
+        h.push(5);
+        let first: Vec<f32> = h
+            .apply_on_device(&row, 16)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(first[2], -1.0);
+        assert_eq!(first[5], -1.0);
+        assert_eq!(first[0], 0.0);
+
+        // A repeat leaves the set alone: same answer, no rebuild.
+        let generation = h.generation;
+        h.push(2);
+        assert_eq!(h.generation, generation);
+
+        // Swapping 5 for 9 keeps the set two wide but changes it, so the cache
+        // must not be reused.
+        h.truncate(1);
+        h.push(9);
+        let second: Vec<f32> = h
+            .apply_on_device(&row, 16)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(second[2], -1.0);
+        assert_eq!(second[9], -1.0);
+        assert_eq!(second[5], 0.0, "the dropped id must stop being penalized");
+    }
+
+    // The card recommendation is the shared triple plus the checkpoint's own
+    // penalty — the one value `recommended` cannot resolve on its own.
+    #[test]
+    fn recommended_for_adds_the_checkpoints_penalty_to_the_shared_set() {
+        for model in [
+            Model::Qwen27B,
+            Model::Qwen35BA3B,
+            Model::Qwen3827B,
+            Model::Qwen38FlashNext,
+        ] {
+            for thinking in [true, false] {
+                let shared = SamplerOptions::recommended(thinking);
+                let full = SamplerOptions::recommended_for(model, thinking);
+                assert_eq!(full.temperature, shared.temperature);
+                assert_eq!(full.top_k, shared.top_k);
+                assert_eq!(full.top_p, shared.top_p);
+                assert_eq!(full.seed, shared.seed);
+                assert_eq!(
+                    full.presence_penalty,
+                    model.recommended_presence_penalty(thinking)
+                );
+            }
+        }
+        assert_eq!(SamplerOptions::recommended(true).presence_penalty, 0.0);
     }
 }

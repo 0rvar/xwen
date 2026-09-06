@@ -155,6 +155,75 @@ impl Target {
     }
 }
 
+/// Which checkpoint the engine is holding right now, readable from any thread
+/// without going near the engine.
+///
+/// One cell rather than a `bool` beside a name: `/health` answers both "is a
+/// model loaded" and "which one" out of a single load, so the two can never
+/// disagree — a name left behind by an unloaded model is exactly the kind of
+/// stale answer an operational probe must not give. The engine stamps it where
+/// it stamped the bool before, and every reader is a poll: the dashboard reads
+/// it once a frame, so nothing has to be pushed at the TUI and nothing can go
+/// stale between an unload and the next event.
+///
+/// The encoding is a whole [`Target`] in one `u8`: 0 is nothing resident, and
+/// anything else is the checkpoint's position in [`crate::hub::MODELS`] paired
+/// with whether it means the served file. That is what makes the name
+/// resolvable — on a custom-GGUF server the served file and the official
+/// checkpoint of the same architecture answer to different names.
+#[derive(Debug, Default)]
+pub struct ResidentModel(AtomicU8);
+
+impl ResidentModel {
+    /// Nothing resident, which is what a server starts as: the load is lazy and
+    /// the first request is what pays for it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `target` is now the resident checkpoint.
+    pub fn store(&self, target: Target) {
+        self.0.store(encode(target), Ordering::Relaxed);
+    }
+
+    /// Record that nothing is resident: an idle unload, a swap in progress, or
+    /// a model dropped after a panic.
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    /// The resident checkpoint, or `None` when nothing is loaded.
+    pub fn get(&self) -> Option<Target> {
+        decode(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Whether a model is loaded at all. Exactly `self.get().is_some()`, named
+    /// for the question `/health` has always answered.
+    pub fn is_loaded(&self) -> bool {
+        self.get().is_some()
+    }
+}
+
+/// 0 for nothing; otherwise the checkpoint's index in [`crate::hub::MODELS`]
+/// doubled, plus the served-file bit, plus one to keep 0 free. A checkpoint
+/// somehow absent from that table encodes as nothing rather than as the wrong
+/// model.
+fn encode(target: Target) -> u8 {
+    match crate::hub::MODELS.iter().position(|m| *m == target.model) {
+        Some(index) => 1 + (index as u8) * 2 + u8::from(target.served_file),
+        None => 0,
+    }
+}
+
+fn decode(value: u8) -> Option<Target> {
+    let value = value.checked_sub(1)?;
+    let model = *crate::hub::MODELS.get(usize::from(value / 2))?;
+    Some(Target {
+        model,
+        served_file: value % 2 == 1,
+    })
+}
+
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.model)?;
@@ -512,6 +581,29 @@ mod tests {
         assert!(!cancel.is_cancelled());
         drop(guard);
         assert_eq!(cancel.reason(), Some(CancelReason::ClientGone));
+    }
+
+    /// Every target this server can hold survives the trip through one byte,
+    /// both halves of it. Getting the served-file bit wrong would name the
+    /// wrong FILE on a custom-GGUF server while still naming a plausible
+    /// checkpoint, which is a wrong answer that reads as a right one.
+    #[test]
+    fn the_resident_cell_round_trips_every_target() {
+        let cell = ResidentModel::new();
+        assert_eq!(cell.get(), None, "a server starts holding nothing");
+        assert!(!cell.is_loaded());
+
+        for model in crate::hub::MODELS {
+            for target in [Target::official(model), Target::served(model)] {
+                cell.store(target);
+                assert_eq!(cell.get(), Some(target), "{target}");
+                assert!(cell.is_loaded(), "{target}");
+            }
+        }
+
+        cell.clear();
+        assert_eq!(cell.get(), None, "an unload leaves no name behind");
+        assert!(!cell.is_loaded());
     }
 
     /// A response body dropped after the job was already cancelled for another

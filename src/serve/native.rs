@@ -117,6 +117,10 @@ pub(crate) struct GenerateRequest {
     pub temperature: Option<f64>,
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
+    /// Subtracted from the logit of every token the reply has already
+    /// produced, once per distinct token. Absent takes the target
+    /// checkpoint's own default for the resolved thinking mode.
+    pub presence_penalty: Option<f64>,
     pub seed: Option<u64>,
     pub stop_sequences: Option<Vec<String>>,
     pub stream: Option<bool>,
@@ -319,8 +323,10 @@ pub(crate) fn prepare(
         .flatten();
 
     // Request over server config over the model card's recommendation for the
-    // resolved thinking mode (temp 1.0 / top_p 0.95 thinking, 0.7 / 0.80 not).
-    let recommended = SamplerOptions::recommended(enable_thinking);
+    // resolved thinking mode (temp 1.0 / top_p 0.95 thinking, 0.7 / 0.80 not)
+    // and the target checkpoint, which is what the presence penalty is keyed
+    // to on top of the mode.
+    let recommended = SamplerOptions::recommended_for(target.model, enable_thinking);
     Ok(Prepared {
         stream: request.stream.unwrap_or(false),
         job: JobRequest {
@@ -343,6 +349,10 @@ pub(crate) fn prepare(
                     .top_p
                     .or(settings.top_p)
                     .unwrap_or(recommended.top_p),
+                presence_penalty: request
+                    .presence_penalty
+                    .or(settings.presence_penalty)
+                    .unwrap_or(recommended.presence_penalty),
                 seed: request.seed.unwrap_or(recommended.seed),
             },
             stop_sequences: request.stop_sequences.unwrap_or_default(),
@@ -663,11 +673,50 @@ mod tests {
         assert_eq!(shape(&plain.job.messages), vec!["user:Hi"]);
         // Nothing pinned in the server config: the mode's own recommendation
         // applies, thinking's here since thinking defaults on.
-        let recommended = SamplerOptions::recommended(true);
+        let recommended = SamplerOptions::recommended_for(target().model, true);
         assert_eq!(plain.job.sampling.temperature, recommended.temperature);
         assert_eq!(plain.job.sampling.top_k, recommended.top_k);
         assert_eq!(plain.job.sampling.top_p, recommended.top_p);
         assert_eq!(plain.job.sampling.seed, recommended.seed);
+        assert_eq!(
+            plain.job.sampling.presence_penalty,
+            recommended.presence_penalty
+        );
+    }
+
+    /// The presence penalty rides the same request-over-config-over-card
+    /// ladder as the rest, with a card value keyed to the target checkpoint on
+    /// top of the mode.
+    #[test]
+    fn the_presence_penalty_layers_request_over_config_over_the_card() {
+        let body = r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#;
+        // Thinking on, and this target's card asks for no penalty there.
+        assert_eq!(prepared(body).job.sampling.presence_penalty, 0.0);
+        // The 35B-A3B card is the one that does.
+        let a3b = crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B);
+        let on_a3b = prepare(parse(body), &settings(), a3b).expect("request prepares");
+        assert_eq!(on_a3b.job.sampling.presence_penalty, 1.5);
+        // Thinking off: every card asks for 1.5.
+        let instruct = prepared(
+            r#"{"max_tokens":16,"thinking":false,"messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        assert_eq!(instruct.job.sampling.presence_penalty, 1.5);
+
+        let mut pinned = settings();
+        pinned.presence_penalty = Some(0.25);
+        let configured = prepare(parse(body), &pinned, target()).expect("request prepares");
+        assert_eq!(configured.job.sampling.presence_penalty, 0.25);
+
+        let asked = prepare(
+            parse(
+                r#"{"max_tokens":16,"presence_penalty":0.75,
+                    "messages":[{"role":"user","content":"Hi"}]}"#,
+            ),
+            &pinned,
+            target(),
+        )
+        .expect("request prepares");
+        assert_eq!(asked.job.sampling.presence_penalty, 0.75);
     }
 
     /// A non-thinking request samples with the instruct recommendation

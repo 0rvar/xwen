@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -112,7 +112,10 @@ pub struct AppState {
     pub jobs: Arc<JobQueue>,
     pub tokenizer: Arc<LagunaTokenizer>,
     pub settings: Arc<ServeSettings>,
-    pub model_loaded: Arc<AtomicBool>,
+    /// Which checkpoint the engine is holding, stamped by the engine at load
+    /// and cleared on every unload. `/health` reads it, and so does the
+    /// dashboard's header once a frame.
+    pub resident: Arc<types::ResidentModel>,
     /// The process-wide shutdown token. Cancelled by `shutdown_signal`, polled by
     /// the engine, so the running generation aborts and the process exits through
     /// its destructors instead of the shutdown watchdog.
@@ -167,12 +170,20 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
     let (default_target, unidentified) = engine::identify_checkpoint(&settings, &cfg, selected)?;
     let model_id = model_id(&settings, &default_target);
     let quit = QuitSignal::default();
+    // Built before the logger: the dashboard's header reads this cell once a
+    // frame rather than being told about loads, so the TUI has to be handed it
+    // at construction. Nothing is resident yet — the load is lazy, and the
+    // first request is what pays for it.
+    let resident = Arc::new(types::ResidentModel::new());
     // The sink outlives everything that logs: it is started before the first
     // line the server can produce, and the handle's `Drop` stops and joins it on
     // every way out of this function, error paths included. Which sink is the
     // only thing `--tui` decides; every site logs the same events either way.
     let (logger, _sink) = if settings.tui {
-        log::spawn_tui_sink(tui::Vitals::new(model_id.clone(), &settings), quit.clone())
+        log::spawn_tui_sink(
+            tui::Vitals::new(model_id.clone(), &settings, Arc::clone(&resident)),
+            quit.clone(),
+        )
     } else {
         log::spawn_stderr_sink()
     };
@@ -185,7 +196,20 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
     }
     let (tokenizer, max_ctx) = engine::validate_model(&settings, &cfg, default_target, &logger)?;
 
-    let model_loaded = Arc::new(AtomicBool::new(false));
+    // The queue timeout is DERIVED from the context length unless it was named,
+    // so it is not a number anyone can read off the config file. Said once here,
+    // where an operator wondering why a request waited nine minutes can find it.
+    let derived_timeout = config::default_queue_timeout_secs(settings.context_length);
+    if settings.queue_timeout.as_secs() == derived_timeout
+        && derived_timeout != config::DEFAULT_QUEUE_TIMEOUT_SECS
+    {
+        logger.log(ServeLog::HostLine(format!(
+            "xwen serve: queue_timeout {derived_timeout}s, sized to cover two maximal \
+             prefills at context_length {}",
+            settings.context_length,
+        )));
+    }
+
     let shutdown = Arc::new(Cancel::default());
     let jobs = Arc::new(JobQueue::new(
         settings.queue_capacity,
@@ -200,7 +224,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
         settings.clone(),
         default_target,
         Arc::clone(&jobs),
-        Arc::clone(&model_loaded),
+        Arc::clone(&resident),
         Arc::clone(&shutdown),
         logger.clone(),
     );
@@ -210,7 +234,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
         jobs: Arc::clone(&jobs),
         tokenizer,
         settings: Arc::new(settings),
-        model_loaded,
+        resident,
         shutdown: Arc::clone(&shutdown),
         model_id,
         default_target,
@@ -627,9 +651,17 @@ async fn method_not_allowed(method: Method, uri: Uri) -> Response {
 
 /// `GET /health` — cheap enough to poll, and truthful about the lazy load.
 async fn health(State(state): State<AppState>) -> Response {
+    // One read answers both fields, so they cannot disagree: a `model` naming a
+    // checkpoint beside `model_loaded: false` would be a stale name from an
+    // unload, which is the one thing an operational probe must never report.
+    // `model` is null before the first lazy load and after every unload; when
+    // it is there it is the same string `/v1/models` lists and a request selects
+    // the checkpoint by, which on a custom-GGUF server is the file's own id.
+    let resident = state.resident.get();
     axum::Json(json!({
         "status": "ok",
-        "model_loaded": state.model_loaded.load(Ordering::Relaxed),
+        "model_loaded": resident.is_some(),
+        "model": resident.map(|target| model_id(&state.settings, &target)),
     }))
     .into_response()
 }
@@ -1381,6 +1413,7 @@ pub(crate) mod testutil {
             temperature: None,
             top_k: None,
             top_p: None,
+            presence_penalty: None,
             cache_snapshots: config::DEFAULT_CACHE_SNAPSHOTS,
             cache_slots: config::DEFAULT_CACHE_SLOTS,
             // No disk tier for a handler test: nothing here reaches the engine, and
@@ -1452,7 +1485,7 @@ pub(crate) mod testutil {
                 LagunaTokenizer::from_file(path).expect("load reference tokenizer"),
             ),
             settings: Arc::new(testutil::settings()),
-            model_loaded: Arc::new(AtomicBool::new(false)),
+            resident: Arc::new(types::ResidentModel::new()),
             shutdown: Arc::new(Cancel::default()),
             model_id: "xwen-test".to_string(),
             // Named, not `Model::default()`: these tests assert rendered
@@ -1945,6 +1978,48 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_json(response).await["input_tokens"].as_u64().unwrap() > 0);
         assert!(try_take(&queue).is_none());
+    }
+
+    /// `/health` answers the readiness question and the "which one" question
+    /// out of one read of one cell, so the pair can never disagree. Before the
+    /// first lazy load `model` is null rather than the served file's id: a probe
+    /// that reported a name for a model nobody had loaded would be the exact
+    /// confusion this field exists to end.
+    #[tokio::test]
+    async fn health_names_the_resident_checkpoint_and_nothing_before_the_first_load() {
+        let (state, _queue) = probe_state(4096);
+
+        let json = body_json(health(State(state.clone())).await).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["model_loaded"], false);
+        assert!(
+            json["model"].is_null(),
+            "nothing is resident before the first request pays for the load"
+        );
+
+        // The served file, which on this probe is a GGUF that identified as none
+        // of the official checkpoints: it answers under its own id, the same
+        // string `/v1/models` lists it as.
+        state
+            .resident
+            .store(types::Target::served(crate::hub::Model::Qwen35BA3B));
+        let json = body_json(health(State(state.clone())).await).await;
+        assert_eq!(json["model_loaded"], true);
+        assert_eq!(json["model"], "laguna-s-2.1-Q4_K_M");
+
+        // A swap to an official checkpoint out of the hub: the official full
+        // name, not the served file's id.
+        state
+            .resident
+            .store(types::Target::official(crate::hub::Model::Qwen3827B));
+        let json = body_json(health(State(state.clone())).await).await;
+        assert_eq!(json["model"], "Qwen3.8-27B");
+
+        // An idle unload takes the name with it.
+        state.resident.clear();
+        let json = body_json(health(State(state)).await).await;
+        assert_eq!(json["model_loaded"], false);
+        assert!(json["model"].is_null());
     }
 
     /// The body of a handler response, as JSON.

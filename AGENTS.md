@@ -150,9 +150,14 @@ Tokenizer/chat: ChatML. Specials: `<|im_start|>` 248045, `<|im_end|>` 248046,
 `<|endoftext|>` 248044, `<think>` 248068 / `</think>` 248069 (single tokens but
 `special: false` — handle by id in the gen loop), `<tool_call>` 248058/248059,
 `<tool_response>` 248066/248067. No BOS, ever. Stop on 248046 OR 248044. Sampling
-defaults are MODE-KEYED per the official cards, identical across all three checkpoints:
-thinking 1.0 / 0.95 / 20, non-thinking 0.7 / 0.80 / 20 (`SamplerOptions::recommended`;
-explicit flags/config/request values always win). Generation prompt ends inside an open
+defaults are MODE-KEYED per the official cards: thinking 1.0 / 0.95 / 20, non-thinking
+0.7 / 0.80 / 20 on every checkpoint, plus `presence_penalty` 1.5 non-thinking on every
+checkpoint and, thinking, 1.5 on the 35B-A3B alone (`SamplerOptions::recommended_for`,
+`Model::recommended_presence_penalty`; explicit flags/config/request values always win).
+The penalty is vLLM's presence penalty over the current reply's emitted ids, applied on
+the device before the softmax so the fast path stays, and through the verify rows with a
+round-end rollback truncation, so `--draft` and `--no-draft` stay equivalent (greedy
+gate, 2026-09-06). `top_k` 0 means no top-k cut; 1 is greedy. Generation prompt ends inside an open
 `<think>\n` unless thinking is disabled (then a closed empty block is emitted). The chat
 template is a per-checkpoint DIALECT (`Model::chat_dialect`): the 3.8 template renders a
 reasoning_effort system preamble (xhigh default / low have sentences, medium renders
@@ -289,7 +294,8 @@ and **Flash-Next 52.9 at 596 tokens** (it ships no drafter, so it decodes plain)
 dense pair as last fitted: **27B 24.8-25.3 plain, 37.5-38.2 drafted on code**
 (2026-08-08), **3.8-27B 23.7-24.8 plain, 34.4-35.7 drafted on code** (2026-08-15).
 Prefill: **35B 3081-3090 at 3803 tokens** and **Flash-Next 1140 at 3851** (2026-08-30 and
-2026-09-05), the dense **27B 702 at 925** (2026-07-29). Read a drafted or an A/B figure
+2026-09-05), the dense **27B 702 at 880 tokens** (2026-07-29; recorded as "at 925" until
+2026-09-06, which is the bench fixture's NAME and not its token count). Read a drafted or an A/B figure
 only against the arm measured in its own session.
 
 Three rules do not bend. [docs/benching.md](docs/benching.md) has the rest, and the
@@ -395,9 +401,10 @@ kwarg or the native field — on a 3.6 target is itself a 400; `[thinking] effor
 mode-keyed sampling resolved per request after thinking is known (the fixed
 DEFAULT_TEMPERATURE/TOP_K/TOP_P constants are gone; ServeSettings sampling keys are
 Options, and a pinned value pins both modes). Still open on thinking: the Anthropic
-dialect has no per-request effort knob (server-wide default applies) and penalties stay
-accept-and-drop — both ledgered (TODO.md, From: the chat-dialect and sampling-defaults
-arc).
+dialect has no per-request effort knob (server-wide default applies; retired 2026-09-06
+with a reopen condition), and `frequency_penalty`/`repetition_penalty`/`min_p` stay
+accept-and-drop while `presence_penalty` is consumed on every dialect that has a field
+for it (2026-09-06).
 
 API model names are FULL names only (`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B`,
 `Qwen3.8-Flash-Next` — `Model::full_name`, matching `general.name` and the repo), plus

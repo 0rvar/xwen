@@ -53,6 +53,15 @@ pub struct Generator {
     /// Token ids banned from every draw for the life of the generator
     /// (`--ban-string`), sorted. Empty by default.
     blacklist: Vec<u32>,
+    /// Whether the "drafting stops past draft_ctx" line has already been said
+    /// since the drafter was last able to draft. The horizon is otherwise
+    /// SILENT: past it every round is plain, the taps are drained and dropped,
+    /// and the only trace in `--stats` is `spec.rounds` climbing while
+    /// `spec.draft_rounds` does not — which reads as a drafter that stopped
+    /// helping rather than one that ran out of context. Cleared whenever
+    /// drafting is live again, so a conversation that rewinds back under the
+    /// horizon and crosses it a second time says so a second time.
+    drafter_horizon_logged: bool,
     /// Per-request grammar constraint (`response_format` on the server): masks
     /// every answer-section draw to schema-legal tokens. `None` — the default
     /// and the state between constrained requests — leaves decoding untouched.
@@ -1382,6 +1391,7 @@ impl Generator {
             think: ThinkBudget::off(),
             think_statics: None,
             blacklist: Vec::new(),
+            drafter_horizon_logged: false,
             grammar: None,
             last_logits: None,
             prefill_spend: PrefillSpend::default(),
@@ -2173,6 +2183,7 @@ impl Generator {
             spec_params,
             think,
             grammar,
+            drafter_horizon_logged,
             ..
         } = self;
         let drafter = drafter
@@ -2211,6 +2222,13 @@ impl Generator {
         // request's text, and carrying them across requests would let one
         // conversation's economics pause another's.
         let mut pause = PauseController::new(params.pause_margin as f64);
+        // The reply's emitted-token history, for the presence penalty. Built
+        // per call for the same reason the pause controller above is: it
+        // describes THIS reply, and the penalty is scoped to the reply rather
+        // than to the conversation. Rounds sample verify rows they may not
+        // keep, so it is truncated back to the emitted count at the end of
+        // each one.
+        let mut presence = sampler.presence_history();
 
         let finish = |decoded, thinking_tokens, hit_eog, cancelled, stats| DecodeOutcome {
             tokens_out: decoded,
@@ -2246,6 +2264,7 @@ impl Generator {
             };
             let tc = think.control_for();
             let ctl = SampleControl {
+                presence: Some(&presence),
                 allowed,
                 banned,
                 bias: tc.bias,
@@ -2253,6 +2272,7 @@ impl Generator {
                 force: tc.force,
             };
             let token = sampler.sample_controlled(&logits, &ctl)?;
+            presence.push(token);
             think.on_committed(0, token);
             if let Some(g) = grammar.as_mut() {
                 g.on_committed(token)?;
@@ -2301,6 +2321,7 @@ impl Generator {
             // eventually runs past it; from there every round is plain, and the
             // taps are drained and dropped rather than injected.
             let spec_live = drafter_span_rows(drafter.committed_len(), draft_ctx, n_past, 1) == 1;
+            note_draft_horizon(drafter_horizon_logged, spec_live, n_past, draft_ctx);
             let round_kind = pause.next_kind();
             // Look a full draft span ahead: a round that STARTS below the
             // threshold can still have rows above it, and those rows would read a
@@ -2382,6 +2403,7 @@ impl Generator {
                 };
                 let tc = think.control_for();
                 let ctl = SampleControl {
+                    presence: Some(&presence),
                     allowed,
                     banned,
                     bias: tc.bias,
@@ -2389,6 +2411,7 @@ impl Generator {
                     force: tc.force,
                 };
                 let s = sampler.sample_controlled(&step_logits, &ctl)?;
+                presence.push(s);
                 think.on_committed(decoded, s);
                 if let Some(g) = grammar.as_mut() {
                     g.on_committed(s)?;
@@ -2442,6 +2465,7 @@ impl Generator {
                     };
                     let tc = think.control_for();
                     let ctl = SampleControl {
+                        presence: Some(&presence),
                         allowed,
                         banned,
                         bias: tc.bias,
@@ -2449,6 +2473,7 @@ impl Generator {
                         force: tc.force,
                     };
                     let s = sampler.sample_controlled(&row, &ctl)?;
+                    presence.push(s);
                     think.on_committed(t, s);
                     if let Some(g) = grammar.as_mut() {
                         g.on_committed(s)?;
@@ -2505,6 +2530,14 @@ impl Generator {
             // `round_ms` is what makes the speculative and plain round costs
             // comparable (a 12-token round pays 12 callbacks, a plain round one).
             let emit_ms = emit_start.elapsed().as_secs_f64() * 1000.0;
+            // Roll the history back to what this round actually emitted. A
+            // round draws every verify row it walks, but keeps only the rows
+            // the emit loop reached — a mismatch, an EOG, the token cap or a
+            // cancel all stop it short — and the KV rollback just below drops
+            // the rest. Leaving the extra draws in would penalize tokens the
+            // reply never contained, and drafted decode would stop matching
+            // plain decode under the same seed.
+            presence.truncate(decoded);
 
             // `hit_eog` can only have been set by THIS round's emit: a round that
             // sets it breaks out below.
@@ -2639,6 +2672,7 @@ impl Generator {
             spec_params,
             think,
             grammar,
+            drafter_horizon_logged,
             ..
         } = self;
         let head = drafter
@@ -2672,6 +2706,13 @@ impl Generator {
         let mut hit_eog = false;
         let mut cancelled = false;
         let mut pause = PauseController::new(params.pause_margin as f64);
+        // The reply's emitted-token history, for the presence penalty. Built
+        // per call for the same reason the pause controller above is: it
+        // describes THIS reply, and the penalty is scoped to the reply rather
+        // than to the conversation. Rounds sample verify rows they may not
+        // keep, so it is truncated back to the emitted count at the end of
+        // each one.
+        let mut presence = sampler.presence_history();
 
         let finish = |decoded, thinking_tokens, hit_eog, cancelled, stats| DecodeOutcome {
             tokens_out: decoded,
@@ -2706,6 +2747,7 @@ impl Generator {
             };
             let tc = think.control_for();
             let ctl = SampleControl {
+                presence: Some(&presence),
                 allowed,
                 banned,
                 bias: tc.bias,
@@ -2713,6 +2755,7 @@ impl Generator {
                 force: tc.force,
             };
             let token = sampler.sample_controlled(&logits, &ctl)?;
+            presence.push(token);
             think.on_committed(0, token);
             if let Some(g) = grammar.as_mut() {
                 g.on_committed(token)?;
@@ -2751,6 +2794,7 @@ impl Generator {
             // Speculation needs the head's cache to describe exactly the tokens
             // the target's does, and a head cache position to write into.
             let spec_live = drafter_span_rows(head.committed_len(), draft_ctx, n_past, 1) == 1;
+            note_draft_horizon(drafter_horizon_logged, spec_live, n_past, draft_ctx);
             let round_kind = pause.next_kind();
             let serial = think.needs_serial_rounds(draft_max);
             let want_draft =
@@ -2810,6 +2854,7 @@ impl Generator {
                 };
                 let tc = think.control_for();
                 let ctl = SampleControl {
+                    presence: Some(&presence),
                     allowed,
                     banned,
                     bias: tc.bias,
@@ -2817,6 +2862,7 @@ impl Generator {
                     force: tc.force,
                 };
                 let s = sampler.sample_controlled(&step_logits, &ctl)?;
+                presence.push(s);
                 think.on_committed(decoded, s);
                 if let Some(g) = grammar.as_mut() {
                     g.on_committed(s)?;
@@ -2854,6 +2900,7 @@ impl Generator {
                     };
                     let tc = think.control_for();
                     let ctl = SampleControl {
+                        presence: Some(&presence),
                         allowed,
                         banned,
                         bias: tc.bias,
@@ -2861,6 +2908,7 @@ impl Generator {
                         force: tc.force,
                     };
                     let s = sampler.sample_controlled(&row, &ctl)?;
+                    presence.push(s);
                     think.on_committed(t, s);
                     if let Some(g) = grammar.as_mut() {
                         g.on_committed(s)?;
@@ -2905,6 +2953,14 @@ impl Generator {
                 }
             }
             let emit_ms = emit_start.elapsed().as_secs_f64() * 1000.0;
+            // Roll the history back to what this round actually emitted. A
+            // round draws every verify row it walks, but keeps only the rows
+            // the emit loop reached — a mismatch, an EOG, the token cap or a
+            // cancel all stop it short — and the KV rollback just below drops
+            // the rest. Leaving the extra draws in would penalize tokens the
+            // reply never contained, and drafted decode would stop matching
+            // plain decode under the same seed.
+            presence.truncate(decoded);
 
             let retained = retained_commits(committed.len(), emitted_here, hit_eog);
             stats.accepted += matched.min(retained);
@@ -3001,6 +3057,10 @@ impl Generator {
         let ban_floor = self.ban_ids(true);
         let ban_plain = self.ban_ids(false);
         let mut stream = self.tokenizer.decode_stream();
+        // The reply's emitted-token history, for the presence penalty: built
+        // per call, so the penalty covers this reply and not the prompt or an
+        // earlier turn. Nothing rolls back on this path, so it only ever grows.
+        let mut presence = self.sampler.presence_history();
         let mut pos = start_pos;
         let mut decoded = 0usize;
         let mut thinking_tokens = 0usize;
@@ -3023,6 +3083,7 @@ impl Generator {
             };
             let tc = self.think.control_for();
             let ctl = SampleControl {
+                presence: Some(&presence),
                 allowed,
                 banned,
                 bias: tc.bias,
@@ -3030,6 +3091,7 @@ impl Generator {
                 force: tc.force,
             };
             let token = self.sampler.sample_controlled(&logits, &ctl)?;
+            presence.push(token);
             // The earliest moment position `pos + 1`'s PLE table rows are
             // knowable, and the next forward is still several host steps away —
             // so hint them now and let the fault happen on the prefetch thread
@@ -3127,6 +3189,7 @@ impl Generator {
             drafter,
             spec_params,
             think,
+            drafter_horizon_logged,
             ..
         } = self;
         think.reset();
@@ -3241,6 +3304,13 @@ impl Generator {
         // low-acceptance text. Fed the measured cost of each round below; the
         // XWEN_BENCH warm-up prefill happened before this and is not a sample.
         let mut pause = PauseController::new(params.pause_margin as f64);
+        // The reply's emitted-token history, for the presence penalty. Built
+        // per call for the same reason the pause controller above is: it
+        // describes THIS reply, and the penalty is scoped to the reply rather
+        // than to the conversation. Rounds sample verify rows they may not
+        // keep, so it is truncated back to the emitted count at the end of
+        // each one.
+        let mut presence = sampler.presence_history();
 
         // A zero budget must not draw from the sampler at all (plain decode's
         // first sample lives inside its `while decoded < max_tokens` loop).
@@ -3265,6 +3335,7 @@ impl Generator {
             };
             let tc = think.control_for();
             let ctl = SampleControl {
+                presence: Some(&presence),
                 allowed: None,
                 banned,
                 bias: tc.bias,
@@ -3272,6 +3343,7 @@ impl Generator {
                 force: tc.force,
             };
             let token = sampler.sample_controlled(&logits, &ctl)?;
+            presence.push(token);
             think.on_committed(0, token);
             token
         };
@@ -3307,6 +3379,7 @@ impl Generator {
                 // drained and dropped rather than injected.
                 let spec_live =
                     drafter_span_rows(drafter.committed_len(), draft_ctx, n_past, 1) == 1;
+                note_draft_horizon(drafter_horizon_logged, spec_live, n_past, draft_ctx);
                 let round_kind = pause.next_kind();
                 // Look a full draft span ahead: a round that STARTS below the
                 // threshold can still have rows above it, and those rows would
@@ -3393,6 +3466,7 @@ impl Generator {
                     };
                     let tc = think.control_for();
                     let ctl = SampleControl {
+                        presence: Some(&presence),
                         allowed: None,
                         banned,
                         bias: tc.bias,
@@ -3400,6 +3474,7 @@ impl Generator {
                         force: tc.force,
                     };
                     let s = sampler.sample_controlled(&step_logits, &ctl)?;
+                    presence.push(s);
                     think.on_committed(decoded, s);
                     n_past += 1;
                     stats.rounds += 1;
@@ -3434,6 +3509,7 @@ impl Generator {
                         };
                         let tc = think.control_for();
                         let ctl = SampleControl {
+                            presence: Some(&presence),
                             allowed: None,
                             banned,
                             bias: tc.bias,
@@ -3441,6 +3517,7 @@ impl Generator {
                             force: tc.force,
                         };
                         let s = sampler.sample_controlled(&row, &ctl)?;
+                        presence.push(s);
                         think.on_committed(t, s);
                         Ok((s, sampler.is_eog(s)))
                     })?;
@@ -3521,6 +3598,12 @@ impl Generator {
                         break 'rounds;
                     }
                 }
+                // Roll the history back to what the round emitted: it drew
+                // every verify row it walked, and a mismatch leaves the rows
+                // past it uncommitted. The two `break 'rounds` above skip this
+                // because they end the decode outright — nothing samples after
+                // them, so there is no later draw to mis-penalize.
+                presence.truncate(decoded);
             }
         }
 
@@ -3709,6 +3792,33 @@ impl Generator {
 /// drafter right up to its capacity is what keeps the widest set of later rewind
 /// points able to re-enable speculation — a rewind can only do so if it lands
 /// exactly on the committed length.
+/// Say once, on the round where speculation goes dark, that the drafter's
+/// context is what ended it — and say which flag moves it.
+///
+/// The horizon is the one speculation stop with no other signal. An auto-pause
+/// shows up as `paused_rounds`; a low-acceptance text shows up in the ratio
+/// line; running off `draft_ctx` shows up as nothing at all, and the shipped
+/// drafted throughput figures describe conversations INSIDE the window only. On
+/// the checkpoints that ship a sidecar the window is 8192 of a 131072 ceiling,
+/// so a long conversation spends most of itself past it.
+///
+/// `live` clears the flag rather than latching it, so the line follows the
+/// crossing and not the process: a conversation rewound back under the horizon
+/// says it again when it crosses again.
+fn note_draft_horizon(logged: &mut bool, live: bool, pos: usize, draft_ctx: usize) {
+    if live {
+        *logged = false;
+        return;
+    }
+    if std::mem::replace(logged, true) {
+        return;
+    }
+    eprintln!(
+        "xwen: drafting stops past draft_ctx {draft_ctx} tokens (position {pos}); \
+         decoding plain from here — raise --draft-ctx to speculate further",
+    );
+}
+
 fn drafter_span_rows(committed: usize, draft_ctx: usize, pos: usize, len: usize) -> usize {
     if pos != committed {
         return 0;
@@ -4243,6 +4353,28 @@ mod tests {
 
     // ---- The speculative round loop's two pure decisions: which spans the
     // drafter can be fed, and how much of a verified span survives the emit.
+
+    /// The horizon line is said once per crossing, not once per round — a
+    /// 131072-token conversation runs tens of thousands of rounds past `draft_ctx`
+    /// and every one of them takes the same branch. Going live again re-arms it,
+    /// so a rewind back under the horizon that crosses again says so again.
+    #[test]
+    fn the_draft_horizon_is_announced_once_per_crossing() {
+        let mut logged = false;
+        // Below the horizon: nothing to say, and the flag stays clear.
+        note_draft_horizon(&mut logged, true, 100, 8192);
+        assert!(!logged);
+        // The crossing arms it, and every round after it is silent.
+        note_draft_horizon(&mut logged, false, 8192, 8192);
+        assert!(logged);
+        note_draft_horizon(&mut logged, false, 8193, 8192);
+        assert!(logged);
+        // A rewind back under it re-arms.
+        note_draft_horizon(&mut logged, true, 4000, 8192);
+        assert!(!logged);
+        note_draft_horizon(&mut logged, false, 8192, 8192);
+        assert!(logged);
+    }
 
     // A drafter is fed a span only when its cache ends exactly where the span
     // starts; how much of it it takes is bounded by its own context. A rewind it

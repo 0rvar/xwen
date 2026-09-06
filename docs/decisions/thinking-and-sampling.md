@@ -120,6 +120,31 @@ the prompt — see the kwargs entry under "Serving" for the line between the two
 the mode-keyed defaults ship the cards' temp/top_p/top_k, which ARE mode-pure.
 Ledgered with the values and sources (TODO.md).
 
+**The presence penalty ships, on by default, through the verify path (2026-09-06, log.md
+"2026-09-06 — Presence penalty: the cards' recipe, through the speculative verify, on by default").** The refusal above is lifted the way it said it would be: sampler,
+verify and gate as one unit. Semantics are vLLM's presence penalty: p is subtracted from
+the logit of every distinct id the current reply has emitted (prompt and earlier turns
+excluded, reasoning tokens included), before temperature and before any cut, in greedy
+mode too. Defaults are the cards': 1.5 non-thinking on all four checkpoints, 1.5 thinking
+on the 35B-A3B alone, 0 elsewhere (`Model::recommended_presence_penalty`, resolved with
+the triple by `SamplerOptions::recommended_for`); an explicit value on any surface wins.
+Two mechanics decided the shape. On the plain path the penalty is scattered into the
+logit row on the device (`Tensor::index_add`, pinned bitwise against the CPU loop) and
+the device softmax stays, so plain decode is unchanged (126.9 vs 126.5 tok/s on the 35B;
+the CPU fallback would have cost ~4%). Through speculation, row j of a verify block is
+penalized over the emitted history plus accepted drafts 0..j-1, the drafters propose
+UNPENALIZED (llama.cpp's shape), and the history is truncated to the emitted count at
+round end so rollback cannot leave phantom ids; the greedy equivalence gate passes at 1.5
+and at 0. The price is acceptance: 63.0% to 59.4% on the 35B code prompt, drafted decode
+-1.2%. Sampled-mode equivalence diverged at 1.5 where it was identical at 0; that is the
+known near-tie class (the arms softmax on different backends and a constant subtracted
+from many ids manufactures near-ties), not a history bug, and the lever (one softmax
+implementation for both arms) is recorded as not taken in the record. Batch's
+non-thinking decode changes visibly: an item naming no penalty now decodes at 1.5.
+`frequency_penalty`, `repetition_penalty` and `min_p` stay accept-and-drop. `top_k` 0
+now means no top-k cut and 1 is greedy, ending the item that said 0 was greedy here and
+"disabled" in llama.cpp.
+
 **Temperature is applied before the top-k/top-p cut, and stays that way (2026-09-06).**
 llama.cpp cuts first: its default chain is top_k → typ_p → top_p → min_p → temp → dist
 (common/sampling.cpp), so the truncation sees raw logits and temperature only reshapes
