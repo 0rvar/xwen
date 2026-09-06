@@ -50,6 +50,15 @@ pub enum Arch {
     /// Qwen3.8-Flash-Next — 512 routed experts + one shared expert on every
     /// layer, hyper-connection residuals, QSA attention, PLE.
     Qwen4Exp,
+    /// Qwen3-4B dense (`qwen3`) — the one architecture here that is NOT a
+    /// hybrid: full softmax attention on every layer, a dense SwiGLU FFN, no
+    /// DeltaNet, no experts, and full NEoX rope over the whole 128-wide head.
+    ///
+    /// Also the one architecture whose weights are not a GGUF. It is loaded
+    /// from a Hugging Face BF16 safetensors directory ([`crate::qwen3`]), so
+    /// its config arrives through [`XwenConfig::from_qwen3`] rather than
+    /// through [`XwenConfig::from_gguf`].
+    Qwen3,
 }
 
 /// What a GGUF file turned out to be, from [`XwenConfig::identify`].
@@ -104,6 +113,12 @@ impl Arch {
             Arch::Dense => "qwen35",
             Arch::Moe => "qwen35moe",
             Arch::Qwen4Exp => "qwen4exp",
+            // Qwen3-4B's own `model_type`, and the string llama.cpp's
+            // `qwen3.cpp` registers. Nothing here reads GGUF metadata under it
+            // — this build loads the arch from safetensors — but the key is
+            // what a GGUF of it would carry, and `from_gguf` names it when it
+            // refuses one.
+            Arch::Qwen3 => "qwen3",
         }
     }
 
@@ -115,9 +130,12 @@ impl Arch {
     /// Flash-Next and +8% on the 35B-A3B at 3.9k tokens, where the dense 27B
     /// has no expert batch to feed and reads 5-6% SLOWER at 2048, so it keeps
     /// 512. 4096 loses on both counts. `XWEN_PREFILL_CHUNK` overrides.
+    ///
+    /// Qwen3-4B takes the dense arm unmeasured: it has no expert batch to feed
+    /// either, which is the whole reason 2048 wins on the other two.
     pub fn prefill_chunk_default(&self) -> usize {
         match self {
-            Arch::Dense => 512,
+            Arch::Dense | Arch::Qwen3 => 512,
             Arch::Moe | Arch::Qwen4Exp => 2048,
         }
     }
@@ -140,14 +158,23 @@ impl Arch {
             Arch::Dense => Some(crate::hub::Model::Qwen27B),
             Arch::Moe => Some(crate::hub::Model::Qwen35BA3B),
             Arch::Qwen4Exp => Some(crate::hub::Model::Qwen38FlashNext),
+            // Three checkpoints share this graph, and two of them (the base
+            // model and the Z-Image text encoder) have byte-identical configs,
+            // so the architecture alone is worth even less here than it is on
+            // `qwen35`. [`XwenConfig::assumed_model`] reads `rope_theta` to at
+            // least tell the Instruct release apart before falling back here.
+            Arch::Qwen3 => Some(crate::hub::Model::Qwen34B),
         }
     }
 
     /// The DeltaNet z-gate activation: `silu(z)` on the Qwen 3.6/3.8 graphs,
     /// `sigmoid(z)` on qwen4exp (HF `output_gate_type: "sigmoid"`).
+    ///
+    /// `qwen3` answers with the dense value and never uses it: no layer of that
+    /// architecture is a DeltaNet layer, so there is no z-gate to activate.
     pub fn z_gate(&self) -> ZGate {
         match self {
-            Arch::Dense | Arch::Moe => ZGate::Silu,
+            Arch::Dense | Arch::Moe | Arch::Qwen3 => ZGate::Silu,
             Arch::Qwen4Exp => ZGate::Sigmoid,
         }
     }
@@ -156,9 +183,12 @@ impl Arch {
     /// qwen4exp HF math has no clamp (llama.cpp applies [`MOE_SUM_FLOOR`]
     /// unconditionally there too — a recorded divergence, practically a no-op
     /// since top-10 softmax sums are far larger).
+    ///
+    /// `qwen3` answers with the dense value and never uses it: that
+    /// architecture has no router and no experts to renormalize.
     pub fn moe_sum_floor(&self) -> f32 {
         match self {
-            Arch::Dense | Arch::Moe => MOE_SUM_FLOOR,
+            Arch::Dense | Arch::Moe | Arch::Qwen3 => MOE_SUM_FLOOR,
             Arch::Qwen4Exp => 0.0,
         }
     }
@@ -287,6 +317,28 @@ impl XwenConfig {
         crate::hub::Model::identify(self.arch, self.general_name.as_deref(), Some(path))
     }
 
+    /// The checkpoint to run when nothing identifies the file: the
+    /// architecture's registry entry, except on `qwen3`, where one config value
+    /// narrows it first.
+    ///
+    /// A safetensors set carries no `general.name`, so the name rule that
+    /// settles a GGUF has nothing to read. What the three `qwen3` checkpoints
+    /// do differ in is `rope_theta` — 5e6 on Qwen3-4B-Instruct-2507, 1e6 on the
+    /// base model and on the Z-Image text encoder, which are config-identical
+    /// to each other. Reading it here means an unpacked copy of the Instruct
+    /// release runs with its own chat dialect and context length rather than
+    /// the base model's, which is what falling straight to [`Arch::model`]
+    /// would have done.
+    fn assumed_model(&self) -> Option<crate::hub::Model> {
+        if self.arch == Arch::Qwen3
+            && let RopeKind::Plain { freq_base, .. } = &self.rope
+            && let Some(model) = crate::hub::Model::by_safetensors_rope_theta(*freq_base)
+        {
+            return Some(model);
+        }
+        self.arch.model()
+    }
+
     /// Which checkpoint to RUN this file as, cross-checked against an explicit
     /// selection. The whole `--model <gguf>` rule in one place, because every
     /// surface that opens a file someone named has to apply the same one: the
@@ -328,6 +380,23 @@ impl XwenConfig {
                     identified.full_name()
                 );
             }
+            // A safetensors set has no name to contradict, so the release
+            // cross-check falls to the one config value that separates the
+            // `qwen3` releases. Without this a `--model-size
+            // qwen3-4b-instruct-2507` pointed at an unpacked base model would
+            // be honored silently and run at the wrong context length under the
+            // wrong chat dialect.
+            if let Some(expected) = selected.safetensors_rope_theta()
+                && let RopeKind::Plain { freq_base, .. } = &self.rope
+            {
+                let freq_base = *freq_base;
+                ensure!(
+                    freq_base == expected,
+                    "{selected} (from {selector}) has rope_theta {expected:e}, but {} has \
+                     rope_theta {freq_base:e}; that is a different release",
+                    path.display()
+                );
+            }
             // The file said nothing, so the flag settles it: an official
             // checkpoint in a file the operator vouched for.
             return Ok(Identity::Official(selected));
@@ -335,7 +404,7 @@ impl XwenConfig {
         match identified {
             Some(model) => Ok(Identity::Official(model)),
             None => {
-                let assumed = self.arch.model().with_context(|| {
+                let assumed = self.assumed_model().with_context(|| {
                     format!(
                         "{} names no official checkpoint and its architecture has no registry \
                          checkpoint to assume; it cannot be run",
@@ -382,6 +451,16 @@ impl XwenConfig {
             "qwen35" => Arch::Dense,
             "qwen35moe" => Arch::Moe,
             "qwen4exp" => Arch::Qwen4Exp,
+            // A real architecture here, just not one this build reads from a
+            // GGUF: Qwen3-4B is loaded from its Hugging Face BF16 safetensors
+            // directory. Named explicitly rather than falling into the generic
+            // refusal below, because "expected a Qwen GGUF" is a wrong and
+            // discouraging thing to tell someone holding a Qwen3 GGUF.
+            "qwen3" => bail!(
+                "this is a qwen3 (Qwen3-4B) GGUF, which this build does not read: point \
+                 --model at the Hugging Face safetensors directory instead (or use \
+                 --model-size qwen3-4b / qwen3-4b-instruct-2507 / zimage-turbo)"
+            ),
             other => bail!(
                 "expected a Qwen GGUF (architecture \"qwen35\", \"qwen35moe\" or \"qwen4exp\"), \
                  got {other:?}"
@@ -434,7 +513,12 @@ impl XwenConfig {
         let layer_kind = layer_kinds(&md, a, n_layer)?;
 
         let (dense_ff, n_expert, n_expert_used, expert_ff, shared_expert_ff) = match arch {
-            Arch::Dense => (md.usize(&format!("{a}.feed_forward_length"))?, 0, 0, 0, 0),
+            // `Arch::Qwen3` never reaches here: `from_gguf` refuses that
+            // architecture string above, and its config is built by
+            // [`XwenConfig::from_qwen3`] from a safetensors directory.
+            Arch::Dense | Arch::Qwen3 => {
+                (md.usize(&format!("{a}.feed_forward_length"))?, 0, 0, 0, 0)
+            }
             Arch::Moe | Arch::Qwen4Exp => (
                 0,
                 md.usize(&format!("{a}.expert_count"))?,
@@ -477,7 +561,7 @@ impl XwenConfig {
 
         let qwen4exp = match arch {
             Arch::Qwen4Exp => Some(Qwen4ExpConfig::from_gguf(&md, a, &layer_kind)?),
-            Arch::Dense | Arch::Moe => None,
+            Arch::Dense | Arch::Moe | Arch::Qwen3 => None,
         };
 
         Ok(Self {
@@ -505,6 +589,63 @@ impl XwenConfig {
             eog_tokens,
             qwen4exp,
         })
+    }
+
+    /// The runtime config for a Qwen3-4B safetensors checkpoint, from the
+    /// validated [`crate::qwen3::Qwen3Config`] its `config.json` produced.
+    ///
+    /// The second constructor, and infallible: every value that could be wrong
+    /// was already refused by `Qwen3Config::from_hf`, so this is a projection of
+    /// one shape onto another rather than a second parse. What it says about
+    /// this architecture, in the fields a hybrid checkpoint uses and this one
+    /// does not:
+    ///
+    /// - every layer is [`LayerKind::Full`] — there is no DeltaNet here, so
+    ///   `linear_*` and `conv_kernel` are zero and nothing reads them.
+    /// - the FFN is dense on every layer, so `dense_ff` carries
+    ///   `intermediate_size` and every expert field is zero.
+    /// - rope is plain NEoX over the WHOLE head (`n_rot == head_dim == 128`),
+    ///   not the partial 64 of the 3.6/3.8 graphs, and its base is the file's
+    ///   own `rope_theta` — 1e6 on the base model and the Z-Image encoder, 5e6
+    ///   on Instruct-2507.
+    /// - `eog_tokens` is [`crate::qwen3::QWEN3_EOG`] verbatim. It deliberately
+    ///   does NOT go through the `LagunaTokenizer::EOG` union `from_gguf`
+    ///   applies: those are the Qwen 3.6 vocabulary's ids, and folding them in
+    ///   here would make two arbitrary Qwen3 tokens stop generation.
+    ///
+    /// `general_name` is what the caller wants this checkpoint reported as.
+    /// A safetensors directory carries no such field, so it is `None` on every
+    /// production path; it exists because [`XwenConfig`] has the field and a
+    /// caller with a better name than the directory's should be able to use it.
+    pub fn from_qwen3(cfg: &crate::qwen3::Qwen3Config, general_name: Option<String>) -> Self {
+        Self {
+            arch: Arch::Qwen3,
+            general_name,
+            n_layer: cfg.n_layer,
+            hidden: cfg.hidden_size,
+            vocab: cfg.vocab_size,
+            n_head: vec![cfg.n_head; cfg.n_layer],
+            n_kv_head: cfg.n_kv_head,
+            head_dim: cfg.head_dim(),
+            layer_kind: vec![LayerKind::Full; cfg.n_layer],
+            linear_k_heads: 0,
+            linear_v_heads: 0,
+            linear_head_dim: 0,
+            conv_kernel: 0,
+            dense_ff: cfg.intermediate_size,
+            n_expert: 0,
+            n_expert_used: 0,
+            expert_ff: 0,
+            shared_expert_ff: 0,
+            rms_eps: cfg.rms_norm_eps,
+            n_ctx_train: cfg.max_position_embeddings,
+            rope: RopeKind::Plain {
+                freq_base: cfg.rope.theta as f32,
+                n_rot: cfg.rope.rotary_dim,
+            },
+            eog_tokens: cfg.eog.to_vec(),
+            qwen4exp: None,
+        }
     }
 }
 
@@ -1506,5 +1647,118 @@ mod tests {
             Some(crate::hub::Model::Qwen38FlashNext)
         );
         assert!(Arch::Dense.model().is_some() && Arch::Moe.model().is_some());
+    }
+
+    /// The real `Qwen/Qwen3-4B` config.json, through the whole path a
+    /// safetensors checkpoint takes: `Qwen3Config::from_hf` and then
+    /// `from_qwen3`. Self-skips when the checkpoint is not in the local cache.
+    ///
+    /// Pinned as a whole config rather than field by field somewhere else,
+    /// because the fields that matter most here are the ones that are ZERO —
+    /// the DeltaNet and expert geometry a hybrid checkpoint fills in. A
+    /// nonzero `linear_v_heads` would have the stack allocate recurrent state
+    /// for an architecture that has none, and nothing else would notice.
+    #[test]
+    fn the_real_qwen3_config_round_trips_into_an_xwen_config() {
+        let Some(config) = crate::hub::cached_model(crate::hub::Model::Qwen34B) else {
+            eprintln!("skipping: Qwen/Qwen3-4B is not in the Hugging Face cache");
+            return;
+        };
+        let bytes = std::fs::read(&config).unwrap();
+        let qwen3 = crate::qwen3::Qwen3Config::from_json_bytes(&bytes).unwrap();
+        let cfg = XwenConfig::from_qwen3(&qwen3, None);
+
+        assert_eq!(cfg.arch, Arch::Qwen3);
+        assert_eq!(cfg.general_name, None);
+        assert_eq!(cfg.n_layer, 36);
+        assert_eq!(cfg.hidden, 2560);
+        assert_eq!(cfg.vocab, 151936);
+        assert_eq!(cfg.n_head, vec![32; 36]);
+        assert_eq!(cfg.n_kv_head, 8);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.dense_ff, 9728);
+        assert_eq!(cfg.rms_eps, 1e-6);
+        assert_eq!(cfg.n_ctx_train, 40960);
+
+        // Every layer is full attention: there is no hybrid cadence here, and
+        // `is_full_attn` is what the KV allocation walks.
+        assert_eq!(cfg.layer_kind, vec![LayerKind::Full; 36]);
+        assert!((0..cfg.n_layer).all(|il| cfg.is_full_attn(il)));
+
+        // Nothing recurrent and nothing routed, so both derived widths are zero
+        // and no state is sized from them.
+        assert_eq!(
+            (
+                cfg.linear_k_heads,
+                cfg.linear_v_heads,
+                cfg.linear_head_dim,
+                cfg.conv_kernel
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(cfg.conv_dim(), 0);
+        assert_eq!(cfg.linear_v_dim(), 0);
+        assert_eq!(
+            (
+                cfg.n_expert,
+                cfg.n_expert_used,
+                cfg.expert_ff,
+                cfg.shared_expert_ff
+            ),
+            (0, 0, 0, 0)
+        );
+        assert!(cfg.qwen4exp.is_none());
+
+        // Full NEoX rope over the whole 128-wide head at the file's own base —
+        // NOT the partial 64 at 1e7 the 3.6/3.8 graphs use.
+        assert!(
+            matches!(cfg.rope(), RopeKind::Plain { freq_base, n_rot } if *freq_base == 1e6 && *n_rot == 128),
+            "{:?}",
+            cfg.rope()
+        );
+
+        // The Qwen3 stops, and only those: the 3.6 ids `from_gguf` unions in
+        // are two arbitrary tokens in this vocabulary.
+        assert_eq!(cfg.eog_tokens, crate::qwen3::QWEN3_EOG.to_vec());
+        assert_eq!(cfg.eog_tokens, vec![151645, 151643]);
+        for id in LagunaTokenizer::EOG {
+            assert!(!cfg.eog_tokens.contains(&id), "{id} is a Qwen 3.6 stop");
+        }
+    }
+
+    /// Instruct-2507 differs from the base release in exactly the two values
+    /// its config.json differs in, and `from_qwen3` carries both: the rope base
+    /// the identity rule reads, and the context length everything sizes against.
+    #[test]
+    fn the_instruct_release_carries_its_own_theta_and_context() {
+        let Some(config) = crate::hub::cached_model(crate::hub::Model::Qwen34BInstruct2507) else {
+            eprintln!("skipping: Qwen3-4B-Instruct-2507 is not in the Hugging Face cache");
+            return;
+        };
+        let bytes = std::fs::read(&config).unwrap();
+        let qwen3 = crate::qwen3::Qwen3Config::from_json_bytes(&bytes).unwrap();
+        let cfg = XwenConfig::from_qwen3(&qwen3, None);
+        assert_eq!(cfg.n_ctx_train, 262144);
+        assert!(
+            matches!(cfg.rope(), RopeKind::Plain { freq_base, .. } if *freq_base == 5e6),
+            "{:?}",
+            cfg.rope()
+        );
+    }
+
+    /// A qwen3 GGUF is refused by name rather than by the generic
+    /// "expected a Qwen GGUF" message, because it IS a Qwen model this build
+    /// knows — it just does not read it from a GGUF.
+    #[test]
+    fn a_qwen3_gguf_is_refused_by_pointing_at_the_safetensors_form() {
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            "general.architecture".to_string(),
+            Value::String("qwen3".to_string()),
+        );
+        let err = XwenConfig::from_gguf(&content(md)).unwrap_err().to_string();
+        assert!(err.contains("qwen3"), "{err}");
+        assert!(err.contains("safetensors"), "{err}");
+        assert!(err.contains("qwen3-4b"), "{err}");
     }
 }

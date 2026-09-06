@@ -451,6 +451,15 @@ impl GgufFile {
     /// empty off Metal or under `XWEN_LOAD_CLASSIC`). Keep-alive and view
     /// registration must cover all of them: a tensor aliases whichever shard's
     /// mapping holds it.
+    /// The path this checkpoint was OPENED from — shard 0's for a split set.
+    ///
+    /// Unlike the [`GgufFile::path`] field this never panics on a split GGUF,
+    /// because it promises less: it is the name the checkpoint is identified
+    /// and labelled by, not a file whole-file reads would be correct against.
+    pub fn checkpoint_path(&self) -> &Path {
+        &self.path.path
+    }
+
     pub fn mmap_sources(&self) -> Vec<Arc<MmapSource>> {
         self.shards.iter().filter_map(|s| s.mmap.clone()).collect()
     }

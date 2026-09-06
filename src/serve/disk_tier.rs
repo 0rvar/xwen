@@ -38,7 +38,7 @@ use candle_core::Device;
 
 use crate::chat::TOKENIZATION_RULES_VERSION;
 use crate::dflash::DrafterImage;
-use crate::gguf::{self, CheckpointId};
+use crate::gguf::CheckpointId;
 use crate::kv_cache::{HostFullKv, HostSnapshot, MAX_STORED_SNAPSHOTS};
 
 use super::config::ServeSettings;
@@ -1215,7 +1215,7 @@ impl DiskCache {
 /// device: this runs before the model is loaded, and the hash covers the header,
 /// the metadata and the tensor index — never the tens of gigabytes behind them.
 fn checkpoint_id(model: &Path) -> anyhow::Result<CheckpointId> {
-    Ok(gguf::open(model, &Device::Cpu)?.checkpoint_id())
+    Ok(crate::checkpoint::CheckpointSource::open(model, &Device::Cpu, None)?.checkpoint_id())
 }
 
 /// One segment as a chain walk reaches it.

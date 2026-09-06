@@ -646,6 +646,7 @@ pub fn run_stack_hc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::CheckpointSource;
     use crate::gguf::metal_device;
     use crate::ops::ExpertRunner;
     use crate::qwen4exp::tiny_gguf::{TinyGeometry, write_tiny_qwen4exp};
@@ -724,7 +725,12 @@ mod tests {
             }
         }
         let gguf = crate::gguf::open(&path, device).unwrap();
-        let model = XwenModel::load(gguf, ExpertRunner::Reference, max_ctx).unwrap();
+        let model = XwenModel::load(
+            CheckpointSource::Gguf(gguf),
+            ExpertRunner::Reference,
+            max_ctx,
+        )
+        .unwrap();
         (model, dir)
     }
 
@@ -1053,7 +1059,8 @@ mod tests {
         };
 
         let gguf = crate::gguf::open(&path, &device).unwrap();
-        let mut model = XwenModel::load(gguf, ExpertRunner::Fused, 8192).unwrap();
+        let mut model =
+            XwenModel::load(CheckpointSource::Gguf(gguf), ExpertRunner::Fused, 8192).unwrap();
 
         let cfg = model.config();
         assert_eq!(cfg.n_layer, 48);
@@ -1103,7 +1110,12 @@ mod tests {
         let path = dir.join("tiny-qwen4exp.gguf");
         write_tiny_qwen4exp(&path, geo).unwrap();
         let gguf = crate::gguf::open(&path, device).unwrap();
-        let model = XwenModel::load(gguf, ExpertRunner::Reference, max_ctx).unwrap();
+        let model = XwenModel::load(
+            CheckpointSource::Gguf(gguf),
+            ExpertRunner::Reference,
+            max_ctx,
+        )
+        .unwrap();
         (model, dir)
     }
 

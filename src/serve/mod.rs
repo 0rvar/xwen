@@ -1740,7 +1740,10 @@ mod tests {
                 "Qwen3.6-35B-A3B",
                 "Qwen3.6-27B",
                 "Qwen3.8-27B",
-                "Qwen3.8-Flash-Next"
+                "Qwen3.8-Flash-Next",
+                "Qwen3-4B",
+                "Qwen3-4B-Instruct-2507",
+                "Z-Image-Turbo-text-encoder"
             ],
             "the served checkpoint leads and appears once"
         );
@@ -1803,8 +1806,20 @@ mod tests {
         let served = types::Target::official(Model::Qwen3827B);
         let served_id = "Qwen3.8-27B";
 
-        for model in crate::hub::MODELS {
+        // The engine half still refuses the qwen3 checkpoints, whose layer
+        // stack does not exist — but it refuses nothing among the GGUF ones,
+        // which is what leaves the download rule as Flash-Next's only gate.
+        for model in crate::hub::MODELS
+            .into_iter()
+            .filter(|m| !m.is_safetensors())
+        {
             assert!(model.servable(), "{model}");
+        }
+        for model in crate::hub::MODELS
+            .into_iter()
+            .filter(|m| m.is_safetensors())
+        {
+            assert!(!checkpoint_selectable(model), "{model} cannot run yet");
         }
         assert_eq!(
             checkpoint_selectable(Model::Qwen38FlashNext),

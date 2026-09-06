@@ -208,6 +208,10 @@ impl XwenModel {
     fn check_arch(cfg: &XwenConfig) -> Result<()> {
         match cfg.arch {
             Arch::Dense | Arch::Moe => Ok(()),
+            // Reached only through a `CheckpointSource::SafeTensors`, which
+            // `load` refuses before this: the qwen3 layer stack does not exist
+            // yet.
+            Arch::Qwen3 => Ok(()),
             Arch::Qwen4Exp => {
                 ensure!(
                     cfg.qwen4exp.is_some(),
@@ -221,7 +225,29 @@ impl XwenModel {
         }
     }
 
-    pub fn load(gguf: Arc<GgufFile>, runner: ExpertRunner, max_ctx: usize) -> Result<Self> {
+    /// Assemble the model from an opened checkpoint.
+    ///
+    /// The safetensors arm is where this build stops: [`crate::qwen3`] reads
+    /// that checkpoint's config, validates its shards and can load its weights,
+    /// but the layer stack that would run them is the next arc's work. The
+    /// refusal is here rather than at each surface so every one of them says
+    /// the same sentence.
+    pub fn load(
+        source: crate::checkpoint::CheckpointSource,
+        runner: ExpertRunner,
+        max_ctx: usize,
+    ) -> Result<Self> {
+        match source {
+            crate::checkpoint::CheckpointSource::Gguf(gguf) => {
+                Self::load_gguf(gguf, runner, max_ctx)
+            }
+            other @ crate::checkpoint::CheckpointSource::SafeTensors(_) => {
+                Err(other.unimplemented_stack())
+            }
+        }
+    }
+
+    fn load_gguf(gguf: Arc<GgufFile>, runner: ExpertRunner, max_ctx: usize) -> Result<Self> {
         let cfg = XwenConfig::from_gguf(&gguf.content)?;
         Self::check_arch(&cfg)?;
         let max_ctx = clamp_context_length(max_ctx, cfg.n_ctx_train)?;
@@ -297,7 +323,11 @@ impl XwenModel {
                 LayerKind::Linear => Mixer::Linear(LinearAttnBlock::new(&lw, &cfg, attn_weights)?),
             };
             let ffn = match cfg.arch {
-                Arch::Dense => Ffn::Dense(DenseMlp::new(&lw)?),
+                // `Arch::Qwen3` is unreachable here — this is the GGUF layer
+                // loader, and that architecture has no GGUF path — but its FFN
+                // is the same dense SwiGLU under different tensor names, so
+                // there is no other arm it could take.
+                Arch::Dense | Arch::Qwen3 => Ffn::Dense(DenseMlp::new(&lw)?),
                 Arch::Moe | Arch::Qwen4Exp => Ffn::Moe(MoeBlock::new(&lw, &cfg, runner)?),
             };
             layers.push(Layer {

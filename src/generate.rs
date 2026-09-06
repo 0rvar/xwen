@@ -10,7 +10,6 @@ use crate::config::XwenConfig;
 use crate::constrain::GrammarState;
 use crate::dflash::DrafterImage;
 use crate::drafter::{AttachedDrafter, DrafterOps};
-use crate::gguf;
 use crate::kv_cache::{CacheSnapshot, HostFullKv, HostSnapshot, KvCheckpoint};
 use crate::model::XwenModel;
 use crate::mtp::MtpDrafter;
@@ -1411,29 +1410,36 @@ impl Generator {
     }
 
     /// Open a checkpoint on `device` and assemble a generator around it: the
-    /// GGUF, its config, the tokenizer and the sampler's EOG set all come
+    /// weights, their config, the tokenizer and the sampler's EOG set all come
     /// from one place so the CLI and the server load a model identically.
     /// `tokenizer` is override-only — `None` uses the vocabulary embedded in
     /// the binary (`LagunaTokenizer::embedded`), which is what every default
     /// path wants. Attaching a drafter stays the caller's business —
     /// it needs the same `device`, which is why the device is passed in
     /// rather than made here.
+    ///
+    /// `model` is whatever `--model` or the registry resolved: a GGUF, or a
+    /// safetensors directory. `entry` is the registry checkpoint the caller
+    /// believes it is, which is what tells a safetensors set where its
+    /// tokenizer lives and which of its planes are allowed to be zero-filled
+    /// ([`CheckpointSource::open`]). `None` means the caller has no opinion.
     pub fn load(
         device: &Device,
         model: &Path,
+        entry: Option<crate::hub::Model>,
         tokenizer: Option<&Path>,
         runner: ExpertRunner,
         max_ctx: usize,
         sampling: SamplerOptions,
     ) -> Result<Self> {
-        let gguf = gguf::open(model, device)?;
-        let cfg = XwenConfig::from_gguf(&gguf.content)?;
+        let source = crate::checkpoint::CheckpointSource::open(model, device, entry)?;
+        let cfg = source.config()?;
         let tok = match tokenizer {
             Some(path) => LagunaTokenizer::from_file(path)?,
             None => LagunaTokenizer::embedded()?,
         };
         let sampler = Sampler::new(sampling, cfg.eog_tokens.clone(), tok.vocab_size());
-        let model = XwenModel::load(gguf, runner, max_ctx)?;
+        let model = XwenModel::load(source, runner, max_ctx)?;
         Ok(Self::new(model, tok, sampler))
     }
 

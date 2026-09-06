@@ -526,7 +526,7 @@ fn main() -> Result<()> {
         vocab >= 2,
         "vocab {vocab} < 2: cannot form a top-2 for the parity dumps"
     );
-    let model = XwenModel::load(gguf, runner, cli.max_ctx)?;
+    let model = XwenModel::load(xwen::CheckpointSource::Gguf(gguf), runner, cli.max_ctx)?;
 
     if let Some(corpus) = cli.ppl.clone() {
         anyhow::ensure!(

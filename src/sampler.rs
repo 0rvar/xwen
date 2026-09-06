@@ -74,9 +74,14 @@ impl SamplerOptions {
     /// The model card's recommended sampling for each chat mode, minus the one
     /// value that is not shared across the checkpoints: thinking is temp 1.0 /
     /// top_p 0.95, instruct (non-thinking) is temp 0.7 / top_p 0.80, top_k 20
-    /// either way. The cards key those three to thinking on/off alone — all
-    /// four checkpoints share both sets. The seed is this runtime's own fixed
-    /// default; the cards name none.
+    /// either way. The cards key those three to thinking on/off alone, and all
+    /// four Qwen 3.6/3.8 checkpoints share both sets. The seed is this
+    /// runtime's own fixed default; the cards name none.
+    ///
+    /// The Qwen3-4B cards do NOT share these values, which is why this is no
+    /// longer the whole answer for a caller holding a checkpoint. It stays the
+    /// 3.6/3.8 set, and [`SamplerOptions::recommended_for`] is where each
+    /// checkpoint's own card is read.
     ///
     /// The presence penalty is left at zero here because the cards do NOT
     /// share it (Qwen3.6-35B-A3B is the only one asking for one while
@@ -106,9 +111,33 @@ impl SamplerOptions {
     /// payload — resolves against this one function, so a checkpoint's defaults
     /// cannot drift between them.
     pub fn recommended_for(model: Model, thinking: bool) -> Self {
+        // The Qwen3-4B cards ask for a different set than the 3.6/3.8 one, so
+        // the shared triple above is no longer shared by everything: the base
+        // card is 0.6 / 0.95 thinking and 0.7 / 0.80 not, and Instruct-2507 has
+        // no thinking mode at all and asks for 0.7 / 0.80 whatever the caller
+        // passes. Both read off each release's own `generation_config.json`.
+        // `top_k` is 20 on every card here.
+        //
+        // Exhaustive so a new checkpoint has to state its card rather than
+        // inherit the 3.6 one.
+        let card = match model {
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => {
+                Self::recommended(thinking)
+            }
+            Model::Qwen34B | Model::ZImageTurboEncoder => Self {
+                temperature: if thinking { 0.6 } else { 0.7 },
+                top_p: if thinking { 0.95 } else { 0.80 },
+                ..Self::recommended(thinking)
+            },
+            Model::Qwen34BInstruct2507 => Self {
+                temperature: 0.7,
+                top_p: 0.80,
+                ..Self::recommended(thinking)
+            },
+        };
         Self {
             presence_penalty: model.recommended_presence_penalty(thinking),
-            ..Self::recommended(thinking)
+            ..card
         }
     }
 }
@@ -2510,5 +2539,45 @@ mod tests {
             }
         }
         assert_eq!(SamplerOptions::recommended(true).presence_penalty, 0.0);
+    }
+
+    /// The Qwen3-4B cards, which are where `recommended` stopped being the
+    /// whole answer: the base release runs cooler than the 3.6 family when
+    /// thinking, and Instruct-2507 has no thinking mode to key on at all.
+    ///
+    /// Values read off each release's own `generation_config.json` in the
+    /// Hugging Face cache: base and Z-Image `temperature` 0.6 / `top_p` 0.95,
+    /// Instruct-2507 0.7 / 0.8, `top_k` 20 on all three.
+    #[test]
+    fn the_qwen3_cards_are_their_own_and_instruct_has_one_mode() {
+        for model in [Model::Qwen34B, Model::ZImageTurboEncoder] {
+            let thinking = SamplerOptions::recommended_for(model, true);
+            assert_eq!(thinking.temperature, 0.6, "{model:?}");
+            assert_eq!(thinking.top_p, 0.95, "{model:?}");
+            assert_eq!(thinking.top_k, 20, "{model:?}");
+
+            let instruct = SamplerOptions::recommended_for(model, false);
+            assert_eq!(instruct.temperature, 0.7, "{model:?}");
+            assert_eq!(instruct.top_p, 0.80, "{model:?}");
+
+            // Not the 3.6 thinking set, which is what this used to hand back.
+            assert_ne!(
+                thinking.temperature,
+                SamplerOptions::recommended(true).temperature
+            );
+            // And no presence penalty in either mode: the card recommends none.
+            assert_eq!(thinking.presence_penalty, 0.0, "{model:?}");
+            assert_eq!(instruct.presence_penalty, 0.0, "{model:?}");
+        }
+
+        // Instruct-2507 answers the same whatever the caller passes, because
+        // its template has no thinking mode for the flag to select.
+        let on = SamplerOptions::recommended_for(Model::Qwen34BInstruct2507, true);
+        let off = SamplerOptions::recommended_for(Model::Qwen34BInstruct2507, false);
+        assert_eq!(on.temperature, 0.7);
+        assert_eq!(on.top_p, 0.80);
+        assert_eq!(on.temperature, off.temperature);
+        assert_eq!(on.top_p, off.top_p);
+        assert_eq!(on.top_k, off.top_k);
     }
 }

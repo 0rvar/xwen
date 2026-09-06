@@ -310,8 +310,11 @@ fn main() -> Result<()> {
     // ---- (c) one target decode forward -------------------------------------
     let mut target_ms = None;
     if args.target_forward {
-        let mut model =
-            xwen::XwenModel::load(target.clone(), xwen::ops::ExpertRunner::Fused, 2048)?;
+        let mut model = xwen::XwenModel::load(
+            xwen::CheckpointSource::Gguf(target.clone()),
+            xwen::ops::ExpertRunner::Fused,
+            2048,
+        )?;
         let token = Tensor::new(&[1u32], &device)?;
         // Not amortized the same way: a forward mutates the KV cache, so each
         // call must advance a position rather than repeat one. Timed as a run of

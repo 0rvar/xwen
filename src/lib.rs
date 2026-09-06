@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod batch;
 pub mod chat;
+pub mod checkpoint;
 pub mod config;
 pub mod constrain;
 pub mod dflash;
@@ -26,6 +27,7 @@ pub mod serve;
 pub mod stack_profile;
 pub mod tokenizer;
 
+pub use checkpoint::CheckpointSource;
 pub use config::XwenConfig;
 pub use generate::Generator;
 pub use model::XwenModel;

@@ -312,8 +312,11 @@ pub(super) const ENGINE_THREAD: &str = "engine";
 /// Metadata-only read of the checkpoint. The CPU device skips the mmap aliasing the
 /// Metal load path sets up, so this touches the header and tensor index alone.
 fn read_config(path: &Path) -> Result<XwenConfig> {
-    let gguf = gguf::open(path, &Device::Cpu)?;
-    XwenConfig::from_gguf(&gguf.content)
+    // No registry entry: this is a metadata read of a file the server was
+    // pointed at, and the identity it feeds is what decides which entry it is.
+    // The only thing the entry would buy here is a safetensors set's zero-run
+    // allowlist, and a set that fails that check is one no request could run.
+    crate::checkpoint::CheckpointSource::open(path, &Device::Cpu, None)?.config()
 }
 
 /// Metadata-only read of a drafter sidecar, on the CPU device for the same
@@ -517,6 +520,7 @@ impl EngineState {
         let mut generator = Generator::load(
             &device,
             &model_path,
+            Some(size.model),
             None,
             ExpertRunner::Fused,
             max_ctx,

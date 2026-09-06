@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand};
 
 use xwen::batch::{BatchRequest, BatchResponse};
 use xwen::chat::{ChatOptions, Message, ReasoningEffort, build_prompt_with_spans};
-use xwen::config::{Identity, XwenConfig};
+use xwen::checkpoint::CheckpointSource;
+use xwen::config::Identity;
 use xwen::dflash::DflashDrafter;
 use xwen::generate::{Generator, SpecParams};
 use xwen::gguf;
@@ -56,11 +57,18 @@ struct ModelArgs {
     /// Which official checkpoint to run: Qwen3.8-Flash-Next (`flash-next`,
     /// the default on every surface, still EXPERIMENTAL and without a
     /// drafter), the dense Qwen3.6-27B, the Qwen3.6-35B-A3B MoE, or the dense
-    /// Qwen3.8-27B. Each checkpoint's full name works here too. A `--model <gguf>` path overrides the target file
-    /// outright, and then the FILE says which checkpoint it is: this flag is the
-    /// cross-check (it must agree, or startup fails) and the tie-break for a
-    /// custom GGUF that names no release — on every surface alike.
-    #[arg(long, value_name = "27b|35b|3.8-27b|flash-next")]
+    /// Qwen3.8-27B. The dense Qwen3-4B checkpoints — `qwen3-4b`,
+    /// `qwen3-4b-instruct-2507` and the encode-only `zimage-turbo` — are
+    /// registered but not runnable yet: their layer stack is not implemented.
+    /// Each checkpoint's full name works here too. A `--model` path (a GGUF, or
+    /// a safetensors directory) overrides the target outright, and then the
+    /// CHECKPOINT says which one it is: this flag is the cross-check (it must
+    /// agree, or startup fails) and the tie-break for a custom file that names
+    /// no release — on every surface alike.
+    #[arg(
+        long,
+        value_name = "27b|35b|3.8-27b|flash-next|qwen3-4b|qwen3-4b-instruct-2507|zimage-turbo"
+    )]
     model_size: Option<Model>,
 }
 
@@ -356,9 +364,10 @@ enum Cmd {
     },
     /// Dump GGUF metadata and tensor listing.
     Inspect {
-        /// Model GGUF (default: the checkpoint --model-size names, ensured in
-        /// the Hugging Face cache — downloaded on first use, cached forever
-        /// after).
+        /// Model GGUF, or the Hugging Face safetensors directory of a
+        /// checkpoint stored that way (default: the checkpoint --model-size
+        /// names, ensured in the Hugging Face cache — downloaded on first use,
+        /// cached forever after).
         #[arg(short, long)]
         model: Option<PathBuf>,
         #[command(flatten)]
@@ -366,9 +375,10 @@ enum Cmd {
     },
     /// One-shot generation from a prompt.
     Generate {
-        /// Model GGUF (default: the checkpoint --model-size names, ensured in
-        /// the Hugging Face cache — downloaded on first use, cached forever
-        /// after).
+        /// Model GGUF, or the Hugging Face safetensors directory of a
+        /// checkpoint stored that way (default: the checkpoint --model-size
+        /// names, ensured in the Hugging Face cache — downloaded on first use,
+        /// cached forever after).
         #[arg(short, long)]
         model: Option<PathBuf>,
         #[command(flatten)]
@@ -423,9 +433,10 @@ enum Cmd {
     },
     /// Interactive chat REPL.
     Chat {
-        /// Model GGUF (default: the checkpoint --model-size names, ensured in
-        /// the Hugging Face cache — downloaded on first use, cached forever
-        /// after).
+        /// Model GGUF, or the Hugging Face safetensors directory of a
+        /// checkpoint stored that way (default: the checkpoint --model-size
+        /// names, ensured in the Hugging Face cache — downloaded on first use,
+        /// cached forever after).
         #[arg(short, long)]
         model: Option<PathBuf>,
         #[command(flatten)]
@@ -493,10 +504,11 @@ enum Cmd {
     /// prefill takes a different MoE matmul kernel than one long prefill does,
     /// which flips the occasional near-tie (see the batch module's docs).
     Batch {
-        /// Model GGUF (default: the checkpoint the payload names, ensured in
-        /// the Hugging Face cache — downloaded on first use, cached forever
-        /// after). Given one, the file decides which checkpoint it is and the
-        /// payload's `model` becomes the cross-check.
+        /// Model GGUF, or the Hugging Face safetensors directory of a
+        /// checkpoint stored that way (default: the checkpoint the payload
+        /// names, ensured in the Hugging Face cache — downloaded on first use,
+        /// cached forever after). Given one, the checkpoint decides what it is
+        /// and the payload's `model` becomes the cross-check.
         #[arg(short, long)]
         model: Option<PathBuf>,
         /// Custom tokenizer.json (default: the checkpoint tokenizer embedded
@@ -530,8 +542,9 @@ struct ServeArgs {
     /// to overwrite an existing file.
     #[arg(long)]
     init: bool,
-    /// Model GGUF to serve (default: the config file's `model`, else the
-    /// server's default checkpoint from the Hugging Face cache).
+    /// Model GGUF, or safetensors directory, to serve (default: the config
+    /// file's `model`, else the server's default checkpoint from the Hugging
+    /// Face cache).
     #[arg(short, long)]
     model: Option<PathBuf>,
     #[command(flatten)]
@@ -802,16 +815,18 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     for warning in &warnings {
         eprintln!("{warning}");
     }
-    if !settings.model.is_file() {
+    // `exists`, not `is_file`: a checkpoint is a GGUF file or a safetensors
+    // directory, and `CheckpointSource::open` is what decides which.
+    if !settings.model.exists() {
         bail!("model {} does not exist", settings.model.display());
     }
 
-    // The served FILE decides which checkpoint this is, not the name: it settles
+    // The served CHECKPOINT decides which one this is, not the name: it settles
     // the chat dialect, the drafter and the label. Read once here and reused by
     // the drafter prefetch below.
-    let served_cfg =
-        XwenConfig::from_gguf(&gguf::open(&settings.model, &candle_core::Device::Cpu)?.content)
-            .with_context(|| format!("reading {}", settings.model.display()))?;
+    let served_cfg = CheckpointSource::open(&settings.model, &candle_core::Device::Cpu, selected)?
+        .config()
+        .with_context(|| format!("reading {}", settings.model.display()))?;
     let (served_target, _) =
         xwen::serve::engine::identify_checkpoint(&settings, &served_cfg, selected)?;
 
@@ -889,11 +904,12 @@ fn one_shot_checkpoint(
         let model = selected.unwrap_or(default);
         return Ok(Checkpoint::official(model));
     };
-    let gguf = gguf::open(path, &candle_core::Device::Cpu)
+    let source = CheckpointSource::open(path, &candle_core::Device::Cpu, selected)
         .with_context(|| format!("reading {}", path.display()))?;
-    let cfg = XwenConfig::from_gguf(&gguf.content)
+    let cfg = source
+        .config()
         .with_context(|| format!("reading {}", path.display()))?;
-    Ok(match cfg.identify(path, selected, selector)? {
+    Ok(match source.identify(&cfg, selected, selector)? {
         Identity::Official(model) => Checkpoint::official(model),
         Identity::Assumed(assumed) => {
             // Said out loud because it decides the chat template dialect and the
@@ -905,7 +921,7 @@ fn one_shot_checkpoint(
                 path.display(),
                 assumed.full_name()
             );
-            Checkpoint::assumed(assumed, path)
+            Checkpoint::assumed(assumed, &source.label())
         }
     })
 }
@@ -932,15 +948,15 @@ impl Checkpoint {
         }
     }
 
-    /// A file that named no checkpoint answers under its own file name, as it
+    /// A checkpoint that named none of the official ones answers under its own
+    /// name — a GGUF's file stem, a safetensors set's directory name — as it
     /// does on the wire when a server is started with it.
-    fn assumed(model: Model, path: &Path) -> Self {
+    /// `CheckpointSource::label` is where that name comes from, so the two
+    /// surfaces cannot spell the same checkpoint differently.
+    fn assumed(model: Model, label: &str) -> Self {
         Self {
             model,
-            label: path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "xwen".to_string()),
+            label: label.to_string(),
         }
     }
 }
@@ -1345,7 +1361,15 @@ fn build_generator(
     let device = gguf::metal_device()?;
 
     let load_start = std::time::Instant::now();
-    let mut generator = Generator::load(&device, model, tokenizer, runner, max_ctx, sampling)?;
+    let mut generator = Generator::load(
+        &device,
+        model,
+        Some(size),
+        tokenizer,
+        runner,
+        max_ctx,
+        sampling,
+    )?;
     eprintln!(
         "xwen: model loaded in {:.1}s",
         load_start.elapsed().as_secs_f64()
@@ -1493,10 +1517,14 @@ fn main() -> Result<()> {
         Some(Cmd::Inspect { model, select }) => {
             let model = resolve_model(model, select.size())?;
             let device = candle_core::Device::Cpu;
-            let gguf = gguf::open(&model, &device)?;
-            print!("{}", gguf::describe_file(&gguf));
-            let cfg = XwenConfig::from_gguf(&gguf.content)?;
-            println!("\nparsed config: {cfg:#?}");
+            let source = CheckpointSource::open(&model, &device, Some(select.size()))?;
+            // The tensor listing is a GGUF rendering of a GGUF file table; a
+            // safetensors set has its own and no describer yet, so it prints
+            // the config alone rather than nothing.
+            if let Some(gguf) = source.gguf() {
+                print!("{}", gguf::describe_file(gguf));
+            }
+            println!("\nparsed config: {:#?}", source.config()?);
             Ok(())
         }
         Some(Cmd::Generate {
@@ -1991,10 +2019,7 @@ mod tests {
     /// lives; this covers only the naming.
     #[test]
     fn a_file_that_names_no_checkpoint_is_recorded_under_its_own_name() {
-        let assumed = Checkpoint::assumed(
-            Model::Qwen27B,
-            Path::new("/models/laguna-s-2.1-Q4_K_M.gguf"),
-        );
+        let assumed = Checkpoint::assumed(Model::Qwen27B, "laguna-s-2.1-Q4_K_M");
         assert_eq!(assumed.model, Model::Qwen27B);
         assert_eq!(assumed.label, "laguna-s-2.1-Q4_K_M");
         assert_eq!(
