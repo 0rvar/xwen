@@ -208,11 +208,21 @@ impl ResidentModel {
 /// doubled, plus the served-file bit, plus one to keep 0 free. A checkpoint
 /// somehow absent from that table encodes as nothing rather than as the wrong
 /// model.
+/// Every code the registry can produce has to fit the word that carries it. A
+/// registry that outgrew a `u8` would otherwise wrap silently at `index 127` and
+/// report some other checkpoint as resident — so it is a build error instead,
+/// and the conversion below cannot fail.
+const _: () = assert!(
+    2 * crate::hub::MODELS.len() < u8::MAX as usize,
+    "the resident-model word is a u8 and the checkpoint registry has outgrown it"
+);
+
 fn encode(target: Target) -> u8 {
-    match crate::hub::MODELS.iter().position(|m| *m == target.model) {
-        Some(index) => 1 + (index as u8) * 2 + u8::from(target.served_file),
-        None => 0,
-    }
+    let Some(index) = crate::hub::MODELS.iter().position(|m| *m == target.model) else {
+        return 0;
+    };
+    let code = 1 + index * 2 + usize::from(target.served_file);
+    u8::try_from(code).expect("the registry fits a u8: see the assertion above")
 }
 
 fn decode(value: u8) -> Option<Target> {
@@ -604,6 +614,22 @@ mod tests {
         cell.clear();
         assert_eq!(cell.get(), None, "an unload leaves no name behind");
         assert!(!cell.is_loaded());
+
+        // The codes themselves: every target takes a distinct nonzero byte, and
+        // the widest one is inside the word rather than wrapped into another
+        // checkpoint's. The registry is small enough today that this cannot
+        // fail; it is the property the const assertion beside `encode` keeps
+        // true as the registry grows, checked here on the values it produces.
+        let mut codes: Vec<u8> = Vec::new();
+        for model in crate::hub::MODELS {
+            for target in [Target::official(model), Target::served(model)] {
+                let code = encode(target);
+                assert!(code > 0, "{target} encodes as nothing resident");
+                assert!(!codes.contains(&code), "{target} collides on code {code}");
+                codes.push(code);
+            }
+        }
+        assert_eq!(codes.len(), crate::hub::MODELS.len() * 2);
     }
 
     /// A response body dropped after the job was already cancelled for another

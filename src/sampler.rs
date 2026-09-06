@@ -492,6 +492,13 @@ impl Sampler {
 
     /// Draw from the candidate set, consuming exactly one RNG step.
     fn draw(&mut self, probs: &[f32], k: usize, top_p: f32) -> Result<u32> {
+        // Neither cut bites: every id keeps the probability the softmax gave it,
+        // so there is no candidate set to build and no order to find. Sorting
+        // ~248k entries to hand a weighted draw a permutation of the row it
+        // already has is the whole cost of this branch, and it is skipped.
+        if no_top_k_cut(k, probs.len()) && top_p >= 1.0 {
+            return draw_row(&mut self.rng, probs);
+        }
         let candidates = candidate_set(probs, k, top_p)?;
         let weights: Vec<f32> = candidates.iter().map(|c| c.0).collect();
         let distr = WeightedIndex::new(&weights).map_err(|e| {
@@ -568,13 +575,59 @@ fn softmax_in_place(values: &mut [f32], temperature: f64) {
     }
 }
 
+/// A weighted draw over the row as it lies, in one pass and one allocation
+/// less than none.
+///
+/// Same draw as [`WeightedIndex`] performs over a candidate vector: one
+/// uniform in `[0, total)`, then the first id whose cumulative weight passes
+/// it. It consumes the same single RNG step, which is what the speculative
+/// loop depends on. The id it lands on is NOT the one the sorted path would
+/// have drawn from the same seed — the uniform is mapped through the
+/// cumulative weights, and the two paths accumulate the same weights in a
+/// different order — but the distribution is the same one, exactly.
+fn draw_row(rng: &mut StdRng, probs: &[f32]) -> Result<u32> {
+    // NaN propagates through the sum, so this pass is the corrupt-row check
+    // as well as the normalizer.
+    let total: f32 = probs.iter().sum();
+    ensure!(
+        !total.is_nan(),
+        "the probability row holds a NaN: the forward pass produced a corrupt row"
+    );
+    ensure!(
+        total > 0.0,
+        "no candidate carries any probability mass after top-k/top-p filtering"
+    );
+    let point = rand::distr::Uniform::new(0.0f32, total)
+        .map_err(|e| anyhow!("the probability row spans no drawable range: {e}"))?
+        .sample(rng);
+    let mut cumsum = 0f32;
+    for (id, &p) in probs.iter().enumerate() {
+        cumsum += p;
+        if cumsum > point {
+            return Ok(id as u32);
+        }
+    }
+    // Only reachable when rounding leaves the running sum a hair under the
+    // point the uniform was drawn against. The last id carrying mass is the
+    // one the walk was about to reach, and looking for it here keeps the
+    // loop above to one add and one compare per id.
+    probs
+        .iter()
+        .rposition(|&p| p > 0.0)
+        .map(|id| id as u32)
+        .ok_or_else(|| anyhow!("no candidate carries any probability mass after filtering"))
+}
+
 /// The tokens a draw may return, as `(weight, id)` sorted by descending
-/// weight. `probs` is the softmax over the whole encodable vocabulary; a zeroed
-/// weight is a candidate the top-p cut removed.
+/// weight. `probs` is the softmax over the whole encodable vocabulary. A
+/// candidate the top-p cut removed is either zeroed or absent, depending on
+/// which side of the branch below built the list; both are the same thing to a
+/// weighted draw, and every caller that inspects the support filters the zeros.
 ///
 /// `k == 0` is "no top-k cut" and takes the same branch a `k` wider than the
-/// vocabulary does. (`k == 1` never arrives: it is greedy, and `Sampler::new`
-/// resolved it to `ArgMax`.)
+/// vocabulary does — [`nucleus`], which finds the same prefix without paying
+/// for a ~248k-entry sort. (`k == 1` never arrives: it is greedy, and
+/// `Sampler::new` resolved it to `ArgMax`.)
 ///
 /// Order of operations: vocabulary-wide softmax, then top-k, then top-p over
 /// the survivors renormalized to sum to one — `top_p` is a threshold on mass
@@ -583,21 +636,111 @@ fn softmax_in_place(values: &mut [f32], temperature: f64) {
 /// `cur_p->p` is: they are what the cut was measured against. The draw
 /// normalizes anyway, so the scale reaches nothing but the threshold.
 fn candidate_set(probs: &[f32], k: usize, top_p: f32) -> Result<Vec<(f32, u32)>> {
-    let mut candidates = if k == 0 || k >= probs.len() {
-        // Nothing for top-k to remove: the whole vocabulary is the candidate
-        // set the top-p cut then applies to.
-        ensure!(
-            !probs.iter().any(|p| p.is_nan()),
-            "the probability row holds a NaN: the forward pass produced a corrupt row"
-        );
-        let mut all: Vec<(f32, u32)> = probs.iter().copied().zip(0u32..).collect();
-        all.sort_by(|a, b| b.0.total_cmp(&a.0));
-        all
-    } else {
-        top_k_desc(probs, k)?
-    };
+    if no_top_k_cut(k, probs.len()) {
+        // Nothing for top-k to remove, so the top-p cut is applied to the whole
+        // vocabulary — but the nucleus is a PREFIX of the sorted order, and
+        // finding a prefix does not need the row sorted past its end.
+        return nucleus(probs, top_p);
+    }
+    let mut candidates = top_k_desc(probs, k)?;
     truncate_top_p(&mut candidates, top_p);
     Ok(candidates)
+}
+
+/// True when top-k removes nothing: `k == 0` is llama.cpp's and vLLM's spelling
+/// of "no cut", and a `k` at or past the vocabulary asks for every id anyway.
+fn no_top_k_cut(k: usize, vocab: usize) -> bool {
+    k == 0 || k >= vocab
+}
+
+/// How many candidates the uncut nucleus asks for first, and the factor it grows
+/// by when they were not enough.
+///
+/// The first try covers the rows this actually decodes: a Qwen logit row at
+/// temperature 1 puts `top_p` 0.95 inside a few dozen ids, and 256 is that with
+/// room. The growth is coarse on purpose — a row flat enough to need a second
+/// pass is nowhere near needing a third, and each pass is one streaming scan.
+const NUCLEUS_FIRST_TRY: usize = 256;
+const NUCLEUS_GROWTH: usize = 16;
+
+/// The top-p cut over a row no top-k narrowed, without sorting the row.
+///
+/// Sorting ~248k entries per token to keep the first handful is most of a decode
+/// budget spent to be thrown away. Two shapes avoid it:
+///
+/// * `top_p >= 1.0` keeps everything, so there is no cut and no ORDER to find:
+///   the draw is a weighted pick over the row as it lies ([`Sampler::draw`]
+///   short-circuits before this is ever called, and this branch covers the
+///   direct callers).
+/// * Below 1.0 the survivors are the shortest prefix of the descending order
+///   whose renormalized mass reaches `top_p`. A prefix of length `m` can be
+///   found by a streaming top-`m` selection, and whether `m` was enough is
+///   exactly whether the walk crossed the threshold inside it — so the set grows
+///   until it does, and the answer is the one a full sort would have given.
+///
+/// The renormalizer is the sum over the WHOLE row, which is what the sorted path
+/// divided by when the whole row was the candidate set. It is summed in id order
+/// here and was summed in descending order there; the two differ by rounding,
+/// which can move the kept prefix only for a threshold sitting within an ulp of
+/// a candidate boundary.
+fn nucleus(probs: &[f32], top_p: f32) -> Result<Vec<(f32, u32)>> {
+    // A NaN anywhere makes the total NaN — addition propagates it — so the one
+    // pass that has to happen anyway is also the corrupt-row check.
+    let total: f32 = probs.iter().sum();
+    ensure!(
+        !total.is_nan(),
+        "the probability row holds a NaN: the forward pass produced a corrupt row"
+    );
+    if top_p >= 1.0 || total <= 0.0 {
+        // No cut, or a degenerate row the draw will reject on its own terms.
+        // Either way every id stays a candidate, and the sorted order is what
+        // the weighted draw walks.
+        let mut all: Vec<(f32, u32)> = probs.iter().copied().zip(0u32..).collect();
+        all.sort_by(|a, b| b.0.total_cmp(&a.0));
+        return Ok(all);
+    }
+    let mut m = NUCLEUS_FIRST_TRY;
+    loop {
+        if m >= probs.len() {
+            let mut all: Vec<(f32, u32)> = probs.iter().copied().zip(0u32..).collect();
+            all.sort_by(|a, b| b.0.total_cmp(&a.0));
+            return Ok(cut_nucleus(all, total, top_p));
+        }
+        let candidates = top_k_desc(probs, m)?;
+        if nucleus_len(&candidates, total, top_p).is_some() {
+            return Ok(cut_nucleus(candidates, total, top_p));
+        }
+        m = m.saturating_mul(NUCLEUS_GROWTH);
+    }
+}
+
+/// How many of `candidates` the top-p walk keeps, or `None` when their mass
+/// never reaches the threshold — which for a partial selection means it was too
+/// small, not that nothing is kept.
+///
+/// Divide-then-accumulate, in that order, because that is what `truncate_top_p`
+/// does and the two must cut in the same place.
+fn nucleus_len(candidates: &[(f32, u32)], total: f32, top_p: f32) -> Option<usize> {
+    let mut cumsum = 0f32;
+    for (i, c) in candidates.iter().enumerate() {
+        cumsum += c.0 / total;
+        if cumsum >= top_p {
+            return Some(i + 1);
+        }
+    }
+    None
+}
+
+/// Keep the nucleus and renormalize it, dropping the tail outright rather than
+/// zeroing it. Zero weight and absence are the same thing to a weighted draw,
+/// and to every caller that filters the zeros back out.
+fn cut_nucleus(mut candidates: Vec<(f32, u32)>, total: f32, top_p: f32) -> Vec<(f32, u32)> {
+    let keep = nucleus_len(&candidates, total, top_p).unwrap_or(candidates.len());
+    candidates.truncate(keep);
+    for c in candidates.iter_mut() {
+        c.0 /= total;
+    }
+    candidates
 }
 
 /// The `k` largest entries of `probs` as `(probability, id)`, sorted
@@ -834,7 +977,9 @@ mod tests {
         }
     }
 
-    // top_k of 0 or 1 also collapses to greedy.
+    // top_k of 1 collapses to greedy. Zero is the OPPOSITE — llama.cpp's and
+    // vLLM's spelling of "no top-k cut", pinned in
+    // `top_k_zero_keeps_the_whole_vocabulary_and_one_is_greedy`.
     #[test]
     fn top_k_one_is_argmax() {
         let l = logits(&[0.1, 4.0, 0.2, 0.3]);
@@ -2102,6 +2247,129 @@ mod tests {
                 "top_k 1 is greedy at every seed"
             );
         }
+    }
+
+    /// The reference the two uncut paths replaced: sort the whole row, then cut
+    /// and renormalize. What `candidate_set` did for `k == 0` before the nucleus
+    /// selection, kept here as the oracle it has to agree with.
+    fn sorted_uncut(probs: &[f32], top_p: f32) -> Vec<(f32, u32)> {
+        let mut all: Vec<(f32, u32)> = probs.iter().copied().zip(0u32..).collect();
+        all.sort_by(|a, b| b.0.total_cmp(&a.0));
+        truncate_top_p(&mut all, top_p);
+        all.retain(|c| c.0 > 0.0);
+        all
+    }
+
+    /// Rows the nucleus has to handle: peaked enough that the first try covers
+    /// it, and flat enough that it has to grow past 256 candidates.
+    fn nucleus_rows() -> Vec<(&'static str, Vec<f32>)> {
+        let mut flat = vec![1.0f32; 4096];
+        flat[7] = 1.4;
+        let peaked: Vec<f32> = det_logits(4096, 31337, 9.0);
+        let mut narrow = vec![-20.0f32; 4096];
+        for (i, v) in narrow.iter_mut().enumerate().take(3) {
+            *v = 3.0 - i as f32;
+        }
+        vec![
+            ("flat, wider than the first try", flat),
+            ("peaked", peaked),
+            ("three ids carry everything", narrow),
+            ("small row", det_logits(64, 4242, 2.0)),
+        ]
+    }
+
+    // The nucleus found by growing a partial selection is the one a full sort
+    // finds: same ids in the same order, same renormalized weights. It is the
+    // same prefix by construction — the survivors are a prefix of the descending
+    // order, and the walk crossing the threshold inside a partial selection
+    // proves the selection was wide enough — so this pins the construction, over
+    // rows that need one try and rows that need several.
+    #[test]
+    fn the_uncut_nucleus_matches_a_full_sort() {
+        for (case, logits) in nucleus_rows() {
+            for top_p in [0.0f32, 0.2, 0.8, 0.95, 0.999] {
+                let mut probs = logits.clone();
+                softmax_in_place(&mut probs, 1.0);
+                let want = sorted_uncut(&probs, top_p);
+                let got: Vec<(f32, u32)> = candidate_set(&probs, 0, top_p)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|c| c.0 > 0.0)
+                    .collect();
+                let ids = |v: &[(f32, u32)]| v.iter().map(|c| c.1).collect::<Vec<_>>();
+                assert_eq!(ids(&want), ids(&got), "{case} at top_p {top_p}");
+                for (&(a, id), &(b, _)) in want.iter().zip(&got) {
+                    assert!(
+                        (a - b).abs() <= 1e-5 * a,
+                        "{case} at top_p {top_p}: token {id} weighted {b} against {a}"
+                    );
+                }
+            }
+        }
+    }
+
+    // With no cut at either end the draw skips the candidate set entirely and
+    // walks the row. Two things have to hold for that to be a pure saving: it
+    // draws from the same distribution as the sorted path, and it consumes the
+    // same one RNG step — the speculative loop's output only matches plain
+    // decode's while the two stay in lockstep on the stream.
+    //
+    // The token a given seed lands on DOES change, and cannot not change: the
+    // uniform is mapped through cumulative weights, and the two paths accumulate
+    // the same weights in a different order. Only the distribution is the
+    // contract.
+    #[test]
+    fn the_uncut_draw_matches_the_sorted_draw_in_distribution() {
+        const DRAWS: usize = 40_000;
+        let mut probs: Vec<f32> = vec![3.0, 1.0, 2.0, 0.5, 2.5, 0.25];
+        softmax_in_place(&mut probs, 1.0);
+
+        let mut fast_rng = StdRng::seed_from_u64(4242);
+        let mut sorted_rng = StdRng::seed_from_u64(4242);
+        let sorted = sorted_uncut(&probs, 1.0);
+        let weights: Vec<f32> = sorted.iter().map(|c| c.0).collect();
+        let distr = WeightedIndex::new(&weights).unwrap();
+
+        let mut fast_counts = vec![0usize; probs.len()];
+        let mut sorted_counts = vec![0usize; probs.len()];
+        for _ in 0..DRAWS {
+            fast_counts[draw_row(&mut fast_rng, &probs).unwrap() as usize] += 1;
+            sorted_counts[sorted[distr.sample(&mut sorted_rng)].1 as usize] += 1;
+        }
+        for (id, (&fast, &want)) in fast_counts.iter().zip(&sorted_counts).enumerate() {
+            let fast = fast as f64 / DRAWS as f64;
+            let want = want as f64 / DRAWS as f64;
+            assert!(
+                (fast - want).abs() < 0.01,
+                "id {id} drawn at {fast} against the sorted path's {want}"
+            );
+            assert!(
+                (fast - f64::from(probs[id])).abs() < 0.01,
+                "id {id} drawn at {fast} against its probability {}",
+                probs[id]
+            );
+        }
+        // Same number of draws, same position in the stream: one step each.
+        assert_eq!(
+            rand::Rng::random::<u64>(&mut fast_rng),
+            rand::Rng::random::<u64>(&mut sorted_rng),
+            "the two draws must consume the RNG identically"
+        );
+    }
+
+    // A row the controls left with a single survivor still draws that survivor
+    // when neither cut applies: the walk crosses the point at the one id
+    // carrying mass, and a row carrying none is an error rather than id 0.
+    #[test]
+    fn the_uncut_draw_handles_degenerate_rows() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut only = vec![0.0f32; 32];
+        only[17] = 1.0;
+        for _ in 0..16 {
+            assert_eq!(draw_row(&mut rng, &only).unwrap(), 17);
+        }
+        assert!(draw_row(&mut rng, &[0.0f32; 8]).is_err());
+        assert!(draw_row(&mut rng, &[0.5, f32::NAN, 0.5]).is_err());
     }
 
     // The on-device scatter and the CPU loop subtract the same f32 from the

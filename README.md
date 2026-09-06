@@ -328,9 +328,12 @@ without thinking, so **an item that says nothing about sampling now decodes with
 a batch answers, though a batch stays as reproducible as it was, the penalty being a
 function of what the reply has already emitted. Spell `"sampling": {"presence_penalty":
 0}` on the item, or in `defaults` for the whole request, to get the old behaviour back.
-Scored fields (`schema` with `include_score`) are drawn unpenalized whatever the item
-says: nothing is emitted token by token there, so there is no history for a per-token
-penalty to be measured over.
+An item that decodes under a `schema` takes 0 unless it names a value: under a grammar
+mask the tokens a reply repeats are the document's own punctuation, and penalizing them
+tilts a greedy pick between two structurally legal continuations. Scored fields
+(`schema` with `include_score`) are drawn unpenalized whatever the item says: nothing is
+emitted token by token there, so there is no history for a per-token penalty to be
+measured over.
 
 Per-item failures land as `error` on that item and the rest of the batch still runs.
 

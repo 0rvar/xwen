@@ -15,7 +15,7 @@ use tokio::sync::mpsc::error::TrySendError;
 
 use super::config::{DraftMode, ServeSettings};
 use super::disk_cache::DiskImage;
-use super::disk_tier::{DiskCache, DiskCandidate};
+use super::disk_tier::{DiskCache, DiskCandidate, PendingSlot};
 use super::log::{JobPhase, JobRecord, ServeLog, ServeLogger, SlotSummary};
 use super::queue::{JobQueue, Queued};
 use super::types::{
@@ -79,7 +79,7 @@ const DISK_WRITE_FLOOR_BYTES_PER_SEC: u64 = 700 * 1024 * 1024;
 /// is the pending bytes at the measured write floor, and never less than the
 /// grace. It stays bounded — an image that does not land costs a re-prefill,
 /// nothing more — and the expiry is still reported rather than retried.
-fn disk_flush_budget(pending: u64) -> Duration {
+pub(super) fn disk_flush_budget(pending: u64) -> Duration {
     Duration::from_secs(pending / DISK_WRITE_FLOOR_BYTES_PER_SEC).max(DISK_FLUSH_GRACE)
 }
 
@@ -275,17 +275,28 @@ fn startup_drafter(settings: &ServeSettings, served: Target) -> Option<std::path
 /// architecture's checkpoint. It is the only target the served file answers for.
 /// `shutdown` is the process-wide cancel token: once it fires, the running job aborts
 /// and queued jobs are dropped unstarted.
-pub fn spawn_engine(
+pub(super) fn spawn_engine(
     settings: ServeSettings,
     default_target: Target,
     jobs: Arc<JobQueue>,
     resident: Arc<ResidentModel>,
     shutdown: Arc<Cancel>,
+    disk_pending: PendingSlot,
     logger: ServeLogger,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(ENGINE_THREAD.to_string())
-        .spawn(move || engine_loop(settings, default_target, jobs, resident, shutdown, logger))
+        .spawn(move || {
+            engine_loop(
+                settings,
+                default_target,
+                jobs,
+                resident,
+                shutdown,
+                disk_pending,
+                logger,
+            )
+        })
         .expect("spawning the inference thread")
 }
 
@@ -683,6 +694,7 @@ fn engine_loop(
     jobs: Arc<JobQueue>,
     resident: Arc<ResidentModel>,
     shutdown: Arc<Cancel>,
+    disk_pending: PendingSlot,
     logger: ServeLogger,
 ) {
     let _exit = EngineExitGuard {
@@ -704,6 +716,12 @@ fn engine_loop(
     // custom-GGUF server the official checkpoint of the same architecture is a
     // different file with the same name for sizing.
     let disk = DiskCache::open(&settings, &logger);
+    // Published for the shutdown watchdog, which sizes its own grace off the same
+    // bytes this thread sizes its flush budget off — see `serve::shutdown_grace`.
+    // Left empty when the tier is off, which reads as nothing owed.
+    if let Some(disk) = disk.as_ref() {
+        let _ = disk_pending.set(disk.pending_handle());
+    }
     let disk_for = |target: Target| -> Option<&DiskCache> {
         if target == default_target {
             disk.as_ref()
@@ -1927,6 +1945,7 @@ fn run_job(
     // narrower question of whether it could actually speculate from here. A drafter
     // that has fallen behind (a conversation past its context, a page-in with no
     // drafter planes) would otherwise pay the round loop's overhead for nothing.
+    engine.generator.note_draft_horizon_at(prompt_len);
     let outcome = if engine.generator.spec_ready_at(prompt_len) {
         engine.generator.decode_loop_spec(
             prompt_len,

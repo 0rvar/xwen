@@ -103,9 +103,10 @@ const SLOWEST_PREFILL_TOKENS_PER_SEC: u64 = 200;
 /// with when it arrives.
 ///
 /// The old flat 300 was sized against nothing in particular and is well under one
-/// maximal prefill on this machine: a 131072-token prompt is 567 s of prefill on
-/// the default checkpoint before its own decode starts, so a request arriving
-/// behind one was dropped for saturation while the server worked normally. The
+/// maximal prefill on this machine: a 131072-token prompt is 565 s of prefill on
+/// the default checkpoint at the 232 tok/s it was measured at, and 655 s at the
+/// floor rate below, before its own decode starts — so a request arriving behind
+/// one was dropped for saturation while the server worked normally. The
 /// derived value covers TWO such prefills — the one running plus one already
 /// queued ahead — which is the shape of the case the timeout is there to
 /// survive.
@@ -114,10 +115,12 @@ const SLOWEST_PREFILL_TOKENS_PER_SEC: u64 = 200;
 pub fn default_queue_timeout_secs(context_length: usize) -> u64 {
     let one_prefill = context_length as u64 / SLOWEST_PREFILL_TOKENS_PER_SEC;
     // Rounded to a whole minute, UP rather than down: a default that reads
-    // `1080` says "eighteen minutes" where `1048` says nothing, and rounding the
-    // other way would put the value back under the two prefills it exists to
-    // cover (at 131072 the pair is 524 s, and rounding down to five minutes
-    // would land on 300 — exactly the flat value this replaced).
+    // `1320` says "twenty-two minutes" where `1310` says nothing, and rounding
+    // the other way would put the value back under the two prefills it exists to
+    // cover (at 131072 the pair is 1310 s, and rounding down would land on 1260,
+    // fifty seconds inside a wait the server can legitimately be working
+    // through). The examples are pinned in
+    // `the_queue_timeout_default_covers_two_maximal_prefills`.
     let derived = (2 * one_prefill).div_ceil(60) * 60;
     derived.max(DEFAULT_QUEUE_TIMEOUT_SECS)
 }
@@ -1679,6 +1682,10 @@ mod tests {
             DEFAULT_QUEUE_TIMEOUT_SECS
         );
         // Past that it grows with the context, rounded up to a whole minute.
+        // The 131072 case is the one the derivation is documented against: two
+        // prefills at the floor rate are 1310 s, rounding up lands on 1320, and
+        // rounding down would have landed on 1260.
+        assert_eq!(2 * (131072 / SLOWEST_PREFILL_TOKENS_PER_SEC), 1310);
         assert_eq!(default_queue_timeout_secs(131072), 1320);
         assert_eq!(default_queue_timeout_secs(262144), 2640);
         assert_eq!(default_queue_timeout_secs(524288), 5280);

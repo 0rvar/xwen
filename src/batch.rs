@@ -100,7 +100,8 @@ pub const DEFAULT_MAX_TOKENS: usize = 512;
 /// `presence_penalty` is NOT one of these: it is not inert at temperature 0
 /// (greedy takes the argmax of the penalized row), and unlike the three above
 /// its default is the checkpoint's own card value for the item's thinking
-/// mode. [`resolve_sampling`] fills it in from there, and a batch stays
+/// mode. [`resolve_sampling`] fills it in from there — for an UNCONSTRAINED item;
+/// a grammar-masked one defaults to 0, for the reason given there. A batch stays
 /// reproducible either way because the penalty is a deterministic function of
 /// what the reply has already emitted.
 pub const BATCH_SAMPLING: SamplerOptions = SamplerOptions {
@@ -746,6 +747,7 @@ fn run_item(
     // The speculative loop draws the same tokens either way; this asks the
     // narrower question of whether it could actually speculate from here, so a
     // drafter that fell behind does not pay the round loop's overhead.
+    generator.note_draft_horizon_at(prompt_len);
     let outcome = if generator.spec_ready_at(prompt_len) {
         generator.decode_loop_spec(
             prompt_len,
@@ -1470,6 +1472,7 @@ fn decode_reasoning(
             }
         };
         let mut stop = || closed.get();
+        generator.note_draft_horizon_at(prompt_len);
         outcome = if generator.spec_ready_at(prompt_len) {
             generator.decode_loop_spec(prompt_len, true, budget, &mut on_event, &mut stop)?
         } else {
@@ -1823,6 +1826,10 @@ fn prepare_item(
         tokens.len(),
     );
 
+    // A scored item writes its structure rather than drawing it, so the only
+    // decode that runs under a grammar mask is a schema the compiler took.
+    let constrained = scored.is_none() && item.schema.is_some();
+
     Ok(Prepared {
         tokens,
         prefix_len,
@@ -1834,6 +1841,7 @@ fn prepare_item(
         sampling: resolve_sampling(
             model,
             opts.enable_thinking,
+            constrained,
             defaults.sampling.as_ref(),
             item.sampling.as_ref(),
         ),
@@ -1944,14 +1952,29 @@ fn resolve_render(
 /// [`BATCH_SAMPLING`]: it is the one sampling value keyed to the checkpoint and
 /// the item's thinking mode, and batch resolves it the way every other surface
 /// does (`SamplerOptions::recommended_for`).
+///
+/// EXCEPT under a grammar mask, where the default is 0. The card's 1.5 exists to
+/// keep prose from circling, and it moves a greedy pick by moving logits: on a
+/// constrained decode the tokens that repeat are the STRUCTURE — the `,` between
+/// every pair of fields, the quotes around every key — so penalizing what the
+/// answer has already emitted biases the choice between two structurally legal
+/// continuations, `,` against `}`, for a reason that has nothing to do with the
+/// document. The mask already guarantees the shape; the penalty can only
+/// mis-rank inside it. An item or request that names a penalty still gets it,
+/// constrained or not: the rule moves the DEFAULT, not the knob.
 fn resolve_sampling(
     model: Model,
     thinking: bool,
+    constrained: bool,
     defaults: Option<&SamplingSpec>,
     item: Option<&SamplingSpec>,
 ) -> SamplerOptions {
     let mut opts = SamplerOptions {
-        presence_penalty: SamplerOptions::recommended_for(model, thinking).presence_penalty,
+        presence_penalty: if constrained {
+            0.0
+        } else {
+            SamplerOptions::recommended_for(model, thinking).presence_penalty
+        },
         ..BATCH_SAMPLING
     };
     for spec in [defaults, item].into_iter().flatten() {
@@ -2159,13 +2182,13 @@ mod tests {
     // override layers apply in order without either restating the whole set.
     #[test]
     fn sampling_layers_default_then_item() {
-        let plain = resolve_sampling(Model::Qwen35BA3B, true, None, None);
+        let plain = resolve_sampling(Model::Qwen35BA3B, true, false, None, None);
         assert_eq!(plain.temperature, 0.0);
         // The one value that does NOT come from BATCH_SAMPLING: the card's,
         // for this checkpoint in this mode.
         assert_eq!(plain.presence_penalty, 1.5);
         assert_eq!(
-            resolve_sampling(Model::Qwen27B, true, None, None).presence_penalty,
+            resolve_sampling(Model::Qwen27B, true, false, None, None).presence_penalty,
             0.0
         );
 
@@ -2174,7 +2197,7 @@ mod tests {
             seed: Some(7),
             ..Default::default()
         };
-        let layered = resolve_sampling(Model::Qwen35BA3B, true, Some(&defaults), None);
+        let layered = resolve_sampling(Model::Qwen35BA3B, true, false, Some(&defaults), None);
         assert_eq!(layered.temperature, 0.7);
         assert_eq!(layered.seed, 7);
         assert_eq!(layered.top_k, BATCH_SAMPLING.top_k);
@@ -2183,7 +2206,7 @@ mod tests {
             temperature: Some(0.0),
             ..Default::default()
         };
-        let both = resolve_sampling(Model::Qwen35BA3B, true, Some(&defaults), Some(&item));
+        let both = resolve_sampling(Model::Qwen35BA3B, true, false, Some(&defaults), Some(&item));
         assert_eq!(both.temperature, 0.0);
         // Untouched by the item, so the default layer still shows through.
         assert_eq!(both.seed, 7);
@@ -2194,9 +2217,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_sampling(Model::Qwen35BA3B, true, None, Some(&off)).presence_penalty,
+            resolve_sampling(Model::Qwen35BA3B, true, false, None, Some(&off)).presence_penalty,
             0.0
         );
+    }
+
+    // A grammar-masked item takes no presence penalty by default. The card's
+    // 1.5 is a prose knob: under a mask the repeated tokens are the document's
+    // own punctuation, and penalizing them tilts a greedy pick between two
+    // structurally legal continuations for a reason the caller never asked for.
+    // Naming a penalty still gets it — the rule moves the default, not the knob.
+    #[test]
+    fn a_grammar_masked_item_defaults_to_no_presence_penalty() {
+        // Same checkpoint, same thinking mode, the two sides of the rule.
+        assert_eq!(
+            resolve_sampling(Model::Qwen35BA3B, true, false, None, None).presence_penalty,
+            1.5,
+            "unconstrained free decode keeps the card default"
+        );
+        assert_eq!(
+            resolve_sampling(Model::Qwen35BA3B, true, true, None, None).presence_penalty,
+            0.0,
+            "a grammar mask drops it"
+        );
+
+        // Pinned at either layer, it survives the mask.
+        let pinned = SamplingSpec {
+            presence_penalty: Some(0.8),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_sampling(Model::Qwen35BA3B, true, true, Some(&pinned), None).presence_penalty,
+            0.8,
+            "a request default pins it through the mask"
+        );
+        assert_eq!(
+            resolve_sampling(Model::Qwen35BA3B, true, true, None, Some(&pinned)).presence_penalty,
+            0.8,
+            "and so does an item"
+        );
+
+        // The rest of the sampling set is untouched by the rule.
+        let masked = resolve_sampling(Model::Qwen35BA3B, true, true, None, None);
+        assert_eq!(masked.temperature, BATCH_SAMPLING.temperature);
+        assert_eq!(masked.top_k, BATCH_SAMPLING.top_k);
+        assert_eq!(masked.top_p, BATCH_SAMPLING.top_p);
+        assert_eq!(masked.seed, BATCH_SAMPLING.seed);
     }
 
     // Thinking is off unless a request asks for it, which is the divergence

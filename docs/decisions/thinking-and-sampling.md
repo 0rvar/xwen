@@ -145,6 +145,22 @@ non-thinking decode changes visibly: an item naming no penalty now decodes at 1.
 now means no top-k cut and 1 is greedy, ending the item that said 0 was greedy here and
 "disabled" in llama.cpp.
 
+**The card's presence penalty is a prose knob, so a grammar-masked batch item defaults
+to 0 (2026-09-06).** The paragraph above put every batch item on the card's 1.5, and
+batch decodes at temperature 0 where the penalty is not inert: greedy takes the argmax
+of the penalized row. For free text that is what the card asks for, and the ids a reply
+repeats are its words. Under a schema mask the ids it repeats are the document's
+punctuation, the `,` between every pair of fields and the quotes around every key, so
+subtracting 1.5 from them ranks `}` above `,` at a boundary where the grammar allows
+both, on a count of how many commas the item has written so far. The mask already
+decides the shape; the penalty can only mis-rank inside it, and nobody asked for a
+document whose field count depends on a repetition knob. So `resolve_sampling` takes the
+card default only for an item that free-decodes unconstrained, and an item whose schema
+reached the grammar compiler resolves to 0. A penalty the item or the request's
+`defaults` names still applies, constrained or not: the rule moves the default, not the
+knob. Scored items were already unpenalized for a different reason, `select_option`
+teacher-forcing whole candidate values rather than emitting tokens.
+
 **Temperature is applied before the top-k/top-p cut, and stays that way (2026-09-06).**
 llama.cpp cuts first: its default chain is top_k → typ_p → top_p → min_p → temp → dist
 (common/sampling.cpp), so the truncation sees raw logits and temperature only reshapes

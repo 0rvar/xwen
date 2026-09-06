@@ -333,11 +333,14 @@ down from the 230.8 the DEFAULT checkpoint reads at a 131072-token prompt — Fl
 is the slow one here, where the 35B-A3B reads 668 — and rounded down because prefill
 cost per token keeps climbing past the length that was measured. At the default 262144
 that is 2640 s. The old 300 was not conservative, it was wrong in the dangerous
-direction: one 131072-token prefill on the default checkpoint is 567 s, so a request
+direction: one 131072-token prefill on the default checkpoint is 565 s measured (655 at
+the 200 tok/s floor), so a request
 arriving behind a long prompt was dropped for saturation while the server was working
 normally. Two prefills rather than one because the case worth surviving is a queue, not
-a single arrival. Rounded UP rather than down, against the first instinct, because
-rounding a 1310 s pair down to five minutes lands back on 300. Naming `queue_timeout`
+a single arrival. Rounded UP to the minute rather than down: two 131072-token prefills
+at the floor are 1310 s, which rounds up to 1320 and down to 1260, and the timeout must
+outlast the pair (2026-09-06 review fix; the first draft of this paragraph had the
+arithmetic wrong). Naming `queue_timeout`
 explicitly still wins, the value is logged once at startup, and holding a queued
 streaming request costs almost nothing — the asymmetry that makes erring long correct.
 
@@ -352,4 +355,9 @@ real page-out timing (the small-image line `113 MiB in 1229 ms` is fixed cost, n
 which is exactly why the shape is a floor plus a rate rather than either alone). The
 wait stays bounded and its expiry stays reported rather than retried: an image that does
 not land costs the next server a re-prefill, while a shutdown that hangs costs the
-operator a `kill -9`.
+operator a `kill -9`. The shutdown watchdog uses the same budget (2026-09-06 review
+fix): its grace is `SHUTDOWN_GRACE` (30 s) or the flush budget plus a 5 s margin,
+whichever is larger, re-derived every 250 ms while the engine queues the live
+conversation's image after the signal, and the derived value is what the
+"shutdown grace expired" line reports. Before the fix a budget past 30 s was cut off by
+the flat watchdog, and pending bytes did not count a write already claimed; they do now.

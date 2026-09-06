@@ -29,6 +29,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{File, FileTimes};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -373,6 +374,18 @@ impl Store {
 /// The half of the tier both threads share.
 struct Shared {
     store: Mutex<Store>,
+    /// Bytes of the write the writer thread is in the middle of, 0 between
+    /// writes.
+    ///
+    /// [`claim`] REMOVES a request from `pending` before the write starts, which
+    /// is what makes replacing a pending entry a coalesce rather than a race —
+    /// but it also means the largest write there can be is invisible to anyone
+    /// summing the map. A shutdown asking how long to wait would then size its
+    /// budget as if the multi-gigabyte image already on its way to disk were not
+    /// there, and cut it off mid-write. Written under the store lock at both
+    /// ends, so a reader holding that lock sees the request in exactly one of the
+    /// two places and never in neither.
+    in_flight: AtomicU64,
     /// `<cache_dir>/kv`, the root the size budget spans.
     root: PathBuf,
     /// `<cache_dir>/kv/<checkpoint>`, where this server's segments go.
@@ -464,6 +477,36 @@ pub(super) struct DiskCache {
     /// weights, and the operator is told once rather than per request. A `Cell`
     /// because only the engine thread reads or writes it.
     trusted: Cell<bool>,
+}
+
+/// Host bytes the writer still owes, queued and in flight alike. Both halves are
+/// read under the store lock, which is where both are written, so a claim in
+/// progress is counted in exactly one of them.
+fn pending_bytes(shared: &Arc<Shared>) -> u64 {
+    let store = shared.store();
+    let queued: u64 = store.pending.values().map(WriteRequest::byte_len).sum();
+    let in_flight = shared.in_flight.load(Ordering::Relaxed);
+    drop(store);
+    queued.saturating_add(in_flight)
+}
+
+/// A read-only view of [`DiskCache::pending_bytes`], clonable and `Send`, for a
+/// thread that does not own the tier. Holding one keeps the tier's shared half
+/// alive, which costs an index and nothing else.
+#[derive(Clone)]
+pub(super) struct PendingBytes(Arc<Shared>);
+
+/// Where the engine thread publishes its [`PendingBytes`] handle. Set once, when
+/// the tier opens; still empty means the tier is off or has not opened yet, and
+/// both read as nothing owed. It exists because the tier is opened on the engine
+/// thread, after the watchdog's owner has already been handed everything else it
+/// gets.
+pub(super) type PendingSlot = Arc<std::sync::OnceLock<PendingBytes>>;
+
+impl PendingBytes {
+    pub(super) fn get(&self) -> u64 {
+        pending_bytes(&self.0)
+    }
 }
 
 /// A stored chain that could serve an arriving prompt, and how deep.
@@ -572,6 +615,7 @@ impl DiskCache {
         }
         let shared = Arc::new(Shared {
             store: Mutex::new(Store::default()),
+            in_flight: AtomicU64::new(0),
             root,
             dir,
             checkpoint,
@@ -1126,18 +1170,23 @@ impl DiskCache {
         let _ = self.tx.send(Message::Wake);
     }
 
-    /// Host bytes the writer still has queued. The caller turns this into the
-    /// wait it will allow (`disk_flush_budget`), because how long a flush should
-    /// be given is a property of how much is in it: the fixed grace this
-    /// replaced was sized on a single ~4.2 GiB image and a long conversation is
-    /// several of those.
+    /// Host bytes the writer still owes: what is queued, plus the write it is in
+    /// the middle of. The caller turns this into the wait it will allow
+    /// (`disk_flush_budget`), because how long a flush should be given is a
+    /// property of how much is in it: the fixed grace this replaced was sized on
+    /// a single ~4.2 GiB image and a long conversation is several of those.
     pub(super) fn pending_bytes(&self) -> u64 {
-        self.shared
-            .store()
-            .pending
-            .values()
-            .map(WriteRequest::byte_len)
-            .sum()
+        pending_bytes(&self.shared)
+    }
+
+    /// A handle on the same number for a thread that does not hold the tier.
+    ///
+    /// The `DiskCache` belongs to the engine thread and never leaves it, while the
+    /// shutdown watchdog runs beside it and has to size its own grace from what
+    /// the writer still owes — the same bytes, through the same budget function,
+    /// or the watchdog kills the flush it was meant to cover.
+    pub(super) fn pending_handle(&self) -> PendingBytes {
+        PendingBytes(Arc::clone(&self.shared))
     }
 
     /// Wait up to `budget` for the queued writes to land. Called on the way down —
@@ -1677,14 +1726,14 @@ fn writer_loop(rx: Receiver<Message>, shared: Arc<Shared>) {
             // here.
             Message::Wake => {
                 if let Some(request) = claim(&shared) {
-                    write_one(&shared, &request);
+                    write_claimed(&shared, &request);
                 }
             }
             // The barrier the shutdown path waits on, so everything pending has to be
             // written before it is acknowledged rather than everything sent so far.
             Message::Flush(ack) => {
                 while let Some(request) = claim(&shared) {
-                    write_one(&shared, &request);
+                    write_claimed(&shared, &request);
                 }
                 let _ = ack.send(());
             }
@@ -1695,6 +1744,10 @@ fn writer_loop(rx: Receiver<Message>, shared: Arc<Shared>) {
 /// Take the oldest pending write, so slots are served in the order they were paged
 /// out. Claiming removes it: the map holds work nobody has started, which is what
 /// makes replacing an entry a coalesce rather than a race with the writer.
+///
+/// The bytes move to [`Shared::in_flight`] in the same breath, under the store
+/// lock, so they never stop counting toward what the tier still owes. Release
+/// them with [`InFlight`], never by hand.
 fn claim(shared: &Arc<Shared>) -> Option<WriteRequest> {
     let mut store = shared.store();
     let slot = store
@@ -1702,7 +1755,30 @@ fn claim(shared: &Arc<Shared>) -> Option<WriteRequest> {
         .iter()
         .min_by_key(|(_, request)| request.stamp)
         .map(|(slot, _)| *slot)?;
-    store.pending.remove(&slot)
+    let request = store.pending.remove(&slot)?;
+    shared
+        .in_flight
+        .store(request.byte_len(), Ordering::Relaxed);
+    Some(request)
+}
+
+/// Holds [`Shared::in_flight`] for the length of one write and clears it on the
+/// way out — the write finishing, failing, or panicking all being the same thing
+/// to a byte count that only says what is still owed. One writer thread means one
+/// claim at a time, so the release is a store rather than a subtraction.
+struct InFlight<'a>(&'a Arc<Shared>);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let _store = self.0.store();
+        self.0.in_flight.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Write one claimed request, then release its bytes.
+fn write_claimed(shared: &Arc<Shared>, request: &WriteRequest) {
+    let _in_flight = InFlight(shared);
+    write_one(shared, request);
 }
 
 /// What one conversation's write does to the tree.
@@ -2453,6 +2529,7 @@ mod tests {
             Self {
                 shared: Arc::new(Shared {
                     store: Mutex::new(Store::default()),
+                    in_flight: AtomicU64::new(0),
                     root,
                     dir: segments,
                     checkpoint,
@@ -2540,6 +2617,7 @@ mod tests {
         fn restarted(&self) -> Arc<Shared> {
             let fresh = Arc::new(Shared {
                 store: Mutex::new(Store::default()),
+                in_flight: AtomicU64::new(0),
                 root: self.shared.root.clone(),
                 dir: self.shared.dir.clone(),
                 checkpoint: self.shared.checkpoint,
@@ -3314,6 +3392,42 @@ mod tests {
         );
         assert_eq!(claim(&tier.shared).expect("the older enqueue").slot, 1);
         assert_eq!(claim(&tier.shared).expect("then the newer").slot, 0);
+    }
+
+    /// What the tier owes counts the write already under way. Claiming empties the
+    /// map before a byte is written, so a shutdown sizing its wait off the map
+    /// alone would size it as if the multi-gigabyte image in the writer's hands
+    /// were not there, and cut the write off in the middle.
+    #[test]
+    fn a_claimed_write_still_counts_toward_what_the_tier_owes() {
+        let tier = Tier::new("in-flight", 1 << 30);
+        let (disk, _wakes) = tier.engine_side(0);
+        let history = tokens(1, 600);
+        disk.queue_write(
+            0,
+            &history,
+            &full_kv(history.len()),
+            [(history.len(), snapshot(history.len()))].into_iter(),
+            None,
+        );
+        let queued = disk.pending_bytes();
+        assert!(queued > 0, "a queued image weighs something");
+
+        // The writer takes it: out of the map, into the write, and still owed.
+        let claimed = claim(&tier.shared).expect("the queued write");
+        assert!(tier.shared.store().pending.is_empty());
+        assert_eq!(
+            disk.pending_bytes(),
+            queued,
+            "an in-flight write is still owed"
+        );
+        // The handle the watchdog holds reads the same number.
+        assert_eq!(disk.pending_handle().get(), queued);
+
+        // Finishing the write is what releases it.
+        write_claimed(&tier.shared, &claimed);
+        assert_eq!(disk.pending_bytes(), 0);
+        assert_eq!(disk.pending_handle().get(), 0);
     }
 
     /// What the startup scan does with each kind of file it can find: a chain is

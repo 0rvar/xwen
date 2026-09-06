@@ -102,8 +102,36 @@ const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How long a graceful shutdown may wait for connections to close before the
-/// process leaves on its own.
+/// process leaves on its own. A FLOOR, not the whole answer: see
+/// [`shutdown_grace`].
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// What the watchdog allows on top of the disk tier's own flush budget.
+///
+/// The two waits do not start together: the engine only reaches its flush after
+/// it has drained the accepted jobs and imaged the live conversation, while this
+/// clock starts at the signal. The margin covers that head start, and being
+/// generous costs a shutdown seconds it will not use.
+const SHUTDOWN_FLUSH_MARGIN: Duration = Duration::from_secs(5);
+
+/// How often the watchdog re-reads what the disk tier owes. The image that
+/// dominates the wait is the LIVE conversation's, and the engine queues it after
+/// the signal — a grace fixed at the signal would be sized on an empty queue.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+
+/// How long the watchdog waits before exiting the process out from under
+/// whatever is still running.
+///
+/// Connections are one half and the disk tier is the other. The engine gives the
+/// writer `engine::disk_flush_budget(pending)` — bytes at the measured write
+/// floor, since one long conversation images several gigabytes — so a watchdog
+/// on a flat 30 s would kill a flush the engine had legitimately allowed 40 s
+/// for, mid-write, and cost the next server the re-prefill the image existed to
+/// avoid. Same budget function, plus the margin, and never below the connection
+/// floor.
+fn shutdown_grace(pending: u64) -> Duration {
+    SHUTDOWN_GRACE.max(engine::disk_flush_budget(pending) + SHUTDOWN_FLUSH_MARGIN)
+}
 
 /// Everything a handler needs, cloned per request. `Clone + Send + Sync` is a
 /// hard requirement of axum's `State`, which the queue's mutex satisfies.
@@ -211,6 +239,9 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
     }
 
     let shutdown = Arc::new(Cancel::default());
+    // Filled by the engine thread once it has opened the disk tier, and read only
+    // by the shutdown watchdog (`shutdown_grace`).
+    let disk_pending: disk_tier::PendingSlot = Arc::default();
     let jobs = Arc::new(JobQueue::new(
         settings.queue_capacity,
         SchedulePolicy {
@@ -226,6 +257,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
         Arc::clone(&jobs),
         Arc::clone(&resident),
         Arc::clone(&shutdown),
+        Arc::clone(&disk_pending),
         logger.clone(),
     );
 
@@ -267,6 +299,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
             .with_graceful_shutdown(shutdown_signal(
                 Arc::clone(&shutdown),
                 Arc::clone(&jobs),
+                Arc::clone(&disk_pending),
                 logger.clone(),
                 quit,
             ))
@@ -528,6 +561,7 @@ async fn signalled(stream: Option<&mut tokio::signal::unix::Signal>) {
 async fn shutdown_signal(
     shutdown: Arc<Cancel>,
     jobs: Arc<JobQueue>,
+    disk_pending: disk_tier::PendingSlot,
     logger: ServeLogger,
     quit: QuitSignal,
 ) {
@@ -564,11 +598,21 @@ async fn shutdown_signal(
     // that wait. It exits the process outright, which runs no destructors; as a
     // last resort that is fine, since the OS reclaims the Metal buffers and the
     // model's mmap either way.
+    // How long it bounds that wait is not a constant: the engine is on its way to
+    // giving the disk writer a budget sized on the bytes it still owes, and cutting
+    // that off mid-write throws away the image and costs the next server a
+    // re-prefill. So the grace is re-derived from the same bytes as the engine's,
+    // and it only ever grows — the biggest of those bytes, the live conversation's
+    // image, is queued after this thread has already started counting.
     std::thread::spawn(move || {
-        std::thread::sleep(SHUTDOWN_GRACE);
-        logger.log(ServeLog::ShutdownGraceExpired {
-            grace: SHUTDOWN_GRACE,
-        });
+        let owed = || disk_pending.get().map_or(0, disk_tier::PendingBytes::get);
+        let start = Instant::now();
+        let mut grace = shutdown_grace(owed());
+        while let Some(left) = grace.checked_sub(start.elapsed()) {
+            std::thread::sleep(left.min(SHUTDOWN_POLL));
+            grace = grace.max(shutdown_grace(owed()));
+        }
+        logger.log(ServeLog::ShutdownGraceExpired { grace });
         // The exit runs no destructors, so the line has to be on its way out
         // before the process is.
         logger.flush();
@@ -1549,6 +1593,37 @@ mod tests {
     use axum::body::Bytes;
 
     use testutil::{generation, probe_state, try_take};
+
+    /// The watchdog covers the flush the engine is allowed, whatever size that
+    /// is. A conversation that images tens of gigabytes buys the writer a budget
+    /// past the flat connection grace, and a watchdog still counting to 30 would
+    /// exit the process in the middle of that write — the one case the budget was
+    /// widened for.
+    #[test]
+    fn the_shutdown_watchdog_outlasts_the_disk_flush_it_covers() {
+        // Nothing owed, or little enough to write inside the floor: the
+        // connection grace is the whole answer, unchanged.
+        assert_eq!(shutdown_grace(0), SHUTDOWN_GRACE);
+        assert_eq!(shutdown_grace(4 * 1024 * 1024 * 1024), SHUTDOWN_GRACE);
+
+        // A 40 GiB queue is minutes of writing, and the watchdog waits it out
+        // with room to spare.
+        let big = 40 * 1024 * 1024 * 1024;
+        let budget = engine::disk_flush_budget(big);
+        assert!(budget > SHUTDOWN_GRACE, "the premise: a budget past 30s");
+        assert!(shutdown_grace(big) >= budget);
+        assert_eq!(shutdown_grace(big), budget + SHUTDOWN_FLUSH_MARGIN);
+
+        // It is monotonic in what is owed, which is what lets the watchdog keep
+        // taking the larger of its old grace and a freshly derived one as the
+        // engine queues the live conversation behind it.
+        let mut last = shutdown_grace(0);
+        for gib in 1..64u64 {
+            let now = shutdown_grace(gib * 1024 * 1024 * 1024);
+            assert!(now >= last);
+            last = now;
+        }
+    }
 
     /// Both identity headers are read the same way, and both are bounded on the
     /// shared path every route builds its `ClientId` on — `/xwen/v1/batch`

@@ -1991,6 +1991,29 @@ impl Generator {
             .is_some_and(|d| d.committed_len() == pos && pos < d.max_ctx())
     }
 
+    /// Say the horizon line at a dispatch gate, for the request that never
+    /// reaches a speculative round at all.
+    ///
+    /// [`Self::spec_ready_at`] sends a prompt already past `draft_ctx` down the
+    /// plain loop, which never asks about the horizon, so the one stop with no
+    /// other signal was silent exactly when it explained the whole request. The
+    /// gates call this with the prompt length; it shares the round loops' latch,
+    /// so a request that crosses the horizon says it once whichever side of the
+    /// gate the crossing happens on.
+    ///
+    /// Only the horizon speaks here. A gate can also pick plain decode for a
+    /// drafter that fell behind — a page-in with no drafter planes, a rewind it
+    /// could not follow — and blaming `draft_ctx` for that would send the reader
+    /// after the wrong flag.
+    pub fn note_draft_horizon_at(&mut self, pos: usize) {
+        let Some(draft_ctx) = self.drafter_max_ctx() else {
+            return;
+        };
+        // A gate never speculates by definition; whether that is the horizon's
+        // doing is `note_draft_horizon`'s own test of `pos` against `draft_ctx`.
+        note_draft_horizon(&mut self.drafter_horizon_logged, false, pos, draft_ctx);
+    }
+
     /// Align the drafter's cache with a target cache that was just rewound to
     /// `pos` within the same conversation. A drafter holding more than `pos`
     /// tokens is truncated, which is exact — its cache is position-indexed with no
@@ -3792,8 +3815,11 @@ impl Generator {
 /// drafter right up to its capacity is what keeps the widest set of later rewind
 /// points able to re-enable speculation — a rewind can only do so if it lands
 /// exactly on the committed length.
-/// Say once, on the round where speculation goes dark, that the drafter's
-/// context is what ended it — and say which flag moves it.
+/// Say once per crossing that the drafter's context is what ended speculation —
+/// and say which flag moves it. The round where speculation goes dark is one
+/// place that happens; a dispatch gate handing a prompt that is already past the
+/// horizon to the plain loop ([`Generator::note_draft_horizon_at`]) is the
+/// other, and both share this latch, so one crossing says it once.
 ///
 /// The horizon is the one speculation stop with no other signal. An auto-pause
 /// shows up as `paused_rounds`; a low-acceptance text shows up in the ratio
@@ -3802,21 +3828,33 @@ impl Generator {
 /// the checkpoints that ship a sidecar the window is 8192 of a 131072 ceiling,
 /// so a long conversation spends most of itself past it.
 ///
-/// `live` clears the flag rather than latching it, so the line follows the
-/// crossing and not the process: a conversation rewound back under the horizon
-/// says it again when it crosses again.
+/// Being live, or being under the horizon at all, clears the flag rather than
+/// latching it, so the line follows the crossing and not the process: a
+/// conversation rewound back under the horizon says it again when it crosses
+/// again.
+///
+/// `live` false is NOT on its own a crossing, which is why `pos` is checked
+/// against `draft_ctx` here rather than trusted from the caller. Speculation
+/// also stops when the drafter falls out of step with the target — an MTP rewind
+/// that dropped its carry hidden, a conversation paged in without drafter planes
+/// — and at a position the drafter could still have covered. Blaming
+/// `draft_ctx` for that would send the reader after a flag that changes nothing.
+///
+/// The line goes through [`crate::host_log`] rather than to stderr directly: on
+/// a `serve --tui` server stderr belongs to the dashboard, and a raw `eprintln!`
+/// lands in the middle of a redrawn frame instead of in the server's log.
 fn note_draft_horizon(logged: &mut bool, live: bool, pos: usize, draft_ctx: usize) {
-    if live {
+    if live || pos < draft_ctx {
         *logged = false;
         return;
     }
     if std::mem::replace(logged, true) {
         return;
     }
-    eprintln!(
+    crate::host_log::host_line(format!(
         "xwen: drafting stops past draft_ctx {draft_ctx} tokens (position {pos}); \
          decoding plain from here — raise --draft-ctx to speculate further",
-    );
+    ));
 }
 
 fn drafter_span_rows(committed: usize, draft_ctx: usize, pos: usize, len: usize) -> usize {
@@ -4371,6 +4409,44 @@ mod tests {
         assert!(logged);
         // A rewind back under it re-arms.
         note_draft_horizon(&mut logged, true, 4000, 8192);
+        assert!(!logged);
+        note_draft_horizon(&mut logged, false, 8192, 8192);
+        assert!(logged);
+
+        // Speculation stopping is not the same thing as the horizon. An MTP
+        // rewind that dropped the head's carry hidden, or a page-in with no
+        // drafter planes, goes dark at a position the drafter could still have
+        // covered — and `draft_ctx` is not what a reader should change then.
+        let mut desynced = false;
+        note_draft_horizon(&mut desynced, false, 4000, 8192);
+        assert!(!desynced, "a desync under the horizon says nothing");
+    }
+
+    /// A prompt that is already past the horizon never reaches a speculative
+    /// round: the dispatch gate sends it down the plain loop, which asks nothing
+    /// about `draft_ctx`. The gate says the line itself, on the same latch, so
+    /// the crossing is announced exactly once whichever side of the gate it
+    /// happens on.
+    #[test]
+    fn the_dispatch_gate_announces_a_prompt_past_the_horizon() {
+        let mut logged = false;
+        // A prompt the drafter's context cannot reach: the gate is the only
+        // place this request will ever be told about the horizon.
+        note_draft_horizon(&mut logged, false, 9000, 8192);
+        assert!(logged);
+        // The latch is the round loop's, so nothing downstream repeats it.
+        note_draft_horizon(&mut logged, false, 9001, 8192);
+        assert!(logged);
+
+        // A prompt inside the context is not a crossing, even when the gate
+        // still picks plain decode — a drafter that fell behind is a different
+        // stop, and `draft_ctx` is not the flag that moves it.
+        let mut logged = true;
+        note_draft_horizon(&mut logged, false, 4000, 8192);
+        assert!(!logged);
+        // The last position the drafter can cover is inside it; the first it
+        // cannot is the crossing.
+        note_draft_horizon(&mut logged, false, 8191, 8192);
         assert!(!logged);
         note_draft_horizon(&mut logged, false, 8192, 8192);
         assert!(logged);
