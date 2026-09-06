@@ -243,7 +243,7 @@ function baseEnv(): Record<string, string> {
   const e: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ACT_L2_CLASSIC" || k === "XWEN_SHEXP_QMATMUL" || k === "XWEN_HC_GEMM_QMATMUL" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DELTA_DECODE_KERNEL" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MV_EXT_CLASSIC" || k.startsWith("XWEN_MV_EXT_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k === "XWEN_HC_CLASSIC" || k === "XWEN_HC_GATE_CLASSIC" || k === "XWEN_HC_GATE_FUSED_MAX_N" || k === "XWEN_STACK_PROFILE" || k === "XWEN_CHUNK_SYNC" || k === "XWEN_PREFILL_CHUNK" || k === "XWEN_PLE_PROFILE" || k === "XWEN_PLE_READBACK_CLASSIC" || k === "XWEN_PLE_TAIL_CLASSIC" || k === "XWEN_DELTA_BA_CLASSIC" || k === "XWEN_QSA_CLASSIC" || k === "XWEN_QSA_HOST_TOPK" || k.startsWith("XWEN_MM_ID") || k.startsWith("XWEN_DUP_")) continue;
+    if (k === "XWEN_NO_MM_ID" || k === "XWEN_MV_CLASSIC" || k === "XWEN_ATTN_F32" || k === "XWEN_ATTN_MM_CLASSIC" || k === "XWEN_ATTN_MM_TENSOR" || k === "XWEN_SDPA_F32" || k === "XWEN_COMBINE_CLASSIC" || k === "XWEN_ATTN_GLUE_CLASSIC" || k === "XWEN_FLASH_CLASSIC" || k === "XWEN_ACT_CLASSIC" || k === "XWEN_ACT_L2_CLASSIC" || k === "XWEN_SHEXP_QMATMUL" || k === "XWEN_HC_GEMM_QMATMUL" || k === "XWEN_ATTN_DEQUANT" || k === "XWEN_DELTA_CLASSIC" || k === "XWEN_DELTA_SCAN_V2" || k === "XWEN_DELTA_DECODE_KERNEL" || k === "XWEN_DENSE_MM_CLASSIC" || k.startsWith("XWEN_DENSE_MM_") || k === "XWEN_MV_EXT_CLASSIC" || k.startsWith("XWEN_MV_EXT_") || k === "XWEN_MOE_GLUE_CLASSIC" || k === "XWEN_MOE_DUAL" || k === "XWEN_MOE_SHEXP_CLASSIC" || k === "XWEN_MOE_SHEXP_FUSED_MAX_N" || k === "XWEN_HC_CLASSIC" || k === "XWEN_HC_GATE_CLASSIC" || k === "XWEN_HC_GATE_FUSED_MAX_N" || k === "XWEN_STACK_PROFILE" || k === "XWEN_CHUNK_SYNC" || k === "XWEN_PREFILL_CHUNK" || k === "XWEN_PLE_PROFILE" || k === "XWEN_PLE_READBACK_CLASSIC" || k === "XWEN_PLE_TAIL_CLASSIC" || k === "XWEN_DELTA_BA_CLASSIC" || k === "XWEN_QSA_CLASSIC" || k === "XWEN_QSA_HOST_TOPK" || k.startsWith("XWEN_MM_ID") || k.startsWith("XWEN_DUP_")) continue;
     // Covers DIR/TIER and the EXPECT_* experiment overrides — the gate sets
     // those explicitly per run; an inherited one would skew every tier.
     if (k.startsWith("XWEN_PARITY_")) continue;
@@ -298,7 +298,12 @@ function referenceEnv(): Record<string, string> {
   // both sides on the same approximate path. Cached references predating the
   // pin are still valid because no binary of that era could run the gemm (the
   // schema-v7 grandfather says exactly this).
-  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1", XWEN_MV_EXT_CLASSIC: "1", XWEN_MOE_GLUE_CLASSIC: "1" };
+  // XWEN_MOE_SHEXP_CLASSIC is redundant here — XWEN_MOE_GLUE_CLASSIC already
+  // takes the block off the epilogue path the fused shared expert lives in, and
+  // the Reference runner never opens it either — but pinned explicitly so the
+  // oracle's env states every bounded path it refuses, not just the ones whose
+  // outer switch happens to cover them.
+  return { ...baseEnv(), XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1", XWEN_MV_EXT_CLASSIC: "1", XWEN_MOE_GLUE_CLASSIC: "1", XWEN_MOE_SHEXP_CLASSIC: "1" };
 }
 
 /** Experiment flags (--sdpa-f32 / --attn-mm-classic / --flash-classic), set once in main. */
@@ -494,6 +499,7 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
     const actL2 = p.act_l2 ?? (version < 9 ? "classic" : undefined);
     const shexpGemm = p.shexp_gemm ?? (version < 9 ? "classic" : undefined);
     const hcGemm = p.hc_gemm ?? (version < 9 ? "classic" : undefined);
+    const moeShexp = p.moe_shexp ?? (version < 11 ? "classic" : undefined);
     return (
       p.moe_impl === "reference" &&
       p.attn_dtype === "f32" &&
@@ -508,7 +514,8 @@ async function isReferenceDump(path: string, kind?: string): Promise<boolean> {
       mvExt === "classic" &&
       actL2 === "classic" &&
       shexpGemm === "classic" &&
-      hcGemm === "classic"
+      hcGemm === "classic" &&
+      moeShexp === "classic"
     );
   } catch {
     return false;
@@ -685,12 +692,17 @@ async function runFullLogitTier(tier: "strict" | "mm", parityDir: string, regenR
   // which is where it runs by default. XWEN_DENSE_MM_CLASSIC=1 pins the dense
   // checkpoint's FFN prefill to candle's QMatMul chain for the same reason —
   // the vendored gemm's reduced-precision tensor path is bounded-close, not
-  // bit-identical. mm runs the default mm_id prefill
+  // bit-identical. XWEN_MOE_SHEXP_CLASSIC=1 pins the MoE shared expert to its
+  // five-dispatch chain for the same reason again — the fused pair reassociates
+  // all three of its dot products, and its epilogue folds the routed combine
+  // over a wider partition than the bitwise `kernel_moe_epilogue` does — while
+  // decode grades the fused route, which is the tier it actually dispatches on.
+  // mm runs the default mm_id prefill
   // (code-short's 58 tokens are >= MM_ID_MIN_SEQ) with the default f16 attention.
   // Only the mm candidate picks up the experiment flags (candidateEnv); strict
   // stays pinned to the exact env its 0.999 anchor was blessed with.
   const env = tier === "strict"
-    ? { ...baseEnv(), XWEN_NO_MM_ID: "1", XWEN_MV_CLASSIC: "1", XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1", XWEN_MV_EXT_CLASSIC: "1" }
+    ? { ...baseEnv(), XWEN_NO_MM_ID: "1", XWEN_MV_CLASSIC: "1", XWEN_ATTN_F32: "1", XWEN_ATTN_MM_CLASSIC: "1", XWEN_COMBINE_CLASSIC: "1", XWEN_ATTN_GLUE_CLASSIC: "1", XWEN_FLASH_CLASSIC: "1", XWEN_ACT_CLASSIC: "1", XWEN_DELTA_CLASSIC: "1", XWEN_DENSE_MM_CLASSIC: "1", XWEN_MV_EXT_CLASSIC: "1", XWEN_MOE_SHEXP_CLASSIC: "1" }
     : candidateEnv();
   await preflight(`${tier} candidate dump`);
   console.log(`  generating ${tier} candidate (Fused, ${tier === "strict" ? "classic mv fallback" : "mm_id"}) -> ${candPath}`);

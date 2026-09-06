@@ -35,7 +35,10 @@ pub use hc::{
     hc_silu_quarter, hc_write,
 };
 pub use mm_id::mul_mm_id;
-pub use moe_glue::{moe_epilogue, moe_router, moe_router_supported};
+pub use moe_glue::{
+    moe_epilogue, moe_epilogue_shexp, moe_router, moe_router_supported, moe_shexp_fused_supported,
+    moe_shexp_gate_up,
+};
 pub use mv_ext::{matmul_mv_ext, mv_ext_supported};
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
 pub use q8::matmul_q8;
@@ -743,6 +746,85 @@ pub fn moe_glue_classic() -> bool {
 pub fn moe_dual() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var_os("XWEN_MOE_DUAL").is_some())
+}
+
+/// `XWEN_MOE_SHEXP_CLASSIC=1` reverts the FUSED SHARED EXPERT —
+/// `ops::moe_shexp_gate_up` and `ops::moe_epilogue_shexp`, which fold the gate
+/// gemv, the up gemv, the SwiGLU activation, the `ffn_gate_inp_shexp` logit and
+/// the down gemv into one dispatch plus a shexp-aware epilogue — back to the
+/// five-dispatch chain: two `QLinear` matmuls, `ops::silu_mul`, a third matmul
+/// and a candle f32 gemv, feeding the plain `ops::moe_epilogue`.
+///
+/// Counted per MoE LAYER that is four launches against zero (the fused pair's
+/// second kernel replaces an epilogue the block dispatched anyway), which on
+/// Flash-Next is 192 of a decode token's ~1356 and on the 35B-A3B 160.
+///
+/// This is a real kill switch and NOT a bit-identity anchor, unlike the rest of
+/// the moe_glue family: all three fused dot products reassociate (the gate/up
+/// rows fold per-thread `simd_sum` partials where `QMatMul`'s gemv folds its
+/// own partition, and the shexp-aware epilogue's routed combine folds over a
+/// full simdgroup where `kernel_moe_epilogue` folds over `next_pow2(top_k/2)`
+/// lanes). `kernel_moe_epilogue` itself is untouched and still runs, bitwise,
+/// wherever this path does not — which is what keeps the strict parity tier's
+/// anchor intact. Bounded at rel_l2 <= 1e-5 against an f32 host reference
+/// (`shexp_fused_matches_reference`); the strict tier pins this switch on both
+/// sides and mm/decode/ppl grade the fused path.
+///
+/// `XWEN_MOE_GLUE_CLASSIC` disables it too, and not merely by convention: that
+/// switch takes the whole block off the epilogue path, and the fused shared
+/// expert lives inside it. [`moe_shexp_fused_enabled`] reads both.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`moe_glue_classic`, `hc_gate_classic`): any value enables it — only leaving
+/// it unset keeps the fused pair.
+pub fn moe_shexp_classic() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_MOE_SHEXP_CLASSIC").is_some())
+}
+
+/// Token count an MoE block must be at or below for its shared expert to take
+/// the FUSED PAIR instead of the five-dispatch chain.
+///
+/// Same trade as [`HC_GATE_FUSED_MAX_N`], for the same reason: the fused pair
+/// re-reads the token's activation row in every threadgroup of its first
+/// kernel, and its second kernel widens the epilogue's threadgroups, so it only
+/// pays where launch latency dominates. A decode step is one token; the ceiling
+/// sits at the small-batch window's width so a short speculative or ragged
+/// batch takes it too.
+///
+/// INCLUSIVE, like [`HC_GATE_FUSED_MAX_N`] and unlike [`HC_SPLIT_MAX_N`]: the
+/// pair covers `n == 1`, which an exclusive bound of 1 would exclude.
+pub const MOE_SHEXP_FUSED_MAX_N: usize = 8;
+
+/// Effective fused-shared-expert ceiling: `XWEN_MOE_SHEXP_FUSED_MAX_N=<n>`
+/// overrides the default (an A/B knob for the threshold — `0` keeps every batch
+/// on the five-dispatch chain, which is what the kill switch does and is why
+/// [`moe_shexp_fused_enabled`] reads both; a large value pushes the pair into
+/// prefill token counts it was not shaped for, where the projections take the
+/// dense cooperative-tensor gemm instead). Value-parsed, read once and cached;
+/// unset or unparsable falls back to [`MOE_SHEXP_FUSED_MAX_N`].
+pub fn moe_shexp_fused_max_n() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("XWEN_MOE_SHEXP_FUSED_MAX_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(MOE_SHEXP_FUSED_MAX_N)
+    })
+}
+
+/// Whether the fused shared expert can run in this process AT ALL: neither kill
+/// switch set, and a ceiling that admits at least one token. `MoeBlock::forward`
+/// asks this and then compares its own token count against
+/// [`moe_shexp_fused_max_n`]; the parity dump's `moe_shexp` provenance label
+/// asks it alone.
+///
+/// One function because the two must agree — `XWEN_MOE_SHEXP_FUSED_MAX_N=0`
+/// disables the pair exactly as either kill switch does, so a label that read
+/// only the switches would stamp "fused" on a dump that never dispatched the
+/// kernels.
+pub fn moe_shexp_fused_enabled() -> bool {
+    !moe_glue_classic() && !moe_shexp_classic() && moe_shexp_fused_max_n() >= 1
 }
 
 /// `XWEN_ATTN_GLUE_CLASSIC=1` reverts the attention glue — the fused softplus

@@ -19,7 +19,7 @@
 //! grandfathering any would let a genuinely stale dump pass.
 
 /// The schema version the current `logits-dump` writes.
-pub const PROVENANCE_SCHEMA_VERSION: u32 = 10;
+pub const PROVENANCE_SCHEMA_VERSION: u32 = 11;
 
 /// One provenance field's introduction record.
 pub struct ProvenanceField {
@@ -109,6 +109,19 @@ pub struct ProvenanceField {
 /// checkpoints the gate runs have no hyper-connections at all, so this is a
 /// configured-path label there and NO tier pins it. Pin it alongside
 /// `XWEN_HC_CLASSIC` when Flash-Next becomes gradeable (docs/parity.md).
+///
+/// Version 11: moe_shexp (the MoE shared expert's DECODE route: "fused" for the
+/// pair that folds the gate gemv, the up gemv, the SwiGLU activation, the
+/// `ffn_gate_inp_shexp` logit and the down gemv into one dispatch plus a
+/// shexp-aware epilogue, "classic" for the five-dispatch chain under
+/// XWEN_MOE_SHEXP_CLASSIC, XWEN_MOE_GLUE_CLASSIC or a zero
+/// XWEN_MOE_SHEXP_FUSED_MAX_N — `ops::moe_shexp_fused_enabled` is the one
+/// predicate both the label and `MoeBlock::forward` ask). Grandfather
+/// "classic": no pre-v11 binary had the kernels. Load-bearing and bounded, like
+/// `hc_gate` — all three fused dots reassociate — but UNLIKE it this one is
+/// gradeable today, the 35B-A3B being an MoE checkpoint the gate runs: the
+/// strict tier pins XWEN_MOE_SHEXP_CLASSIC on both sides and mm/decode/ppl
+/// grade the fused route.
 pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "moe_impl",
@@ -208,6 +221,11 @@ pub const PROVENANCE_FIELDS: &[ProvenanceField] = &[
     ProvenanceField {
         name: "hc_gate",
         introduced: 10,
+        grandfather: Some("classic"),
+    },
+    ProvenanceField {
+        name: "moe_shexp",
+        introduced: 11,
         grandfather: Some("classic"),
     },
 ];
@@ -316,6 +334,12 @@ mod tests {
         assert_eq!(resolve_missing("hc_gate", 1), Some("classic"));
         assert_eq!(resolve_missing("hc_gate", 9), Some("classic"));
         assert_eq!(resolve_missing("hc_gate", 10), None);
+        // moe_shexp introduced at v11: v1..v10 dumps missing it resolve to
+        // "classic" (no earlier binary had the fused shared expert); missing at
+        // v11 fails.
+        assert_eq!(resolve_missing("moe_shexp", 1), Some("classic"));
+        assert_eq!(resolve_missing("moe_shexp", 10), Some("classic"));
+        assert_eq!(resolve_missing("moe_shexp", 11), None);
         // Baseline fields are required at every version.
         assert_eq!(resolve_missing("attn_dtype", 1), None);
         assert_eq!(resolve_missing("attn_dtype", 2), None);

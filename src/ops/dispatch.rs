@@ -2914,6 +2914,368 @@ pub(crate) fn run_moe_epilogue(
     Ok(output_tensor(dst, mdev, out_length, (seq, n_out)))
 }
 
+/// Threads per threadgroup in `kernel_moe_shexp_gate_up`: four simdgroups. It
+/// does NOT have to divide the row's q8_0 block count — the leftover threads
+/// carry a `+0.0` accumulator through the reduction — so the only width bound is
+/// the register one below.
+pub(crate) const MOE_SHEXP_THREADS: usize = 128;
+
+/// q8_0 blocks of the activation row ONE thread of `kernel_moe_shexp_gate_up`
+/// stages in registers. It bounds the kernel's register footprint (32 floats per
+/// block), so a `hidden` wider than
+/// `MOE_SHEXP_THREADS * MOE_SHEXP_MAX_BLK_PER_THREAD` blocks is refused rather
+/// than run at whatever occupancy it would spill to.
+pub(crate) const MOE_SHEXP_MAX_BLK_PER_THREAD: usize = 2;
+
+/// Bottleneck rows one threadgroup of `kernel_moe_shexp_gate_up` computes,
+/// sharing one staged pass over the token's activation. The per-row accumulator
+/// PAIRS are registers, which is what bounds it.
+pub(crate) const MOE_SHEXP_ROWS_PER_TG: usize = 4;
+
+/// q8_0 blocks of one `ffn_down_shexp` row a single lane of
+/// `kernel_moe_epilogue_shexp` folds. Its reduction is one simdgroup, so this
+/// bounds `inner` at `32 * MOE_SHEXP_MAX_BLK_PER_LANE`.
+pub(crate) const MOE_SHEXP_MAX_BLK_PER_LANE: usize = 4;
+
+/// Threads per threadgroup in `kernel_moe_epilogue_shexp`: exactly one
+/// simdgroup, keeping it inside `kernel_moe_epilogue`'s single-`simd_sum`
+/// contract.
+pub(crate) const MOE_SHEXP_EPILOGUE_THREADS: usize = 32;
+
+/// Whether `kernel_moe_shexp_gate_up` covers this half of the geometry: q8_0
+/// planes, and a `hidden` that is a whole number of q8_0 blocks no wider than
+/// the staged register array. `inner` only has to be positive here — the row
+/// tiling handles a ragged last tile — but the epilogue half bounds it, and
+/// callers ask [`moe_shexp_fused_supported`], which is the conjunction.
+fn moe_shexp_gate_up_supported(hidden: usize, inner: usize, dtype: GgmlDType) -> bool {
+    if dtype != GgmlDType::Q8_0 {
+        return false;
+    }
+    let block = GgmlDType::Q8_0.block_size();
+    if hidden == 0 || !hidden.is_multiple_of(block) {
+        return false;
+    }
+    inner > 0 && hidden / block <= MOE_SHEXP_THREADS * MOE_SHEXP_MAX_BLK_PER_THREAD
+}
+
+/// Whether `kernel_moe_epilogue_shexp` covers this half of the geometry: a q8_0
+/// down plane, an `inner` that is a whole number of q8_0 blocks its single
+/// simdgroup can fold, and a `top_k` that fits that same simdgroup.
+fn moe_shexp_epilogue_supported(inner: usize, top_k: usize, dtype: GgmlDType) -> bool {
+    if dtype != GgmlDType::Q8_0 {
+        return false;
+    }
+    let block = GgmlDType::Q8_0.block_size();
+    if inner == 0 || !inner.is_multiple_of(block) {
+        return false;
+    }
+    if inner / block > MOE_SHEXP_EPILOGUE_THREADS * MOE_SHEXP_MAX_BLK_PER_LANE {
+        return false;
+    }
+    top_k > 0 && top_k <= MOE_SHEXP_EPILOGUE_THREADS
+}
+
+/// Whether the fused shared-expert decode pair covers this block's geometry and
+/// weight dtypes. The bounds are the kernels', so a block outside them keeps the
+/// five-dispatch chain rather than failing; both launchers ask this too and
+/// `bail!` when it says no.
+pub(crate) fn moe_shexp_fused_supported(
+    hidden: usize,
+    inner: usize,
+    top_k: usize,
+    gate_dtype: GgmlDType,
+    up_dtype: GgmlDType,
+    down_dtype: GgmlDType,
+) -> bool {
+    gate_dtype == up_dtype
+        && up_dtype == down_dtype
+        && moe_shexp_gate_up_supported(hidden, inner, gate_dtype)
+        && moe_shexp_epilogue_supported(inner, top_k, down_dtype)
+}
+
+/// Matches the Metal `moe_shexp_gate_up_args` struct (src/ops/moe_glue.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeShexpGateUpArgs {
+    hidden: i32,
+    inner: i32,
+    nblk: i32,
+    n_row_tg: i32,
+}
+
+/// Matches the Metal `moe_epilogue_shexp_args` struct (src/ops/moe_glue.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeEpilogueShexpArgs {
+    top_k: i32,
+    n_out: i32,
+    inner: i32,
+    nblk_inner: i32,
+}
+
+/// The first half of the fused shared expert against
+/// `kernel_moe_shexp_gate_up` (moe_glue.metal): the gate and up q8_0
+/// projections, their SwiGLU activation and the scalar gate logit, in ONE
+/// dispatch where the classic chain spends four.
+///
+/// `x` is the block's normed input `[n, hidden]` f32, `gate` and `up` the
+/// `[inner, hidden]` q8_0 projections' raw bytes, and `gate_inp` the
+/// `ffn_gate_inp_shexp` row as the `[hidden, 1]` f32 tensor `SharedExpert`
+/// already holds pre-transposed. Returns `(h [n, inner], logit [n, 1])` — the
+/// ungated bottleneck and the RAW pre-sigmoid gate logit, which is what
+/// [`run_moe_epilogue_shexp`] takes (the sigmoid stays in the epilogue, where it
+/// was before this path existed).
+///
+/// Geometry outside [`moe_shexp_fused_supported`] is an error here: the caller
+/// asks that predicate first and keeps the classic chain when it says no.
+pub(crate) fn run_moe_shexp_gate_up(
+    x: &Tensor,
+    gate: &QuantPlane,
+    up: &QuantPlane,
+    gate_inp: &Tensor,
+    hidden: usize,
+    inner: usize,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("moe_shexp_gate_up requires the activation on a Metal device");
+    };
+    if !moe_shexp_gate_up_supported(hidden, inner, gate.dtype) || up.dtype != gate.dtype {
+        bail!(
+            "moe_shexp_gate_up does not cover hidden {hidden}, inner {inner}, {:?}/{:?} weights",
+            gate.dtype,
+            up.dtype
+        );
+    }
+    let (n, row) = x
+        .dims2()
+        .map_err(|e| anyhow::anyhow!("the activation must be rank-2 [n, hidden]: {e}"))?;
+    if n == 0 {
+        bail!("moe_shexp_gate_up needs at least one token");
+    }
+    if row != hidden {
+        bail!("the activation is {row} wide, expected hidden = {hidden}");
+    }
+    for (what, plane) in [("gate", gate), ("up", up)] {
+        if plane.out_dim != inner || plane.in_dim != hidden {
+            bail!(
+                "the shared expert's {what} projection is [{}, {}], expected [{inner}, {hidden}]",
+                plane.out_dim,
+                plane.in_dim
+            );
+        }
+        // The kernel indexes the weight through `device const moe_block_q8_0 *`,
+        // whose alignment is that of its `half` scale. Rows are whole blocks, so
+        // only the bound base offset could break it.
+        if !plane.base_off.is_multiple_of(2) {
+            bail!(
+                "moe_shexp_gate_up needs a 2-byte-aligned {what} view, got offset {}",
+                plane.base_off
+            );
+        }
+        check_plane_fits(plane, &format!("shared expert {what} projection"))?;
+    }
+    check_f32(x, &[n, hidden], "shared expert activation")?;
+    check_f32(gate_inp, &[hidden, 1], "shared expert gate row")?;
+    if !x.device().same_device(gate_inp.device()) {
+        bail!("the shared expert gate row must live on the same Metal device as the activation");
+    }
+    let n_h = checked_elems(&[n, inner], "moe_shexp bottleneck")?;
+    glue_index_fits_i32(checked_elems(&[n, hidden], "moe_shexp activation")?)?;
+    glue_index_fits_i32(n_h)?;
+
+    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), "kernel_moe_shexp_gate_up")?;
+    if pipeline.max_total_threads_per_threadgroup() < MOE_SHEXP_THREADS {
+        bail!(
+            "kernel_moe_shexp_gate_up needs {MOE_SHEXP_THREADS} threads per threadgroup, the \
+             pipeline allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    check_delta_simd_width(&pipeline, "kernel_moe_shexp_gate_up")?;
+
+    let h = mdev.new_buffer(n_h, DType::F32, "moe_shexp_h")?;
+    let logit = mdev.new_buffer(n, DType::F32, "moe_shexp_logit")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("the shared expert activation is not on a Metal device");
+    };
+    let (r_guard, r_layout) = gate_inp.storage_and_layout();
+    let Storage::Metal(r_storage) = &*r_guard else {
+        bail!("the shared expert gate row is not on a Metal device");
+    };
+
+    let n_row_tg = inner.div_ceil(MOE_SHEXP_ROWS_PER_TG);
+    let args = MoeShexpGateUpArgs {
+        hidden: hidden as i32,
+        inner: inner as i32,
+        nblk: (hidden / GgmlDType::Q8_0.block_size()) as i32,
+        n_row_tg: n_row_tg as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
+        encoder.set_input_buffer(2, Some(&gate.buffer), gate.base_off);
+        encoder.set_input_buffer(3, Some(&up.buffer), up.base_off);
+        encoder.set_input_buffer(4, Some(r_storage.buffer()), f32_off(r_layout));
+        encoder.set_output_buffer(5, Some(&h), 0);
+        encoder.set_output_buffer(6, Some(&logit), 0);
+        // One threadgroup per (row tile of the two projections, token), plus one
+        // for the gate logit.
+        encoder.dispatch_thread_groups(
+            mtl_size!(n_row_tg + 1, n, 1),
+            mtl_size!(MOE_SHEXP_THREADS, 1, 1),
+        );
+    }
+    drop(x_guard);
+    drop(r_guard);
+
+    let h = output_tensor(h, mdev, n_h, (n, inner));
+    let logit = output_tensor(logit, mdev, n, (n, 1));
+    Ok((h, logit))
+}
+
+/// The second half of the fused shared expert against
+/// `kernel_moe_epilogue_shexp` (moe_glue.metal): `run_moe_epilogue`'s block tail
+/// with the shared expert's q8_0 DOWN projection folded into the same pass, so
+/// the classic chain's separate down gemv disappears.
+///
+/// `down` is the uncombined routed projection `[seq, top_k, n_out]` f32, `w` the
+/// routing weights `[seq, top_k]`, `h` [`run_moe_shexp_gate_up`]'s bottleneck
+/// `[seq, inner]`, `down_shexp` the `[n_out, inner]` q8_0 projection's raw bytes
+/// and `gate` the RAW `[seq, 1]` gate logit. Returns `[seq, n_out]`.
+///
+/// BOUNDED, not bitwise, against `run_moe_epilogue` — the routed combine folds
+/// over 32 lanes here where that kernel folds over `next_pow2(top_k/2)` — which
+/// is why this is a second kernel and `kernel_moe_epilogue` is left alone as the
+/// strict tier's anchor.
+pub(crate) fn run_moe_epilogue_shexp(
+    down: &Tensor,
+    weights: &Tensor,
+    h: &Tensor,
+    down_shexp: &QuantPlane,
+    gate: &Tensor,
+    inner: usize,
+) -> Result<Tensor> {
+    let cdev = down.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("moe_epilogue_shexp requires down on a Metal device");
+    };
+
+    let (seq, top_k, n_out) = down
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("down must be rank-3 [seq, top_k, n_out]: {e}"))?;
+    if seq == 0 || top_k == 0 || n_out == 0 {
+        bail!("moe_epilogue_shexp needs a non-empty down projection");
+    }
+    if !moe_shexp_epilogue_supported(inner, top_k, down_shexp.dtype) {
+        bail!(
+            "moe_epilogue_shexp does not cover inner {inner}, top_k {top_k}, {:?} weights",
+            down_shexp.dtype
+        );
+    }
+    if down_shexp.out_dim != n_out || down_shexp.in_dim != inner {
+        bail!(
+            "the shared expert's down projection is [{}, {}], expected [{n_out}, {inner}]",
+            down_shexp.out_dim,
+            down_shexp.in_dim
+        );
+    }
+    if !down_shexp.base_off.is_multiple_of(2) {
+        bail!(
+            "moe_epilogue_shexp needs a 2-byte-aligned down view, got offset {}",
+            down_shexp.base_off
+        );
+    }
+    check_plane_fits(down_shexp, "shared expert down projection")?;
+    check_f32(down, &[seq, top_k, n_out], "down")?;
+    check_f32(weights, &[seq, top_k], "weights")?;
+    check_f32(h, &[seq, inner], "shared expert bottleneck")?;
+    check_f32(gate, &[seq, 1], "gate")?;
+    for (name, t) in [("weights", weights), ("bottleneck", h), ("gate", gate)] {
+        if !down.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as down");
+        }
+    }
+    if !combine_index_fits_i32(seq, top_k, n_out) {
+        bail!(
+            "moe_epilogue_shexp index math overflows i32: seq={seq} top_k={top_k} n_out={n_out} \
+             (seq*top_k*n_out = {} exceeds i32::MAX)",
+            (seq as i64) * (top_k as i64) * (n_out as i64)
+        );
+    }
+    glue_index_fits_i32(checked_elems(&[seq, inner], "moe_shexp bottleneck")?)?;
+
+    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), "kernel_moe_epilogue_shexp")?;
+    if pipeline.max_total_threads_per_threadgroup() < MOE_SHEXP_EPILOGUE_THREADS {
+        bail!(
+            "kernel_moe_epilogue_shexp needs {MOE_SHEXP_EPILOGUE_THREADS} threads per \
+             threadgroup, the pipeline allows {}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    check_delta_simd_width(&pipeline, "kernel_moe_epilogue_shexp")?;
+
+    let out_length = checked_elems(&[seq, n_out], "moe_epilogue_shexp output")?;
+    let dst = mdev.new_buffer(out_length, DType::F32, "moe_epilogue_shexp")?;
+
+    let (down_guard, down_layout) = down.storage_and_layout();
+    let Storage::Metal(down_storage) = &*down_guard else {
+        bail!("down is not on a Metal device");
+    };
+    let (w_guard, w_layout) = weights.storage_and_layout();
+    let Storage::Metal(w_storage) = &*w_guard else {
+        bail!("weights is not on a Metal device");
+    };
+    let (h_guard, h_layout) = h.storage_and_layout();
+    let Storage::Metal(h_storage) = &*h_guard else {
+        bail!("the shared expert bottleneck is not on a Metal device");
+    };
+    let (g_guard, g_layout) = gate.storage_and_layout();
+    let Storage::Metal(g_storage) = &*g_guard else {
+        bail!("gate is not on a Metal device");
+    };
+
+    let args = MoeEpilogueShexpArgs {
+        top_k: top_k as i32,
+        n_out: n_out as i32,
+        inner: inner as i32,
+        nblk_inner: (inner / GgmlDType::Q8_0.block_size()) as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(down_storage.buffer()), f32_off(down_layout));
+        encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
+        encoder.set_input_buffer(3, Some(h_storage.buffer()), f32_off(h_layout));
+        encoder.set_input_buffer(4, Some(&down_shexp.buffer), down_shexp.base_off);
+        encoder.set_input_buffer(5, Some(g_storage.buffer()), f32_off(g_layout));
+        encoder.set_output_buffer(6, Some(&dst), 0);
+        // kernel_moe_epilogue's grid, unchanged: one threadgroup per output
+        // element, now a full simdgroup wide.
+        encoder.dispatch_thread_groups(
+            mtl_size!(out_length, 1, 1),
+            mtl_size!(MOE_SHEXP_EPILOGUE_THREADS, 1, 1),
+        );
+    }
+    drop(down_guard);
+    drop(w_guard);
+    drop(h_guard);
+    drop(g_guard);
+
+    Ok(output_tensor(dst, mdev, out_length, (seq, n_out)))
+}
+
 /// Matches the Metal `attn_gate_args` struct (src/ops/attn_glue.metal).
 /// `#[repr(C)]` pins the layout byte-for-byte.
 #[repr(C)]

@@ -329,3 +329,369 @@ kernel void kernel_moe_epilogue(
         dst[did] = value + shared;
     }
 }
+
+// ---------------------------------------------------------------------------
+// The fused shared expert at decode.
+//
+// A decode step's MoE block spends five of its twelve dispatches on the shared
+// expert: the gate gemv, the up gemv, `kernel_moe_silu_mul`, the down gemv, and
+// the `ffn_gate_inp_shexp` scalar logit — four candle launches and one vendored
+// one, moving 1.74 MB each at the production geometry where the routed experts
+// next door move thirty. Below a handful of tokens that is five launch
+// latencies for bytes the machine streams in a fraction of one.
+//
+// These two kernels swallow all five:
+//   kernel_moe_shexp_gate_up    gate gemv + up gemv + silu*mul + the gate logit
+//   kernel_moe_epilogue_shexp   the epilogue with the shexp DOWN gemv folded in
+// leaving ONE dispatch for the shared expert's projections and none for its
+// glue — the sigmoid, the broadcast multiply and the routed+shared add were
+// already inside `kernel_moe_epilogue`, and the down projection now joins them.
+// Four launches per MoE layer disappear.
+//
+// ROUNDING: BOUNDED, not bitwise, unlike everything above it in this file. All
+// three dot products are reassociated — the gate/up rows fold per-thread
+// partials through `simd_sum` where candle's `QMatMul` gemv folds its own
+// partition, the shexp down row folds per-lane block partials the same way, and
+// the routed combine runs over 32 lanes here where `kernel_moe_epilogue` runs
+// over `next_pow2(top_k/2)` of them. That is why `kernel_moe_epilogue` is NOT
+// touched and stays the strict tier's bitwise anchor: this is a separate kernel
+// taken only at `n <= XWEN_MOE_SHEXP_FUSED_MAX_N`, and `XWEN_MOE_SHEXP_CLASSIC`
+// (or `XWEN_MOE_GLUE_CLASSIC`, which disables the whole epilogue path) restores
+// the five-dispatch chain. The bound is rel_l2 <= 1e-5 against an f32 host
+// reference (`shexp_fused_matches_reference`).
+//
+// LAYOUT, and why neither kernel is one threadgroup per token. The refuted
+// XWEN_MOE_DUAL experiment is the constraint that shapes both: merging two
+// bandwidth-saturating `mul_mv_id` gathers into one dispatch LOST 3 tok/s on
+// the 35B, because the parallelism was what kept memory requests outstanding.
+// Nothing here merges a saturating dispatch — the routed gemms are untouched —
+// and both kernels keep a wide grid anyway. The first launches one threadgroup
+// per (row tile of the two projections, token) plus one for the gate logit,
+// exactly as `kernel_hc_gate_down` carries its injection head as an extra
+// threadgroup. The second inherits `kernel_moe_epilogue`'s grid unchanged: one
+// threadgroup per OUTPUT ELEMENT, `n * n_out` of them, each reading one
+// `ffn_down_shexp` row — so the whole 1.74 MB plane is read once per token
+// across a grid that was already there, with no extra allocation. What the
+// first kernel re-reads across its threadgroups is the token's activation row,
+// 10 KiB at the production geometry: a cache working set, not a bandwidth cost.
+//
+// The two partition k differently because their reductions are different
+// lengths. kernel_moe_shexp_gate_up splits each `hidden/32`-block row across
+// MOE_SHEXP_THREADS threads, interleaved, and stages the token's own slice of
+// the activation in registers ONCE — reused across the tile's rows, both
+// planes, and the gate logit, which is the whole reason the logit rides along
+// for free. kernel_moe_epilogue_shexp gives its single simdgroup the
+// `inner/32`-block row, at most MOE_SHEXP_MAX_BLK_PER_LANE blocks per lane.
+// ---------------------------------------------------------------------------
+
+// block_q8_0 (ggml-common.h): one f16 delta then 32 int8 quants, 34 bytes. All
+// three shared-expert projections ship q8_0 on every shipped checkpoint, and
+// these kernels read them directly rather than through QMatMul. Declared here
+// rather than shared with q8.metal or hc.metal: each vendored .metal is its own
+// runtime-compiled library.
+#define QK8_0 32
+typedef struct {
+    half   d;
+    int8_t qs[QK8_0];
+} moe_block_q8_0;
+
+// Threads per threadgroup in kernel_moe_shexp_gate_up: four simdgroups. It does
+// NOT have to divide the row's block count — a hidden of 2560 is 80 blocks and
+// leaves threads 80.. with a +0.0 accumulator, an exact additive identity — so
+// the host admits any hidden that is a whole number of blocks. Mirrored by
+// dispatch.rs MOE_SHEXP_THREADS.
+#define MOE_SHEXP_THREADS 128
+#define MOE_SHEXP_SIMDGROUPS (MOE_SHEXP_THREADS / 32)
+
+// q8_0 blocks of the activation row one thread of kernel_moe_shexp_gate_up
+// owns, at most. It stages them in registers (32 floats each) and the row dots,
+// both planes and the gate logit all read them from there, so this bounds the
+// kernel's register footprint; the host refuses a hidden wider than
+// MOE_SHEXP_THREADS * MOE_SHEXP_MAX_BLK_PER_THREAD blocks (8192 elements).
+// Production is 80 blocks (Flash-Next, hidden 2560) or 64 (35B-A3B, hidden
+// 2048) — one per thread. Mirrored by dispatch.rs
+// MOE_SHEXP_MAX_BLK_PER_THREAD.
+#define MOE_SHEXP_MAX_BLK_PER_THREAD 2
+
+// Bottleneck rows one threadgroup of kernel_moe_shexp_gate_up computes. Each
+// costs two full-width dots against the same staged activation, so the rows
+// share one pass over it and pay only their own weight bytes; the per-row
+// accumulator pairs are registers, which is what bounds this. Mirrored by
+// dispatch.rs MOE_SHEXP_ROWS_PER_TG.
+#define MOE_SHEXP_ROWS_PER_TG 4
+
+// q8_0 blocks of one `ffn_down_shexp` row a single lane of
+// kernel_moe_epilogue_shexp owns, at most — the host refuses an `inner` wider
+// than 32 * MOE_SHEXP_MAX_BLK_PER_LANE (4096). Production is 20 blocks (inner
+// 640) or 16 (inner 512), so under one per lane. Mirrored by dispatch.rs
+// MOE_SHEXP_MAX_BLK_PER_LANE.
+#define MOE_SHEXP_MAX_BLK_PER_LANE 4
+
+// Matches dispatch.rs MoeShexpGateUpArgs (#[repr(C)]).
+typedef struct {
+    int32_t hidden;
+    int32_t inner;
+    int32_t nblk;     // hidden / QK8_0, the q8_0 blocks in one gate/up row
+    int32_t n_row_tg; // ceil(inner / MOE_SHEXP_ROWS_PER_TG)
+} moe_shexp_gate_up_args;
+
+// The shared expert's two input projections, their SwiGLU activation, and the
+// scalar gate logit, in one launch.
+//
+// Grid is (n_row_tg + 1, n): threadgroup `g < n_row_tg` computes bottleneck rows
+// `g * MOE_SHEXP_ROWS_PER_TG ..` of `silu(gate . x) * (up . x)`, and the LAST
+// one computes `<x[s], ffn_gate_inp_shexp>`. Every threadgroup stages its own
+// slice of the token's activation row; that is a read of 10 KiB per threadgroup
+// at the production geometry, cheaper than a second launch.
+//
+// Outputs: `h[t, inner]`, the ungated SwiGLU bottleneck, and `logit[t, 1]`, the
+// RAW pre-sigmoid gate logit — the sigmoid stays in the epilogue, where it
+// already was.
+kernel void kernel_moe_shexp_gate_up(
+        constant moe_shexp_gate_up_args & args [[buffer(0)]],
+        device const float * x                 [[buffer(1)]],
+        device const moe_block_q8_0 * gate_w   [[buffer(2)]],
+        device const moe_block_q8_0 * up_w     [[buffer(3)]],
+        device const float * gate_inp          [[buffer(4)]],
+        device       float * h                 [[buffer(5)]],
+        device       float * logit             [[buffer(6)]],
+        uint2 tgid    [[threadgroup_position_in_grid]],
+        uint2 tpos    [[thread_position_in_threadgroup]],
+        uint  sgid    [[simdgroup_index_in_threadgroup]],
+        uint  lane    [[thread_index_in_simdgroup]],
+        uint  sgcount [[simdgroups_per_threadgroup]]) {
+    // The launch is `MOE_SHEXP_THREADS x 1`, so the row component is the whole
+    // partition (the vector arity has to match tgid's).
+    const uint tid = tpos.x;
+    // One slot per (row of this tile, simdgroup), for each of the two
+    // projections. The gate-logit threadgroup reduces one value and uses the
+    // first MOE_SHEXP_SIMDGROUPS slots of the first array.
+    threadgroup float partial_g[MOE_SHEXP_ROWS_PER_TG * MOE_SHEXP_SIMDGROUPS];
+    threadgroup float partial_u[MOE_SHEXP_ROWS_PER_TG * MOE_SHEXP_SIMDGROUPS];
+
+    const size_t row = (size_t) tgid.y * (size_t) args.hidden;
+
+    // This thread's slice of the token's activation, staged once. The loop bound
+    // is the compile-time maximum with a runtime guard inside, so every index
+    // into the array is a constant after unrolling and the array stays in
+    // registers.
+    float xv[MOE_SHEXP_MAX_BLK_PER_THREAD * QK8_0];
+    for (int p = 0; p < MOE_SHEXP_MAX_BLK_PER_THREAD; ++p) {
+        const int blk = (int) tid + p * MOE_SHEXP_THREADS;
+        if (blk < args.nblk) {
+            const size_t base = row + (size_t) blk * QK8_0;
+            for (int i = 0; i < QK8_0; ++i) {
+                xv[p * QK8_0 + i] = x[base + (size_t) i];
+            }
+        }
+    }
+
+    if ((int) tgid.x < args.n_row_tg) {
+        // MOE_SHEXP_ROWS_PER_TG rows of BOTH projections against the staged
+        // activation. Per q8_0 block: an f32 dot of the 32 quants, then one
+        // multiply by the block's delta — the same form as
+        // kernel_mul_mv_q8_0_f32_attn (q8.metal).
+        const int row0 = (int) tgid.x * MOE_SHEXP_ROWS_PER_TG;
+        float acc_g[MOE_SHEXP_ROWS_PER_TG];
+        float acc_u[MOE_SHEXP_ROWS_PER_TG];
+        for (short r = 0; r < MOE_SHEXP_ROWS_PER_TG; ++r) {
+            acc_g[r] = 0.0f;
+            acc_u[r] = 0.0f;
+        }
+        for (short r = 0; r < MOE_SHEXP_ROWS_PER_TG; ++r) {
+            // Uniform across the threadgroup: a ragged last tile skips the same
+            // rows in every thread, so nothing below diverges.
+            if (row0 + (int) r >= args.inner) {
+                continue;
+            }
+            device const moe_block_q8_0 * grow =
+                gate_w + (size_t) (row0 + (int) r) * (size_t) args.nblk;
+            device const moe_block_q8_0 * urow =
+                up_w + (size_t) (row0 + (int) r) * (size_t) args.nblk;
+            for (int p = 0; p < MOE_SHEXP_MAX_BLK_PER_THREAD; ++p) {
+                const int blk = (int) tid + p * MOE_SHEXP_THREADS;
+                if (blk < args.nblk) {
+                    device const moe_block_q8_0 * bg = grow + blk;
+                    device const moe_block_q8_0 * bu = urow + blk;
+                    // packed_char4, not char4: the quants start two bytes into
+                    // a 34-byte block, so a naturally aligned vector load would
+                    // fault.
+                    device const packed_char4 * qg = (device const packed_char4 *) bg->qs;
+                    device const packed_char4 * qu = (device const packed_char4 *) bu->qs;
+                    float sg = 0.0f;
+                    float su = 0.0f;
+                    for (short i = 0; i < QK8_0 / 4; ++i) {
+                        const packed_char4 vg = qg[i];
+                        const packed_char4 vu = qu[i];
+                        const float x0 = xv[p * QK8_0 + 4 * i + 0];
+                        const float x1 = xv[p * QK8_0 + 4 * i + 1];
+                        const float x2 = xv[p * QK8_0 + 4 * i + 2];
+                        const float x3 = xv[p * QK8_0 + 4 * i + 3];
+                        sg += (float) vg.x * x0;
+                        sg += (float) vg.y * x1;
+                        sg += (float) vg.z * x2;
+                        sg += (float) vg.w * x3;
+                        su += (float) vu.x * x0;
+                        su += (float) vu.y * x1;
+                        su += (float) vu.z * x2;
+                        su += (float) vu.w * x3;
+                    }
+                    acc_g[r] += sg * (float) bg->d;
+                    acc_u[r] += su * (float) bu->d;
+                }
+            }
+        }
+        // One reduction pass for all MOE_SHEXP_ROWS_PER_TG rows: the per-row
+        // simd_sums need no barrier between them, only the single fence before
+        // the serial fold.
+        for (short r = 0; r < MOE_SHEXP_ROWS_PER_TG; ++r) {
+            const float sum_g = simd_sum(acc_g[r]);
+            const float sum_u = simd_sum(acc_u[r]);
+            if (lane == 0) {
+                partial_g[(uint) r * MOE_SHEXP_SIMDGROUPS + sgid] = sum_g;
+                partial_u[(uint) r * MOE_SHEXP_SIMDGROUPS + sgid] = sum_u;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < MOE_SHEXP_ROWS_PER_TG && row0 + (int) tid < args.inner) {
+            float tot_g = 0.0f;
+            float tot_u = 0.0f;
+            for (uint u = 0; u < sgcount; ++u) {
+                tot_g += partial_g[tid * MOE_SHEXP_SIMDGROUPS + u];
+                tot_u += partial_u[tid * MOE_SHEXP_SIMDGROUPS + u];
+            }
+            // kernel_moe_silu_mul's expression verbatim (silu_mul.metal):
+            // candle's usilu, `x / (1 + exp(-x))`, then a separately rounded
+            // multiply. The chain this replaces runs exactly these two lines.
+            const float s = tot_g / (1 + exp(-tot_g));
+            h[(size_t) tgid.y * (size_t) args.inner + (size_t) (row0 + (int) tid)] = s * tot_u;
+        }
+        return;
+    }
+
+    // The gate logit, `<x[t], ffn_gate_inp_shexp>`. Accumulated per thread while
+    // the activation is still in registers, over the same block partition the
+    // projections used.
+    float acc = 0.0f;
+    for (int p = 0; p < MOE_SHEXP_MAX_BLK_PER_THREAD; ++p) {
+        const int blk = (int) tid + p * MOE_SHEXP_THREADS;
+        if (blk < args.nblk) {
+            const size_t base = (size_t) blk * QK8_0;
+            for (int i = 0; i < QK8_0; ++i) {
+                acc += gate_inp[base + (size_t) i] * xv[p * QK8_0 + i];
+            }
+        }
+    }
+    const float lane_sum = simd_sum(acc);
+    if (lane == 0) {
+        partial_g[sgid] = lane_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint u = 0; u < sgcount; ++u) {
+            total += partial_g[u];
+        }
+        logit[tgid.y] = total;
+    }
+}
+
+// Threads per threadgroup in kernel_moe_epilogue_shexp: ONE simdgroup, so both
+// of its reductions stay inside the single `simd_sum` that
+// kernel_moe_epilogue's contract is built on. Mirrored by dispatch.rs
+// MOE_SHEXP_EPILOGUE_THREADS.
+#define MOE_SHEXP_EPILOGUE_THREADS 32
+
+// Matches dispatch.rs MoeEpilogueShexpArgs (#[repr(C)]).
+typedef struct {
+    int32_t top_k;
+    int32_t n_out;
+    int32_t inner;
+    int32_t nblk_inner; // inner / QK8_0, the q8_0 blocks in one down_shexp row
+} moe_epilogue_shexp_args;
+
+// dst[s, c] = (Σ_k down[s, k, c] * w[s, k])
+//           + (Σ_j down_shexp[c, j] * h[s, j]) * sigmoid(gate[s]).
+//
+// kernel_moe_epilogue with the shared expert's DOWN projection folded in: the
+// `shexp` operand it read as a materialized `[seq, n_out]` tensor is computed
+// here instead, one row of `ffn_down_shexp` per threadgroup against
+// kernel_moe_shexp_gate_up's bottleneck `h`. The grid is unchanged — one
+// threadgroup per output element — so the plane is read exactly once per token
+// across a grid that already existed, and nothing is allocated for it.
+//
+// Widened from `next_pow2(top_k/2)` threads to a full simdgroup, because the
+// down row needs `inner/32` blocks folded where the routed combine needs only
+// `top_k` terms; both reductions are one `simd_sum` over the same 32 lanes,
+// each in its own accumulator. That widening is why this kernel is bounded and
+// not bitwise against kernel_moe_epilogue, which is left untouched as the
+// strict tier's anchor.
+kernel void kernel_moe_epilogue_shexp(
+        constant moe_epilogue_shexp_args & args  [[buffer(0)]],
+        device const float * down                [[buffer(1)]],
+        device const float * w                   [[buffer(2)]],
+        device const float * h                   [[buffer(3)]],
+        device const moe_block_q8_0 * down_shexp [[buffer(4)]],
+        device const float * gate                [[buffer(5)]],
+        device       float * dst                 [[buffer(6)]],
+        uint lane   [[thread_index_in_threadgroup]],
+        uint dst_id [[threadgroup_position_in_grid]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+    const int top_k = args.top_k;
+    const int n_out = args.n_out;
+    const int did = (int) dst_id;
+    const int s = did / n_out;
+    const int c = did % n_out;
+    const int down_base = s * top_k * n_out + c;
+    const int sk_base = s * top_k;
+
+    // The routed combine, in its own accumulator — kernel_moe_epilogue's loop
+    // over a wider partition.
+    float routed = 0.0f;
+    for (int k = (int) lane; k < top_k; k += MOE_SHEXP_EPILOGUE_THREADS) {
+        float d = down[down_base + k * n_out];
+        float ww = w[sk_base + k];
+        float r3 = d * ww;
+        routed = routed + r3;
+    }
+
+    // The shared expert's down projection for this output channel, in a second
+    // accumulator. The loop bound is the compile-time maximum with a runtime
+    // guard inside, so the whole walk unrolls.
+    device const moe_block_q8_0 * drow =
+        down_shexp + (size_t) c * (size_t) args.nblk_inner;
+    const size_t hbase = (size_t) s * (size_t) args.inner;
+    float shexp = 0.0f;
+    for (int p = 0; p < MOE_SHEXP_MAX_BLK_PER_LANE; ++p) {
+        const int b = (int) lane + p * MOE_SHEXP_EPILOGUE_THREADS;
+        if (b < args.nblk_inner) {
+            device const moe_block_q8_0 * blk = drow + b;
+            // packed_char4, not char4: the quants start two bytes into a
+            // 34-byte block.
+            device const packed_char4 * q4 = (device const packed_char4 *) blk->qs;
+            const size_t hb = hbase + (size_t) b * QK8_0;
+            float sumq = 0.0f;
+            for (short i = 0; i < QK8_0 / 4; ++i) {
+                const packed_char4 v = q4[i];
+                sumq += (float) v.x * h[hb + (size_t) (4 * i + 0)];
+                sumq += (float) v.y * h[hb + (size_t) (4 * i + 1)];
+                sumq += (float) v.z * h[hb + (size_t) (4 * i + 2)];
+                sumq += (float) v.w * h[hb + (size_t) (4 * i + 3)];
+            }
+            shexp += sumq * (float) blk->d;
+        }
+    }
+
+    routed = simd_sum(routed);
+    shexp = simd_sum(shexp);
+    if (lane == 0) {
+        // candle's usigmoid: recip(1 + exp(-x)) — a true divide, no fma. The
+        // same expression kernel_moe_epilogue applies to the same raw logit.
+        const float g = gate[s];
+        const float sig = 1.0f / (1.0f + exp(-g));
+        // candle's bmul, then badd in the block's order: routed + shared.
+        const float shared = shexp * sig;
+        dst[did] = routed + shared;
+    }
+}

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use candle_core::Tensor;
+use candle_core::quantized::GgmlDType;
 
+use crate::gguf::QuantPlane;
 use crate::ops::dispatch;
 
 /// Fused MoE routing decision against the vendored `moe_glue.metal` router — the
@@ -51,6 +53,71 @@ pub fn moe_epilogue(
     gate: &Tensor,
 ) -> Result<Tensor> {
     dispatch::run_moe_epilogue(down, weights, shexp, gate)
+}
+
+/// Whether the FUSED SHARED EXPERT covers this block's geometry and weight
+/// dtypes — the pair of kernels that swallow the shared expert's five decode
+/// dispatches (gate gemv, up gemv, `silu_mul`, down gemv, gate logit) into one
+/// plus a shexp-aware epilogue. The bounds are the kernels': q8_0 planes
+/// throughout, a `hidden` that is a whole number of q8_0 blocks no wider than
+/// the first kernel's staged register array, an `inner` its epilogue's single
+/// simdgroup can fold, and a `top_k` inside that simdgroup. A block outside them
+/// keeps the five-dispatch chain rather than failing. See
+/// [`moe_shexp_gate_up`] for the split.
+pub fn moe_shexp_fused_supported(
+    hidden: usize,
+    inner: usize,
+    top_k: usize,
+    gate_dtype: GgmlDType,
+    up_dtype: GgmlDType,
+    down_dtype: GgmlDType,
+) -> bool {
+    dispatch::moe_shexp_fused_supported(hidden, inner, top_k, gate_dtype, up_dtype, down_dtype)
+}
+
+/// The shared expert's gate and up q8_0 projections, their SwiGLU activation and
+/// the scalar gate logit, in ONE dispatch (`kernel_moe_shexp_gate_up`) where the
+/// classic chain spends four: two `QMatMul` gemvs, `ops::silu_mul`, and the
+/// candle f32 matmul against `ffn_gate_inp_shexp`.
+///
+/// `x` is the block's normed input `[n, hidden]` f32, `gate` / `up` the
+/// `[inner, hidden]` q8_0 projections' raw bytes, and `gate_inp` the
+/// `ffn_gate_inp_shexp` row as the `[hidden, 1]` f32 tensor `SharedExpert`
+/// already holds. Returns `(h [n, inner], logit [n, 1])` — the UNGATED SwiGLU
+/// bottleneck and the RAW pre-sigmoid gate logit, both of which
+/// [`moe_epilogue_shexp`] consumes. Metal only; the caller's kill switches are
+/// `XWEN_MOE_SHEXP_CLASSIC` and `XWEN_MOE_GLUE_CLASSIC`.
+pub fn moe_shexp_gate_up(
+    x: &Tensor,
+    gate: &QuantPlane,
+    up: &QuantPlane,
+    gate_inp: &Tensor,
+    hidden: usize,
+    inner: usize,
+) -> Result<(Tensor, Tensor)> {
+    dispatch::run_moe_shexp_gate_up(x, gate, up, gate_inp, hidden, inner)
+}
+
+/// [`moe_epilogue`] with the shared expert's q8_0 DOWN projection folded into
+/// the same pass (`kernel_moe_epilogue_shexp`):
+/// `dst[s,c] = Σ_k down[s,k,c] * w[s,k] + (Σ_j down_shexp[c,j] * h[s,j]) *
+/// sigmoid(gate[s])`. `h` is [`moe_shexp_gate_up`]'s bottleneck `[seq, inner]`
+/// and `down_shexp` the `[n_out, inner]` projection's raw bytes; the materialized
+/// `shexp` tensor [`moe_epilogue`] takes is never built.
+///
+/// BOUNDED, not bitwise, against [`moe_epilogue`]: this kernel's routed combine
+/// folds over a full simdgroup where that one folds over
+/// `next_pow2(top_k/2)` lanes. [`moe_epilogue`] itself is untouched and stays
+/// the bit-identical anchor the strict parity tier runs. Metal only.
+pub fn moe_epilogue_shexp(
+    down: &Tensor,
+    weights: &Tensor,
+    h: &Tensor,
+    down_shexp: &QuantPlane,
+    gate: &Tensor,
+    inner: usize,
+) -> Result<Tensor> {
+    dispatch::run_moe_epilogue_shexp(down, weights, h, down_shexp, gate, inner)
 }
 
 #[cfg(test)]
@@ -506,5 +573,633 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("> 32"), "unexpected error: {err}");
+    }
+
+    // ---------------------------------------------------------------- shexp
+
+    /// The two production geometries the fused shared expert ships for:
+    /// `(hidden, inner, top_k, n_expert)` on Flash-Next and on the 35B-A3B.
+    /// `n_out` is `hidden` — the shared expert projects back to the block width.
+    const SHEXP_CASES: [(usize, usize, usize); 2] = [(2560, 640, 10), (2048, 512, 8)];
+
+    /// The shared expert's three q8_0 planes plus everything the two comparison
+    /// paths need from them.
+    ///
+    /// Each plane VIEWS the last `n_out` rows of a `[skip + n_out, k]` upload,
+    /// so `skip > 0` is the nonzero-`base_off` case with no other change; the
+    /// `QTensor` alongside is a quantization of exactly those rows, and the
+    /// constructor asserts the two agree byte for byte, which is what makes the
+    /// classic chain a fair comparison rather than a second quantizer.
+    struct ShexpWeights {
+        gate: QuantPlane,
+        up: QuantPlane,
+        down: QuantPlane,
+        gate_q: std::sync::Arc<candle_core::quantized::QTensor>,
+        up_q: std::sync::Arc<candle_core::quantized::QTensor>,
+        down_q: std::sync::Arc<candle_core::quantized::QTensor>,
+        /// The `QTensor`s that own the planes' uploads. Never read — held only
+        /// so the allocations stay claimed. A `QuantPlane` retains the MTLBuffer
+        /// OBJECT, not candle's pool `Arc`, so dropping the tensor that made the
+        /// upload lets the pool hand the same memory to the next `new_buffer`
+        /// and a later kernel writes its output over these weights (the trap
+        /// `dispatch::testutil::build_stack` documents).
+        _owners: Vec<std::sync::Arc<candle_core::quantized::QTensor>>,
+        gate_deq: Vec<f32>,
+        up_deq: Vec<f32>,
+        down_deq: Vec<f32>,
+        /// `ffn_gate_inp_shexp` in the `[hidden, 1]` shape `SharedExpert` holds.
+        gate_inp: Tensor,
+        gate_inp_v: Vec<f32>,
+    }
+
+    /// A `[skip + n_out, k]` q8_0 weight uploaded once, handed back as a plane
+    /// whose `base_off` skips the first `skip` rows, plus the `QTensor` and the
+    /// dequantized f32 of exactly the rows the plane covers.
+    fn build_q8_plane(
+        dev: &Device,
+        skip: usize,
+        n_out: usize,
+        k: usize,
+        data: &[f32],
+    ) -> (
+        QuantPlane,
+        std::sync::Arc<candle_core::quantized::QTensor>,
+        std::sync::Arc<candle_core::quantized::QTensor>,
+        Vec<f32>,
+    ) {
+        use candle_core::quantized::{QStorage, QTensor};
+        let cpu = Device::Cpu;
+        assert_eq!(data.len(), (skip + n_out) * k);
+        let whole = QTensor::quantize(
+            &Tensor::from_vec(data.to_vec(), (skip + n_out, k), &cpu).unwrap(),
+            GgmlDType::Q8_0,
+        )
+        .unwrap();
+        // Quantizing the tail rows alone must give the same bytes: q8_0 blocks
+        // are 32 contiguous elements of one row, so a row's encoding cannot
+        // depend on the rows above it. Asserted rather than assumed, because it
+        // is what lets the offset plane and the QTensor below be compared.
+        let tail = QTensor::quantize(
+            &Tensor::from_vec(data[skip * k..].to_vec(), (n_out, k), &cpu).unwrap(),
+            GgmlDType::Q8_0,
+        )
+        .unwrap();
+        let row_bytes = k / GgmlDType::Q8_0.block_size() * GgmlDType::Q8_0.type_size();
+        assert_eq!(
+            &whole.data().unwrap()[skip * row_bytes..],
+            &tail.data().unwrap()[..],
+            "a q8_0 row's bytes must not depend on the rows above it"
+        );
+        let deq = tail
+            .dequantize(&cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        // Upload the WHOLE weight once and retain its buffer before the storage
+        // moves into a QTensor, the way the loader does.
+        let storage = QStorage::from_data(whole.data().unwrap(), dev, GgmlDType::Q8_0).unwrap();
+        let QStorage::Metal(qms) = &storage else {
+            panic!("expected Metal quantized storage")
+        };
+        let buffer = std::sync::Arc::new(qms.buffer().clone());
+        // MOVED into a QTensor the caller must keep alive: the plane's
+        // `buffer` above is a retained handle on the same MTLBuffer, NOT a
+        // clone of candle's pool `Arc`, so once this tensor drops the pool is
+        // free to hand the same memory out again — and the next kernel output
+        // allocated from it lands on top of these weights.
+        let owner = std::sync::Arc::new(QTensor::new(storage, (skip + n_out, k)).unwrap());
+
+        // The classic chain's QMatMul reads its own upload of the same bytes.
+        let tail_storage = QStorage::from_data(tail.data().unwrap(), dev, GgmlDType::Q8_0).unwrap();
+        let qtensor = std::sync::Arc::new(QTensor::new(tail_storage, (n_out, k)).unwrap());
+
+        (
+            QuantPlane {
+                buffer,
+                base_off: skip * row_bytes,
+                dtype: GgmlDType::Q8_0,
+                out_dim: n_out,
+                in_dim: k,
+            },
+            owner,
+            qtensor,
+            deq,
+        )
+    }
+
+    /// Rows generated AHEAD of the ones a plane covers, so that `skip` only
+    /// moves where the plane's view starts and never which values it sees: every
+    /// plane views the LAST `n_out` rows of its data, and the slice handed to
+    /// `build_q8_plane` begins `skip` rows before them. That is what makes the
+    /// offset and zero-offset weight sets comparable bit for bit.
+    const SHEXP_PAD_ROWS: usize = 5;
+
+    fn shexp_weights(dev: &Device, skip: usize, hidden: usize, inner: usize) -> ShexpWeights {
+        use crate::ops::dispatch::testutil::pseudo_random;
+        assert!(skip <= SHEXP_PAD_ROWS);
+        let head = SHEXP_PAD_ROWS - skip;
+        let gate_all = pseudo_random(
+            (SHEXP_PAD_ROWS + inner) * hidden,
+            0xA1 + hidden as u64,
+            -0.06,
+            0.06,
+        );
+        let up_all = pseudo_random(
+            (SHEXP_PAD_ROWS + inner) * hidden,
+            0xA2 + hidden as u64,
+            -0.05,
+            0.05,
+        );
+        let down_all = pseudo_random(
+            (SHEXP_PAD_ROWS + hidden) * inner,
+            0xA3 + hidden as u64,
+            -0.04,
+            0.04,
+        );
+        let (gate, gate_own, gate_q, gate_deq) =
+            build_q8_plane(dev, skip, inner, hidden, &gate_all[head * hidden..]);
+        let (up, up_own, up_q, up_deq) =
+            build_q8_plane(dev, skip, inner, hidden, &up_all[head * hidden..]);
+        let (down, down_own, down_q, down_deq) =
+            build_q8_plane(dev, skip, hidden, inner, &down_all[head * inner..]);
+        let gate_inp_v = pseudo_random(hidden, 0xA4 + hidden as u64, -0.1, 0.1);
+        let gate_inp = Tensor::from_vec(gate_inp_v.clone(), (hidden, 1), &Device::Cpu)
+            .unwrap()
+            .to_device(dev)
+            .unwrap();
+        ShexpWeights {
+            gate,
+            up,
+            down,
+            gate_q,
+            up_q,
+            down_q,
+            _owners: vec![gate_own, up_own, down_own],
+            gate_deq,
+            up_deq,
+            down_deq,
+            gate_inp,
+            gate_inp_v,
+        }
+    }
+
+    /// The whole fused pair on the host, in f32, over the dequantized weights
+    /// the kernels read: `h = silu(gate . x) * (up . x)`, the raw gate logit,
+    /// and the epilogue's `routed + (down_shexp . h) * sigmoid(logit)`. Every
+    /// dot is a sequential f32 sum, which is a different association from every
+    /// path under test — that is the point: the bound holds all of them.
+    #[allow(clippy::too_many_arguments)]
+    fn host_shexp(
+        w: &ShexpWeights,
+        x: &[f32],
+        routed: &[f32],
+        rw: &[f32],
+        n: usize,
+        hidden: usize,
+        inner: usize,
+        top_k: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut h = vec![0f32; n * inner];
+        let mut logit = vec![0f32; n];
+        let mut dst = vec![0f32; n * hidden];
+        for s in 0..n {
+            let xr = &x[s * hidden..(s + 1) * hidden];
+            for r in 0..inner {
+                let mut g = 0f32;
+                let mut u = 0f32;
+                let grow = &w.gate_deq[r * hidden..(r + 1) * hidden];
+                let urow = &w.up_deq[r * hidden..(r + 1) * hidden];
+                for ((gw, uw), xv) in grow.iter().zip(urow).zip(xr) {
+                    g += gw * xv;
+                    u += uw * xv;
+                }
+                // kernel_moe_silu_mul's silu, then a separate multiply.
+                h[s * inner + r] = (g / (1.0 + (-g).exp())) * u;
+            }
+            let mut acc = 0f32;
+            for (gw, xv) in w.gate_inp_v.iter().zip(xr) {
+                acc += gw * xv;
+            }
+            logit[s] = acc;
+            let sig = 1.0f32 / (1.0 + (-logit[s]).exp());
+            for c in 0..hidden {
+                let mut combined = 0f32;
+                for k in 0..top_k {
+                    combined += routed[(s * top_k + k) * hidden + c] * rw[s * top_k + k];
+                }
+                let mut shared = 0f32;
+                for j in 0..inner {
+                    shared += w.down_deq[c * inner + j] * h[s * inner + j];
+                }
+                dst[s * hidden + c] = combined + shared * sig;
+            }
+        }
+        (h, logit, dst)
+    }
+
+    /// The five-dispatch chain the fused pair replaces, over the SAME quantized
+    /// bytes: two `QMatMul` gemvs, `ops::silu_mul`, a third gemv, the candle f32
+    /// gate matmul, and the plain `moe_epilogue`. Spelled out rather than called
+    /// into moe.rs so an edit to the production chain shows up here as a failure
+    /// instead of silently moving the target.
+    fn classic_shexp_chain(
+        w: &ShexpWeights,
+        x: &Tensor,
+        routed: &Tensor,
+        weights: &Tensor,
+    ) -> Tensor {
+        use candle_core::Module;
+        let mm = |qt: &std::sync::Arc<candle_core::quantized::QTensor>, x: &Tensor| {
+            candle_core::quantized::QMatMul::from_arc(qt.clone())
+                .unwrap()
+                .forward(x)
+                .unwrap()
+        };
+        let g = mm(&w.gate_q, x);
+        let u = mm(&w.up_q, x);
+        let h = crate::ops::silu_mul(&g, &u).unwrap();
+        let shexp = mm(&w.down_q, &h);
+        let logit = x.matmul(&w.gate_inp).unwrap();
+        moe_epilogue(routed, weights, &shexp, &logit).unwrap()
+    }
+
+    fn assert_rel_l2(got: &Tensor, want: &[f32], tol: f32, what: &str) {
+        use crate::ops::dispatch::testutil::rel_l2;
+        let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(g.len(), want.len(), "{what}: length");
+        // A non-finite element is its own diagnosis — a NaN rel_l2 says only
+        // "somewhere" — so name the first one and which side it is on.
+        for (i, (a, b)) in g.iter().zip(want).enumerate() {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{what}: element {i} is not finite (got {a}, want {b})"
+            );
+        }
+        let e = rel_l2(&g, want);
+        assert!(e <= tol, "{what}: rel_l2 {e} > {tol}");
+    }
+
+    /// The fused shared expert at both production geometries, across the token
+    /// window it is taken in, graded against BOTH an f32 host reference and the
+    /// five-dispatch chain it replaces.
+    ///
+    /// Bounded, never bitwise: all three dots are reassociated (the gate/up rows
+    /// fold per-thread `simd_sum` partials where `QMatMul`'s gemv folds its own
+    /// partition, the shexp down row folds per-lane block partials, and the
+    /// routed combine runs over 32 lanes where `kernel_moe_epilogue` runs over
+    /// `next_pow2(top_k/2)`). The HOST bound — rel_l2 <= 1e-5 — is the one that
+    /// holds the pair. The cross-path bound is looser above one token for the
+    /// same reason the fused hc gate's is
+    /// (`gate_fused_matches_reference`): `QMatMul` takes its matmul kernel past
+    /// one row and stages half activation tiles, so above n = 1 it is the
+    /// CLASSIC side that moves away from the oracle, measured ~2.2e-4 at the
+    /// Flash-Next geometry where the pair stays near 1e-6. That is asserted
+    /// below rather than assumed, so the loose 5e-4 cross-path bound cannot
+    /// quietly absorb a regression in the pair itself.
+    #[test]
+    fn shexp_fused_matches_reference() {
+        use crate::ops::dispatch::testutil::{pseudo_random, rel_l2};
+        let device = metal_device().unwrap();
+
+        for (hidden, inner, top_k) in SHEXP_CASES {
+            let w = shexp_weights(&device, 0, hidden, inner);
+            assert!(moe_shexp_fused_supported(
+                hidden,
+                inner,
+                top_k,
+                GgmlDType::Q8_0,
+                GgmlDType::Q8_0,
+                GgmlDType::Q8_0
+            ));
+
+            for &n in &[1usize, 3, 8] {
+                let case = format!("hidden={hidden} inner={inner} top_k={top_k} n={n}");
+                let x_v = pseudo_random(n * hidden, 0xB1 + n as u64, -2.0, 2.0);
+                let routed_v = pseudo_random(n * top_k * hidden, 0xB2 + n as u64, -1.0, 1.0);
+                let rw_v = pseudo_random(n * top_k, 0xB3 + n as u64, 0.0, 1.0);
+
+                let x = on_device(x_v.clone(), (n, hidden), &device);
+                let routed = Tensor::from_vec(routed_v.clone(), (n, top_k, hidden), &Device::Cpu)
+                    .unwrap()
+                    .to_device(&device)
+                    .unwrap();
+                let rw = on_device(rw_v.clone(), (n, top_k), &device);
+
+                let (h, logit) =
+                    moe_shexp_gate_up(&x, &w.gate, &w.up, &w.gate_inp, hidden, inner).unwrap();
+                assert_eq!(h.dims(), &[n, inner]);
+                assert_eq!(logit.dims(), &[n, 1]);
+                let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, inner).unwrap();
+                assert_eq!(dst.dims(), &[n, hidden]);
+                assert_eq!(dst.dtype(), DType::F32);
+
+                let (want_h, want_logit, want_dst) =
+                    host_shexp(&w, &x_v, &routed_v, &rw_v, n, hidden, inner, top_k);
+                assert_rel_l2(&h, &want_h, 1e-5, &format!("fused shexp h {case}"));
+                assert_rel_l2(
+                    &logit,
+                    &want_logit,
+                    1e-5,
+                    &format!("fused shexp logit {case}"),
+                );
+                assert_rel_l2(&dst, &want_dst, 1e-5, &format!("fused shexp dst {case}"));
+
+                let classic = classic_shexp_chain(&w, &x, &routed, &rw);
+                let classic_v: Vec<f32> = classic.flatten_all().unwrap().to_vec1().unwrap();
+                let tol = if n == 1 { 1e-6 } else { 5e-4 };
+                assert_rel_l2(
+                    &dst,
+                    &classic_v,
+                    tol,
+                    &format!("fused shexp vs the classic chain {case}"),
+                );
+                if n > 1 {
+                    // Which side the cross-path gap belongs to, stated as an
+                    // assertion rather than a comment: past one row `QMatMul`
+                    // takes its matmul kernel and stages half activation tiles,
+                    // so the CLASSIC chain leaves the oracle (measured ~2e-4 at
+                    // the Flash-Next geometry) while the fused pair stays at the
+                    // ~1e-6 the assertion above holds it to. If that ever
+                    // inverts, the loose cross-path bound above is hiding a
+                    // regression in the pair and this fails first.
+                    let fused_err = rel_l2(
+                        &dst.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                        &want_dst,
+                    );
+                    let classic_err = rel_l2(&classic_v, &want_dst);
+                    assert!(
+                        fused_err <= classic_err,
+                        "{case}: the fused pair sits {fused_err} from the f32 oracle where the \
+                         classic chain sits {classic_err} — the pair must be the closer of the two"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every operand is resolved through a start offset — the planes through
+    /// `base_off`, the tensors through `start_offset * 4` — and the tests above
+    /// build all of them at zero. A dropped offset would silently read the
+    /// buffer head, so run the same arithmetic over offset views and over
+    /// copies at zero and require the two BITWISE.
+    #[test]
+    fn shexp_fused_honours_offset_views() {
+        use crate::ops::dispatch::testutil::pseudo_random;
+        let device = metal_device().unwrap();
+        let (hidden, inner, top_k) = SHEXP_CASES[1];
+        let (n, skip) = (3usize, 5usize);
+
+        // Same source values in both weight sets; only the plane offset differs.
+        let flat = shexp_weights(&device, 0, hidden, inner);
+        let offset = shexp_weights(&device, skip, hidden, inner);
+        // The offset planes must really carry one, or this test proves nothing.
+        assert_ne!(offset.gate.base_off, 0);
+        assert_ne!(offset.down.base_off, 0);
+
+        let big_x = on_device(
+            pseudo_random((n + skip) * hidden, 0xC1, -2.0, 2.0),
+            (n + skip, hidden),
+            &device,
+        );
+        let x_view = big_x.narrow(0, skip, n).unwrap();
+        assert_ne!(
+            x_view.layout().start_offset(),
+            0,
+            "the narrowed view must actually carry an offset"
+        );
+        let x_copy = on_device(
+            x_view.flatten_all().unwrap().to_vec1().unwrap(),
+            (n, hidden),
+            &device,
+        );
+
+        let routed = Tensor::from_vec(
+            pseudo_random(n * top_k * hidden, 0xC2, -1.0, 1.0),
+            (n, top_k, hidden),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .to_device(&device)
+        .unwrap();
+        let rw = on_device(
+            pseudo_random(n * top_k, 0xC3, 0.0, 1.0),
+            (n, top_k),
+            &device,
+        );
+
+        let run = |w: &ShexpWeights, x: &Tensor, offset_h: bool| {
+            let (h, logit) =
+                moe_shexp_gate_up(x, &w.gate, &w.up, &w.gate_inp, hidden, inner).unwrap();
+            // Offset the bottleneck too: pad it with a leading row and hand the
+            // epilogue the narrowed view of that.
+            let h = if offset_h {
+                let padded = Tensor::cat(
+                    &[&Tensor::zeros((1, inner), DType::F32, &device).unwrap(), &h],
+                    0,
+                )
+                .unwrap();
+                let view = padded.narrow(0, 1, n).unwrap();
+                assert_ne!(view.layout().start_offset(), 0);
+                view
+            } else {
+                h
+            };
+            let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, inner).unwrap();
+            (dst, logit)
+        };
+
+        let (v_dst, v_logit) = run(&offset, &x_view, true);
+        let (c_dst, c_logit) = run(&flat, &x_copy, false);
+        assert_f32_bits_eq(&v_dst, &c_dst, "fused shexp over offset views");
+        assert_f32_bits_eq(&v_logit, &c_logit, "fused shexp logit over offset views");
+    }
+
+    /// Geometry outside the kernels' bounds is refused by the predicate the
+    /// caller asks — which is what keeps such a block on the five-dispatch
+    /// chain — and the launchers hard-error rather than reading past an array
+    /// their partition does not cover. Each case below breaks exactly one bound.
+    #[test]
+    fn shexp_fused_refuses_unsupported_geometry() {
+        use crate::ops::dispatch::testutil::pseudo_random;
+        let device = metal_device().unwrap();
+        let q8 = GgmlDType::Q8_0;
+        let (hidden, inner, top_k) = SHEXP_CASES[0];
+
+        assert!(moe_shexp_fused_supported(hidden, inner, top_k, q8, q8, q8));
+        // Any dtype but q8_0: the kernels read that block layout directly.
+        assert!(!moe_shexp_fused_supported(
+            hidden,
+            inner,
+            top_k,
+            GgmlDType::Q4K,
+            q8,
+            q8
+        ));
+        assert!(!moe_shexp_fused_supported(
+            hidden,
+            inner,
+            top_k,
+            q8,
+            q8,
+            GgmlDType::Q4K
+        ));
+        // A hidden that is not a whole number of q8_0 blocks: the staged
+        // activation slice would straddle one.
+        assert!(!moe_shexp_fused_supported(
+            hidden + 16,
+            inner,
+            top_k,
+            q8,
+            q8,
+            q8
+        ));
+        // ... and one wider than the staged register array (128 threads x 2
+        // blocks = 8192 elements).
+        assert!(moe_shexp_fused_supported(8192, inner, top_k, q8, q8, q8));
+        assert!(!moe_shexp_fused_supported(
+            8192 + 32,
+            inner,
+            top_k,
+            q8,
+            q8,
+            q8
+        ));
+        // An inner outside the epilogue simdgroup's per-lane block bound
+        // (32 lanes x 4 blocks = 4096), or not a whole number of blocks.
+        assert!(moe_shexp_fused_supported(hidden, 4096, top_k, q8, q8, q8));
+        assert!(!moe_shexp_fused_supported(
+            hidden,
+            4096 + 32,
+            top_k,
+            q8,
+            q8,
+            q8
+        ));
+        assert!(!moe_shexp_fused_supported(
+            hidden,
+            inner + 16,
+            top_k,
+            q8,
+            q8,
+            q8
+        ));
+        // A top_k past one simdgroup has no reduction.
+        assert!(moe_shexp_fused_supported(hidden, inner, 32, q8, q8, q8));
+        assert!(!moe_shexp_fused_supported(hidden, inner, 33, q8, q8, q8));
+        assert!(!moe_shexp_fused_supported(hidden, inner, 0, q8, q8, q8));
+
+        // The launchers refuse what the predicate refuses. The planes here are
+        // real q8_0 weights of a covered shape; the GEOMETRY passed alongside
+        // them is the unsupported one.
+        let (h_small, i_small, k_small) = (256usize, 128usize, 4usize);
+        let w = shexp_weights(&device, 0, h_small, i_small);
+        let x = on_device(
+            pseudo_random(h_small, 0xD1, -1.0, 1.0),
+            (1, h_small),
+            &device,
+        );
+        assert!(
+            moe_shexp_gate_up(&x, &w.gate, &w.up, &w.gate_inp, h_small + 16, i_small).is_err(),
+            "a hidden that is not a whole number of blocks"
+        );
+        assert!(
+            moe_shexp_gate_up(&x, &w.down, &w.up, &w.gate_inp, h_small, i_small).is_err(),
+            "a plane whose shape contradicts the geometry"
+        );
+        let (h, logit) =
+            moe_shexp_gate_up(&x, &w.gate, &w.up, &w.gate_inp, h_small, i_small).unwrap();
+        let routed = Tensor::zeros((1, k_small, h_small), DType::F32, &device).unwrap();
+        let rw = Tensor::zeros((1, k_small), DType::F32, &device).unwrap();
+        assert!(moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, i_small).is_ok());
+        assert!(
+            moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, i_small + 16).is_err(),
+            "an inner that is not a whole number of blocks"
+        );
+        assert!(
+            moe_epilogue_shexp(&routed, &rw, &h, &w.gate, &logit, i_small).is_err(),
+            "a down plane whose shape contradicts the geometry"
+        );
+
+        // A plane whose declared shape AGREES with the geometry but outruns its
+        // own allocation. Nothing else in the call carries the weight's length —
+        // it is raw bytes, not a tensor — so without the buffer bound the
+        // kernels would read off the end of device memory.
+        let lying_gate = QuantPlane {
+            out_dim: i_small * 4,
+            ..w.gate.clone()
+        };
+        assert!(
+            moe_shexp_gate_up(&x, &lying_gate, &w.up, &w.gate_inp, h_small, i_small * 4).is_err()
+        );
+        let lying_down = QuantPlane {
+            out_dim: h_small * 4,
+            ..w.down.clone()
+        };
+        let wide_routed = Tensor::zeros((1, k_small, h_small * 4), DType::F32, &device).unwrap();
+        assert!(moe_epilogue_shexp(&wide_routed, &rw, &h, &lying_down, &logit, i_small).is_err());
+    }
+
+    /// The fused pair's launch geometry is spelled out in BOTH languages — a
+    /// `#define` shaping the kernels' threadgroups and register arrays, and the
+    /// host constants that size the grid and refuse a geometry those bounds do
+    /// not cover. Nothing links them, and moving only one side would produce a
+    /// launch whose threads and arrays disagree with no diagnostic, so this test
+    /// is the link (same shape as `router_geometry_matches_metal`).
+    #[test]
+    fn moe_shexp_constants_match_metal() {
+        const SRC: &str = include_str!("moe_glue.metal");
+        let parse = |name: &str| -> usize {
+            let mut found = None;
+            for line in SRC.lines() {
+                if let Some(rest) = line.trim().strip_prefix(&format!("#define {name} ")) {
+                    assert!(
+                        found.is_none(),
+                        "moe_glue.metal defines {name} more than once"
+                    );
+                    found = Some(
+                        rest.trim()
+                            .parse::<usize>()
+                            .unwrap_or_else(|_| panic!("{name} must be a plain integer literal")),
+                    );
+                }
+            }
+            found.unwrap_or_else(|| panic!("moe_glue.metal must #define {name}"))
+        };
+        for (name, host) in [
+            ("MOE_SHEXP_THREADS", dispatch::MOE_SHEXP_THREADS),
+            (
+                "MOE_SHEXP_MAX_BLK_PER_THREAD",
+                dispatch::MOE_SHEXP_MAX_BLK_PER_THREAD,
+            ),
+            ("MOE_SHEXP_ROWS_PER_TG", dispatch::MOE_SHEXP_ROWS_PER_TG),
+            (
+                "MOE_SHEXP_MAX_BLK_PER_LANE",
+                dispatch::MOE_SHEXP_MAX_BLK_PER_LANE,
+            ),
+            (
+                "MOE_SHEXP_EPILOGUE_THREADS",
+                dispatch::MOE_SHEXP_EPILOGUE_THREADS,
+            ),
+        ] {
+            assert_eq!(
+                parse(name),
+                host,
+                "moe_glue.metal's {name} and dispatch.rs's ({host}) must agree"
+            );
+        }
+        // The epilogue's reduction is ONE simd_sum, so its threadgroup can never
+        // be wider than a simdgroup — that is the contract it inherits from
+        // kernel_moe_epilogue, not a tunable.
+        assert_eq!(
+            dispatch::MOE_SHEXP_EPILOGUE_THREADS,
+            32,
+            "the shexp-aware epilogue folds a single 32-lane simdgroup"
+        );
+        // And the first kernel's threadgroup must be a whole number of them, or
+        // its cross-simdgroup fold walks slots no simdgroup wrote.
+        assert_eq!(dispatch::MOE_SHEXP_THREADS % 32, 0);
     }
 }

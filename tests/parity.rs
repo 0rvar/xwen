@@ -302,6 +302,12 @@ struct Provenance {
     /// "up-only" the split A/B arms). Introduced at schema version 9 with
     /// grandfather "classic".
     hc_gemm: Option<String>,
+    /// The MoE shared expert's DECODE route ("fused" for the pair that folds
+    /// the gate gemv, the up gemv, the SwiGLU activation, the
+    /// `ffn_gate_inp_shexp` logit and the down gemv into one dispatch plus a
+    /// shexp-aware epilogue, "classic" for the five-dispatch chain). Introduced
+    /// at schema version 11 with grandfather "classic".
+    moe_shexp: Option<String>,
 }
 
 impl Provenance {
@@ -512,6 +518,16 @@ fn parse_provenance(v: &Value) -> Result<Option<Provenance>> {
                 Some(d) => Some(
                     d.as_str()
                         .context("provenance `hc_gemm` is not a string")?
+                        .to_string(),
+                ),
+                None => None,
+            },
+            // v11: absent in pre-v11 dumps (grandfathered to "classic" by the
+            // version-aware check); present-but-not-a-string is malformed.
+            moe_shexp: match p.get("moe_shexp") {
+                Some(d) => Some(
+                    d.as_str()
+                        .context("provenance `moe_shexp` is not a string")?
                         .to_string(),
                 ),
                 None => None,
@@ -998,6 +1014,20 @@ fn check_hc_gemm(p: &Provenance, side: &str, want: &str) -> Result<()> {
     check_field(p, side, "hc_gemm", p.hc_gemm.as_deref(), want)
 }
 
+/// `want` is "classic" for the Reference-oracle side (its ReferenceExperts
+/// hands out no uncombined projection, so the epilogue path the fused shared
+/// expert lives in never opens) and for strict-tier candidates
+/// (`XWEN_MOE_SHEXP_CLASSIC=1`), "fused" for the mm/decode/ppl candidates.
+/// Load-bearing like `check_dense_mm`: all three of the fused pair's dot
+/// products reassociate, so it is bounded-close and cannot sit under the
+/// bitwise tier. The DECODE tier is the one that actually dispatches the pair —
+/// mm and ppl are prefill and run above its token ceiling, where this labels
+/// the configured route exactly as `dense_mm` does on the 35B. Introduced at
+/// schema version 11 with grandfather "classic".
+fn check_moe_shexp(p: &Provenance, side: &str, want: &str) -> Result<()> {
+    check_field(p, side, "moe_shexp", p.moe_shexp.as_deref(), want)
+}
+
 /// Enforce the attention DECODE-projection path recorded in one side's provenance.
 /// The reference oracle and strict-tier candidates run under `XWEN_ATTN_F32=1`,
 /// so the whole block is the dequant-f32 QMatMul → "f32-bypass" (`want = Some`).
@@ -1106,6 +1136,10 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
             check_act_l2(p, "reference dump", "classic")?;
             check_shexp_gemm(p, "reference dump", "classic")?;
             check_hc_gemm(p, "reference dump", "classic")?;
+            // v11, same reasoning: the fused shared expert reassociates every
+            // dot it folds, and the oracle cannot reach it at all
+            // (--moe-impl reference, XWEN_MOE_GLUE_CLASSIC).
+            check_moe_shexp(p, "reference dump", "classic")?;
             // The oracle's XWEN_ATTN_F32 makes the whole attention block the
             // dequant-f32 QMatMul, so its decode projections are "f32-bypass" too
             // (redundant with attn_mm, but pinned for symmetry / stale-dump defence).
@@ -1350,6 +1384,11 @@ fn compare(candidate: &Dump, reference: &Dump, tier: Tier) -> Result<()> {
         check_act_l2(p, "candidate dump", want_v9)?;
         check_shexp_gemm(p, "candidate dump", want_v9)?;
         check_hc_gemm(p, "candidate dump", want_v9)?;
+        // v11's moe_shexp takes the same mapping and for the same reason:
+        // strict candidates run under XWEN_MOE_SHEXP_CLASSIC=1 (the fused
+        // shared expert reassociates its dots), mm/decode grade the shipped
+        // route.
+        check_moe_shexp(p, "candidate dump", want_v9)?;
     }
 
     // EVERY tier also pins the CANDIDATE's attention decode-projection path:
@@ -1702,6 +1741,7 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_act_l2(p, "reference-greedy.json", "classic")?;
             check_shexp_gemm(p, "reference-greedy.json", "classic")?;
             check_hc_gemm(p, "reference-greedy.json", "classic")?;
+            check_moe_shexp(p, "reference-greedy.json", "classic")?;
             check_attn_decode(p, "reference-greedy.json", Some("f32-bypass"))?;
         }
         Some(p) => bail!(
@@ -1733,6 +1773,10 @@ fn greedy_compare(reference: &GreedyDump, candidate: &GreedyDump) -> Result<()> 
             check_act_l2(p, "candidate-greedy.json", "fused")?;
             check_shexp_gemm(p, "candidate-greedy.json", "fused")?;
             check_hc_gemm(p, "candidate-greedy.json", "fused")?;
+            // The decode gate is the tier that actually dispatches the fused
+            // shared expert: every generated token is one row, inside its
+            // ceiling.
+            check_moe_shexp(p, "candidate-greedy.json", "fused")?;
             // The decode gate grades the shipped decode gemv: "f16" (official) or
             // "q8" (UD) both pass; XWEN_PARITY_EXPECT_ATTN_DECODE pins one.
             check_attn_decode(
@@ -2075,6 +2119,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_act_l2(p, "reference-ppl.json", "classic")?;
             check_shexp_gemm(p, "reference-ppl.json", "classic")?;
             check_hc_gemm(p, "reference-ppl.json", "classic")?;
+            check_moe_shexp(p, "reference-ppl.json", "classic")?;
             check_attn_decode(p, "reference-ppl.json", Some("f32-bypass"))?;
         }
         Some(p) => bail!(
@@ -2106,6 +2151,7 @@ fn ppl_compare(reference: &PplDump, candidate: &PplDump) -> Result<()> {
             check_act_l2(p, "candidate-ppl.json", "fused")?;
             check_shexp_gemm(p, "candidate-ppl.json", "fused")?;
             check_hc_gemm(p, "candidate-ppl.json", "fused")?;
+            check_moe_shexp(p, "candidate-ppl.json", "fused")?;
             check_attn_decode(p, "candidate-ppl.json", expected_attn_decode().as_deref())?;
         }
         Some(p) => bail!(
@@ -2356,6 +2402,14 @@ fn prov(moe_impl: &str) -> Provenance {
             .to_string(),
         ),
         hc_gemm: Some(
+            if moe_impl == "reference" {
+                "classic"
+            } else {
+                "fused"
+            }
+            .to_string(),
+        ),
+        moe_shexp: Some(
             if moe_impl == "reference" {
                 "classic"
             } else {
@@ -3700,6 +3754,7 @@ fn compare_pins_candidate_attn_decode_per_tier() {
     p.act_l2 = Some("classic".to_string());
     p.shexp_gemm = Some("classic".to_string());
     p.hc_gemm = Some("classic".to_string());
+    p.moe_shexp = Some("classic".to_string());
     // attn_decode defaults to "f16" — wrong for strict (expects "f32-bypass").
     let err = compare(&tiny_dump(Some(p)), &reference, Tier::Strict)
         .unwrap_err()
@@ -3882,6 +3937,9 @@ fn load_dump_defaults_missing_schema_version_to_v1() {
     assert_eq!(prov.hc_gemm, None);
     check_hc_gemm(&prov, "reference dump", "classic")
         .expect("missing hc_gemm at v1 must grandfather to classic");
+    assert_eq!(prov.moe_shexp, None);
+    check_moe_shexp(&prov, "reference dump", "classic")
+        .expect("missing moe_shexp at v1 must grandfather to classic");
 }
 
 #[test]
@@ -3953,6 +4011,7 @@ fn committed_ppl_reference_fixtures_stay_valid() {
         check_act_l2(&p, &name, "classic").unwrap();
         check_shexp_gemm(&p, &name, "classic").unwrap();
         check_hc_gemm(&p, &name, "classic").unwrap();
+        check_moe_shexp(&p, &name, "classic").unwrap();
         checked += 1;
     }
     assert!(

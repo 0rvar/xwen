@@ -422,6 +422,23 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
         } else {
             "classic"
         },
+        // The MoE shared expert's DECODE route: "fused" for the pair that folds
+        // the gate gemv, the up gemv, the SwiGLU activation, the
+        // ffn_gate_inp_shexp logit and the down gemv into one dispatch plus a
+        // shexp-aware epilogue, "classic" for the five-dispatch chain. The
+        // Reference oracle never reaches it — its ReferenceExperts hands out no
+        // uncombined projection, so the whole epilogue path is off — and
+        // XWEN_MOE_GLUE_CLASSIC closes it for the same reason;
+        // `moe_shexp_fused_enabled` is the SAME predicate MoeBlock::forward
+        // gates on, so a ceiling of zero reads "classic" here rather than
+        // labelling a run that never dispatched the kernels.
+        "moe_shexp": if matches!(moe_impl, "reference" | "ref") {
+            "classic"
+        } else if xwen::ops::moe_shexp_fused_enabled() {
+            "fused"
+        } else {
+            "classic"
+        },
         // The hyper-connection bottleneck's two projections at prefill:
         // "classic" when both stay on QMatMul (XWEN_HC_GEMM_QMATMUL=both, or
         // XWEN_DENSE_MM_CLASSIC), "fused" when both take the dense gemm, and
