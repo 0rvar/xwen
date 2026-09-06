@@ -23,7 +23,11 @@ chat dialects, 16/16 renders byte-equal to `llama-server --jinja`, tools refused
 the call format is JSON and the serve parser reads only `<function=`. And
 `llama-logits-all`, a per-position logits oracle neither existing tool provides, whose
 CPU arm turns out not to be xwen's arithmetic: llama.cpp narrows F32 activations to BF16
-before every BF16 matmul there, so the 2e-2 Stage 1 bar waits for the Metal arm.
+before every BF16 matmul there, so the 2e-2 Stage 1 bar waits for the Metal arm. The
+Stage 2 encoder reference landed early, needing neither GPU nor stack: it proves the
+`hidden_states` index convention with forward hooks (the naive assertion for it is false
+by 12.15), shows padded and unpadded batch-1 bitwise equal, and reports the pipeline's
+own bf16 arm at minimum cosine 0.99960 against an acceptance bar of 0.9999.
 [Record](records/qwen3-dense.md), [architecture](qwen3-dense.md), [Z-Image](zimage.md),
 [parity](parity.md).
 

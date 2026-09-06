@@ -892,9 +892,15 @@ sides.
 `logits-dump --all-positions` against the oracle per position on max-abs error, argmax
 equality and pooled top-5; and `tests/qwen3_encoder.rs` (`XWEN_ZIMAGE_REF_DIR`) comparing
 `encode` against the torch dump from `scripts/zimage-ref-dump.py`, rendered string first
-and then per-token cosine and relative error. Committed under
+and then per-token cosine and relative error, with position 0 reported separately because
+it is a massive activation that would otherwise lead the metric. Committed under
 `tests/fixtures/zimage-encoder/` are the prompts, the rendered strings and their sha256,
-the ids and the sha256 of every dump; the arrays themselves are not committed. A third
+the ids and the sha256 of every dump; the arrays themselves are not committed. That
+reference exists as of 2026-09-06, dumped at fp32 and at bf16 on 12 prompts, so the
+encoder side is waiting on the engine and not on the oracle. Read its two caveats before
+grading anything against it: the bf16 arm, which is what the pipeline executes, does not
+itself meet the fp32 bar, and the index convention it proves is not the one the naive
+assertion checks (docs/zimage.md). A third
 test needs no oracle at all: teacher-force the same ids one token at a time and at chunk
 sizes 7/8/9/16 and assert every position matches the single-pass prefill within the same
 bar. All-position prefill never exercises the seq==1 sdpa path or the t <= 8 gemv, and

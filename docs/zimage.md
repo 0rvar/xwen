@@ -81,9 +81,10 @@ then cut back to its real tokens, so the return value is a list of variable-leng
 **Why xwen can ignore the padding.** Padding is on the right and attention is causal, so
 no padded position can influence a retained one. An unpadded batch-1 forward of length
 `n` is mathematically identical to padding to 512 and slicing. The reference dump checks
-that claim rather than trusting it: on the 73-token prompt the padded and unpadded
-hidden states came back **bitwise equal**, max absolute difference 0. What 512 still
-controls is truncation, and that xwen must reproduce.
+that claim rather than trusting it: on the 73-token prompt the padded-with-mask and
+unpadded hidden states came back **bitwise equal**, max absolute difference 0.0, which is
+exact agreement and not fp32 noise. What 512 still controls is truncation, and that xwen
+must reproduce.
 
 **No negative prompt on Turbo.** `encode_prompt` encodes an empty-string negative prompt
 only when `do_classifier_free_guidance` holds, which is `guidance_scale > 0`; the
@@ -116,8 +117,16 @@ So `[-2]` is index 35, the output of `model.layers[34]`: run layers 0 through 34
 inclusive, take the residual stream, apply no final norm. `model.layers[35]`,
 `model.norm` and the LM head are never used by Z-Image.
 
-Two independent confirmations. The reference dump proves the index with forward hooks
-instead of assuming it. And the shipped weights corroborate it by accident, below.
+**Proven, and one obvious proof of it is wrong.** The reference dump does not assume the
+table: it hangs forward hooks on `layers[34]` and `layers[35]` and checks every prompt in
+both dtypes. `hidden_states[35]` is bitwise the output of `layers[34]`, max absolute
+difference 0.0, and `hidden_states[36]` is bitwise `norm(output of layers[35])`, also 0.0.
+The tempting one-liner, `hidden_states[36] == norm(hidden_states[35])`, is **false** and
+must not be written down as a check: index 36 is the norm of layer 35's output, not the
+norm of index 35, and the two differ by 12.15 max absolute on the first prompt. The
+conclusion the plan drew is right, the shortest proof of it is not.
+
+The shipped weights corroborate the same reading by accident, below.
 
 ## The shard-3 corruption
 
@@ -171,18 +180,42 @@ hooks, and dumps two references per prompt: **fp32**, which is the acceptance re
 and **bf16**, which is what the pipeline actually executes and is reported as a
 diagnostic rather than gated.
 
-Committed under `tests/fixtures/zimage-encoder/`: the prompts, the rendered strings and
-their sha256, the token ids, and the sha256 of every dump. The arrays themselves are not
-committed; `tests/qwen3_encoder.rs` reads them from a directory named by an environment
-variable. Twelve prompts, 11 to 512 tokens, including one that is exactly 512 and one
-that truncates from 643.
+Committed under `tests/fixtures/zimage-encoder/`: `prompts.json` and `reference.json`,
+holding the prompts, the rendered strings and their sha256, the token ids, and the file
+names and sha256 of every dump, with no absolute paths. The arrays themselves are not
+committed (50 MB, written to `/tmp/zimage-ref` by default); `tests/qwen3_encoder.rs`
+finds them under a directory named by an environment variable, and asserts the rendered
+strings and the ids with no dump present at all. Twelve prompts, 11 to 512 tokens,
+including one tuned to land on exactly 512 templated tokens and one that truncates from
+643. Template overhead is 8 tokens.
 
-Two numbers from the 2026-09-06 dump matter beyond bookkeeping. Padded and unpadded
-agree bitwise, quoted above. And **the bf16 arm sits further from fp32 than the planned
-acceptance bars**: per-token minimum cosine 0.9996 to 0.9998 and maximum relative error
-1.8e-2 to 3.2e-2 across the twelve prompts, against a plan that grades xwen at cosine
-0.9999 and relative error 1e-2 versus fp32. A bar tighter than the distance between the
-real pipeline and its own fp32 idealization is a bar about arithmetic, not about
-conditioning quality. Whoever sets the Stage 2 gate in the arc that lands it should
-decide deliberately which reference it grades against; the record carries this as an
-open question rather than a settled bar.
+Run on 2026-09-06 with torch 2.14.0, transformers 5.16.1, CPU, 8 threads. That
+transformers is well past the 4.51 these configs were written against, which is exactly
+why the index convention was proven empirically rather than read off the version's
+source. The fp32 arm runs `eager` attention for a transparent softmax and the bf16 arm
+runs `sdpa`, which is what the pipeline executes; fp32 sdpa against fp32 eager differs by
+5.49e-4 on a per-token magnitude up to 1.4e4, about 4e-8 relative, so the kernel choice
+is irrelevant at fp32 and xwen may be graded against this reference however it computes
+attention.
+
+Two findings from that run matter beyond bookkeeping.
+
+**The bf16 arm sits further from fp32 than the planned acceptance bars.** Per-token
+minimum cosine 0.99960 and maximum relative error 0.03236 across the twelve prompts,
+against a plan that grades xwen at cosine 0.9999 and relative error 1e-2 versus fp32. So
+the bar is tighter than the distance between the real pipeline and its own fp32
+idealization. That is not by itself a reason to loosen it: xwen keeps F32 activations
+against BF16 weights, which is a different and probably closer arithmetic than torch's
+all-bf16 path, and it may clear 0.9999 outright. The decision is only needed if it lands
+between the two, and these numbers are the context for it.
+
+**Position 0 is a massive activation and it dominates the relative-error metric.** Token
+0 is `<|im_start|>` in every prompt and, under causal attention, its hidden state depends
+on nothing else, so that row is bitwise identical across all twelve prompts. Its maximum
+magnitude is 13,753.5 against 150 to 380 for every other token in the same prompt. bf16's
+ulp at that magnitude is 64, so a few ulps of accumulated error reads as 1.8% relative,
+which is why seven of the twelve prompts report exactly 0.01814 as their worst token and
+why it is the same token every time. Any relative-error metric with a per-token
+denominator will be led by this row, so `tests/qwen3_encoder.rs` reports position 0
+separately; a per-prompt denominator is the other option. If xwen ever lands between the
+bars, this row is the first term to look at, because one fix there moves eleven prompts.

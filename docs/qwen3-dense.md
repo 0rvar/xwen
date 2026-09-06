@@ -165,7 +165,7 @@ the measurements as they land:
 | chat template | `llama-server --jinja /apply-template` | byte-equal rendering | 16/16 cases, 2026-09-06 |
 | Stage 1, full-vocab logits | `llama-logits-all` per-position dump | max-abs <= 2e-2, argmax 100%, pooled top-5 >= 99.9% | pending |
 | decode consistency | the engine against itself | same 2e-2 bar across chunk sizes | pending |
-| Stage 2, encoder hidden states | torch fp32 dump | cosine >= 0.9999, relative error <= 1e-2 | pending |
+| Stage 2, encoder hidden states | torch fp32 dump | cosine >= 0.9999, relative error <= 1e-2 | reference dumped 2026-09-06, xwen side pending |
 
 Two things about those bars are not yet settled and should not be quoted as if they
 were. The Stage 1 bar of 2e-2 is provisional: llama.cpp's CPU path rounds F32
@@ -179,4 +179,10 @@ The Stage 2 relative error is defined per token as
 `max_i |x_i − r_i| / max(max_i |r_i|, 1e-6)`, the denominator being that token's own
 largest magnitude in the reference. The reference is dumped at fp32 and graded there;
 the same script also dumps bf16, which is what the real pipeline executes, and that
-distance is reported alongside rather than gated.
+distance is reported alongside rather than gated. Two things about the Stage 2 bar are
+known before xwen has been measured against it. The bf16 arm does not meet it against
+its own fp32 reference, reading minimum cosine 0.99960 and maximum relative error
+0.03236, so the bar is tighter than the arithmetic diffusers ships. And position 0 is a
+massive activation, magnitude 13,753.5 against 150 to 380 elsewhere and the same row in
+every prompt, which leads any per-token relative-error metric; the test reports it
+separately for that reason. Both are in [zimage.md](zimage.md).

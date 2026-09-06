@@ -104,6 +104,23 @@ arithmetic as the candidate, and the 2e-2 max-abs bar is not committed to until 
 binary has produced the Metal arm. The tool takes `--n-gpu-layers` for exactly that; the
 GPU was busy this arc.
 
+**The Stage 2 encoder reference landed early**, the arc plan having put it in Arc 2. It
+needs no GPU and no xwen stack, so it was produced alongside the rest:
+`scripts/zimage-ref-dump.py` under `uv`, torch 2.14.0 and transformers 5.16.1 on the CPU,
+twelve prompts dumped at fp32 (the acceptance reference, `eager` attention) and at bf16
+(what the pipeline executes, `sdpa`), with fixtures committed under
+`tests/fixtures/zimage-encoder/` and the 50 MB of arrays deliberately not committed.
+
+It settled three things by measurement. The `hidden_states` index convention is proven
+with forward hooks rather than assumed, on every prompt in both dtypes, and the proof the
+plan proposed for it is WRONG: `hidden_states[36] == norm(hidden_states[35])` is false by
+12.15 max absolute, because index 36 is the norm of layer 35's output and not the norm of
+index 35. The right assertions hold bitwise. Padded-to-512-with-mask against unpadded
+batch-1 is bitwise equal, max absolute difference 0.0, so xwen may run unpadded. And
+fp32 `sdpa` against fp32 `eager` differs by 5.49e-4 on magnitudes up to 1.4e4, about 4e-8
+relative, so the attention kernel is irrelevant at fp32 and the reference does not
+constrain how xwen computes it. The two findings that are not bookkeeping are below.
+
 ### Verified this arc
 
 CPU-only, no GPU, no model run beyond the oracle's own CPU decode:
@@ -131,12 +148,21 @@ canonically equivalent spellings and `decode(encode(text))` returns the NFC form
 by a test on the embedded vocabulary, and the fixture generator refuses a non-NFC
 prompt. Recorded in decisions.md "The HF tokenizer normalizes to NFC".
 
-**The bf16 reference sits outside the planned Stage 2 bars.** The 2026-09-06 dump
-reports per-token minimum cosine 0.9996 to 0.9998 and maximum relative error 1.8e-2 to
-3.2e-2 between the bf16 arm, which is what the pipeline executes, and the fp32 arm,
-which the plan grades xwen against at 0.9999 and 1e-2. Whoever lands Stage 2 decides
-which reference the gate uses; it is a question about what the bar means, not a
-regression. Detail in [docs/zimage.md](../zimage.md).
+**The bf16 reference sits outside the planned Stage 2 bars.** The dump reports per-token
+minimum cosine 0.99960 and maximum relative error 0.03236 between the bf16 arm, which is
+what the pipeline executes, and the fp32 arm, which the plan grades xwen against at
+0.9999 and 1e-2. So the acceptance bar is tighter than diffusers' own arithmetic. That is
+not automatically a reason to loosen it, since xwen keeps F32 activations against BF16
+weights and may clear 0.9999 outright; the decision is needed only if it lands between
+the two, and these are the numbers for it.
+
+**Position 0 is a massive activation and it leads the relative-error metric.** Token 0 is
+`<|im_start|>` in every prompt and depends on nothing else under causal attention, so
+that row is bitwise identical across all twelve prompts, with a maximum magnitude of
+13,753.5 against 150 to 380 elsewhere. bf16's ulp there is 64, which is why seven prompts
+report exactly 0.01814 as their worst token and why it is the same token every time. The
+Rust test reports position 0 separately for that reason. Detail in
+[docs/zimage.md](../zimage.md).
 
 **`serve::unknown_model_message` now lists names a request cannot select.** It
 enumerates every entry in `MODELS`, so a client given a 400 is told `Qwen3-4B` is valid
