@@ -113,8 +113,7 @@ offset-alignment conditions; the kernel test compares against candle on the CPU 
 than on Metal; two reference-dump recipes in docs/parity.md would now produce a dump the
 gate rejects, because the oracle pin is load-bearing; a code comment misdescribes the
 doubled plane as ledgered and as a cost only the classic arm pays; and `mod f32` shadows
-the primitive type name. The fix commit f5dbffd landed the same day, renaming the module to `f32_mv`, and
-has not landed.
+the primitive type name. The fix commit f5dbffd landed the same day, renaming the module to `f32_mv`.
 
 **Decision: shipped on by default.** +10.3% on the 35B and +4.8% on Flash-Next, ahead in
 every round on both, no loss anywhere, both checks pass.
