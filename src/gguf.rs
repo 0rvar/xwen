@@ -278,6 +278,33 @@ impl CheckpointId {
         Ok((hash, file_len))
     }
 
+    /// An id over a checkpoint that is a SET of files rather than one GGUF:
+    /// each `(path, metadata_len)` is folded in the order given, and the total
+    /// length is the sum of the whole files.
+    ///
+    /// Same guarantee as the split-GGUF chain `fold` was written for, generalised
+    /// to a caller that knows where each of its files stops being metadata. A
+    /// safetensors checkpoint uses it for its config, its shard index and each
+    /// shard's JSON header; the tensor payload is not read, exactly as a GGUF's
+    /// is not.
+    pub fn chain(files: &[(&Path, u64)]) -> Result<Self> {
+        ensure!(!files.is_empty(), "checkpoint id: no files to fold");
+        let mut hash = Self::OFFSET_BASIS;
+        let mut total = 0u64;
+        for (path, metadata_len) in files {
+            let mut file = File::open(path)
+                .with_context(|| format!("opening {} for the checkpoint id", path.display()))?;
+            let (next, file_len) = Self::fold(&mut file, *metadata_len, hash)
+                .with_context(|| format!("hashing {}", path.display()))?;
+            hash = next;
+            total = total.saturating_add(file_len);
+        }
+        Ok(Self {
+            hash,
+            file_len: total,
+        })
+    }
+
     /// A specific id, for tests that have to bind and mis-bind a persisted
     /// artifact without a checkpoint on disk to derive one from.
     #[cfg(test)]

@@ -18,6 +18,7 @@ pub mod moe;
 pub mod mtp;
 pub mod ops;
 pub mod parity_schema;
+pub mod qwen3;
 pub mod qwen4exp;
 pub mod rope;
 pub mod sampler;
