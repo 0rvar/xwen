@@ -29,20 +29,34 @@ Full record, moved verbatim: [records/fused-moe-shared-expert.md](records/fused-
 
 ## 2026-09-06 — The fused hc gate is +57-76% on 2..8-token forwards, and the duplicate-dispatch probe learns decode mode: the shared expert floors at 0.43 ms, the router projection overlaps itself
 
-Two questions the 2026-09-05 entries below left open. The fused hyper-connection gate
-also fires at 2..8 tokens, and every A/B of it so far was a single-token decode; the
-duplicate-dispatch probe priced prefill only, because `ops::dup` returned early at one
-token. Both are answered here. Neither run changed model math: run 1 is a switch A/B on
-cf7c579, run 2 adds a probe stage and a probe opt-in (d5daa18) and nothing else.
+Two questions the 2026-09-05 entries below left open, neither run changing model math
+(cf7c579, d5daa18). Forcing every prefill forward to exactly n tokens, the fused
+hyper-connection gate beats the split seven-dispatch path by +76% at 2 tokens, +57%
+at 4 and +61% at 8 (three interleaved rounds, medians, `lowpowermode 0`), because in
+that window the split path sends both bottleneck gemms through candle's tile matmul.
+In decode mode the probe floors the shared expert at 0.43 ms/token and reads the
+router projection and the MoE glue at about zero. The reading to carry forward: a
+duplicated decode launch has no buffer hazard against its original, so a delta above
+zero is a FLOOR and a delta of about zero means the stage overlaps itself, never that
+it is free. The router projection is therefore still unpriced, and its zero says low
+occupancy. Left open: the 8-token decode tail read lower on every fused arm, and the
+recheck needs a prompt that cannot stop early.
 
 Full record, moved verbatim: [records/hc-gate-ragged-and-probe-decode.md](records/hc-gate-ragged-and-probe-decode.md) (107 lines).
 
 ## 2026-09-05 — Fused hyper-connection decode gate: 7 dispatches per gate become 3, Flash-Next plain decode 47.0 → 51.2 tok/s (+9% median), the first in-situ confirmation of the dispatch-count lever
 
-The decode budget of the ceiling diagnosis (below) put ~7.4 ms of a 21.3 ms token into
-per-dispatch fixed cost at ~4 µs across ~1740 launches, and named the hyper-connection
-gates — 672 of those launches, 7 per gate × 96 — as the largest population. This entry
-removes 384 of them. Commit dd50397.
+The ceiling diagnosis (below) put ~7.4 ms of a 21.3 ms token into per-dispatch fixed
+cost at ~4 µs across ~1740 launches, naming the hyper-connection gates as the largest
+population. Commit dd50397 replaces six of the seven launches a gate makes at decode
+with two kernels, taking hc launches from 672 to 288 per token. Flash-Next plain
+decode goes 47.0 to 51.2 tok/s, +8.9% at the median over three interleaved rounds on
+the 596-token fixture, with the honest range +5-10% because both arms are bimodal;
+prefill is unchanged. The budget predicted +7.8% for 384 dispatches at ~4 µs, so this
+is the first end-to-end confirmation that the per-dispatch residual is real and
+recoverable. The kernels are bounded, not bitwise; the replay check passes with 0
+hard mismatches and `XWEN_HC_GATE_CLASSIC` restores the split path. Still ledgered:
+the write fold, the unswept threadgroup shape, and the QSA tail and MoE glue.
 
 Full record, moved verbatim: [records/fused-hc-gate.md](records/fused-hc-gate.md) (103 lines).
 
@@ -119,38 +133,51 @@ launch-count lever (prefill dispatch floor <1%, unchanged).
 
 ## 2026-09-05 — Ceiling diagnosis for Flash-Next: achievable bandwidth measured at 537-565 GB/s, a decode token is 57% weight bytes and ~33% per-dispatch fixed cost, prefill is not launch-bound
 
-TODO.md's "FIRST" item asked why decode and prefill sit so far under their ceilings
-and to rewrite the perf ledger from the answer. Steps 1-3 (measure bandwidth, decode
-budget, prefill budget) are done here; the ledger rewrite is in TODO.md. Machine:
-`pmset -g` printed `lowpowermode 0` for every run; the owner says the machine was in
-"automatic" battery mode, not high performance. The owner's `xwen serve` was closed
-before any GPU run. Entry points: `ops::bandwidth::tests::bandwidth_sweep` (new,
-d1ada66), `/tmp/ceil/*.ts` scratch harnesses (disposable), the tensor table from
-`xwen inspect` on the UD-Q4_K_XL shards.
+TODO.md's "FIRST" item asked why decode and prefill sit under their ceilings. Steps
+1-3 are here; every run was at `lowpowermode 0`, automatic power mode. Achievable
+bandwidth is now measured: streaming read 537-565 GB/s at the median, 87-94% of the
+614 nominal, with a 2.4-2.7 µs per-dispatch floor for a dependent chain. A decode
+token reads 6.33 GB of weights, 11.7-12.3 ms of its 21.3, so the bytes-only ceiling
+is 81-86 tok/s and the residual ~7.4 ms is ~1740 dispatches at ~4 µs average; decode
+is neither CPU-bound nor command-buffer-bound. Prefill at 3851 tokens runs 13.7
+TFLOP/s on 12.07 GFLOP/token, its dispatch floor is under 1%, and two in-situ A/Bs
+bracket the expert gemms at 14-43% of wall, which CONTESTS the 2026-08-30 "gemms are
+a minority of `ffn`" reading. The lever is dispatch COUNT for decode and the expert
+gemms plus hc glue for prefill, never per-kernel bandwidth.
 
 Full record, moved verbatim: [records/ceiling-diagnosis.md](records/ceiling-diagnosis.md) (264 lines).
 
 ## 2026-09-05 — PLE gate and conv move to device for multi-token prefill: Flash-Next prefill +12-13% at 880 and 3851 tokens, on by default (`XWEN_PLE_TAIL_CLASSIC` restores the host tail)
 
 Picked up from TODO.md's "Next Flash-Next perf work" item (P3 item (5)), started in a
-Codex session and finished here. `XWEN_PLE_PROFILE` put the host gate plus conv at
-41 + 198 ms per 2048-token chunk (213-238 ms across two profiles, `powermode 0`), and
-at decode the pair costs ~0.13 ms/token, which nobody has turned into a qualified gain,
-so decode keeps the host tail and the batched readback of the entry below.
+Codex session and finished here. Two Metal kernels take the PLE gate and the dilated
+conv off the host for multi-token forwards, where `XWEN_PLE_PROFILE` had put them at
+41 + 198 ms per 2048-token chunk; the conv state stays host-owned and its layout is
+untouched. Flash-Next prefill goes 1010 to 1139.7 tok/s at 3851 tokens (+12.8%) and
+1117.6 to 1261.5 at 880 (+12.9%), interleaved arms with 60 s idles, `lowpowermode 0`,
+decode flat. `XWEN_PLE_TAIL_CLASSIC` restores the host tail, which decode keeps: the
+pair costs ~0.13 ms/token there and nobody has turned that into a qualified gain. The
+forced replay showed one hard mismatch, and a control established it is not the
+kernel: reversing the summation order of one f32 dot product in the classic path
+reproduces the same mismatch at the same step. So `flashnext-replay.ts` gained an
+engine-near-tie excusal rule, and the run passes at 185/192 with 0 hard.
 
 Full record, moved verbatim: [records/ple-device-tail.md](records/ple-device-tail.md) (123 lines).
 
 ## 2026-09-05 — PLE batches its three device-to-host readbacks
 
-The next Flash-Next perf candidate selected from TODO.md was the PLE readback
-collapse. `PleLayer::forward` previously called `to_vec1` separately for key, value
-and carrier, and candle's `MetalStorage::to_cpu` allocated, blitted and waited EACH
-time. At single-token decode, `readback_inputs` now encodes all three copies into
-one shared staging buffer and waits once. Multi-token prefill keeps its original
-independent transfers. The key and carrier are 10240-wide, the value 2560-wide: 90 KiB/token
-total. The host gate, conv, recurrent state, table gather and frozen references are
-unchanged. `XWEN_PLE_READBACK_CLASSIC=1` restores the old transfers. The ownership,
-offset and temporary-memory choices are in decisions.md "PLE decode readbacks".
+The next Flash-Next perf candidate from TODO.md was the PLE readback collapse.
+`PleLayer::forward` called `to_vec1` separately for key, value and carrier, and
+candle's `MetalStorage::to_cpu` allocated, blitted and waited each time;
+`readback_inputs` now encodes all three copies into one staging buffer and waits
+once. The all-length sweep carried a drift flag and no established prefill gain, so
+batching ships at seq == 1 only and multi-token prefill keeps its original transfers.
+Decode reads 44.78 to 46.06 tok/s, +2.85% central, over a CB/BC pair at 3677 tokens
+with 60 s idles and anchors inside the 3% flag; the isolated transfer transaction
+goes 0.50-0.59 to 0.17-0.23 ms. Correctness is equivalence to the pre-change engine
+rather than a fresh oracle run: 192/192 exact replays across three fixtures, plus all
+six 35B parity checks. A second candidate, hc's two Q8_0 decode projections, was
+screened and left unchanged, its down projection still unresolved on the ledger.
 
 Full record, moved verbatim: [records/ple-readbacks.md](records/ple-readbacks.md) (105 lines).
 
@@ -162,12 +189,17 @@ same source. Updated the README and justfile references to the canonical file.
 
 ## 2026-09-05 — Per-run metrics on disk and `xwen stats`: every surface appends a JSONL record, aggregated by day/model/surface/session
 
-**Context.** Nothing in xwen remembered a run after it finished. The `--stats` line and
-the API usage objects report a run to whoever asked for it and then the numbers are
-gone, so questions the machine should be able to answer — how much did this week cost,
-which checkpoint did the work, is serve's prefix reuse actually hitting, which Claude
-Code session spent the afternoon — had no source but scrollback. This arc gives every
-surface a place to write one line and gives that file a reader.
+Nothing in xwen remembered a run, so `src/metrics.rs` and an `xwen stats` subcommand
+give every surface a place to write one line and give that file a reader. Each
+finished run appends one JSON object to `$HOME/.local/state/xwen/metrics.jsonl`:
+schema version, timestamp, surface, checkpoint, the token counts and the seconds each
+phase took, `ok`, and the optionals a surface may know, an absent optional meaning
+not measured and never 0. `stats` groups by day, week, month, model, surface, client,
+session or all, and every rate is sum(tokens)/sum(seconds) over the bucket rather
+than a mean of per-run rates. A failed run is a record, not a gap, and `ok` means the
+run reached its own end. Twenty review findings came back and all twenty are fixed,
+five material. What is NOT covered: no model was run end to end for a smoke, because
+another process held the GPU, and that is the first ledger item.
 
 Full record, moved verbatim: [records/metrics.md](records/metrics.md) (170 lines).
 
@@ -204,11 +236,18 @@ The recipe pins `--locked`; the trap is in CLAUDE.md's operational hazards.
 
 ## 2026-08-30 (technique survey) — Perf landscape and technique survey (research, no code): no public Apple Silicon runtime is a peer on Flash-Next, four techniques survive the cut, and candle turns out to already implement MLX-style concurrent encoding
 
-**Context.** Two research passes with nothing built: where xwen actually sits against
-every public Apple Silicon runtime, and which of the techniques those runtimes and the
-recent literature use are worth taking here. No `src/` or `scripts/` file was touched.
-What came out is a ranked queue (TODO.md "Deferred from the technique survey") and three
-refutations (decisions.md), one of which cancels the item that motivated the pass.
+Two research passes with nothing built: where xwen sits against every public Apple
+Silicon runtime, and which of their techniques are worth taking here. On Flash-Next
+there is no public peer. The best published same-chip figure is llama.cpp Metal on an
+M5 Max at 33.0 tok/s decode / 966 prefill, but on a smaller IQ4_XS build, so it
+crosses files and sessions and is not the claim to make; the honest headline stays
+the same-file same-hour +13% decode / +24% prefill. The one contested class is the
+35B-A3B, where other machines report ~91 and 130.2 against our 114, so no lead is
+claimed until the ledgered same-machine arm runs. Four techniques survive the cut and
+every one is unpriced. The finding that re-ranks the queue is that candle at the
+pinned rev ALREADY implements the MLX-style concurrent encoding the survey meant to
+adopt, just coarsely, so the residual levers are all candle-side: cadence,
+whole-scope barriers, cross-encoder fence waits, per-dispatch locking.
 
 Full record, moved verbatim: [records/technique-survey.md](records/technique-survey.md) (83 lines).
 
@@ -286,15 +325,18 @@ keeps the plane. The shexp planes predate this change and keep their window:
 
 ## 2026-08-30 (mm_id tiles) — work-list grid and NR1 64: expert gemms +17-23% in isolation, prefill unchanged end-to-end at 3803 tokens, and the ffn stage turns out to be mostly not the gemms [CONTESTED 2026-09-05: the "mostly not the gemms" reading came off the 2.2x-inflated stage profiler; two in-situ A/Bs bracket the expert gemms at 14-43% of prefill wall, and the tile work reads −2.8% end to end — see "Ceiling diagnosis"]
 
-The prefill-chunk pass left a ledger item for a NARROWER `mm_id` token tile (32 → 16)
-on the theory that a 40-row expert wastes most of its second 32-row tile. A code read
-refuted it before any bench: `kernel_mul_mm_id_t` dequantizes the expert's whole weight
-tile once per TOKEN tile and is dequant-bound, so passes per expert = ceil(rows/NR1),
-and a narrower tile RAISES the dominant cost (Flash-Next 1.88 → 2.97 passes at the 2048
-chunk; the 35B 2.5 → 4.5). The lever runs the other way: NR1 64 makes those 1.0 / 1.5.
-The read also found a bigger waste in the grid: `(t/32, n_out/64, n_expert)` is sized
-for one expert owning every row, so at the 2048 chunk ~97% of launched threadgroups
-early-return on `r1 >= tpe[e]` (Flash-Next down: 1,310,720 launched, 40,960 useful).
+The prefill-chunk pass left a ledger item for a NARROWER `mm_id` token tile (32 to
+16). A code read refuted it before any bench: `kernel_mul_mm_id_t` dequantizes the
+expert's whole weight tile once per TOKEN tile and is dequant-bound, so a narrower
+tile RAISES the dominant cost. The read also found that the `(t/32, n_out/64,
+n_expert)` grid is sized for one expert owning every row, so ~97% of launched
+threadgroups early-return. Two changes shipped behind switches: a work-list grid, and
+NR1 64 on the `_t` family. Isolated at t = 2048 the expert gemms gain +17-23%, all
+four launch shapes bitwise against the old grid. End to end at 3803 tokens the
+arm-to-arm spread sits inside a single arm's round-to-round spread, so no prefill win
+is claimable. Greedy output is byte-identical and the 35B gate is ALL PASS. The
+attribution drawn at the time, that the gemms are a minority of `ffn`, came off the
+sync-inflated stage profiler and is contested above.
 
 Full record, moved verbatim: [records/mm-id-tiles.md](records/mm-id-tiles.md) (82 lines).
 
@@ -520,22 +562,35 @@ onto `dense_mm`, the f16 rescale chain at prefill, and the unattributed decode f
 
 ## 2026-08-30 (later still) — the GDN mixer arc: a per-step profiler names three targets, two of them turn out to be its own brackets, and folding the beta|alpha projection buys +4.6-4.8% on Flash-Next and +8.8% on the 35B-A3B
 
-`XWEN_GDN_PROFILE` (ae82696) is a per-step attribution of the gated-DeltaNet block: one
-stderr line per forward with every DeltaNet layer folded together, each step raw AND
-floor-corrected (an empty bracket is 0.7 µs but a bracket around a single dispatch is
-~0.17 ms of command-buffer round trip, so the line closes both floors and prints them),
-and each step's static byte count alongside so an achieved GB/s comes with it.
-`XWEN_GDN_REPS` repeats a step's work inside its own bracket. Unset it costs one
-`Option` check per hook and the shipped checkpoints' output is byte-identical.
+`XWEN_GDN_PROFILE` (ae82696) is a per-step attribution of the gated-DeltaNet block.
+Its decode line named three targets and two of them turned out to be the instrument.
+A decode-specialized scan kernel is a wash end to end (44.7 against 44.6 tok/s,
+byte-identical text) and stays opt-in, because an amortized bench prices the scan at
+1.35-1.43 ms/token against a bytes-only floor of 0.98-1.02: it was already
+bandwidth-bound. And `attn_qkv`, which the profiler ranked slowest of the three Q8_0
+projections at 346 GB/s, streams at 510 in a rotate-arm sweep, the fastest of them.
+What shipped is the smallest target on the line: folding the beta|alpha projection
+into its own head (0261e17) is worth +4.6-4.8% on Flash-Next and +8.8% on the 35B-A3B
+(105.1 to 114.4), prefill unchanged, the mechanism being one dispatch fewer per
+layer. The lesson: that line RANKS steps, it does not PRICE them. The remaining GDN
+work is dispatch-count fusion.
 
 Full record, moved verbatim: [records/gdn-mixer-arc.md](records/gdn-mixer-arc.md) (249 lines).
 
 ## 2026-08-30 (P4, later the same day) — Flash-Next serves: the QSA indexer rows ride in `HostFullKv`, the PLE state rides on its own layer's snapshot entry, and the container goes to v4
 
-P4 was the item that kept this checkpoint off two surfaces, and it was always one
-question: what does a cache image have to carry. The answer turned out to be two
-answers, because qwen4exp carries two pieces of state that no image carried before and
-they are not the same kind of thing.
+P4 kept this checkpoint off two surfaces, and it was one question: what does a cache
+image have to carry, with two answers. The QSA indexers' raw keys are
+position-indexed, so a snapshot stores nothing and a rewind is an exact truncate;
+only page-out moves bytes, beside the K/V planes they mirror. The PLE state has no
+inverse, so it travels as data: a `PleImage` rides its own layer's entry through a
+wrapper variant rather than a fourth kind, because that layer is ALSO a DeltaNet
+layer and a flat variant would have dropped its recurrent state. The container goes 3
+to 4, forced by the QSA half alone: its planes sit untagged inside the full-attention
+record, so a v3 reader would report corruption on a file that is not corrupt. That
+let `refuse_state_transfer` and the unservable messages go; `auto_fetch` and
+`supports_drafting` stay closed. 1009 lib and 5 bin tests pass, but no serve-engine
+harness runs a real model, so the real file through a real server is untried.
 
 Full record, moved verbatim: [records/flash-next-serve.md](records/flash-next-serve.md) (160 lines).
 
@@ -646,22 +701,35 @@ so P4 cannot land and leave serve on the older model by accident.
 
 ## 2026-08-29 (P3, later the same day) — Flash-Next prefill 239 → 796 tok/s and decode 37.8 → 45: a Q5_1 `mm_id` arm, four fused hyper-connection kernels, and a norm split across streams below 32 tokens
 
-**Context.** P2 closed hours earlier with the graph correct and prefill 3.3-3.5x behind
-llama.cpp on the identical file. P3 opened on that gap. Everything below is the
-`UD-Q4_K_XL` file at a 530-token prompt, arms interleaved, `pmset -g` reporting
-`powermode 0` this session — no `lowpowermode` key appeared, which is the reverse of
-what this machine usually prints, and is recorded verbatim rather than normalised.
-High-power mode is still not positively confirmable here, so it is not claimed.
+P2 closed hours earlier with prefill 3.3-3.5x behind llama.cpp on the identical file;
+P3 opened on that gap. Everything below is the `UD-Q4_K_XL` file at a 530-token
+prompt, arms interleaved, `pmset -g` reporting `powermode 0`, not a high-power claim.
+A Q5_1 `mm_id` arm took prefill 239 to 443, the 43 layers whose down plane is Q5_1
+having sent all three expert planes down the per-token fallback. Four fused hc
+kernels replaced 17 glue dispatches and took prefill to 765-781, 1.75x. That fusion
+cost 6% of decode by running one threadgroup per token, so below 32 tokens the norm
+now splits across streams, bit-identical, taking decode 37.8 to 43.1. The PLE layer's
+cost turned out to be page faults on a demand-paged 28.8 GB table, so a prefetch
+thread rides sample time and decode reaches 45. End state against llama.cpp in the
+same hour: prefill 795.7 against 789, decode 43.1 against 41.4, forced replay 186/192
+with 0 hard.
 
 Full record, moved verbatim: [records/flash-next-p3-kernels.md](records/flash-next-p3-kernels.md) (129 lines).
 
 ## 2026-08-29 — Qwen3.8-Flash-Next runs: P0 through P2 in one day, agreeing with llama.cpp at 189/192 forced-replay steps, 37.5-38.1 tok/s decode
 
-**Context.** The qwen4exp arc had been paused since 2026-08-26 with P0 complete and no
-runnable weights. Three things unblocked it at once: Unsloth published the full quant
-ladder, llama.cpp merged qwen4exp support, and the machine had disk free. The day ran
-P1 and P2 end to end. `docs/qwen4exp-port.md` is the arc doc; the decisions moved to
-decisions.md "Qwen3.8-Flash-Next (qwen4exp)" as this entry was written.
+The arc had been paused since 2026-08-26 with no runnable weights; Unsloth's quant
+ladder, llama.cpp's merge and free disk unblocked it, and P1 and P2 ran in one day.
+Header-parsing every published GGUF turned up an unwritten rule: `ffn_down_exps` is
+640 columns, which fails every K/IQ block-size requirement, so the converter silently
+demotes that plane on every publisher's file. `UD-Q4_K_XL` was chosen as the only
+Q4-class file whose types we have kernels for, at the cost of 43 of 48 layers
+carrying Q5_1 experts. The oracle moved to pin 6fe749801 and all three existing
+checkpoints re-passed at it. The parity gate cannot run on this checkpoint, so U7
+rebuilt the decode tier by hand with llama-server standing in: 189/192 agreeing, zero
+hard mismatches, the three divergences near-ties. Decode 37.5-38.1 tok/s against
+40.9-41.5 in the same hour; prefill 203.5 against 713.4, 3.5x slower and reproduced
+to the centisecond. Correct, and honestly slow in one place.
 
 Full record, moved verbatim: [records/flash-next-port.md](records/flash-next-port.md) (113 lines).
 
@@ -750,60 +818,101 @@ parity gate was not run and did not need to be.
 
 ## 2026-08-19 — The chat template becomes a per-checkpoint DIALECT: 3.8 gets its reasoning_effort preamble and preserve_thinking default, gen/chat gain --no-think and --reasoning-effort, and sampling defaults go mode-keyed (1.0/0.95/20 thinking, 0.7/0.80/20 instruct)
 
-Two commits, one arc (a2e02d0, 205d9ba). The first makes the renderer
-dialect-aware; the second surfaces the knobs on every entry point and re-keys the
-sampling defaults. Together they close the divergence recorded on 2026-08-14: every
-default 3.8 conversation was rendering without the system instruction its template
-injects, equal to the official `reasoning_effort="medium"` rendering rather than the
-official default.
+Two commits, one arc (a2e02d0, 205d9ba): the first makes the renderer dialect-aware,
+the second surfaces the knobs on every entry point and re-keys the sampling defaults.
+Together they close the 2026-08-14 divergence, where every default 3.8 conversation
+rendered without the system instruction its template injects. `ChatDialect` comes
+from `Model::chat_dialect()`, and four 3.8 behaviours are pinned by tests: the
+verbatim `reasoning_effort` preamble, `preserve_thinking` defaulting true, no block
+for an empty system message, and no inline `<think>` splitting. The CLI gains
+`--no-think` and `--reasoning-effort`, and `TOKENIZATION_RULES_VERSION` goes 2 to 3.
+Sampling defaults are keyed to thinking mode per the official cards, so serve's fixed
+constants are gone and its keys resolve per request. On the wire one
+`reasoning_effort` field drives both the think budget and the template level. 838 lib
+and 69 binary tests pass; no model math changed.
 
 Full record, moved verbatim: [records/chat-dialects.md](records/chat-dialects.md) (101 lines).
 
 ## 2026-08-15 (latest, same arc) — MTP Stage C: the graph is confirmed against llama.cpp by BYTE-IDENTICAL output, the sweep moves the 3.8's defaults to p_min 0.7 / depth 4 (+44-45% code, +37-38% chat over plain), and two stage-B claims do not survive being re-run
 
-Stage C is the arc's verification half: cross-check the graph against the reference
-implementation (C2), fit the shipped defaults with a real sweep instead of single runs
-(C3), and write the arc down (C4). No implementation changed except the two fitted
-constants and the harness edits that made them measurable.
+Stage C is the verification half; no implementation changed except two fitted
+constants. The graph is confirmed by a stronger result than asked for: run against
+llama.cpp at `p_min` 0 on both sides, the generated text is BYTE-IDENTICAL on both
+fixtures, with acceptance 73.3% against 75.0% on code and 45.7% against 47.1% on
+chat, so acceptance is compared over the very same continuation. Two harness traps
+cost the first attempt: `llama-cli` runs conversation mode regardless of `-no-cnv`,
+and the two `p_min` floors are different gates. The sweep then crossed `p_min` with
+depth, 128 greedy tokens, interleaved, medians of 3 reps, and moved the defaults to
+p_min 0.7 / depth 4: depth is the axis that pays, spanning 12% where the floor spans
+1.8%, and a probe brackets 4 as a peak. At the shipped configuration, measured three
+times in one session, 34.4-35.7 code and 33.1-34.0 chat against plain 23.7-24.8. Two
+stage-B claims did not survive being re-run.
 
 Full record, moved verbatim: [records/mtp-stage-c.md](records/mtp-stage-c.md) (115 lines).
 
 ## 2026-08-15 (superseded in part by Stage C above — its "+60%" is a single run at the old defaults, and its sampled-equivalence claim does not reproduce) — MTP drafting SHIPS on Qwen3.8-27B: 39.3 tok/s drafted against 24.5 plain in the same session (+60%) at 93.5% acceptance, and `--draft` is byte-identical to `--no-draft` under both equivalence modes
 
-The checkpoint that had no drafter now has one. `src/mtp.rs` is the head (one extra
-trunk-flavour full-attention layer with its own KV), `src/drafter.rs` the seam between the
-two drafter kinds, and `generate.rs` the chain round. Stage A built the head and the seam
-and left two `bail!` stubs where the loops go; this entry covers both stages, since A
-shipped no user-visible behaviour on its own.
+The checkpoint that had no drafter now has one: `src/mtp.rs` is the head, one extra
+trunk-flavour full-attention layer with its own KV, `src/drafter.rs` the seam between
+the two kinds, and `generate.rs` the chain round. The sync rule now lives in one
+function: the head's KV row for position p is built from (token_p, hidden_{p-1}), and
+`sync` owns the shift itself. The chain stays on the GPU, one readback at the end,
+because Phase 0 priced a per-step CPU readback at +1.45-2.96 ms. Prefill pays for the
+head and the cost is small, an interleaved A/B reading -4.2% at 839 prompt tokens and
+-5.8% at 3286, the growth with position being the head's own mask. The first live
+smoke read 39.3 tok/s drafted against 24.5 plain at 93.5% acceptance, single runs at
+the old defaults, which Stage C supersedes. One limitation is ledgered rather than
+hidden: the head cannot follow a rewind, keeping exactly one carry hidden.
 
 Full record, moved verbatim: [records/mtp-stage-b.md](records/mtp-stage-b.md) (110 lines).
 
 ## 2026-08-15 — Phase 0 for MTP drafting on Qwen3.8-27B: the 3.6 DFlash head partially transfers but does not pay (0.86-1.02x vs the native head's 1.33-1.65x in the same session), and an MTP draft step costs 7-8.5% of a target forward
 
-Measurement only — no shipped code changed. Two experiments that feed the MTP arc's design
-(the arc itself is committed regardless of how they read).
+Measurement only, no shipped code changed, and everything is conditional on machine
+state: `lowpowermode 1`, on battery, plain 3.8 decode reading 9.0-9.4 tok/s against
+the 23.8 recorded the day before. No absolute here is comparable to another session;
+both experiments rest on quantities a throttled machine cannot move. The 3.6-27B
+DFlash head does attach to the 3.8 target and partially transfers, acceptance running
+50-80% against the native head's 66-97% on the same prompts in the same hour, but
+throughput lands at 0.99x code / 0.95x chat where the native pair runs 1.43x / 1.33x,
+so it does not clear its own overhead. The second experiment: one MTP draft step
+costs 7.1-8.5% of a target decode forward by timing and 8.19% by bytes, inside the
+viability band. Two design inputs fall out: the lm_head is 51.8-53.6% of the step's
+time and 69.8% of its bytes, and a per-step CPU readback costs +1.45-2.96 ms, so the
+chain should stay on the GPU.
 
 Full record, moved verbatim: [records/mtp-phase-0.md](records/mtp-phase-0.md) (93 lines).
 
 ## 2026-08-14 — Review round: a job now names a FILE, not just a checkpoint; drafting is resolved per checkpoint; a contradicting `--model-size` fails at startup
 
-Two reviews (Claude and Codex/gpt-5.6-sol) of the entry below found one shared root
-behind most of their findings: the arc had introduced a second kind of model identity
-(the served file's own id) without giving the engine a way to represent it. Everything
-here follows from fixing that.
+Two reviews of the entry below found one shared root behind most of their findings:
+the arc had introduced a second kind of model identity, the served file's own id,
+without giving the engine a way to represent it. A job now names a `Target`, a
+checkpoint plus "is this the served file", and equality on it is file identity, which
+the engine's swap check and the disk tier already wanted. That closed three real
+bugs, among them an official name answered by unchecked weights and `/v1/models`
+publishing an id its own resolver refused. `--model-size` becomes a startup error
+against a file that identifies itself, instead of silently winning and then 500ing
+every request; drafting resolves per checkpoint. A second pass found four more, two
+introduced by the fixes and both the same mistake: a rule stated in a comment and
+checked nowhere. 873 tests pass, with the live swap cycle verified by hand.
 
 Full record, moved verbatim: [records/serve-target-review.md](records/serve-target-review.md) (119 lines).
 
 ## 2026-08-14 — Qwen3.8-27B added as a registry entry (same graph, no drafter), and the APIs go to full model names only: `/v1/models` stops listing one checkpoint three ways and an unknown `model` is a 400 instead of a silent default
 
-**Two changes, one root.** Qwen3.8-27B released today; its `config.json` is
-byte-identical to Qwen3.6-27B's, so it is the same forward pass over different weights
-and needed no model math (the parity gate was deliberately not run: nothing it grades
-changed). Adding it broke two claims the code made. `Arch::model()`'s doc said the GGUF
-architecture identifies the checkpoint one-to-one — true until two releases shipped the
-same dense `qwen35` graph. And the model-name vocabulary, which had been the CLI's short
-aliases, could no longer be stretched: `27b` already meant 3.6 and a third checkpoint
-made the aliases a naming scheme rather than a shorthand.
+Qwen3.8-27B released today, its `config.json` byte-identical to Qwen3.6-27B's, so it
+is the same forward pass over different weights; the parity gate was deliberately not
+run. `Arch::model()` said the GGUF architecture identifies the checkpoint one-to-one,
+true until two releases shipped the same dense `qwen35` graph, so identification
+became a chain: `--model-size`, then `general.name`, then the file name, then the
+arch with a warning. The running server was listing `Qwen3.6-35B-A3B-Q4_K_M`, `27b`
+and `35b`, three ids for two checkpoints, while an unrecognized `model` fell back to
+the default. The APIs now speak `Model::full_name()` and nothing else; anything else
+is a 400. The drafter became `Option<Drafter>`, most of the diff. Two facts were
+checked rather than trusted: the tokenizers are NOT byte-identical, and the chat
+template DOES differ and is now vendored. 869 tests pass, the checkpoint verified end
+to end from an empty cache.
 
 Full record, moved verbatim: [records/qwen38-27b-registry.md](records/qwen38-27b-registry.md) (84 lines).
 
@@ -876,43 +985,52 @@ see "Benching rules").
 
 ## 2026-08-11 — First client feedback lands: the scored-field escape stops lying about first fields, `shared_prefix` collapses 14 POSTs into one, the body cap goes to 100 MB, and max_ctx becomes a ceiling (lazy KV, 128k CLI default)
 
-**Where it came from.** The first external consumer of `/xwen/v1/batch`'s scored path
-reported two things and asked for a third. The bug report: on `include_score: "all"`
-items with several fields, the FIRST field's `escape` reads 0.999-1.000 (18/18 of their
-multi-field items) while all 142 non-first fields sit at 1e-7 to 4e-4, pinning every
-category's mean escape at exactly 1/fieldCount and killing the signal — their
-hypothesis was escape sampled one token early, at the skeleton's opening punctuation.
-The feature ask: a `shared_prefix` field, because each item repeats the story text and
-a 377 KB story against the ~2 MB body cap forced one batch into 14 POSTs, each
-re-prefilling the same prefix. And the operational ask: raise that cap, raise the
-context default, and make context memory demand-driven in serve.
+The first external consumer of the scored batch path reported a bug, asked for a
+feature and asked for three operational changes. The bug: on multi-field items the
+FIRST field's `escape` read 0.999-1.000 while non-first fields sat at 1e-7 to 4e-4. A
+row dump found the model putting 54.9% on ` true` and 44.9% on ` false`, single
+tokens carrying a leading space, against ~5e-5 on the bare spellings the opener set
+held: the measure read the model's preferred spelling of the ANSWER as none of the
+above. The fix reclassifies the whole next-token row by raw BYTES, and first-field
+escape goes 0.9999 to 0.00197 with scores bit-identical. `shared_prefix` ships as a
+wire-size field, not a prefill feature, and the body cap goes 2 MB to 100 MB. max_ctx
+becomes a ceiling rather than an allocation, caches starting at 8192 positions and
+doubling on demand, so the CLI default rises to 131072. 791 + 69 tests pass; the
+parity gate refused to start on a held GPU and is pending.
 
 Full record, moved verbatim: [records/client-feedback.md](records/client-feedback.md) (136 lines).
 
 ## 2026-08-11 — `/xwen/v1/batch` ships and the server stops being pinned to one checkpoint: every request names its model, the engine swaps lazily
 
-**Where it came from.** The batch runner had been CLI-only since it shipped
-(2026-08-09), with the HTTP endpoint parked behind P10 in the ledger. The ask that
-unparked it also reshaped it: the endpoint should not be pinned to the served model —
-`--model` should only decide which checkpoint is the DEFAULT for the compat dialects,
-and any checkpoint should lazy-load and idle-unload like the one the server started
-around. That turns "add a route" into "make the engine checkpoint-aware", and the route
-falls out of it.
+The batch runner had been CLI-only since 2026-08-09 with the HTTP endpoint parked in
+the ledger. The ask that unparked it also reshaped it: the endpoint should not be
+pinned to the served model, so `--model` decides only the compat dialects' default
+and any checkpoint lazy-loads. `EngineState` now records which checkpoint it holds,
+every queued job names the one it needs, and a mismatch images the live conversation
+out through the idle-unload path before the swap, keeping one model resident. `POST
+/xwen/v1/batch` takes exactly the document `xwen batch` reads on stdin and rides the
+ordinary queue as a second `Job` variant; the runner grew a progress callback and a
+cancellation poll. A two-family review found six fixes, the one real correctness bug
+being new to the arc and opened by it: a chat job's thinking budget leaked into the
+next batch job, which before this could not exist. 781 + 69 tests pass, and the first
+live exercise swapped 35B to 27B inside one server.
 
 Full record, moved verbatim: [records/serve-batch-multi-checkpoint.md](records/serve-batch-multi-checkpoint.md) (124 lines).
 
 ## 2026-08-09 — `xwen batch`: one prefill for N items, and scored fields that report the model's confidence instead of a sampled token
 
-**Where it came from.** Two research passes opened the arc — one on the
-classification/structured-extraction state of the art, one on serving-side prefix reuse
-(BatchLLM, Marconi, SGLang's RadixAttention). They converged on the same shape from
-opposite directions. The serving literature says the cheapest batch is one that groups
-by shared prefix and prefills it once; the classification literature says the accurate
-way to label a document along nine taxonomies is nine narrow questions, not one wide
-one, because a single prompt asking for nine fields lets early fields condition later
-ones and gives no per-field confidence at all. Decomposed classification is exactly the
-workload whose items agree on everything but their last sentence. So the batch API and
-the classification surface are one feature, not two that happen to share a subcommand.
+Two research passes opened the arc, converging from opposite directions: the cheapest
+batch prefills its shared prefix once, and the accurate way to label a document along
+nine taxonomies is nine narrow questions. So `xwen batch` reads one JSON request on
+stdin, prefills the items' longest common token prefix once, snapshots it and replays
+it per item. The scored path is the other half: the engine writes the JSON skeleton
+itself, teacher-forces it, and scores every allowed option at each choice point, so
+the model only ranks values. The outside-model review found the flaw that mattered,
+that scoring an option's own tokens makes a strict-prefix option unbeatable; the fix
+scores one terminator token past the value. The demo then produced the arc's thesis
+as a measurement: the scored boolean vector beat the free-decoded array over the
+identical tag set on both checkpoints, and the gap did not close when the rubric was
+sharpened, so it is structural.
 
 Full record, moved verbatim: [records/xwen-batch.md](records/xwen-batch.md) (213 lines).
 
@@ -975,21 +1093,35 @@ this run's own plain rate.
 
 ## 2026-08-08 — the small-batch window reaches the attention and DeltaNet projections (verify span 8 −12.0%), and the first real controller sweep makes `draft_p_min` per-checkpoint: 0.5 on the 27B, +11-13% over the shipped 0.3
 
-**Two arcs, and the second is the one the first predicted.** The entry below shipped
-`mul_mv_ext` behind `QLinear::forward` and closed on two things: a list of sites the
-window does NOT cover, and the observation that the controller had already started
-behaving differently because verifies got cheap. This entry covers both follow-ups —
-extending the window to the q8_0 attention and DeltaNet projections, and running the
-`p_min`/`pause_margin` retune that unblocked.
+Two arcs, the second the one the first predicted. Arc 1 extends the `mul_mv_ext`
+window to the q8_0 attention and DeltaNet projections, one `Proj` variant covering
+seven tensors on every layer of both checkpoints. The verify forward on the 27B at
+`n_past` 512 goes -12.0% at span 8, -6.0% at 6 and -5.0% at 4, pooled medians of two
+sessions; span 2 is a wash rather than the small regression the table shows, because
+the spans where the kernel cannot run carry the same +2% ordering bias. Both gates
+ALL PASS at pre-change numbers. Arc 2 builds `scripts/retune-draft.ts` so the
+protocol is a script rather than folklore, and runs two 120-run sweeps. They agree:
+`draft_p_min` becomes per-checkpoint, 0.5 on the 27B (37.3 against 33.0 at the
+shipped 0.3) and 0.3 on the 35B, the mechanism being that the 27B stops pausing
+entirely at 0.5. `pause_margin` had never been swept and now has, staying a shared
+1.0 for a measured reason.
 
 Full record, moved verbatim: [records/small-batch-window-projections.md](records/small-batch-window-projections.md) (180 lines).
 
 ## 2026-08-08 — `mul_mv_ext` ships: the verify forward at span 2 goes 153 → 61 ms, drafted decode gains +11.6-13.2% on the 27B, and the kernel is 20-400x MORE accurate than the mm it replaces
 
-**Context.** The entry below decomposed the verify round's ~149 ms fixed cost and put
-87.6% of it in the dense FFN's matmuls at small M — candle's `mul_mm` grid collapsing to
-`ne01/64` threadgroups at M ≤ 32, ~73 GB/s against ~280 on the seq==1 mat-vec path. It
-named the fix and priced it by byte arithmetic. This arc built and measured it.
+The entry below put 87.6% of the verify round's ~149 ms fixed cost in the dense FFN's
+matmuls at small M and priced the fix by byte arithmetic. This arc built and measured
+it. `src/ops/mv_ext.metal` vendors llama.cpp's multi-row quantized mat-vec, which
+dequantizes a weight block once and reuses it across 2-5 output rows, routed at seq
+2..=8 from one decision point, `QLinear::forward`. The verify forward on the 27B goes
+153.4 to 61.5 ms at span 2 and 220.1 to 161.2 at span 8, interleaved arms, and
+drafted decode gains +11.6% on the 27B code prompt and +13.2% on chat, +4.2% on the
+35B code prompt and nothing on 35B chat, which is pause-dominated. The accuracy
+result runs the other way from `dense_mm`, worth stating because the reflex is now to
+expect a precision cost: this kernel is 20-400x MORE accurate than the mm it
+replaces, being f32 end to end. Extending the window past 8 is REFUTED: spans 16, 24
+and 32 read 1.11x, 1.42x and 1.69x worse than classic.
 
 Full record, moved verbatim: [records/mv-ext.md](records/mv-ext.md) (101 lines).
 
@@ -1055,12 +1187,18 @@ unarmed profiled runs.
 
 ## 2026-08-08 — The 27B prefill residual is real and lives in the pipelining: per-stage syncs find only +103 of the +410-438 µs/token, and both cross-chunk accumulation and command-buffer batching are refuted as its mechanism
 
-**Context.** The dense-FFN gemm arc (P8c, 2026-07-29) closed the 27B prefill gap and
-handed off one number it could not attribute: +350 to +560 µs/token of prefill cost
-outside every measured stage, growing with prompt length, and named in TODO.md as the
-largest remaining 27B-prefill unknown. That item's own next step was "per-layer timing
-inside `model.rs` `run_stack` — in situ, not a synthetic bench". This arc built that
-instrument and ran it. It shipped a diagnosis, not a fix.
+The dense-FFN gemm arc closed the 27B prefill gap and handed off one number it could
+not attribute: +350 to +560 µs/token outside every measured stage, growing with
+length. This arc built the instrument that item asked for and ran it, and shipped a
+diagnosis, not a fix. `XWEN_STACK_PROFILE` splits each chunk's wall clock into the
+stages `run_stack` runs, bracketed by device syncs, with a host bucket for the gaps.
+The residual reproduces twice, +410.3 and +437.9 µs/token between the 880- and
+3851-token fixtures. Under per-stage serialization the same length delta is only
++102.8, of which attention is +53.5 and the FFN an unexplained +42.2 on a stage that
+is length-independent by construction. So about 335 µs/token exists only when the
+stages pipeline, the central finding. Two candidate mechanisms are refuted by direct
+A/B: cross-chunk accumulation, and command-buffer batching over a 100x range. Two
+hypotheses survive, both needing a counter candle does not expose.
 
 Full record, moved verbatim: [records/27b-prefill-residual.md](records/27b-prefill-residual.md) (140 lines).
 
@@ -1141,24 +1279,35 @@ fails the drafter preflight now hard-errors at startup where it previously ran p
 
 ## 2026-07-29 — The 27B prefill gap was the dense FFN's gemm, not the DeltaNet scan: a Q4_K cooperative-tensor kernel takes prefill from 263 to 702 tok/s @925
 
-**Context.** Two entries below, the DeltaNet arc refuted its own premise and handed off a
-question: the 27B's 1.8-2.1x prefill loss to llama.cpp is not in the DeltaNet layers, it
-is "in the dense projections", and the next arc "should start from a per-stage profile
-rather than from a reading of llama.cpp's kernels". A profiling pass did exactly that and
-found the answer in one stage. This arc fixed it.
+Two entries below, the DeltaNet arc refuted its own premise and handed off a
+question: the 27B's prefill loss is not in the DeltaNet layers, and the next arc
+should start from a per-stage profile. It did. The dense SwiGLU FFN is 66-85% of
+prefill wall, a band because that row is derived from a rate that is 7-8%
+pessimistic, and the mechanism is not subtle: the FFN runs candle's Q4_K mm at ~12
+TFLOP/s where the same shapes through the Metal-4 cooperative-tensor gemm do 28-36.
+That it is kernel efficiency and not a memory wall is settled without appealing to
+any peak: the Q4_K arm moves 3.6x fewer weight bytes and takes 2.4x longer. So
+`dense_mm.metal` is that gemm reading Q4_K directly. Prefill goes 263 to 702 tok/s at
+925 tokens and 200 to 445 at 4k, decode unchanged. The cost, stated plainly: the
+kernel is LESS accurate than the chain it replaces, ~4.1e-4 against ~1.9e-4, so it is
+pinned off both sides of the strict tier and graded by mm, decode and ppl.
 
 Full record, moved verbatim: [records/dense-ffn-prefill-gemm.md](records/dense-ffn-prefill-gemm.md) (198 lines).
 
 ## 2026-07-29 — DFlash adapted to the Qwen sidecars (P9): both drafters load and accept 85-95%, and speculation is a 27B-only win because the verify forward runs the per-token reference scan
 
-**Context.** The DFlash subsystem came over from laguna whole and inert: `dflash.rs`
-described a six-layer, hidden-3072, 72-head drafter with a per-head softplus attention
-gate and a per-tap encoder norm, gated behind a `dflash.decoder_arch == "laguna"` check.
-The ggml-org sidecars for Qwen 3.6 are a different model — 5 layers at hidden 5120 (27B)
-or 6 at 2048 (35B-A3B), 32 Q / 8 KV heads, no gate tensor, no `enc.aux_norm`, no
-`decoder_arch` key at all, and sliding-window attention on every layer but the last. Two
-tests (`real_file_load_and_shapes`, `real_file_bf16_alias_load_and_forward`) were the
-suite's only red ones and asserted the laguna geometry on purpose, as the arc's gate.
+The DFlash subsystem came over from laguna whole and inert, describing a drafter the
+Qwen sidecars are not, with two deliberately-red tests as the gate. Reading the
+oracle against the shipped headers found three graph differences nobody had briefed:
+the noise block is non-causal, the injection path applies no `attn_norm`, and the
+encoder is three ops. Both drafters load and propose well, 85-95% acceptance, but
+speculation is a 27B-only win: +4.8-6.8% on code and +1.5-7.4% on chat there, against
+-11.5% and -12.7% on the 35B-A3B. The 35B's loss is not a drafting failure, and the
+arm that proves it drafts nothing: at `--draft-p-min 1.1` it still decodes at 92.6
+against 105.1 plain. The cost is the mandatory per-round cache sync, ~1.2 ms, 12% of
+the 35B's step and 2.8% of the 27B's. The deeper ceiling is that an armed multi-token
+chunk falls back to the frozen reference scan, which makes the K-snapshot fused
+verify a precondition for P9, not an optimization.
 
 Full record, moved verbatim: [records/dflash-drafting.md](records/dflash-drafting.md) (160 lines).
 
@@ -1335,36 +1484,52 @@ split out as its own TODO entry. It is gated on a Metal top-k, not on this chang
 
 ## 2026-07-29 — Fused MoE glue: an MoE layer goes from 24 dispatches per token to 14, and 35B decode from 92.6 to 102.8 tok/s
 
-**Context.** With the DeltaNet layers fused, the 35B-A3B's remaining decode cost is the
-MoE half, and it was launch-bound rather than bandwidth-bound: 24 dispatches per layer
-at seq==1, 960 per token across the 40 layers, of which exactly 8 are real matmuls.
-Everything else is glue — a softmax, an arg-sort, a gather, a sum, two clamp halves that
-each upload a fresh 4-byte scalar buffer, a divide, a sigmoid, three elementwise
-multiplies and three adds.
+With the DeltaNet layers fused, the 35B-A3B's remaining decode cost was the MoE half,
+and it was launch-bound rather than bandwidth-bound: 24 dispatches per layer at seq
+== 1, of which 8 are real matmuls. Three fusions ship behind one kill switch, each
+bit-identical to the candle chain it replaces. `kernel_moe_router` returns the
+selected ids and their renormalized weights in one threadgroup per token, replacing
+seven dispatches; `kernel_moe_epilogue` folds the combine, the shared-expert gate and
+the final add into one pass, replacing four. Bit-identity held in the two places it
+looked unlikely, candle's online-Welford softmax and its non-stable bitonic arg-sort,
+where a tie flip swaps an entire expert. Decode goes 92.6 to 102.8 tok/s, +11.0%,
+arms never overlapping across five interleaved reps, prefill unmoved. Because
+everything is bitwise, no provenance change was needed and both gates report
+pre-change numbers.
 
 Full record, moved verbatim: [records/fused-moe-glue.md](records/fused-moe-glue.md) (108 lines).
 
 ## 2026-07-28 — Fused DeltaNet kernels: a layer goes from ~65 dispatches per token to 8, and 35B prefill from 305 to 2183 tok/s
 
-**Context.** Three of every four Qwen 3.6 layers are gated DeltaNet, and all of them
-ran the P3 reference: composed candle ops, one scan step per token. Decode spent about
-65 Metal dispatches on a layer containing seven matmuls. Prefill was worse in kind, not
-just degree — the scan is a Rust `for t in 0..seq` loop issuing eight dispatches per
-timestep per layer, so a 512-token chunk on the 35B cost roughly 123k dispatches. This
-is P8's decode-side package. The chunked (chunk 64, tri-solve) scan was explicitly out
-of scope and stays open as P8b.
+Three of every four Qwen 3.6 layers are gated DeltaNet and all ran the P3 reference,
+about 65 dispatches per layer per token, with prefill worse in kind: the scan was a
+Rust loop issuing eight dispatches per timestep per layer, ~123k for a 512-token
+chunk on the 35B. Four kernels replace it with 8 dispatches per layer at any length,
+the scan's shape being the trick: value-dim columns are independent, so a thread
+holds its state slice in registers and the state is read and written once however
+long the chunk. The 35B-A3B goes 305.4 to 2183.2 tok/s prefill and 57.8 to 91.2
+decode at 596 tokens; the 27B goes 77.3 to 290.4 and 14.3 to 19.0. A measurement
+finding came out worth more than the numbers: a sequential A/B here is not an A/B,
+the matrix drifting 20-35% slower over ten minutes of load. This is also the first
+vendored family that is not bitwise, so `XWEN_DELTA_CLASSIC` is pinned on BOTH sides
+of strict. Both gates ALL PASS, and perplexity is now the number to watch.
 
 Full record, moved verbatim: [records/fused-deltanet-kernels.md](records/fused-deltanet-kernels.md) (197 lines).
 
 ## 2026-07-28 — Sampler tail: 0.82 → 0.41 ms/token, by moving the softmax off the CPU
 
-**Context.** The per-token sampling tail was suspected of costing multiple milliseconds
-of the ~16.9 ms decode budget. The bench that would have shown it (`sampler_decode_bench`
-in moe.rs) was still carrying laguna's shapes — hidden 3072, vocab 100352, top-k 10,
-47 MoE layers — so it had never measured Qwen geometry. Fixed first: the whole
-`decode_bench` constant block now reads 35B-A3B (hidden 2048, expert_ff 512, top-k 8,
-vocab 248320, 40 MoE layers), and the tiled `[VOCAB, HIDDEN]` synthetic tables tile at
-512 rows because 1024 does not divide 248320.
+The per-token sampling tail was suspected of costing multiple milliseconds of the
+~16.9 ms decode budget, and the bench that would have shown it still carried laguna's
+shapes, so it had never measured Qwen geometry. Measured at real width, the whole
+draw cost 0.819 ms/token, of which 0.204 was the logit-row copy and 0.615 CPU work,
+the exp pass alone 0.347 ms and the `select_nth` over 248320 indices 0.270. So the
+full-vocabulary softmax moved onto whatever device holds the logits and the candidate
+set now comes from a streaming top-k, the draw reading back probabilities instead of
+logits so the bus crossings are unchanged. After: 0.406 ms/token, ~2.4% of the
+budget. candle's op order is deliberately preserved, so no distribution changed; what
+did change is that seeded token streams differ. The review follow-up fixed four
+things, three about rows that are not well-formed: the padded tail was drawable, and
+NaN was silently skipped on the greedy path the gate runs.
 
 Full record, moved verbatim: [records/sampler-tail.md](records/sampler-tail.md) (94 lines).
 
@@ -1459,10 +1624,18 @@ worth carrying into the review of every other inherited dialect layer.
 
 ## 2026-07-28 (late night) — Parity harness live (P7): both checkpoints match upstream llama.cpp, floors an order of magnitude tighter than laguna's
 
-**Context.** Everything before this rested on cited source lines, hand-computed unit
-tests, and one greedy eyeball. The engine had never been compared against another
-implementation on the same weights, and the 27B had never been run at all. P7 was the
-item standing between "it produces fluent text" and "it computes the right thing".
+The engine had never been compared against another implementation on the same
+weights, and the 27B had never been run at all, so everything rested on cited source
+lines and hand-computed unit tests. Upstream llama.cpp is pinned at e9fa0781 as a
+submodule, so moving the pin is a staged change someone approves; the fixtures were
+regenerated with Qwen ids from the oracle's own tokenizer, the SWA fixture replaced
+by prose that stresses the DeltaNet recurrence. Two latent parser bugs in the
+inherited `parity.ts` were silent corrupters, each capable of a convincing false
+divergence and neither of a false pass. Both checkpoints agree with upstream: ALL
+PASS, six graded each. Track A's bisection finds no cliff, the rel-L2 profile
+flattening rather than compounding. The floors are set under the worst observed value
+across both checkpoints and all three fixtures, 0.9998 strict and 0.999 mm, an order
+tighter than laguna's. Four things are explicitly NOT proven and are ledgered.
 
 Full record, moved verbatim: [records/parity-harness.md](records/parity-harness.md) (91 lines).
 
