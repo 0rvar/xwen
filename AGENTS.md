@@ -246,9 +246,10 @@ owner's terminal said `powermode 2` in the same second, after the owner switched
 high performance; 0 was automatic. The mode moved nothing measurable (decode 47.0 →
 47.3, prefill 1140 → 1139, streaming read +4-5% at most; log.md "Ceiling diagnosis"),
 so figures measured on automatic stand.] Interleaved protocol; full history in log.md). Plain (--no-draft), measured inside the
-sweeps that graded each: **35B-A3B decode 114 tok/s as of 0261e17** (2026-08-30, the
-beta|alpha fold, +8.8% over the 105.1 arm of the same session; was 104-107 through
-2026-08-08), 27B 24.8-25.3, 3.8-27B 23.7-24.8. The fold has NOT been re-swept with
+sweeps that graded each: **35B-A3B decode 115.0 tok/s fused as of 0ed20ea** (2026-09-06, the fused MoE
+shared expert; the same session's `XWEN_MOE_SHEXP_CLASSIC` arm read 113.2, so +1.6%;
+was 114 at 0261e17 on 2026-08-30, the beta|alpha fold, +8.8% over the 105.1 arm of that
+session; 104-107 through 2026-08-08), 27B 24.8-25.3, 3.8-27B 23.7-24.8. The fold has NOT been re-swept with
 drafting, so every drafted figure below is still against the pre-fold plain level.
 Prefill: the chunk is PER ARCHITECTURE since 2026-08-30 — 2048 on the MoE
 checkpoints, 512 on the dense (`Arch::prefill_chunk_default`, `XWEN_PREFILL_CHUNK`
@@ -285,7 +286,11 @@ as of 2026-09-05 with the fused hc decode gate — 3 dispatches per gate instead
 `XWEN_HC_GATE_CLASSIC` restores 7 — against 47.0 classic in the same rounds, +9% median,
 +5-10% round by round, prefill unchanged**, and the same gate is **+57-76% on 2..8-token
 forwards** (2026-09-06, medians 149.7 vs 93.2 tok/s at chunk 8, 108.9 vs 69.5 at 4,
-68.1 vs 38.6 at 2, every forward forced to n tokens with `XWEN_PREFILL_CHUNK`)) —
+68.1 vs 38.6 at 2, every forward forced to n tokens with `XWEN_PREFILL_CHUNK`);
+**51.5 with the fused MoE shared expert on top (2026-09-06, b7cd358), +0.6% median over
+51.2 classic in the same rounds and +0.8% at best, within noise on this checkpoint where
+the same commit is +1.6% on the 35B; `XWEN_MOE_SHEXP_CLASSIC` restores the five-dispatch
+chain**) —
 interleaved rounds, medians, the fold measured in two sessions,
 against llama.cpp's 789 / 41.4 on the same file in the same hour as the 2026-08-29 arm
 (`pmset -g` said `powermode 0` that session — still no high-power
@@ -343,6 +348,13 @@ dequant-bound by the 2026-08-30 code reading). Levers are dispatch COUNT for dec
 the expert gemm + hc glue for prefill; never per-kernel bandwidth. The fused hc gate (2026-09-05) removed 384 launches and
 measured +9% against the budget's +7.8%, so the attribution is confirmed in situ; the hc
 population is now 288 and ~1356 launches remain per token below the indexer budget.
+**But the ~4 µs average is an average over launches of very different byte weight, and
+it only predicts a fusion whose launches carry under ~2 MB (less than ~4 µs of traffic
+at rate) AND sit on the dependent chain (2026-09-06, log.md "Fused MoE shared expert"):
+the shared expert's five launches per layer were byte-bound at ~535 GB/s, so removing 192
+of them recovered the gaps only, +0.6% against +3.5-4% predicted. Byte-bound or
+overlapped launches yield their gaps, never the budget figure.** The MoE population is
+384 after that fusion (12 dispatches per layer became 8).
 
 **The 27B prefill gap is CLOSED (P8c, 2026-07-29).** It was never the DeltaNet
 scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill

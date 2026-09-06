@@ -166,6 +166,43 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    would stream 5.2 MB of router weight on a single core. The gemv replacement is the
    correct form of that lever. Note the −192 above was router (−1) plus shexp (−3) per
    layer; it is now shexp alone (−4), the same count from a different fold.
+   **DONE 2026-09-06, same day (b7cd358, plus 0ed20ea for the fused|classic host line;
+   log.md "Fused MoE shared expert"): the shexp fusion landed at −4/layer, −192/token on
+   Flash-Next and −160 on the 35B, and it is ON BY DEFAULT, but it bought a fifth of what
+   this ledger priced.** `kernel_moe_shexp_gate_up` (both Q8_0 gemvs + SwiGLU + the shexp
+   gate logit) and `kernel_moe_epilogue_shexp` (the epilogue with the down gemv folded in),
+   both bounded at ~1e-6 rel_l2 from an f32 oracle, `XWEN_MOE_SHEXP_CLASSIC` restoring the
+   five-dispatch chain, `XWEN_MOE_SHEXP_FUSED_MAX_N` = 8 inclusive, provenance `moe_shexp`
+   at schema v11. Measured on pinned binaries, three interleaved rounds each: **35B 113.2
+   → 115.0 tok/s (+1.6%, ahead in every round), Flash-Next 51.2 → 51.5 (+0.6%; per round
+   −0.4/+0.4/+0.8%)** against the +3.5-4% this item predicted from 192 launches at ~4 µs.
+   Flash-Next replay check PASS with the classic control (62/64 code-short, 64/64
+   text-mixed, 58/64 long-mixed, 0 hard); 35B parity gate ALL PASS (strict cos 1.000000,
+   mm cos 0.999618, ppl delta-nll 0.001179).
+   **The budget refinement that came out of it, and it re-ranks everything below**
+   (decisions.md "Ceilings"): the shared expert's cost is its BYTES, not its launches.
+   Three Q8_0 planes of 1.74 MB = 5.2 MB/layer = 250 MB/token = 0.46 ms at ~540 GB/s;
+   the fused kernel A alone floors at 0.31 ms for its 3.5 MB/layer (~535 GB/s, at rate)
+   against 0.55 ms for the five classic launches, so the removed launches were
+   bandwidth-bound, mostly hidden under their own traffic and partly overlapped with the
+   routed expert gathers they share an input with. Fusing recovered the gaps only,
+   ~0.15 ms. **Price a fusion candidate at (launches removed × ~4 µs) ONLY when its
+   launches carry under ~2 MB (less than ~4 µs of traffic at rate) AND sit on the
+   dependent chain**; the hc gate qualified (~1 MB each, strictly dependent, +9% against
+   +7.8%), this one did not. Still open on this item: (a) `MOE_SHEXP_ROWS_PER_TG` (4) and
+   the 128-thread shape are UNSWEPT one-constant A/Bs, and a bad shape would show only as
+   tok/s; (b) the `moe_shexp` provenance label is written from the env predicate rather
+   than from observed execution, so it records intent; the one-time "moe: shared expert
+   fused|classic at N token(s)" host line is what a bench must read instead; (c) a review
+   fix commit is IN PROGRESS and not landed, covering the untested multi-block partitions
+   above hidden 4096 / inner 1024, an n > 1 classic comparison built on bare `QMatMul`
+   rather than the planed `QLinear` route, an offset test leaving four bindings at zero,
+   and two parity rows overstating `XWEN_SHEXP_QMATMUL` / `XWEN_MV_EXT_CLASSIC`.
+   (d) The remaining MoE decode lever is the glue kernels themselves (router kernel and
+   epilogue: tiny bytes, on the chain), which the refined rule keeps in the launch-count
+   class. **The router gemv is IN PROGRESS and UNMEASURED** (vendored wide-grid f32 gemv
+   replacing the single-row mlx gemm; an occupancy item, not a launch-count one), log
+   entry pending.
 3. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line
    earlier.** One drain per token for data that never left the CPU; pass the ids down
    instead. ≈ +0.3 ms, +1.4%, no math change; run the Flash-Next replay check anyway.
@@ -237,6 +274,18 @@ experiment, and `XWEN_DUP_STAGE=experts_down` is how to price any change to it i
 shared expert. The router fold is refuted by reading (item 2), and the −192 is the shared
 expert alone, 5 → 1 with the down gemv in the epilogue, which is in progress; the router
 projection's own lever is a wide-grid gemv, unpriced.
+
+**DONE 2026-09-06, decode: the fused shared expert** (b7cd358 + 0ed20ea, ledger item 2;
+35B 113.2 → 115.0 tok/s (+1.6%), Flash-Next 51.2 → 51.5 (+0.6%), both checks pass), and
+with it the −192 above is spent. **It also changed how the next candidate is chosen**: the
+launch budget only prices launches that carry under ~2 MB and sit on the dependent chain
+(decisions.md "Ceilings"; item 2), and the shexp launches were byte-bound, which is why
++3.5-4% predicted came in at +0.6%. **Re-ranked decode list by that rule: the MoE glue
+kernels (router kernel and epilogue: tiny bytes, on the chain), then the token-id readback
+sync (item 3, ~+1.4%), then the QSA tail above the indexer budget (item 5), then the GDN
+glue (item 4).** Separately, and NOT a launch-count item: the router projection is an
+occupancy item (8 threadgroups for 5.2 MB), and its **wide-grid f32 gemv replacement is IN
+PROGRESS and UNMEASURED**, with no number claimed and a log entry pending.
 
 
 **DONE as opt-in 2026-09-05** (`XWEN_PLE_DEVICE=1`, multi-token Metal forwards; +12.8% prefill @3851,
@@ -2375,6 +2424,14 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     obvious one is REFUTED on this device (decisions.md, `XWEN_MOE_DUAL`).
     Next step is a count-reducing shape nobody has proposed yet, not a rate
     argument.
+    **ANSWERED 2026-09-06: the shape is the shared expert, 5 → 1** (b7cd358; the four
+    shexp dispatches plus the shexp gate matmul become one kernel, with the down gemv
+    folded into the epilogue), which takes the 12 per layer to 8 and the 576 per token to
+    384. It is worth +1.6% on the 35B and +0.6% on Flash-Next, not the +3-8 tok/s this
+    item estimated, because those launches were byte-bound rather than launch-bound
+    (decode item 2 of the re-ranked ledger at the top of this file; decisions.md
+    "Ceilings"). The remaining count-reducing shape here is the glue kernels, which do
+    qualify under the refined rule.
     **STATUS after P3's first pass (2026-08-29): (1) partly, (2), (3) and (6)
     done; (4), (5), (8) untouched; (7) closed earlier; (9) retired; (10)-(13)
     added.** In rough order of expected

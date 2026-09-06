@@ -352,6 +352,31 @@ move a dump: the rescale branch's activation glue folds into `ops::silu_mul_l2`
 dense prefill gemm (`XWEN_SHEXP_QMATMUL`, provenance `shexp_gemm`).
 `XWEN_MOE_GLUE_CLASSIC` still covers only the bit-identical trio.
 
+**The shared expert is ONE dispatch at decode, and it ships on by default even though it
+bought a fifth of what the launch budget promised.** Five launches per MoE layer (gate,
+up, silu*mul, down, gate logit) become two kernels in `src/ops/moe_glue.metal`:
+`kernel_moe_shexp_gate_up`, which takes both Q8_0 gemvs, the SwiGLU and the
+`ffn_gate_inp_shexp` logit, and `kernel_moe_epilogue_shexp`, the block epilogue with the
+down gemv folded in and separate accumulators for the routed combine and the down dot.
+Net −4 dispatches per layer, −192 per token on Flash-Next and −160 on the 35B-A3B.
+Measured on a pinned binary, three interleaved rounds each: 35B decode 113.2 → 115.0
+tok/s (+1.6%, fused ahead in every round), Flash-Next 51.2 → 51.5 (+0.6%, per-round
+−0.4/+0.4/+0.8%). The prediction from the ~4 µs launch budget was +3.5-4% on Flash-Next
+and it failed; the reason is the "Ceilings" refinement below. Shipped anyway because it is
+positive on both checkpoints, loses nothing anywhere, and both correctness checks pass:
+the Flash-Next replay check with `XWEN_MOE_SHEXP_CLASSIC=1` as control, and the 35B parity
+gate (log.md, this date). Like the fused hc gate it copies, it is BOUNDED rather than
+bitwise (~1e-6 relative L2 from an f32 host oracle at both shipped geometries at n = 1, 3
+and 8, both accumulations reassociated), so it gets its own switches and a provenance
+field rather than living under `XWEN_MOE_GLUE_CLASSIC`: `XWEN_MOE_SHEXP_CLASSIC` restores
+the five-dispatch chain, `XWEN_MOE_SHEXP_FUSED_MAX_N` (8, inclusive) bounds the window,
+`moe_shexp` at schema v11 records which side ran, the strict tier pins classic and the
+mm/decode/ppl tiers grade fused. `kernel_moe_epilogue` itself is unchanged and still
+bit-identical. Known limitation, ledgered: the provenance field is written from the env
+predicate rather than from observed execution, so it records intent, and the one-time
+"moe: shared expert fused|classic at N token(s)" host line (0ed20ea) is what a bench uses
+to prove a run was not a silent fallback (2026-09-06).
+
 **hc planes are dense_mm-only.** The loader's plane predicate is
 `dense_mm_supported || mv_ext_supported`, so giving the hyper-connection bottleneck
 planes for the prefill gemm would also have opened the mv_ext 2..8-token window
@@ -3069,7 +3094,12 @@ is dispatch COUNT — the budget prices a removed dispatch at ~4 µs and a remov
 at ~0.3 ms — never per-kernel bandwidth, which the big planes already reach at 95-97%
 of a pure read. The first lever pulled on that reading, the fused hc decode gate (−384
 launches, "At decode the whole read gate is two launches" above), measured +9% against a
-+7.8% prediction — the attribution holds. Prefill at the 2048 chunk is 12.07 GFLOP per token; 3851 tokens run at
++7.8% prediction — the attribution holds.
+[QUALIFIED 2026-09-06 by the fused shared expert, "The shared expert is ONE
+dispatch at decode" above: that per-dispatch price is an average over launches of
+very different byte weight, and it does NOT predict every fusion. The refinement is
+at the end of this paragraph.]
+Prefill at the 2048 chunk is 12.07 GFLOP per token; 3851 tokens run at
 13.7 TFLOP/s end to end against 28-36 for the dense gemm in isolation, weight re-reads
 are 9% of wall (every expert is touched per chunk — a lower bound inside the gemm time,
 not additive to it), the dispatch floor is under 1%,
@@ -3098,12 +3128,36 @@ delta of about zero means "it overlaps with itself", never "it is free", and the
 cannot price a latency-bound decode stage at all. Measured at 596 tokens with `-n 128`:
 the shared expert floors at 0.43 ms of a 19.65 ms token (2.2%), which is its five launches
 per layer being a dependent chain, against the 0.77-0.96 ms the ~4 µs budget gives 240
-launches; the MoE glue and the newly wrapped `router_proj` stage both read zero, so both
-overlap fully and neither is priced. The instrument itself checks out across lengths: the
+launches (a chain, but a BYTE-bound one, which the refinement below is about); the MoE
+glue and the newly wrapped `router_proj` stage both read zero, so both overlap fully and
+neither is priced. The instrument itself checks out across lengths: the
 `moe_glue` prefill delta is 0.058 s at 596 tokens where the 0.40 s at 3851 scales to 0.062.
 What the zero on the router projection does say is that it runs at low occupancy, which is
 the gemv hypothesis for a single-row mlx gemm over a 5.2 MB f32 plane, and the A/B that
 replaces it with a wide-grid gemv is what would price it.
+
+**And the launch budget itself is refined, 2026-09-06 (log.md "Fused MoE shared expert";
+"The shared expert is ONE dispatch at decode" above).** The fused shared expert removed
+192 decode launches, which the ~4 µs average priced at +3.5-4% on Flash-Next, and
+measured +0.6% there and +1.6% on the 35B. The probe explains the gap on the fused
+binary: the shared expert's cost is its BYTES, not its launches. Three Q8_0 planes of
+1.74 MB are 5.2 MB per layer and 250 MB per token, 0.46 ms at the measured ~540 GB/s;
+kernel A alone floors at 0.31 ms for its 3.5 MB per layer, which is ~535 GB/s and
+therefore at rate, against 0.55 ms for the five classic launches. The removed launches
+were bandwidth-bound and mostly hidden under traffic they had to move anyway, and,
+hanging off the same input as the routed expert gathers with no hazard between them,
+partly overlapped with those as well; fusing them recovered the gaps only, ~0.15 ms.
+The hc gate is the contrast that makes the rule: its seven launches carried ~1 MB each on
+a strictly dependent chain, so each launch's latency was exposed and the budget held.
+**The rule, for ranking every remaining fusion candidate: (launches removed × ~4 µs) is
+the right price ONLY for launches that carry less than ~4 µs of traffic at rate, roughly
+2 MB, AND sit on the dependent chain. Byte-bound or overlapped launches yield their gaps
+only, which is a small positive rather than the budget figure.** Re-ranked by it, the
+decode candidates are the MoE glue kernels (router kernel and epilogue: tiny bytes, on the
+chain), the token-id readback sync, the QSA tail and the GDN glue. The router projection
+is not on that list: it is an occupancy item rather than a launch-count one (8
+threadgroups for 5.2 MB), and its lever is the vendored wide-grid f32 gemv, being
+implemented and unmeasured.
 
 ## Process
 

@@ -90,7 +90,13 @@ achievable bandwidth at 537-565 GB/s and put the bytes-only Flash-Next decode ce
 the rest of it is ~1740 dispatches in a dependent chain. The first lever pulled from that
 budget, the fused hyper-connection decode gate (three dispatches per gate instead of
 seven, `XWEN_HC_GATE_CLASSIC` restores the old path), took plain decode from 47.0 to
-51.2 tok/s at 596 tokens, and +57-76% on 2-8 token forwards. Prefill stages are priced
+51.2 tok/s at 596 tokens, and +57-76% on 2-8 token forwards. The second lever, the
+fused MoE shared expert (five dispatches per layer become one, with the down projection
+folded into the block epilogue; `XWEN_MOE_SHEXP_CLASSIC` restores the chain), is worth
+**+1.6% on the 35B-A3B, 113.2 to 115.0 tok/s** and +0.6% on Flash-Next, and the gap
+between those and the +3.5-4% the launch budget predicted is the finding: those launches
+were bandwidth-bound, so only launches carrying under ~2 MB on the dependent chain are
+worth the budget's price (decisions.md "Ceilings"). Prefill stages are priced
 in situ
 by the duplicate-dispatch probe (`XWEN_DUP_STAGE`, log.md "Duplicate-dispatch probe"): at
 3851 tokens the expert gemms are 28-32% of wall, MoE glue 11.5%, the hyper-connection
@@ -177,7 +183,8 @@ of 3 reps, arms interleaved, `lowpowermode 0` on AC):
 | `Qwen3.8-27B` | +44 to +45% | +37 to +38% | 78-80% | 2026-08-15 |
 
 The 35B-A3B's PLAIN decode level moved on 2026-08-30 (105.1 → 114.4 tok/s, the
-beta|alpha fold at 0261e17); the gains in this table were fitted against the older level
+beta|alpha fold at 0261e17) and again on 2026-09-06 (113.2 → 115.0, the fused MoE
+shared expert); the gains in this table were fitted against the oldest of those levels
 and have not been re-swept, so read them as gains over their own sweep's plain arm.
 
 Acceptance trades against draft length, so raising `--draft-p-min` buys acceptance and
