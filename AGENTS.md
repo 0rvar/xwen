@@ -5,23 +5,43 @@ from the code: ground-truth sources, hard-won gotchas, workflows. When picking u
 TODO.md item, read this whole file first — items acquire traps and the traps get
 documented here.
 
-Doc system: `README.md` is getting-started + the practical surface; `docs/decisions.md`
-is the WHY, by topic — every deliberate choice, default, policy, and refuted direction,
-with its evidence; `docs/log.md` is the chronological narrative both point into;
-`docs/parity.md` is the verification runbook; `TODO.md` is the forward ledger.
+Doc map. Every file here has exactly one job, and work that lands is recorded in the
+one that owns it:
 
-Keep those roles separate when finishing work. Put benchmark tables, test results,
-failed experiments and the completed-work narrative in `docs/log.md`; put the
-reasoning behind the resulting choice in `docs/decisions.md`. In `TODO.md`, leave
-only a brief dated completion/refutation annotation and a link to that record,
-alongside the work that remains. Do not duplicate the results or narrative there.
-Existing ledger history is preserved, not deleted or rewritten to clean it up.
+- **`README.md`** is getting started and the practical surface.
+- **`AGENTS.md`** is the rules, the gotchas and this map.
+- **`docs/decisions.md`** is an index over **`docs/decisions/<topic>.md`**, which hold the
+  WHY by topic: every deliberate choice, default, policy and refuted direction, with its
+  evidence. A new decision is a dated paragraph appended inside the topic it belongs to.
+- **`docs/log.md`** is the timeline, newest first: short dated entries. Full arc
+  write-ups, meaning protocol, tables and reviews, live in **`docs/records/<slug>.md`**
+  behind a stub in the log.
+- **`docs/parity.md`** is the verification runbook.
+- **`docs/perf-state.md`** is the current figures, and it is their single source.
+- **`docs/benching.md`** is how to measure anything on this machine.
+- **`TODO.md`** is the open ledger; closed items live verbatim in
+  [`docs/ledger-archive.md`](docs/ledger-archive.md).
+- **`scripts/docs-check.ts`** asserts that links, anchors, unique titles and quoted
+  references all resolve.
 
-Before handing off, make the next live TODO actionable: name the next experiment
-or implementation step, its entry point and prerequisites, and any unresolved
-risks or verification gaps. Clearly distinguish a measured result from an unpriced
-candidate. Link to the evidence rather than making the next agent reconstruct the
-session or repeat an already-completed experiment.
+Rules for keeping it that way:
+
+- Finishing an arc means recording it. The shape is a judgement call per session: a new
+  record for a substantial arc, an update to an existing record or decision paragraph
+  when the work continues one, or a mix of both. Records are not mandatory.
+- Log entries stay short, a paragraph with the headline figures and the links. The
+  narrative and the tables belong in the record or in the topic file, not in the log.
+- A `TODO.md` annotation is at most three lines plus a link. Do not duplicate results or
+  narrative there.
+- Headings are never renamed once written, because everything links by heading text.
+- A ledger item or section that closes moves verbatim to [`docs/ledger-archive.md`](docs/ledger-archive.md) at the
+  end of the arc that closes it. Ledger history is preserved, never rewritten to clean
+  it up.
+- Before handing off, make the next live TODO actionable: name the next experiment or
+  implementation step, its entry point and prerequisites, and any unresolved risks or
+  verification gaps. Distinguish a measured result from an unpriced candidate, and link
+  to the evidence rather than making the next agent reconstruct the session.
+- Run `bun scripts/docs-check.ts` before handing off.
 
 ## Non-negotiables
 
@@ -31,8 +51,8 @@ session or repeat an already-completed experiment.
 - TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, or it
   becomes a ledger item with context. Ledger items are never deleted, only annotated.
 - Every shipped arc updates the docs before it's done: dated log.md entry, README if
-  the surface changed, decisions.md if a decision was made/changed/refuted. A TODO.md
-  update alone is not sufficient.
+  the surface changed, decisions.md if a decision was made/changed/refuted, perf-state.md
+  if a figure moved. A TODO.md update alone is not sufficient.
 - The reference implementations (`ReferenceExperts`, and the DeltaNet reference once it
   lands) are frozen correctness oracles. Never "optimize" them.
 - Any change touching model math re-runs the parity gate (docs/parity.md) before it
@@ -235,180 +255,24 @@ less than the band, ≤8 excuses, everything else hard; docs/parity.md "Limitati
 
 ## Perf state
 
-As of 2026-08-15 for the 3.8-27B, 2026-08-08 for the 3.6 pair (`lowpowermode 0` —
-NOT low-power mode; high-power mode is never positively confirmable and must not be
-claimed. **The KEY SET CHANGED at some point: this used to emit no `powermode` key,
-and on 2026-08-29/30 two agents saw `pmset -g` print `powermode 0` and NO
-`lowpowermode` key. Report the line verbatim as of the session; still never claim
-high-power mode from either key.** [2026-09-05: the two names are one key printed
-differently by different shells — the bench shell said `lowpowermode 2` while the
-owner's terminal said `powermode 2` in the same second, after the owner switched to
-high performance; 0 was automatic. The mode moved nothing measurable (decode 47.0 →
-47.3, prefill 1140 → 1139, streaming read +4-5% at most; log.md "Ceiling diagnosis"),
-so figures measured on automatic stand.] Interleaved protocol; full history in log.md). Plain (--no-draft), measured inside the
-sweeps that graded each: **35B-A3B decode 127.0 tok/s as of 24c4069** (2026-09-06, the wide-grid
-f32 router gemv on top of the fused MoE shared expert; the same session's
-`XWEN_ROUTER_MV_CLASSIC` arm read 115.1, so +10.3%, ahead in every round; was 115.0 earlier
-that day at 0ed20ea with the fused shared expert alone, whose own classic arm read 113.2;
-was 114 at 0261e17 on 2026-08-30, the beta|alpha fold, +8.8% over the 105.1 arm of that
-session; 104-107 through 2026-08-08), 27B 24.8-25.3, 3.8-27B 23.7-24.8. The fold has NOT been re-swept with
-drafting, so every drafted figure below is still against the pre-fold plain level.
-Prefill: the chunk is PER ARCHITECTURE since 2026-08-30 — 2048 on the MoE
-checkpoints, 512 on the dense (`Arch::prefill_chunk_default`, `XWEN_PREFILL_CHUNK`
-overrides; decisions.md "The prefill chunk is per architecture") — measured that day at 3851 tokens: **35B 2634
-(2429 at 512)**, and 3081-3090 @3803 after the 2026-08-30 FFN-glue levers (the L2
-fold + shexp onto dense_mm; 2746-2755 in the same sweep's all-classic arm); the dense 27B reads 5-6% SLOWER at 2048 (650/599 vs 608/571) and keeps
-512 (its 702@925 / 445@4k are from 2026-07-29 and not re-measured). Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run
-adds ~9s of Metal pipeline compilation. With drafting (the default since P9a) at
-the per-model defaults: **27B 37.5-38.2 code / 36.8-37.4 chat** (+46-52% over
-plain), **35B 133.6-134.8 code / 122.3-123.7 chat** (+26-28% / +15-17%), both
-fitted 2026-08-08; **3.8-27B 34.4-35.7 code / 33.1-34.0 chat** (+44-45% / +37-38%)
-at the p_min 0.7, depth 4 fitted 2026-08-15, acceptance 80.0% code / 77.8% chat.
-Ranges span the medians the shipped configuration was measured at (for the 3.8,
-three independent measurements in one session: stage 1, stage 2's shipped-margin
-arm, and the depth probe).
-Those drafted figures are WITHIN-SWEEP against the plain arm of the same sweep;
-do not difference them against a drafted number from another session — the 27B's
-between-session level shifts, and yesterday's 31.7 code figure at p_min 0.3 reads
-36.5-37.6 in today's own 0.3 arm.
-Qwen3.8-Flash-Next (EXPERIMENTAL; every surface since P4, but these numbers are
-`generate`'s — serve matches them as of 2026-08-30, §serve), 2026-08-29 after the
-P3 kernel pass for prefill and 2026-08-30 at the ba fold (0261e17) for decode,
-plain because no drafter exists for it: **prefill ~796 tok/s @530, decode 46.5-46.7
-(44.4-44.5 before the ba fold, 43.1 before the PLE row prefetch)** — 530-token prompt
-(long prompts at the 2048 chunk of 2026-08-30: **824 @3851 / 951 @1962**, against
-748 / 883 at the old 512 chunk, same session; the FFN-glue levers of the same day —
-the rescale-chain L2 fold plus the shexp and hc gemms onto dense_mm, hc `up` alone
-worth +7-11% — lift it to **~960-980 @3803 and ~860 @7606**, the same sweep's
-all-classic arms reading 865-872 / 766; **decode by context, same day, after the
-QSA block-key cache, fused gather and device-side selection (2026-08-30): 46 below the
-2048 indexer budget and 44-45 at 3.8k-32k, plain — 30 before the arc, 33 after the
-cache alone; the cliff is closed, TODO.md keeps the follow-ups; **and 51.2 at 596 tokens
-as of 2026-09-05 with the fused hc decode gate — 3 dispatches per gate instead of 7,
-`XWEN_HC_GATE_CLASSIC` restores 7 — against 47.0 classic in the same rounds, +9% median,
-+5-10% round by round, prefill unchanged**, and the same gate is **+57-76% on 2..8-token
-forwards** (2026-09-06, medians 149.7 vs 93.2 tok/s at chunk 8, 108.9 vs 69.5 at 4,
-68.1 vs 38.6 at 2, every forward forced to n tokens with `XWEN_PREFILL_CHUNK`);
-**51.5 with the fused MoE shared expert on top (2026-09-06, b7cd358), +0.6% median over
-51.2 classic in the same rounds and +0.8% at best, within noise on this checkpoint where
-the same commit is +1.6% on the 35B; `XWEN_MOE_SHEXP_CLASSIC` restores the five-dispatch
-chain**; **and 52.9 with the router gemv on top of that (2026-09-06, 24c4069), +4.8%
-median over the 50.5 its `XWEN_ROUTER_MV_CLASSIC` arm read in the same rounds, ahead in
-all three, prefill unchanged at 1171; candle's mlx gemv ran the 5.24 MB router plane on
-8 threadgroups and the vendored `kernel_mul_mv_f32_f32_v` runs it on 256; note the
-Flash-Next session level drifts, this session's classic arm reading 50.5 where the
-morning's read 51.2, so compare only within a session**) —
-interleaved rounds, medians, the fold measured in two sessions,
-against llama.cpp's 789 / 41.4 on the same file in the same hour as the 2026-08-29 arm
-(`pmset -g` said `powermode 0` that session — still no high-power
-claim). Its decode is bimodal round over round (~42 vs ~44 at the pre-fold level) and
-unexplained, and BOTH per-step profilers — `XWEN_STACK_PROFILE`'s decode stages and
-`XWEN_GDN_PROFILE`'s whole line — are SYNC-INFLATED: they RANK steps, they do not PRICE
-them (two figures off the GDN line read 2-3x high against amortized benches of the same
-work), so take every headline from an unprofiled run and price a step with an amortized
-bench or end-to-end tok/s, never with a profiler figure.
-As of 2026-09-05, **the PLE gate and conv run on device for multi-token prefill**
-(`XWEN_PLE_TAIL_CLASSIC=1` restores the host tail): Flash-Next prefill **1010 → 1140
-@3851 (+12.8%), 1118 → 1262 @880 (+12.9%)**, decode flat, interleaved rounds,
-`lowpowermode 0`. It flips one long-mixed replay step that a benign host reorder flips
-identically; the Flash-Next check excuses that by its engine near-tie rule (below).
-As of 2026-09-05, **PLE decode readbacks are batched at seq == 1 only**
-(`XWEN_PLE_READBACK_CLASSIC` restores the three waits). Multi-token prefill keeps
-its old readbacks; all-length batching had no established prefill gain. The
-qualified decode measurement and the initial all-length sweep's drift flag
-drift flag, live in [the log](docs/log.md#2026-09-05--ple-batches-its-three-device-to-host-readbacks).
-Prefill at the 2048 chunk is UNCHANGED end-to-end by the 2026-08-30 mm_id tile work
-(work-list grid + NR1 64: +17-23% on the expert gemms in isolation, nothing claimable at
-3803 tokens on either MoE checkpoint), because the prefill `ffn` stage is now mostly
-NOT the expert gemms — router, rescale chain, SwiGLU, combine and shared expert are the
-majority (TODO.md's prefill section is re-ranked accordingly). [REFUTED 2026-09-05:
-that reading came off the 2.2x-inflated stage profiler. The duplicate-dispatch probe
-(`XWEN_DUP_STAGE`, log.md "Duplicate-dispatch probe") prices prefill stages in situ with
-no sync: at 3851 tokens the expert gemms are 0.96-1.09 s of 3.4 s (28-32%, 73% of `ffn`),
-MoE glue 0.40 s, hc gates 0.39 s (gemms 0.14), GDN kernels 0.23 s (scan 0.16), shared
-expert ~0; 38% of wall is unpriced (projections, attention, QSA, PLE, lm_head). Price a
-prefill stage with the probe, never with the profiler or an isolated bench.]
-The probe also runs at decode via `XWEN_DUP_DECODE` (2026-09-06), but read it differently
-there: a decode copy has no buffer hazard against its original, so a delta above zero is
-only a FLOOR for that stage and a delta of about zero means the stage overlaps itself,
-never that it is free, which is why the probe cannot price a latency-bound decode stage
-(measured: shared expert floors at 0.43 ms of a 19.65 ms token, MoE glue and the router
-projection both read zero).
-Within-session cross-drafter comparison, 2026-08-15 (the only way to compare the
-two kinds honestly — same machine, same hour): the 3.6-27B's DFlash head runs
-1.50x/1.47x over its own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x
-over its own. Same trunk geometry, so the block drafter is still the stronger
-drafter; the MTP head closes most of the gap and is worth roughly ten times less
-KV (4 KiB/token against 40).
+[docs/perf-state.md](docs/perf-state.md) is the single source for current figures; these
+are the headlines. Plain decode as of 2026-09-06, both at 24c4069: **35B-A3B 127.0 tok/s**
+and **Flash-Next 52.9 at 596 tokens** (it ships no drafter, so it decodes plain). The
+dense pair as last fitted: **27B 24.8-25.3 plain, 37.5-38.2 drafted on code**
+(2026-08-08), **3.8-27B 23.7-24.8 plain, 34.4-35.7 drafted on code** (2026-08-15).
+Prefill: **35B 3081-3090 at 3803 tokens** and **Flash-Next 1140 at 3851** (2026-08-30 and
+2026-09-05), the dense **27B 702 at 925** (2026-07-29). Read a drafted or an A/B figure
+only against the arm measured in its own session.
 
-**Flash-Next ceilings (2026-09-05, log.md "Ceiling diagnosis"; decisions.md
-"Ceilings").** A decode token reads 6.33 GB of weights (+~0.3 GB state/KV) = 11.7-12.3
-ms of its 21.3 at the measured bandwidth, so the bytes-only ceiling is **81-86 tok/s**;
-the other ~9 ms is ~1740 dispatches in a mostly dependent chain (hc 672, MoE 576,
-GDN 252) at ~4 µs average (a residual between the measured 2.5 µs floor and the 8.4 µs
-gemv intercept) plus 3 syncs and the serial scan. Decode is not CPU-bound (3.7 ms CPU per
-token) and not command-buffer-bound. Prefill at 3851 runs 13.7 TFLOP/s end to end on
-12.07 GFLOP/token; the dispatch floor is <1%, weight re-reads 9% (inside the gemm
-time, a lower bound), and the expert gemms
-14-43% (amortized bench 43%, two in-situ A/Bs bracket it lower; ~12 TFLOP/s isolated,
-dequant-bound by the 2026-08-30 code reading). Levers are dispatch COUNT for decode and
-the expert gemm + hc glue for prefill; never per-kernel bandwidth. The fused hc gate (2026-09-05) removed 384 launches and
-measured +9% against the budget's +7.8%, so the attribution is confirmed in situ; the hc
-population is now 288 and ~1356 launches remain per token below the indexer budget.
-**But the ~4 µs average is an average over launches of very different byte weight, and
-it only predicts a fusion whose launches carry under ~2 MB (less than ~4 µs of traffic
-at rate) AND sit on the dependent chain (2026-09-06, log.md "Fused MoE shared expert"):
-the shared expert's five launches per layer were byte-bound at ~535 GB/s, so removing 192
-of them recovered the gaps only, +0.6% against +3.5-4% predicted. Byte-bound or
-overlapped launches yield their gaps, never the budget figure.** The MoE population is
-384 after that fusion (12 dispatches per layer became 8). **And OCCUPANCY is a third class
-of decode cost beside bytes and launch gaps (2026-09-06, log.md "Router projection on a
-256-threadgroup gemv"): the router projection read zero on the probe and 4% of a token's
-bytes on the budget, yet moving it off candle's 8-threadgroup mlx gemv onto a
-256-threadgroup vendored one was worth +10.3% on the 35B and +4.8% on Flash-Next, so a
-kernel that leaves the GPU mostly idle is invisible to both instruments; the audit that
-would find the rest, threadgroup count against bytes for every decode dispatch, is
-ledgered and unbuilt.**
+Three rules do not bend. [docs/benching.md](docs/benching.md) has the rest, and the
+ceilings that rank the remaining levers are in perf-state.md.
 
-**The 27B prefill gap is CLOSED (P8c, 2026-07-29).** It was never the DeltaNet
-scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill
-wall) running candle's `kernel_mul_mm_q4_K_f32` at ~12-13 TFLOP/s where the
-Metal-4 cooperative-tensor gemm does 28-36. `src/ops/dense_mm.metal` (Q4_K
-source, in-kernel tile dequant, `seq > 32`) made 27B prefill 2.2-2.7x faster:
-270 → 702 @925, 236 → 445 @4k, against llama.cpp's 486 / 502. Prefill no longer
-degrades with length for FFN reasons, though a +350-560 µs/token residual
-outside all measured stages still does (TODO.md — and it is most of why 4k fell
-short of the profile's 496 upper bound while 925 met it). The kernel is
-knowingly less accurate than the `QMatMul` chain (~4.1e-4 vs ~1.9e-4 rel_l2 from
-the f32 oracle — matmul2d's reduced-precision path, the same trade the attention
-prefill gemm made); it is pinned off on both sides of the strict parity tier and
-graded by mm/decode/ppl.
-
-Benching rules this machine has already enforced the hard way. Achievable
-bandwidth IS measured (2026-09-05, `ops::bandwidth::tests::bandwidth_sweep`,
-"automatic" power mode, `lowpowermode 0`): streaming read 537-565 GB/s median
-(575-580 best rounds, 87-94% of the 614 nominal), copy ~517, a 32 MB weight plane
-528-537, and a 2.4-2.7 µs fixed cost per back-to-back dispatch inside one encoder.
-Argue bytes-moved against THAT range, never the nominal figure, and remember the
-Q8_0 gemv's 8.41 µs intercept is kernel ramp, not launch floor (a decode budget
-closes at ~4 µs average per dispatch). Between two arms, still compare bytes-moved
-against time (the Q4_K FFN gemm reads 3.6x fewer weight bytes than the f16 one and
-takes 2.4x longer, which settles bandwidth-vs-kernel without any peak). Use AMORTIZED rates
-(BATCH dispatches per sync, outputs held alive), never per-dispatch: a budget
-built from per-dispatch numbers sums to 127% of wall. Keep the duty cycle low —
-the same shape measured 23% slower in a 36 s run than in a 9 s one, with no
-thermal flag anywhere. The machine thermal-throttles under sustained load as a
-matter of course (owner's word, 2026-08-30), so design rounds around it: short runs,
-arms interleaved tightly (A B A B, never all of A then all of B), ~60 s idle between
-rounds, an anchor arm at the start and end of every session with a >3% drift flag, and
-never a test suite or a second model process alongside a bench. Bench a PINNED binary
-(a detached-worktree build under /tmp, `--bin` on the harness): a coding agent's `cargo
-build` in the main tree swaps `target/release/xwen` and its `include_str!` kernels under
-a running harness (2026-09-05: a session aborted on a half-written kernel). llama.cpp's prefill thermal-boosts harder than xwen's
-(-17% vs -5% settling) — never read a first-reps prefill ratio as steady state.
-And on a machine shared with other agents, calibrate every prefill run against
-the classic arm's known baseline before believing absolutes: three separate
-contended runs read 3x low in BOTH arms while the ratio stayed put.
+- State the `pmset -g` line verbatim as of the session, and never claim high-power mode.
+  Neither `lowpowermode` nor `powermode` can confirm it.
+- One large model process at a time, and never a test suite alongside a bench.
+- Bench a PINNED binary: a detached-worktree build under /tmp, `--bin` on the harness.
+  A coding agent's `cargo build` in the main tree swaps the binary and its kernels under
+  a running harness.
 
 ## Drafting (SHIPPED and ON BY DEFAULT; all three checkpoints as of 2026-08-15)
 
@@ -465,8 +329,8 @@ Both have the same root and the same fix.
 
 Controller constants: `p_min` PER-CHECKPOINT via `Model::draft_p_min_default()` and depth
 PER-KIND via `Model::draft_max_default()`, both in src/hub.rs; `pause_margin` stays a
-shared 1.0. Values and the acceptance they buy are in "Perf state" below. `p_min` here is
-a FULL-VOCAB probability and deliberately NOT llama.cpp's top-10-renormalized one
+shared 1.0. Values and the acceptance they buy are in
+[docs/perf-state.md](docs/perf-state.md). `p_min` here is a FULL-VOCAB probability and deliberately NOT llama.cpp's top-10-renormalized one
 (decisions.md), so any cross-check against llama.cpp must run both sides at `p_min` 0 or
 it is comparing two different gates. The standing retune tool is `bun
 scripts/retune-draft.ts` (two-stage, no cell reuse between stages, P9's qualification
@@ -475,7 +339,7 @@ change `hub.rs`'s arms you must also update the script's `SHIPPED_P_MIN` and
 `SHIPPED_DRAFT_MAX` tables, or the next sweep grades against a status quo that no longer
 ships. `bun scripts/spec-equivalence.ts` covers all three checkpoints; its GREEDY mode is
 the gate, and its sampled mode diverges on the shipped 3.6 checkpoints too (near ties,
-not a regression — see "Perf state").
+not a regression — see [docs/perf-state.md](docs/perf-state.md)).
 
 ## serve (INHERITED, partially adapted)
 

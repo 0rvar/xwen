@@ -12,16 +12,22 @@ end (greedy, chat template, thinking split, clean stops), and the 3.6 pair passe
 parity gate against upstream llama.cpp on identical GGUF weights (`docs/parity.md`) —
 Qwen3.8-27B runs that same dense graph. Flash-Next has no harness of its own yet and was
 verified by forced replay against llama.cpp (`docs/qwen4exp-port.md`). Decode rates are
-in Speculative decoding below and in AGENTS.md's Perf state. See `TODO.md` for the
-priority ledger and `docs/log.md` for the narrative.
+in Speculative decoding below and, in full, in `docs/perf-state.md`. See `TODO.md` for
+the open ledger and `docs/log.md` for the timeline.
 
 ## Docs
 
-- `docs/decisions.md` — every deliberate choice and refuted direction, with evidence
-- `docs/log.md` — dated engineering narrative
-- `docs/parity.md` — verification runbook (vs upstream llama.cpp)
-- `AGENTS.md` — agent context: ground truth, architecture cheat sheet, hazards
-- `TODO.md` — deferred-work ledger
+- `docs/perf-state.md`: the current figures, one row per checkpoint and surface
+- `docs/benching.md`: how to measure anything on this machine, and what the instruments
+  can and cannot see
+- `docs/decisions.md`: an index of every deliberate choice and refuted direction, by
+  topic, under `docs/decisions/`
+- `docs/log.md`: the dated timeline, newest first, with the full arc write-ups it points
+  into under `docs/records/`
+- `docs/parity.md`: the verification runbook (vs upstream llama.cpp)
+- `AGENTS.md`: agent context, meaning ground truth, architecture cheat sheet, hazards,
+  and the map of these files
+- `TODO.md`: the open ledger; items close by moving verbatim to `docs/ledger-archive.md`
 
 ## Build
 
