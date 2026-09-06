@@ -4,6 +4,20 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-06 — Docs restructured: decisions by topic, records behind log stubs, perf-state and benching split out, and the ledger regrouped by area with a ten-item Front
+
+Two passes in one day, both script-driven with every moved line accounted for. The first
+split decisions.md into 17 topic files behind an index, moved 32 long log entries into
+docs/records behind short stubs, archived 44 closed ledger items verbatim, trimmed ~50
+annotations to three lines and a link, and took AGENTS.md from 524 to 388 lines by
+moving the figures to docs/perf-state.md and the measurement rules to docs/benching.md;
+scripts/docs-check.ts now asserts links, anchors, titles and quoted names. The second
+regrouped TODO.md by area with a capped Front, made the lettered sub-item the unit that
+closes, added state tags and `From:` provenance lines, and gave the ledger a second exit
+beside shipping (retired, with a reopen condition; decisions.md "The ledger is a memory
+and a backlog"). Sizes and the reasoning are in the record:
+[docs restructure](records/docs-restructure.md).
+
 ## 2026-09-06 — Router projection on a 256-threadgroup gemv: 35B decode 115.1 → 127.0 (+10%), Flash-Next 50.5 → 52.9 (+5%); the lever was occupancy, not launches
 
 The third decode lever of the day and the largest, and it is not a launch-count item at

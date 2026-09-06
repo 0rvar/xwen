@@ -19,10 +19,13 @@ one that owns it:
 - **`docs/parity.md`** is the verification runbook.
 - **`docs/perf-state.md`** is the current figures, and it is their single source.
 - **`docs/benching.md`** is how to measure anything on this machine.
-- **`TODO.md`** is the open ledger; closed items live verbatim in
-  [`docs/ledger-archive.md`](docs/ledger-archive.md).
+- **`TODO.md`** is the backlog and the open ledger: a ranked **Front** of at most ten
+  planned items, then every deferred scope grouped by area, each tagged and carrying a
+  `From:` line. Closed and retired text lives verbatim in
+  [`docs/ledger-archive.md`](docs/ledger-archive.md) under the arc that deferred it.
 - **`scripts/docs-check.ts`** asserts that links, anchors, unique titles and quoted
-  references all resolve.
+  references all resolve, and that the ledger keeps its shape (tags, `From:` lines,
+  the front cap, item length).
 
 Rules for keeping it that way:
 
@@ -34,9 +37,22 @@ Rules for keeping it that way:
 - A `TODO.md` annotation is at most three lines plus a link. Do not duplicate results or
   narrative there.
 - Headings are never renamed once written, because everything links by heading text.
-- A ledger item or section that closes moves verbatim to [`docs/ledger-archive.md`](docs/ledger-archive.md) at the
-  end of the arc that closes it. Ledger history is preserved, never rewritten to clean
-  it up.
+- The ledger has three exits and the unit is the item or the lettered sub-item. Shipped:
+  the text moves verbatim to [`docs/ledger-archive.md`](docs/ledger-archive.md) under
+  the heading its `From:` line names, at the end of the arc that closes it. Retired: a
+  dated line with the reason and a reopen condition, then the same move, under a
+  `Retired: <area>` heading. Retired means not planned, not forbidden: pick it up when
+  its reopen condition holds, or for a reason the retirement did not foresee, and say
+  why. Only `docs/decisions/` says refuted, and only with evidence; that is the one
+  state not to relitigate without new evidence.
+- The Front of `TODO.md` holds at most ten items, ranked, each with its expected gain
+  against a ceiling in docs/perf-state.md or a user who is waiting. Promoting one means
+  demoting one. An item in an area section is not planned until it is promoted.
+- A review finding that is not worth an item is not silently dropped and not a ledger
+  item either: the record says "not taken now", the reason, and a reopen condition.
+- Triage at the end of every arc, and for any item whose latest date is older than 30
+  days: promote it, keep it with a fresh dated line saying why it is still worth it, or
+  retire it. Archive text is never rewritten; the open ledger may be regrouped.
 - Before handing off, make the next live TODO actionable: name the next experiment or
   implementation step, its entry point and prerequisites, and any unresolved risks or
   verification gaps. Distinguish a measured result from an unpriced candidate, and link
@@ -48,8 +64,10 @@ Rules for keeping it that way:
 - Design target: maximum tok/s for Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B GGUF on
   this one machine (M5 Max, Metal). Batch 1. No portability hedging. (3.8-27B runs the
   3.6-27B graph unchanged — it is a registry entry, not a port.)
-- TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, or it
-  becomes a ledger item with context. Ledger items are never deleted, only annotated.
+- TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, it
+  becomes a ledger item with context, or it is retired with a dated reason and a reopen
+  condition. Ledger text is never deleted: closed and retired items move verbatim to
+  the archive.
 - Every shipped arc updates the docs before it's done: dated log.md entry, README if
   the surface changed, decisions.md if a decision was made/changed/refuted, perf-state.md
   if a figure moved. A TODO.md update alone is not sufficient.
@@ -368,7 +386,8 @@ mode-keyed sampling resolved per request after thinking is known (the fixed
 DEFAULT_TEMPERATURE/TOP_K/TOP_P constants are gone; ServeSettings sampling keys are
 Options, and a pinned value pins both modes). Still open on thinking: the Anthropic
 dialect has no per-request effort knob (server-wide default applies) and penalties stay
-accept-and-drop — both ledgered (TODO.md 2026-08-19 section).
+accept-and-drop — both ledgered (TODO.md, From: the chat-dialect and sampling-defaults
+arc).
 
 API model names are FULL names only (`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B`,
 `Qwen3.8-Flash-Next` — `Model::full_name`, matching `general.name` and the repo), plus
