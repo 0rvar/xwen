@@ -126,11 +126,46 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    A/B was n = 1, and at 2..8 tokens kernel A re-stages the carrier row per token per
    threadgroup. An A/B pinning `XWEN_HC_GATE_FUSED_MAX_N=1` against 8 on a serve-style
    ragged forward would price it (Qwen review, 2026-09-06).
+   **(e) MEASURED and CLOSED 2026-09-06: it is the largest win the gate has, +57-76%.**
+   Forcing every forward to n tokens with `XWEN_PREFILL_CHUNK=n` over the 880-token
+   prefill fixture, fused against `XWEN_HC_GATE_FUSED_MAX_N=1`, three interleaved rounds
+   on a pinned cf7c579 build: medians 149.7 vs 93.2 tok/s at n = 8 (+61%), 108.9 vs 69.5
+   at 4 (+57%), 68.1 vs 38.6 at 2 (+76%). The split path in that window sends both
+   bottleneck gemms through candle `QMatMul`'s tile matmul (dense_mm-only planes), which
+   is what the fused kernels displace ([log](docs/log.md), 2026-09-06 entry). Nothing
+   above n = 8 has been measured, so the ceiling itself stays where it is.
+   (f) **NEW 2026-09-06, unexplained, from that same run:** the 8-token decode tail after
+   each ragged prefill read LOWER on every fused arm (47.9-52.1 tok/s) than on every split
+   arm (55.4-57.6), all nine pairs, even though n = 1 decode runs the identical fused gate
+   on both arms. The 128-token recheck is not comparable (the fused arm stopped on a stop
+   token after 11 tokens in both rounds), so there is no valid decode figure for it; the
+   n = 1 A/B of 2026-09-05 (51.2 vs 47.0) remains the decode measurement. A recheck needs a
+   prompt that cannot stop early or a token budget that ignores stop ids. Open question:
+   whether anything about a fused-gate prefill leaves the first decode steps slower.
 2. **MoE FFN: 576 dispatches/token (30%).** 12 per layer; the glue is already fused and
    the dual gate|up kernel is refuted (decisions.md `XWEN_MOE_DUAL`), so what is left
    is shape-level: the router is already one projection plus one fused kernel, so
    folding the projection in is −1/layer; shexp's four dispatches as one is −3/layer →
    −192 ≈ −0.8 ms, +3.6%. Item (15).
+   **PROBED 2026-09-06 in decode mode (`XWEN_DUP_DECODE`, log.md 2026-09-06 entry), and
+   the shape of the item changes.** The shared expert FLOORS at 0.43 ms of a 19.65 ms
+   token (2.2%): its five launches per layer (gate, up, silu*mul, down, gate logit; 240
+   per token) are a dependent chain that does not overlap its own duplicate, against the
+   0.77-0.96 ms the ~4 µs budget gives 240 launches. The router projection is UNPRICED at
+   decode: its duplicate cost nothing, and at decode a zero delta means the stage overlaps
+   itself, never that it is free. What the zero does say is that it runs at low occupancy,
+   consistent with a single-row mlx gemm over a 5.24 MB f32 plane (251 MB per token across
+   48 layers). Two experiments follow. **Shared-expert fusion, 5 → 1 with the down gemv
+   folded into the epilogue, −4/layer, −192/token, in progress 2026-09-06.** And **the
+   router gemv**: replace the f32 matmul with a wide-grid gemv at n <= 8 (candle
+   `QMatMul` over the F32 `ffn_gate_inp` tensor, reaching ggml's
+   `kernel_mul_mv_f32_f32`), unpriced, no number claimed. **REFUTED by reading, same day:
+   this ledger's own "fold the router projection into `kernel_moe_router`" (−1/layer).**
+   That kernel is one threadgroup per token, which is the shape `kernel_hc_norm_inject`
+   lost 6% of decode with (decisions.md "Below 32 tokens the hc norm splits"), so the fold
+   would stream 5.2 MB of router weight on a single core. The gemv replacement is the
+   correct form of that lever. Note the −192 above was router (−1) plus shexp (−3) per
+   layer; it is now shexp alone (−4), the same count from a different fold.
 3. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line
    earlier.** One drain per token for data that never left the CPU; pass the ids down
    instead. ≈ +0.3 ms, +1.4%, no math change; run the Flash-Next replay check anyway.
@@ -198,6 +233,10 @@ expert's four dispatches; ledger item 2), then the token-id readback sync (item 
 duplicate-dispatch probe has priced the stages (log "Duplicate-dispatch probe"); the
 expert gemm (0.96-1.09 s of 3.4 s) is the item, the down plane's dequant the first
 experiment, and `XWEN_DUP_STAGE=experts_down` is how to price any change to it in situ.
+**Amended 2026-09-06:** the −192 above no longer comes from the router fold plus a 4 → 1
+shared expert. The router fold is refuted by reading (item 2), and the −192 is the shared
+expert alone, 5 → 1 with the down gemv in the epilogue, which is in progress; the router
+projection's own lever is a wide-grid gemv, unpriced.
 
 
 **DONE as opt-in 2026-09-05** (`XWEN_PLE_DEVICE=1`, multi-token Metal forwards; +12.8% prefill @3851,

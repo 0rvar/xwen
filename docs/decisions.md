@@ -2988,6 +2988,15 @@ default numerics are now the more accurate ones, and `XWEN_HC_GATE_FUSED_MAX_N=1
 restores the old ones for anyone who needs them verbatim. The tail mixer takes the same
 kernels without the head threadgroup. This is the first lever pulled from the ceiling
 diagnosis, and it landed on its prediction (−384 launches × ~4 µs ≈ +7.8%, measured +9%).
+**And the 2..8-token window is where the gate wins biggest: +57-76% (2026-09-06).** Forcing
+every forward to n tokens with `XWEN_PREFILL_CHUNK` and A/B-ing
+`XWEN_HC_GATE_FUSED_MAX_N=1` against the default measures 149.7 vs 93.2 tok/s at n = 8,
+108.9 vs 69.5 at 4, 68.1 vs 38.6 at 2 (log.md "The fused hc gate is +57-76%"). The size of
+that is about the displaced path, not about the fusion: the hc planes are dense_mm-only, so
+the split path in that window sends both bottleneck gemms through candle `QMatMul`'s tile
+matmul, a gemm shape with half-precision activation tiles at a gemv-sized problem, and the
+fused kernels replace it with two wide-grid gemv-style launches. The deliberate numeric
+change recorded above therefore also buys throughput in the window it changed.
 
 
 **PLE rows are prefetched, advisorily, and never gated on the gate.** The decode cost of
@@ -3080,6 +3089,21 @@ ledger is priced from these figures rather than from the bracket.** Prefill stag
 priced by the probe from now on: it is the only instrument on this machine that adds no
 sync, and its one caveat is that a stage which leaves the GPU idle can overlap its own
 copy and read low (the two-copy experts arm scaled linearly, 1.03 s per copy).
+**In decode mode that caveat is the rule, not the corner case (2026-09-06,
+`XWEN_DUP_DECODE`; log.md "the probe learns decode mode").** A duplicated decode launch
+has no buffer hazard against its original, writing a fresh output from the same inputs, so
+candle's encoder inserts no barrier and the two run concurrently: a stage that leaves the
+GPU idle prices at about zero. So a decode delta above zero is a FLOOR for that stage and a
+delta of about zero means "it overlaps with itself", never "it is free", and the probe
+cannot price a latency-bound decode stage at all. Measured at 596 tokens with `-n 128`:
+the shared expert floors at 0.43 ms of a 19.65 ms token (2.2%), which is its five launches
+per layer being a dependent chain, against the 0.77-0.96 ms the ~4 µs budget gives 240
+launches; the MoE glue and the newly wrapped `router_proj` stage both read zero, so both
+overlap fully and neither is priced. The instrument itself checks out across lengths: the
+`moe_glue` prefill delta is 0.058 s at 596 tokens where the 0.40 s at 3851 scales to 0.062.
+What the zero on the router projection does say is that it runs at low occupancy, which is
+the gemv hypothesis for a single-row mlx gemm over a 5.2 MB f32 plane, and the A/B that
+replaces it with a wide-grid gemv is what would price it.
 
 ## Process
 

@@ -283,7 +283,9 @@ QSA block-key cache, fused gather and device-side selection (2026-08-30): 46 bel
 cache alone; the cliff is closed, TODO.md keeps the follow-ups; **and 51.2 at 596 tokens
 as of 2026-09-05 with the fused hc decode gate — 3 dispatches per gate instead of 7,
 `XWEN_HC_GATE_CLASSIC` restores 7 — against 47.0 classic in the same rounds, +9% median,
-+5-10% round by round, prefill unchanged**) —
++5-10% round by round, prefill unchanged**, and the same gate is **+57-76% on 2..8-token
+forwards** (2026-09-06, medians 149.7 vs 93.2 tok/s at chunk 8, 108.9 vs 69.5 at 4,
+68.1 vs 38.6 at 2, every forward forced to n tokens with `XWEN_PREFILL_CHUNK`)) —
 interleaved rounds, medians, the fold measured in two sessions,
 against llama.cpp's 789 / 41.4 on the same file in the same hour as the 2026-08-29 arm
 (`pmset -g` said `powermode 0` that session — still no high-power
@@ -314,6 +316,12 @@ no sync: at 3851 tokens the expert gemms are 0.96-1.09 s of 3.4 s (28-32%, 73% o
 MoE glue 0.40 s, hc gates 0.39 s (gemms 0.14), GDN kernels 0.23 s (scan 0.16), shared
 expert ~0; 38% of wall is unpriced (projections, attention, QSA, PLE, lm_head). Price a
 prefill stage with the probe, never with the profiler or an isolated bench.]
+The probe also runs at decode via `XWEN_DUP_DECODE` (2026-09-06), but read it differently
+there: a decode copy has no buffer hazard against its original, so a delta above zero is
+only a FLOOR for that stage and a delta of about zero means the stage overlaps itself,
+never that it is free, which is why the probe cannot price a latency-bound decode stage
+(measured: shared expert floors at 0.43 ms of a 19.65 ms token, MoE glue and the router
+projection both read zero).
 Within-session cross-drafter comparison, 2026-08-15 (the only way to compare the
 two kinds honestly — same machine, same hour): the 3.6-27B's DFlash head runs
 1.50x/1.47x over its own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x

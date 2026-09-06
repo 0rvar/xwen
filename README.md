@@ -90,7 +90,8 @@ achievable bandwidth at 537-565 GB/s and put the bytes-only Flash-Next decode ce
 the rest of it is ~1740 dispatches in a dependent chain. The first lever pulled from that
 budget, the fused hyper-connection decode gate (three dispatches per gate instead of
 seven, `XWEN_HC_GATE_CLASSIC` restores the old path), took plain decode from 47.0 to
-51.2 tok/s at 596 tokens. Prefill stages are priced in situ
+51.2 tok/s at 596 tokens, and +57-76% on 2-8 token forwards. Prefill stages are priced
+in situ
 by the duplicate-dispatch probe (`XWEN_DUP_STAGE`, log.md "Duplicate-dispatch probe"): at
 3851 tokens the expert gemms are 28-32% of wall, MoE glue 11.5%, the hyper-connection
 gates 11%, GDN kernels 7%.
