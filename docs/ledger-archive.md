@@ -6,8 +6,9 @@ deferred each item), so an item's `From:` line in TODO.md and a section name quo
 anywhere both resolve here. Since the regroup the unit that moves is the item or the
 lettered sub-item, and each moved block opens with a one-line note saying what it is and
 where its open remainder lives. Retired items go under `Retired: <area>` headings with
-the reason and the reopen condition on their retirement line. Nothing in this file is
-actionable; the live ledger is TODO.md. Text is never deleted: it moves here.
+the reason and the reopen condition on their retirement line. Nothing here is planned; the
+live ledger is TODO.md, and a retired item is picked up again whenever its reopen line
+says so. Text is never deleted: it moves here.
 
 ## FIRST: why is Flash-Next so far from its ceilings, and rewrite this ledger from the answer (2026-09-05)
 
@@ -150,6 +151,16 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    A/B was n = 1, and at 2..8 tokens kernel A re-stages the carrier row per token per
    threadgroup. An A/B pinning `XWEN_HC_GATE_FUSED_MAX_N=1` against 8 on a serve-style
    ragged forward would price it (Qwen review, 2026-09-06).
+
+[Trimmed from the open item «Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs» on 2026-09-06: probe build note, probe now run.]
+
+   **FIRST, build the instrument that settles the
+   bracket: an in-situ duplicate-dispatch probe** — a presence switch that encodes a
+   stage's kernels twice (the expert gemms first, then the hc gates, the GDN chunked
+   scan) so the wall delta IS that stage's in-situ time; no math change when unset,
+   Flash-Next replay check anyway. Duplicate only the kernel dispatches, never the
+   surrounding block — re-running the router, the gathers or an allocation would put
+   their cost into the delta too (Qwen review, 2026-09-05).
 
 ## Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29)
 
@@ -471,6 +482,45 @@ serve batch + multi-checkpoint arc (2026-08-11)" below.
    Kill-switches XWEN_DELTA_CLASSIC / XWEN_DELTA_CHUNK_CLASSIC falling back to the P3
    reference. Gate: bitwise-or-bounded vs reference per parity.md tiering.
 
+[Trimmed from the open item «DFlash adaptation to the Qwen sidecars — ADAPTED 2026-07-29» on 2026-09-06: stale opt-in and 27B-only claim.]
+
+   , but speculation is
+   a 27B-only win and stays opt-in.
+
+[Trimmed from the open item «DFlash adaptation to the Qwen sidecars — ADAPTED 2026-07-29» on 2026-09-06: stale pointer to archived (d).]
+
+     Fixing either could flip `--draft` to opt-out; see (d).
+
+[Trimmed from the open item «serve adaptation» on 2026-09-06: thinking flags and snapshots landed.]
+
+    thinking-mode flags
+    (enable_thinking / preserve_thinking) surfaced per dialect, prefix-cache + disk
+    tier snapshots extended with recurrent state (48–96 KiB conv + 2–6 MiB delta per
+    snapshot depending on model).
+
+[Trimmed from the open item «Three leftovers from the MoE glue fusion: the residual add, the prefill combine, and `mul_mv_id_dual`'s unchecked ids» (until 2026-09-06 titled «MoE block glue fusion — SHIPPED 2026-07-29») on 2026-09-06: the shipped headline, retitled away.]
+
+- [ ] [measured] **MoE block glue fusion — SHIPPED 2026-07-29.** An MoE layer went from 24
+    dispatches per decoded token to 14 (960 → 560 across the 40 layers) and 35B-A3B
+    decode from 92.6 to 102.8 tok/s (+11.0%), on three fusions all bit-identical to the
+    candle chains they replace, behind `XWEN_MOE_GLUE_CLASSIC=1`, with both parity gates
+    passing at pre-change numbers.
+    [Record](records/fused-moe-glue.md), decisions.md "Kernel policy".
+
+[Trimmed from the open item «The 27B's interactive generate/chat smoke run was never done, and its numbers carry a ±10% spread» (until 2026-09-06 titled «27B dense bring-up — MOSTLY DONE 2026-07-28 via P7») on 2026-09-06: the mostly-done headline, retitled away.]
+
+- [ ] [small] **27B dense bring-up — MOSTLY DONE 2026-07-28 via P7.** The parity gate ran the
+    27B end to end: first forward correct, all gated tiers pass (strict is
+    near-vacuous on the dense model — see P7c). Remaining: an interactive
+    generate/chat smoke run, decode/prefill perf numbers for the 27B (nothing
+    measured yet; 64 layers dense will be much slower per token than the A3B), and
+    the deferred conv threadgroup-sizing check when P8 lands.
+
+[Trimmed from the open item «The DFlash drafter's per-token cache sync, its unre-derived draft-ctx horizon, and the deferred ring-buffer cache» (until 2026-09-06 titled «DFlash adaptation to the Qwen sidecars — ADAPTED 2026-07-29») on 2026-09-06: the adapted headline, retitled away.]
+
+- [ ] [measured] **DFlash adaptation to the Qwen sidecars — ADAPTED 2026-07-29; (b), (c) and
+   (e) still open.**
+
 ## Deferred from the P2-P4 model-core retarget (2026-07-28)
 
 - [ ] **The DeltaNet rollback trail costs one retained delta state per verify
@@ -588,7 +638,7 @@ All three come out of the per-stage prefill profile that root-caused the 27B gap
 They are what that profile found and did NOT fix; the profile itself is transcribed
 in log.md 2026-07-29.
 
-[Trimmed from the open item «Attention glue: ~10 unfused eager passes per layer, inside a 57.13 ms/layer attention block» on 2026-09-06: the downgraded glue premise, inverted.]
+[Trimmed on 2026-09-06 from the item «Attention glue: ~10 unfused eager passes per layer, inside a 57.13 ms/layer attention block», since retitled «A fused sigmoid-gate kernel at the attention gate site, and the head-dim-256 flash instantiation» and living under Prefill performance: the downgraded glue premise, inverted. The block below is the item as it stood, checkbox and tag included.]
 
 - [ ] [unpriced] **Attention glue: ~10 unfused eager passes per layer, inside a 57.13 ms/layer
   attention block.** MEASURED (profiling pass, amortized, T=3851): the whole attention
@@ -1143,6 +1193,18 @@ pieces deliberately not carried.
 The MTP head ships and drafts (see the closed item above). These are the pieces stages B
 and C deliberately did not carry.
 
+[Trimmed from the open item «No fitted draft floor for a custom drafter on Qwen3.8-27B» (until 2026-09-06 titled «DONE 2026-08-14 (review round): drafting is resolved per checkpoint, not per process») on 2026-09-06: the DONE narrative and its stray checkbox.]
+
+- [ ] [blocked] [x] **DONE 2026-08-14 (review round): drafting is resolved per checkpoint, not per
+  process.** Filed as deferred in the first pass and fixed in the review round, because a
+  sidecar-less DEFAULT checkpoint silently disabled drafting for every OTHER checkpoint
+  that server could load (-46 to -52% on the 27B, invisible). `ServeSettings.draft` is
+  now a `DraftMode` (`Off` / `Official` / `Custom(path)`) resolved when each checkpoint
+  loads. [Record](records/serve-target-review.md), and the rules it settled are in
+  [decisions/serving.md](decisions/serving.md).
+  What remains: nothing about the shape, but the fallback floor it exposes is worth a
+  measurement.
+
 ## Deferred from the chat-dialect and sampling-defaults arc (2026-08-19)
 
 - [x] **`--min-think`/`--max-think` are not guarded against `--no-think`.** The same
@@ -1264,7 +1326,7 @@ expert gemms at ~44% of wall — [record](records/ceiling-diagnosis.md).]
 of `ffn`, glue 11.5%, and the re-ranked ledger at the top of this file puts the expert
 gemm first for prefill — [log](log.md#2026-09-05--duplicate-dispatch-probe-prices-flash-next-prefill-in-situ-expert-gemms-109-s-of-342-s-3851-32-moe-glue-040-hc-gates-039-gdn-023-shared-expert-0).]
 
-[Closed parts of the item «Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the 2048-token QSA budget, then slopes gently», moved verbatim on 2026-09-06; its open remainder is in TODO.md under "Decode performance".]
+[Closed parts of the item «Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the 2048-token QSA budget, then slopes gently», moved verbatim on 2026-09-06. That item is now fully closed and no longer appears in TODO.md; its surviving scope was promoted into items under Decode performance, Prefill performance and Parity, provenance and tooling, each naming it in a "Promoted from" line.]
 
 - [ ] **Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the
   2048-token QSA budget, then slopes gently: 46.1 tok/s at 1963 tokens, 30.8 at 2045
@@ -1406,7 +1468,7 @@ few rows per token, never through a matmul), 6B active per token, built on "GDN 
 QSA" mechanisms, ~1/9th the training cost of Qwen3.7-Plus at comparable capability.
 Decision: we WILL port it, targeting Q4_K on this machine.
 
-[Closed parts of the item «Port Qwen3.8-Flash-Next», moved verbatim on 2026-09-06; its open remainder is in TODO.md under "Research candidates".]
+[Closed parts of the item «Port Qwen3.8-Flash-Next», moved verbatim on 2026-09-06. Its open remainder was promoted into items across five areas of TODO.md — Decode performance, Prefill performance, Serve/batch/CLI, Cache images/memory/context, Parity/provenance/tooling and Tokenizer/chat/sampling — each carrying a "Promoted from" line naming this item.]
 
   and the n-gram embedding subsystem are new; the transferable assets are the Gated
   DeltaNet implementation (GDN) and the 35B-A3B MoE machinery (router / top-k renorm /
@@ -1762,7 +1824,7 @@ Decision: we WILL port it, targeting Q4_K on this machine.
     returns `default()`, so `xwen serve` and `xwen batch` both run Flash-Next with no
     flags.** [Record](records/flash-next-serve.md), decisions.md "Qwen3.8-Flash-Next".
 
-[Duplicate of the open item «GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger», folded and moved on 2026-09-06.]
+[Duplicate of the open item «GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger» (survivor's From: Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4)), folded and moved on 2026-09-06. It is filed here, under the heading the duplicate text came from, not under the survivor's.]
 
 - [ ] [measured] **GDN dispatch count: three unstarted fusion candidates.** (The text below is verbatim from the parent item and may open or close mid-sentence.)
   The GDN block issues **288 dispatches per decoded token** [252 since the
@@ -1790,7 +1852,7 @@ Decision: we WILL port it, targeting Q4_K on this machine.
   From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
   Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-30 there.
 
-[Duplicate of the open item «Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population», folded and moved on 2026-09-06.]
+[Duplicate of the open item «Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population» (survivor's From: Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4)), folded and moved on 2026-09-06. It is filed here, under the heading the duplicate text came from, not under the survivor's.]
 
 - [ ] [unpriced] **Hyper-connection follow-ups: in-place hc_write and the Q8_0 decode gemms.** (The text below is verbatim from the parent item and may open or close mid-sentence.)
   **(a)** `hc_write` is out-of-place; an
@@ -1806,7 +1868,7 @@ Decision: we WILL port it, targeting Q4_K on this machine.
   From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
   Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
 
-[Duplicate of the open item «`IndexerCache` still allocates at `max_ctx` up front and has no growth path, and page-in is now a second reason to care», folded and moved on 2026-09-06.]
+[Duplicate of the open item «`IndexerCache` still allocates at `max_ctx` up front and has no growth path, and page-in is now a second reason to care» (survivor's From: Deferred from the qwen4exp cache-image arc (2026-08-30, P4)), folded and moved on 2026-09-06. It is filed here, under the heading the duplicate text came from, not under the survivor's.]
 
 - [ ] [measured] **IndexerCache allocates at max_ctx with no growth path.** (The text below is verbatim from the parent item and may open or close mid-sentence.)
   allocates at `max_ctx` with no growth path, ~1.6 GB across the 12 QSA layers
@@ -1815,25 +1877,33 @@ Decision: we WILL port it, targeting Q4_K on this machine.
   From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
   Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
 
-[Trimmed from the open item «QSA top-k runs on the host via arg_sort» on 2026-09-06: trailing fragment of a neighbour.]
+[Orphan fragment of item (5) of the P4 numbered list in «Port Qwen3.8-Flash-Next» above, left dangling on the promoted item «QSA top-k runs on the host via arg_sort» and trimmed from it on 2026-09-06. It came from the numbered list, not from that item.]
 
 ; **(5)** the PLE gate, signed sqrt,
 
-[Trimmed from the open item «Parallelize the 16 page faults inside one PLE gather» on 2026-09-06: trailing fragment of a neighbour.]
+[Orphan fragment of item (7) of the P4 numbered list in «Port Qwen3.8-Flash-Next» above, left dangling on the promoted item «Parallelize the 16 page faults inside one PLE gather» and trimmed from it on 2026-09-06. It came from the numbered list, not from that item.]
 
 ; **(7)** ~~QSA mask memory — the
 
-[Trimmed from the open item «The PLE prefetcher spawns one thread per PleTable» on 2026-09-06: trailing fragment of a neighbour.]
+[Orphan fragment of item (12) of the P4 numbered list in «Port Qwen3.8-Flash-Next» above, left dangling on the promoted item «The PLE prefetcher spawns one thread per PleTable» and trimmed from it on 2026-09-06. It came from the numbered list, not from that item.]
 
  **(12) NEW 2026-08-29 —
 
-[Trimmed from the open item «Flash-Next decode is bimodal round over round» on 2026-09-06: trailing fragment of a neighbour.]
+[Orphan fragment of item (11) of the P4 numbered list in «Port Qwen3.8-Flash-Next» above, left dangling on the promoted item «Flash-Next decode is bimodal round over round» and trimmed from it on 2026-09-06. It came from the numbered list, not from that item.]
 
  **(11) NEW 2026-08-29 (Opus-2 review #5) — the PLE prefetcher
 
-[Trimmed from the open item «Flash-Next's unconsumed presence penalty, template divergences and audio specials» on 2026-09-06: leading fragment of a neighbour.]
+[Orphan fragment of the P4 cache-image bullet in «Port Qwen3.8-Flash-Next» above, left dangling on the promoted item «Flash-Next's unconsumed presence penalty, template divergences and audio specials» and trimmed from it on 2026-09-06. It came from that bullet, not from the item named.]
 
   plane world, so it needs its own plane type and validator. Also P4:
+
+[Closed on 2026-09-06: the port shipped and Flash-Next is the default checkpoint, so this stub held no open scope. Its live sub-items were promoted into TODO.md across Decode performance, Prefill performance, Serve/batch/CLI, Cache images, Parity and Tokenizer; each names this heading in its From: line.]
+
+- [ ] [blocked] **Port Qwen3.8-Flash-Next.** A PORT, not a registry entry — QSA sparse
+  attention and the n-gram embedding subsystem are new. The closed narrative of this item
+  is in the archive under its `From:` heading; the parts that stay open are their own
+  items across the area sections, each naming that same heading.
+  From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
 
 ## Deferred from the DeltaNet decode-scan pass (2026-08-30)
 
@@ -1863,3 +1933,186 @@ changed, so everything here is a follow-up rather than a leftover.
 Shipped that day: per-run JSONL records on every surface and `xwen stats` over them
 (log.md "Per-run metrics on disk"; the choices in decisions.md "Metrics"). Nothing here
 blocks use of the feature; item (a) is the one with a known trigger.
+
+## Retired: Prefill performance
+
+[Retired 2026-09-06: the chunked scan is refuted twice as a prefill lever (the fused sequential scan is 3% of 27B prefill, and llama.cpp's own Metal decomposition measured slower here) and its rollback-replay rationale is superseded by the K-snapshot verify. Reopen if: a per-stage profile contradicts the 3% figure, or a rollback design genuinely needs chunk-boundary replay.]
+
+- [ ] [measured] **DeltaNet Metal kernels — (a) DONE 2026-07-28, (b) still open.** Original
+   scope for (b): chunked prefill scan, chunk 64, llama.cpp's chunked form as the spec
+   (cumsum → tri decay mask → solve_tri → per-chunk state update) — needs tri-solve which
+   candle lacks; vendored kernel. Kill-switch XWEN_DELTA_CHUNK_CLASSIC falling back to the
+   P3 reference. Gate: bitwise-or-bounded vs reference per parity.md tiering.
+   - **(b) The chunked scan (chunk 64, tri-solve) remains open**, and its case is now
+     weaker than it looked: the single-dispatch sequential scan already put prefill at
+     ~2000 tok/s, so the chunked form is competing against that rather than against
+     the 300 tok/s reference. Its real remaining argument is the rollback trail (see
+     the archived P2-P4 model-core retarget section): a chunked scan that can replay a
+     prefix cheaply would let the per-token trail be dropped entirely. Measure before building.
+     ANNOTATION 2026-07-29: measured, and the picture splits by model — the weak-case
+     reading holds on the 35B, while on the 27B the sequential scan looked like the cause
+     of a 1.8-2.1x prefill loss to llama.cpp, making the chunked form's bounty ~2x there.
+     [Log](log.md#2026-07-29--first-llamacpp-head-to-head-xwen-wins-decode-on-both-models-loses-27b-prefill-2x-to-the-sequential-deltanet-scan).
+     ANNOTATION 2026-07-29 (later the same day): **the ~2x bounty is WITHDRAWN — that
+     reading was wrong.** The fused scan is 3% of 27B prefill, so making it FREE moves
+     prefill ~297 → ~307 tok/s against llama.cpp's 486; the gap is in the dense
+     projections and needs its own item.
+     [Log](log.md#2026-07-29--the-deltanet-scan-is-3-of-27b-prefill-llamacpps-decomposition-measured-slower-and-the-premise-behind-p8b-refuted).
+     ANNOTATION 2026-07-29 (P8c): **that item was opened, root-caused and CLOSED the same
+     day — the gap was the dense FFN's gemm (66-85% of 27B prefill wall through candle's
+     `kernel_mul_mm_q4_K_f32`), and `src/ops/dense_mm.metal` fixed it.**
+     [Record](records/dense-ffn-prefill-gemm.md), decisions.md "The dense-FFN
+     prefill gemm dequantizes in-kernel".
+     Separately, llama.cpp
+     on Metal never runs its chunked form at all (its fused `ggml_gated_delta_net` op
+     pre-empts the chunked graph, delta-net-base.cpp:437-446), and its sequential
+     Metal decomposition was transplanted here and measured SLOWER at both geometries
+     and both lengths. So **(b) stays ledgered but is refuted as a prefill lever**;
+     its remaining live rationale is chunk-boundary replay for the rollback trail, and
+     even that is superseded by the K-snapshot plan under P9. Do not reopen (b) for
+     prefill without a per-stage profile that contradicts the 3% figure — re-run
+     `delta_scan_timing` (src/ops/delta.rs, `#[ignore]`d) to price it. See log.md
+     2026-07-29 "The DeltaNet scan is 3% of 27B prefill" and decisions.md "The
+     DeltaNet scan decomposition".
+   - `XWEN_DELTA_CHUNK_CLASSIC` was never created — there is no chunked path to
+     switch off yet. It belongs with (b).
+  From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
+
+## Retired: Cache images, memory and context
+
+[Retired 2026-09-06: Qwen ships no YaRN scaling keys in config or GGUF, the native window is 262144, and no workload here has asked for more. Reopen if: a real workload needs context beyond the native 262144 window.]
+
+- [ ] [blocked] **YaRN long-context.** Native 262144; Qwen documents 1M via YaRN but ships no
+    scaling keys in config or GGUF. laguna's YaRN rope code is retained; wire an
+    opt-in flag only on demand. Note rope table memory at 262k is trivial (64 dims).
+  From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
+
+[Retired 2026-09-06: periodic snapshots inside a 32k message cost hundreds of MB of host RAM to serve a prompt-editing workload nobody here runs. Reopen if: a client that edits prompts in place shows up, or the DeltaNet snapshot floor drops far enough to make an interval knob cheap.]
+
+- [ ] [blocked] **Mid-message snapshots would let an edited prompt resume; ledger only.** Today
+  `rewind_to` can only stop at the anchor, a turn boundary, a fork point or a page-out
+  tail, so rewriting the last user message of a single-message prompt falls under every
+  snapshot and re-prefills from zero (`cached_tokens: 0` at all three lengths measured).
+  Periodic snapshots INSIDE a long message — every N thousand tokens — would give the
+  edit somewhere to land, and the recurrent state makes it a snapshot problem rather
+  than a matching problem: there is nothing to restore at a position nobody captured.
+  The price is what makes this a ledger item and not a task: a Flash-Next image is
+  ~30 KiB/token plus the ~113 MiB DeltaNet floor per snapshot, so periodic stops inside
+  a 32k message cost hundreds of MB of host RAM to save prefill for a client that edits
+  prompts in place — a workload nobody here has. Revisit if one shows up; the knob would
+  be an interval, defaulted off.
+  From: Deferred from the first Flash-Next serve benchmark (2026-08-30).
+
+## Retired: Drafting
+
+[Retired 2026-09-06: outside the production regime (block_size 16 caps real verify spans near 17) and the 2026-08-08 evidence attributes it to armed-trail memory pressure, not a kernel threshold. Reopen if: a drafter whose block_size pushes real verify spans past 32, or an armed-trail memory regression in production.]
+
+- [ ] [measured] **Every verify arm goes superlinear at span 48.** Fused 264 → 548 ms between
+  spans 32 and 48; classic 472 → 846; reproduced across reps and arms. NOT the
+  dense-mm threshold (`XWEN_DENSE_MM_CLASSIC=1` arm shows the same jump). Outside
+  the production regime — drafter `block_size` 16 caps real verify spans near 17 —
+  so unchased, but unexplained. Also from the same pass, one anomalous
+  `XWEN_DENSE_MM_CLASSIC=1` sweep read ~17% high at every span including span 2
+  where that kernel cannot run, against four mutually-consistent fused sweeps and
+  an immediate re-run that matched them; single unreplicated outlier, recorded
+  here so a future contradiction has a trail.
+  ANNOTATION 2026-08-08: **new evidence — the overshoot is ARMING-dependent (armed runs
+  overshoot 1.54-1.65x, unarmed come in at 0.80-0.91x), so it is trail memory pressure
+  rather than a kernel threshold. Still outside the production regime and unchased.**
+  [Log](log.md#2026-08-08--verify-round-diagnosis-the-149-ms-fixed-cost-is-the-dense-ffns-matmuls-at-small-m-and-none-of-the-armed-machinery-it-was-blamed-on).
+  From: Deferred from the K-snapshot verify pass (2026-07-29, P9a).
+
+## Retired: Decode performance
+
+[Retired 2026-09-06: worth at most ~1.4 ms at span 2 and possibly nothing, and the only evidence sits inside a known arm-ordering bias the item itself identifies. Reopen if: a bias-controlled A/B at spans 2-24 runs for another reason; add the two window floors as arms.]
+
+- [ ] [measured] **Option: floor the `Proj::DenseF16Q8` window at t >= 3, leaving span 2 on the
+  gemv.** Added 2026-08-08 from that pass's attention-projection coverage A/B. At t=2 the
+  ext kernel saves only ONE gemv weight pass, and its geometry is fixed (nsg=2, nxpsg=8)
+  rather than tuned for a two-row batch, so there is a plausible mechanism for it not to
+  pay there. The evidence does NOT currently show a loss: span 2 measured +1.4 ms
+  (+2.3%), but the same
+  interleave reads pairwise medians of +1.6 to +2.3% in the same direction at spans
+  12/16/24 where the kernel cannot run, because the coverage arm was second in every
+  pair. So this is worth at
+  most ~1.4 ms at span 2 only and it might be worth nothing. **Do not ship it off the
+  existing data** — it needs its own A/B, and one designed to separate the effect from
+  the arm-ordering bias (alternate which arm goes first between reps, or run the two
+  window floors as the two arms so both are the same binary generation). Nothing else in
+  the window is affected: the `QLinear` sites keep 2..=8, which is where the −92 ms
+  span-2 win lives. Cheap to try (`mv_ext_window`'s caller at the Proj site is one
+  condition) and cheap to leave alone.
+  From: Deferred from the small-batch mat-vec pass (2026-08-08).
+
+[Retired 2026-09-06: outside the production regime, arming-independent, and the attention-projection coverage A/B came back a clean negative on it. Reopen if: a real verify span reaches 48, or the `mul_mv_ext` window routing is next changed.]
+
+- [ ] [measured] **The lm_head roughly doubles at span 48 (7.0 → 13.1 ms) and nobody knows why.**
+  Added 2026-08-08 from the verify-round sweeps; first recorded inside the annotation on
+  «Every verify arm goes superlinear at span 48» in "Drafting", and promoted here because
+  it is a distinct phenomenon from that item's trail-memory finding and belongs with the
+  matmul work. It is **arming-independent** — the doubling appears in both the armed and
+  the unarmed profiled runs — which rules out the K-snapshot trail that explains the
+  span-48 superlinearity itself. Outside the production regime (drafter `block_size` 16
+  caps real verify spans near 17) and therefore not urgent, but it is a single dispatch
+  on a well-understood shape doubling across a span step, which usually means a
+  threshold or a fallback nobody has named. Note the lm_head IS one of the three sites
+  the `mul_mv_ext` window covers (via `forward_all_logits`), so anyone touching that
+  routing should check this at the same time. Recorded so a future contradiction has a
+  trail.
+  ANNOTATION 2026-08-08 (later the same day): **still open, and the attention-projection
+  coverage A/B is a clean negative on it** — span 48 unchanged between the arms, medians
+  526.39 (HEAD) against 521.97 (coverage), inside the run-to-run spread.
+  [Record](records/small-batch-window-projections.md).
+  From: Deferred from the small-batch mat-vec pass (2026-08-08).
+
+[Retired 2026-09-06: in-place moves the same 3.1 MB in and out, the scan is already within 1.4x of that floor arm, and the only prizes need an aliasing promise no op-level function can make. Reopen if: a decode profile shows pool-allocation cost, together with a caller-supplied unaliased flag plumbed from `LinearAttnBlock::forward_fused`.]
+
+- [ ] [measured] **The decode scan still double-buffers its state, and making it in-place is not
+  the kernel's call.** `run_delta_scan_decode` allocates a fresh
+  `[v_heads, 128, 128]` f32 buffer per layer per token and leaves the incoming state
+  untouched, which is what lets a rollback trail hold every state it recorded. Writing
+  the same buffer would move the SAME bytes (3.1 MB read + 3.1 MB written either way —
+  the floor arm of `delta_scan_decode_timing` prices exactly that and the scan is
+  already within 1.4x of it), so the only prizes are the pool allocation and whatever
+  the write-allocate costs, and the price is an aliasing promise no op-level function
+  can make on its own: the armed verify trail holds device-side clones of every state
+  (`kv_cache.rs` `advance_linear`), and any future holder — a prefix-cache image that
+  stops materializing, a serve snapshot that keeps a handle — would be corrupted
+  silently rather than loudly. If it is ever worth doing, the shape is a caller-supplied
+  "this state is unaliased" flag plumbed from `LinearAttnBlock::forward_fused` (which
+  knows `cache.linear_trail_armed()`), not an inference inside `dispatch`.
+  From: Deferred from the DeltaNet decode-scan pass (2026-08-30).
+
+[Retired 2026-09-06: the shipped prefetcher already reads a median gather of 0.002 ms against 0.97-1.02 without, so the overlap window this is conditioned on is not short. Reopen if: a gather profile shows the window is too short at longer contexts.]
+
+- [ ] [unpriced] **Parallelize the 16 page faults inside one PLE gather.** Follow-up on the
+  shipped PLE prefetcher, if its A/B shows the overlap window is too short: the 16 faults
+  inside a single gather are taken serially on one thread — parallelize them across the
+  window rather than deepening the lookahead.
+  From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
+  Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
+
+[Retired 2026-09-06: unreachable while every published qwen4exp file asserts n_ple == 1. Reopen if: a multi-PLE checkpoint appears.]
+
+- [ ] [small] **The PLE prefetcher spawns one thread per PleTable.** That is harmless on
+  every published qwen4exp file, because upstream hard-asserts `n_ple == 1`, but the code
+  does not depend on that assert: a checkpoint with several PLE layers would get a
+  prefetch thread each, all faulting the same table. If a multi-PLE file ever appears,
+  share one prefetcher across tables rather than one per layer.
+  From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
+  Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
+
+## Retired: Research candidates
+
+[Retired 2026-09-06: no comparative claim is being published, and the arm costs a second large-model process on a machine whose standing rule is one at a time. Reopen if: before publishing any claim of a lead in the 35B-A3B class on Apple silicon.]
+
+- [ ] [blocked] **Same-machine MLX arm for the 35B-A3B comparison.** Landscape research (2026-08-30,
+  session xwen-da): xwen's Flash-Next numbers have no public Apple Silicon peer (best
+  published same-chip: llama.cpp 33.0 decode on a smaller IQ4_XS; MLX 4-bit needs
+  ~163 GB and does not fit 128 GB), but the 35B-A3B class IS contested — MLX 4-bit on
+  M4 Max measures ~91 decode (one Qwen3.5 sweep says 130). Before ever claiming a lead
+  there, run mlx-lm on THIS machine with the closest 4-bit build of Qwen3.6-35B-A3B,
+  same prompts, thermal protocol. Sources and the full engine survey are in the session
+  log only; re-research before citing (aggregator-tier numbers were discarded as
+  unreliable).
+  From: Deferred from the landscape research (2026-08-30).

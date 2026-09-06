@@ -24,13 +24,14 @@ distinction visible. Two things changed in the rules. The unit that closes is th
 OR the lettered sub-item, so a mixed item no longer keeps its shipped halves in the open
 file. And there is a second exit beside shipping: retired, a dated reason plus a reopen
 condition, moved to the archive like a closed item. Retired is deliberately weaker than
-refuted: refuted lives only in these topic files, with evidence, and is the one state not
-to relitigate; retired means not planned and not forbidden, and the mandatory reopen
+refuted: refuted lives only in these topic files, with evidence, and is the one state not to
+relitigate without new evidence; retired means not planned and not forbidden, and the mandatory reopen
 line is what stops an agent reading it as a verdict. Review findings not worth an item
 are recorded in the record as "not taken now" with the same reopen shape, which cuts the
 intake that grew the file. Triage is a forced choice, not an automatic deletion: at the
 end of an arc and past 30 days, promote, re-date with a reason, or retire. The archive
-stays verbatim under the pre-regroup headings; the open ledger may be regrouped, which
+stays verbatim, shipped text under the pre-regroup headings and retired text under
+`Retired: <area>`; the open ledger may be regrouped, which
 amends the earlier "never rewritten" rule for the open file only. The regroup itself ran
 as a script over a per-item classification, asserting every original line landed exactly
 once (record: [docs restructure](../records/docs-restructure.md)).

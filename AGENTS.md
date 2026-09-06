@@ -21,8 +21,9 @@ one that owns it:
 - **`docs/benching.md`** is how to measure anything on this machine.
 - **`TODO.md`** is the backlog and the open ledger: a ranked **Front** of at most ten
   planned items, then every deferred scope grouped by area, each tagged and carrying a
-  `From:` line. Closed and retired text lives verbatim in
-  [`docs/ledger-archive.md`](docs/ledger-archive.md) under the arc that deferred it.
+  `From:` line. Closed text lives verbatim in
+  [`docs/ledger-archive.md`](docs/ledger-archive.md) under the arc that deferred it,
+  retired text under `Retired: <area>`.
 - **`scripts/docs-check.ts`** asserts that links, anchors, unique titles and quoted
   references all resolve, and that the ledger keeps its shape (tags, `From:` lines,
   the front cap, item length).
@@ -37,16 +38,20 @@ Rules for keeping it that way:
 - A `TODO.md` annotation is at most three lines plus a link. Do not duplicate results or
   narrative there.
 - Headings are never renamed once written, because everything links by heading text.
-- The ledger has three exits and the unit is the item or the lettered sub-item. Shipped:
+- The ledger has two exits, shipped and retired, and the unit is the item or the
+  lettered sub-item. Shipped:
   the text moves verbatim to [`docs/ledger-archive.md`](docs/ledger-archive.md) under
   the heading its `From:` line names, at the end of the arc that closes it. Retired: a
   dated line with the reason and a reopen condition, then the same move, under a
-  `Retired: <area>` heading. Retired means not planned, not forbidden: pick it up when
+  `Retired: <area>` heading (the area is the TODO.md section the item sat in). Every
+  moved block opens with one bracketed line saying what it is and where its open
+  remainder lives. Retired means not planned, not forbidden: pick it up when
   its reopen condition holds, or for a reason the retirement did not foresee, and say
   why. Only `docs/decisions/` says refuted, and only with evidence; that is the one
   state not to relitigate without new evidence.
 - The Front of `TODO.md` holds at most ten items, ranked, each with its expected gain
-  against a ceiling in docs/perf-state.md or a user who is waiting. Promoting one means
+  against a ceiling in docs/perf-state.md, a user who is waiting, or, for an
+  instrument, what it would price. Promoting one means
   demoting one. An item in an area section is not planned until it is promoted.
 - A review finding that is not worth an item is not silently dropped and not a ledger
   item either: the record says "not taken now", the reason, and a reopen condition.
@@ -66,8 +71,8 @@ Rules for keeping it that way:
   3.6-27B graph unchanged — it is a registry entry, not a port.)
 - TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, it
   becomes a ledger item with context, or it is retired with a dated reason and a reopen
-  condition. Ledger text is never deleted: closed and retired items move verbatim to
-  the archive.
+  condition (retired means not planned, not forbidden). Ledger text is never deleted:
+  closed and retired items move verbatim to the archive.
 - Every shipped arc updates the docs before it's done: dated log.md entry, README if
   the surface changed, decisions.md if a decision was made/changed/refuted, perf-state.md
   if a figure moved. A TODO.md update alone is not sufficient.

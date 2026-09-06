@@ -68,10 +68,23 @@ decisions.md "The ledger is a memory and a backlog"; the mechanics were:
   archive, Front cap of ten with every entry naming an item, 40-line item limit, and an
   age histogram from each item's latest date.
 
-Result: TODO.md 2116 → 1542 lines, 109 open items (20 promoted sub-items after three duplicates folded), Front 10/10;
-archive 858 → 1815. Ten retire proposals were collected with reasons and reopen
-conditions and NOT applied; they are the owner's call and are listed in the session
-report, not here.
+- Three reviewers (Codex, an in-model reviewer, Qwen through the local server) read the
+  result. Their findings drove a second tidy batch: five items still headlined as
+  finished were retitled to their open scope, sub-items relettered, seven duplicated
+  bold leads dropped, eleven archive note lines corrected, tags regraded on seven items,
+  the rule text made consistent on the number of exits and where retired text goes,
+  and the checker hardened (Front required, malformed items and finished headlines
+  fail, in-place retirement fails, fences and CRLF handled, ages counted correctly).
+- The first ten retirements happened the same day, on the owner's call: the chunked
+  DeltaNet scan, YaRN long context, two span-48 anomalies and the span-2 window floor,
+  the in-place decode scan, mid-message snapshots, the MLX comparison arm, and two PLE
+  items promoted from the port. Each sits in the archive under `Retired: <area>`
+  behind its dated reason and reopen condition.
+
+Result: TODO.md 2116 → 1345 lines, 98 open items, Front 10/10; archive 858 → 2118
+(the size moved from the open file to the archive, as intended). Twenty-one items
+carry a latest date older than 30 days; the triage rule was written this arc and its
+first pass over those items is the next ledger chore, not done here.
 
 ## What is still weak
 
