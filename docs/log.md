@@ -4,6 +4,29 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-06 — Dense Qwen3-4B registered: BF16 safetensors loader, per-instance tokenizer specials, two chat dialects, a per-position logits oracle
+
+Arc 0 of a new architecture, and the only GPU-free one: `model_type: qwen3` joins the repo as
+both a full LM checkpoint and the text-conditioning encoder the diffusion image models
+will call in-process, which is a scope amendment and not a throughput one
+(decisions.md "Dense Qwen3-4B is a full checkpoint AND the conditioning encoder"). Four
+commits, nothing runnable on purpose: three registry entries with `servable()` and
+`auto_fetch()` false until the arc whose surface makes each true. What landed is the CPU
+side. A BF16 safetensors loader that validates before it allocates and copies rather
+than aliases, shards 1 and 2 of every set starting at `% 16 == 8`. An integrity scan that
+refuses a projection with a zero run past 4096 elements unless the entry allowlists it,
+written against a real defect: Z-Image ships Qwen3-4B's last-layer MLP with 14,772,816
+and 3,938,425 contiguous zeros, harmless for the hidden state it reads and
+disqualifying for anything else. Tokenizer specials became per-instance data resolved by
+text, over eleven call sites, with `TOKENIZATION_RULES_VERSION` deliberately unbumped. Two
+chat dialects, 16/16 renders byte-equal to `llama-server --jinja`, tools refused because
+the call format is JSON and the serve parser reads only `<function=`. And
+`llama-logits-all`, a per-position logits oracle neither existing tool provides, whose
+CPU arm turns out not to be xwen's arithmetic: llama.cpp narrows F32 activations to BF16
+before every BF16 matmul there, so the 2e-2 Stage 1 bar waits for the Metal arm.
+[Record](records/qwen3-dense.md), [architecture](qwen3-dense.md), [Z-Image](zimage.md),
+[parity](parity.md).
+
 ## 2026-09-06 — QSA prefill selection and mask on the device: 128k prefill 231 → 284-296 tok/s, peak 59 → 28 GB
 
 The Front-1 item, priced first as it asked. `XWEN_QSA_TIMER` timed the host round trip

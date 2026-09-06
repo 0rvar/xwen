@@ -44,3 +44,49 @@ alternative — one representation always — roughly doubles the attention-proj
 bytes streamed per decoded token (halving those bytes is why dual storage exists;
 laguna measured the win when it shipped it), a real cost not paid for a low-bit
 property nothing currently depends on (2026-07-28).
+
+**Dense Qwen3 arrives as BF16 safetensors, read one shard at a time and copied, not
+aliased.** GGUF stays the only format for every other checkpoint; `qwen3` is read
+through the pinned candle's own `MmapedSafetensors`, which adds no dependency and no
+hand parser. Two deliberate departures from the obvious spelling. It opens one instance
+per shard rather than `::multi`, because `multi` collapses a duplicated tensor name to
+the last shard and `tensors()` loses shard provenance, which makes "present in exactly
+its named shard" and "not in two shards" unimplementable; the loader owns its own
+routing map instead, at the same mmap cost and on the same `load` path. And the payload
+is copied into device buffers rather than aliased in place, because it cannot be
+aliased: measured on all three sets, shards 1 and 2 start their data at
+`8 + header_len` with `% 16 == 8`, and both `gguf::dense_alias_tensor` and
+`ops::matmul_bf16` require a 16-byte start offset. That copy is what makes the alignment
+irrelevant rather than fatal, and candle's `load` preserves the stored dtype, so BF16 in
+the file is BF16 on the device with no silent widening. Norm planes are the one
+exception, widened to F32 at load because candle's Metal `rms_norm` needs the weight
+dtype to match the activations. Validation is CPU-only and happens before any
+allocation: shard membership, duplicate names, duplicate index keys, stray
+`*.safetensors` the index does not list, the expected shape table, BF16-only. `TensorSet`
+is consume-once and `finish()` errors listing leftovers, so a plane nobody read is a
+load failure rather than a silent zero. A `lm_head.weight` that ships anyway must be
+byte-equal to the embedding (the config check refuses untied embeddings) and is then
+struck off the ledger without being read, which is a 742 MiB device allocation not made.
+The set's identity is a `gguf::CheckpointId` chained over `config.json`, the index and
+each shard's header, so snapshots and the disk tier key a safetensors set exactly as they
+key a GGUF; it hashes metadata only and sums whole-file lengths, which catches a shard
+whose size changed and deliberately does not catch a same-length in-place overwrite
+(2026-09-06).
+
+**A projection plane with a long run of zeros is a load error unless the registry entry
+allowlists it by name.** The scan is not defensive programming looking for a use: it was
+written against a shipped defect. `Tongyi-MAI/Z-Image-Turbo`'s `text_encoder/` shard 3
+carries `model.layers.35.mlp.up_proj.weight` with 14,772,816 contiguous zero elements
+from element 27,003 and `down_proj` with 3,938,425 from element 20,930,265, where
+`Qwen/Qwen3-4B`'s byte-identical-headered shard 3 has none - one contiguous run each,
+not magnitude-selected and not row-structured, which is a torn write and not pruning
+(docs/zimage.md). The threshold is a run strictly longer than 4096 elements, which no
+trained plane in either set comes near. The allowlist is per registry entry rather than
+per load, so the corruption is tolerated exactly when someone names the entry that
+documents it and refused when a bare directory is pointed at; the same entry also
+refuses the layer index that would evaluate those planes. The second scan in the same
+pass counts values outside f16's range, because the tensor-core gemm stages BF16 weights
+to half: 10,917 of 4,022,272,000 projection values below the subnormal floor on the base
+set and 10,876 on Z-Image's, none above 65504, both reproduced independently. So the
+gemv-versus-gemm difference on this checkpoint is a 1.1e-5 flush, not an overflow, and
+that is a bounded fact to read parity numbers against rather than a hazard (2026-09-06).

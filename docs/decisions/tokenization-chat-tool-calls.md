@@ -165,3 +165,63 @@ and a checkpoint declaring a different `eos_token_id` would leave its real stop 
 bannable, letting `--ban-string` remove the only token that can end a reply. The
 protected set is now passed in from the sampler, so the guarantee holds by construction
 rather than by the two sources happening to match (2026-07-28).
+
+**Special token ids are per-tokenizer-instance data, resolved by token text at load.**
+The entry above says tokenizer.rs is the single owner of every token id in the crate,
+and that stays true; what changed is that ownership moved from nine constants to a
+`Specials` struct that `from_inner` resolves out of the added vocabulary, failing the
+load by name when one is missing. The constants remain for the two places where the
+embedded 248k vocabulary IS the subject: `config.rs`'s GGUF-only EOG fold, which runs
+before any tokenizer exists, and `ConstraintFactory::embedded`. Eleven call sites in
+`generate.rs`, `batch.rs`, `constrain.rs` and the serve tree now read the instance, and
+`ConstraintFactory::new` takes tokenizer bytes, the EOG ids and the logit width, so a
+grammar mask is sized by the model's own logits row rather than by `PADDED_VOCAB`. The
+Qwen3 vocabulary is 151936 against 248320 and its specials sit at 151643-151668, so a
+constant that was merely a number on one checkpoint would have been a wrong number on
+the other rather than a missing one - the failure mode that argues for resolution by
+text. Two things deliberately did NOT change. `TOKENIZATION_RULES_VERSION` stays at 3:
+the version is per encoding rule, the shipped dialects render every existing
+conversation identically, and the new dialects are new rules rather than changed ones,
+so a bump would invalidate every disk-tier image for nothing. And the Qwen3
+`tokenizer.json` is NOT embedded in the binary; it is loaded from the checkpoint
+directory, which every entry ships one in. The 3.6 tokenizer is embedded because it is
+the default checkpoint's and the binary must work before anything is fetched; a second
+embed would be another ~11 MB of binary for a vocabulary that never runs without its own
+8 GB of weights beside it (2026-09-06).
+
+**The HF tokenizer normalizes to NFC where llama.cpp does not, so `encode` is not
+injective over canonically equivalent spellings.** Every Qwen `tokenizer.json`, 3.6's and
+Qwen3's alike, declares `"normalizer": {"type": "NFC"}`. The `tokenizers` runtime applies
+it; llama.cpp's GGUF tokenizer implements no normalizers at all. On text that is not
+already NFC the two disagree outright: `e` followed by U+0301 is one id here and two
+under the oracle. This is pre-existing and is not a Qwen3 fact - it has always been true
+of the shipped checkpoints - and xwen is on the right side of it, because the model's own
+training pipeline is the HF one. It is recorded here because it has two consequences a
+caller can trip over. `decode(encode(text))` returns the NFC form, not the input, so a
+round-trip is not an identity check. And a fixture whose ids come from `llama-tokenize`
+is only a valid oracle for NFC input, which is why the fixture generator refuses a
+non-NFC prompt outright rather than recording a disagreement as data. Pinned by a test on
+the embedded vocabulary so it holds with or without a Qwen3 checkpoint in the cache
+(2026-09-06).
+
+**Qwen3 gets two chat dialects and no tool calling.** `ChatDialect::Qwen3` is hybrid
+thinking - with thinking on the generation prompt emits nothing after the assistant
+header and the model writes its own `<think>`, with it off the template writes the empty
+block - and `ChatDialect::Qwen3Instruct` has no thinking at all. Both templates are
+vendored byte-exact under `reference/` as the spec, and all 16 fixture literals are
+byte-equal to `llama-server --jinja`, the Z-Image single-turn render among them. The
+divergences from the 3.6 lineage are wider than the thinking tail and each one changes a
+token stream: the Qwen3 template trims no message body where 3.6 pipes every one through
+`|trim`; it writes a reasoning block only where there is reasoning to write, where 3.6
+writes an empty one; and it renders three conversations the 3.6 renderer refuses outright
+(a system message past position 0, a conversation with no user query, a tool result
+opening the conversation). Most of that is shared by both members of each template
+family, so the renderer keys it on a private lineage rather than on four dialect arms.
+Tools are REFUSED on both, with a named error, rather than half-rendered. Three things
+differ at once - the header prose, the placement of the client's system content, and
+decisively the call format, which is JSON inside `<tool_call>` where 3.6 writes
+`<function=NAME><parameter=KEY>`. The serve engine parses only the latter (the entry
+above), so rendering the Qwen3 tools header would produce calls the engine cannot read
+back: a silent wrong answer in place of a loud refusal. Supporting them means a second
+parser dialect, which is its own piece of work and is recorded as not taken now
+(2026-09-06).

@@ -13,7 +13,8 @@ parity gate against upstream llama.cpp on identical GGUF weights (`docs/parity.m
 Qwen3.8-27B runs that same dense graph. Flash-Next has no harness of its own yet and was
 verified by forced replay against llama.cpp (`docs/qwen4exp-port.md`). Decode rates are
 in Speculative decoding below and, in full, in `docs/perf-state.md`. See `TODO.md` for
-the open ledger and `docs/log.md` for the timeline.
+the open ledger and `docs/log.md` for the timeline. A fifth architecture, dense Qwen3-4B
+in HF safetensors, is registered but does not run yet (Models, below).
 
 ## Docs
 
@@ -25,6 +26,8 @@ the open ledger and `docs/log.md` for the timeline.
 - `docs/log.md`: the dated timeline, newest first, with the full arc write-ups it points
   into under `docs/records/`
 - `docs/parity.md`: the verification runbook (vs upstream llama.cpp)
+- `docs/qwen3-dense.md`: the dense Qwen3-4B architecture, its config and its verification
+  bars; `docs/zimage.md` is the Z-Image text-encoder role that came with it
 - `AGENTS.md`: agent context, meaning ground truth, architecture cheat sheet, hazards,
   and the map of these files
 - `TODO.md`: the open ledger; items close by moving verbatim to `docs/ledger-archive.md`
@@ -119,6 +122,29 @@ the same graph as Qwen3.6-27B — its config is byte-identical — so it needs n
 of its own. It ships no DFlash sidecar, but it does ship a first-party MTP head, which is
 a different drafter shape and became a second drafter implementation (2026-08-15); all
 three qwen35 checkpoints speculate. Flash-Next does not (below).
+
+Three more are **registered but not runnable yet** (2026-09-06). They are dense Qwen3-4B
+in HF BF16 safetensors, not GGUF, and there is no layer stack for that architecture yet,
+so loading one is an error rather than a slow path. They are listed here because
+`xwen fetch` and `xwen inspect` already work on them and because the registry names them:
+
+| Full name | Repo | `--model-size` | Role |
+| --- | --- | --- | --- |
+| `Qwen3-4B` | `Qwen/Qwen3-4B` | `qwen3-4b` / `4b` | full LM, hybrid thinking |
+| `Qwen3-4B-Instruct-2507` | `Qwen/Qwen3-4B-Instruct-2507` | `qwen3-4b-instruct-2507` / `4b-instruct` | full LM, no thinking mode |
+| `Z-Image-Turbo-text-encoder` | `Tongyi-MAI/Z-Image-Turbo`, `text_encoder/` | `zimage-turbo` / `z-image-turbo` | encode-only, never an LM |
+
+8.06 GB each, three shards plus config, index and tokenizer. None is auto-fetched and
+none is servable or selectable over HTTP; each gate flips in the arc whose surface makes
+it work. The encoder entry never becomes an LM: its copy of the weights has a corrupted
+last-layer MLP, which the hidden state Z-Image reads never touches and anything else
+does. `docs/qwen3-dense.md` has the architecture and the verification bars,
+`docs/zimage.md` has the encoder role and the corruption.
+
+**`--model <path>` now takes a safetensors directory** on every one-shot subcommand, not
+only `serve`: a directory, a `config.json` inside one or a `*.safetensors` inside one all
+resolve to the same set. The file decides which checkpoint it is, and `--model-size`
+stays a cross-check that errors on disagreement rather than an override.
 
 ## Thinking, effort and sampling
 

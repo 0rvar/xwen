@@ -17,6 +17,9 @@ one that owns it:
   write-ups, meaning protocol, tables and reviews, live in **`docs/records/<slug>.md`**
   behind a stub in the log.
 - **`docs/parity.md`** is the verification runbook.
+- **`docs/qwen3-dense.md`** and **`docs/zimage.md`** are the dense Qwen3-4B architecture
+  and its Z-Image encoder role, the way `docs/qwen4exp-port.md` is Flash-Next's port:
+  per-architecture reference, not a rule and not a timeline.
 - **`docs/perf-state.md`** is the current figures, and it is their single source.
 - **`docs/benching.md`** is how to measure anything on this machine.
 - **`TODO.md`** is the backlog and the open ledger: a ranked **Front** of at most ten
@@ -73,7 +76,12 @@ Rules for keeping it that way:
 
 - Design target: maximum tok/s for Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B GGUF on
   this one machine (M5 Max, Metal). Batch 1. No portability hedging. (3.8-27B runs the
-  3.6-27B graph unchanged — it is a registry entry, not a port.)
+  3.6-27B graph unchanged — it is a registry entry, not a port.) **Amended 2026-09-06:**
+  dense Qwen3-4B (`model_type: qwen3`, HF BF16 safetensors) is in scope as a full
+  checkpoint AND as the text-conditioning encoder for the diffusion image transformers
+  to come, and it is NOT a tok/s target. It is held to correctness bars and to costing
+  the checkpoints above nothing; no arc of it argues for a hot-path change on its behalf
+  (decisions.md "Dense Qwen3-4B is a full checkpoint AND the conditioning encoder").
 - TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, it
   becomes a ledger item with context, or it is retired with a dated reason and a reopen
   condition (retired means not planned, not forbidden). Ledger text is never deleted:
@@ -99,6 +107,16 @@ Rules for keeping it that way:
    layout: the GGUF has conversion-baked deltas (next section).
 4. HF `config.json` of Qwen/Qwen3.6-* — last resort; its text params nest under
    `text_config` and its single `eos_token_id` is wrong for chat.
+
+That order is for the GGUF archs. **For dense `qwen3` the order is different and HF is
+not demoted**: llama.cpp `src/models/qwen3.cpp` and HF `modeling_qwen3.py` are joint
+authority and they agree on every form that could have gone the other way, because there
+is no converter between us and these weights: we read the HF safetensors directly, so
+none of the conversion deltas below apply. The `config.json` of the checkpoint itself is
+authoritative for its own parameters here (it does not nest, and both its stop ids are in
+`generation_config.json`), and diffusers' `pipeline_z_image.py` is authority for the
+encoder role. Details: [docs/qwen3-dense.md](docs/qwen3-dense.md),
+[docs/zimage.md](docs/zimage.md).
 
 ## Architecture cheat sheet (Qwen 3.6, ggml-org GGUF)
 
@@ -241,6 +259,68 @@ edited ref costs a full re-download.
 - llama.cpp's `gguf-py/constants.py` does not match the shipped files (lists SSM_IN,
   omits ssm_beta and the shexp set). The shipped tensor tables are the spec; never
   read constants.py as one.
+
+## Qwen3-4B dense (`qwen3`, HF BF16 safetensors; REGISTERED, NOT RUNNABLE as of 2026-09-06)
+
+A second weight format and a second vocabulary, not a variant of the graphs above. It is
+in the repo for two roles at once: a full LM checkpoint, and the text-conditioning
+encoder that the diffusion image transformers will call in-process (Z-Image-Turbo
+first). [docs/qwen3-dense.md](docs/qwen3-dense.md) is the architecture and the
+verification bars, [docs/zimage.md](docs/zimage.md) is the encoder role,
+[docs/records/qwen3-dense.md](docs/records/qwen3-dense.md) is the arc.
+
+Shape: 36 layers, ALL full attention, hidden 2560, 32 Q / 8 KV heads, head_dim 128,
+dense SwiGLU 9728, vocab 151936, rms_norm_eps 1e-6, tied embeddings, no biases, no
+sliding window, no output gate. Rope is FULL NEoX over all 128 head dims (theta 1e6, or
+5e6 on Instruct-2507), not the partial 64-of-256 of 3.6. QK-RMSNorm over [128] on every
+layer, before rope, v untouched. GQA broadcast is repeat_interleave (KV head j serves Q
+heads 4j..4j+3), which is the form the 3.6 GGUF path calls wrong for ITSELF; there is no
+converter here, so no tiled V-order and no pre-baked norm. Specials 151643
+`<|endoftext|>`, 151644 `<|im_start|>`, 151645 `<|im_end|>`, 151667 `<think>` / 151668
+`</think>` (`special: false`, same by-id trap). No BOS. Stops on 151645 AND 151643, and
+unlike 3.6 both are in the upstream `generation_config.json`.
+
+Arc 0 landed config, loader, specials, dialects, registry and the Stage 1 oracle. There
+is NO layer stack: `XwenModel::load`'s safetensors arm returns "stack not implemented",
+and `servable()`/`auto_fetch()` are false on all three entries until the arc whose
+surface makes each true. Do not describe any of it as running.
+
+Traps, each of which has already cost someone time:
+
+- **Z-Image ships a corrupt copy of Qwen3-4B.** `text_encoder/` shard 3 has
+  `model.layers.35.mlp.up_proj.weight` zero-filled for 14,772,816 contiguous elements
+  from element 27,003 and `down_proj` for 3,938,425 from element 20,930,265; base
+  Qwen3-4B has none. Harmless for the encoder (index 35 never evaluates layer 35) and
+  disqualifying for anything else, which is why that entry is encode-only. The loader
+  refuses any zero run past 4096 elements unless the REGISTRY ENTRY allowlists that
+  tensor by name, so a bare directory is refused and only the documented entry passes.
+  Never widen the allowlist to make a load succeed, and never point an LM surface at
+  that copy: `Qwen/Qwen3-4B` is the faithful one.
+- **NFC.** Every Qwen tokenizer.json declares an NFC normalizer that the HF runtime
+  applies and llama.cpp does not. `encode` is not injective over decomposed spellings
+  and `decode(encode(x))` returns the NFC form. Pre-existing, affects 3.6 identically. A
+  fixture whose ids come from `llama-tokenize` is a valid oracle only for NFC input.
+- **Specials are per tokenizer instance now**, resolved by token text at load
+  (`LagunaTokenizer::specials()`), not the 248k constants. The constants survive only in
+  `config.rs`'s GGUF-only EOG fold and `ConstraintFactory::embedded`. A new call site
+  that reaches for a constant will be a wrong number on this vocabulary, not a missing
+  one. `TOKENIZATION_RULES_VERSION` stays at 3 on purpose.
+- **Identity for a safetensors directory** is provenance first (the entry's own cached
+  snapshot, comparing canonicalized DIRECTORIES and never a file, hub cache files being
+  symlinks into shared blobs), then `rope_theta` (5e6 Instruct-2507, else base, which
+  wins the tie with the byte-identical Z-Image config). There is no name inside the set,
+  so the `general.name` passes are unreachable here. `--model-size` stays a cross-check
+  and a disagreement is a startup error.
+- **`CheckpointSource` is the one open seam.** Every consumer that used to call
+  `gguf::open` itself now routes through it, so a new checkpoint consumer goes there and
+  not beside it. Note that `Qwen3Set::open` scans all 8 GB on every open (~1.4 s in dev),
+  which every routed metadata-only caller now pays; fine while nothing serves these
+  entries, and the first thing to fix when `servable()` flips.
+- **The Python exception.** `scripts/zimage-ref-dump.py` is the only Python in the repo,
+  run by hand under `uv` in a throwaway venv, never in CI. It exists because the encoder
+  has no ONNX export and there is no bun path to torch. It is not a precedent.
+- **A GGUF whose arch string is `qwen3` is refused**, pointing at the safetensors
+  directory. Safetensors is the form this architecture ships in here.
 
 ## The candle situation
 

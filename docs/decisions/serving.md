@@ -365,3 +365,43 @@ whichever is larger, re-derived every 250 ms while the engine queues the live
 conversation's image after the signal, and the derived value is what the
 "shutdown grace expired" line reports. Before the fix a budget past 30 s was cut off by
 the flat watchdog, and pending bytes did not count a write already claimed; they do now.
+
+**A safetensors directory identifies by provenance first, then by `rope_theta`, and
+never by a bare name (2026-09-06).** The GGUF rule above is "the file names itself, the
+architecture is only a fallback". A safetensors set has no `general.name` to read, so
+the name passes are unreachable for `Arch::Qwen3` and something else has to carry the
+weight. Provenance does: a directory is `Official` only when it IS that registry entry's
+own cached HF snapshot, compared after canonicalizing the DIRECTORY and never a file
+inside it, because hub cache files are symlinks into a shared blob store and
+canonicalizing `config.json` would compare `blobs/` against itself for every entry.
+Anything else is `Assumed` under its own directory name, with `rope_theta` choosing the
+release - 5e6 is Instruct-2507, 1e6 is the base model, which wins the tie it shares with
+the byte-identical Z-Image config. `--model-size` keeps the meaning it has everywhere
+else, a cross-check rather than an override: naming a release whose theta disagrees with
+the directory is a startup error, which is what stops `--model-size
+qwen3-4b-instruct-2507` from being silently accepted on a base-model directory by the
+existing "the file said nothing, so the flag settles it" branch. `--model <dir>` is
+therefore a real surface on every one-shot subcommand, not just serve, and a directory,
+a `config.json` inside one or a `*.safetensors` inside one all resolve to the same set.
+One seam made that affordable: `CheckpointSource` is now the single place a checkpoint
+gets opened, and `Generator::load`, `XwenModel::load`, `serve::read_config`, the disk
+tier's checkpoint id, serve startup, `one_shot_checkpoint` and `inspect` all route
+through it. The drafter open stays GGUF, there being no safetensors drafter to open
+(2026-09-06).
+
+**The Z-Image encoder is an encode-only entry, and every qwen3 entry stays unlisted
+until the surface that would run it works.** `servable()` exists as the seam a
+half-ported architecture says no through, and this is what it was kept for: all three
+qwen3 entries register with `servable()` and `auto_fetch()` false in the arc that adds
+them, and each gate flips in the arc whose surface makes it true. Nothing is listed by
+`/v1/models`, selectable on the wire, or downloadable by a zero-flag run before it can
+answer. `ZImageTurboEncoder` is the one that never flips: its weights are a corrupted
+copy of Qwen3-4B base (docs/zimage.md), harmless for the hidden state Z-Image reads and
+disqualifying for anything that evaluates the last layer, so the LM surfaces are refused
+on it by construction rather than by documentation. Pointing xwen at
+`Qwen/Qwen3-4B` is the supported way to run that model as an LM. The cost of this
+policy is one honest wart: `serve::unknown_model_message` enumerates every registry
+entry, so a 400 can name a checkpoint that a request cannot then select. That was
+already true of an uncached Flash-Next and the unservable entries make it
+unconditional; it is a message bug with a one-line fix, recorded rather than
+improvised into an unrelated arc (2026-09-06).
