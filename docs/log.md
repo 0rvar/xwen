@@ -4,6 +4,63 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-06 — The 128k envelope measured, and the prefill mask is a 25 GB memory fix
+
+The oldest open ledger item closed. `scripts/longctx.ts` is the new instrument: it cuts
+repo prose to a token target against the checkpoint's own GGUF vocab, interleaves
+lengths A B A B, and samples `phys_footprint_peak` per run. Two results reframe things.
+**Flash-Next decode is flat across context where the 35B's is not** — 47.1 to 46.9 tok/s
+from 8k to 64k and 41.9 at 128k, against the 35B's 96.4 falling to 36.8 — so the 35B's
+headline 127.0 describes short conversations only. **Prefill is the wall**: 197 s for a
+maximal 35B prefill and 569 s for Flash-Next, which is what `queue_timeout` now derives
+from (300 s flat was dropping queued requests while the server worked normally; the
+default is 2640 s at `context_length` 262144, and it is logged at startup).
+
+The prefill mask went to the device, bit-identical, `XWEN_HOST_MASK=1` restoring the host
+fill. The ledger called the host loop "the binding cost of long prefill" and that is
+**refuted on time** — both checkpoints are a dead heat at 131072, because candle fills
+chunk N+1's mask while the GPU is still on chunk N. What it actually buys is **the 35B's
+131072 peak footprint falling from 42-69 GB to a flat 17 GB**, which is where the "~28 GB
+that is neither weights nor KV" went: `Tensor::from_vec` hands the pool a fresh
+exact-size buffer per chunk and no two chunks ask for the same size. Flash-Next stays at
+59 GB because its QSA indexer builds its own host mask per sparse layer per chunk, which
+is the ledgered follow-up. `DEFAULT_DRAFT_CTX` stays at 8192 and the reason inverted:
+drafting on the 35B reads **below** plain at every length measured, -8% at 1046 tokens
+(80.6% acceptance) deepening to -37% at 16409, so raising the horizon would extend a
+loss — which corroborates the same day's presence-penalty finding on a code prompt from
+the other direction. The horizon also stopped being silent, `--max-ctx` became one
+constant clamped to `n_ctx_train` on every surface, and the disk flush budget follows the
+bytes it has queued. Tables, the A/B and what was left undone:
+[record](records/long-context-envelope.md).
+
+## 2026-09-06 — Chores: health and TUI name the checkpoint, tagged bench records, mtl_size, scripts sweep
+
+Five ledger chores, none of them touching model math. `/health` grew a `model` field and
+the dashboard a resident cell and a HISTORY `model` column, all three reading one
+`ResidentModel` the engine stamps at load and clears at every unload — the bool and the
+name come from a single read, so they cannot disagree, and the TUI polls the cell rather
+than folding events, so an unload cannot leave a stale name on screen. Run records grew
+an optional `tag`, set from `XWEN_METRICS_TAG` inside `RunRecord::new`; the scripts that
+drive the binary export it (`bench`, `parity`, `demo`), `xwen stats` reports untagged
+runs alone and its footer always says how many it left out, `--tag`/`--all-tags` ask for
+the rest (decisions.md "Metrics" — the new paragraph supersedes 2026-09-05's). The
+`mtl_size!` macro is gone for a `const fn` returning `objc2_metal::MTLSize`, whose round
+trip through candle's `get_block_dims` had every field overwritten and so computed
+nothing: 69 call sites, no value moved. And the scripts sweep closed: `classify.ts` and
+the bench fixtures carry no laguna leftovers, but the fixture NAMES are laguna's token
+counts — 880, 3851 and 596 under this tokenizer — so the two 27B prefill rows in
+docs/perf-state.md are relabelled and the mapping is written down.
+
+## 2026-09-06 — Presence penalty: the cards' recipe, through the speculative verify, on by default
+
+The cards' `presence_penalty` 1.5 is live: non-thinking on every checkpoint, thinking on
+the 35B-A3B alone, explicit values winning on every surface (CLI, serve.toml, OpenAI,
+native, batch). On the device before the softmax, so plain decode is unchanged; through
+the verify rows with a round-end rollback truncation, so the greedy equivalence gate passes
+at 1.5 and at 0. Acceptance on the 35B drops 63.0% to 59.4%, drafted decode -1.2%; sampled
+mode diverges at 1.5 in the known near-tie class. `top_k` 0 is now "no cut", 1 greedy.
+Batch's non-thinking output changes. [Record](records/presence-penalty.md).
+
 ## 2026-09-06 — Metrics: the Claude Code agent id is recorded, and `xwen stats --by agent`
 
 `x-claude-code-agent-id` now lands on the run record as its own `agent` field, read

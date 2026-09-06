@@ -140,12 +140,27 @@ assistant content. Details and evidence in decisions.md "Tokenization, chat, too
 calls".
 
 **Sampling defaults are keyed to thinking mode**, per the official model cards and
-identical across all three checkpoints: thinking temp 1.0 / top_p 0.95 / top_k 20,
+identical across all four checkpoints: thinking temp 1.0 / top_p 0.95 / top_k 20,
 non-thinking 0.7 / 0.80 / 20. Explicit flags, config keys and request fields always win;
 a server-configured sampling value pins one number for both modes, unset lets each
-request use its mode's own. The cards also recommend `presence_penalty` 1.5 for
-non-thinking mode — not implemented: the sampler has no penalty machinery and penalties
-entangle the speculative verify path (TODO.md).
+request use its mode's own.
+
+**`presence_penalty` is the one default that is also keyed to the checkpoint**, and it
+is on. Every card asks for 1.5 without thinking; with thinking, only Qwen3.6-35B-A3B
+does, and the other three ask for none. It subtracts that much from the logit of every
+token the current reply has already produced, once per distinct token however many
+times it appeared, before temperature and before any cut — vLLM's semantics — and it
+applies in greedy mode too. The scope is the reply: the prompt and earlier turns are
+outside it, reasoning tokens are inside it. Set it with `--presence-penalty` on
+`generate`/`chat`/`serve`, `presence_penalty` under `[sampling]` in a serve config, the
+OpenAI or native `presence_penalty` request field, or an item's `sampling` block in a
+batch payload; `0` turns it off. Drafters propose unpenalized and only the target's
+verify draw is penalized, so `--draft` and `--no-draft` still produce the same tokens
+under the same seed. On the plain decode path the penalty is scattered into the logits
+on the GPU, so a default-on run costs no measurable decode speed.
+
+**`top_k` follows llama.cpp's spelling**: `0` means no top-k cut at all (the whole
+vocabulary stays eligible and only `top_p` narrows it) and `1` is greedy.
 
 On the serve side, requests pick thinking per dialect: Anthropic `thinking`, native
 `thinking`, OpenAI `reasoning_effort` — which drives both the think-token budget
@@ -302,6 +317,21 @@ supplying one on a 3.6 checkpoint fails the item, since that template has no suc
 parameter), an assistant `prefill`, `max_tokens` and `sampling`; `defaults` sets any of
 them batch-wide. Batch sampling is greedy and thinking is off unless a request says
 otherwise — both differ from the chat surface on purpose (docs/decisions.md "Batch").
+
+**`presence_penalty` is the exception to "batch has its own defaults", and it is on.**
+It is not inert at temperature 0 (greedy takes the argmax of the penalized row), so it
+does not get the treatment `top_k`/`top_p`/`seed` get; instead an item that names none
+takes the checkpoint's card value for its OWN thinking mode, the way every other
+surface resolves it. Thinking is off by default here and every card asks for 1.5
+without thinking, so **an item that says nothing about sampling now decodes with
+`presence_penalty` 1.5 where it used to decode unpenalized** — a visible change to what
+a batch answers, though a batch stays as reproducible as it was, the penalty being a
+function of what the reply has already emitted. Spell `"sampling": {"presence_penalty":
+0}` on the item, or in `defaults` for the whole request, to get the old behaviour back.
+Scored fields (`schema` with `include_score`) are drawn unpenalized whatever the item
+says: nothing is emitted token by token there, so there is no history for a per-token
+penalty to be measured over.
+
 Per-item failures land as `error` on that item and the rest of the batch still runs.
 
 **`shared_prefix`.** A request-level string prepended verbatim to every item's first
@@ -344,6 +374,14 @@ config template; every setting is also a flag.
 DEFAULT checkpoint; any request may name another one and the engine lazy-loads it,
 imaging the live conversation out first (the same path an idle unload takes) — one
 model resident at a time, always, and `idle_unload` applies to whichever is loaded.
+
+`GET /health` says which one that is: `model_loaded` is the readiness bool it always
+was, and `model` names the resident checkpoint the same way `/v1/models` does, or is
+`null` before the first lazy load and after every unload. Both come from one read of one
+cell, so the pair cannot disagree. The dashboard reads the same cell: its header carries
+a `loaded`/`loaded <name>`/`unloaded` mark beside the served file's own id, and the
+HISTORY pane has a `model` column, so a row's rate can be read against the checkpoint
+that produced it.
 
 **On the wire a checkpoint has exactly one name: its full name** (`Qwen3.6-27B`,
 `Qwen3.6-35B-A3B`, `Qwen3.8-27B`, `Qwen3.8-Flash-Next`) — 2026-08-14. The CLI's short
@@ -390,7 +428,20 @@ Request bodies are capped at 100 MB (real cost is judged in tokens by the queue 
 256k window — is a ceiling, not an allocation: the KV cache starts at 8k positions and
 grows on demand as a conversation lengthens, and an idle unload drops whatever it grew
 to, so the next load starts small again. The one-shot CLI commands' `--max-ctx` works
-the same way and defaults to 131072.
+the same way and defaults to 131072. Either way the ceiling is trimmed at load to the
+context the file was actually converted with, with a line saying so — a blessed
+checkpoint's 262144 leaves both defaults untouched, and one converted smaller is run
+inside its own window rather than past its rope table.
+
+`queue_timeout` follows from `context_length` rather than being a flat number: the
+default covers two maximal prefills at the slowest rate this machine has been measured
+at, which is 2640 s at the default 262144 and never less than 300. It is said once at
+startup. The point is that a request arriving behind one long prefill is not dropped for
+saturation while the server is working normally — a 131072-token prompt is 567 s of
+prefill on the default checkpoint before its own decode starts, so the flat 300 s this
+replaced dropped queued requests while the server worked normally. Naming
+`queue_timeout` explicitly still wins, and a queued streaming request costs almost
+nothing to hold.
 
 The default bind is loopback because with no `api_key` the server accepts every request;
 set `host = "0.0.0.0"` (or `--host`) together with an `api_key` to serve the LAN.
@@ -401,7 +452,9 @@ Every run appends one JSON line to `$HOME/.local/state/xwen/metrics.jsonl`: what
 what it cost, and who asked for it. `generate`, `chat`, `batch` and every served request
 record themselves, on by default. `XWEN_METRICS_FILE=<path>` records somewhere else and
 `XWEN_METRICS_FILE=off`, in any casing, records nothing; setting the variable to an
-empty string is not setting it and the default path applies. A write that fails prints
+empty string is not setting it and the default path applies. `XWEN_METRICS_TAG=<name>`
+marks the runs of that process as harness-driven rather than asked for, which is how a
+sweep stays in the history and out of the default report. A write that fails prints
 one warning for the life of the process and never fails the run that produced it, and a
 whole record goes out in a single append, so a server and a `generate` recording at the
 same moment interleave records rather than fragments.
@@ -410,8 +463,9 @@ A record carries the schema version, the completion timestamp, the surface (`gen
 `chat`, `batch`, `serve:anthropic`, `serve:openai`, `serve:native`, `serve:batch`), the
 checkpoint name, prompt / cached / prefill / decode token counts with the seconds each
 phase took, `ok`, and whatever else the surface knows: thinking tokens, drafted and
-accepted positions, batch item count, the client, session and agent ids. Readers
-ignore fields they do not recognize, so an older xwen still reads a newer one's history.
+accepted positions, batch item count, the client, session and agent ids, and the tag.
+Readers ignore fields they do not recognize, so an older xwen still reads a newer one's
+history.
 
 An absent optional means not measured, which is not the same as zero. `thinking_tokens`
 is the one to know: serve always measures it and writes it, 0 included, while `generate`
@@ -430,7 +484,14 @@ naming the checkpoint the run replies as, and is unchanged.
 (default `day`), `--since 24h|7d|4w|YYYY-MM-DD` (a date means local midnight), `--model`
 and `--surface` filter exactly, `--client` and `--session` by substring, `--json` prints
 the rows instead of the table, and `--file` reads another history without ever recording
-to it. A bad `--since` is an error before the file is opened, so a typo says so rather
+to it. The report covers real use alone: a run recorded under a tag is left out, `--tag
+<name>` reads one harness on its own, `--all-tags` reads the whole file, and the stderr
+footer always says how many tagged runs the default left out. The scripts that drive the
+binary set the tag themselves — `bench` for `bench.ts`, `retune-draft.ts`,
+`spec-equivalence.ts` and `flashnext-replay.ts`, `parity` for `parity-gate.ts`, `demo`
+for the server `classify-demo.ts` spawns — so a sweep does not read as a day of
+inference nobody did. A script that drives an ALREADY-RUNNING server cannot tag anything:
+the record is written by the server process, so that server's own environment decides. A bad `--since` is an error before the file is opened, so a typo says so rather
 than reporting an empty history. The label column is measured in display columns, so a
 CJK or emoji label still lines up, and is cut to 48 with a trailing ellipsis; a raw
 client id is the one thing long enough to need it.

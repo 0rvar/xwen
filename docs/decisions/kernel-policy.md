@@ -462,3 +462,35 @@ that needs no patch. Full anchors and the reasoning in log.md "technique survey"
 in TODO.md. Nothing here ships on a tok/s reading alone: candle's pooled-buffer recycle
 has no in-flight check (`device.rs:488-503`), so a concurrency or cadence change is
 graded by the parity gate plus greedy equivalence.
+
+**The causal prefill mask is built on the device, and it is a MEMORY change (2026-09-06).**
+`PrefillMask::causal_on_device` replaces the host `Vec<f32>` fill — a scalar double loop
+over `seq x (pos + seq)`, ~8.6e9 stores over a full 131072 prefill — and its upload with
+two `arange` vectors, a broadcast compare and a `where`. Bit-identical by construction
+and by test: `the_device_built_causal_mask_equals_the_host_fill` compares the additive
+f32 plane AND the f16 sdpa copy at every chunk shape the prefill walk produces, on the
+real Metal device. `XWEN_HOST_MASK=1` restores the host path, which a non-Metal device
+takes anyway; it is the `--control` arm for `scripts/flashnext-replay.ts` and is stripped
+by `parity-gate.ts`.
+
+The ledger item that asked for this called the host fill "the binding cost of long
+prefill". That is REFUTED on time: at 131072 the two arms are a dead heat on both
+checkpoints (35B 667.8 against 659.2 tok/s, Flash-Next 230.8 against 230.9), because
+candle is asynchronous and the host fills chunk N+1's mask while the GPU is still on
+chunk N, so ~69 GB of stores and uploads hide behind a prefill of 197 s and 569 s
+respectively. Nobody should quote this change as a throughput win.
+
+What it does buy is 25-52 GB of peak footprint on the dense-attention path: the 35B's
+131072 peak goes from 42-69 GB to a flat 17 GB, and the device arm's two passes agree
+exactly where the host arm's differ by 27 GB. The mechanism is buffer handling, not
+arithmetic — the host path reaches the device through `Tensor::from_vec`, one fresh
+exact-size buffer per chunk with no two chunks asking for the same size, while `where`
+allocates through the pooled builder and gets recycled. `ops::chunk_sync`'s doc comment
+had already named that shape ("a pool that only ever adds entries because each chunk's
+mask upload asks for a fresh exact-size buffer") before anyone measured it.
+
+Flash-Next does not move, at 59 GB either way, because its QSA indexer builds its own
+`n x n_kv` f32 mask through the same `Tensor::from_vec`, per sparse layer per chunk, and
+above the 2048 budget that is every chunk. Moving THAT one is the follow-up, and it is
+ledgered with a memory number rather than a time one — the time criterion it was given
+(10% of the 131072 prefill wall) fails on the causal mask's own 0%.

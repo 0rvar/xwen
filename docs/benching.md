@@ -10,7 +10,16 @@ already cost this project or laguna a wrong number. The figures themselves live 
 - **Bench a PINNED binary.** Build a detached worktree under /tmp and pass `--bin` to the
   harness. A coding agent's `cargo build` in the main tree swaps `target/release/xwen`
   and its `include_str!` kernels under a running harness; on 2026-09-05 a session aborted
-  on a half-written kernel.
+  on a half-written kernel. `bench.ts`, `longctx.ts` and `retune-draft.ts` all take the
+  flag (`--bin`, `--bin`, `--binary`), each defaulting to the main tree only so an ad-hoc
+  run works. On `longctx.ts` prefer the `XWEN_LONGCTX_BIN` environment form: the repo's
+  `pgrep` guard matches any command line containing `target/release/xwen`, so a `--bin`
+  naming a worktree build makes the harness itself look like a running model process to
+  every other bench on the machine.
+- **Take the GPU lock.** `/tmp/xwen-gpu.lock` is how concurrent agents on this machine
+  take turns: wait until `pgrep` is clear AND the file is absent, write your name into
+  it, run, delete it. `longctx.ts` does this per run rather than per sweep, so a long
+  sweep interleaves with someone else's work instead of blocking it for an hour.
 - **Interleave the arms tightly**, A B A B, never all of A then all of B. Report medians.
 - **~60 s idle between rounds**, and keep the runs short. The machine thermal-throttles
   under sustained load as a matter of course (owner's word, 2026-08-30), and duty cycle

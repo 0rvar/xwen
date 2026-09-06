@@ -17,9 +17,13 @@
 //   bun scripts/bench.ts --gate           # run `bun scripts/parity-gate.ts` first (cached refs)
 //   bun scripts/bench.ts --expect-mode lpm|full   # abort if the machine is not in that mode (default: lpm)
 //   bun scripts/bench.ts --out-dir DIR    # where raw outputs land (default: /tmp/xwen-bench)
+//   bun scripts/bench.ts --bin PATH       # the binary to measure (default: target/release/xwen)
 //
 // Bench prompts are committed fixtures (tests/fixtures/bench-prompts/): the
 // same token counts every run, so numbers are comparable across sessions.
+// The file NAMES are laguna's token counts and were never refitted; under this
+// tokenizer prefill-925.txt is 880 tokens, prefill-4k.txt 3851 and
+// decode-630.txt 596. Quote those, not the names (docs/perf-state.md).
 
 import { $ } from "bun";
 import { mkdirSync } from "node:fs";
@@ -38,6 +42,11 @@ function opt(name: string, dflt: string): string {
   return i >= 0 && args[i + 1] ? args[i + 1] : dflt;
 }
 
+// The binary under test. docs/benching.md requires a PINNED build — a detached
+// worktree under /tmp — because a coding agent's `cargo build` in the main tree
+// swaps target/release/xwen and its kernels under a running harness. The default
+// is the main tree's binary only so an ad-hoc run still works.
+const bin = opt("bin", join(repo, "target/release/xwen"));
 const outDir = opt("out-dir", "/tmp/xwen-bench");
 const expectMode = opt("expect-mode", "lpm");
 const only = opt("only", "prefill-925,prefill-4k,decode").split(",");
@@ -113,7 +122,7 @@ for (const b of benches.filter((b) => only.includes(b.name))) {
   const prompt = await Bun.file(b.prompt).text();
   const proc = Bun.spawnSync(
     [
-      join(repo, "target/release/xwen"),
+      bin,
       "generate",
       "--model",
       process.env.XWEN_MODEL ?? officialModel(),
@@ -127,7 +136,14 @@ for (const b of benches.filter((b) => only.includes(b.name))) {
       String(b.nTokens),
       "--stats",
     ],
-    { cwd: repo, env: { ...process.env, XWEN_BENCH: "1" }, maxBuffer: 64 * 1024 * 1024 },
+    {
+      cwd: repo,
+      // XWEN_METRICS_TAG marks every record these runs write as harness-driven,
+      // so a sweep's runs stay in the history but out of `xwen stats`' default
+      // table, which answers what real use cost.
+      env: { ...process.env, XWEN_BENCH: "1", XWEN_METRICS_TAG: "bench" },
+      maxBuffer: 64 * 1024 * 1024,
+    },
   );
   await Bun.write(outFile, proc.stdout.toString() + proc.stderr.toString());
   if (proc.exitCode !== 0) {

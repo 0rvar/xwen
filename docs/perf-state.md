@@ -29,11 +29,12 @@ reasoning behind the choice that produced it lives in [decisions](decisions.md).
 | Qwen3.6-27B | plain decode | 24.8-25.3 tok/s | 2026-08-08, commit not recorded | `lowpowermode 0` |
 | Qwen3.6-27B | drafted decode, code | 37.5-38.2 tok/s (+46-52% over its own plain arm) | fitted 2026-08-08 | `lowpowermode 0` |
 | Qwen3.6-27B | drafted decode, chat | 36.8-37.4 tok/s (+46-52%) | fitted 2026-08-08 | `lowpowermode 0` |
-| Qwen3.6-27B | prefill @925 | 702 tok/s (chunk 512) | 2026-07-29, not re-measured | not recorded |
-| Qwen3.6-27B | prefill @4k | 445 tok/s (chunk 512) | 2026-07-29, not re-measured | not recorded |
+| Qwen3.6-27B | prefill @880 | 702 tok/s (chunk 512) | 2026-07-29, not re-measured; recorded as `@925` at the time, which is the fixture's NAME | not recorded |
+| Qwen3.6-27B | prefill @3851 | 445 tok/s (chunk 512) | 2026-07-29, not re-measured; recorded as `@4k` at the time | not recorded |
 | Qwen3.6-35B-A3B | plain decode | 127.0 tok/s | 2026-09-06, 24c4069; the `XWEN_ROUTER_MV_CLASSIC` arm read 115.1 in the same session, so +10.3%, ahead in every round | not recorded |
 | Qwen3.6-35B-A3B | drafted decode, code | 133.6-134.8 tok/s (+26-28%) | fitted 2026-08-08, against the pre-fold plain level | `lowpowermode 0` |
 | Qwen3.6-35B-A3B | drafted decode, chat | 122.3-123.7 tok/s (+15-17%) | fitted 2026-08-08, against the pre-fold plain level | `lowpowermode 0` |
+| Qwen3.6-35B-A3B | presence penalty A/B, code, 256 tokens | plain 126.5 (p 0) / 126.9 (p 1.5); drafted 121.1 at 63.0% acceptance (p 0) / 119.6 at 59.4% (p 1.5) | 2026-09-06, pinned build of the penalty tree, 3 interleaved reps, medians | `lowpowermode 0` |
 | Qwen3.6-35B-A3B | prefill @3851 | 2634 tok/s at chunk 2048, 2429 at 512 | 2026-08-30 | `powermode 0` |
 | Qwen3.6-35B-A3B | prefill @3803 | 3081-3090 tok/s after the FFN-glue levers; the same sweep's all-classic arm read 2746-2755 | 2026-08-30 | `powermode 0` |
 | Qwen3.8-27B | plain decode | 23.7-24.8 tok/s | 2026-08-15 | `lowpowermode 0` |
@@ -55,13 +56,23 @@ reasoning behind the choice that produced it lives in [decisions](decisions.md).
 Notes on individual rows:
 
 - **The 35B fold has not been re-swept with drafting**, so both drafted 35B figures are
-  against the pre-fold plain level.
+  against the pre-fold plain level. **The 2026-09-06 penalty A/B read drafting BELOW
+  plain on the 35B at penalty 0 (121.1 vs 126.5, code prompt, 256 tokens)**: after the
+  router gemv lifted plain by 10%, the drafted arm on that prompt no longer clears it.
+  One prompt, one length; ledgered as a measured item in "Drafting".
 - **The dense 27B keeps chunk 512.** It reads 5-6% slower at 2048 (650/599 vs 608/571,
   2026-08-30); the MoE checkpoints use 2048. `XWEN_PREFILL_CHUNK` overrides, and the rule
   is `Arch::prefill_chunk_default` (decisions.md "The prefill chunk is per architecture").
 - **The router-gemv session of 2026-09-06 reported Flash-Next prefill unchanged at 1171**
   without restating the prompt length; the length-tagged prefill rows above are the ones
   to quote.
+- **The bench fixtures are named after laguna's tokenizer, not this one** (2026-09-06).
+  `tests/fixtures/bench-prompts/prefill-925.txt` is 880 tokens under the Qwen tokenizer,
+  `prefill-4k.txt` is 3851 and `decode-630.txt` is 596; the files are wikitext-2 English
+  prose and nothing about them is checkpoint-specific. The names are kept because
+  `scripts/bench.ts`, the log and the records all reach them by name. So `@925`, `@4k`
+  and `@630` anywhere in this repo are FILE NAMES, and the counts to quote are 880, 3851
+  and 596 — which is what every row measured since 2026-08-29 already does.
 - **llama.cpp on the same Flash-Next file, in the same hour as the 2026-08-29 arm, ran
   789 prefill / 41.4 decode** (`pmset -g` said `powermode 0` that session).
 - **Flash-Next decode is bimodal round over round** (~42 vs ~44 at the pre-fold level) and
@@ -71,6 +82,77 @@ Notes on individual rows:
   own plain arm where the 3.8-27B's MTP head runs 1.45x/1.38x over its own. Same trunk
   geometry, so the block drafter is still the stronger drafter; the MTP head closes most
   of the gap and is worth roughly ten times less KV, 4 KiB/token against 40.
+
+## Long context
+
+Measured 2026-09-06 by `scripts/longctx.ts` against a pinned worktree build of 4a66616,
+`lowpowermode         0` with no high-power claim. Medians of two interleaved
+repetitions per length, lengths run A B A B rather than all reps of one length in a row.
+The prompt is repo prose cut to the token target against the checkpoint's own GGUF vocab
+and fed through the chat template with a 160-token thinking floor, which is what keeps
+decode a rate at every length: a raw continuation of a cut-off document emits an
+end-of-generation token almost immediately, and a 32768-token raw run decoded 28 tokens
+in 0.67 s before this harness stopped asking it to.
+
+Every figure below is at one large model process with another agent's builds on the same
+CPU; treat the absolutes as this session's and the shape as the finding.
+
+**Qwen3.6-35B-A3B, plain.**
+
+| Prompt tokens | Prefill tok/s | Prefill wall | Decode tok/s | Peak footprint |
+| --- | --- | --- | --- | --- |
+| 8201 | 2326 | 3.6 s | 96.4 | 12.0 GB |
+| 32879 | 1586 | 20.8 s | 78.9 | 14.0 GB |
+| 65554 | 1145 | 57.3 s | 60.3 | 25.0 GB |
+| 131382 | 668 | 196.6 s | 36.8 | 50.5 GB |
+
+**Qwen3.8-Flash-Next, plain.**
+
+| Prompt tokens | Prefill tok/s | Prefill wall | Decode tok/s | Peak footprint |
+| --- | --- | --- | --- | --- |
+| 8243 | 925 | 8.9 s | 47.1 | 20.0 GB |
+| 32921 | 584 | 56.3 s | 46.0 | 20.0 GB |
+| 65596 | 403 | 162.7 s | 46.9 | 27.0 GB |
+| 131424 | 231 | 569.3 s | 41.9 | 59.0 GB |
+
+The 131424 row is one repetition, and it comes from the working-tree build's
+`XWEN_HOST_MASK=1` control arm rather than the pinned one — the same mask values by
+construction, measured in the prefill-mask A/B. Its device-mask twin read 230.9 / 42.1 /
+59.0, so the row is the same either way.
+
+Three things to read off these:
+
+- **Flash-Next decode is flat where the 35B's is not.** 47.1 to 46.9 tok/s from 8k to
+  64k, then 41.9 at 128k, against the 35B's 96.4 falling to 36.8 — a 62% loss on the
+  dense-attention checkpoint against 11% on the sparse one, and none of that 11% before
+  64k. QSA is doing exactly what it is for, and the 2026-08-30 "44-45 at 3.8k-32k" row
+  extends to 64k unchanged. On the 35B, long-context decode is a different regime from
+  the headline 127.0 and should never be quoted from it.
+- **Prefill falls on both, and it is the wall an operator actually hits.** A maximal
+  prefill is 197 s on the 35B and 569 s on Flash-Next, which is slower per token at every
+  length. The 231 tok/s floor is what `queue_timeout` is now derived from
+  (decisions/serving.md).
+- **Peak footprint quadrupled on the 35B**, 12.0 to 50.5 GB, on weights of 20.4 GB and a
+  KV cache of 2.6 GB at 131072 — so ~28 GB of the peak was neither. It was the prefill
+  mask, and building it on the device fixed it: the same 131072 run now peaks at a flat
+  **17 GB against 42-69 GB** on the host path, measured in the same binary with
+  `XWEN_HOST_MASK=1` as the control arm. Flash-Next does not move (59 GB either way)
+  because its QSA indexer builds its own host mask per sparse layer per chunk, which is
+  what the remaining 42 GB there is. See
+  [the long-context envelope record](records/long-context-envelope.md).
+
+The prefill-mask A/B itself, one repetition per arm on the working-tree build, both arms
+in the same binary:
+
+| Checkpoint, 131072 tokens | Prefill tok/s | Decode tok/s | Peak footprint |
+| --- | --- | --- | --- |
+| 35B-A3B, host fill | 667.8 | 37.0 | 42 GB |
+| 35B-A3B, device build | 659.2 | 36.6 | 17 GB |
+| Flash-Next, host fill | 230.8 | 41.9 | 59 GB |
+| Flash-Next, device build | 230.9 | 42.1 | 59 GB |
+
+A dead heat on time on both checkpoints. Do not quote the device mask as a throughput
+win; it is a memory win on the dense-attention path and nothing else.
 
 ## Ceilings
 

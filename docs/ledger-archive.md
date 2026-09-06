@@ -164,6 +164,17 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
 
 ## Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29)
 
+[Sub-item (c) of the open item «The DFlash drafter's per-token cache sync, its unre-derived draft-ctx horizon, and the deferred ring-buffer cache» shipped 2026-09-06, moved verbatim. Its open remainder — (b), the per-token cache sync — stays in TODO.md under "Drafting".]
+
+   - **(c) `DEFAULT_DRAFT_CTX` (8192) was NOT re-derived and its inherited rationale
+     is now half wrong.** Laguna's argument was O(depth) drafter forwards plus
+     collapsing proposal quality with depth. The O(depth) half no longer holds: every
+     sidecar layer but the last is windowed (2048 on the 27B, 4096 on the 35B) and
+     `attention` narrows the cache to the window, so only one layer of five or six
+     grows with the context. The memory argument stands (40 KiB/token on the 27B,
+     48 on the 35B, imaged per cache slot). Re-derive by measuring drafter cost and
+     acceptance at 4k/8k/16k/32k on the Qwen sidecars before changing it.
+
 1. **Mechanical fork — DONE 2026-07-28.** cp-based copy of ../laguna, maxuna→xwen
    rename, MAXUNA_*→XWEN_* env prefix, Qwen tokenizer/chat-template/configs vendored
    into reference/, dflash KEPT (reversal — see log 2026-07-28). Gate passed:
@@ -611,6 +622,18 @@ serve batch + multi-checkpoint arc (2026-08-11)" below.
   Convention question like the top-p one was — llama.cpp and HF disagree with
   each other here, so there is no single ground truth to defer to. Needs a
   decision, not a patch.
+  From: Deferred from the sampler-tail pass (2026-07-28).
+
+[Item shipped 2026-09-06 with the presence-penalty arc (log.md "2026-09-06 — Presence penalty: the cards' recipe, through the speculative verify, on by default"): top_k 0 is no cut, 1 is greedy. Moved verbatim.]
+
+- [ ] [unpriced] **`top_k = 0` means greedy here, "top-k disabled" in llama.cpp.** The sampler
+  maps every `top_k <= 1` to argmax, where llama.cpp treats `k <= 0` as a no-op
+  filter (the whole vocabulary stays eligible). Pre-existing, harmless at the
+  default of 20, but the serve layers forward client-supplied values verbatim, so
+  a llama.cpp-reared client sending `top_k: 0` gets deterministic output instead
+  of unrestricted sampling. Surfaced by outside-model review 2026-07-29. A
+  semantics decision, like the temperature-order one settled on 2026-09-06 (decisions.md
+  "Thinking budget and sampling controls"), not a bug fix.
   From: Deferred from the sampler-tail pass (2026-07-28).
 
 ## Deferred from the dense-FFN prefill gemm pass (2026-07-29, P8c)
@@ -1117,6 +1140,13 @@ deliberately did not carry.
   sizes distinctly (chat-tok phase).
   From: Deferred from the fork bootstrap (2026-07-28).
 
+[Item shipped 2026-09-06, moved verbatim.]
+
+- [ ] [small] **`glance` the copied scripts/ for maxuna-isms** beyond the mechanical rename
+  (bench prompt fixtures, hardcoded model names, parity-gate assumptions). Still unswept:
+  `classify.ts`, and `tests/fixtures/bench-prompts` (never opened).
+  From: Deferred from the fork bootstrap (2026-07-28).
+
 ## Deferred from the serve batch + multi-checkpoint arc (2026-08-11)
 
 - [x] **The batch route inherits axum's default request-body limit (~2 MB) — DONE
@@ -1139,6 +1169,16 @@ deliberately did not carry.
 
 `/xwen/v1/batch` and per-request checkpoint selection shipped (log.md 2026-08-11,
 decisions.md "Serving"). These are the pieces deliberately not carried.
+
+[Item shipped 2026-09-06, moved verbatim.]
+
+- [ ] [small] **Neither `/health` nor the TUI says which checkpoint is loaded.** `/health`
+  reports `model_loaded` as a bare bool and the TUI vitals were built around one model
+  id for the process lifetime. Post-swap, both are truthful but incomplete: nothing
+  outside the log line says the resident model changed. Cheap: a `model` field on
+  `/health` from a shared `AtomicU8`-style cell the engine stamps at load, and a vitals
+  line. Do it with the first operational confusion, or sooner if the TUI gets touched.
+  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
 
 ## Deferred from the Qwen3.8-27B + API-naming arc (2026-08-14)
 
@@ -1318,6 +1358,34 @@ and C deliberately did not carry.
 The chat template became a per-checkpoint dialect and sampling defaults went mode-keyed
 (log.md 2026-08-19; commits a2e02d0/205d9ba). These are the pieces deliberately not
 carried.
+
+[Item shipped 2026-09-06 (log.md "2026-09-06 — Presence penalty: the cards' recipe, through the speculative verify, on by default"), moved verbatim.]
+
+- [ ] [unpriced] **The cards' recommended penalties (presence_penalty 1.5) are not implemented, and
+  the reason is the speculative verify path, not laziness.** The official model cards
+  recommend `presence_penalty` 1.5 for instruct (non-thinking) mode on ALL THREE
+  checkpoints, and ALSO for thinking mode on the 35B-A3B alone — the 27B and 3.8-27B
+  thinking recommendations say 0.0. Sources: HF README.md of Qwen/Qwen3.6-27B (~lines
+  633-639), Qwen/Qwen3.6-35B-A3B (~661-667), Qwen/Qwen3.8-27B (~250-255);
+  generation_config.json carries NO penalty keys, so anyone reading only the config
+  files misses this entirely. Not implemented because (1) the sampler has no penalty
+  machinery at all (`repetition_penalty` and `min_p` are likewise absent), and (2) a
+  penalty makes the target distribution history-dependent, which entangles speculative
+  decoding: the batched verify forward (`forward_all_logits`) scores every draft
+  position in one pass, and each position's distribution would need the penalty applied
+  over ITS history prefix — per-position penalty state, on both the drafted and the
+  plain arm, or `--draft` and `--no-draft` sample from different distributions and the
+  spec-equivalence gate is broken by design. llama.cpp does carry penalties through its
+  verify, so there is a reference when this is taken; it is sampler + verify + gate work
+  as one unit. Until then the OpenAI dialect accepts and DROPS
+  `presence_penalty`/`repetition_penalty`/`min_p` (decisions.md "Serving" for why
+  dropping sampling params is acceptable where dropping template kwargs is not), and the
+  35B-A3B's thinking-mode sampling is the one place the shipped defaults knowingly
+  deviate from the full card recipe. Related but separate: the 3.6 pair's cards list a
+  third "thinking, precise coding" set (temp 0.6 / top_p 0.95 / top_k 20) — not
+  auto-selectable (nothing in a request says "coding"), achievable as an explicit
+  `--temp 0.6`, recorded here so nobody rediscovers it as a gap.
+  From: Deferred from the chat-dialect and sampling-defaults arc (2026-08-19).
 
 ## Deferred from the qwen4exp cache-image arc (2026-08-30, P4)
 
@@ -1572,7 +1640,24 @@ its up shape needs a new geometry and its down shape remains unqualified (item (
 
 ## Deferred from the DeltaNet-kernel hardening pass (2026-07-29)
 
-[Nothing closed here yet; the heading exists because TODO.md items name it in their From: line.]
+[Section prose: the heading exists because TODO.md items name it in their `From:` line.
+The first item closed under it is the `mtl_size!` one below, on 2026-09-06.]
+
+[Item shipped 2026-09-06, moved verbatim.]
+
+- [ ] [small] **The `mtl_size!` rationale in dispatch.rs is factually wrong.**
+  `src/ops/dispatch.rs:21-24` justifies the macro with "xwen does not depend on
+  objc2-metal directly, and a function cannot return the unnameable type" — but
+  `Cargo.toml:26-28` pins the objc2 crates as direct dependencies, `src/gguf.rs:141`
+  already named `objc2_metal::MTLDevice`, and `check_delta_simd_width` now names
+  `objc2_metal::MTLComputePipelineState` in that same file. `objc2_metal::MTLSize` is
+  therefore nameable and the macro may be unnecessary. Left alone rather than
+  rewritten: correcting the stated reason means either inventing a rationale nobody
+  has verified or reworking the grid helpers, and neither belongs in a pass whose
+  contract was that no computed value moves. Decide whether the macro earns its keep
+  (candle's `get_block_dims` round-trip vs a plain struct literal) and rewrite or
+  delete the comment to match.
+  From: Deferred from the DeltaNet-kernel hardening pass (2026-07-29).
 
 ## Deferred from the client-feedback arc (2026-08-11)
 
@@ -1581,6 +1666,30 @@ its up shape needs a new geometry and its down shape remains unqualified (item (
 The escape fix, `shared_prefix`, the 100 MB body cap and lazy KV / the 131072 CLI
 default shipped (log.md 2026-08-11 client-feedback entry; decisions.md "Batch",
 "Serving", "Defaults and CLI surface"). What the arc deliberately did not do:
+
+[Item shipped 2026-09-06, moved verbatim. The envelope is measured (docs/perf-state.md "Long context"), (a)-(e) all landed, and what it opened instead lives in the long-context envelope arc's own heading below.]
+
+- [ ] [unpriced] **The 128k operational envelope is unmeasured, and four constants were sized at
+  8192.** Every perf figure in CLAUDE.md is at max_ctx 8192; raising the default makes
+  long contexts REACHABLE, not characterized. Known pressure points, none touched by
+  the lazy-KV change itself: (a) the prefill mask is sized by absolute position, not
+  max_ctx — `PrefillMask::from_host` materializes `[1, n_head, seq, pos+seq]` f16 per
+  512-token chunk, ~3.0 GiB transient at position 128k on the 27B (2.0 on the 35B)
+  plus an f32 host Vec filled by a scalar double loop (~8.6e9 stores over a full 128k
+  prefill) — this, not KV, is the binding cost of long prefill; (b)
+  `DEFAULT_QUEUE_TIMEOUT_SECS` = 300 while a 128k 27B prefill is 187-295 s at the
+  measured 445-702 tok/s, so one long prefill can push a queued request into the
+  saturation drop; (c) `DISK_FLUSH_GRACE` = 25 s was sized on a ~4.2 GiB / ~5 s page-out
+  image, while a 128k 27B conversation images at ~8 GiB; (d) the drafter's
+  `draft_ctx` = 8192 horizon means speculation covers the first 6% of a 131072
+  conversation and goes plain past it with no log line — the shipped drafted tok/s
+  figures describe conversations inside that window only; (e) only the serve path
+  clamps `context_length` to the checkpoint's `n_ctx_train`
+  (`resolve_context_length`) — the CLI's `--max-ctx` never consults it, harmless for
+  the 262144-window blessed files but silently past-window for a checkpoint converted
+  smaller. Measure a real long-context workload before trusting (a)-(d); none matters
+  at yesterday's 8192.
+  From: Deferred from the client-feedback arc (2026-08-11).
 
 ## Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream)
 
@@ -2137,6 +2246,34 @@ blocks use of the feature; item (a) is the one with a known trigger.
   tokens" is a question this history could answer. If it lands it wants its own field
   and its own `--by agent`, never a fallback inside `session_key`.
   From: Deferred from the metrics arc (2026-09-05).
+
+[Item shipped 2026-09-06, moved verbatim.]
+
+- [ ] [small] **The serve TUI does not show a job's model, though `JobRecord` now carries it.**
+  The metrics work added `model` to the job record so a served run could name its
+  checkpoint; the dashboard's job rows still do not display it. On a single-checkpoint
+  server that is nothing, and on a server that lazy-swaps between checkpoints it is the
+  one field that explains a row's rate. Cheap: a column in the job table, the field is
+  already there.
+  From: Deferred from the metrics arc (2026-09-05).
+
+[Item shipped 2026-09-06, moved verbatim.]
+
+- [ ] [small] **The bench and parity scripts record into the same file and skew usage stats.**
+  `scripts/*.ts` drive `generate`, `chat` and serve through the same surfaces everyone
+  else uses, so a sweep's several hundred runs land in the history beside real use, and
+  a `--by day` table taken after a retune reads as a day of heavy inference that nobody
+  did. Recording them was the deliberate default (decisions.md: silent exclusion is the
+  harder mistake to notice), so the fix is one of two shapes and neither is decided:
+  the scripts export `XWEN_METRICS_FILE=off`, which loses the data; or records grow a
+  tag field the scripts set and `xwen stats` filters on, which keeps it and costs a
+  schema field plus a default filter decision. `--surface` and `--since` carve a bench
+  session out by hand today.
+  From: Deferred from the metrics arc (2026-09-05).
+
+## Deferred from the presence-penalty arc (2026-09-06)
+
+[Nothing closed here yet; the heading exists because TODO.md items name it in their From: line.]
 
 ## Retired: Prefill performance
 
@@ -2772,3 +2909,7 @@ blocks use of the feature; item (a) is the one with a known trigger.
   the embedded 3.6 tokenizer does not carry — harmless for text, unhandled.
   From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
   Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
+
+## Deferred from the long-context envelope arc (2026-09-06)
+
+[Opened 2026-09-06 by the arc recorded in docs/records/long-context-envelope.md. Nothing closed here yet; the heading exists so this arc's items have somewhere to land.]

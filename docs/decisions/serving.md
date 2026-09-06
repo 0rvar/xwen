@@ -321,3 +321,35 @@ status on the wire and (b) dropping the snapshot instead of hydrating it are bot
 affordable, and both were declined for the same reason — nobody has measured how often
 real traffic hydrates plane-less slots, so neither the reporting cost nor the re-prefill
 cost can be weighed against anything. Reopen when that measurement exists.
+
+**Two operational constants that were sized at 8192 now follow from what the machine
+measures (2026-09-06).** Both were flat numbers whose stated rationale no longer held
+once the long-context envelope was measured (perf-state.md, "Long context").
+
+`queue_timeout` is derived from `context_length`: two maximal prefills at the slowest
+prefill rate this machine has been measured at, rounded up to a whole minute, never
+below the 300 s floor the old flat default was. The floor rate is 200 tok/s, rounded
+down from the 230.8 the DEFAULT checkpoint reads at a 131072-token prompt — Flash-Next
+is the slow one here, where the 35B-A3B reads 668 — and rounded down because prefill
+cost per token keeps climbing past the length that was measured. At the default 262144
+that is 2640 s. The old 300 was not conservative, it was wrong in the dangerous
+direction: one 131072-token prefill on the default checkpoint is 567 s, so a request
+arriving behind a long prompt was dropped for saturation while the server was working
+normally. Two prefills rather than one because the case worth surviving is a queue, not
+a single arrival. Rounded UP rather than down, against the first instinct, because
+rounding a 1310 s pair down to five minutes lands back on 300. Naming `queue_timeout`
+explicitly still wins, the value is logged once at startup, and holding a queued
+streaming request costs almost nothing — the asymmetry that makes erring long correct.
+
+The disk tier's shutdown flush waits for the bytes it actually has queued rather than a
+fixed 25 s: `disk_flush_budget(pending)` is `pending / 700 MB/s`, floored at the old
+`DISK_FLUSH_GRACE`, which keeps its name as the floor. The 25 s was sized on ONE ~4.2
+GiB image at ~5 s (~860 MB/s); a 131072-token Flash-Next conversation images several
+times that, and a shutdown that also splits a stored segment queues more than one image
+at once. 700 MB/s is that same measurement rounded down; the write rate was NOT
+re-measured in this arc, so it is the weakest number here and the one to replace with a
+real page-out timing (the small-image line `113 MiB in 1229 ms` is fixed cost, not rate,
+which is exactly why the shape is a floor plus a rate rather than either alone). The
+wait stays bounded and its expiry stays reported rather than retried: an image that does
+not land costs the next server a re-prefill, while a shutdown that hangs costs the
+operator a `kill -9`.

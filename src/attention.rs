@@ -52,6 +52,51 @@ impl PrefillMask {
         Ok(Some(Self::from_host(host, n_head, device)?))
     }
 
+    /// The causal prefill mask built ON THE DEVICE, which is the shipped path.
+    ///
+    /// Values are identical to [`Self::build`] at [`MaskKind::Full`] — 0 where a
+    /// key is visible, `-inf` where it is strictly future, the same additive
+    /// `[seq, k_seq]` f32 plane, and the same `from_raw` derives the same f16
+    /// sdpa copy from it. The only difference is where the zeros and the
+    /// infinities get written.
+    ///
+    /// What that is worth: the host build fills `seq * (pos + seq)` f32 in a
+    /// scalar double loop and uploads the result, so both its store count and
+    /// its upload grow with absolute position. Over a full 131072-token prefill
+    /// that is ~8.6e9 host stores and ~34 GiB uploaded, all of it to say
+    /// `k > q`. Here the host writes only the two `arange` vectors — `k_seq` and
+    /// `seq` elements, three orders of magnitude smaller — and the compare
+    /// happens where the mask is consumed.
+    ///
+    /// The two constant planes are stride-0 broadcast views of a single element.
+    /// candle's Metal `where_cond` takes both operands' strides and dispatches
+    /// the strided kernel, so neither costs `seq * k_seq` bytes; only the u8
+    /// predicate, the f32 result and the f16 copy are real allocations.
+    ///
+    /// `arange` is f32 rather than an integer dtype because f32 represents every
+    /// integer exactly to 2^24 and the largest position this can see is the
+    /// 262144 the checkpoints were converted with.
+    pub fn causal_on_device(
+        n_head: usize,
+        seq: usize,
+        pos: usize,
+        device: &Device,
+    ) -> Result<Option<Self>> {
+        // seq == 1 is a decode step, which builds no mask on either path.
+        if seq == 1 {
+            return Ok(None);
+        }
+        let k_seq = pos + seq;
+        let keys = Tensor::arange(0f32, k_seq as f32, device)?.reshape((1, k_seq))?;
+        let queries = Tensor::arange(pos as f32, (pos + seq) as f32, device)?.reshape((seq, 1))?;
+        // The host loop's predicate exactly: a key is masked iff `kj > q_abs`.
+        let blocked = keys.broadcast_gt(&queries)?;
+        let neg = Tensor::full(f32::NEG_INFINITY, (1, 1), device)?.broadcast_as((seq, k_seq))?;
+        let zero = Tensor::zeros((1, 1), DType::F32, device)?.broadcast_as((seq, k_seq))?;
+        let raw = blocked.where_cond(&neg, &zero)?;
+        Ok(Some(Self::from_raw(raw, n_head)?))
+    }
+
     /// The device half of `build`: upload an already-filled host mask and
     /// materialize the sdpa copy. Split from the CPU fill so a caller can time
     /// the two separately; the tensors are identical either way.
@@ -711,6 +756,69 @@ mod tests {
 
     fn dense(rows: usize, cols: usize, seed: u64, dev: &Device) -> Tensor {
         Tensor::from_vec(seeded(rows * cols, seed), (rows, cols), dev).unwrap()
+    }
+
+    /// The device-built causal mask is the host fill's values, bit for bit, at
+    /// every shape the prefill walk produces: the first chunk (pos 0), a chunk
+    /// deep into a conversation, a ragged last chunk, and the two-token edge.
+    ///
+    /// This is the whole safety argument for building the mask on the device.
+    /// Nothing downstream would fail loudly on a mask that is subtly wrong —
+    /// attention would just attend to the wrong keys and the model would read as
+    /// slightly worse — so the two paths are pinned to each other here, on the
+    /// real target device when there is one.
+    #[test]
+    fn the_device_built_causal_mask_equals_the_host_fill() {
+        let dev = Device::new_metal(0).unwrap_or(Device::Cpu);
+        let n_head = 3;
+        for (seq, pos) in [
+            (2usize, 0usize),
+            (8, 0),
+            (8, 5),
+            (7, 129),
+            (64, 4096),
+            (3, 1),
+        ] {
+            let host = PrefillMask::build(MaskKind::Full, n_head, seq, pos, &dev)
+                .unwrap()
+                .expect("a multi-token chunk always has a mask");
+            let device = PrefillMask::causal_on_device(n_head, seq, pos, &dev)
+                .unwrap()
+                .expect("a multi-token chunk always has a mask");
+            for (what, a, b) in [
+                ("raw", &host.raw, &device.raw),
+                // The sdpa copy is a stride-0 broadcast over the head axis on
+                // both paths, so comparing it also asserts the shapes agree.
+                ("sdpa", &host.sdpa, &device.sdpa),
+            ] {
+                assert_eq!(a.dims(), b.dims(), "{what} shape at seq {seq} pos {pos}");
+                assert_eq!(a.dtype(), b.dtype(), "{what} dtype at seq {seq} pos {pos}");
+                // Contiguous first: `sdpa` is a stride-0 view over the heads.
+                let a = a.contiguous().unwrap().flatten_all().unwrap();
+                let b = b.contiguous().unwrap().flatten_all().unwrap();
+                let a = a.to_dtype(DType::F32).unwrap();
+                let b = b.to_dtype(DType::F32).unwrap();
+                let (a, b) = (a.to_vec1::<f32>().unwrap(), b.to_vec1::<f32>().unwrap());
+                // -inf == -inf is true, and every other value is an exact 0.
+                assert_eq!(a, b, "{what} values at seq {seq} pos {pos}");
+            }
+        }
+    }
+
+    /// A single decode token has no mask on either path.
+    #[test]
+    fn neither_mask_path_builds_anything_for_one_token() {
+        let dev = Device::Cpu;
+        assert!(
+            PrefillMask::build(MaskKind::Full, 4, 1, 100, &dev)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            PrefillMask::causal_on_device(4, 1, 100, &dev)
+                .unwrap()
+                .is_none()
+        );
     }
 
     struct RawWeights {

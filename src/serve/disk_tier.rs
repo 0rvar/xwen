@@ -437,6 +437,16 @@ struct WriteRequest {
     drafter: Option<Arc<DrafterImage>>,
 }
 
+impl WriteRequest {
+    /// Host bytes this write carries. The three images each know their own size;
+    /// the token history is small enough beside them to leave out.
+    fn byte_len(&self) -> u64 {
+        let snapshots: usize = self.snapshots.iter().map(|(_, s)| s.byte_len()).sum();
+        let drafter = self.drafter.as_ref().map_or(0, |d| d.byte_len());
+        (self.full_kv.byte_len() + snapshots + drafter) as u64
+    }
+}
+
 /// The disk tier as the engine holds it. Absent (`DiskCache::open` returning
 /// `None`) means the tier is off, which every call site treats as "there is
 /// nothing on disk" rather than as an error.
@@ -1114,6 +1124,20 @@ impl DiskCache {
             );
         }
         let _ = self.tx.send(Message::Wake);
+    }
+
+    /// Host bytes the writer still has queued. The caller turns this into the
+    /// wait it will allow (`disk_flush_budget`), because how long a flush should
+    /// be given is a property of how much is in it: the fixed grace this
+    /// replaced was sized on a single ~4.2 GiB image and a long conversation is
+    /// several of those.
+    pub(super) fn pending_bytes(&self) -> u64 {
+        self.shared
+            .store()
+            .pending
+            .values()
+            .map(WriteRequest::byte_len)
+            .sum()
     }
 
     /// Wait up to `budget` for the queued writes to land. Called on the way down —

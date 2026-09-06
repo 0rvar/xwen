@@ -482,6 +482,23 @@ pub fn chunk_sync() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_CHUNK_SYNC").is_some())
 }
 
+/// `XWEN_HOST_MASK` restores the HOST-built causal prefill mask: the scalar
+/// double loop over `seq x (pos + seq)` plus an upload, which the device build
+/// (`PrefillMask::causal_on_device`) replaced because both halves grow with
+/// absolute position and neither computes anything but `k > q`.
+///
+/// It is kept for two jobs. It is the control arm the Flash-Next replay check
+/// runs against (`bun scripts/flashnext-replay.ts --control XWEN_HOST_MASK=1`),
+/// the two paths being required to produce identical masks. And it is what any
+/// non-Metal device takes, so the fallback is exercised rather than assumed.
+///
+/// PRESENCE-BASED and cached (read once), like the sibling switches
+/// (`stack_profile`, `chunk_sync`): any value enables it.
+pub fn host_mask() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_HOST_MASK").is_some())
+}
+
 /// `XWEN_PREFILL_CHUNK=<usize>` overrides the prefill chunk — how many prompt
 /// tokens every prefill path (`generate`/`chat`/`batch`, serve, the ppl pass)
 /// feeds the model per forward. The default is per architecture

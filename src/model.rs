@@ -24,6 +24,29 @@ use crate::stack_profile::Stage;
 /// fires only on a `--max-ctx` far past anything the checkpoints support.
 const MEMORY_WARN_BYTES: u64 = 90 * 1024 * 1024 * 1024;
 
+/// The context ceiling a load will honour: what the caller asked for, capped at
+/// what the checkpoint was converted with. Going past the trained context needs
+/// a rope override at load, which nothing here does, so a larger request is
+/// trimmed rather than honoured into gibberish.
+///
+/// `serve` has always done this in `resolve_context_length`, which additionally
+/// reports the clamp through the server log; the one-shot surfaces never did,
+/// and their `--max-ctx` default is a number a converted-smaller checkpoint can
+/// be well below. So the rule lives HERE, at the one place every surface passes
+/// through, and serve's own resolve runs first and makes this a no-op there —
+/// which is why a served clamp is still reported once, through `ServeLog`.
+fn clamp_context_length(requested: usize, trained: usize) -> Result<usize> {
+    anyhow::ensure!(requested > 0, "--max-ctx must be at least 1");
+    if requested <= trained {
+        return Ok(requested);
+    }
+    eprintln!(
+        "xwen: --max-ctx {requested} is past this checkpoint's trained context \
+         {trained}; running at {trained}",
+    );
+    Ok(trained)
+}
+
 /// Initial full-attention KV allocation, in positions. `max_ctx` is a CEILING,
 /// not an allocation: each full-attention layer starts at this many slots
 /// (or `max_ctx`, if smaller) and doubles on demand as a sequence grows into
@@ -201,6 +224,7 @@ impl XwenModel {
     pub fn load(gguf: Arc<GgufFile>, runner: ExpertRunner, max_ctx: usize) -> Result<Self> {
         let cfg = XwenConfig::from_gguf(&gguf.content)?;
         Self::check_arch(&cfg)?;
+        let max_ctx = clamp_context_length(max_ctx, cfg.n_ctx_train)?;
         let device = gguf.device.clone();
         let w = Weights::from_gguf(gguf.clone());
 
@@ -594,15 +618,39 @@ impl XwenModel {
         Ok((normed, taps, spec_captured))
     }
 
-    /// Build the hoisted prefill mask, splitting the CPU fill from the upload so
-    /// the profiler can charge them to separate stages. The tensors are what
-    /// `PrefillMask::build` produces either way.
+    /// Build the hoisted prefill mask.
+    ///
+    /// The device build is the shipped path and the host fill is the control arm
+    /// behind `XWEN_HOST_MASK` (`ops::host_mask`), which a non-Metal device also
+    /// takes — candle's other backends run the same tensor ops, but the point of
+    /// the device build is that the compare lands on the GPU, and off Metal the
+    /// host loop is the honest thing to do. Both produce the same tensors.
+    ///
+    /// Under the profiler the host arm still splits the CPU fill from the upload
+    /// so the two get separate stages. The device build has no host half, so it
+    /// is charged whole to `MaskUploadAndBroadcast` and `MaskFillHost` reads
+    /// zero — which is the shape of the change, and keeps the `mask_upload`
+    /// bucket name that earlier records quote.
     pub(crate) fn build_prefill_mask(
         &mut self,
         n_head: usize,
         seq: usize,
         pos: usize,
     ) -> Result<Option<PrefillMask>> {
+        let host_build = crate::ops::host_mask() || !matches!(self.device, Device::Metal(_));
+        if !host_build {
+            if self.profile.is_none() {
+                return PrefillMask::causal_on_device(n_head, seq, pos, &self.device);
+            }
+            crate::stack_profile::stage_begin(&mut self.profile, &self.device)?;
+            let mask = PrefillMask::causal_on_device(n_head, seq, pos, &self.device)?;
+            crate::stack_profile::stage_end(
+                &mut self.profile,
+                &self.device,
+                Stage::MaskUploadAndBroadcast,
+            )?;
+            return Ok(mask);
+        }
         if self.profile.is_none() {
             return PrefillMask::build(MaskKind::Full, n_head, seq, pos, &self.device);
         }
@@ -1285,6 +1333,22 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_c
 mod tests {
     use super::*;
     use crate::config::RopeKind;
+
+    /// Every surface's context ceiling is trimmed to what the file was converted
+    /// with. `serve` has always done this in its own `resolve_context_length`;
+    /// the one-shot surfaces default `--max-ctx` to 131072 and used to hand that
+    /// straight to a rope table built for whatever the checkpoint says, which is
+    /// silently past-window on a checkpoint converted smaller.
+    #[test]
+    fn the_context_ceiling_is_trimmed_to_the_trained_context() {
+        assert_eq!(clamp_context_length(4096, 262144).unwrap(), 4096);
+        assert_eq!(clamp_context_length(262144, 262144).unwrap(), 262144);
+        // A blessed 262144-window file leaves the CLI default untouched.
+        assert_eq!(clamp_context_length(131072, 262144).unwrap(), 131072);
+        // A checkpoint converted to 32768 gets 32768, not the flag's 131072.
+        assert_eq!(clamp_context_length(131072, 32768).unwrap(), 32768);
+        assert!(clamp_context_length(0, 262144).is_err());
+    }
 
     /// A qwen4exp file with no `qwen4exp.*` metadata is refused up front:
     /// `load` runs `check_arch` on the parsed config before the rope table and

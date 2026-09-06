@@ -49,16 +49,16 @@ checkpoints is no longer "launches x 4 us": that price holds only for launches u
 reading after the probe priced its projection at zero; the audit in the Front's first
 entry is what would find the rest) and the syncs plus the serial scan.]
 
-1. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
-2. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
-3. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
-4. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
-5. **Above the 2048 indexer budget: +165 dispatches** (Decode performance, measured): 0.66 ms of dispatch cost plus 0.24 ms of QSA score tail, at every context past 2048 tokens; that 0.90 ms works out to ~+4% of a 18.9 ms token, a figure derived here and not stated in the item
-6. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
-7. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line earlier** (Decode performance, measured): +0.3 ms/token, +1.4%, no math change and no new kernel
-8. **GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger** (Decode performance, measured): the three-projection merge is -72 dispatches, about +1.4%
-9. **serve at 32k decodes 4-7% under `generate` and the cause is unconfirmed** (Serve, batch and CLI, measured): 4-7% of serve decode on the default checkpoint, settled or refuted by three arms of one prompt
-10. **GDN prefill (`mixer_delta`, ranked 2nd at 20% by the profiler, unpriced)** (Prefill performance, measured): the GDN kernels are 0.23 s (6.7%) of prefill wall and the scan alone 0.16 s (4.6%); the MoE glue this item ranks under is 0.40 s (11.5%) and ranks above it
+1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
+2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
+3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
+4. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
+5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
+6. **Above the 2048 indexer budget: +165 dispatches** (Decode performance, measured): 0.66 ms of dispatch cost plus 0.24 ms of QSA score tail, at every context past 2048 tokens; that 0.90 ms works out to ~+4% of a 18.9 ms token, a figure derived here and not stated in the item
+7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
+8. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line earlier** (Decode performance, measured): +0.3 ms/token, +1.4%, no math change and no new kernel
+9. **GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger** (Decode performance, measured): the three-projection merge is -72 dispatches, about +1.4%
+10. **serve at 32k decodes 4-7% under `generate` and the cause is unconfirmed** (Serve, batch and CLI, measured): 4-7% of serve decode on the default checkpoint, settled or refuted by three arms of one prompt
 
 ## Decode performance
 
@@ -359,16 +359,11 @@ entry is what would find the rest) and the syncs plus the serial scan.]
      than pause once it has enough evidence, since a paused drafter still pays this.
      Fixing either would cut what a paused drafter still pays; the flip to opt-out has
      since happened on its own, in P9a.
-   - **(c) `DEFAULT_DRAFT_CTX` (8192) was NOT re-derived and its inherited rationale
-     is now half wrong.** Laguna's argument was O(depth) drafter forwards plus
-     collapsing proposal quality with depth. The O(depth) half no longer holds: every
-     sidecar layer but the last is windowed (2048 on the 27B, 4096 on the 35B) and
-     `attention` narrows the cache to the window, so only one layer of five or six
-     grows with the context. The memory argument stands (40 KiB/token on the 27B,
-     48 on the 35B, imaged per cache slot). Re-derive by measuring drafter cost and
-     acceptance at 4k/8k/16k/32k on the Qwen sidecars before changing it.
-   (e) retired 2026-09-06 (docs/ledger-archive.md "Retired: Drafting"); (c) stays open
-   here and is taken with the 128k envelope item in "Cache images, memory and context".
+   (e) retired 2026-09-06 (docs/ledger-archive.md "Retired: Drafting"); (c) shipped
+   2026-09-06 with the long-context envelope arc and moved verbatim to the archive under
+   this item's own heading — `DEFAULT_DRAFT_CTX` stays 8192, and the re-derivation found
+   drafting reading BELOW plain at every length rather than a better horizon
+   ([record](docs/records/long-context-envelope.md)). (b) is what stays open here.
   From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
 
 - [ ] [measured] **The auto-pause controller costs 3-6% on a checkpoint it never pauses, and the
@@ -444,15 +439,28 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   gate.
   From: Deferred from the qwen4exp cache-image arc (2026-08-30, P4).
 
-## Serve, batch and CLI
+- [ ] [measured] **Drafting reads below plain on the 35B-A3B after the router gemv.** The
+  2026-09-06 presence-penalty A/B (code prompt, 256 tokens, 3 interleaved reps, pinned
+  build) read drafted 121.1 tok/s against plain 126.5 at penalty 0, and 119.6 against
+  126.9 at the shipped 1.5, acceptance 63.0% / 59.4%. The drafted 35B figures in
+  docs/perf-state.md were fitted against the pre-fold plain level and never re-swept;
+  plain gained +10.3% on 2026-09-06 and the drafted arm on this prompt no longer clears
+  it. **2026-09-06, second workload: the loss deepens with context.** The long-context
+  arc measured the same direction on long-document prose with a forced thinking decode —
+  drafted against plain, medians of 2: 111.9 vs 121.9 at 1046 tokens (80.6% acceptance),
+  85.3 vs 116.3 at 4117 (70.9%), 73.1 vs 104.2 at 8201 (58.5%), 62.8 vs 99.1 at 16409
+  (57.4%). So it is -8% even at short context and inside the acceptance band the fits
+  were made at, and -37% by 16k. Two independent workloads now agree, which removes the
+  "one prompt" caveat; what is added is that a retune looking only at short prompts will
+  not see half of it, and that `DEFAULT_DRAFT_CTX` = 8192 is currently LIMITING this loss
+  rather than costing anything (docs/records/long-context-envelope.md). First step is
+  still the standing retune (`bun scripts/retune-draft.ts`) on the 35B, now at more than
+  one context length, which either refits `p_min`/depth or shows drafting should default
+  off on this checkpoint.
+  [Record](docs/records/presence-penalty.md).
+  From: Deferred from the presence-penalty arc (2026-09-06).
 
-- [ ] [small] **Neither `/health` nor the TUI says which checkpoint is loaded.** `/health`
-  reports `model_loaded` as a bare bool and the TUI vitals were built around one model
-  id for the process lifetime. Post-swap, both are truthful but incomplete: nothing
-  outside the log line says the resident model changed. Cheap: a `model` field on
-  `/health` from a shared `AtomicU8`-style cell the engine stamps at load, and a vitals
-  line. Do it with the first operational confusion, or sooner if the TUI gets touched.
-  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
+## Serve, batch and CLI
 
 - [ ] [measured] **serve at 32k decodes 4-7% under `generate` and the cause is unconfirmed — run a
   `--ctx 8192` / `--ctx 65536` serve arm to test the state-allocation hypothesis.** At
@@ -479,18 +487,6 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   minutes with the GPU free; do it before trusting any number the history reports.
   From: Deferred from the metrics arc (2026-09-05).
 
-- [ ] [small] **The bench and parity scripts record into the same file and skew usage stats.**
-  `scripts/*.ts` drive `generate`, `chat` and serve through the same surfaces everyone
-  else uses, so a sweep's several hundred runs land in the history beside real use, and
-  a `--by day` table taken after a retune reads as a day of heavy inference that nobody
-  did. Recording them was the deliberate default (decisions.md: silent exclusion is the
-  harder mistake to notice), so the fix is one of two shapes and neither is decided:
-  the scripts export `XWEN_METRICS_FILE=off`, which loses the data; or records grow a
-  tag field the scripts set and `xwen stats` filters on, which keeps it and costs a
-  schema field plus a default filter decision. `--surface` and `--since` carve a bench
-  session out by hand today.
-  From: Deferred from the metrics arc (2026-09-05).
-
 - [ ] [small] **Whether the header's session id equals the transcript id `claude --resume` shows
   is unconfirmed.** `x-claude-code-session-id` is documented as a per-session identifier
   and is what `--by session` keys on, which works regardless. What is not established is
@@ -499,14 +495,6 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   if it is not, nobody should assume it. Settle it by capturing one request's header
   next to the session id that `claude --resume` lists for the same conversation. Until
   then no doc claims the two are the same (README says so explicitly).
-  From: Deferred from the metrics arc (2026-09-05).
-
-- [ ] [small] **The serve TUI does not show a job's model, though `JobRecord` now carries it.**
-  The metrics work added `model` to the job record so a served run could name its
-  checkpoint; the dashboard's job rows still do not display it. On a single-checkpoint
-  server that is nothing, and on a server that lazy-swaps between checkpoints it is the
-  one field that explains a row's rate. Cheap: a column in the job table, the field is
-  already there.
   From: Deferred from the metrics arc (2026-09-05).
 
 ## Cache images, memory and context
@@ -526,27 +514,19 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   From: Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4).
   Promoted from the item «MoE FFN: 576 dispatches/token (30%)» on 2026-09-06; dated 2026-09-06 there.
 
-- [ ] [unpriced] **The 128k operational envelope is unmeasured, and four constants were sized at
-  8192.** Every perf figure in CLAUDE.md is at max_ctx 8192; raising the default makes
-  long contexts REACHABLE, not characterized. Known pressure points, none touched by
-  the lazy-KV change itself: (a) the prefill mask is sized by absolute position, not
-  max_ctx — `PrefillMask::from_host` materializes `[1, n_head, seq, pos+seq]` f16 per
-  512-token chunk, ~3.0 GiB transient at position 128k on the 27B (2.0 on the 35B)
-  plus an f32 host Vec filled by a scalar double loop (~8.6e9 stores over a full 128k
-  prefill) — this, not KV, is the binding cost of long prefill; (b)
-  `DEFAULT_QUEUE_TIMEOUT_SECS` = 300 while a 128k 27B prefill is 187-295 s at the
-  measured 445-702 tok/s, so one long prefill can push a queued request into the
-  saturation drop; (c) `DISK_FLUSH_GRACE` = 25 s was sized on a ~4.2 GiB / ~5 s page-out
-  image, while a 128k 27B conversation images at ~8 GiB; (d) the drafter's
-  `draft_ctx` = 8192 horizon means speculation covers the first 6% of a 131072
-  conversation and goes plain past it with no log line — the shipped drafted tok/s
-  figures describe conversations inside that window only; (e) only the serve path
-  clamps `context_length` to the checkpoint's `n_ctx_train`
-  (`resolve_context_length`) — the CLI's `--max-ctx` never consults it, harmless for
-  the 262144-window blessed files but silently past-window for a checkpoint converted
-  smaller. Measure a real long-context workload before trusting (a)-(d); none matters
-  at yesterday's 8192.
-  From: Deferred from the client-feedback arc (2026-08-11).
+- [ ] [measured] **The QSA indexer's host-built mask is 42 GB of Flash-Next's peak footprint at
+  131072.** **2026-09-06.** Moving the CAUSAL prefill mask to the device took the 35B's
+  131072 peak from 42-69 GB to a flat 17 GB, and moved Flash-Next's not at all (59 GB
+  either way): its indexer builds its own `n x n_kv` f32 mask on the host through
+  `Tensor::from_vec` (`qwen4exp/indexer.rs`, `select_with`), per sparse layer per chunk,
+  and above the 2048 budget that is every chunk — so no two allocations ask the pool for
+  the same size and none is recycled. The fix is the same shape that worked for the
+  causal one: build the -inf plane on the device and scatter zeros at the selected
+  columns, same values, behind a kill switch. Do NOT expect throughput from it — the
+  causal mask's own A/B was a dead heat on time on both checkpoints, because candle fills
+  the next chunk's mask while the GPU is still on this one. This is a memory item.
+  [Record](docs/records/long-context-envelope.md).
+  From: Deferred from the long-context envelope arc (2026-09-06).
 
 - [ ] [measured] **Three shrinks for Flash-Next's ~15 GB of private memory.**
   xwen dirties ~15 GB of private memory where llama-server dirties 751 MB on the same
@@ -631,20 +611,6 @@ entry is what would find the rest) and the syncs plus the serial scan.]
       them as a baseline for anything. See decisions.md "Measurement discipline".
   From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
 
-- [ ] [small] **The `mtl_size!` rationale in dispatch.rs is factually wrong.**
-  `src/ops/dispatch.rs:21-24` justifies the macro with "xwen does not depend on
-  objc2-metal directly, and a function cannot return the unnameable type" — but
-  `Cargo.toml:26-28` pins the objc2 crates as direct dependencies, `src/gguf.rs:141`
-  already named `objc2_metal::MTLDevice`, and `check_delta_simd_width` now names
-  `objc2_metal::MTLComputePipelineState` in that same file. `objc2_metal::MTLSize` is
-  therefore nameable and the macro may be unnecessary. Left alone rather than
-  rewritten: correcting the stated reason means either inventing a rationale nobody
-  has verified or reworking the grid helpers, and neither belongs in a pass whose
-  contract was that no computed value moves. Decide whether the macro earns its keep
-  (candle's `get_block_dims` round-trip vs a plain struct literal) and rewrite or
-  delete the comment to match.
-  From: Deferred from the DeltaNet-kernel hardening pass (2026-07-29).
-
 - [ ] [small] **Snapshot-replay-vs-scratch has no Track-B parity case.** The equivalence was
   exercised at ship time by hand (`XWEN_BATCH_NO_CACHE=1` as the A/B arm, same request
   both ways) and the finding is recorded — values identical except one genuine near-tie,
@@ -655,11 +621,6 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   make one near-tie likely. Until then a regression in the restore path would be caught
   only by someone running the demo.
   From: Deferred from the batch + scored-classification arc (2026-08-09).
-
-- [ ] [small] **`glance` the copied scripts/ for maxuna-isms** beyond the mechanical rename
-  (bench prompt fixtures, hardcoded model names, parity-gate assumptions). Still unswept:
-  `classify.ts`, and `tests/fixtures/bench-prompts` (never opened).
-  From: Deferred from the fork bootstrap (2026-07-28).
 
 - [ ] [small] **No parity-gate or retune arm for Qwen3.8-27B.** `scripts/parity-gate.ts` accepts
   `--model-size 3.8-27b` and would run it (nothing about the gate is 3.6-specific), but
@@ -774,42 +735,6 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   From: Deferred from the prefill-chunk pass (2026-08-30).
 
 ## Tokenizer, chat and sampling
-
-- [ ] [unpriced] **`top_k = 0` means greedy here, "top-k disabled" in llama.cpp.** The sampler
-  maps every `top_k <= 1` to argmax, where llama.cpp treats `k <= 0` as a no-op
-  filter (the whole vocabulary stays eligible). Pre-existing, harmless at the
-  default of 20, but the serve layers forward client-supplied values verbatim, so
-  a llama.cpp-reared client sending `top_k: 0` gets deterministic output instead
-  of unrestricted sampling. Surfaced by outside-model review 2026-07-29. A
-  semantics decision, like the temperature-order one settled on 2026-09-06 (decisions.md
-  "Thinking budget and sampling controls"), not a bug fix.
-  From: Deferred from the sampler-tail pass (2026-07-28).
-
-- [ ] [unpriced] **The cards' recommended penalties (presence_penalty 1.5) are not implemented, and
-  the reason is the speculative verify path, not laziness.** The official model cards
-  recommend `presence_penalty` 1.5 for instruct (non-thinking) mode on ALL THREE
-  checkpoints, and ALSO for thinking mode on the 35B-A3B alone — the 27B and 3.8-27B
-  thinking recommendations say 0.0. Sources: HF README.md of Qwen/Qwen3.6-27B (~lines
-  633-639), Qwen/Qwen3.6-35B-A3B (~661-667), Qwen/Qwen3.8-27B (~250-255);
-  generation_config.json carries NO penalty keys, so anyone reading only the config
-  files misses this entirely. Not implemented because (1) the sampler has no penalty
-  machinery at all (`repetition_penalty` and `min_p` are likewise absent), and (2) a
-  penalty makes the target distribution history-dependent, which entangles speculative
-  decoding: the batched verify forward (`forward_all_logits`) scores every draft
-  position in one pass, and each position's distribution would need the penalty applied
-  over ITS history prefix — per-position penalty state, on both the drafted and the
-  plain arm, or `--draft` and `--no-draft` sample from different distributions and the
-  spec-equivalence gate is broken by design. llama.cpp does carry penalties through its
-  verify, so there is a reference when this is taken; it is sampler + verify + gate work
-  as one unit. Until then the OpenAI dialect accepts and DROPS
-  `presence_penalty`/`repetition_penalty`/`min_p` (decisions.md "Serving" for why
-  dropping sampling params is acceptable where dropping template kwargs is not), and the
-  35B-A3B's thinking-mode sampling is the one place the shipped defaults knowingly
-  deviate from the full card recipe. Related but separate: the 3.6 pair's cards list a
-  third "thinking, precise coding" set (temp 0.6 / top_p 0.95 / top_k 20) — not
-  auto-selectable (nothing in a request says "coding"), achievable as an explicit
-  `--temp 0.6`, recorded here so nobody rediscovers it as a gap.
-  From: Deferred from the chat-dialect and sampling-defaults arc (2026-08-19).
 
 ## Research candidates
 

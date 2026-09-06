@@ -98,3 +98,28 @@ one `wait_until_completed`: candle's Metal pool frees the replaced buffers only 
 sync, and without one the whole pass holds old and new allocations side by side. Rope
 tables still build to max_ctx at load — 64 MB at 262144, not worth the machinery
 (2026-08-11).
+
+**`--max-ctx` is one constant and it is clamped to the file's trained context
+(2026-09-06).** `generate`, `chat` and `batch` each carried their own literal 131072 clap
+default with no mechanism keeping the three agreeing; they now share `DEFAULT_MAX_CTX`
+in the binary. The value did not move — it is the length the envelope has now been
+measured at (perf-state.md, "Long context") and it is deliberately below serve's own
+262144 default, because a one-shot run has no operator watching a dashboard.
+
+The clamp is the substantive half. `serve` has always trimmed its `context_length` to
+the checkpoint's `n_ctx_train` in `resolve_context_length`, and the one-shot surfaces
+never consulted it at all — harmless on the blessed 262144-window files, and silently
+past-window on a checkpoint someone converted smaller, where the rope table is built to
+a budget the weights were never trained for. The rule now lives in `XwenModel::load`,
+the one place every surface passes through, and says so on stderr when it bites. Serve's
+own resolve still runs first, so a served clamp is still reported once through
+`ServeLog::ContextClamped` rather than twice; a zero is refused on both paths.
+
+**The drafter's `draft_ctx` horizon says so when it is crossed (2026-09-06).** Past
+`draft_ctx` every round decodes plain, the taps are drained and dropped, and until now
+nothing said a word: `spec.rounds` kept climbing while `spec.draft_rounds` did not,
+which reads as a drafter that stopped helping rather than one that ran out of context.
+One line is emitted on the round where speculation goes dark, naming the flag that moves
+it. It is armed per crossing rather than per process — going live again clears it — so a
+conversation rewound back under the horizon says it again when it crosses again, and a
+long generation past the horizon says it once rather than tens of thousands of times.
