@@ -99,6 +99,19 @@ decode dispatch ≈ 4 µs (≈0.02% of a token), a removed sync ≈ 0.3 ms (≈1
 537-565 GB/s. Ceilings that may be quoted: decode 81-86 tok/s bytes-only at the
 measured rate (we run 47); prefill 2300-3000 tok/s gemm-only at 28-36 TFLOP/s (we run
 1129-1140 @3851).
+[Position 2026-09-06, after the fused shared expert and the router gemv (log.md entries of
+that date): **Flash-Next decode 52.9 tok/s at 596 tokens = 62-65% of the 81-86 bytes-only
+ceiling**; prefill unchanged at 1140 @3851 = ~45% of the ~2500 tok/s that the same 12.07
+GFLOP/token would take at the ~30 TFLOP/s the dense cooperative-tensor gemm reaches
+(a derived compute ceiling, not a measured one). **35B-A3B decode 127.0** against a
+bytes-only ceiling that is NOT in the docs: a back-of-envelope ~2.7 GB of active weights
+per token (8 Q4_K experts + Q8_0 shexp/attention/GDN planes + the Q6_K lm_head) at
+~550 GB/s is ~4.9 ms, ~200 tok/s, so ~62% as well; measuring that budget the way the
+Flash-Next one was measured (bytes per token summed from the tensor table, the streaming
+rate, then the residual) is an open item. The ~7 ms non-byte residual on both MoE
+checkpoints is no longer "launches x 4 us": that price holds only for launches under
+~2 MB on the dependent chain; the rest is occupancy losses (the router class, found by the
+audit in decode item 2(e)) and the syncs plus the serial scan.]
 
 **Decode (21.3 ms/token = 12.0 bytes + ~7.4 dispatch fixed cost + 0.9 syncs + 1.0 scan
 beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/dispatch).**
@@ -294,6 +307,13 @@ activation traffic estimated; GDN chunked scan, attention and glue ranked only).
    (scan 0.16), shared expert ~0; 38% unpriced. The bracket is settled at its upper
    half and the "minority" reading refuted (gemms 73% of `ffn`). The item that remains is
    the gemm efficiency work itself — the down plane is 44% of the expert time, not half.**
+   **Open sub-item (2026-09-06): price the unpriced 38%.** Nothing names it, and it is the
+   size of the expert gemms. Add probe stages for the GDN projections (`attn_qkv`,
+   `attn_gate`, `ssm_out`), the full-attention projections and sdpa, the QSA indexer,
+   PLE, and lm_head (same `ops::dup` idiom, pure launchers only, never a cache advance),
+   run the 3851-token session once, and re-rank this list on the result. Cheap (an hour),
+   and it decides whether the second prefill lever is in the gemms or somewhere no one has
+   looked. Unstarted.
 2. **Hyper-connection activation traffic: ~8% of wall estimated** — MEASURED 0.39 s
    (11.3%) by the probe, of which the two bottleneck gemms 0.14 and the glue kernels plus
    the write 0.25 s (7.3%) (the 84 MB carrier
