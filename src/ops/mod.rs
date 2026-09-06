@@ -251,8 +251,11 @@ pub enum DupStage {
     Experts,
     /// The routed-expert down projection alone.
     ExpertsDown,
-    /// The MoE glue around the experts: router, SwiGLU activation, combine and
-    /// block epilogue.
+    /// The MoE router projection (`ffn_gate_inp`) alone. In no other stage:
+    /// `MoeGlue` starts after it, at the routing kernel.
+    RouterProj,
+    /// The MoE glue around the experts: routing kernel, SwiGLU activation,
+    /// combine and block epilogue — not the router projection.
     MoeGlue,
     /// The shared expert's projections.
     Shexp,
@@ -269,9 +272,10 @@ pub enum DupStage {
 
 impl DupStage {
     /// The `XWEN_DUP_STAGE` token for each stage, in declaration order.
-    const NAMES: [(&'static str, DupStage); 8] = [
+    const NAMES: [(&'static str, DupStage); 9] = [
         ("experts", DupStage::Experts),
         ("experts_down", DupStage::ExpertsDown),
+        ("router_proj", DupStage::RouterProj),
         ("moe_glue", DupStage::MoeGlue),
         ("shexp", DupStage::Shexp),
         ("hc", DupStage::Hc),
@@ -349,9 +353,12 @@ fn dup_reps() -> usize {
 }
 
 /// Runs `f` once for its result, then `XWEN_DUP_REPS` more times with the
-/// results dropped when `stage` is selected by `XWEN_DUP_STAGE` and `n > 1`
-/// (the probe prices prefill only; a decode dispatch is latency-bound and the
-/// copies would overlap). `n` is the token count of the chunk at the call site.
+/// results dropped when `stage` is selected by `XWEN_DUP_STAGE` and `n > 1`,
+/// or `n == 1` too under `XWEN_DUP_DECODE`. `n` is the token count of the
+/// chunk at the call site. Decode is opt-in because its dispatches are
+/// latency-bound: a copy that writes a fresh buffer overlaps the original
+/// wherever the chain leaves the GPU idle, so a decode delta is the LOWER
+/// bound below with more room under it than a prefill one.
 ///
 /// The instrument this exists for: run a prefill twice, once plain and once
 /// with a stage selected, and the wall-clock difference is that stage's GPU
@@ -382,7 +389,16 @@ pub fn dup<T>(
     f: impl FnMut() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let stages = dup_stages()?;
-    dup_with(stages, dup_reps(), stage, n, f)
+    dup_with(stages, dup_reps(), dup_decode(), stage, n, f)
+}
+
+/// `XWEN_DUP_DECODE`: presence lets [`dup`] repeat single-token calls as well,
+/// so the probe can price a decode stage (a launch-count fusion's before and
+/// after, say) by the same wall-clock difference. Read once. Inert unless
+/// `XWEN_DUP_STAGE` names a stage.
+fn dup_decode() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("XWEN_DUP_DECODE").is_some())
 }
 
 /// [`dup`] over an explicit configuration, so the repeat rule is testable
@@ -391,11 +407,12 @@ pub fn dup<T>(
 fn dup_with<T>(
     stages: &[DupStage],
     reps: usize,
+    decode: bool,
     stage: DupStage,
     n: usize,
     mut f: impl FnMut() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    if n <= 1 || !stages.contains(&stage) {
+    if n == 0 || (n == 1 && !decode) || !stages.contains(&stage) {
         return f();
     }
     let out = f()?;
@@ -1212,24 +1229,28 @@ mod tests {
 
         // Selected, multi-token: the real call plus `reps` discarded copies.
         let calls = Cell::new(0);
-        let out = dup_with(&stages, 2, DupStage::Experts, 64, counting(&calls)).unwrap();
+        let out = dup_with(&stages, 2, false, DupStage::Experts, 64, counting(&calls)).unwrap();
         assert_eq!(calls.get(), 3);
         // The FIRST result is what the caller gets; the copies never replace it.
         assert_eq!(out, 1);
 
         // A stage nobody selected runs once whatever the token count.
         let calls = Cell::new(0);
-        dup_with(&stages, 2, DupStage::GdnScan, 64, counting(&calls)).unwrap();
+        dup_with(&stages, 2, false, DupStage::GdnScan, 64, counting(&calls)).unwrap();
         assert_eq!(calls.get(), 1);
 
-        // Decode (n == 1) runs once even for a selected stage.
+        // Decode (n == 1) runs once even for a selected stage, unless the
+        // decode opt-in is set, when it repeats like any other token count.
         let calls = Cell::new(0);
-        dup_with(&stages, 2, DupStage::Experts, 1, counting(&calls)).unwrap();
+        dup_with(&stages, 2, false, DupStage::Experts, 1, counting(&calls)).unwrap();
         assert_eq!(calls.get(), 1);
+        let calls = Cell::new(0);
+        dup_with(&stages, 2, true, DupStage::Experts, 1, counting(&calls)).unwrap();
+        assert_eq!(calls.get(), 3);
 
         // The empty configuration — the unset environment — never repeats.
         let calls = Cell::new(0);
-        dup_with(&[], 4, DupStage::Experts, 64, counting(&calls)).unwrap();
+        dup_with(&[], 4, true, DupStage::Experts, 64, counting(&calls)).unwrap();
         assert_eq!(calls.get(), 1);
     }
 

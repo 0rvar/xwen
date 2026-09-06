@@ -91,7 +91,9 @@ impl MoeBlock {
 
     /// Returns (ids [seq, top_k] u32 on-device, weights [seq, top_k] f32).
     pub fn route(&self, x_normed: &Tensor) -> Result<(Tensor, Tensor)> {
-        let logits = route_logits(&self.router_t, x_normed)?;
+        let logits = crate::ops::dup(crate::ops::DupStage::RouterProj, x_normed.dim(0)?, || {
+            route_logits(&self.router_t, x_normed)
+        })?;
         if self.glue_fused(x_normed) {
             // One kernel for softmax + arg-sort + gather + sum + clamp + divide,
             // bit-identical to the candle chain below (ops::moe_glue).
