@@ -1078,6 +1078,7 @@ fn run_record(record: &JobRecord, batch_job: bool) -> crate::metrics::RunRecord 
     let mut run = crate::metrics::RunRecord::new(surface, record.model.clone());
     run.client = record.origin.client.clone();
     run.session = record.origin.session.clone();
+    run.agent = record.origin.agent.clone();
     run.thinking_tokens = Some(record.thinking_tokens);
     run.drafted = record.spec.map(|spec| spec.drafted);
     run.accepted = record.spec.map(|spec| spec.accepted);
@@ -4446,6 +4447,7 @@ mod tests {
                 streaming: true,
                 client: Some("user_1a2b_session_9f2c".to_string()),
                 session: Some("9f2ca1b4-0d31".to_string()),
+                agent: Some("explore-metrics".to_string()),
             },
             model: "Qwen3.6-35B-A3B".to_string(),
             stop: Some(StopKind::EndTurn),
@@ -4473,6 +4475,7 @@ mod tests {
         assert_eq!(run.model, "Qwen3.6-35B-A3B");
         assert_eq!(run.client.as_deref(), Some("user_1a2b_session_9f2c"));
         assert_eq!(run.session.as_deref(), Some("9f2ca1b4-0d31"));
+        assert_eq!(run.agent.as_deref(), Some("explore-metrics"));
         assert_eq!(run.prompt_tokens, 2048);
         assert_eq!(run.cached_tokens, 380);
         assert_eq!(run.prefill_tokens, 1668);
@@ -4507,6 +4510,7 @@ mod tests {
                 dialect: crate::serve::types::Dialect::Native,
                 client: None,
                 session: None,
+                agent: None,
                 ..served_record().origin
             },
             // Eight items of 1000 shared + 500 own.
@@ -6764,6 +6768,7 @@ mod tests {
                 streaming: true,
                 client: None,
                 session: None,
+                agent: None,
             },
             "Qwen3.6-35B-A3B".to_string(),
             4096,

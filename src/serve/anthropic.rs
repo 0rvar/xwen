@@ -1135,7 +1135,11 @@ pub(crate) fn client_id(request: &MessagesRequest, headers: &HeaderMap) -> Clien
             Value::String(text) => Some(text.clone()),
             other => serde_json::to_string(other).ok(),
         });
-    ClientId::new(client, super::session_header(headers))
+    ClientId::new(
+        client,
+        super::session_header(headers),
+        super::agent_header(headers),
+    )
 }
 
 pub(crate) async fn messages(
@@ -1531,9 +1535,9 @@ mod tests {
         );
     }
 
-    /// The session header and the body's `metadata.user_id` ride the job to the
-    /// engine, which is the only thing either is read for: neither touches the
-    /// prompt, the sampling or the reply.
+    /// The session and agent headers and the body's `metadata.user_id` ride the
+    /// job to the engine, which is the only thing any of them is read for: none
+    /// touches the prompt, the sampling or the reply.
     #[test]
     fn the_client_and_session_ids_reach_the_job() {
         let (state, queue) = probe_state(4096);
@@ -1547,6 +1551,10 @@ mod tests {
             "9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40"
                 .parse()
                 .expect("a header value"),
+        );
+        headers.insert(
+            crate::serve::AGENT_HEADER,
+            "explore-metrics".parse().expect("a header value"),
         );
         let who = client_id(&request, &headers);
         let prepared = prepare(request, &settings(), "laguna-s-2.1").expect("request prepares");
@@ -1569,6 +1577,7 @@ mod tests {
             job.origin.session.as_deref(),
             Some("9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40")
         );
+        assert_eq!(job.origin.agent.as_deref(), Some("explore-metrics"));
     }
 
     /// A `user_id` of any other JSON type is kept as its compact JSON rather

@@ -1432,6 +1432,7 @@ mod tests {
             streaming: true,
             client: None,
             session: None,
+            agent: None,
         }
     }
 

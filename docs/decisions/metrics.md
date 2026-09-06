@@ -211,3 +211,17 @@ and the file is append-only, so old records and new ones sit in the same file fo
 and every reader has to handle both. Serde's default behaviour does the ignoring;
 `v` exists so a future change that is not additive has something to branch on rather
 than having to guess from which keys are present (2026-09-05).
+
+**The agent id is recorded after all, as its own field with its own grouping.** The
+paragraph above retired `x-claude-code-agent-id` for a good reason, which still holds:
+folding it into the session key would split one session into a row per subagent, and
+"which session was that" would stop having an answer. What that reasoning missed is that
+the two questions are different questions. A session-keyed report answers where a
+conversation's tokens went; an agent-keyed one answers which subagent spent them, and on
+a machine where most of the decoding happens inside fanned-out agents that is the more
+actionable of the two. So the header is read beside the session one, bounded the same
+128 characters, and stored in `agent` — a field of its own, never a fallback inside
+`session_key`, which is untouched. `--by agent` groups on it and labels every run
+without one `-`, the same marker `--by client` and `--by session` use, so the subagent
+traffic and the rest of a session read as separate rows without either grouping
+disturbing the other. Recorded on the owner's decision (2026-09-06).

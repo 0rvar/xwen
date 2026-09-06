@@ -283,7 +283,7 @@ enum Cmd {
     /// another file, or says `off` (in any casing) to record nothing at all;
     /// setting it to an empty string counts as not setting it.
     Stats {
-        /// What a row covers: day|week|month|model|surface|client|session|all.
+        /// What a row covers: day|week|month|model|surface|client|session|agent|all.
         #[arg(long, default_value = "day")]
         by: String,
         /// Only runs since this point: `24h`, `7d`, `4w`, or `YYYY-MM-DD`

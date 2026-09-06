@@ -62,8 +62,24 @@ pub(crate) const SESSION_HEADER: &str = "x-claude-code-session-id";
 /// in bytes that are not text. An empty value is normalized away by
 /// [`ClientId::new`], which owns that rule for both identity fields.
 pub(crate) fn session_header(headers: &HeaderMap) -> Option<String> {
+    read_header(headers, SESSION_HEADER)
+}
+
+/// The header Claude Code sets on requests a subagent makes. It rides those and
+/// nothing else, so most requests of a session carry none — which is why it is
+/// recorded beside the session id rather than mixed into it.
+pub(crate) const AGENT_HEADER: &str = "x-claude-code-agent-id";
+
+/// The agent a request declares, read exactly as [`session_header`] reads its
+/// own: `None` when unset or not text, and an empty value normalized away by
+/// [`ClientId::new`].
+pub(crate) fn agent_header(headers: &HeaderMap) -> Option<String> {
+    read_header(headers, AGENT_HEADER)
+}
+
+fn read_header(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
-        .get(SESSION_HEADER)
+        .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
 }
@@ -1069,6 +1085,7 @@ pub(crate) fn submit(
             streaming,
             client: who.client,
             session: who.session,
+            agent: who.agent,
         },
         model,
         prompt: prompt.tokens,
@@ -1499,6 +1516,48 @@ mod tests {
     use axum::body::Bytes;
 
     use testutil::{generation, probe_state, try_take};
+
+    /// Both identity headers are read the same way, and both are bounded on the
+    /// shared path every route builds its `ClientId` on — `/xwen/v1/batch`
+    /// included, which reads the headers and nothing else.
+    #[test]
+    fn both_identity_headers_are_read_and_bounded() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SESSION_HEADER,
+            "9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40"
+                .parse()
+                .expect("a header value"),
+        );
+        headers.insert(
+            AGENT_HEADER,
+            "explore-metrics".parse().expect("a header value"),
+        );
+        let who = ClientId::new(None, session_header(&headers), agent_header(&headers));
+        assert_eq!(
+            who.session.as_deref(),
+            Some("9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40")
+        );
+        assert_eq!(who.agent.as_deref(), Some("explore-metrics"));
+
+        // Absent is nobody, and so is a header sent empty.
+        let bare = ClientId::new(None, session_header(&HeaderMap::new()), None);
+        assert_eq!(bare, ClientId::default());
+        let mut empty = HeaderMap::new();
+        empty.insert(AGENT_HEADER, "".parse().expect("a header value"));
+        assert_eq!(ClientId::new(None, None, agent_header(&empty)).agent, None);
+
+        // The agent id is a client-supplied string like the others, so it is
+        // cut to the same bound before it can reach the history file.
+        let long = "a".repeat(4096);
+        let mut overlong = HeaderMap::new();
+        overlong.insert(AGENT_HEADER, long.parse().expect("a header value"));
+        let bounded = ClientId::new(None, None, agent_header(&overlong));
+        assert_eq!(
+            bounded.agent.expect("an agent id").chars().count(),
+            types::CLIENT_ID_MAX_CHARS
+        );
+    }
 
     #[test]
     fn no_configured_key_accepts_anything() {

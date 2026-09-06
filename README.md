@@ -410,8 +410,8 @@ A record carries the schema version, the completion timestamp, the surface (`gen
 `chat`, `batch`, `serve:anthropic`, `serve:openai`, `serve:native`, `serve:batch`), the
 checkpoint name, prompt / cached / prefill / decode token counts with the seconds each
 phase took, `ok`, and whatever else the surface knows: thinking tokens, drafted and
-accepted positions, batch item count, the client and session ids. Readers ignore fields
-they do not recognize, so an older xwen still reads a newer one's history.
+accepted positions, batch item count, the client, session and agent ids. Readers
+ignore fields they do not recognize, so an older xwen still reads a newer one's history.
 
 An absent optional means not measured, which is not the same as zero. `thinking_tokens`
 is the one to know: serve always measures it and writes it, 0 included, while `generate`
@@ -425,7 +425,8 @@ way, `generate`, `chat` and `batch` included, so `--by model` never splits one f
 across two names. A batch response's own `model` field answers a different question,
 naming the checkpoint the run replies as, and is unchanged.
 
-`xwen stats` reports over the file. `--by day|week|month|model|surface|client|session|all`
+`xwen stats` reports over the file.
+`--by day|week|month|model|surface|client|session|agent|all`
 (default `day`), `--since 24h|7d|4w|YYYY-MM-DD` (a date means local midnight), `--model`
 and `--surface` filter exactly, `--client` and `--session` by substring, `--json` prints
 the rows instead of the table, and `--file` reads another history without ever recording
@@ -512,8 +513,12 @@ it `user_…_session_…`, another embeds a JSON `session_id`. Both fields stay
 accept-and-drop, held as raw JSON like `tool_choice`, so a wrongly-typed `metadata` or
 `user` costs at most the client id and is never a 400. `--by session` takes the header
 when there is one, otherwise reads past the last `session_` marker in the client string,
-and labels whatever is left `-`. Both ids are cut to 128 characters. Whether the
-header's id is the same one `claude --resume` shows is not confirmed.
+and labels whatever is left `-`. The `x-claude-code-agent-id` header is read the same
+way and recorded as its own field: it rides subagent requests only, so `--by agent`
+names the subagents that did the work and labels every other run `-`, while `--by
+session` keeps one session one row whatever ran inside it. All three ids are cut to 128
+characters. Whether the header's id is the same one `claude --resume` shows is not
+confirmed.
 
 ## Verifying a change
 

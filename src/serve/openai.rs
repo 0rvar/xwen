@@ -1149,7 +1149,11 @@ pub(crate) fn client_id(request: &ChatRequest, headers: &HeaderMap) -> ClientId 
         .as_ref()
         .and_then(Value::as_str)
         .map(str::to_string);
-    ClientId::new(client, super::session_header(headers))
+    ClientId::new(
+        client,
+        super::session_header(headers),
+        super::agent_header(headers),
+    )
 }
 
 pub(crate) async fn chat_completions(
@@ -1261,8 +1265,8 @@ mod tests {
             .expect("request is rejected")
     }
 
-    /// The session header and the body's `user` field ride the job to the
-    /// engine, which is the only thing either is read for.
+    /// The session and agent headers and the body's `user` field ride the job
+    /// to the engine, which is the only thing any of them is read for.
     #[test]
     fn the_client_and_session_ids_reach_the_job() {
         let (state, queue) = probe_state(4096);
@@ -1276,6 +1280,10 @@ mod tests {
             "9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40"
                 .parse()
                 .expect("a header value"),
+        );
+        headers.insert(
+            crate::serve::AGENT_HEADER,
+            "explore-metrics".parse().expect("a header value"),
         );
         let who = client_id(&request, &headers);
         let prepared =
@@ -1296,6 +1304,7 @@ mod tests {
             job.origin.session.as_deref(),
             Some("9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40")
         );
+        assert_eq!(job.origin.agent.as_deref(), Some("explore-metrics"));
 
         // A request that names nobody carries nothing.
         let bare = parse(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#);

@@ -38,7 +38,7 @@ impl Dialect {
 }
 
 /// What a client says it is, for a history that can answer "which session was
-/// that". Both values are opaque here: whatever the client sent, bounded, and
+/// that". Every value is opaque here: whatever the client sent, bounded, and
 /// never parsed at the point it is stored — the shape of the body id has
 /// already changed once between Claude Code releases, and a reader can pick a
 /// session out of an old string long after the writer has stopped knowing how.
@@ -49,10 +49,13 @@ pub struct ClientId {
     /// shape is not promised.
     pub client: Option<String>,
     /// The `x-claude-code-session-id` header, which is the documented
-    /// per-session identifier. `x-claude-code-agent-id` is deliberately not
-    /// read: it rides only subagent requests, so keying on it would split one
-    /// session into a row per agent.
+    /// per-session identifier.
     pub session: Option<String>,
+    /// The `x-claude-code-agent-id` header, which rides subagent requests only.
+    /// It is recorded and grouped on in its own right, and never folded into
+    /// the session key: one session stays one row under `--by session` however
+    /// many agents ran inside it.
+    pub agent: Option<String>,
 }
 
 /// The longest client-supplied identifier that is stored. Nothing legitimate
@@ -61,15 +64,16 @@ pub struct ClientId {
 pub const CLIENT_ID_MAX_CHARS: usize = 128;
 
 impl ClientId {
-    /// Both values as the client sent them, each cut to
+    /// Every value as the client sent it, each cut to
     /// [`CLIENT_ID_MAX_CHARS`] on a character boundary. An empty string is how
     /// a client spells "not supplied" without dropping the key, and it is
-    /// normalized here rather than in each dialect, so that the two cannot
+    /// normalized here rather than in each dialect, so that the dialects cannot
     /// drift into disagreeing about what an empty id means.
-    pub fn new(client: Option<String>, session: Option<String>) -> Self {
+    pub fn new(client: Option<String>, session: Option<String>, agent: Option<String>) -> Self {
         Self {
             client: bound(client),
             session: bound(session),
+            agent: bound(agent),
         }
     }
 }
@@ -95,6 +99,9 @@ pub struct RequestOrigin {
     pub client: Option<String>,
     /// The session identifier the client's headers carried, when they did.
     pub session: Option<String>,
+    /// The agent identifier the client's headers carried, which only a subagent
+    /// request has.
+    pub agent: Option<String>,
 }
 
 /// One unit of the engine thread's work: a chat generation or a whole batch.

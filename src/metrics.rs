@@ -94,6 +94,12 @@ pub struct RunRecord {
     /// The `x-claude-code-session-id` header, when the request carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The `x-claude-code-agent-id` header, when the request carried one. It
+    /// rides subagent requests only, so most runs of a session have none; it is
+    /// its own field and never feeds [`session_key`], which keeps one session
+    /// one row however many agents worked inside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Whether the run reached its own natural end: an end-of-generation token
     /// or its token cap, with no error.
     ///
@@ -127,12 +133,14 @@ impl RunRecord {
             items: None,
             client: None,
             session: None,
+            agent: None,
             ok: true,
         }
     }
 }
 
-/// The label `--by session` and `--by client` use for a run that named nobody.
+/// The label `--by session`, `--by client` and `--by agent` use for a run that
+/// named nobody.
 pub const UNATTRIBUTED: &str = "-";
 
 /// The session a record belongs to.
@@ -405,6 +413,10 @@ pub enum GroupBy {
     Client,
     /// The session a run belonged to, as [`session_key`] derives it.
     Session,
+    /// The Claude Code agent a run came from, which is the subagents only: a
+    /// run the header named nobody for is [`UNATTRIBUTED`], never folded into
+    /// the session it belonged to.
+    Agent,
     /// Everything the filters kept, as one row.
     All,
 }
@@ -419,6 +431,7 @@ impl GroupBy {
             GroupBy::Surface => "surface",
             GroupBy::Client => "client",
             GroupBy::Session => "session",
+            GroupBy::Agent => "agent",
         }
     }
 
@@ -440,6 +453,11 @@ impl GroupBy {
                 .filter(|client| !client.is_empty())
                 .unwrap_or_else(|| UNATTRIBUTED.to_string()),
             GroupBy::Session => session_key(rec),
+            GroupBy::Agent => rec
+                .agent
+                .clone()
+                .filter(|agent| !agent.is_empty())
+                .unwrap_or_else(|| UNATTRIBUTED.to_string()),
             GroupBy::All => "all".to_string(),
         }
     }
@@ -457,10 +475,11 @@ impl std::str::FromStr for GroupBy {
             "surface" => Ok(GroupBy::Surface),
             "client" => Ok(GroupBy::Client),
             "session" => Ok(GroupBy::Session),
+            "agent" => Ok(GroupBy::Agent),
             "all" => Ok(GroupBy::All),
             other => bail!(
                 "unknown --by {other:?} \
-                 (expected day|week|month|model|surface|client|session|all)"
+                 (expected day|week|month|model|surface|client|session|agent|all)"
             ),
         }
     }
@@ -992,6 +1011,8 @@ mod tests {
         rec.thinking_tokens = Some(40);
         rec.drafted = Some(200);
         rec.accepted = Some(160);
+        rec.session = Some("9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40".to_string());
+        rec.agent = Some("explore-metrics".to_string());
         let line = serde_json::to_string(&rec).expect("a record serializes");
         let back: RunRecord = serde_json::from_str(&line).expect("a record parses");
         assert_eq!(rec, back);
@@ -1007,6 +1028,12 @@ mod tests {
         assert!(!line.contains("thinking_tokens"));
         assert!(!line.contains("drafted"));
         assert!(!line.contains("items"));
+        assert!(!line.contains("agent"));
+        let back: RunRecord = serde_json::from_str(&line).expect("a record parses");
+        assert_eq!(
+            back.agent, None,
+            "a run no agent header named reads back as nobody's"
+        );
 
         let future = r#"{"v":2,"ts":10,"surface":"chat","model":"Qwen3.8-27B",
             "prompt_tokens":0,"cached_tokens":0,"prefill_tokens":0,"prefill_secs":0.0,
@@ -1179,6 +1206,47 @@ mod tests {
             ["3333-4444", "1111-2222"],
             "heaviest session first"
         );
+    }
+
+    /// `--by agent` names the subagents that did the work, and a run no agent
+    /// header named is its own row rather than being folded into a session.
+    /// The same records under `--by session` are still one row: the agent id is
+    /// a field of its own and never reaches the session key.
+    #[test]
+    fn grouping_by_agent_separates_the_subagents_from_the_rest() {
+        let session = "9f2ca1b4-0d31-4e77-9a02-7c1f8b6e5d40";
+        let mut records = Vec::new();
+        for (agent, decode) in [
+            (Some("explore-metrics"), 10),
+            (Some("router-fixes"), 40),
+            (Some("explore-metrics"), 5),
+            (None, 20),
+        ] {
+            let mut rec = run(10, "serve:anthropic", "Qwen3.6-27B");
+            rec.session = Some(session.to_string());
+            rec.agent = agent.map(str::to_string);
+            rec.decode_tokens = decode;
+            records.push(rec);
+        }
+
+        let agents = aggregate(records.clone().into_iter(), GroupBy::Agent, 0);
+        assert_eq!(
+            agents
+                .iter()
+                .map(|row| (row.label.as_str(), row.runs, row.decode_tokens))
+                .collect::<Vec<_>>(),
+            [
+                ("router-fixes", 1, 40),
+                (UNATTRIBUTED, 1, 20),
+                ("explore-metrics", 2, 15)
+            ],
+            "most decoding first, and the unattributed run a row of its own"
+        );
+
+        let sessions = aggregate(records.into_iter(), GroupBy::Session, 0);
+        assert_eq!(sessions.len(), 1, "one session stays one row");
+        assert_eq!(sessions[0].label, session);
+        assert_eq!(sessions[0].runs, 4);
     }
 
     #[test]

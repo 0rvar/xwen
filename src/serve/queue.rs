@@ -348,6 +348,7 @@ mod tests {
                     streaming: true,
                     client: None,
                     session: None,
+                    agent: None,
                 },
                 // Named rather than `Model::default()`: what these tests need
                 // is a checkpoint that differs from the 27B they compare

@@ -116,6 +116,7 @@ fn submit_batch(
             // is read here exactly as on the two chat routes.
             client: who.client,
             session: who.session,
+            agent: who.agent,
         },
         request,
         model,
@@ -188,7 +189,11 @@ pub(crate) async fn batch(
     // not claim official weights ran.
     request.model = Some(label);
 
-    let who = ClientId::new(None, super::session_header(&headers));
+    let who = ClientId::new(
+        None,
+        super::session_header(&headers),
+        super::agent_header(&headers),
+    );
     let (mut events, guard) = match submit_batch(&state, request, model, who) {
         Ok(submitted) => submitted,
         Err(SubmitError::Invalid(message)) => return bad_request(message).into_response(),
