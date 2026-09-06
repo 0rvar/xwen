@@ -415,6 +415,29 @@ one. So both matmuls stay candle dispatches and the kernel takes over at the sof
 The cost is one dispatch out of ten; the alternative was a bounded router, and a bounded
 router is exactly the thing the chaos-amplifier rule above forbids (2026-07-29).
 
+**But the projection's DISPATCH is now a vendored gemv at 1..8 rows, and its pin on the
+oracle is load-bearing (2026-09-06).** The paragraph above still holds of the FUSION: the
+kernel takes over at the softmax, both matmuls stay outside it, and no bounded router
+exists. What changed is what runs underneath the projection. candle lowers
+`[1, hidden] × [hidden, n_expert]` f32 to the mlx `gemv_t` kernel, which covers the whole
+plane with 8 threadgroups (5.24 MB per layer on Flash-Next, 2.1 MB on the 35B), and at
+2..8 rows to a 32×32-tile gemm on 16 threadgroups with 24 of its 32 M-rows idle. Every
+cheap route out was closed by reading candle at rev 21cca0b: the tile choice is hardwired
+with no knob, a `QMatMul` over an F32 QTensor dequantizes and lands back on the same gemv,
+and candle's own `kernel_mul_mv_f32_f32` receives a zero row stride from its host code. So
+`kernel_mul_mv_f32_f32_v` (`src/ops/f32.metal`, the f16 gemv of `src/ops/f16.metal` with
+float weight loads) is vendored, and runs 256 threadgroups on Flash-Next's 512 experts. It
+is taken at 1..=8 rows inclusive (`XWEN_ROUTER_MV_MAX_N`, 0 for classic) unless
+`XWEN_ROUTER_MV_CLASSIC`; candle's matmul still runs above the ceiling, so prefill is
+untouched. The route is reassociation only, ~1e-6 rel_l2 at both geometries and at t = 1,
+3 and 8, but this switch is unlike every earlier bounded one: top-k routing is discrete and
+the router runs BEFORE the routing decision, so a near-tie flips a whole expert rather than
+a few output bits. The strict tier pins classic AND the reference oracle runs classic, and
+that second pin is the load-bearing one; schema v12 records `router_mv`. The cost is that
+the router plane is held twice, transposed for candle and as loaded for the gemv, ~251 MB
+on Flash-Next and ~8 MB on the 35B, which is open and ledgered. Worth +10.3% decode on the
+35B-A3B and +4.8% on Flash-Next (log.md "Router projection on a 256-threadgroup gemv").
+
 **Reproducing candle's arg-sort tie order is not optional, and it is not the stable
 one.** candle's Metal `arg_sort_last_dim` is llama.cpp's bitonic network, whose
 comparators are strict and never consult the index — so equal probabilities do NOT come
@@ -3157,7 +3180,21 @@ decode candidates are the MoE glue kernels (router kernel and epilogue: tiny byt
 chain), the token-id readback sync, the QSA tail and the GDN glue. The router projection
 is not on that list: it is an occupancy item rather than a launch-count one (8
 threadgroups for 5.2 MB), and its lever is the vendored wide-grid f32 gemv, being
-implemented and unmeasured.
+implemented and unmeasured. **[MEASURED AND SHIPPED the same day; the paragraph below.]**
+
+**And a third class of decode cost, named 2026-09-06 (log.md "Router projection on a
+256-threadgroup gemv"): OCCUPANCY.** The router projection was invisible to both
+instruments above. The probe read zero on it, because at decode its duplicate overlaps
+itself, and the byte budget put it at 4% of a token's bytes, so neither ranked it. Yet
+replacing candle's 8-threadgroup mlx gemv with a 256-threadgroup vendored one is worth
++10.3% decode on the 35B-A3B and +4.8% on Flash-Next: 0.8 and 0.9 ms per token recovered
+against bytes floors of 0.16 and 0.45 ms, so the old kernel had been costing six and three
+times its own bytes respectively. Bytes moved and launch gaps do not span the decode cost
+space; a kernel that leaves the GPU mostly idle is its own class, and the narrower the
+plane the worse the fixed 8-threadgroup shape gets, which is why the smaller router gained
+the most. The instrument that would find the rest is an audit rather than a probe: list
+every decode dispatch's threadgroup count against its bytes, and flag any plane over ~1 MB
+running under ~32 threadgroups (TODO.md, decode ledger).
 
 ## Process
 

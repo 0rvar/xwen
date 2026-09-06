@@ -246,8 +246,10 @@ owner's terminal said `powermode 2` in the same second, after the owner switched
 high performance; 0 was automatic. The mode moved nothing measurable (decode 47.0 →
 47.3, prefill 1140 → 1139, streaming read +4-5% at most; log.md "Ceiling diagnosis"),
 so figures measured on automatic stand.] Interleaved protocol; full history in log.md). Plain (--no-draft), measured inside the
-sweeps that graded each: **35B-A3B decode 115.0 tok/s fused as of 0ed20ea** (2026-09-06, the fused MoE
-shared expert; the same session's `XWEN_MOE_SHEXP_CLASSIC` arm read 113.2, so +1.6%;
+sweeps that graded each: **35B-A3B decode 127.0 tok/s as of 24c4069** (2026-09-06, the wide-grid
+f32 router gemv on top of the fused MoE shared expert; the same session's
+`XWEN_ROUTER_MV_CLASSIC` arm read 115.1, so +10.3%, ahead in every round; was 115.0 earlier
+that day at 0ed20ea with the fused shared expert alone, whose own classic arm read 113.2;
 was 114 at 0261e17 on 2026-08-30, the beta|alpha fold, +8.8% over the 105.1 arm of that
 session; 104-107 through 2026-08-08), 27B 24.8-25.3, 3.8-27B 23.7-24.8. The fold has NOT been re-swept with
 drafting, so every drafted figure below is still against the pre-fold plain level.
@@ -290,7 +292,12 @@ forwards** (2026-09-06, medians 149.7 vs 93.2 tok/s at chunk 8, 108.9 vs 69.5 at
 **51.5 with the fused MoE shared expert on top (2026-09-06, b7cd358), +0.6% median over
 51.2 classic in the same rounds and +0.8% at best, within noise on this checkpoint where
 the same commit is +1.6% on the 35B; `XWEN_MOE_SHEXP_CLASSIC` restores the five-dispatch
-chain**) —
+chain**; **and 52.9 with the router gemv on top of that (2026-09-06, 24c4069), +4.8%
+median over the 50.5 its `XWEN_ROUTER_MV_CLASSIC` arm read in the same rounds, ahead in
+all three, prefill unchanged at 1171; candle's mlx gemv ran the 5.24 MB router plane on
+8 threadgroups and the vendored `kernel_mul_mv_f32_f32_v` runs it on 256; note the
+Flash-Next session level drifts, this session's classic arm reading 50.5 where the
+morning's read 51.2, so compare only within a session**) —
 interleaved rounds, medians, the fold measured in two sessions,
 against llama.cpp's 789 / 41.4 on the same file in the same hour as the 2026-08-29 arm
 (`pmset -g` said `powermode 0` that session — still no high-power
@@ -354,7 +361,14 @@ at rate) AND sit on the dependent chain (2026-09-06, log.md "Fused MoE shared ex
 the shared expert's five launches per layer were byte-bound at ~535 GB/s, so removing 192
 of them recovered the gaps only, +0.6% against +3.5-4% predicted. Byte-bound or
 overlapped launches yield their gaps, never the budget figure.** The MoE population is
-384 after that fusion (12 dispatches per layer became 8).
+384 after that fusion (12 dispatches per layer became 8). **And OCCUPANCY is a third class
+of decode cost beside bytes and launch gaps (2026-09-06, log.md "Router projection on a
+256-threadgroup gemv"): the router projection read zero on the probe and 4% of a token's
+bytes on the budget, yet moving it off candle's 8-threadgroup mlx gemv onto a
+256-threadgroup vendored one was worth +10.3% on the 35B and +4.8% on Flash-Next, so a
+kernel that leaves the GPU mostly idle is invisible to both instruments; the audit that
+would find the rest, threadgroup count against bytes for every decode dispatch, is
+ledgered and unbuilt.**
 
 **The 27B prefill gap is CLOSED (P8c, 2026-07-29).** It was never the DeltaNet
 scan — that is 3% of prefill — it was the dense SwiGLU FFN (66-85% of prefill

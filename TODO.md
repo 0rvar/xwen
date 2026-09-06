@@ -203,6 +203,37 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    class. **The router gemv is IN PROGRESS and UNMEASURED** (vendored wide-grid f32 gemv
    replacing the single-row mlx gemm; an occupancy item, not a launch-count one), log
    entry pending.
+   **DONE 2026-09-06, same day (24c4069; log.md "Router projection on a 256-threadgroup
+   gemv"): the router gemv landed, it is ON BY DEFAULT, and it is the largest decode lever
+   of the day on both MoE checkpoints.** `kernel_mul_mv_f32_f32_v`
+   (`src/ops/f32.metal`, the f16 gemv with float weight loads) runs 256 threadgroups over
+   Flash-Next's 512-expert plane where candle's mlx `gemv_t` ran 8; taken at 1..=8 rows
+   (`XWEN_ROUTER_MV_MAX_N`, inclusive, 0 = classic) unless `XWEN_ROUTER_MV_CLASSIC`, with
+   candle's matmul still running above the ceiling so prefill is untouched. Measured on a
+   pinned binary, three interleaved rounds each: **35B 115.1 → 127.0 tok/s (+10.3%),
+   Flash-Next 50.5 → 52.9 (+4.8%)**, ahead in every round on both. That is 0.8 and 0.9 ms
+   per token recovered against bytes floors of 0.16 and 0.45 ms, so the mlx gemv had been
+   costing six and three times its own bytes. **127.0 is the new 35B plain-decode figure.**
+   Flash-Next replay check PASS with the `XWEN_ROUTER_MV_CLASSIC` control (62/64
+   code-short, 64/64 text-mixed, 59/64 long-mixed, 0 hard); 35B parity gate ALL PASS
+   (strict cos 1.000000 under the classic mv fallback, mm cos 0.999618, decode 63/62/61
+   agree, ppl delta-nll 0.001179). Reassociation only (~1e-6 rel_l2) at schema v12
+   `router_mv`, but the pin is LOAD-BEARING in a way no earlier switch's was: the router
+   runs before the discrete top-k decision, so the strict tier pins classic AND the
+   reference oracle runs classic. Still open: a review fix commit is IN PROGRESS and not
+   landed, renaming `mod f32` to `f32_mv` and covering the admission predicate not asking
+   the launcher's 16-byte offset-alignment conditions, a kernel test comparing against
+   candle on the CPU rather than on Metal, two reference-dump recipes in docs/parity.md
+   that would now produce a rejected dump, and a code comment misdescribing the cost of
+   the doubled router plane (which that commit also ledgers).
+   (e) **NEXT INSTRUMENT, an unpriced candidate: a threadgroup-count-against-bytes audit
+   of every decode dispatch.** The router projection was invisible to both instruments
+   this project has (the probe reads zero on a stage that overlaps itself, and the byte
+   budget put it at 4% of a token's bytes) and it was worth +10%. Occupancy is a third
+   class of decode cost beside bytes and launch gaps (decisions.md "Ceilings"), and the
+   mechanical way to find the rest of it is to list each decode dispatch's threadgroup
+   count next to the bytes it moves, then flag any plane over ~1 MB running under ~32
+   threadgroups. Nothing is named or priced until that list exists.
 3. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line
    earlier.** One drain per token for data that never left the CPU; pass the ids down
    instead. ≈ +0.3 ms, +1.4%, no math change; run the Flash-Next replay check anyway.
@@ -286,6 +317,18 @@ sync (item 3, ~+1.4%), then the QSA tail above the indexer budget (item 5), then
 glue (item 4).** Separately, and NOT a launch-count item: the router projection is an
 occupancy item (8 threadgroups for 5.2 MB), and its **wide-grid f32 gemv replacement is IN
 PROGRESS and UNMEASURED**, with no number claimed and a log entry pending.
+
+**DONE 2026-09-06, decode: the router-projection gemv** (24c4069, ledger item 2; 35B
+115.1 → 127.0 tok/s (+10.3%), Flash-Next 50.5 → 52.9 (+4.8%), both checks pass). It is the
+largest decode lever of the day and it did not come out of the launch budget at all.
+**The day's three stacked levers: 35B 113.2 → 115.0 → 127.0, Flash-Next 51.2 → 51.5 →
+52.9** (the Flash-Next levels drift between sessions, so only the within-session ratios
+are claims). **The launch-budget order below is unchanged** (the MoE glue kernels, then
+the token-id readback sync at item 3, then the QSA tail at item 5, then the GDN glue at
+item 4), **but a new class now sits ahead of it to be surveyed first: OCCUPANCY.** The
+router projection was priced by neither the probe nor the byte budget and was worth +10%,
+so the next instrument is the threadgroup-count-against-bytes audit of every decode
+dispatch (item 2(e)), and it should run before the next launch-count lever is picked.
 
 
 **DONE as opt-in 2026-09-05** (`XWEN_PLE_DEVICE=1`, multi-token Metal forwards; +12.8% prefill @3851,

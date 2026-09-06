@@ -96,7 +96,12 @@ folded into the block epilogue; `XWEN_MOE_SHEXP_CLASSIC` restores the chain), is
 **+1.6% on the 35B-A3B, 113.2 to 115.0 tok/s** and +0.6% on Flash-Next, and the gap
 between those and the +3.5-4% the launch budget predicted is the finding: those launches
 were bandwidth-bound, so only launches carrying under ~2 MB on the dependent chain are
-worth the budget's price (decisions.md "Ceilings"). Prefill stages are priced
+worth the budget's price (decisions.md "Ceilings"). The third lever came from outside that
+budget entirely: the MoE router projection ran candle's mlx gemv on 8 threadgroups over a
+5.24 MB f32 plane, and a vendored 256-threadgroup gemv (`XWEN_ROUTER_MV_CLASSIC` restores
+candle's) is worth **+10.3% on the 35B-A3B, 115.1 to 127.0 tok/s** and +4.8% on
+Flash-Next, which makes low occupancy a third class of decode cost that neither the byte
+budget nor the probe can see. Prefill stages are priced
 in situ
 by the duplicate-dispatch probe (`XWEN_DUP_STAGE`, log.md "Duplicate-dispatch probe"): at
 3851 tokens the expert gemms are 28-32% of wall, MoE glue 11.5%, the hyper-connection
@@ -183,8 +188,9 @@ of 3 reps, arms interleaved, `lowpowermode 0` on AC):
 | `Qwen3.8-27B` | +44 to +45% | +37 to +38% | 78-80% | 2026-08-15 |
 
 The 35B-A3B's PLAIN decode level moved on 2026-08-30 (105.1 → 114.4 tok/s, the
-beta|alpha fold at 0261e17) and again on 2026-09-06 (113.2 → 115.0, the fused MoE
-shared expert); the gains in this table were fitted against the oldest of those levels
+beta|alpha fold at 0261e17) and twice on 2026-09-06 (113.2 → 115.0, the fused MoE
+shared expert; then 115.1 → 127.0, the router gemv); the gains in this table were fitted
+against the oldest of those levels
 and have not been re-swept, so read them as gains over their own sweep's plain arm.
 
 Acceptance trades against draft length, so raising `--draft-p-min` buys acceptance and
