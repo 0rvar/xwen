@@ -229,7 +229,7 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    agree, ppl delta-nll 0.001179). Reassociation only (~1e-6 rel_l2) at schema v12
    `router_mv`, but the pin is LOAD-BEARING in a way no earlier switch's was: the router
    runs before the discrete top-k decision, so the strict tier pins classic AND the
-   reference oracle runs classic. Still open: a review fix commit is IN PROGRESS and not
+   reference oracle runs classic. Still open: a review fix commit was IN PROGRESS [LANDED 2026-09-06, `moe: router review fixes`, the commit after ed39b70] and not
    landed, renaming `mod f32` to `f32_mv` and covering the admission predicate not asking
    the launcher's 16-byte offset-alignment conditions, a kernel test comparing against
    candle on the CPU rather than on Metal, two reference-dump recipes in docs/parity.md
@@ -243,6 +243,17 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    mechanical way to find the rest of it is to list each decode dispatch's threadgroup
    count next to the bytes it moves, then flag any plane over ~1 MB running under ~32
    threadgroups. Nothing is named or priced until that list exists.
+   (f) **The router gemv holds `ffn_gate_inp` TWICE, 2026-09-06.** `MoeBlock` keeps the
+   plane in both orientations because the two arms want different ones and both are on
+   the DEFAULT path: prefill runs above `ROUTER_MV_MAX_N` and takes `x.matmul(router_t)`
+   over the `[hidden, n_expert]` transpose, decode runs at or below it and takes the gemv
+   over `[n_expert, hidden]` as loaded. Cost: 5.24 MB per layer, ~251 MB across
+   Flash-Next's 48 (512 x 2560 x 4 B) and ~8 MB across the 35B-A3B's 40 (256 x 2048 x
+   4 B) — resident f32, never quantized. Two ways to reclaim it, neither started: give the
+   gemv a prefill form (a tiled f32 gemm over the same orientation, so `router_t` can go),
+   or find a transpose-free candle route over the `[n_expert, hidden]` plane for the
+   fallback arm (so `router` alone serves both). Not urgent at 251 MB of 111 GB, but it is
+   a real number and it grows with `n_expert`.
 3. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line
    earlier.** One drain per token for data that never left the CPU; pass the ids down
    instead. ≈ +0.3 ms, +1.4%, no math change; run the Flash-Next replay check anyway.

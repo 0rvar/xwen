@@ -6,7 +6,7 @@ pub mod delta;
 pub mod dense_mm;
 mod dispatch;
 pub mod f16;
-pub mod f32;
+pub mod f32_mv;
 pub mod flash;
 pub mod hc;
 pub mod mm_id;
@@ -29,8 +29,9 @@ pub use delta::{
 };
 pub use dense_mm::{dense_mm_supported, matmul_dense_q};
 pub use dispatch::mv_vendored_supported;
+pub(crate) use dispatch::view_offset_aligned_16;
 pub use f16::matmul_f16;
-pub use f32::{matmul_f32, matmul_f32_supported};
+pub use f32_mv::{matmul_f32, matmul_f32_supported};
 pub use flash::flash_attn;
 pub use hc::{
     hc_gate_down, hc_gate_fused_supported, hc_gate_up_mix, hc_mix, hc_norm, hc_norm_supported,

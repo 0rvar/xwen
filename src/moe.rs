@@ -51,10 +51,16 @@ pub struct MoeBlock {
     ///
     /// Kept ALONGSIDE `router_t` rather than instead of it, so the candle
     /// fallback path is byte-for-byte the one that shipped before the gemv.
-    /// The cost is holding the plane twice — 5.24 MB per layer, ~250 MB across
-    /// Flash-Next's 48 — which is ledgered (TODO.md), not fixed here: dropping
-    /// the transpose entirely means the `XWEN_ROUTER_MV_CLASSIC` arm has to
-    /// rebuild it, and that arm is the strict parity tier's.
+    /// BOTH planes are on the default path, not just the kill-switch arm:
+    /// prefill runs above `ROUTER_MV_MAX_N` and takes `x.matmul(router_t)`,
+    /// decode runs at or below it and takes the gemv over `router` as loaded.
+    /// The cost is holding the plane twice — 5.24 MB per layer, ~251 MB across
+    /// Flash-Next's 48 (512 x 2560 x 4 B x 48), ~8 MB on the 35B-A3B
+    /// (256 x 2048 x 4 B x 40). Reclaiming it needs one of the two arms to
+    /// stop wanting its own orientation: either the gemv grows a prefill form
+    /// so `router_t` can go, or candle gains a transpose-free route over the
+    /// `[n_expert, hidden]` plane. Ledgered in TODO.md (2026-09-06), not fixed
+    /// here.
     router: Tensor,
     /// Router weight, pre-transposed to `[hidden, n_expert]` and made contiguous
     /// once at load so the per-forward routing matmul needs no transpose/copy.
@@ -136,6 +142,14 @@ impl MoeBlock {
             && x.dims() == [seq, hidden]
             && n_expert == self.n_expert
             && crate::ops::matmul_f32_supported(seq, hidden, n_expert)
+            // The launcher binds each operand at its view's byte offset and the
+            // kernel reads both through float4, so a start that is not
+            // 16-byte-aligned is one of its hard errors. A plane loaded from the
+            // GGUF and a residual row straight out of a norm both start at zero;
+            // a narrowed view is what can land off the boundary, and it belongs
+            // on candle rather than on a bailing launcher.
+            && crate::ops::view_offset_aligned_16(&self.router)
+            && crate::ops::view_offset_aligned_16(x)
     }
 
     /// Returns (ids [seq, top_k] u32 on-device, weights [seq, top_k] f32).
@@ -1437,6 +1451,74 @@ mod tests {
             bits(&want),
             "at n = {n} the router projection must run candle's matmul, bit for bit"
         );
+    }
+
+    /// View alignment is one of the launcher's hard errors, so the predicate
+    /// has to ask it: the kernel reads both operands through `float4`, which
+    /// Metal binds only at a 16-byte offset. An activation that starts one
+    /// float in must therefore read `false` and go to candle's matmul — with
+    /// the router's logits intact, which is the whole point. A predicate that
+    /// said `true` here would turn a legal input into a failed forward.
+    ///
+    /// Narrowing on dim 0 could never produce such a view (a row is
+    /// `hidden * 4` bytes and `hidden` is a multiple of 32), so the fixture
+    /// slices a flat buffer and reshapes: candle carries the start offset
+    /// through a contiguous reshape unchanged.
+    #[test]
+    fn an_unaligned_activation_falls_back_to_candle() {
+        let device = crate::gguf::metal_device().expect("the router gemv needs Metal");
+        let (block, _dir) = shexp_block("router_mv_unaligned", &device);
+        let (n_expert, hidden) = block.router.dims2().unwrap();
+
+        let buf = det_tensor(&[hidden + 1], 0xA004, 2.0)
+            .to_device(&device)
+            .unwrap();
+        let x = buf
+            .narrow(0, 1, hidden)
+            .unwrap()
+            .reshape((1, hidden))
+            .unwrap();
+        assert!(x.is_contiguous(), "the view is dense, only offset");
+        assert!(
+            !crate::ops::view_offset_aligned_16(&x),
+            "a one-float offset is 4 bytes in, not 16"
+        );
+
+        // The same row materialized at offset zero, to separate alignment from
+        // every other clause: it differs from `x` in nothing else and DOES take
+        // the gemv.
+        let x0 = Tensor::from_vec(
+            x.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            (1, hidden),
+            &device,
+        )
+        .unwrap();
+        assert!(
+            crate::ops::matmul_f32_supported(1, hidden, n_expert),
+            "[{n_expert}x{hidden}] at one token is inside the gemv's shape rules"
+        );
+        assert!(block.router_mv(&x0), "the aligned twin takes the gemv");
+        assert!(!block.router_mv(&x), "the unaligned view must not");
+
+        // Not merely unused there: the launcher bails, which is what makes the
+        // predicate load-bearing rather than an optimization.
+        assert!(crate::ops::matmul_f32(&block.router, &x).is_err());
+
+        // And the fallback still routes: the logits off the unaligned view
+        // match the ones candle computes from the materialized copy.
+        let got = route_logits(&block.router, &block.router_t, &x, block.router_mv(&x)).unwrap();
+        assert_eq!(got.dims(), &[1, n_expert]);
+        let want = route_logits(&block.router, &block.router_t, &x0, false).unwrap();
+        let rel = rel_l2(
+            &got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            &want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        assert!(rel < 1e-6, "fallback router logits rel_l2 {rel}");
+
+        // The whole routing decision runs, which is what the forward asks for.
+        let (ids, weights) = block.route(&x).unwrap();
+        assert_eq!(ids.dims(), &[1, block.n_expert_used]);
+        assert_eq!(weights.dims(), &[1, block.n_expert_used]);
     }
 
     /// Deterministic pseudo-random f32 tensor in roughly `[-scale, scale]`, so

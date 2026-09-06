@@ -380,9 +380,12 @@ const F16_MM_MIN_SEQ: usize = 8;
 /// Fork host constants for `kernel_mul_mv_f16_f32_v` at our shapes: nr0 = 2
 /// src0 rows per threadgroup (the only case in ggml's disp switch) and
 /// nsg = min(4, ceil(ne00/128)) = 4 simdgroups splitting the K reduction
-/// (every attention K is >= 3072). Baked into the kernel as well.
-const MV_F16_NR0: usize = 2;
-const MV_F16_NSG: usize = 4;
+/// (every attention K is >= 3072). Baked into the kernels as well — the whole
+/// dense mv family (`f16.metal`, `bf16.metal`, `f32.metal`) shares this one
+/// grid, so `f32_mv::tests::mv_geometry_matches_metal` holds all three sources'
+/// `#define MV_NR0` / `#define MV_NSG` equal to these.
+pub(crate) const MV_F16_NR0: usize = 2;
+pub(crate) const MV_F16_NSG: usize = 4;
 
 /// Tile geometry of the dense cooperative-tensor quantized gemm
 /// (dense_mm.metal's `kernel_mul_mm_q_f32_t`), which the host must agree with to
@@ -416,9 +419,11 @@ pub(crate) const MV_EXT_K_MULTIPLE: usize = 128;
 /// ggml's N_R0 / N_SG for the vendored q8_0 attention decode gemv
 /// (kernel_mul_mv_q8_0_f32_attn, q8.metal): N_R0_Q8_0 = 2 rows per threadgroup,
 /// N_SG_Q8_0 = 4 simdgroups splitting the K reduction (ggml-metal-impl.h). Same
-/// f16-style geometry as the attention f16 gemv above.
-const MV_Q8_NR0: usize = 2;
-const MV_Q8_NSG: usize = 4;
+/// f16-style geometry as the attention f16 gemv above, and held equal to
+/// `q8.metal`'s own `#define MV_NR0` / `#define MV_NSG` by
+/// `f32_mv::tests::mv_geometry_matches_metal`.
+pub(crate) const MV_Q8_NR0: usize = 2;
+pub(crate) const MV_Q8_NSG: usize = 4;
 
 /// ggml's per-dtype (N_R0, N_SG) for the vendored mat-vec kernels
 /// (ggml-metal-impl.h) plus the grid geometry the fork's host dispatch selects
@@ -1681,6 +1686,23 @@ pub(crate) fn matmul_f32_shape_supported(t: usize, k: usize, n_out: usize) -> bo
     t >= 1 && t <= F16_MM_MIN_SEQ && k.is_multiple_of(32) && n_out.is_multiple_of(4)
 }
 
+/// Whether `t`'s view starts at a 16-byte-aligned BYTE offset — the binding
+/// rule `run_matmul_dense_variant` hard-errors on for BOTH of its operands,
+/// because the kernels read weight and activation through 16-byte vector
+/// device pointers (float4 in the f32 gemv).
+///
+/// A property of the TENSOR rather than of the geometry, so it sits outside
+/// `matmul_f32_shape_supported` and is asked separately: `MoeBlock::router_mv`
+/// asks it of the router plane and of the activation, so a view that lands off
+/// the boundary keeps candle's matmul instead of erroring the forward. A
+/// freshly allocated tensor starts at offset zero, and so does every plane the
+/// GGUF loader hands over (32-byte tensor alignment); a view into a larger
+/// buffer is the only thing that can land off the boundary.
+pub(crate) fn view_offset_aligned_16(t: &Tensor) -> bool {
+    let (_guard, layout) = t.storage_and_layout();
+    (layout.start_offset() * t.dtype().size_in_bytes()).is_multiple_of(16)
+}
+
 /// The weight element type of the dense mixed-dtype matmul family: which dtype
 /// the input tensor must carry and which kernel library the dispatch selects.
 /// Both are 2-byte types consumed by structurally identical kernels (the bf16
@@ -1779,7 +1801,8 @@ fn run_matmul_dense_variant(
     let w_buf = w_storage.buffer();
     let w_off = w_layout.start_offset() * family.dtype().size_in_bytes();
     // The kernels read the weight through 4/16-element vector device pointers
-    // (half4/half4x4, bfloat4), which Metal requires 16-byte aligned; rows are
+    // (half4/half4x4 in the f16 family, bfloat4 in the bf16 one, float4 in the
+    // f32 router gemv), which Metal requires 16-byte aligned; rows are
     // (k % 8 == 0 checked above), so only a misaligned view start could break
     // it. The mmap alias paths produce exactly such offset views (GGUF's
     // 32-byte tensor alignment satisfies this); a hand-sliced view lands here.

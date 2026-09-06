@@ -48,7 +48,7 @@ mod tests {
     use super::*;
     use crate::gguf::metal_device;
     use crate::ops::dispatch::testutil::{pseudo_random, rel_l2};
-    use candle_core::{DType, Device, Tensor};
+    use candle_core::{DType, Tensor};
 
     /// The two production router planes as (n_out, k) = (n_expert, hidden):
     /// Qwen3.8-Flash-Next and Qwen3.6-35B-A3B.
@@ -80,10 +80,18 @@ mod tests {
     /// against the path this replaces (candle's `matmul` over the `[k, n_out]`
     /// transpose). Both operands are f32 in every arm and no arm rounds
     /// anything, so all three differ only in summation order.
+    ///
+    /// Every tensor is built ON THE METAL DEVICE, the host oracle apart. The
+    /// route the kernel replaces is candle's METAL matmul — its mlx `gemv_t`
+    /// at `t <= 8`, the eight-threadgroup dispatch this whole change exists to
+    /// get off — so a CPU-resident pair would compare the kernel against
+    /// candle's CPU matmul instead: a different implementation with a different
+    /// summation order, grading nothing that ships. The host f32 dot stays the
+    /// load-bearing check; the candle arm pins the size of the reassociation
+    /// between the two paths that actually run.
     #[test]
     fn matmul_f32_matches_host_reference() {
         let device = metal_device().unwrap();
-        let cpu = Device::Cpu;
 
         for (n_out, k) in ROUTER_SHAPES {
             for t in [1usize, 3, 8] {
@@ -95,14 +103,10 @@ mod tests {
                 let wv = pseudo_random(n_out * k, seed, -0.5, 0.5);
                 let xv = pseudo_random(t * k, seed ^ 0xF00D, -1.0, 1.0);
 
-                let w = Tensor::from_vec(wv.clone(), (n_out, k), &cpu).unwrap();
-                let x = Tensor::from_vec(xv.clone(), (t, k), &cpu).unwrap();
+                let w = Tensor::from_vec(wv.clone(), (n_out, k), &device).unwrap();
+                let x = Tensor::from_vec(xv.clone(), (t, k), &device).unwrap();
 
-                let got = matmul_f32(
-                    &w.to_device(&device).unwrap(),
-                    &x.to_device(&device).unwrap(),
-                )
-                .unwrap();
+                let got = matmul_f32(&w, &x).unwrap();
                 assert_eq!(got.dims(), &[t, n_out]);
                 assert_eq!(got.dtype(), DType::F32);
                 let got = flat(&got);
@@ -114,7 +118,8 @@ mod tests {
                     "host oracle [{n_out}x{k}] t={t} rel_l2 {rel_host}"
                 );
 
-                // The route this replaces: x [t, k] @ router_t [k, n_out].
+                // The route this replaces, on the device it replaces it on:
+                // x [t, k] @ router_t [k, n_out], candle's Metal matmul.
                 let candle = flat(&x.matmul(&w.t().unwrap().contiguous().unwrap()).unwrap());
                 let rel_candle = rel_l2(&got, &candle);
                 assert!(
@@ -226,5 +231,67 @@ mod tests {
         // k mismatch between the two operands.
         let x = Tensor::zeros((1, 1024), DType::F32, &device).unwrap();
         assert!(matmul_f32(&w, &x).is_err());
+    }
+
+    /// `MV_NR0` / `MV_NSG` are written twice for every vendored mat-vec: once
+    /// as a `#define` in the .metal source, which sizes the kernel's row loop
+    /// and its cross-simdgroup reduce, and once in Rust, which sizes the grid
+    /// and the threadgroup allocation. Nothing in the toolchain ties the two
+    /// together, and a change on one side alone silently drops or double-covers
+    /// weight rows — the kernel compiles and the dispatch succeeds either way.
+    ///
+    /// Four sources now carry the pair. `f16.metal`, `bf16.metal` and
+    /// `f32.metal` share one launcher (`run_matmul_dense_variant`) and so one
+    /// pair of Rust constants; `q8.metal` has its own launcher and its own
+    /// pair, ggml's `N_R0_Q8_0` / `N_SG_Q8_0`. Needs no device.
+    #[test]
+    fn mv_geometry_matches_metal() {
+        use crate::ops::dispatch::{MV_F16_NR0, MV_F16_NSG, MV_Q8_NR0, MV_Q8_NSG};
+
+        let sources: [(&str, &str, usize, usize); 4] = [
+            (
+                "f16.metal",
+                include_str!("f16.metal"),
+                MV_F16_NR0,
+                MV_F16_NSG,
+            ),
+            (
+                "bf16.metal",
+                include_str!("bf16.metal"),
+                MV_F16_NR0,
+                MV_F16_NSG,
+            ),
+            (
+                "f32.metal",
+                include_str!("f32.metal"),
+                MV_F16_NR0,
+                MV_F16_NSG,
+            ),
+            ("q8.metal", include_str!("q8.metal"), MV_Q8_NR0, MV_Q8_NSG),
+        ];
+
+        /// The integer in `#define <name> <int>`, ignoring a trailing comment.
+        fn define(src: &str, file: &str, name: &str) -> usize {
+            src.lines()
+                .find_map(|line| {
+                    let rest = line.trim_start().strip_prefix("#define ")?;
+                    let rest = rest.strip_prefix(name)?;
+                    rest.split_whitespace().next()?.parse::<usize>().ok()
+                })
+                .unwrap_or_else(|| panic!("{file} has no `#define {name} <integer>`"))
+        }
+
+        for (file, src, nr0, nsg) in sources {
+            assert_eq!(
+                define(src, file, "MV_NR0"),
+                nr0,
+                "{file} bakes a different NR0 than the host sizes the grid with"
+            );
+            assert_eq!(
+                define(src, file, "MV_NSG"),
+                nsg,
+                "{file} bakes a different NSG than the host dispatches threads with"
+            );
+        }
     }
 }
