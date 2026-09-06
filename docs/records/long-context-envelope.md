@@ -241,3 +241,14 @@ changed no drafting default.
 
 Listed here rather than as new ledger items, per the intake rule, except where a number
 makes an item.
+
+## Reviews and follow-ups (2026-09-06)
+
+The three-model review of the day's commits (see the presence-penalty record) landed in
+df5e678: the shutdown watchdog's grace now derives from the flush budget it was cutting
+off, in-flight writes count toward pending bytes, and the horizon line fires at the
+dispatch gates too. The QSA host-mask item this arc wrote as memory-only was folded into
+a Front-1 prefill item the same evening (8d0c2fe): the causal-mask dead heat does not
+transfer to a mask that waits on a per-layer readback, and the 925 → 231 tok/s prefill
+curve is that path's number until a timer says otherwise. Drafting is off by default on
+the 35B-A3B from the same commit, on the horizon curve measured here.

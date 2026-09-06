@@ -78,3 +78,16 @@ Two non-thinking 35B replies at 1.5 and at 0 read as normal prose (the report ha
   ledger item cites the lines, and the table is in one place under one test.
 
 Full agent report: /tmp/agent-report-penalties.md (session artifact, not in the repo).
+
+## Reviews (2026-09-06)
+
+Codex (gpt-6-astra), Qwen3.8-Flash-Next through the local server, and an Opus reviewer
+read the four commits. Codex found three defects in the serve constants (the shutdown
+watchdog could kill a flush longer than 30 s, in-flight writes were invisible to the
+flush budget, the horizon line missed prompts already past the horizon); Opus found that
+`top_k` 0 sorted the whole vocabulary per token, that the horizon line bypassed the
+serve logger and misdiagnosed a drafter desync, wrong arithmetic in the queue-timeout
+comment, a stale comment, a truncating conversion, and the grammar-mask interaction with
+the default penalty. Qwen returned zero findings after tracing every decode loop's
+push/truncate balance. All nine fixed in df5e678; grammar-masked batch decode now
+resolves to penalty 0 unless pinned.
