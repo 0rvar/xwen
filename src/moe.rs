@@ -117,6 +117,20 @@ impl MoeBlock {
             && let Some(down) = self.experts.project(x_normed, &ids)?
         {
             let seq = x_normed.dim(0)?;
+            let fused = self.fused_shexp(x_normed);
+            // One line per process saying which shared-expert path the first
+            // within-ceiling call took, so a bench can tell a fused run from a
+            // silent fallback (a missing plane, a non-contiguous input) without
+            // a profiler.
+            if seq <= crate::ops::moe_shexp_fused_max_n() {
+                static NOTE: std::sync::Once = std::sync::Once::new();
+                NOTE.call_once(|| {
+                    crate::host_log::host_line(format!(
+                        "moe: shared expert {} at {seq} token(s)",
+                        if fused { "fused" } else { "classic" }
+                    ));
+                });
+            }
 
             // At decode the shared expert's five dispatches — gate gemv, up
             // gemv, silu*mul, down gemv, gate logit — cost more in launch
@@ -128,9 +142,7 @@ impl MoeBlock {
             // Bounded, not bit-identical, unlike everything else on this path
             // (moe_glue.metal): kept behind its own switch and its own ceiling,
             // and `ops::moe_epilogue` below is the untouched bitwise anchor.
-            if self.fused_shexp(x_normed)
-                && let Some((gate_p, up_p, down_p)) = self.shared.fused_planes()
-            {
+            if fused && let Some((gate_p, up_p, down_p)) = self.shared.fused_planes() {
                 let (h, gate) = crate::ops::dup(crate::ops::DupStage::Shexp, seq, || {
                     crate::ops::moe_shexp_gate_up(
                         x_normed,
