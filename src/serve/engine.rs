@@ -614,8 +614,8 @@ fn attach_drafter(
 /// 35B-A3B's fitted 0.3 — an arbitrary value for any other checkpoint. Every
 /// shipped checkpoint now carries a fitted floor of its own, so reaching it takes
 /// a custom `draft.path` attached to a checkpoint that ships no sidecar, which is
-/// currently no checkpoint at all. Nothing pretends otherwise; see the retune
-/// ledger item in TODO.md.
+/// currently no checkpoint at all. Nothing pretends otherwise; the floor item is
+/// retired in docs/ledger-archive.md "Retired: Drafting".
 /// Extracted from [`attach_drafter`] so the resolution is testable without a
 /// Metal device.
 /// The draft depth for the checkpoint being loaded: the operator's pinned value
@@ -2649,8 +2649,9 @@ fn page_in(
     // way the degradation is permanent for the conversation: the drafter's cache is fed
     // by target-layer taps during target forwards, so a reset drafter at a nonzero
     // restore point has no way to catch up (`drafter_span_rows` stays 0), and re-seeding
-    // would mean re-running the target prefill the snapshot exists to avoid — see the
-    // TODO.md ledger item. Every ground a stored record can be refused on — kind, shape,
+    // would mean re-running the target prefill the snapshot exists to avoid; accepted
+    // and documented in decisions.md "Serving". Every ground a stored record can be
+    // refused on — kind, shape,
     // position, capacity — is settled before a single row is written, so a refusal leaves
     // the drafter untouched; a device failure part-way through the writes does not, which
     // is why the repair is a full reset rather than a length fix, and why that reset is

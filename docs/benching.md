@@ -76,7 +76,11 @@ automatic stand.
 stages and `XWEN_GDN_PROFILE`'s whole line are sync-inflated: two figures off the GDN line
 read 2-3x high against amortized benches of the same work, and the prefill stage profiler
 reads 2.2x high. Take every headline from an unprofiled run, and price a step with an
-amortized bench or with end-to-end tok/s.
+amortized bench or with end-to-end tok/s. `XWEN_GDN_PROFILE`'s decode line is the sharpest
+case: it orders the steps within one run and does not time them, overstating each by
+roughly its dispatch round trip — the scan reads 3.79-7.19 ms/token there against 1.43 ms
+in an amortized bench of the same work. Never quote a decode figure from that line as a
+cost.
 
 **The duplicate-dispatch probe prices prefill stages in situ**, with no syncs
 (`XWEN_DUP_STAGE`, log.md "Duplicate-dispatch probe"). At 3851 tokens on Flash-Next:

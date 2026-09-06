@@ -521,6 +521,13 @@ serve batch + multi-checkpoint arc (2026-08-11)" below.
 - [ ] [measured] **DFlash adaptation to the Qwen sidecars — ADAPTED 2026-07-29; (b), (c) and
    (e) still open.**
 
+[Item closed 2026-09-06 as already shipped: the `<function=...>` tool-call parser landed 2026-07-28 (log.md "Serve integration fixes: the tool-call parser was reading `:` and `;` as span markers") and lives in `src/serve/engine.rs`; the item was stale.]
+
+- [ ] [unpriced] **serve adaptation.** Tool-call parsing for the `<function=...>` XML-ish format in
+    both API dialects (string args raw, non-string JSON) — the one piece of the original
+    scope still not adapted (AGENTS.md "serve"). Estimated-prefill scheduling unchanged.
+  From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
+
 ## Deferred from the P2-P4 model-core retarget (2026-07-28)
 
 - [ ] **The DeltaNet rollback trail costs one retained delta state per verify
@@ -579,6 +586,32 @@ serve batch + multi-checkpoint arc (2026-08-11)" below.
     gone rather than replaced — the ~365 GB/s lm_head anchor they were compared
     against is kept as the reference point, so the benches still say what a
     reading means without asserting a measurement nobody has taken here.
+
+[Duplicate of the open item «Top-k selection still crosses the bus at full vocabulary width.», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [measured] **The fast path still softmaxes the full vocabulary it no longer needs.**
+  Split out of the top-p convention item when that resolved (2026-07-29). The cut
+  now renormalizes over the k survivors, which is arithmetically a k-wide softmax,
+  so nothing downstream of the selection depends on the full-vocabulary
+  denominator any more — the ~0.1 ms it was worth is unclaimed only because the
+  selection itself still runs CPU-side over the whole row. Pairs with «Top-k selection
+  still crosses the bus at full vocabulary width» in this section: land that and the
+  device softmax collapses to the candidates along with the readback.
+  From: Deferred from the sampler-tail pass (2026-07-28).
+
+[Item closed 2026-09-06 by decision: xwen keeps the HF/vLLM order — decisions.md "Thinking budget and sampling controls", the paragraph on sampler order.]
+
+- [ ] [unpriced] **Temperature is applied before the top-k/top-p cut; llama.cpp's default
+  chain cuts first.** Found 2026-07-29 while transcribing `top_p`: llama.cpp's
+  default sampler chain is top_k → typ_p → top_p → min_p → temp → dist
+  (common/sampling.cpp), so its truncation sees raw-logit probabilities, while
+  xwen (like HF's default warper order) scales by temperature first, so the cut
+  sees the sharpened/flattened distribution. At the model's default temp 1.0 the
+  two are identical; the divergence only bites when `--temp` is overridden.
+  Convention question like the top-p one was — llama.cpp and HF disagree with
+  each other here, so there is no single ground truth to defer to. Needs a
+  decision, not a patch.
+  From: Deferred from the sampler-tail pass (2026-07-28).
 
 ## Deferred from the dense-FFN prefill gemm pass (2026-07-29, P8c)
 
@@ -658,6 +691,17 @@ in log.md 2026-07-29.
   glue never existed** (the glue kernels have been wired into the main block since the
   fork; the attention block's length-growth is +53.5 µs/token, ≈ the sdpa quadratic).
   [Record](records/27b-prefill-residual.md).
+
+[Duplicate of the open item «Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel.», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [unpriced] **A fused sigmoid-gate kernel at the attention gate site, and the
+  head-dim-256 flash instantiation.** The gate kernel is worth ~2-3 dispatches; the flash
+  instantiation is what would remove the mask (the item «Prefill runs candle sdpa with a
+  materialized mask, not the vendored flash kernel» in this section). Neither is sized
+  against a measured bounty. These two are all that survived this item's original premise
+  — ~42 ms/layer of unfused attention glue — which was DOWNGRADED 2026-08-08 as inverted;
+  that narrative is in the archive. [Record](records/27b-prefill-residual.md).
+  From: Deferred from the dense-FFN prefill gemm pass (2026-07-29, P8c).
 
 ## Deferred from the K-snapshot verify pass (2026-07-29, P9a)
 
@@ -835,6 +879,26 @@ session logs referenced by log.md "K-snapshot fused verify lands".
   Separate new observation from the same sweeps, unexplained and NOT arming-dependent:
   **lm_head roughly doubles at span 48 (7.0 → 13.1 ms)** in both the armed and the
   unarmed profiled runs. Recorded so a future contradiction has a trail.
+
+[Item closed 2026-09-06 by decision, option (c): accept and document — decisions.md "Serving", the paragraph on plane-less slots.]
+
+- [ ] [unpriced] **Serve slots persisted without drafter planes silently decode plain forever
+  under default-on drafting** (Codex review of the flip, corroborated against the
+  code). `hydrate`'s `None => reset_drafter()` branch (serve/engine.rs, see the
+  comment there) was written for the flag-change edge; with drafting default-on it
+  is the COMMON path against slots written by `--no-draft` runs or pre-drafting
+  builds. A reset drafter at a nonzero restore point can never resync — its cache
+  is fed by target-layer taps during target forwards, `drafter_span_rows` returns
+  0 whenever `pos != committed` (unit test at generate.rs:3139 pins this), and
+  re-seeding would require re-running the target prefill the snapshot exists to
+  avoid. Output stays correct; speculation is lost and the server still reports
+  draft ON. Options when this is picked up (fits P10 serve adaptation): (a)
+  per-conversation draft status so the degradation is at least visible, (b) drop
+  the snapshot when drafting is enabled and planes are absent (trade prefill reuse
+  for speculation — wrong for long contexts), (c) accept and document. No option
+  is obviously right without measuring how often real serve traffic hydrates
+  plane-less slots.
+  From: Deferred from the K-snapshot verify pass (2026-07-29, P9a).
 
 ## Deferred from the small-batch mat-vec pass (2026-08-08)
 
@@ -1041,6 +1105,18 @@ deliberately did not carry.
   under test ratchets the bound outward forever and catches nothing.
   [Rationale and trip-wire](parity.md#perplexity-gate).
 
+[Item closed 2026-09-06 as already shipped: `GrammarTrie::embedded()` builds at `LagunaTokenizer::PADDED_VOCAB` and a unit test pins the padded width above the tokenizer's; grammar-masked batch has run on the real model since 2026-08-09.]
+
+- [ ] [small] **Qwen3.6 vocab is 248320 padded / 248077 real, and constrain.rs will trip on
+  it.** `constrain.rs:90` asserts `tok_trie().vocab_size() == expected_vocab` and
+  `:264` feeds it the tokenizer's id space (~248070 via HF tokenizer), while the
+  model's logits width is 248320 — the equality fails against a real model. Decide:
+  pad the trie to logits width (padding ids permanently masked) or relax the check to
+  trie ≤ logits with the tail force-masked. Also check the ban-string path against
+  [PADnnnnnn] ids (type 5, unreachable but present). tokenizer.rs now exposes both
+  sizes distinctly (chat-tok phase).
+  From: Deferred from the fork bootstrap (2026-07-28).
+
 ## Deferred from the serve batch + multi-checkpoint arc (2026-08-11)
 
 - [x] **The batch route inherits axum's default request-body limit (~2 MB) — DONE
@@ -1205,6 +1281,18 @@ and C deliberately did not carry.
   What remains: nothing about the shape, but the fallback floor it exposes is worth a
   measurement.
 
+[Duplicate of the open item «The MTP head cannot follow a rewind, so a serve conversation that rewinds stops speculating until it prefills from zero.», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [unpriced] **A stored MTP cache image resumes only at the position it ends at.** Same root as
+  the item above, seen from the disk tier: `DrafterImage` carries one carry hidden, so
+  `MtpDrafter::import_cache` refuses a `pos` short of `image.pos` rather than restoring a
+  head that cannot take another token. A page-in that resumes at an earlier snapshot
+  therefore loses the drafter planes and runs that conversation plain — which is the
+  regime `Engine::rejects_image` already documents as acceptable (a drafter refusal costs
+  speculation, not the conversation), but it is more common for this kind than for
+  DFlash, whose images take any prefix. Fixed by whichever fix the item above gets.
+  From: Deferred from the MTP drafting arc (2026-08-15, stages B and C).
+
 ## Deferred from the chat-dialect and sampling-defaults arc (2026-08-19)
 
 - [x] **`--min-think`/`--max-think` are not guarded against `--no-think`.** The same
@@ -1365,6 +1453,16 @@ gemm first for prefill — [log](log.md#2026-09-05--duplicate-dispatch-probe-pri
   [Log](log.md#2026-08-30-qsa-decode-step-c--block-selection-moved-onto-the-device-flash-next-decode-above-the-2048-budget-33--44-45-toks-at-38k-32k-the-cliff-closed),
   decisions.md "Decode selection runs on the device". Remaining sub-items:
 
+[Duplicate of the open item «Above the 2048 indexer budget: +165 dispatches», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [unpriced] **`kernel_qsa_select`'s threshold walk is serial on thread 0.**
+  The walk covers 256 bins × 4 passes on that one thread; a cooperative
+  256-thread walk (per-bin prefix via scan) is the obvious next shape. Measure the
+  kernel's share of the step with an amortized bench before acting — at 44-45 vs 46.7
+  there is at most ~1 ms/step left in the whole above-budget path.
+  From: Deferred from the prefill-chunk pass (2026-08-30).
+  Promoted from the item «Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the 2048-token QSA budget, then slopes gently» on 2026-09-06; dated 2026-08-30 there.
+
 ## Deferred from the technique survey (2026-08-30)
 
 - [x] **`CANDLE_METAL_COMPUTE_PER_BUFFER` default (50, per DISPATCH not per op —
@@ -1391,6 +1489,35 @@ ranked candidates against published evidence, it did not measure anything on thi
 machine, so no item carries an expected win. Each says what would have to be measured
 first. The candle-side items (3) and (4) are patches to the pinned rev 21cca0b, which
 nothing in this repo has done before; treat that as part of their cost.
+
+[Duplicate of the open item «+350 to +560 µs/token of prefill cost lives OUTSIDE every measured stage, and it grows with prompt length.», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [unpriced] **Per-resource barrier scoping and dependency-filtered cross-encoder fence waits**
+  (candle patch). candle's `auto_barrier` emits a whole-scope barrier over the full
+  window since the last one (`encoder.rs:104-149`), and every new encoder waits on every
+  live fence rather than only the ones it depends on. This is the same pair the
+  2026-08-08 prefill-residual entry left standing as the unconfirmed remainder after
+  `XWEN_CHUNK_SYNC` and the cadence sweep both cleared — and that entry's closing
+  condition was "do not re-propose without an instrument that can see inside a chunk",
+  which a patched candle IS. Estimate unknown; the residual it targets is +350-560
+  µs/token on 27B prefill.
+  From: Deferred from the technique survey (2026-08-30).
+
+[Duplicate of the open item «Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [measured] **Fuse gate/up + SiLU onto the cooperative-tensor accumulators in `mm_id`**
+  (BaseRT-M5's shape, arXiv 2607.00501). Prefill only; the `_t` family already
+  dequantizes the expert tile once per token tile, and this would keep both projections'
+  results in the accumulators through the activation instead of round-tripping them.
+  **Bounded by an already-measured fact**: the expert gemms are a MINORITY of the
+  prefill `ffn` stage — the 2026-08-30 mm_id pass moved them +17-23% in isolation and
+  the stage fell 3-5%. So a few percent of `ffn` at best, and the non-gemm parts of that
+  stage (router, combine, SwiGLU glue) rank above it. Estimate unknown but capped low.
+  [CONTESTED 2026-09-05: that "minority" reading came off the 2.2x-inflated stage
+  profiler, two in-situ A/Bs bracket the expert gemms at 14-43% of prefill WALL, and the
+  cap is lifted to "unpriced" — [record](records/ceiling-diagnosis.md).]
+  [PRICED 2026-09-05: 28-32% of prefill wall by the duplicate-dispatch probe.]
+  From: Deferred from the technique survey (2026-08-30).
 
 ## Next Flash-Next perf work (2026-09-05)
 
@@ -1905,6 +2032,58 @@ Decision: we WILL port it, targeting Q4_K on this machine.
   items across the area sections, each naming that same heading.
   From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
 
+[Duplicate of the open item «Above the 2048 indexer budget: +165 dispatches», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [unpriced] **QSA top-k runs on the host via arg_sort.** A device partial-top-k kernel
+  is the intended replacement: D16 says selection is computed with candle ops in P2, and
+  says explicitly that the top-k kernel is P3.
+  From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
+  Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
+
+[Duplicate of the open item «Flash-Next still ships no drafter, and `supports_drafting()` stays false.», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [blocked] **Flash-Next's two closed gates: auto_fetch and supports_drafting.**
+  TWO GATES DID NOT MOVE and this ledger keeps them: `auto_fetch()` stays false (a
+  111 GB fetch is explicit-only) and `supports_drafting()` stays false (D6's missing
+  speculative verify seam). The unconsumed `recommended_presence_penalty`, the Unsloth
+  template divergences and the seven audio/TTS specials are untouched and still open,
+  under «Flash-Next's unconsumed presence penalty, template divergences and audio
+  specials» in "Tokenizer, chat and sampling". New work this arc left behind carries the
+  `From:` line "Deferred from the qwen4exp cache-image arc (2026-08-30, P4)".
+  From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
+  Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-30 there.
+
+[Duplicate of the open item «No parity-gate or retune arm for Qwen3.8-27B.», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [small] **No ppl reference fixture for Qwen3.8-27B.**
+  **2026-08-29.** Re-grading the
+  oracle bump (e9fa0781 → `6fe749801`) turned this up: the 3.8-27B parity run
+  can only grade strict/mm/decode, because
+  `tests/fixtures/reference-ppl-Qwen3.8-27B-Q4_K_M.json` does not exist and
+  never has — a full-tier run bails with "ppl reference fixture missing", so
+  the checkpoint has been shipping without a perplexity floor since it was
+  added. Nothing regressed; the tier was simply never calibrated for this
+  file. Fix: `--regen-ppl-ref` against the 3.8 hub file, then grade ppl and
+  record the floor in docs/parity.md beside the 3.6 pair's. Until then the
+  3.8's parity coverage is 5 checks where the others get 6.
+  From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
+  Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
+
+[Duplicate of the open item «The parity harness cannot run on qwen4exp.», folded and moved verbatim on 2026-09-06.]
+
+- [ ] [small] **parity-gate.ts accepts --model-size flash-next with no fixtures behind it.**
+  `scripts/hf.ts`'s flash-next entry widens what `--model-size` the parity gate
+  accepts, with nothing behind it. The entry exists so `bench.ts` can resolve
+  the checkpoint (b54046b), but the gate reads the same table, so
+  `parity-gate.ts --model-size flash-next` is now spellable and will fail deep
+  rather than at argument validation — the harness cannot run on this checkpoint
+  at all and there are no fixtures for it. Low priority precisely because the run
+  fails either way; fix by gating the gate's accepted set on fixture existence.
+  Same entry: its **`shards` key is dead** — nothing reads it, the loader finds
+  the shard set from any one file. Delete it or make it load-bearing.
+  From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
+  Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
+
 ## Deferred from the DeltaNet decode-scan pass (2026-08-30)
 
 [Section prose of the pre-regroup ledger, moved verbatim on 2026-09-06.]
@@ -1913,6 +2092,21 @@ Decision: we WILL port it, targeting Q4_K on this machine.
 the general kernel still runs seq == 1 by default) and measured as a wash
 (log.md 2026-08-30 "later still", decisions.md "A decode-specialized scan kernel is a
 WASH"). These are the two things it deliberately did not take.
+
+[Item closed 2026-09-06 as a doc change: docs/benching.md now carries the caveat that the line ranks steps and does not time them.]
+
+- [ ] [small] **`XWEN_GDN_PROFILE`'s decode line overstates a step by roughly its dispatch
+  round trip, and the dispatch-floor correction does not recover it.** The scan measured
+  3.79-7.19 ms/token corrected in that line against 1.43 ms/token in an amortized bench
+  of the same work at the same geometry, and the same inflation applies to every step in
+  the line (its raw mixer total, 78 ms, is more than three whole unprofiled tokens). The
+  line is still useful for RANKING steps within one run — which is how the 27B prefill
+  work used it — but a decode figure from it must not be quoted as a cost, and the
+  shares it prints are shares of an inflated total. Either bracket the whole block once
+  and attribute by difference, or run every step under `XWEN_GDN_REPS` and say so on
+  the line; until then treat it like `XWEN_STACK_PROFILE`'s decode stages (CLAUDE.md
+  already says those rank, not time).
+  From: Deferred from the DeltaNet decode-scan pass (2026-08-30).
 
 ## Deferred from the first Flash-Next serve benchmark (2026-08-30)
 
@@ -1933,6 +2127,16 @@ changed, so everything here is a follow-up rather than a leftover.
 Shipped that day: per-run JSONL records on every surface and `xwen stats` over them
 (log.md "Per-run metrics on disk"; the choices in decisions.md "Metrics"). Nothing here
 blocks use of the feature; item (a) is the one with a known trigger.
+
+[Item shipped 2026-09-06 (7f0659e: the field and `--by agent`), moved verbatim.]
+
+- [ ] [small] **`x-claude-code-agent-id` is not recorded.** Claude Code sends it on subagent
+  requests. It was left out on purpose: recording it as the session would split one
+  session into a row per agent, which is the wrong default for the question `--by
+  session` answers. It is real information though, and "which subagent burned the
+  tokens" is a question this history could answer. If it lands it wants its own field
+  and its own `--by agent`, never a fallback inside `session_key`.
+  From: Deferred from the metrics arc (2026-09-05).
 
 ## Retired: Prefill performance
 
@@ -1978,6 +2182,24 @@ blocks use of the feature; item (a) is the one with a known trigger.
      switch off yet. It belongs with (b).
   From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
 
+[Retired 2026-09-06: it only matters for short chunks and ragged tails and nothing has shown those shapes hot. Reopen if: a prefill probe shows the shexp or hc route hot at short chunks.]
+
+- [ ] [small] **`DENSE_MM_MIN_SEQ` is unfitted for the shexp/hc shapes.** The 32-token
+  floor was fitted on the 27B FFN (k 5120/17408); the shexp (k 2560/640, and
+  2048/512 on the 35B) and hc (k 10240/320) routes inherit it unmeasured
+  (2026-08-30). Only matters for short chunks and ragged tails; sweep
+  `XWEN_DENSE_MM_MIN_SEQ` over those shapes if they ever show up hot.
+  From: Deferred from the prefill-chunk pass (2026-08-30).
+
+[Retired 2026-09-06: one sync per chunk, not per token, and the item itself rates it low value. Reopen if: a prefill probe prices the per-chunk readback above 1% of wall.]
+
+- [ ] [unpriced] **QSA prefill still reads the scores back once per chunk per layer to build the mask on the host.**
+  Prefill is `n > 1`, and it assembles the `[n_q, n_kv]` mask on the host rather than on
+  the device. A device-side mask build (top-k per query row,
+  then a fill kernel) would remove it; low value — one sync per chunk, not per token.
+  From: Deferred from the prefill-chunk pass (2026-08-30).
+  Promoted from the item «Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the 2048-token QSA budget, then slopes gently» on 2026-09-06; dated 2026-08-30 there.
+
 ## Retired: Cache images, memory and context
 
 [Retired 2026-09-06: Qwen ships no YaRN scaling keys in config or GGUF, the native window is 262144, and no workload here has asked for more. Reopen if: a real workload needs context beyond the native 262144 window.]
@@ -2003,6 +2225,30 @@ blocks use of the feature; item (a) is the one with a known trigger.
   be an interval, defaulted off.
   From: Deferred from the first Flash-Next serve benchmark (2026-08-30).
 
+[Retired 2026-09-06: a workload that alternates checkpoints and misses its warm conversations does not exist here. Reopen if: a workload alternates checkpoints and loses warm conversations to the swap.]
+
+- [ ] [blocked] **The disk tier serves only the default checkpoint.** A non-default checkpoint
+  runs with every disk-tier call site handed `None`: the tier binds to one checkpoint
+  id at startup and `verify()` permanently distrusts itself against any other. The
+  segment layout is already per-checkpoint directories (`root/<checkpoint>/`), so the
+  lift is opening one tier per checkpoint lazily rather than one at startup — do it
+  when a workload actually alternates checkpoints and misses its warm conversations,
+  not before. Until then a swap costs the outgoing checkpoint's warm slots and, with
+  the tier on, keeps only the DEFAULT checkpoint's conversations across swaps.
+  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
+
+[Retired 2026-09-06: no blessed file hits it at any ceiling and the state is safe when it does. Reopen if: a misconfigured `max_ctx` fails mid-conversation for someone; the fix is a load-time advisory line.]
+
+- [ ] [blocked] **Lazy KV moves the unaffordable-`max_ctx` failure from load time to
+  mid-conversation.** Eager allocation failed fast at load; now the same misconfigured
+  server starts fine and hits the allocation error at whatever depth exhausts the
+  device — a growth step failing mid-request surfaces as that request's error (the
+  state is safe and retries converge, `grow_kv_capacity`'s doc). `MEMORY_WARN_BYTES`
+  (90 GiB) never fires for any blessed file even at the 262144 ceiling, so the warning
+  is not the guard here. If this ever bites, the fix is a load-time advisory line
+  ("ceiling X GiB exceeds device memory Y") rather than a return to eager allocation.
+  From: Deferred from the client-feedback arc (2026-08-11).
+
 ## Retired: Drafting
 
 [Retired 2026-09-06: outside the production regime (block_size 16 caps real verify spans near 17) and the 2026-08-08 evidence attributes it to armed-trail memory pressure, not a kernel threshold. Reopen if: a drafter whose block_size pushes real verify spans past 32, or an armed-trail memory regression in production.]
@@ -2021,6 +2267,53 @@ blocks use of the feature; item (a) is the one with a known trigger.
   rather than a kernel threshold. Still outside the production regime and unchased.**
   [Log](log.md#2026-08-08--verify-round-diagnosis-the-149-ms-fixed-cost-is-the-dense-ffns-matmuls-at-small-m-and-none-of-the-armed-machinery-it-was-blamed-on).
   From: Deferred from the K-snapshot verify pass (2026-07-29, P9a).
+
+[Retired 2026-09-06: custom-GGUF-only edge on a design target of blessed checkpoints whose sidecars always match, and `--no-draft` is the workaround. Reopen if: someone runs a custom GGUF whose sidecar fails preflight and wants plain decode instead of an error.]
+
+- [ ] [blocked] **The draft-by-default flip makes a mismatched custom GGUF fail at startup.**
+  With drafting opt-out, `xwen serve --model <custom.gguf>` whose geometry fails the
+  drafter preflight (`DflashConfig::check_against_target`) now hard-errors where it
+  previously ran plain; `--no-draft` is the workaround. Recommended shape when it
+  bites someone: an IMPLICITLY-defaulted drafter that fails preflight should degrade
+  to plain decoding with a warning, while an EXPLICIT `--draft` keeps the hard error.
+  Not built now: the design target is the two blessed checkpoints, whose sidecars
+  always match, so the edge is custom-GGUF-only.
+  From: Deferred from the K-snapshot verify pass (2026-07-29, P9a).
+
+[Retired 2026-09-06: the truncation argument holds for every shape shipped (shared prefix below the snapshot position), and the harder case only arrives with a prefix tree or concurrent sequences. Reopen if: the multi-level prefix tree or concurrent-sequence serving lands.]
+
+- [ ] [small] **DFlash draft-slot handling across snapshot/restore was never checked against
+  SGLang's pattern.** Batch replay syncs the drafter by truncation (`sync_drafter_to`),
+  which is correct here because every item shares every token below the snapshot
+  position — see decisions.md "Batch". The serving-SOTA research surfaced SGLang's
+  snapshot/promote handling of speculative draft slots across cache reuse, which solves a
+  strictly harder problem (concurrent sequences, divergent branches) and may name a case
+  the truncation argument does not cover. Read it against `sync_drafter_to` and
+  `DrafterImage` before the multi-level prefix tree or the serve endpoint lands, since
+  both break the shared-prefix premise truncation rests on.
+  From: Deferred from the batch + scored-classification arc (2026-08-09).
+
+[Retired 2026-09-06: no custom drafter for Qwen3.8-27B exists and the retune script cannot sweep one. Reopen if: someone runs a custom drafter on Qwen3.8-27B.]
+
+- [ ] [blocked] **No fitted draft floor for a custom drafter on Qwen3.8-27B.** Exposed by the
+  per-checkpoint `DraftMode` work of 2026-08-14
+  ([record](records/serve-target-review.md),
+  [decisions/serving.md](decisions/serving.md)), which settled the shape and left
+  this floor behind. A custom drafter attached to a checkpoint with no fitted floor of
+  its own falls back to `SpecParams::default().draft_p_min`, which is the 35B-A3B's fitted 0.3
+  wearing a neutral name — an arbitrary value for that pair. If anyone actually runs a
+  custom drafter on Qwen3.8-27B, fit a floor for it (`scripts/retune-draft.ts` cannot:
+  it sweeps official sidecars only).
+  From: Deferred from the MTP drafting arc (2026-08-15, stages B and C).
+
+[Retired 2026-09-06, sub-item (e) of the open item «The DFlash drafter's per-token cache sync, its unre-derived draft-ctx horizon, and the deferred ring-buffer cache» in "Drafting": only worth it if `draft_ctx` grows a lot under (c), and (c) is taken with the 128k envelope work. Reopen if: `draft_ctx` is raised well past 8192 and the flat `[n_kv, max_ctx, hd]` allocation shows in the footprint.]
+
+   - **(e) A ring-buffer drafter cache is deferred.** The per-layer cache stays a flat
+     `[n_kv, max_ctx, hd]` array; windowing lives in `attention`'s narrow-plus-mask.
+     A ring would cap the allocation at the window rather than at `draft_ctx`, but it
+     would also stop `DrafterImage` being a straight prefix copy of the committed
+     rows, which is what makes export/import and the disk tier simple. Only worth it
+     if `draft_ctx` grows a lot under (c).
 
 ## Retired: Decode performance
 
@@ -2102,6 +2395,32 @@ blocks use of the feature; item (a) is the one with a known trigger.
   From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
   Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
 
+[Retired 2026-09-06: each of its three parts is a deliberate non-take with no number and no user waiting, and the item itself states the condition under which each becomes worth taking. Reopen if: the epilogue learns to write both `ffn_out` and `l_out` when taps are on, a prefill probe prices the combine above 1% of wall, or the dual path ships on by default.]
+
+- [ ] [measured] **Three leftovers from the MoE glue fusion: the residual add, the prefill
+    combine, and `mul_mv_id_dual`'s unchecked ids.** The fusion itself shipped 2026-07-29
+    ([record](records/fused-moe-glue.md), decisions.md "Kernel policy"); these are
+    what it deliberately did not take.
+    - **The residual add was NOT fused in, on purpose.** The briefed design folded
+      `model.rs`'s `x + ffn_out` into the epilogue for a twelfth dispatch. That would
+      delete the `ffn_out` tap, which docs/parity.md lists with published per-layer
+      floors on both checkpoints — or force the gate onto the classic path, where it
+      would never exercise the fused epilogue at all. Worth ~40 dispatches per token
+      (one per layer) if someone later teaches the epilogue to write both `ffn_out` and
+      `l_out` when taps are on; not worth a provenance hole.
+    - **Prefill is untouched and was not attacked.** Above `MM_ID_MIN_SEQ` the epilogue
+      declines (the f16-tile projection carries an L2 rescale it has no term for) and
+      only the router kernel and the shared-expert activation fuse; measured +0.6% at
+      925 tokens and +0.2% at 4k, i.e. nothing. Fusing the prefill combine would mean
+      an epilogue variant carrying the rescale — cheap to write, but prefill is
+      compute-bound at ~2100-2500 tok/s and there is no evidence it would show.
+    - **`mul_mv_id_dual`'s wrapper trusts its ids buffer.** It validates rank, dtype,
+      contiguity and dims but not that each id is < n_expert (values live on the GPU;
+      checking means a readback) nor that ids/gate/up share x's device. Fine for the
+      router-produced ids of its only caller, loose for a `pub` API. Harden if the
+      dual path ever ships on by default.
+  From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
+
 ## Retired: Research candidates
 
 [Retired 2026-09-06: no comparative claim is being published, and the arm costs a second large-model process on a machine whose standing rule is one at a time. Reopen if: before publishing any claim of a lead in the 35B-A3B class on Apple silicon.]
@@ -2116,3 +2435,340 @@ blocks use of the feature; item (a) is the one with a known trigger.
   log only; re-research before citing (aggregator-tier numbers were discarded as
   unreliable).
   From: Deferred from the landscape research (2026-08-30).
+
+## Retired: Serve, batch and CLI
+
+[Retired 2026-09-06: the literature puts single-level collapse at roughly 1% of achievable reuse and no measured workload here loses on it. Reopen if: a measured workload where the single level demonstrably loses, or a system prompt shared across successive batch requests becomes a real cost.]
+
+- [ ] [blocked] **Prefix grouping is single-level, and there is no cross-batch pinned snapshot.**
+  One batch computes one LCP over all items; items that share more with each other than
+  with the batch as a whole get no credit for it, and a system prompt shared across
+  successive batch requests is re-prefilled every time. The literature says the first
+  costs little: BatchLLM measured single-level collapse at roughly 1% of achievable reuse
+  against a full prefix tree, and a tree brings eviction, invalidation and per-node
+  snapshot accounting with it. The pinned cross-batch snapshot is the cheaper of the two
+  and is the one to build first if it is built. Revisit only with a measured workload
+  where the single level demonstrably loses, not on principle.
+  From: Deferred from the batch + scored-classification arc (2026-08-09).
+
+[Retired 2026-09-06: no caller needs machine-readable progress from a batch, and the single-document output is what makes `jq` over a batch trivial. Reopen if: a caller needs per-item results before the batch ends.]
+
+- [ ] [small] **Results are not streamed.** `xwen batch` prints one JSON document when the last
+  item finishes; progress goes to stderr as unstructured lines. A long batch therefore
+  gives a caller nothing machine-readable until the end. NDJSON on stdout (one
+  `ItemResponse` per line, `BatchStats` last) is the obvious shape and would not change
+  the core, which already completes items in request order. Wants a flag rather than a
+  format change — the current single-document output is what makes `jq` over a batch
+  trivial.
+  From: Deferred from the batch + scored-classification arc (2026-08-09).
+
+[Retired 2026-09-06: no long batch runs over HTTP here, and the same shape as «Results are not streamed» would solve both. Reopen if: a long batch over HTTP is cut off by an idle-timeout proxy or a client needs progress.]
+
+- [ ] [small] **Batch-over-HTTP gives no progress until the last item.** The CLI shows stderr
+  progress lines; the HTTP client gets one JSON document at the end and nothing before
+  it (a proxy that times out idle responses will cut a long batch off). The engine-side
+  hooks already emit per-item progress into the server log, so an SSE or NDJSON variant
+  of the route is wiring, not design. Related to the existing «Results are not
+  streamed» item in this section — solve both with one shape when picked up.
+  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
+
+[Retired 2026-09-06: no client asks for token-level evidence; the scored path answers the label-level question that is asked. Reopen if: a client needs `logprobs`/`top_logprobs` on emitted tokens.]
+
+- [ ] [small] **Per-token logprobs are not exposed in any dialect.** `include_score` reports
+  confidence over a field's ALLOWED OPTIONS, which is a different quantity from
+  OpenAI's `logprobs`/`top_logprobs` (raw log-softmax over the vocabulary at each emitted
+  position, top-k of it). The machinery for both now exists — `Generator::last_logprobs_for`
+  is the log-softmax over an encodable slice — but the two must not be conflated in the
+  surface: a client asking for `logprobs` wants token evidence, not label evidence.
+  Independent of the scored path; belongs with the serve adaptation.
+  From: Deferred from the batch + scored-classification arc (2026-08-09).
+
+[Retired 2026-09-06: an accuracy refinement of the scored classifier that nobody has asked for; away from near-ties the channels agree. Reopen if: a scored near-tie on a boolean is read as a confident answer, or a consumer needs the channels summed.]
+
+- [ ] [unpriced] **Scored-field probabilities are conditional on the compact skeleton, and the
+  formatting channels disagree on near-ties.** The 2026-08-11 row dump behind the
+  escape fix shows the first boolean slot at ` true` 54.9% / ` false` 44.9%
+  (space-led spellings) while the bare-token channel the teacher-forced skeleton
+  actually scores through reads true 0.444 / false 0.556 — the two channels pick
+  OPPOSITE winners on this near-tie. Away from ties they agree (spam field: 0.998
+  false both ways), and the scores' renormalization argument ("formatting divides
+  out") holds only when format preference is independent of the value, which this
+  measurement shows it is not exactly. Candidate refinement: also score each option
+  through its space-led single-token spelling and sum the channels; interacts with
+  check_seams and the terminator rule. Do not treat a scored near-tie (|p−0.5| small
+  on a boolean) as a confident answer; the escape fix does not change this.
+  From: Deferred from the batch + scored-classification arc (2026-08-09).
+
+[Retired 2026-09-06: the README definition stands and consumers can compare escape across categories with and without first fields; the split wants the channel-summing refinement derived alongside it. Reopen if: a consumer needs value-escape separated from format drift, together with the channel-summing refinement.]
+
+- [ ] [unpriced] **`escape` conflates value disagreement with format drift, materially so at
+  first fields; a split is a candidate refinement.** The 2026-08-12 confirmation dump
+  (log.md) shows 25-46% of the no-think field-0 outside mass is ` True`/` False` — the
+  chosen answer in a spelling that would invalidate the JSON — and bare `True`/`False`
+  are 28-87% of later fields' outside mass, so the mixture is everywhere, not a
+  first-field artifact. Classifying these OUTSIDE is correct (the assembler would
+  never emit them), but escape therefore overstates value-level disagreement wherever
+  it is read, and first fields are where its absolute magnitude (1e-2 vs 1e-5) makes
+  that material. Candidate: report escape's top outside
+  components, or split it into value-escape (bytes that prefix no option under ANY
+  casing/spelling equivalence) vs format-drift (an option's bytes under a
+  non-canonical spelling). The equivalence class is the hard part — it interacts with
+  the channel-summing refinement one item up, and both should be derived together if
+  either ships. Until then the README definition stands and consumers should compare
+  escape across categories with and without first fields.
+  From: Deferred from the batch + scored-classification arc (2026-08-09).
+
+[Retired 2026-09-06: each of the four lifts is a scope decision with no schema waiting on it. Reopen if: a schema someone needs is refused by the shape guard.]
+
+- [ ] [unpriced] **v1's scored-schema limits are refusals, and each has a known lift.** The shape
+  guard accepts a flat all-required object of enum/boolean fields and refuses everything
+  else by name. Four separable extensions, in rough order of value: (1) values that merge
+  with their delimiter under BPE — the seam check refuses them today; scoring the merged
+  token as the option's last token is the principled fix, and it interacts with the
+  terminator-token rule, so derive them together; (2) JSON-escaped values, refused
+  because the escape sequence rather than the label would be what gets scored; (3)
+  free-form fields alongside scored ones, which means interleaving assembly with
+  grammar-masked decode inside one document; (4) free `thinking: true` combined with
+  `prefill`, currently not composable on a scored item. Each is a scope decision, not a
+  bug.
+  From: Deferred from the batch + scored-classification arc (2026-08-09).
+
+[Retired 2026-09-06: both checkpoints are cached on this machine and the download resumes on retry. Reopen if: a request names an uncached checkpoint and races the watchdog, or the hf-hub progress bar draws over the TUI.]
+
+- [ ] [blocked] **A cache-miss checkpoint downloads inside the request that named it.** ~20 GB
+  on a miss, inside one HTTP request, racing the watchdog deadline if one is configured
+  (the download resumes in place, so a retry eventually completes — hf-hub semantics).
+  Both checkpoints are cached on this machine, so this is theoretical here; if it ever
+  bites, the fix is a 503-with-progress answer while a background fetch runs, not a
+  longer deadline. Also: hf-hub's own byte-level progress bar writes to raw stderr
+  (`ApiBuilder::with_progress(true)`), bypassing `ServeLogger` — under `--tui` it
+  draws over the dashboard, the same hazard class the batch runner's `eprintln!`s
+  were converted to hooks for. Route or suppress it when this item is picked up.
+  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
+
+[Retired 2026-09-06: deliberate: the native generate surface is modelless by design and the batch route selects. Reopen if: a native-API consumer wants the non-default checkpoint through `/xwen/v1/generate`.]
+
+- [ ] [blocked] **`/xwen/v1/generate` carries no model field.** Deliberate — the native generate
+  surface documents itself as modelless and the batch route is the native surface that
+  selects — but it is now the only route that cannot reach the non-default checkpoint.
+  Add the field if a native-API consumer ever wants it; it is a two-line change in
+  `prepare` plus tests.
+  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
+
+[Retired 2026-09-06: exposure is bounded by one short item plus one prefill and no workload has a span long enough to care. Reopen if: a workload has scored spans or prefills long enough that cancel latency matters.]
+
+- [ ] [blocked] **Mid-batch cancellation does not reach the scored path's forced spans, nor any
+  prefill.** The cancel poll runs between items and per decoded token inside an item's
+  free decode; a scored item's teacher-forced assembly checks only at item boundaries,
+  and neither the shared-prefix prefill nor an item's own tail prefill polls at all
+  (`prefill_tokens` chunks internally but takes no callback). Items are short (≤192
+  tokens in the demo), so the exposure is bounded by one item's latency plus one
+  prefill — thread the poll through `assemble_scored` and the prefill chunk loop only
+  if a real workload makes either span long enough to care.
+  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
+
+[Retired 2026-09-06: on a single-user box the age limit bounds the damage and fairness under mixed traffic is not a workload here. Reopen if: scheduling fairness under real mixed traffic matters.]
+
+- [ ] [blocked] **The batch scheduling estimate is bytes-based and can read zero.** A batch of
+  items with empty message content (schema-only probes) estimates zero prompt tokens
+  and schedules as free; the real cost floor is the rendered template per item. Fold a
+  per-item constant into `size_estimates` (or estimate from the rendered skeleton)
+  when scheduling fairness under real mixed traffic matters; on a single-user box the
+  age limit already bounds the damage.
+  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
+
+[Retired 2026-09-06: a single-user machine does not interleave checkpoints in its queue. Reopen if: a real workload interleaves checkpoints and pays the swap per pickup.]
+
+- [ ] [blocked] **The scheduler does not group queued jobs by checkpoint.** `shortest-prefill`
+  scores by prefill cost alone, so a queue holding jobs for both checkpoints can pick
+  them interleaved and pay a ~3 s swap per pickup where checkpoint-grouped ordering
+  would pay two. The cost model could add the swap (a job for the non-resident
+  checkpoint costs its prefill plus a load-equivalent), which also naturally batches
+  same-checkpoint work without starving the other (the age limit already guards
+  starvation). Do it when a real workload actually interleaves checkpoints; a
+  single-user machine mostly will not.
+  From: Deferred from the serve batch + multi-checkpoint arc (2026-08-11).
+
+[Retired 2026-09-06: the default bind is loopback on a single-user machine. Reopen if: the server fronts a LAN under `api_key`.]
+
+- [ ] [blocked] **100 MB bodies are buffered with no concurrency bound.** The batch handler
+  buffers and serde-parses the whole body (typically 2-5x the text in tree form)
+  BEFORE `submit_batch` can answer 429, and nothing caps concurrent connections — N
+  clients can each hold ~100 MB + parse tree against 19-37 GB of resident weights.
+  Accepted for now: the default bind is loopback on a single-user machine, and the
+  compat dialects never need large bodies. If the server ever fronts a LAN under
+  `api_key`, add a concurrency-limit layer (or move the cap per-route: 100 MB for
+  `/xwen/v1/batch`, default for the dialects) before raising anything else.
+  From: Deferred from the client-feedback arc (2026-08-11).
+
+[Retired 2026-09-06: the dialect has no natural field for it and the OpenAI and native dialects carry it. Reopen if: Anthropic's API grows an effort field to mirror.]
+
+- [ ] [blocked] **The Anthropic dialect has no per-request template-effort knob.** Its API shape
+  has no natural field: `thinking.budget_tokens` is a budget, not a level, and inventing
+  a nonstandard field on a compat dialect defeats the point of speaking the dialect.
+  Requests get the server-wide `[thinking] effort` default (which `count_tokens` also
+  renders, so counts match generation); a client that needs per-request effort on 3.8
+  uses the OpenAI or native dialect. Revisit only if Anthropic's API grows an effort
+  field to mirror.
+  From: Deferred from the chat-dialect and sampling-defaults arc (2026-08-19).
+
+[Retired 2026-09-06: `XWEN_METRICS_FILE` reaches every surface and no server here needs its history somewhere specific. Reopen if: a server deployment needs a per-deployment metrics path or recording off for a benchmark front.]
+
+- [ ] [small] **A `[metrics]` table in serve.toml (path, enabled).** `XWEN_METRICS_FILE` is the
+  only control and it reaches all four surfaces, which is why it shipped alone
+  (decisions.md). A server is the one surface with a config file and the one that runs
+  long enough for an operator to want its history somewhere specific — a per-deployment
+  path, or recording off for a server that fronts a benchmark. The table would override
+  the variable for serve only; keep the variable as the surface-wide answer.
+  From: Deferred from the metrics arc (2026-09-05).
+
+[Retired 2026-09-06: under 10 MB a year at a hundred runs a day and the full-scan reader is comfortable well past that. Reopen if: the metrics file is large enough to be worth measuring (tens of MB).]
+
+- [ ] [blocked] **The file grows forever; there is no rotation or compaction.** A line is ~250
+  bytes, so this is a slow problem: a hundred runs a day is under 10 MB a year, and the
+  full-scan reader stays comfortable well past that. `--since` bounds what a report
+  reads over, not what the file holds. Nothing in xwen prunes, and that is deliberate
+  for now (the durable-history choice is the whole reason it is not in the cache dir),
+  but a machine left running for years wants either a size-triggered roll to
+  `metrics.jsonl.1` or a compaction that folds records older than N months into daily
+  summaries. Decide when the file is big enough to be worth measuring, not before.
+  From: Deferred from the metrics arc (2026-09-05).
+
+[Retired 2026-09-06: nothing moves away from midnight and the machine mostly runs in one season. Reopen if: a report is misread because of a clock change.]
+
+- [ ] [blocked] **One UTC offset is applied to every record in a report, so a daylight-saving
+  change buckets runs onto the wrong local day.** `read_utc_offset` shells out to
+  `date +%z` and the answer is read once per report, not once per record, so a report
+  covering both sides of a clock change interprets the far side an hour off. Away from
+  midnight nothing moves; within an hour of it a run lands in the neighbouring day's
+  bucket, and `--since YYYY-MM-DD` picks its cutoff by the same offset. Reading the
+  offset per record would mean a subprocess per line, which is not the fix; the fix is
+  either a real tz lookup (a dependency this arc declined) or reading
+  `/var/db/timezone`-style rules directly. Worth doing when someone is misled by it,
+  which on a machine that mostly runs in one season is not yet.
+  From: Deferred from the metrics arc (2026-09-05).
+
+## Retired: Parity, provenance and tooling
+
+[Retired 2026-09-06: empirically identical on this machine, and the bitwise ops tests plus the strict parity tier are the tripwire. Reopen if: a bitwise ops test or the strict tier fails with no other cause; suspect the compile axis first.]
+
+- [ ] [unpriced] **Bit-identity claims ride an unpinned Metal compile axis (candle compiles Fast, vendored kernels do not).**
+  Found by outside-model review, 2026-07-29. candle rev 21cca0b compiles its kernels with BOTH
+  `MTLMathMode::Fast` and `MTLMathFloatingPointFunctions::Fast`
+  (candle-metal-kernels `kernel.rs:191-192`); `pipelines.rs` compiles the vendored
+  sources with default options, and the fp pragmas pin only the math-mode axis.
+  Kernels calling `fast::exp`/`fast::divide` explicitly (the router) are immune;
+  the epilogue's bare `exp(-g)` in its sigmoid is the one spot where a toolchain
+  that lowers the two axes differently could split bits. Empirically identical on
+  this machine today — the bitwise ops tests and the strict parity tier are the
+  tripwire, and any future failure there should suspect this first. The clean fix
+  is constructing `MTLCompileOptions` to mirror candle's exactly, but that changes
+  the compile of EVERY vendored kernel and needs a full bitwise-suite + parity
+  re-run as its own arc, not a drive-by.
+  From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
+  Promoted from the item «MoE block glue fusion — SHIPPED 2026-07-29» on 2026-09-06; dated 2026-07-29 there.
+
+[Retired 2026-09-06: nothing has needed an attention-side bench at Qwen geometry, and the deleted versions are in git history at the fork point. Reopen if: the 27B decode budget is next attacked and needs an attention-side bench.]
+
+- [ ] [small] **The attention and full-stack decode/prefill benches were deleted, not
+  ported.** `attention.rs`'s `tests::decode_bench` + `tests::prefill_bench`
+  modules (~1300 lines) and `moe.rs`'s `full_stack_decode_bench` measured
+  Laguna's attention chain — 48/72 heads, head dim 128, SWA rings, softplus
+  per-head gate — none of which exists in Qwen 3.6, and they were the only
+  consumers of the SWA-geometry test scaffolding. The MoE-side benches
+  (`moe_decode_ffn_bench`, the expert-gather attribution set) survive unchanged.
+  Rebuild the attention-side equivalents at Qwen geometry (16 Q / 2 KV heads,
+  head dim 256, double-width `attn_q`, uniform causal) when the decode budget is
+  next attacked; the deleted versions are in git history at the fork point.
+  From: Deferred from the P2-P4 model-core retarget (2026-07-28).
+
+[Retired 2026-09-06: a watch item whose tripwire is the ppl gate itself; nothing to do until it moves. Reopen if: the ppl tier fails or the 35B delta rises past 0.0015 (it sits at 0.000791 against a 0.002 floor).]
+
+- [ ] [measured] **The 35B's perplexity delta grew with the fused DeltaNet scan and the floor's
+  margin shrank.** `PPL_NLL_DELTA_MAX = 0.002` stands and is not re-derived from the
+  fused measurement (RESOLVED 2026-07-28 by the parity owner;
+  [rationale and trip-wire](parity.md#perplexity-gate)).
+  Still open as a WATCH item: the fused scan sits at 0.000791 on the 35B, so a
+  further ~2.5x rise fails the gate, and the sign is systematic (candidate worse in
+  all four measurements across both architectures — the fused scan widened the gap
+  ~+50% on each). This is the single most sensitive number the gate reports about the
+  fused scan; the cosine tiers barely moved (35B mm actually improved, 0.999540 →
+  0.999631).
+  From: Deferred from the fork bootstrap (2026-07-28).
+
+[Retired 2026-09-06: accepted by decision and no near-tie flip has been suspected in production. Reopen if: a near-tie flip is suspected in production; measure it before blaming sampling.]
+
+- [ ] [blocked] **Partition-parity drift never measured.** The q8/f16 dual-storage split makes
+  cached state depend on call partitioning (see decisions.md "Kernel policy" entry,
+  2026-07-28). Accepted by decision, but the drift magnitude at the 8↔9 boundary on
+  real weights has never been quantified — measure it (same prompt, cache on/off,
+  compare state and downstream logits) if a near-tie flip is ever suspected in
+  production, before blaming sampling.
+  From: Deferred from the fork bootstrap (2026-07-28).
+
+[Retired 2026-09-06: ggml-org was chosen on provenance and output quality has not come into question. Reopen if: output quality comes into question; point the ppl gate at a competing Q4_K_M.]
+
+- [ ] [blocked] **Quant-vendor comparison never measured.** ggml-org was chosen over
+  unsloth/bartowski on provenance (converter authors, inspectable custom mix, dflash
+  sidecars), not on quality. Now that the perplexity gate exists, pointing it at a
+  competing Q4_K_M is cheap — run it if output quality ever comes into question.
+  From: Deferred from the fork bootstrap (2026-07-28).
+
+[Retired 2026-09-06: both production extents are 4 and no checkpoint with a wider indexer geometry exists. Reopen if: a checkpoint with `ratio` or indexer head count above 5.]
+
+- [ ] [small] **`strided_sum`'s reduce-order replay refuses extents above 5, so a wider indexer geometry fails at `select`.**
+  The reason is candle's reducer, which
+  folds through a 4-lane `simd_sum` there so the bit-identity breaks (1 ulp at
+  extent 6). Both production extents are 4; a checkpoint with `ratio` or indexer
+  head count above 5 would fail at `select` and needs either the plain `sum` (bounded,
+  not bitwise) or a widened replay.
+  From: Deferred from the prefill-chunk pass (2026-08-30).
+  Promoted from the item «Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the 2048-token QSA budget, then slopes gently» on 2026-09-06; dated 2026-08-30 there.
+
+[Retired 2026-09-06: the CPU/oracle path is not graded on Flash-Next today, so the silent fallback has no consumer. Reopen if: the parity harness runs on Flash-Next (the «The parity harness cannot run on qwen4exp» item), which grades the CPU/oracle path.]
+
+- [ ] [small] **The fused QSA gather is Metal-only and alignment-restricted; the CPU/oracle path silently takes the `index_select` chain.**
+  A non-Metal source (the CPU/oracle attention
+  path) takes that chain with no switch. The kernel refuses a view
+  whose start or head stride is not a multiple of 4 elements (vec4 loads).
+  From: Deferred from the prefill-chunk pass (2026-08-30).
+  Promoted from the item «Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the 2048-token QSA budget, then slopes gently» on 2026-09-06; dated 2026-08-30 there.
+
+## Retired: Tokenizer, chat and sampling
+
+[Retired 2026-09-06: text tokenizes identically and no 3.8 or Flash-Next reply has ended strangely; the item already names its own reopen condition. Reopen if: a 3.8 or Flash-Next reply ends strangely for no visible reason, or one of ids 248070-248076 is observed in a sample.]
+
+- [ ] [small] **Qwen3.8's tokenizer adds seven ids the embedded tokenizer does not know.**
+  248070-248076 (`<|audio_start|>`, `<|audio_end|>`, `<tts_pad>`, `<tts_text_bos>`,
+  `<tts_text_eod>`, `<tts_text_bos_single>`, `<|audio_pad|>`) exist in 3.8's
+  tokenizer.json and not in the vendored 3.6 one; base vocab and merges are identical,
+  so text tokenizes the same and only these ids are affected. Unresolved: whether the
+  text-only checkpoint can emit one at all (its lm_head covers the padded 248320 rows
+  either way), and what `decode` does with it if it does — the likely answer is an empty
+  string or a lossy replacement, silently, mid-reply. Cheapest honest fix if it ever
+  matters is not a second 12.8 MB embed but treating unknown-but-in-range ids as a stop
+  or a logged anomaly. Reopen if a 3.8 reply ever ends strangely for no visible reason.
+  2026-08-26: Qwen3.8-Flash-Next ships this exact tokenizer (hash-verified: base
+  identical, added tokens through 248076), so the qwen4exp port arc makes a third
+  checkpoint carry these seven ids — the question stops being 3.8-27B-only and the
+  answer should be settled once, in that arc's P4, for all of them.
+  From: Deferred from the Qwen3.8-27B + API-naming arc (2026-08-14).
+
+[Retired 2026-09-06: a pointer item: its penalty half is taken by «The cards' recommended penalties (presence_penalty 1.5) are not implemented», its harness and drafter halves are their own items, the audio specials retire with the 3.8 tokenizer item, and the Unsloth template divergences (tool calls, developer role, multiple leading system messages, `effort=high`) have no user rendering those shapes. Reopen if: a Flash-Next chat uses tools, a developer role, several leading system messages or `effort=high` and renders differently from `reference/chat_template-qwen38.jinja`.]
+
+- [ ] [unpriced] **Flash-Next's unconsumed presence penalty, template divergences and audio specials.**
+  Three P4 leftovers. `Model::recommended_presence_penalty()` returns the card's 1.5 for
+  non-thinking Flash-Next and **nothing consumes it** — threading the request's
+  resolved checkpoint through openai/native/anthropic prepare is the same
+  wiring needed to stop accept-and-dropping request penalties (the 2026-08-19
+  penalties item in this section); the parity-harness fixes are «The parity harness
+  cannot run on qwen4exp» in "Parity, provenance and tooling" and the drafter is
+  «Flash-Next still ships no drafter, and `supports_drafting()` stays false» in
+  "Drafting"; the embedded chat template is Unsloth-modified and diverges
+  from `reference/chat_template-qwen38.jinja` for **tool calls, the developer
+  role, multiple leading system messages and `effort=high`** (plain chat and
+  thinking render byte-identical, which is why P2 could ship on it); and the
+  checkpoint's tokenizer adds seven audio/TTS specials at 248070-248076 that
+  the embedded 3.6 tokenizer does not carry — harmless for text, unhandled.
+  From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
+  Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.

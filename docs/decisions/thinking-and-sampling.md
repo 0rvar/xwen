@@ -119,3 +119,17 @@ dropping `presence_penalty`/`repetition_penalty`/`min_p` (they degrade sampling,
 the prompt — see the kwargs entry under "Serving" for the line between the two), and
 the mode-keyed defaults ship the cards' temp/top_p/top_k, which ARE mode-pure.
 Ledgered with the values and sources (TODO.md).
+
+**Temperature is applied before the top-k/top-p cut, and stays that way (2026-09-06).**
+llama.cpp cuts first: its default chain is top_k → typ_p → top_p → min_p → temp → dist
+(common/sampling.cpp), so the truncation sees raw logits and temperature only reshapes
+what survived. HF's default warper order and vLLM both scale by temperature first, and
+that matters here because the official cards' recipes — 0.7 / 0.80 / 20 non-thinking,
+1.0 / 0.95 / 20 thinking — were published for vLLM and HF serving, so those numbers mean
+what they mean under the temperature-first order. The two orders are identical at
+temperature 1.0 and diverge only when `--temp` is overridden, temperature below 1
+sharpening the distribution before top_p measures its mass and so cutting a shorter tail.
+xwen keeps temperature first, matching the recipes it ships as defaults rather than the
+reference implementation it checks parity against. The neighbouring `top_k = 0`
+semantics divergence is a separate question and stays open (TODO.md); it is being taken
+with the penalties arc, where the sampler chain is being touched anyway.

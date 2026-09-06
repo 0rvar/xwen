@@ -4,6 +4,30 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-06 — Metrics: the Claude Code agent id is recorded, and `xwen stats --by agent`
+
+`x-claude-code-agent-id` now lands on the run record as its own `agent` field, read
+beside the session header on every serve route, and `--by agent` groups on it. The
+session key is untouched, so one session is still one row under `--by session`; this is
+the view that splits it by subagent. Absent field reads back as `None`, no schema bump.
+Reverses the 2026-09-05 decision on the owner's say (decisions.md "Metrics"). 7f0659e.
+
+## 2026-09-06 — Ledger triage: 98 open items to 49, and an intake rule
+
+The first triage pass under the rules the restructure entry below wrote, and the ledger
+loses half its length without losing a line of text. 34 items and one lettered sub-item
+are retired, each with the reason and the reopen condition that brings it back; 10
+duplicates are folded into the partner item that already owned the question, with a
+pointer line wherever the fold carried something the partner did not say; and 5 are
+closed — two that shipped and went stale in place, two by decision (decisions.md
+"Serving" on plane-less slots, "Thinking budget and sampling controls" on sampler order)
+and one by a doc line in docs/benching.md. Everything moved verbatim to
+[docs/ledger-archive.md](ledger-archive.md). The cause the pass exposed is the intake
+path, so the rule changed with it: AGENTS.md now says a deferred scope or a review
+finding enters the ledger only when it carries a number or a user who is waiting, and
+everything else is a "not taken now" line in the arc's record. Record: [docs
+restructure](records/docs-restructure.md).
+
 ## 2026-09-06 — Docs restructured: decisions by topic, records behind log stubs, perf-state and benching split out, and the ledger regrouped by area with a ten-item Front
 
 Two passes in one day, both script-driven with every moved line accounted for. The first

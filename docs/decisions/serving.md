@@ -304,3 +304,20 @@ turn boundary — 32k tokens took 67.5 s cold and 489 ms for the next turn, 7.6k
 lands under every snapshot and reports `cached_tokens: 0` with a full cold prefill.
 Clients that edit prompts in place should expect that, and the fix, if it is ever worth
 its cost, is mid-message snapshots (TODO.md), not a smarter matcher.
+
+**Slots persisted without drafter planes decode plain, and that is accepted
+(2026-09-06).** A cache slot written by a `--no-draft` run or by a pre-drafting build
+carries no drafter planes, and with drafting on by default that is now the common
+hydration, not a flag-change edge. Such a slot takes the `None => reset_drafter()` arm
+(src/serve/engine.rs:2663) and can never resync: the drafter cache is fed by target-layer
+taps during target forwards, so a drafter reset at a nonzero restore point has nothing to
+catch up with — `drafter_span_rows` is 0 whenever `pos` is past what the drafter has
+committed — and re-seeding it would mean re-running the target prefill the snapshot
+exists to avoid. Output stays correct; what is lost is speculation, for the whole life of
+that conversation, while the server still reports drafting ON. Of the three options the
+ledger item «Serve slots persisted without drafter planes silently decode plain forever»
+listed, (c) is taken: accept it and write it down here. (a) a per-conversation draft
+status on the wire and (b) dropping the snapshot instead of hydrating it are both
+affordable, and both were declined for the same reason — nobody has measured how often
+real traffic hydrates plane-less slots, so neither the reporting cost nor the re-prefill
+cost can be weighed against anything. Reopen when that measurement exists.

@@ -53,8 +53,13 @@ Rules for keeping it that way:
   against a ceiling in docs/perf-state.md, a user who is waiting, or, for an
   instrument, what it would price. Promoting one means
   demoting one. An item in an area section is not planned until it is promoted.
-- A review finding that is not worth an item is not silently dropped and not a ledger
-  item either: the record says "not taken now", the reason, and a reopen condition.
+- Intake. A deferred scope or a review finding enters the ledger only when it carries a
+  number (a measured gain or cost, against a ceiling in docs/perf-state.md) or a user who
+  is waiting for it. A chore enters as `[small]` only when the next arc is expected to do
+  it. Everything else goes in the arc's record as "not taken now" with the reason and a
+  reopen condition, and is not a ledger item. "If this ever bites, the fix is X" is a
+  record line, never an item: the record keeps the sketch, and the reopen condition is
+  what makes it findable.
 - Triage at the end of every arc, and for any item whose latest date is older than 30
   days: promote it, keep it with a fresh dated line saying why it is still worth it, or
   retire it. Archive text is never rewritten; the open ledger may be regrouped.
@@ -373,9 +378,9 @@ and PLE state (decisions.md "Qwen3.8-Flash-Next"), and no surface falls back to
 anything. Benchmarked on Flash-Next 2026-08-30 (log.md): decode at parity with
 `generate` (42-47 tok/s through 32k), a 32k conversation resumes its next turn in
 ~0.5 s, and an edited prompt re-prefills from zero because prefix reuse quantizes to
-snapshots (decisions.md "Serving"). Still not adapted:
-ChatML/tool-call parsing in the dialect layers (Qwen's `<function=...>` XML-ish call
-format, string-args-raw rule). Thinking
+snapshots (decisions.md "Serving"). The tool-call parser IS adapted
+(2026-07-28, `src/serve/engine.rs`): Qwen's `<function=...>` XML-ish call format, string
+arguments passed through raw and non-string arguments parsed as JSON. Thinking
 semantics ARE adapted as of 2026-08-19: open-`<think>` seeding, per-dialect
 preserve_thinking (a request field on the native and OpenAI dialects, the checkpoint
 template's default otherwise — the normalizers pass ALL replayed reasoning through in

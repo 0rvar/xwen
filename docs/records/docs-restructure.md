@@ -84,7 +84,48 @@ decisions.md "The ledger is a memory and a backlog"; the mechanics were:
 Result: TODO.md 2116 → 1345 lines, 98 open items, Front 10/10; archive 858 → 2118
 (the size moved from the open file to the archive, as intended). Twenty-one items
 carry a latest date older than 30 days; the triage rule was written this arc and its
-first pass over those items is the next ledger chore, not done here.
+first pass over those items is the next ledger chore, not done here. That pass ran the
+same day (below): `bun scripts/docs-check.ts` now prints `49 open items, front 10/10`,
+and TODO.md is 844 lines against an archive of 2764.
+
+## Pass three: the first triage and the intake rule
+
+The regroup left 98 open items, and reading them by kind is what explained the number.
+Ten were the Front's levers. Behind them sat roughly fourteen priced levers waiting for
+a Front slot, seven instruments and open questions, fourteen chores, three decisions
+nobody had made, nine features nobody had asked for, one item blocked upstream, and ten
+outright duplicates of another item. The largest group was none of those: about
+twenty-six items were "if this ever bites, the fix is X" notes, each a real observation
+with a sketch of a fix, no number and no user.
+
+Two causes, and only one of them is about writing. The first is the intake path: a
+ledger item was the only exit a review finding had that was not silence, so every
+finding became one, and a note about an edge nobody had hit ranked in the same list as a
+measured 10% decode lever. The second is mechanical: the unit that closed was the item,
+so an item that shipped in part but was never lettered stayed open in whole, and
+finished text kept its place in the open file and went stale there.
+
+The moves. 34 items and one lettered sub-item retired, each behind a dated reason and
+the condition that reopens it; 10 duplicates folded into the partner item that already
+owned the question, with a pointer line wherever the fold carried something the partner
+did not say; 5 closed, two of them shipped long ago (the `<function=...>` tool-call
+parser, the padded-vocabulary grammar trie), two settled by decision in this pass
+(plane-less slots decode plain, temperature stays before the cut) and one answered by a
+line in docs/benching.md. Every moved block went to
+[docs/ledger-archive.md](../ledger-archive.md) verbatim, and the script asserted that
+each non-blank line of the old TODO.md lands in exactly one of the two files.
+
+Three of the nine unrequested features were kept on the owner's say, and they are being
+built next rather than sitting as ledger text: the Claude Code agent-id field, the
+cards' recommended penalties for the 35B-A3B, and the 128k context envelope. The chores
+that survived need the GPU free rather than a decision, and they wait for a session that
+has it.
+
+The rule that came out of the pass is in AGENTS.md and restated in the TODO.md preamble:
+a deferred scope or a review finding enters the ledger only with a number or a user
+waiting for it, a chore only when the next arc is expected to do it, and everything else
+is a "not taken now" line in the arc's record with a reopen condition. The record keeps
+the sketch; the reopen condition is what makes it findable again.
 
 ## What is still weak
 
