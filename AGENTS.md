@@ -255,7 +255,7 @@ session; 104-107 through 2026-08-08), 27B 24.8-25.3, 3.8-27B 23.7-24.8. The fold
 drafting, so every drafted figure below is still against the pre-fold plain level.
 Prefill: the chunk is PER ARCHITECTURE since 2026-08-30 — 2048 on the MoE
 checkpoints, 512 on the dense (`Arch::prefill_chunk_default`, `XWEN_PREFILL_CHUNK`
-overrides; decisions.md "Prefill chunk") — measured that day at 3851 tokens: **35B 2634
+overrides; decisions.md "The prefill chunk is per architecture") — measured that day at 3851 tokens: **35B 2634
 (2429 at 512)**, and 3081-3090 @3803 after the 2026-08-30 FFN-glue levers (the L2
 fold + shexp onto dense_mm; 2746-2755 in the same sweep's all-classic arm); the dense 27B reads 5-6% SLOWER at 2048 (650/599 vs 608/571) and keeps
 512 (its 702@925 / 445@4k are from 2026-07-29 and not re-measured). Load 2.8-3.0s, 19.2 GB resident at max_ctx 8192; cold first run

@@ -67,7 +67,7 @@ comment corrections) changes no arithmetic on any path, so the 0261e17 grade sta
 it.
 
 **Re-passed again at the mm_id work-list grid + NR1 64 change** (2026-08-30, uncommitted
-at the time of the run, on top of f949b1d; log.md "mm_id: work-list grid and NR1 64"),
+at the time of the run, on top of f949b1d; log.md "mm_id tiles"),
 which rewrote `kernel_mul_mm_id_map0` (it now also emits the pass-2 work list, in a
 threadgroup padded to whole simdgroups) and templated the `_t` kernel on its token-tile
 width: **35B-A3B ALL PASS**, six graded checks, run twice (before and after the review

@@ -328,7 +328,7 @@ activation traffic estimated; GDN chunked scan, attention and glue ranked only).
 4. **Weight re-reads: 9%, structural.** Every expert is touched per 2048-token chunk
    (~40 rows each), so a chunk reads the whole 82.5 GB trunk. A 4096 chunk would halve
    it in principle, but 4096 was MEASURED SLOWER on 2026-08-30 (745 vs 824 tok/s at
-   2048; decisions.md "Prefill chunk"), so chunk size alone does not recover it.
+   2048; decisions.md "The prefill chunk is per architecture"), so chunk size alone does not recover it.
 5. **Dispatch count: <1%.** Nothing to gain from launch-count work at prefill.
 
 ## Next Flash-Next perf work (2026-09-05)
@@ -2885,7 +2885,7 @@ WASH"). These are the two things it deliberately did not take.
 ## Deferred from the prefill-chunk pass (2026-08-30)
 
 The chunk went 512 → 2048 on the MoE checkpoints, on every surface, and stayed 512 on
-the dense ones (decisions.md "Prefill chunk", log.md 2026-08-30 "prefill chunk"). The
+the dense ones (decisions.md "The prefill chunk is per architecture", log.md 2026-08-30 "prefill chunk"). The
 A/B named four things it did not take. **Re-ranked 2026-08-30 after the mm_id tile pass**
 (log.md "mm_id tiles"): the expert gemms are a MINORITY of the prefill `ffn` stage (a
 17-23% isolated gemm gain moved `ffn` 3-5% and prefill wall not at all), so the two

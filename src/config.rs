@@ -111,7 +111,7 @@ impl Arch {
     /// set (the sdpa mask and score tile grow with its square) while amortizing
     /// per-forward overhead, and on an MoE checkpoint it is also the expert
     /// batch: the rows each routed expert sees per gemm. Fitted 2026-08-30
-    /// (docs/decisions.md "Prefill chunk"): 2048 is +10% prefill over 512 on
+    /// (docs/decisions.md "The prefill chunk is per architecture"): 2048 is +10% prefill over 512 on
     /// Flash-Next and +8% on the 35B-A3B at 3.9k tokens, where the dense 27B
     /// has no expert batch to feed and reads 5-6% SLOWER at 2048, so it keeps
     /// 512. 4096 loses on both counts. `XWEN_PREFILL_CHUNK` overrides.
