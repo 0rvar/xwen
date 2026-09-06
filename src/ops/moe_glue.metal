@@ -560,9 +560,14 @@ kernel void kernel_moe_shexp_gate_up(
                 tot_g += partial_g[tid * MOE_SHEXP_SIMDGROUPS + u];
                 tot_u += partial_u[tid * MOE_SHEXP_SIMDGROUPS + u];
             }
-            // kernel_moe_silu_mul's expression verbatim (silu_mul.metal):
-            // candle's usilu, `x / (1 + exp(-x))`, then a separately rounded
-            // multiply. The chain this replaces runs exactly these two lines.
+            // kernel_moe_silu_mul's expression as written (silu_mul.metal):
+            // candle's usilu, `x / (1 + exp(-x))`, then the multiply. That kernel
+            // pins the text with contract(off) / reassociate(off) to stay bitwise
+            // with candle; this one runs under the file's default fast math, so
+            // the compiler may contract or reorder it. Deliberate: the dots above
+            // are already reassociated, this kernel is graded BOUNDED against the
+            // f32 oracle (moe_glue.rs), and the pragmas would cost the gemv loops
+            // their fma.
             const float s = tot_g / (1 + exp(-tot_g));
             h[(size_t) tgid.y * (size_t) args.inner + (size_t) (row0 + (int) tid)] = s * tot_u;
         }

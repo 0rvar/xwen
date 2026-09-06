@@ -198,6 +198,15 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    above hidden 4096 / inner 1024, an n > 1 classic comparison built on bare `QMatMul`
    rather than the planed `QLinear` route, an offset test leaving four bindings at zero,
    and two parity rows overstating `XWEN_SHEXP_QMATMUL` / `XWEN_MV_EXT_CLASSIC`.
+   [(c) LANDED 2026-09-06 as 2c56d16: cross-path bound 1e-6 / 2e-6 measured through the
+   planed route, partitions and every admitted shape dispatched, all bindings offset,
+   predicate asks alignment / plane bound / routed width.] (d) On (b), the fix worth
+   making (Qwen review, 2026-09-06): record the label from OBSERVED execution, an
+   AtomicBool on `MoeBlock` set when the fused tail actually dispatches (same for
+   `router_mv` and `hc_gate`), read by logits-dump after its forwards; today a dump
+   is stamped "fused" and satisfies the gate's pin even when `project()` returned
+   None and the classic chain ran. Numerics are unaffected (classic is correct); the gap
+   is measurement validity. Unstarted.
    (d) The remaining MoE decode lever is the glue kernels themselves (router kernel and
    epilogue: tiny bytes, on the chain), which the refined rule keeps in the launch-count
    class. **The router gemv is IN PROGRESS and UNMEASURED** (vendored wide-grid f32 gemv
