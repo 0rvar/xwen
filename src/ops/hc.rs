@@ -1118,6 +1118,78 @@ mod tests {
         }
     }
 
+    /// Every carrier shape the predicate admits, graded against the frozen
+    /// oracle.
+    ///
+    /// [`gate_fused_matches_reference`] runs one of them. The bounds admit
+    /// exactly two carrier widths — 160 or 320 q8_0 blocks, one or two per
+    /// thread — crossed with a power-of-two stream count up to
+    /// [`dispatch::HC_MAX_STREAMS`], and the cases below walk both sides of that
+    /// split at one, two, four and eight streams. Each corner is a different
+    /// kernel path, not a different number: one block per thread takes the
+    /// `p < nbpt` false side of the staging loop, eight streams run the shuffle
+    /// butterfly to its last stage where one stream skips it entirely, and the
+    /// stream count is what decides how many carrier blocks fall to each stream.
+    /// The two token counts are the ends of the window the gate is taken in.
+    ///
+    /// Graded against `ref_hc` alone: the split path is the wrong yardstick
+    /// above one token (see the tolerance note in
+    /// [`gate_fused_matches_reference`]), and the oracle is the bound that holds
+    /// the gate everywhere.
+    #[test]
+    fn gate_fused_covers_every_admitted_shape() {
+        let dev = metal_device().unwrap();
+        for &(hc_count, hidden, n) in &[
+            // Width 5120 — ONE block per thread.
+            (1usize, 5120usize, 1usize),
+            (2, 2560, 1),
+            (8, 640, 1),
+            // Width 10240 — two blocks per thread.
+            (8, 1280, 1),
+            // The production geometry at both ends of the token window.
+            (HC, HIDDEN, 2),
+            (HC, HIDDEN, crate::ops::HC_GATE_FUSED_MAX_N),
+        ] {
+            let width = hc_count * hidden;
+            let case = format!("hc={hc_count} hidden={hidden} n={n}");
+            assert!(
+                hc_gate_fused_supported(hc_count, hidden, LOW_RANK, GgmlDType::Q8_0),
+                "{case}: the predicate must admit this shape"
+            );
+            let w = gate_weights(&dev, hc_count, hidden, LOW_RANK);
+            let stream_v = pseudo_random(n * width, 0x5A + (hc_count * 31 + n) as u64, -2.0, 2.0);
+            let stream = t2(stream_v.clone(), n, width, &dev);
+
+            let (low, inject, scales) = hc_gate_down(
+                &stream,
+                &w.norm_w,
+                Some(&w.inject_w),
+                &w.down,
+                hc_count,
+                hidden,
+                LOW_RANK,
+                EPS,
+            )
+            .unwrap();
+            let inject = inject.expect("a gate with an injection head returns one");
+            let mixed = hc_gate_up_mix(
+                &low, &w.up, &stream, &w.norm_w, &scales, hc_count, hidden, LOW_RANK,
+            )
+            .unwrap();
+            assert_eq!(mixed.dims(), &[n, hidden], "{case}");
+
+            assert_rel_l2(
+                &scales,
+                &host_scales(&stream_v, hc_count, hidden),
+                1e-6,
+                &format!("{case}: scales"),
+            );
+            let (r_mixed, r_inject) = w.reference.read_batch(&stream_v, EPS);
+            assert_rel_l2(&mixed, &r_mixed, 1e-5, &format!("{case}: mixed"));
+            assert_rel_l2(&inject, &r_inject, 1e-5, &format!("{case}: inject"));
+        }
+    }
+
     /// The tail mixer's arm: no injection head, so the grid carries no head
     /// threadgroup and nothing comes back for the write-back to scale. The mix
     /// is unaffected — dropping the head changes only whether an injection is

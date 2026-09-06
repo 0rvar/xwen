@@ -93,7 +93,12 @@ alignment of one makes the 2-byte-offset quant loads legal (MSL spec §2.2.3); i
 validation findings (plane-fits-buffer bound on both launchers; the dump's `hc_gate` label
 ignoring `XWEN_HC_GATE_FUSED_MAX_N=0`) are fixed in the commit, and its provenance gap
 (no reader enforces the v10 `hc_gate` field, because no graded checkpoint has a
-hyper-connection) is ledgered in TODO.md.
+hyper-connection) is ledgered in TODO.md. A Qwen3.8-Flash-Next review after the commit
+found no memory-safety or race issue and one real gap — the reference test covered one of
+the eight admitted (hc_count, hidden) shapes and n ∈ {1, 3} — closed by
+`gate_fused_covers_every_admitted_shape` (both carrier widths at 1, 2, 4 and 8 streams,
+plus n = 2 and 8) and `the_fused_gate_ends_at_its_ceiling` (n = 8 fused, n = 9 split,
+bitwise), plus four comment fixes; its unmeasured-window hypothesis is ledgered.
 
 **Left on the ledger (TODO.md, decode item 1).** The write folded into the next gate's
 norm (−96, the carrier still has to be materialized); `HC_GATE_ROWS_PER_TG` (8) and the

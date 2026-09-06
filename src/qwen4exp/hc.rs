@@ -1118,6 +1118,109 @@ mod tests {
         assert!(e <= 1e-5, "fused tail mixer vs the split path: rel_l2 {e}");
     }
 
+    /// The ceiling is a real edge, not a comment: at
+    /// `HC_GATE_FUSED_MAX_N` tokens the read takes the fused gate, and at one
+    /// more it takes the split path.
+    ///
+    /// Both sides are pinned BITWISE against the arm they should have taken,
+    /// recomputed here from the same gate. That is the cleanest reachability
+    /// signal available — the two arms agree only to a tolerance, so a bitwise
+    /// match with one of them is proof of which ran, where a tolerance check
+    /// would pass either way. It also means the test says nothing about
+    /// numerics; `gate_fused_matches_reference` owns that.
+    #[test]
+    fn the_fused_gate_ends_at_its_ceiling() {
+        let dev = dev();
+        let (hc_count, hidden, low_rank) = (4usize, 2560usize, 320usize);
+        let width = hc_count * hidden;
+        let eps = 1e-6f64;
+        let ceiling = crate::ops::HC_GATE_FUSED_MAX_N;
+
+        let norm_w: Vec<f32> = seeded(width, 1212).iter().map(|v| 1.0 + 0.1 * v).collect();
+        let inject_dense = tensor2(&seeded(hc_count * width, 1313), hc_count, width, &dev);
+        let inject_lin = QLinear::from_qtensor(std::sync::Arc::new(
+            candle_core::quantized::QTensor::quantize(
+                &inject_dense,
+                candle_core::quantized::GgmlDType::F32,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        let gate = HcRead::assemble(
+            hc_count,
+            hidden,
+            low_rank,
+            eps,
+            Tensor::from_slice(&norm_w, width, &dev).unwrap(),
+            q8_linear(&dev, low_rank, width, &seeded(low_rank * width, 1414)),
+            q8_linear(&dev, width, low_rank, &seeded(width * low_rank, 1515)),
+            Some(inject_lin),
+            Some(inject_dense),
+        )
+        .unwrap();
+
+        let bits = |t: &Tensor| -> Vec<u32> { flat(t).iter().map(|v| v.to_bits()).collect() };
+
+        // At the ceiling: the two gate kernels, called directly with what
+        // `read_fused` would pass them.
+        let stream = tensor2(&seeded(ceiling * width, 1616), ceiling, width, &dev);
+        assert!(gate.fused(&stream));
+        let (mixed, _) = gate.read(&stream).unwrap();
+        let (low, _, scales) = crate::ops::hc_gate_down(
+            &stream,
+            &gate.norm_w,
+            gate.inject_dense.as_ref(),
+            gate.down.plane().unwrap(),
+            hc_count,
+            hidden,
+            low_rank,
+            eps as f32,
+        )
+        .unwrap();
+        let want = crate::ops::hc_gate_up_mix(
+            &low,
+            gate.up.plane().unwrap(),
+            &stream,
+            &gate.norm_w,
+            &scales,
+            hc_count,
+            hidden,
+            low_rank,
+        )
+        .unwrap();
+        assert_eq!(
+            bits(&mixed),
+            bits(&want),
+            "at n = {ceiling} the read must be the fused gate, bit for bit"
+        );
+
+        // One token past it: the split path. `forward` rather than
+        // `forward_gemm` because the two are the same call below
+        // `dense_mm_min_seq`, which makes this transcription independent of
+        // XWEN_HC_GEMM_QMATMUL.
+        let n = ceiling + 1;
+        let stream = tensor2(&seeded(n * width, 1717), n, width, &dev);
+        let (mixed, _) = gate.read(&stream).unwrap();
+        let (normed, _) = crate::ops::hc_norm(
+            &stream,
+            &gate.norm_w,
+            gate.inject_dense.as_ref(),
+            hc_count,
+            hidden,
+            eps as f32,
+        )
+        .unwrap();
+        let low =
+            crate::ops::hc_silu_quarter(&gate.down.forward(&normed).unwrap(), hc_count).unwrap();
+        let want =
+            crate::ops::hc_mix(&gate.up.forward(&low).unwrap(), &normed, hc_count, hidden).unwrap();
+        assert_eq!(
+            bits(&mixed),
+            bits(&want),
+            "at n = {n} the read must be the split path, bit for bit"
+        );
+    }
+
     /// The carrier is seeded by TILING the embedding — `[x, x, x, x]` — not by
     /// interleaving it. Distinct per-column values make the two orders
     /// distinguishable.

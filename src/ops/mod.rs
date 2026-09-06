@@ -873,9 +873,15 @@ pub fn hc_gate_fused_max_n() -> usize {
 /// `XWEN_HC_GATE_CLASSIC=1` reverts the fused decode gate — `ops::hc_gate_down`
 /// and `ops::hc_gate_up_mix`, which fold the grouped norm, the injection head,
 /// both q8_0 bottleneck projections, the activation and the mix into two
-/// dispatches — back to the SEVEN-dispatch split path: `ops::hc_norm`'s split
-/// pair, the two `QLinear` matmuls, `ops::hc_silu_quarter` and `ops::hc_mix`.
-/// The write-back is outside it and unchanged either way.
+/// dispatches — back to the split path's six: `ops::hc_norm`'s split pair, the
+/// two `QLinear` matmuls, `ops::hc_silu_quarter` and `ops::hc_mix`.
+///
+/// Counted per GATE, the write-back included, that is seven dispatches against
+/// three — the count hc.metal and docs/parity.md use, and the one the ledger's
+/// "672 per token" figure is built from. `ops::hc_write` itself is identical on
+/// both arms and outside this switch; it is the seventh either way, and the
+/// tail mixer runs the same arms one dispatch shorter with no head and no
+/// write.
 ///
 /// This is a real kill switch and NOT a bit-identity anchor: both fused kernels
 /// reassociate reductions the split path runs in another order (the down rows

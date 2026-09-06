@@ -488,9 +488,13 @@ kernel void kernel_hc_inject(
 // simd_sum where the chain's gemv folds its own partition, and the mix's
 // hc_count-term sum runs as a simd_shuffle_xor butterfly where kernel_hc_mix
 // runs a serial loop. The per-stream statistics are partitioned differently
-// again (per q8_0 block rather than per strided slice). Graded at rel_l2 <= 1e-5
-// against both the split chain and ref_hc, the tolerance the classic path is
-// held to; XWEN_HC_GATE_CLASSIC restores the seven-dispatch path.
+// again (per q8_0 block rather than per strided slice). The REFERENCE bound is
+// what holds them: rel_l2 <= 1e-5 against ref_hc, the tolerance the classic path
+// is held to. Against the split chain the tests grade 1e-6 at one token and 5e-5
+// above it — looser not because the gate drifts but because the split chain
+// does, its QMatMul staging half activation tiles once there is more than one
+// row, which puts IT ~1.7e-5 from the oracle where the gate sits ~1.6e-7.
+// XWEN_HC_GATE_CLASSIC restores the seven-dispatch path.
 //
 // LAYOUT, and why it is not one threadgroup per token. `kernel_hc_norm_inject`
 // already proved the one-threadgroup-per-token shape is a 6% decode LOSS here
@@ -502,12 +506,17 @@ kernel void kernel_hc_inject(
 // 40 KiB each at the production geometry, which is a cache working set rather
 // than a bandwidth cost.
 //
-// The k partition is the same in both: `HC_GATE_THREADS` threads own
-// `nblk / HC_GATE_THREADS` q8_0 blocks each, interleaved (thread t takes blocks
-// t, t + HC_GATE_THREADS, ...), so adjacent lanes read adjacent 34-byte blocks
-// and adjacent 128-byte runs of the carrier. The host refuses any geometry that
-// does not divide (dispatch.rs `hc_gate_fused_supported`) and keeps the seven
-// -dispatch path for it.
+// The two partition k differently, because their rows are different lengths.
+// kernel_hc_gate_down SPLITS each 320-block row across `HC_GATE_THREADS`
+// threads, interleaved (thread t takes blocks t, t + HC_GATE_THREADS, ...), so
+// adjacent lanes read adjacent 34-byte blocks and adjacent 128-byte runs of the
+// carrier, and the row finishes in a simd reduction. kernel_hc_gate_up_mix gives
+// each thread a WHOLE row — ten blocks at the production low_rank — and walks
+// them serially, so its only reduction is the hc_count-term fold across lanes at
+// the end; adjacency there is between the rows of neighbouring (column, stream)
+// pairs, not within one row. The host refuses any geometry that does not divide
+// the first partition (dispatch.rs `hc_gate_fused_supported`) and keeps the
+// seven-dispatch path for it.
 // ---------------------------------------------------------------------------
 
 // block_q8_0 (ggml-common.h): one f16 delta then 32 int8 quants, 34 bytes. Both

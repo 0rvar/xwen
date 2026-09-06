@@ -122,7 +122,10 @@ beyond its bytes; the fixed-cost term is the residual, attributed at ~4 µs/disp
    hyper-connection — pin it when a qwen4exp tier exists (Codex review); (e) the 2..8
    token window now runs the fused gate's numerics (closer to the oracle than the QMatMul
    window it replaces; `XWEN_HC_GATE_FUSED_MAX_N=1` restores) — a deliberate change,
-   recorded in decisions.md, not a bug.
+   recorded in decisions.md, not a bug — but its THROUGHPUT there is UNMEASURED: every
+   A/B was n = 1, and at 2..8 tokens kernel A re-stages the carrier row per token per
+   threadgroup. An A/B pinning `XWEN_HC_GATE_FUSED_MAX_N=1` against 8 on a serve-style
+   ragged forward would price it (Qwen review, 2026-09-06).
 2. **MoE FFN: 576 dispatches/token (30%).** 12 per layer; the glue is already fused and
    the dual gate|up kernel is refuted (decisions.md `XWEN_MOE_DUAL`), so what is left
    is shape-level: the router is already one projection plus one fused kernel, so
