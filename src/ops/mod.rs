@@ -39,7 +39,7 @@ pub use hc::{
 pub use mm_id::mul_mm_id;
 pub use moe_glue::{
     moe_epilogue, moe_epilogue_shexp, moe_router, moe_router_supported, moe_shexp_fused_supported,
-    moe_shexp_gate_up,
+    moe_shexp_gate_up, moe_shexp_plane_bindable,
 };
 pub use mv_ext::{matmul_mv_ext, mv_ext_supported};
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};

@@ -167,7 +167,7 @@ impl MoeBlock {
             && let Some(down) = self.experts.project(x_normed, &ids)?
         {
             let seq = x_normed.dim(0)?;
-            let fused = self.fused_shexp(x_normed);
+            let fused = self.fused_shexp(x_normed, &down);
             // One line per process saying which shared-expert path the first
             // within-ceiling call took, so a bench can tell a fused run from a
             // silent fallback (a missing plane, a non-contiguous input) without
@@ -247,7 +247,14 @@ impl MoeBlock {
     /// second kernel IS the epilogue, so a block that is not taking the epilogue
     /// path cannot take this one either. `XWEN_MOE_GLUE_CLASSIC` closes both,
     /// and `ops::moe_shexp_fused_enabled` reads it for exactly that reason.
-    pub(crate) fn fused_shexp(&self, x: &Tensor) -> bool {
+    ///
+    /// `routed` is the uncombined routed projection the epilogue kernel would be
+    /// handed — `ExpertFfn::project`'s `[seq, top_k, n_out]`. It is a parameter
+    /// rather than something the block can derive because `n_out` is the
+    /// EXPERTS' output width, and the second launcher checks the shared expert's
+    /// down projection against it; on a file where the two disagree that is a
+    /// hard error, so it belongs here with the rest of the conditions.
+    pub(crate) fn fused_shexp(&self, x: &Tensor, routed: &Tensor) -> bool {
         let Ok(seq) = x.dim(0) else {
             return false;
         };
@@ -262,15 +269,26 @@ impl MoeBlock {
         };
         let (hidden, inner) = (gate.in_dim, gate.out_dim);
         let row = self.shared.gate_row();
+        // The epilogue writes `n_out` channels per token from the routed
+        // projection and reads `down.out_dim` of them out of the shared expert;
+        // a file where those differ is one the launcher refuses.
+        let Ok(n_out) = routed.dim(2) else {
+            return false;
+        };
         x.dims() == [seq, hidden]
             && up.out_dim == inner
             && up.in_dim == hidden
             && down.out_dim == hidden
             && down.in_dim == inner
+            && n_out == down.out_dim
             && row.dtype() == DType::F32
             && row.is_contiguous()
             && row.dims() == [hidden, 1]
             && x.device().same_device(row.device())
+            // Not implied by the geometry: a plane's bytes are its own claim.
+            && [gate, up, down]
+                .into_iter()
+                .all(crate::ops::moe_shexp_plane_bindable)
             && crate::ops::moe_shexp_fused_supported(
                 hidden,
                 inner,
@@ -1168,14 +1186,14 @@ mod tests {
             block.n_expert_used,
             gp.dtype
         );
+        let (ids, weights) = block.route(&x).unwrap();
+        let down = block.experts.project(&x, &ids).unwrap().unwrap();
         assert!(
-            block.fused_shexp(&x),
+            block.fused_shexp(&x, &down),
             "the tiny fixture's q8_0 shared expert is inside every bound the pair has"
         );
         let got = block.forward(&x).unwrap();
 
-        let (ids, weights) = block.route(&x).unwrap();
-        let down = block.experts.project(&x, &ids).unwrap().unwrap();
         let (gate_p, up_p, down_p) = block.shared.fused_planes().unwrap();
         let (h, gate) = crate::ops::moe_shexp_gate_up(
             &x,
@@ -1208,10 +1226,10 @@ mod tests {
 
         // At the ceiling: the two kernels, called directly.
         let x = shexp_input(&block, ceiling, 0x2002, &device);
-        assert!(block.fused_shexp(&x));
-        let got = block.forward(&x).unwrap();
         let (ids, weights) = block.route(&x).unwrap();
         let down = block.experts.project(&x, &ids).unwrap().unwrap();
+        assert!(block.fused_shexp(&x, &down));
+        let got = block.forward(&x).unwrap();
         let (gate_p, up_p, down_p) = block.shared.fused_planes().unwrap();
         let (h, gate) = crate::ops::moe_shexp_gate_up(
             &x,
@@ -1234,10 +1252,10 @@ mod tests {
         // One token past it: the five-dispatch chain into the plain epilogue.
         let n = ceiling + 1;
         let x = shexp_input(&block, n, 0x3003, &device);
-        assert!(!block.fused_shexp(&x), "n = {n} is past the ceiling");
-        let got = block.forward(&x).unwrap();
         let (ids, weights) = block.route(&x).unwrap();
         let down = block.experts.project(&x, &ids).unwrap().unwrap();
+        assert!(!block.fused_shexp(&x, &down), "n = {n} is past the ceiling");
+        let got = block.forward(&x).unwrap();
         let shexp = block.shared.swiglu_out(&x).unwrap();
         let gate = block.shared.gate_logits(&x).unwrap();
         let want = crate::ops::moe_epilogue(&down, &weights, &shexp, &gate).unwrap();
@@ -1246,6 +1264,67 @@ mod tests {
             bits(&want),
             "at n = {n} the block must run the classic shared-expert chain, bit for bit"
         );
+    }
+
+    /// A plane whose declared shape outruns the allocation it views takes the
+    /// block back to the five-dispatch chain, silently.
+    ///
+    /// `run_moe_epilogue_shexp` hard-errors on it (`check_plane_fits`), and a
+    /// hard error inside `forward` is the one outcome the fallback design is
+    /// there to avoid: `fused_shexp` promises that every launcher condition is
+    /// asked first, so a checkpoint the kernels cannot bind runs slower rather
+    /// than failing. The tensor shapes do not carry this — a plane is raw bytes
+    /// — which is why the predicate has to look at the buffer's length itself.
+    #[test]
+    fn a_plane_that_outruns_its_buffer_keeps_the_classic_chain() {
+        use candle_core::quantized::QStorage;
+        let device = crate::gguf::metal_device().expect("the fused shared expert needs Metal");
+        let (mut block, dir) = shexp_block("fused_shexp_short_plane", &device);
+        let x = shexp_input(&block, 1, 0x4004, &device);
+        let (ids, _) = block.route(&x).unwrap();
+        let routed = block.experts.project(&x, &ids).unwrap().unwrap();
+        assert!(
+            block.fused_shexp(&x, &routed),
+            "the intact fixture must fuse, or this test proves nothing"
+        );
+
+        // One q8_0 block of device memory: a real allocation, and far too small
+        // for the [hidden, inner] shape the down projection declares.
+        let stub = QTensor::quantize(
+            &Tensor::zeros((1, 32), DType::F32, &Device::Cpu).unwrap(),
+            GgmlDType::Q8_0,
+        )
+        .unwrap();
+        let storage = QStorage::from_data(stub.data().unwrap(), &device, GgmlDType::Q8_0).unwrap();
+        let QStorage::Metal(qms) = &storage else {
+            panic!("expected Metal quantized storage")
+        };
+        let short = Arc::new(qms.buffer().clone());
+        // Held so the allocation the plane views stays claimed — a dropped
+        // owner would let the pool hand the same memory out again, which is a
+        // different failure from the one under test.
+        let _owner = QTensor::new(storage, (1, 32)).unwrap();
+
+        // The same down projection, re-planed onto that buffer. Everything else
+        // about the block — geometry, dtypes, the other two planes — is
+        // untouched, so the predicate can only be moved by the plane's length.
+        let gguf = crate::gguf::open(&dir.0.join("tiny-qwen4exp.gguf"), &device)
+            .expect("reopening the tiny GGUF");
+        let w = Weights::from_gguf(gguf);
+        let qt = w.pp("blk.0").qtensor("ffn_down_shexp").unwrap();
+        block.shared.down = crate::gguf::QLinear::from_qtensor_with_buffer(qt, short).unwrap();
+        assert!(
+            block.shared.fused_planes().is_some(),
+            "the re-planed projection must still carry a plane, or the predicate \
+             would be answering a different question"
+        );
+
+        assert!(
+            !block.fused_shexp(&x, &routed),
+            "a down plane that outruns its buffer must fall back, not reach the launcher"
+        );
+        // And the fallback is a real forward, not an error.
+        block.forward(&x).expect("the classic chain still runs");
     }
 
     /// The router matmul followed by the routing decision agrees with feeding

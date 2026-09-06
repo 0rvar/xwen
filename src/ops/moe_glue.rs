@@ -75,6 +75,24 @@ pub fn moe_shexp_fused_supported(
     dispatch::moe_shexp_fused_supported(hidden, inner, top_k, gate_dtype, up_dtype, down_dtype)
 }
 
+/// Whether one of the fused shared expert's three planes is bindable, as
+/// opposed to whether its geometry is covered ([`moe_shexp_fused_supported`] is
+/// the geometry half). Two conditions, both of which the launchers turn into a
+/// hard error: a 2-byte-aligned `base_off` — the kernels index the weight
+/// through `device const moe_block_q8_0 *`, whose alignment is that of its
+/// `half` scale, and rows are whole blocks so only the bound offset can break it
+/// — and a declared `[out_dim, in_dim]` shape that fits the allocation the plane
+/// views. Neither is implied by the tensor shapes: a plane is raw bytes, so
+/// nothing else in the call carries its length.
+///
+/// A custom GGUF whose shared expert fails either must fall back to the
+/// five-dispatch chain rather than fail the forward, which is why
+/// `MoeBlock::fused_shexp` asks this before dispatching.
+pub fn moe_shexp_plane_bindable(plane: &QuantPlane) -> bool {
+    plane.base_off.is_multiple_of(2)
+        && dispatch::check_plane_fits(plane, "shared expert projection").is_ok()
+}
+
 /// The shared expert's gate and up q8_0 projections, their SwiGLU activation and
 /// the scalar gate logit, in ONE dispatch (`kernel_moe_shexp_gate_up`) where the
 /// classic chain spends four: two `QMatMul` gemvs, `ops::silu_mul`, and the
@@ -578,25 +596,43 @@ mod tests {
     // ---------------------------------------------------------------- shexp
 
     /// The two production geometries the fused shared expert ships for:
-    /// `(hidden, inner, top_k, n_expert)` on Flash-Next and on the 35B-A3B.
-    /// `n_out` is `hidden` — the shared expert projects back to the block width.
+    /// `(hidden, inner, top_k)` on Flash-Next and on the 35B-A3B. `n_out` is
+    /// `hidden` — the shared expert projects back to the block width.
     const SHEXP_CASES: [(usize, usize, usize); 2] = [(2560, 640, 10), (2048, 512, 8)];
+
+    /// Geometries at the TOP of what the predicate admits, in the same
+    /// `(hidden, inner, top_k)` shape. Neither is a shipped checkpoint; both are
+    /// here because production is one block per thread in both kernels
+    /// (hidden 2560/2048 is 80/64 blocks over 128 threads, inner 640/512 is
+    /// 20/16 blocks over 32 lanes), so the strided `p > 0` iterations of the
+    /// staging loop in `kernel_moe_shexp_gate_up` and of the row fold in
+    /// `kernel_moe_epilogue_shexp` never execute at a shipped shape. `hidden`
+    /// 8192 is exactly `MOE_SHEXP_THREADS * MOE_SHEXP_MAX_BLK_PER_THREAD` q8_0
+    /// blocks wide and `inner` 4096 exactly `32 * MOE_SHEXP_MAX_BLK_PER_LANE` —
+    /// each the last width the predicate admits, so a partition that dropped its
+    /// final strided iteration would show up here and nowhere else.
+    const SHEXP_PARTITION_CASES: [(usize, usize, usize); 2] = [(8192, 2048, 10), (5120, 4096, 8)];
 
     /// The shared expert's three q8_0 planes plus everything the two comparison
     /// paths need from them.
     ///
     /// Each plane VIEWS the last `n_out` rows of a `[skip + n_out, k]` upload,
     /// so `skip > 0` is the nonzero-`base_off` case with no other change; the
-    /// `QTensor` alongside is a quantization of exactly those rows, and the
+    /// `QLinear` alongside wraps a quantization of exactly those rows, and the
     /// constructor asserts the two agree byte for byte, which is what makes the
     /// classic chain a fair comparison rather than a second quantizer.
     struct ShexpWeights {
         gate: QuantPlane,
         up: QuantPlane,
         down: QuantPlane,
-        gate_q: std::sync::Arc<candle_core::quantized::QTensor>,
-        up_q: std::sync::Arc<candle_core::quantized::QTensor>,
-        down_q: std::sync::Arc<candle_core::quantized::QTensor>,
+        /// The same three weights as PLANED `QLinear`s, built the way
+        /// `SharedExpert::new` builds them (`Weights::qlinear_with_buffer`), so
+        /// the classic arm of the comparison takes the route production's
+        /// classic arm takes — `QMatMul` at one token, `ops::matmul_mv_ext` at
+        /// 2..=8 — rather than `QMatMul` at every count.
+        gate_lin: crate::gguf::QLinear,
+        up_lin: crate::gguf::QLinear,
+        down_lin: crate::gguf::QLinear,
         /// The `QTensor`s that own the planes' uploads. Never read — held only
         /// so the allocations stay claimed. A `QuantPlane` retains the MTLBuffer
         /// OBJECT, not candle's pool `Arc`, so dropping the tensor that made the
@@ -613,8 +649,9 @@ mod tests {
     }
 
     /// A `[skip + n_out, k]` q8_0 weight uploaded once, handed back as a plane
-    /// whose `base_off` skips the first `skip` rows, plus the `QTensor` and the
-    /// dequantized f32 of exactly the rows the plane covers.
+    /// whose `base_off` skips the first `skip` rows, plus a planed `QLinear`
+    /// over the same rows and the dequantized f32 of exactly the rows the plane
+    /// covers.
     fn build_q8_plane(
         dev: &Device,
         skip: usize,
@@ -624,7 +661,7 @@ mod tests {
     ) -> (
         QuantPlane,
         std::sync::Arc<candle_core::quantized::QTensor>,
-        std::sync::Arc<candle_core::quantized::QTensor>,
+        crate::gguf::QLinear,
         Vec<f32>,
     ) {
         use candle_core::quantized::{QStorage, QTensor};
@@ -672,9 +709,20 @@ mod tests {
         // allocated from it lands on top of these weights.
         let owner = std::sync::Arc::new(QTensor::new(storage, (skip + n_out, k)).unwrap());
 
-        // The classic chain's QMatMul reads its own upload of the same bytes.
+        // The classic chain reads its own upload of the same bytes, through a
+        // planed `QLinear` — `QLinear::from_qtensor_with_buffer` pairs the
+        // tensor with a raw view of its OWN allocation exactly as
+        // `Weights::qlinear_with_buffer` does for a file-loaded weight, which is
+        // what opens the 2..=8-token mv_ext window production's classic arm
+        // takes. The layer owns the QTensor, so the allocation the plane views
+        // stays claimed for as long as the layer does.
         let tail_storage = QStorage::from_data(tail.data().unwrap(), dev, GgmlDType::Q8_0).unwrap();
+        let QStorage::Metal(tail_qms) = &tail_storage else {
+            panic!("expected Metal quantized storage")
+        };
+        let tail_buffer = std::sync::Arc::new(tail_qms.buffer().clone());
         let qtensor = std::sync::Arc::new(QTensor::new(tail_storage, (n_out, k)).unwrap());
+        let qlinear = crate::gguf::QLinear::from_qtensor_with_buffer(qtensor, tail_buffer).unwrap();
 
         (
             QuantPlane {
@@ -685,7 +733,7 @@ mod tests {
                 in_dim: k,
             },
             owner,
-            qtensor,
+            qlinear,
             deq,
         )
     }
@@ -719,11 +767,11 @@ mod tests {
             -0.04,
             0.04,
         );
-        let (gate, gate_own, gate_q, gate_deq) =
+        let (gate, gate_own, gate_lin, gate_deq) =
             build_q8_plane(dev, skip, inner, hidden, &gate_all[head * hidden..]);
-        let (up, up_own, up_q, up_deq) =
+        let (up, up_own, up_lin, up_deq) =
             build_q8_plane(dev, skip, inner, hidden, &up_all[head * hidden..]);
-        let (down, down_own, down_q, down_deq) =
+        let (down, down_own, down_lin, down_deq) =
             build_q8_plane(dev, skip, hidden, inner, &down_all[head * inner..]);
         let gate_inp_v = pseudo_random(hidden, 0xA4 + hidden as u64, -0.1, 0.1);
         let gate_inp = Tensor::from_vec(gate_inp_v.clone(), (hidden, 1), &Device::Cpu)
@@ -734,9 +782,9 @@ mod tests {
             gate,
             up,
             down,
-            gate_q,
-            up_q,
-            down_q,
+            gate_lin,
+            up_lin,
+            down_lin,
             _owners: vec![gate_own, up_own, down_own],
             gate_deq,
             up_deq,
@@ -801,27 +849,31 @@ mod tests {
     }
 
     /// The five-dispatch chain the fused pair replaces, over the SAME quantized
-    /// bytes: two `QMatMul` gemvs, `ops::silu_mul`, a third gemv, the candle f32
-    /// gate matmul, and the plain `moe_epilogue`. Spelled out rather than called
-    /// into moe.rs so an edit to the production chain shows up here as a failure
-    /// instead of silently moving the target.
+    /// bytes: three planed `QLinear` projections, `ops::silu_mul` between the
+    /// first two, the candle f32 gate matmul, and the plain `moe_epilogue`.
+    /// Spelled out rather than called into moe.rs so an edit to the production
+    /// chain shows up here as a failure instead of silently moving the target —
+    /// which is also why the projections go through `QLinear::forward_gemm`
+    /// under the same two conditions `SharedExpert::swiglu_out` applies them:
+    /// inside the fused pair's token window that lands on `forward`, so the
+    /// route is `QMatMul` at one token and `ops::matmul_mv_ext` at 2..=8.
     fn classic_shexp_chain(
         w: &ShexpWeights,
         x: &Tensor,
         routed: &Tensor,
         weights: &Tensor,
     ) -> Tensor {
-        use candle_core::Module;
-        let mm = |qt: &std::sync::Arc<candle_core::quantized::QTensor>, x: &Tensor| {
-            candle_core::quantized::QMatMul::from_arc(qt.clone())
-                .unwrap()
-                .forward(x)
-                .unwrap()
+        let proj = |lin: &crate::gguf::QLinear, x: &Tensor| {
+            if crate::ops::shexp_qmatmul() {
+                lin.forward(x).unwrap()
+            } else {
+                lin.forward_gemm(x).unwrap()
+            }
         };
-        let g = mm(&w.gate_q, x);
-        let u = mm(&w.up_q, x);
+        let g = proj(&w.gate_lin, x);
+        let u = proj(&w.up_lin, x);
         let h = crate::ops::silu_mul(&g, &u).unwrap();
-        let shexp = mm(&w.down_q, &h);
+        let shexp = proj(&w.down_lin, &h);
         let logit = x.matmul(&w.gate_inp).unwrap();
         moe_epilogue(routed, weights, &shexp, &logit).unwrap()
     }
@@ -842,29 +894,62 @@ mod tests {
         assert!(e <= tol, "{what}: rel_l2 {e} > {tol}");
     }
 
-    /// The fused shared expert at both production geometries, across the token
-    /// window it is taken in, graded against BOTH an f32 host reference and the
-    /// five-dispatch chain it replaces.
+    /// The fused shared expert at both production geometries and at the two
+    /// geometries that make the kernels' strided partitions execute, across the
+    /// token window the pair is taken in, graded against BOTH an f32 host
+    /// reference and the five-dispatch chain it replaces.
     ///
     /// Bounded, never bitwise: all three dots are reassociated (the gate/up rows
-    /// fold per-thread `simd_sum` partials where `QMatMul`'s gemv folds its own
-    /// partition, the shexp down row folds per-lane block partials, and the
-    /// routed combine runs over 32 lanes where `kernel_moe_epilogue` runs over
-    /// `next_pow2(top_k/2)`). The HOST bound — rel_l2 <= 1e-5 — is the one that
-    /// holds the pair. The cross-path bound is looser above one token for the
-    /// same reason the fused hc gate's is
-    /// (`gate_fused_matches_reference`): `QMatMul` takes its matmul kernel past
-    /// one row and stages half activation tiles, so above n = 1 it is the
-    /// CLASSIC side that moves away from the oracle, measured ~2.2e-4 at the
-    /// Flash-Next geometry where the pair stays near 1e-6. That is asserted
-    /// below rather than assumed, so the loose 5e-4 cross-path bound cannot
-    /// quietly absorb a regression in the pair itself.
+    /// fold per-thread `simd_sum` partials where the classic projection folds
+    /// its own partition, the shexp down row folds per-lane block partials, and
+    /// the routed combine runs over 32 lanes where `kernel_moe_epilogue` runs
+    /// over `next_pow2(top_k/2)`). The HOST bound — rel_l2 <= 1e-5 — is the one
+    /// that holds the pair.
+    ///
+    /// The CROSS-PATH bound grades the pair against the route production's
+    /// classic arm really takes, which is not `QMatMul` throughout: the shared
+    /// expert's three projections are planed `QLinear`s, so at one token each is
+    /// candle's `QMatMul` gemv and at 2..=8 tokens `QLinear::forward` takes the
+    /// vendored small-batch mat-vec (`ops::matmul_mv_ext`), which splits every K
+    /// reduction across 8 lanes holding interleaved chunks. `QMatMul`'s f16-tile
+    /// matmul — the ~2e-4 arm — is never reached inside this window, so both
+    /// sides are f32 reassociations of the same dots and the gap between them is
+    /// small in both halves of the window.
+    ///
+    /// Measured 2026-09-06, rel_l2 on `dst` as
+    /// pair-vs-classic | pair-vs-oracle | classic-vs-oracle:
+    /// - 2560/640:  n=1 5.4e-8 | 8.2e-8 | 8.4e-8; n=3 2.3e-7 | 1.0e-6 | 1.0e-6;
+    ///   n=8 1.9e-7 | 6.8e-7 | 7.0e-7
+    /// - 2048/512:  n=1 7.5e-8 | 2.1e-7 | 1.9e-7; n=3 2.0e-7 | 6.9e-7 | 6.9e-7;
+    ///   n=8 2.1e-7 | 8.3e-7 | 8.4e-7
+    /// - 8192/2048: n=1 5.5e-8 | 8.0e-8 | 8.1e-8; n=3 5.6e-7 | 2.7e-6 | 2.5e-6
+    /// - 5120/4096: n=1 3.1e-7 | 2.5e-6 | 2.4e-6; n=3 5.9e-7 | 2.6e-6 | 2.8e-6
+    ///
+    /// The bounds below — 1e-6 at one token, 2e-6 above it — are those maxima
+    /// (3.1e-7 and 5.9e-7) with roughly 3x headroom, and the split is real: the
+    /// classic side changes kernel at n = 2 and the fused side does not.
+    ///
+    /// Against the oracle the two arms are LEVEL, ratio 0.95..1.11 in either
+    /// direction, so the assertion below is a levelness guard rather than the
+    /// ordering one it would be if the classic side still ran an f16-tile
+    /// matmul: it fails when the pair becomes materially the worse of the two,
+    /// which is what would let the cross-path bound absorb a regression in it.
     #[test]
     fn shexp_fused_matches_reference() {
         use crate::ops::dispatch::testutil::{pseudo_random, rel_l2};
         let device = metal_device().unwrap();
 
-        for (hidden, inner, top_k) in SHEXP_CASES {
+        // The shipped shapes run the whole token window; the partition shapes
+        // run one count below the mv_ext window and one inside it. Not the full
+        // window there only because the host oracle is O(n * hidden * inner) and
+        // these are the widest shapes the predicate admits — the partition
+        // iterations they exist to reach do not depend on the token count.
+        let cases = SHEXP_CASES
+            .iter()
+            .map(|g| (*g, &[1usize, 3, 8][..]))
+            .chain(SHEXP_PARTITION_CASES.iter().map(|g| (*g, &[1usize, 3][..])));
+
+        for ((hidden, inner, top_k), token_counts) in cases {
             let w = shexp_weights(&device, 0, hidden, inner);
             assert!(moe_shexp_fused_supported(
                 hidden,
@@ -875,7 +960,7 @@ mod tests {
                 GgmlDType::Q8_0
             ));
 
-            for &n in &[1usize, 3, 8] {
+            for &n in token_counts {
                 let case = format!("hidden={hidden} inner={inner} top_k={top_k} n={n}");
                 let x_v = pseudo_random(n * hidden, 0xB1 + n as u64, -2.0, 2.0);
                 let routed_v = pseudo_random(n * top_k * hidden, 0xB2 + n as u64, -1.0, 1.0);
@@ -909,7 +994,11 @@ mod tests {
 
                 let classic = classic_shexp_chain(&w, &x, &routed, &rw);
                 let classic_v: Vec<f32> = classic.flatten_all().unwrap().to_vec1().unwrap();
-                let tol = if n == 1 { 1e-6 } else { 5e-4 };
+                // The classic side runs `QMatMul`'s gemv at one token and the
+                // small-batch mv_ext kernel above it, so the gap has two
+                // regimes; both bounds are the measured maxima in the doc
+                // comment with headroom, not round numbers.
+                let tol = if n == 1 { 1e-6 } else { 2e-6 };
                 assert_rel_l2(
                     &dst,
                     &classic_v,
@@ -917,25 +1006,108 @@ mod tests {
                     &format!("fused shexp vs the classic chain {case}"),
                 );
                 if n > 1 {
-                    // Which side the cross-path gap belongs to, stated as an
-                    // assertion rather than a comment: past one row `QMatMul`
-                    // takes its matmul kernel and stages half activation tiles,
-                    // so the CLASSIC chain leaves the oracle (measured ~2e-4 at
-                    // the Flash-Next geometry) while the fused pair stays at the
-                    // ~1e-6 the assertion above holds it to. If that ever
-                    // inverts, the loose cross-path bound above is hiding a
-                    // regression in the pair and this fails first.
+                    // Neither arm owns the cross-path gap: both are f32
+                    // reassociations of the same dots and they sit level against
+                    // the oracle, within 8% of each other either way across the
+                    // four geometries. What must not happen is the pair becoming
+                    // materially the worse of the two — that is the failure the
+                    // bound above could otherwise absorb — so this is a
+                    // levelness guard with a 1.5x margin over the measured
+                    // spread, not a claim about which side is closer.
                     let fused_err = rel_l2(
                         &dst.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
                         &want_dst,
                     );
                     let classic_err = rel_l2(&classic_v, &want_dst);
                     assert!(
-                        fused_err <= classic_err,
+                        fused_err <= classic_err * 1.5,
                         "{case}: the fused pair sits {fused_err} from the f32 oracle where the \
-                         classic chain sits {classic_err} — the pair must be the closer of the two"
+                         classic chain sits {classic_err} — the pair must stay level with the \
+                         chain it replaces, not fall behind it"
                     );
                 }
+            }
+        }
+    }
+
+    /// Every geometry the predicate admits, DISPATCHED — not merely asked about.
+    ///
+    /// `moe_shexp_fused_supported` admits a `hidden` of up to
+    /// `MOE_SHEXP_THREADS * MOE_SHEXP_MAX_BLK_PER_THREAD` q8_0 blocks (8192
+    /// elements) and an `inner` of up to `32 * MOE_SHEXP_MAX_BLK_PER_LANE`
+    /// (4096), while both shipped checkpoints sit at one block per thread and
+    /// under one per lane. This crosses the two partitions across their whole
+    /// admitted range so that every `(blocks per thread, blocks per lane)`
+    /// combination the kernels can be handed is executed at least once against
+    /// the f32 host oracle — a strided iteration dropped from either loop, or a
+    /// ragged tail mishandled in one, cannot pass the whole grid.
+    ///
+    /// One token: the partitions are over the WEIGHT rows and the reduction, not
+    /// over the token count, so the token window is `shexp_fused_matches_reference`'s
+    /// job and the widths are this test's.
+    #[test]
+    fn shexp_fused_covers_every_admitted_shape() {
+        use crate::ops::dispatch::testutil::pseudo_random;
+        let device = metal_device().unwrap();
+        let q8 = GgmlDType::Q8_0;
+        let (n, top_k) = (1usize, 4usize);
+
+        for hidden in [2048usize, 2560, 4096, 8192] {
+            for inner in [512usize, 640, 1024, 2048, 4096] {
+                let case = format!("hidden={hidden} inner={inner}");
+                assert!(
+                    moe_shexp_fused_supported(hidden, inner, top_k, q8, q8, q8),
+                    "{case}: the predicate must admit this shape"
+                );
+
+                let w = shexp_weights(&device, 0, hidden, inner);
+                let seed = 0xE1 + (hidden * 31 + inner) as u64;
+                let x_v = pseudo_random(n * hidden, seed, -2.0, 2.0);
+                let routed_v = pseudo_random(n * top_k * hidden, seed + 1, -1.0, 1.0);
+                let rw_v = pseudo_random(n * top_k, seed + 2, 0.0, 1.0);
+
+                let x = on_device(x_v.clone(), (n, hidden), &device);
+                let routed = Tensor::from_vec(routed_v.clone(), (n, top_k, hidden), &Device::Cpu)
+                    .unwrap()
+                    .to_device(&device)
+                    .unwrap();
+                let rw = on_device(rw_v.clone(), (n, top_k), &device);
+
+                let (h, logit) =
+                    moe_shexp_gate_up(&x, &w.gate, &w.up, &w.gate_inp, hidden, inner).unwrap();
+                let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, inner).unwrap();
+                assert_eq!(dst.dims(), &[n, hidden], "{case}");
+
+                let (want_h, want_logit, want_dst) =
+                    host_shexp(&w, &x_v, &routed_v, &rw_v, n, hidden, inner, top_k);
+                assert_rel_l2(&h, &want_h, 1e-5, &format!("{case}: h"));
+                assert_rel_l2(&dst, &want_dst, 1e-5, &format!("{case}: dst"));
+
+                // The gate logit is ONE number per token, so a relative bound on
+                // it is a relative bound on a single f32 — and this dot cancels
+                // hard: `hidden` terms of a [-2, 2] activation against a
+                // [-0.1, 0.1] row sum to something far smaller than the terms
+                // themselves, and at some seeds land near zero, where any
+                // reassociation reads huge relatively while being tiny
+                // absolutely (hidden 2560 / inner 512 does exactly that: rel_l2
+                // 1.6e-4 where every other shape in this grid reads under 1e-5).
+                // Grade it against the dot's own condition scale instead. The
+                // bound is above the sqrt(n) *
+                // eps rounding at every admitted width (5.4e-6 * mag at
+                // hidden 8192) and orders below what a dropped strided iteration
+                // would produce, which is a fraction of `mag` itself.
+                let mag: f32 = x_v
+                    .iter()
+                    .zip(&w.gate_inp_v)
+                    .map(|(a, b)| (a * b).abs())
+                    .sum();
+                let got_logit = logit.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
+                assert!(
+                    (got_logit - want_logit[0]).abs() <= 1e-4 * mag,
+                    "{case}: gate logit {got_logit} against the oracle's {}, off by more than \
+                     1e-4 of the dot's {mag} magnitude",
+                    want_logit[0]
+                );
             }
         }
     }
@@ -943,8 +1115,12 @@ mod tests {
     /// Every operand is resolved through a start offset — the planes through
     /// `base_off`, the tensors through `start_offset * 4` — and the tests above
     /// build all of them at zero. A dropped offset would silently read the
-    /// buffer head, so run the same arithmetic over offset views and over
-    /// copies at zero and require the two BITWISE.
+    /// buffer head, so run the same arithmetic with EVERY binding a narrowed
+    /// view into a larger buffer, and again with every one of them a copy at
+    /// zero, and require the two BITWISE. Every binding means all of them: the
+    /// three planes, the activation, the `ffn_gate_inp_shexp` row, the routed
+    /// projection, the routing weights, and the bottleneck and gate logit
+    /// flowing from the first kernel into the second.
     #[test]
     fn shexp_fused_honours_offset_views() {
         use crate::ops::dispatch::testutil::pseudo_random;
@@ -957,62 +1133,84 @@ mod tests {
         let offset = shexp_weights(&device, skip, hidden, inner);
         // The offset planes must really carry one, or this test proves nothing.
         assert_ne!(offset.gate.base_off, 0);
+        assert_ne!(offset.up.base_off, 0);
         assert_ne!(offset.down.base_off, 0);
 
-        let big_x = on_device(
-            pseudo_random((n + skip) * hidden, 0xC1, -2.0, 2.0),
-            (n + skip, hidden),
-            &device,
-        );
-        let x_view = big_x.narrow(0, skip, n).unwrap();
-        assert_ne!(
-            x_view.layout().start_offset(),
-            0,
-            "the narrowed view must actually carry an offset"
-        );
-        let x_copy = on_device(
-            x_view.flatten_all().unwrap().to_vec1().unwrap(),
-            (n, hidden),
-            &device,
-        );
+        // The operand values, generated once and shared by the two arms.
+        let x_v = pseudo_random(n * hidden, 0xC1, -2.0, 2.0);
+        let routed_v = pseudo_random(n * top_k * hidden, 0xC2, -1.0, 1.0);
+        let rw_v = pseudo_random(n * top_k, 0xC3, 0.0, 1.0);
 
-        let routed = Tensor::from_vec(
-            pseudo_random(n * top_k * hidden, 0xC2, -1.0, 1.0),
-            (n, top_k, hidden),
-            &Device::Cpu,
-        )
-        .unwrap()
-        .to_device(&device)
-        .unwrap();
-        let rw = on_device(
-            pseudo_random(n * top_k, 0xC3, 0.0, 1.0),
-            (n, top_k),
-            &device,
-        );
-
-        let run = |w: &ShexpWeights, x: &Tensor, offset_h: bool| {
-            let (h, logit) =
-                moe_shexp_gate_up(x, &w.gate, &w.up, &w.gate_inp, hidden, inner).unwrap();
-            // Offset the bottleneck too: pad it with a leading row and hand the
-            // epilogue the narrowed view of that.
-            let h = if offset_h {
-                let padded = Tensor::cat(
-                    &[&Tensor::zeros((1, inner), DType::F32, &device).unwrap(), &h],
-                    0,
-                )
+        let contiguous = |v: &[f32], dims: &[usize]| -> Tensor {
+            Tensor::from_vec(v.to_vec(), dims, &Device::Cpu)
+                .unwrap()
+                .to_device(&device)
+                .unwrap()
+        };
+        // The same values as the LAST rows of a wider buffer, narrowed back to
+        // them: identical elements, a nonzero start offset, and junk ahead of
+        // them that a dropped offset would read instead.
+        let viewed = |v: &[f32], dims: &[usize], seed: u64| -> Tensor {
+            let row: usize = dims[1..].iter().product();
+            let mut data = pseudo_random(skip * row, seed, -3.0, 3.0);
+            data.extend_from_slice(v);
+            let mut wide = dims.to_vec();
+            wide[0] += skip;
+            let big = Tensor::from_vec(data, wide, &Device::Cpu)
+                .unwrap()
+                .to_device(&device)
                 .unwrap();
-                let view = padded.narrow(0, 1, n).unwrap();
-                assert_ne!(view.layout().start_offset(), 0);
-                view
+            let view = big.narrow(0, skip, dims[0]).unwrap();
+            assert_ne!(
+                view.layout().start_offset(),
+                0,
+                "the narrowed view must actually carry an offset"
+            );
+            view
+        };
+        // A kernel output is written at offset 0, so the only way to hand the
+        // NEXT kernel an offset one is to pad it and narrow the padding off.
+        let repad = |t: &Tensor| -> Tensor {
+            let cols = t.dim(1).unwrap();
+            let padded = Tensor::cat(
+                &[&Tensor::ones((skip, cols), DType::F32, &device).unwrap(), t],
+                0,
+            )
+            .unwrap();
+            let view = padded.narrow(0, skip, n).unwrap();
+            assert_ne!(view.layout().start_offset(), 0);
+            view
+        };
+
+        let run = |w: &ShexpWeights, offsets: bool| {
+            let (x, gate_inp, routed, rw) = if offsets {
+                (
+                    viewed(&x_v, &[n, hidden], 0xD1),
+                    viewed(&w.gate_inp_v, &[hidden, 1], 0xD2),
+                    viewed(&routed_v, &[n, top_k, hidden], 0xD3),
+                    viewed(&rw_v, &[n, top_k], 0xD4),
+                )
             } else {
-                h
+                (
+                    contiguous(&x_v, &[n, hidden]),
+                    contiguous(&w.gate_inp_v, &[hidden, 1]),
+                    contiguous(&routed_v, &[n, top_k, hidden]),
+                    contiguous(&rw_v, &[n, top_k]),
+                )
+            };
+            let (h, logit) =
+                moe_shexp_gate_up(&x, &w.gate, &w.up, &gate_inp, hidden, inner).unwrap();
+            let (h, logit) = if offsets {
+                (repad(&h), repad(&logit))
+            } else {
+                (h, logit)
             };
             let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, inner).unwrap();
             (dst, logit)
         };
 
-        let (v_dst, v_logit) = run(&offset, &x_view, true);
-        let (c_dst, c_logit) = run(&flat, &x_copy, false);
+        let (v_dst, v_logit) = run(&offset, true);
+        let (c_dst, c_logit) = run(&flat, false);
         assert_f32_bits_eq(&v_dst, &c_dst, "fused shexp over offset views");
         assert_f32_bits_eq(&v_logit, &c_logit, "fused shexp logit over offset views");
     }

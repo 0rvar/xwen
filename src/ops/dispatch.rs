@@ -5853,7 +5853,7 @@ pub(crate) fn run_hc_write(stream: &Tensor, block_out: &Tensor, inject: &Tensor)
 /// projections' `out_dim`/`in_dim` are checked against the geometry, but a plane
 /// whose declared shape outruns its buffer would pass both of those and read off
 /// the end of device memory.
-fn check_plane_fits(plane: &QuantPlane, what: &str) -> Result<()> {
+pub(crate) fn check_plane_fits(plane: &QuantPlane, what: &str) -> Result<()> {
     let dt = plane.dtype;
     // `in_dim` is a whole number of blocks by the time this runs
     // (`hc_gate_fused_supported` and the shape check above).
