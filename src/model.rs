@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::RmsNorm;
 
@@ -82,6 +82,30 @@ pub(crate) enum Mixer {
     Linear(LinearAttnBlock),
 }
 
+/// The output projection `[seq, hidden] -> [seq, vocab]`, in whichever form
+/// the checkpoint stores it: a quantized `output.weight` on every GGUF
+/// checkpoint, or the BF16 token embedding itself on a tied-head safetensors
+/// checkpoint (Qwen3-4B ships no separate head; `Bf16` is the very tensor
+/// `XwenModel::embed` gathers rows from, shared by handle, never copied).
+pub(crate) enum LmHead {
+    Quant(QLinear),
+    Bf16(Tensor),
+}
+
+impl LmHead {
+    /// The raw projection over every row of `h`. The quantized arm is the
+    /// QMatMul path (with the small-batch window `QLinear::forward` owns); the
+    /// BF16 arm is `ops::matmul_bf16`, whose own host split runs the gemv at
+    /// `seq <= 8` and the tensor gemm above, so a one-row decode never pays the
+    /// gemm here either.
+    fn forward(&self, h: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Quant(q) => Ok(q.forward(h)?),
+            Self::Bf16(w) => crate::ops::matmul_bf16(w, h),
+        }
+    }
+}
+
 /// One transformer layer: pre-attention norm + mixer, pre-FFN norm + FFN. Both
 /// residual adds are owned by `XwenModel::forward`, not here.
 ///
@@ -117,10 +141,17 @@ pub struct XwenModel {
     /// and the tail mixer. `Some` exactly on `Arch::Qwen4Exp`, and its presence
     /// is what routes `run_stack` to the second graph (D14).
     pub(crate) qwen4exp: Option<crate::qwen4exp::stack::Qwen4ExpParts>,
+    /// The Qwen3 dense layer stack: per-layer BF16 projections and F32 norms
+    /// plus the shared rope table. `Some` exactly on `Arch::Qwen3`, and its
+    /// presence is what routes `run_stack` to `qwen3::stack::run_stack`. The
+    /// layers live here rather than in `layers` (which is empty on this
+    /// architecture) because they are neither an `AttnBlock` nor a
+    /// `DenseMlp`: no output gate, no quantized planes.
+    pub(crate) qwen3: Option<crate::qwen3::Qwen3Parts>,
     /// `None` on qwen4exp, which has no `output_norm` tensor — its tail mixer
     /// (`Qwen4ExpParts::output_hc`) is the final normalization.
-    output_norm: Option<RmsNorm>,
-    lm_head: QLinear,
+    pub(crate) output_norm: Option<RmsNorm>,
+    lm_head: LmHead,
     /// Retained handle to the lm_head weight's Metal buffer, shared with
     /// `lm_head`'s QTensor (zero-copy). Present only on Metal for the vendored
     /// plain mat-vec (`mv_vendored_supported` — q8_0 on the current official
@@ -160,7 +191,7 @@ pub struct XwenModel {
     /// from the heavyweight parity `taps` above — a single `Option` check per
     /// layer when unset, and only the configured layers' handles are cloned when
     /// set (a cheap Arc bump each, no dtype conversion).
-    spec_tap_layers: Option<Vec<usize>>,
+    pub(crate) spec_tap_layers: Option<Vec<usize>>,
     /// The most recent forward's spec taps, in configured order, drained by
     /// `take_spec_taps`.
     spec_taps: Vec<Tensor>,
@@ -208,9 +239,8 @@ impl XwenModel {
     fn check_arch(cfg: &XwenConfig) -> Result<()> {
         match cfg.arch {
             Arch::Dense | Arch::Moe => Ok(()),
-            // Reached only through a `CheckpointSource::SafeTensors`, which
-            // `load` refuses before this: the qwen3 layer stack does not exist
-            // yet.
+            // Every precondition of the qwen3 graph is already a `Qwen3Config`
+            // validation (head_dim 128, no bias, no sliding window, tied head).
             Arch::Qwen3 => Ok(()),
             Arch::Qwen4Exp => {
                 ensure!(
@@ -225,13 +255,19 @@ impl XwenModel {
         }
     }
 
-    /// Assemble the model from an opened checkpoint.
+    /// Assemble the model from an opened checkpoint, as a LANGUAGE MODEL: the
+    /// graph every surface that generates from it runs. A GGUF goes through
+    /// the trunk loader; a safetensors set through the qwen3 one.
     ///
-    /// The safetensors arm is where this build stops: [`crate::qwen3`] reads
-    /// that checkpoint's config, validates its shards and can load its weights,
-    /// but the layer stack that would run them is the next arc's work. The
-    /// refusal is here rather than at each surface so every one of them says
-    /// the same sentence.
+    /// A set whose loader tolerated zero-filled planes is refused here. Those
+    /// planes are tolerated only on an entry that documents them (the Z-Image
+    /// text encoder, whose layer 35 MLP is corrupt in the shipped shards), and
+    /// such an entry is an ENCODER: its usable hidden states stop below the
+    /// corrupt layer, and a forward that ran through it would produce logits
+    /// from noise without a single error. [`XwenModel::load_encoder`] is the
+    /// entry that accepts it, for `XwenModel::encode` only. Refused here, at
+    /// the one place every generating surface passes through, rather than at
+    /// each of them.
     pub fn load(
         source: crate::checkpoint::CheckpointSource,
         runner: ExpertRunner,
@@ -241,10 +277,178 @@ impl XwenModel {
             crate::checkpoint::CheckpointSource::Gguf(gguf) => {
                 Self::load_gguf(gguf, runner, max_ctx)
             }
-            other @ crate::checkpoint::CheckpointSource::SafeTensors(_) => {
-                Err(other.unimplemented_stack())
+            crate::checkpoint::CheckpointSource::SafeTensors(set, device) => {
+                let zero_runs = set.zero_runs();
+                ensure!(
+                    zero_runs.is_empty(),
+                    "{} is an encoder, not a language model: {} of its planes ship zero-filled \
+                     ({}), so its hidden states are usable only below that layer and it can \
+                     run under `xwen encode-text` alone, never generate, chat, serve or batch",
+                    set.dir().display(),
+                    zero_runs.len(),
+                    zero_runs
+                        .iter()
+                        .map(|(name, run)| format!("{name}: {} zeros at {}", run.len, run.start))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                Self::load_qwen3(&set, &device, max_ctx)
             }
         }
+    }
+
+    /// Assemble a safetensors checkpoint for [`XwenModel::encode`]: the same
+    /// graph as [`XwenModel::load`] builds, minus the refusal of zero-filled
+    /// planes, because an encoder never runs the layers above the hidden
+    /// state it reads (the CLI refuses a `--layer` that would). A GGUF cannot
+    /// be an encoder here — the hidden-state accessor is a qwen3 stack
+    /// feature — and says so.
+    pub fn load_encoder(
+        source: crate::checkpoint::CheckpointSource,
+        max_ctx: usize,
+    ) -> Result<Self> {
+        match source {
+            crate::checkpoint::CheckpointSource::SafeTensors(set, device) => {
+                Self::load_qwen3(&set, &device, max_ctx)
+            }
+            crate::checkpoint::CheckpointSource::Gguf(gguf) => bail!(
+                "{} is a GGUF checkpoint; the hidden-state encoder runs the Qwen3 dense \
+                 safetensors checkpoints only (--model-size zimage-turbo, qwen3-4b or \
+                 qwen3-4b-instruct-2507)",
+                gguf.checkpoint_path().display()
+            ),
+        }
+    }
+
+    /// The qwen3 load: read every plane onto `device` through the loader,
+    /// build the stack and hand it to `assemble_qwen3`. `device` is the
+    /// caller's, never a fresh one — the surfaces that drive this model build
+    /// their own tensors on theirs, and candle treats two `new_metal(0)`
+    /// devices as different devices.
+    fn load_qwen3(set: &crate::qwen3::Qwen3Set, device: &Device, max_ctx: usize) -> Result<Self> {
+        let qcfg = set.config().clone();
+        let cfg = XwenConfig::from_qwen3(&qcfg, None);
+        Self::check_arch(&cfg)?;
+        let max_ctx = clamp_context_length(max_ctx, cfg.n_ctx_train)?;
+        ensure!(
+            matches!(device, Device::Metal(_)),
+            "the qwen3 stack runs on Metal only: its projections (matmul_bf16), attention \
+             (flash_attn) and activation (silu_mul) are vendored Metal kernels"
+        );
+        let attn = crate::qwen3::AttnImpl::from_env()?;
+
+        let load_start = std::time::Instant::now();
+        let crate::qwen3::Qwen3Weights {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        } = set.load_all(device)?;
+        // The loader never materializes a separate head (a tied one is proven
+        // byte-equal to the embedding and struck off without a read), and the
+        // config check refuses an untied checkpoint; so an explicit head here
+        // is a loader contract change this stack has not been taught, not a
+        // tensor to quietly prefer.
+        ensure!(
+            lm_head.is_none(),
+            "the qwen3 loader handed over a separate lm_head plane; this stack ties the head \
+             to the embedding and has no arm for an untied one"
+        );
+        crate::host_log::host_line(format!(
+            "xwen: qwen3 weights on the device in {:.1}s ({} layers, attention {}{})",
+            load_start.elapsed().as_secs_f64(),
+            layers.len(),
+            attn.label(),
+            if attn == crate::qwen3::AttnImpl::Fused {
+                ""
+            } else {
+                ", the bisect arm"
+            },
+        ));
+
+        // One rope table over the full head, at the runtime context budget.
+        let rope = Arc::new(Rope::new(cfg.rope(), max_ctx, device)?);
+        let parts = crate::qwen3::Qwen3Parts::new(qcfg, layers, rope, attn)?;
+        Self::assemble_qwen3(
+            parts,
+            embed_tokens,
+            norm,
+            set.checkpoint_id(),
+            max_ctx,
+            device.clone(),
+        )
+    }
+
+    /// Put a qwen3 stack, its embedding `[vocab, hidden]` BF16 and its final
+    /// norm weight `[hidden]` F32 together into a model, with one empty
+    /// `LayerCache::Full` per layer. The lm head is the embedding (tied):
+    /// the same handle, no second copy. Shared by the real load and by the
+    /// stack's own tests, which assemble a tiny model over random weights.
+    pub(crate) fn assemble_qwen3(
+        parts: crate::qwen3::Qwen3Parts,
+        embed: Tensor,
+        norm: Tensor,
+        checkpoint: crate::gguf::CheckpointId,
+        max_ctx: usize,
+        device: Device,
+    ) -> Result<Self> {
+        let cfg = XwenConfig::from_qwen3(parts.config(), None);
+        ensure!(
+            embed.dims() == [cfg.vocab, cfg.hidden] && embed.dtype() == DType::BF16,
+            "qwen3 embedding: expected a BF16 [{}, {}] plane, got {:?} {:?}",
+            cfg.vocab,
+            cfg.hidden,
+            embed.dtype(),
+            embed.dims()
+        );
+        ensure!(
+            norm.dims() == [cfg.hidden] && norm.dtype() == DType::F32,
+            "qwen3 final norm: expected an F32 [{}] vector, got {:?} {:?}",
+            cfg.hidden,
+            norm.dtype(),
+            norm.dims()
+        );
+        ensure!(max_ctx > 0, "max_ctx must be at least 1");
+        let kv_slots = max_ctx.min(KV_INITIAL_CTX);
+        let caches = (0..cfg.n_layer)
+            .map(|il| LayerCache::new(&cfg, il, kv_slots, &device))
+            .collect::<Result<Vec<_>>>()?;
+        let weight_bytes =
+            parts.weight_bytes() + (embed.elem_count() * embed.dtype().size_in_bytes()) as u64;
+        report_footprint(weight_bytes, 0, &cfg, kv_slots, max_ctx);
+        let attn_mm = if crate::ops::attn_mm_classic() {
+            "classic"
+        } else {
+            "tensor"
+        };
+        let cfg_eps = cfg.rms_eps;
+        Ok(Self {
+            cfg,
+            device,
+            lm_head: LmHead::Bf16(embed.clone()),
+            embed,
+            layers: Vec::new(),
+            caches,
+            qwen4exp: None,
+            qwen3: Some(parts),
+            output_norm: Some(RmsNorm::new(norm, cfg_eps)),
+            lm_head_buffer: None,
+            lm_head_dtype: candle_core::quantized::GgmlDType::BF16,
+            attn_dtype: DType::BF16,
+            attn_mm,
+            attn_decode: "bf16",
+            max_ctx,
+            kv_slots,
+            tap_enabled: false,
+            taps: Vec::new(),
+            spec_tap_layers: None,
+            spec_taps: Vec::new(),
+            keep_post_norm: false,
+            post_norm_hidden: None,
+            profile: crate::ops::stack_profile().then(crate::stack_profile::StackProfiler::new),
+            _weights_mmap: Vec::new(),
+            checkpoint,
+        })
     }
 
     fn load_gguf(gguf: Arc<GgufFile>, runner: ExpertRunner, max_ctx: usize) -> Result<Self> {
@@ -404,8 +608,9 @@ impl XwenModel {
             layers,
             caches,
             qwen4exp,
+            qwen3: None,
             output_norm,
-            lm_head,
+            lm_head: LmHead::Quant(lm_head),
             lm_head_buffer,
             lm_head_dtype,
             attn_dtype,
@@ -512,6 +717,11 @@ impl XwenModel {
         // injection, none of which fit as a branch inside the loop below.
         if self.qwen4exp.is_some() {
             return crate::qwen4exp::stack::run_stack_hc(self, tokens, pos);
+        }
+        // The Qwen3 dense graph: plain pre-norm layers over BF16 planes with
+        // no output gate, run over this model's caches by its own module.
+        if self.qwen3.is_some() {
+            return crate::qwen3::stack::run_stack(self, tokens, pos, None);
         }
 
         let seq = tokens.elem_count();
@@ -825,10 +1035,10 @@ impl XwenModel {
         if let Some(layers) = &layers {
             for &il in layers {
                 assert!(
-                    il < self.layers.len(),
+                    il < self.layer_count(),
                     "spec tap layer {il} out of range (model has {} layers); \
                      dflash target_layers must be translated via DflashConfig::spec_tap_layers()",
-                    self.layers.len()
+                    self.layer_count()
                 );
             }
         }
@@ -907,8 +1117,9 @@ impl XwenModel {
     /// path, numerically equivalent).
     pub fn lm_head(&self, h: &Tensor) -> Result<Tensor> {
         // Offset/non-contiguous views are materialized inside QLinear::forward
-        // (the Metal quantized matmul silently drops the input start_offset).
-        Ok(self.lm_head.forward(h)?)
+        // (the Metal quantized matmul silently drops the input start_offset);
+        // the bf16 kernel binds the view's own offset and needs no such care.
+        self.lm_head.forward(h)
     }
 
     /// The output projection at ONE query position: `[1, hidden] -> [1, vocab]`,
@@ -926,21 +1137,114 @@ impl XwenModel {
     /// quantized matmul instead would spend the chain's whole budget on the
     /// vocab projection.
     pub fn lm_head_row(&self, h: &Tensor) -> Result<Tensor> {
-        match &self.lm_head_buffer {
-            Some(buf)
+        match (&self.lm_head, &self.lm_head_buffer) {
+            (LmHead::Quant(q), Some(buf))
                 if !crate::ops::mv_classic()
                     && crate::ops::mv_vendored_supported(self.lm_head_dtype) =>
             {
                 Ok(crate::ops::mul_mv(
                     buf,
                     self.lm_head_dtype,
-                    self.lm_head.out_dim,
-                    self.lm_head.in_dim,
+                    q.out_dim,
+                    q.in_dim,
                     h,
                 )?)
             }
+            // The BF16 head has no quantized buffer to bypass through; its
+            // one-row call is already the bf16 gemv (`LmHead::forward`).
             _ => self.lm_head(h),
         }
+    }
+
+    /// The final `output_norm` over `h` `[seq, hidden]` f32 — what the stack
+    /// applies after its last layer. Public so a caller holding a pre-norm
+    /// residual (an `l_out` tap, an `encode` at `n_layer - 1`) can normalize it
+    /// exactly as the model would.
+    pub fn final_norm(&self, h: &Tensor) -> Result<Tensor> {
+        let norm = norm_of(&self.output_norm, "output_norm")?;
+        crate::qwen3::stack::final_rms_norm(h, norm)
+    }
+
+    /// The number of layers this model runs, whichever field holds them: the
+    /// trunk's `layers`, or the qwen3 stack's own.
+    fn layer_count(&self) -> usize {
+        self.qwen3
+            .as_ref()
+            .map(|parts| parts.n_layer())
+            .unwrap_or(self.layers.len())
+    }
+
+    /// The qwen3 stack this model runs, or `None` on every other architecture.
+    /// For dump provenance (which attention arm loaded) and nothing else.
+    pub fn qwen3_parts(&self) -> Option<&crate::qwen3::Qwen3Parts> {
+        self.qwen3.as_ref()
+    }
+
+    /// Hidden states of `ids` at HF `hidden_states` index `n_layers`, as a
+    /// conditioning encoder would read them: `[T, hidden]` bf16 and `T`.
+    ///
+    /// The index is transformers' numbering, `output_hidden_states=True` with
+    /// `tie_last_hidden_states`: 0 is the embedding output, `n` is the residual
+    /// after `layers[n - 1]` BEFORE the final norm, and `n == n_layer` is the
+    /// normed output the lm head reads. Z-Image reads `hidden_states[-2]` of
+    /// 37, i.e. 35. Layers at or above `n` are never run, which is what lets
+    /// an encoder-only checkpoint with a corrupt last layer serve at 35. Past
+    /// `n_layer` is an error.
+    ///
+    /// Batch 1, one prefill over all of `ids` (chunked at `prefill_chunk` only
+    /// above it, positions continuous), the cache reset before AND after, so
+    /// the call leaves no state behind and depends on none. Activations stay
+    /// f32 end to end; the cast to bf16 is the last thing that happens.
+    /// Truncation is the caller's: this encodes exactly the ids it is given.
+    /// Only a qwen3-backed model has a hidden-state encoder.
+    pub fn encode(&mut self, ids: &[u32], n_layers: usize) -> Result<(Tensor, usize)> {
+        ensure!(
+            self.qwen3.is_some(),
+            "encode: this model runs the {:?} graph, which has no hidden-state encoder; only \
+             the Qwen3 dense safetensors checkpoints do",
+            self.cfg.arch
+        );
+        ensure!(!ids.is_empty(), "encode: no tokens to encode");
+        ensure!(
+            ids.len() <= self.max_ctx,
+            "encode: {} tokens exceed max_ctx {} (raise --max-ctx or truncate the prompt)",
+            ids.len(),
+            self.max_ctx
+        );
+        // Validated up front so an out-of-range index fails before the reset.
+        crate::qwen3::stack::plan(Some(n_layers), self.cfg.n_layer)?;
+        self.reset_cache()?;
+        let hidden = self.encode_chunks(ids, n_layers);
+        // Reset whatever the pass left, on success and on failure alike.
+        self.reset_cache()?;
+        // This call publishes nothing: the parity taps it would have collected
+        // stop short of `result_norm`/`result_output`, and its spec taps are
+        // at an unrelated position for any drafter. Clear rather than leave a
+        // previous forward's readable.
+        self.taps.clear();
+        self.spec_taps.clear();
+        self.post_norm_hidden = None;
+        let hidden = hidden?.to_dtype(DType::BF16)?;
+        Ok((hidden, ids.len()))
+    }
+
+    /// The prefill of `encode`, split out so its caller can reset the cache
+    /// whether or not it returned.
+    fn encode_chunks(&mut self, ids: &[u32], n_layers: usize) -> Result<Tensor> {
+        let chunk = self.prefill_chunk();
+        let mut parts = Vec::with_capacity(ids.len().div_ceil(chunk));
+        let mut pos = 0;
+        for c in ids.chunks(chunk) {
+            let tokens = Tensor::new(c, &self.device)?;
+            let (hidden, _taps, _spec) =
+                crate::qwen3::stack::run_stack(self, &tokens, pos, Some(n_layers))?;
+            parts.push(hidden);
+            pos += c.len();
+        }
+        Ok(match parts.len() {
+            1 => parts.remove(0),
+            _ => Tensor::cat(&parts, 0)?,
+        })
     }
 
     /// Snapshot the KV caches BEFORE a `span`-token verify forward, so a partial
@@ -1320,14 +1624,29 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_c
         .map(tensor_bytes)
         .unwrap_or(0);
     let weight_bytes = weight_bytes - ple_table_bytes;
+    report_footprint(weight_bytes, ple_table_bytes, cfg, kv_slots, max_ctx);
+}
 
+/// The resident-memory lines of `warn_if_over_budget`, over an already-summed
+/// weight figure: the GGUF loader sums its tensor table (minus the PLE table,
+/// which is passed separately because it is reported and never uploaded), the
+/// qwen3 loader sums its device planes and passes no PLE table at all.
+fn report_footprint(
+    weight_bytes: u64,
+    ple_table_bytes: u64,
+    cfg: &XwenConfig,
+    kv_slots: usize,
+    max_ctx: usize,
+) {
     // Conv window + delta state, f32, per DeltaNet layer — context-independent.
+    // `saturating_sub`: an all-attention checkpoint carries `conv_kernel` 0 and
+    // no DeltaNet layer, so the term is multiplied by zero either way.
     let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
     let n_linear = cfg.n_layer as u64 - n_full;
     let hd = cfg.linear_head_dim as u64;
     let state_bytes = n_linear
         * 4
-        * ((cfg.conv_kernel as u64 - 1) * cfg.conv_dim() as u64
+        * ((cfg.conv_kernel as u64).saturating_sub(1) * cfg.conv_dim() as u64
             + cfg.linear_v_heads as u64 * hd * hd)
         // qwen4exp only: the QSA raw-key planes (allocated at max_ctx, not
         // grown) and the PLE conv window. Zero on the other checkpoints.

@@ -1584,7 +1584,7 @@ fn run_job(
         prompt,
         boundary,
         anchor,
-        starts_in_thinking,
+        thinking_entry,
         max_think,
         max_tokens,
         sampling,
@@ -1969,7 +1969,7 @@ fn run_job(
     let outcome = if engine.generator.spec_ready_at(prompt_len) {
         engine.generator.decode_loop_spec(
             prompt_len,
-            starts_in_thinking,
+            thinking_entry,
             max_new,
             &mut |event| emitter.accept(event),
             &mut || stopped.get() || disconnected.get() || abandon.reason().is_some(),
@@ -1977,7 +1977,7 @@ fn run_job(
     } else {
         engine.generator.decode_loop(
             prompt_len,
-            starts_in_thinking,
+            thinking_entry,
             max_new,
             &mut |event| emitter.accept(event),
             &mut || stopped.get() || disconnected.get() || abandon.reason().is_some(),

@@ -17,6 +17,24 @@
 #   scripts/ref-dump.sh -m MODEL --fixture code-short -o /tmp/ref-code
 #   scripts/ref-dump.sh -m MODEL -p "..." -o OUTDIR --gen 24   # also greedy-decode 24 tokens
 #
+# --arch qwen35|qwen3 (default qwen35) says which architecture the model is. It
+# changes two things and nothing else: which prompt fixture file --fixture looks
+# an id up in, and the --arch this script writes into the parity.ts command in
+# ref-cmd.txt (that flag picks the tap-name table -- see docs/parity.md "Tap
+# names"). The llama.cpp binaries take the same arguments either way; they read
+# the architecture out of the GGUF.
+#
+#   qwen35 -> tests/fixtures/parity-prompts.json   (Qwen3.6/3.8, hybrid graph)
+#   qwen3  -> tests/fixtures/qwen3-prompts.json    (Qwen3-4B family, dense graph)
+#
+# The dense Qwen3-4B BF16 GGUF works as -m unchanged; it has no BOS either, so
+# the --no-bos cross-check below still holds. Its longest fixture is 3890 tokens,
+# so pass -c 4096 or more for that one -- the default happens to fit, barely.
+#
+#   scripts/ref-dump.sh --arch qwen3 --fixture edge-cjk -o /tmp/ref-cjk \
+#     -m ~/.cache/huggingface/hub/models--unsloth--Qwen3-4B-GGUF/snapshots/\
+# 22c9fc8a8c7700b76a1789366280a6a5a1ad1120/Qwen3-4B-BF16.gguf
+#
 # Outputs (in OUTDIR):
 #   eval-callback.txt  full per-node trace (stdout+stderr), the numeric oracle
 #   tokens.txt         authoritative token ids, comma-separated, as echoed by eval-callback
@@ -27,12 +45,12 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 bin="$root/reference/llama.cpp/build/bin"
-fixtures="$root/tests/fixtures/parity-prompts.json"
 
 model=""
 prompt=""
 fixture=""
 outdir=""
+arch="qwen35"
 ngl=999
 ctx=4096
 gen=0
@@ -43,12 +61,19 @@ while [[ $# -gt 0 ]]; do
     -p|--prompt)  prompt="$2"; shift 2;;
     --fixture)    fixture="$2"; shift 2;;
     -o|--out)     outdir="$2"; shift 2;;
+    --arch)       arch="$2"; shift 2;;
     --ngl)        ngl="$2"; shift 2;;
     -c|--ctx)     ctx="$2"; shift 2;;
     --gen)        gen="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+
+case "$arch" in
+  qwen35) fixtures="$root/tests/fixtures/parity-prompts.json";;
+  qwen3)  fixtures="$root/tests/fixtures/qwen3-prompts.json";;
+  *) echo "error: --arch must be qwen35 or qwen3, got: $arch" >&2; exit 2;;
+esac
 
 [[ -n "$model"  ]] || { echo "error: -m/--model is required" >&2; exit 2; }
 [[ -n "$outdir" ]] || { echo "error: -o/--out is required" >&2; exit 2; }
@@ -151,6 +176,7 @@ cargo run --release --bin logits-dump -- \\
 bun scripts/parity.ts \\
   --ours "$outdir/ours.json" \\
   --ref "$outdir/eval-callback.txt" \\
+  --arch "$arch" \\
   --report "$outdir/parity-report.json"
 EOF
 

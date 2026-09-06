@@ -26,7 +26,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 /// The checkpoint `tokenizer.json`, embedded verbatim. Shared with
 /// `constrain.rs`, which parses it a second time through llguidance's own
@@ -109,15 +109,41 @@ impl Specials {
         self.endoftext
     }
 
-    /// Resolve every marker through an added-vocabulary lookup. A vocabulary
-    /// missing one has no rendering for the chat template and is refused by
-    /// name rather than silently running with a wrong id.
+    /// Every marker, in the order the struct declares them, paired with the id
+    /// each resolved to. The one list both `resolve` and its collision check
+    /// walk, so neither can cover a marker the other misses.
+    fn entries(&self) -> [(&'static str, u32); 9] {
+        [
+            ("<|endoftext|>", self.endoftext),
+            ("<|im_start|>", self.im_start),
+            ("<|im_end|>", self.im_end),
+            ("<think>", self.think_open),
+            ("</think>", self.think_close),
+            ("<tool_call>", self.tool_call_open),
+            ("</tool_call>", self.tool_call_close),
+            ("<tool_response>", self.tool_response_open),
+            ("</tool_response>", self.tool_response_close),
+        ]
+    }
+
+    /// Resolve every marker through an added-vocabulary lookup.
+    ///
+    /// Two ways a vocabulary is refused rather than run with, both by name. A
+    /// missing marker has no rendering for the chat template at all. Two
+    /// markers sharing one id is worse than useless: the decode loop tells
+    /// sections apart BY id, so a vocabulary where (say) `<think>` and
+    /// `</think>` collide would close a reasoning block the moment it opened,
+    /// and one where `<|im_end|>` collides with anything would stop generation
+    /// on ordinary output. Neither failure is visible in the token stream.
+    ///
+    /// A single text mapping to two ids cannot happen — the lookup is a map
+    /// keyed by text — so the check that remains is the other direction.
     fn resolve(lookup: impl Fn(&str) -> Option<u32>) -> Result<Self> {
         let id = |text: &str| -> Result<u32> {
             lookup(text)
                 .ok_or_else(|| anyhow!("the tokenizer's added vocabulary has no {text:?} token"))
         };
-        Ok(Self {
+        let specials = Self {
             endoftext: id("<|endoftext|>")?,
             im_start: id("<|im_start|>")?,
             im_end: id("<|im_end|>")?,
@@ -127,7 +153,17 @@ impl Specials {
             tool_call_close: id("</tool_call>")?,
             tool_response_open: id("<tool_response>")?,
             tool_response_close: id("</tool_response>")?,
-        })
+        };
+        let entries = specials.entries();
+        for (i, (text, id)) in entries.iter().enumerate() {
+            if let Some((other, _)) = entries[..i].iter().find(|(_, seen)| seen == id) {
+                bail!(
+                    "the tokenizer's added vocabulary maps {other:?} and {text:?} to the same id \
+                     {id}; the structural markers have to be distinct tokens"
+                );
+            }
+        }
+        Ok(specials)
     }
 }
 
@@ -624,6 +660,54 @@ mod tests {
         assert_eq!(s.think_open, 151_667);
         assert_eq!(s.think_close, 151_668);
         assert_eq!(s.eog(), [151_645, 151_643]);
+    }
+
+    /// A vocabulary that maps two markers to one id is refused by name.
+    ///
+    /// The failure it prevents is silent: the decode loop tells reasoning from
+    /// answer by comparing ids, so colliding `<think>` and `</think>` would
+    /// close a block on the token that opened it, and any collision with
+    /// `<|im_end|>` would stop generation on ordinary output. Nothing in the
+    /// token stream would look wrong.
+    #[test]
+    fn a_vocabulary_that_reuses_a_marker_id_is_refused() {
+        let good = |text: &str| match text {
+            "<|endoftext|>" => Some(0),
+            "<|im_start|>" => Some(1),
+            "<|im_end|>" => Some(2),
+            "<think>" => Some(3),
+            "</think>" => Some(4),
+            "<tool_call>" => Some(5),
+            "</tool_call>" => Some(6),
+            "<tool_response>" => Some(7),
+            "</tool_response>" => Some(8),
+            _ => None,
+        };
+        Specials::resolve(good).expect("nine distinct ids resolve");
+
+        // `</think>` reusing `<think>`'s id.
+        let collided = |text: &str| {
+            if text == "</think>" {
+                Some(3)
+            } else {
+                good(text)
+            }
+        };
+        let err = Specials::resolve(collided).unwrap_err().to_string();
+        assert!(err.contains("<think>"), "{err}");
+        assert!(err.contains("</think>"), "{err}");
+        assert!(err.contains("same id 3"), "{err}");
+
+        // A missing marker is still named on its own.
+        let missing = |text: &str| {
+            if text == "<tool_response>" {
+                None
+            } else {
+                good(text)
+            }
+        };
+        let err = Specials::resolve(missing).unwrap_err().to_string();
+        assert!(err.contains("<tool_response>"), "{err}");
     }
 
     /// Every fixture prompt encodes to the ids llama.cpp's own tokenizer gave

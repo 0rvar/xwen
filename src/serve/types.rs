@@ -364,9 +364,10 @@ pub struct GenerationJob {
     /// instead of prefilling from zero. `None`, or a position too shallow to be
     /// worth a snapshot, means the prompt is prefilled in the usual two spans.
     pub anchor: Option<usize>,
-    /// Whether the generation header ends inside an open thinking span, i.e.
-    /// whether the first decoded token is reasoning rather than answer text.
-    pub starts_in_thinking: bool,
+    /// Where the generation header leaves the model with respect to its
+    /// reasoning block: inside one, in the answer, or waiting on an opener the
+    /// model writes itself. See `chat::ThinkingEntry`.
+    pub thinking_entry: crate::chat::ThinkingEntry,
     /// Thinking budget in tokens (`None` = uncapped).
     pub max_think: Option<usize>,
     /// Hard output cap; thinking tokens count toward it.

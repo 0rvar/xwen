@@ -41,8 +41,9 @@ use candle_core::{DType, Device, Tensor};
 use clap::Parser;
 use serde_json::{Value, json};
 
-use xwen::XwenConfig;
+use xwen::checkpoint::CheckpointSource;
 use xwen::gguf;
+use xwen::hub::Model;
 use xwen::model::XwenModel;
 use xwen::ops::ExpertRunner;
 use xwen::tokenizer::LagunaTokenizer;
@@ -58,8 +59,36 @@ const LAST_ROW_CAP: usize = 16384;
     about = "Dump Qwen 3.6 logits + taps as JSON for parity checks"
 )]
 struct Cli {
-    #[arg(short, long)]
-    model: PathBuf,
+    /// Model GGUF, or the Hugging Face safetensors directory of a checkpoint
+    /// stored that way. Optional only together with --model-size, which then
+    /// names the official checkpoint to take from the Hugging Face cache.
+    #[arg(short, long, required_unless_present = "model_size")]
+    model: Option<PathBuf>,
+
+    /// Which official checkpoint this is (the cross-check every surface
+    /// applies to a --model path, and the whole answer when --model is
+    /// omitted). Needed for a safetensors entry whose loader tolerates
+    /// documented zero-filled planes.
+    #[arg(long)]
+    model_size: Option<Model>,
+
+    /// Per-position logits for the whole prompt, in the oracle tool's format
+    /// (scripts/llama-logits-all.cpp): raw little-endian f32 `[n_tokens,
+    /// n_vocab]` at `<out>.f32`, a `<out>.json` sidecar with the run facts, and
+    /// `<out>.argmax.json` with the argmax per position plus the last
+    /// position's top-5. Takes its ids from --ids and its prefix from --out;
+    /// one chunked prefill pass, never the KV-less single-forward path.
+    #[arg(long, requires = "ids", requires = "out")]
+    all_positions: bool,
+
+    /// Whitespace-separated token ids for --all-positions (the oracle's own
+    /// input file; no BOS is added).
+    #[arg(long)]
+    ids: Option<PathBuf>,
+
+    /// Output PREFIX for --all-positions.
+    #[arg(long)]
+    out: Option<PathBuf>,
 
     /// Token ids: comma- or space-separated, brackets optional, so the output
     /// of `llama-tokenize --ids` or the token echo of `llama-eval-callback`
@@ -116,8 +145,38 @@ struct Cli {
     #[arg(long, default_value_t = 4096)]
     max_ctx: usize,
 
-    #[arg(short, long)]
-    output: PathBuf,
+    /// The JSON dump every mode but --all-positions writes.
+    #[arg(short, long, required_unless_present = "all_positions")]
+    output: Option<PathBuf>,
+}
+
+impl Cli {
+    /// The JSON output path of the single-dump modes, which require it.
+    fn output(&self) -> Result<&std::path::Path> {
+        self.output
+            .as_deref()
+            .context("--output is required (every mode but --all-positions writes one JSON dump)")
+    }
+
+    /// `output` for an error message, where a missing path is already the
+    /// error being reported.
+    fn output_label(&self) -> String {
+        self.output
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<no --output>".to_string())
+    }
+
+    /// What the dump records as its model: the path given, else the official
+    /// checkpoint named (`main` resolves that to a path before loading, but
+    /// the dump keeps what the run was asked for).
+    fn model_label(&self) -> String {
+        match (&self.model, self.model_size) {
+            (Some(path), _) => path.display().to_string(),
+            (None, Some(size)) => size.full_name().to_string(),
+            (None, None) => String::new(),
+        }
+    }
 }
 
 fn parse_tokens(s: &str) -> Result<Vec<u32>> {
@@ -290,7 +349,10 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
     let attn_dtype = match model.attn_dtype() {
         DType::F32 => "f32",
         DType::F16 => "f16",
-        other => unreachable!("attention computes in f16 or f32, not {other:?}"),
+        // The qwen3 stack's BF16 planes; never reaches the parity gate's
+        // tiers, which are GGUF-only.
+        DType::BF16 => "bf16",
+        other => unreachable!("attention computes in bf16, f16 or f32, not {other:?}"),
     };
     Ok(json!({
         "schema_version": xwen::parity_schema::PROVENANCE_SCHEMA_VERSION,
@@ -516,8 +578,16 @@ fn main() -> Result<()> {
     let runner = expert_runner(&cli.moe_impl)?;
 
     let device = gguf::metal_device()?;
-    let gguf = gguf::open(&cli.model, &device)?;
-    let cfg = XwenConfig::from_gguf(&gguf.content)?;
+    // The path decides what it is (a GGUF, a safetensors directory), exactly
+    // as on every other surface; --model-size is the cross-check and the
+    // source of a documented zero-run allowlist.
+    let path = match (&cli.model, cli.model_size) {
+        (Some(path), _) => path.clone(),
+        (None, Some(size)) => xwen::hub::ensure_model(size)?,
+        (None, None) => anyhow::bail!("pass --model <path> or --model-size <checkpoint>"),
+    };
+    let source = CheckpointSource::open(&path, &device, cli.model_size)?;
+    let cfg = source.config()?;
     let vocab = cfg.vocab;
     // The greedy/replay decode dumps record each step's top1/top2 from
     // `step_top5`, which indexes `top5[0]`/`top5[1]`; a degenerate vocab would
@@ -526,7 +596,17 @@ fn main() -> Result<()> {
         vocab >= 2,
         "vocab {vocab} < 2: cannot form a top-2 for the parity dumps"
     );
-    let model = XwenModel::load(xwen::CheckpointSource::Gguf(gguf), runner, cli.max_ctx)?;
+    let model = XwenModel::load(source, runner, cli.max_ctx)?;
+
+    if cli.all_positions {
+        anyhow::ensure!(
+            cli.greedy.is_none() && cli.replay.is_none() && cli.ppl.is_none(),
+            "--all-positions is mutually exclusive with --greedy/--replay/--ppl"
+        );
+        let ids = cli.ids.as_deref().context("--all-positions needs --ids")?;
+        let out = cli.out.as_deref().context("--all-positions needs --out")?;
+        return run_all_positions(&cli, model, &device, vocab, &path, ids, out);
+    }
 
     if let Some(corpus) = cli.ppl.clone() {
         anyhow::ensure!(
@@ -653,7 +733,7 @@ fn run_ppl(
     let seq_len = n_tokens.min(ppl_chunk); // the prefill chunk length the runner actually saw
     let dump = json!({
         "kind": "ppl",
-        "model": cli.model.display().to_string(),
+        "model": cli.model_label(),
         "corpus": corpus.display().to_string(),
         "moe_impl": cli.moe_impl,
         "provenance": provenance(&model, &cli.moe_impl, seq_len)?,
@@ -666,11 +746,11 @@ fn run_ppl(
         "mean_nll": mean_nll,
         "per_chunk_means": per_chunk_means,
     });
-    std::fs::write(&cli.output, serde_json::to_string(&dump)?)
-        .with_context(|| format!("writing {}", cli.output.display()))?;
+    std::fs::write(cli.output()?, serde_json::to_string(&dump)?)
+        .with_context(|| format!("writing {}", cli.output_label()))?;
     eprintln!(
         "wrote {} (ppl, runner {}, {} tokens, {} scored, mean_nll {:.6}, {} nonfinite)",
-        cli.output.display(),
+        cli.output()?.display(),
         cli.moe_impl,
         n_tokens,
         n_scored,
@@ -729,7 +809,7 @@ fn run_single(cli: &Cli, mut model: XwenModel, device: &Device, vocab: usize) ->
     };
 
     let dump = json!({
-        "model": cli.model.display().to_string(),
+        "model": cli.model_label(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
         "provenance": provenance(&model, &cli.moe_impl, tokens.len())?,
@@ -742,11 +822,11 @@ fn run_single(cli: &Cli, mut model: XwenModel, device: &Device, vocab: usize) ->
         "taps": taps,
     });
 
-    std::fs::write(&cli.output, serde_json::to_string(&dump)?)
-        .with_context(|| format!("writing {}", cli.output.display()))?;
+    std::fs::write(cli.output()?, serde_json::to_string(&dump)?)
+        .with_context(|| format!("writing {}", cli.output_label()))?;
     eprintln!(
         "wrote {} ({} tokens, vocab {}, {} taps) -> top1={}",
-        cli.output.display(),
+        cli.output()?.display(),
         tokens.len(),
         vocab,
         taps.len(),
@@ -808,7 +888,7 @@ fn run_greedy(
 
     let dump = json!({
         "kind": "greedy",
-        "model": cli.model.display().to_string(),
+        "model": cli.model_label(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
         "provenance": provenance(&model, &cli.moe_impl, tokens.len())?,
@@ -817,11 +897,11 @@ fn run_greedy(
         "vocab": vocab,
         "steps": steps,
     });
-    std::fs::write(&cli.output, serde_json::to_string(&dump)?)
-        .with_context(|| format!("writing {}", cli.output.display()))?;
+    std::fs::write(cli.output()?, serde_json::to_string(&dump)?)
+        .with_context(|| format!("writing {}", cli.output_label()))?;
     eprintln!(
         "wrote {} (greedy, {} prompt tokens, {} steps, runner {})",
-        cli.output.display(),
+        cli.output()?.display(),
         tokens.len(),
         n,
         cli.moe_impl
@@ -893,7 +973,7 @@ fn run_replay(
 
     let dump = json!({
         "kind": "replay",
-        "model": cli.model.display().to_string(),
+        "model": cli.model_label(),
         "prompt": cli.prompt,
         "moe_impl": cli.moe_impl,
         "provenance": provenance(&model, &cli.moe_impl, prompt.len())?,
@@ -902,15 +982,139 @@ fn run_replay(
         "vocab": vocab,
         "steps": steps,
     });
-    std::fs::write(&cli.output, serde_json::to_string(&dump)?)
-        .with_context(|| format!("writing {}", cli.output.display()))?;
+    std::fs::write(cli.output()?, serde_json::to_string(&dump)?)
+        .with_context(|| format!("writing {}", cli.output_label()))?;
     eprintln!(
         "wrote {} (replay of {}, {} prompt tokens, {} steps, runner {})",
-        cli.output.display(),
+        cli.output()?.display(),
         dump_path.display(),
         prompt.len(),
         ref_steps.len(),
         cli.moe_impl
+    );
+    Ok(())
+}
+
+/// `--all-positions`: the xwen side of the per-position parity comparison
+/// (docs/parity.md), in the format `scripts/llama-logits-all.cpp` writes so one
+/// comparison reads both. One chunked prefill over the ids at the model's own
+/// prefill chunk (positions continuous, cache never reset), `forward_all_logits`
+/// per chunk; rows stream to `<out>.f32` as they are produced, so a long prompt
+/// never needs its `[n, vocab]` f32 in memory at once.
+fn run_all_positions(
+    cli: &Cli,
+    mut model: XwenModel,
+    device: &Device,
+    vocab: usize,
+    model_path: &std::path::Path,
+    ids_path: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<()> {
+    use std::io::Write;
+
+    let text = std::fs::read_to_string(ids_path)
+        .with_context(|| format!("reading the id file {}", ids_path.display()))?;
+    let tokens = parse_tokens(&text)?;
+    let n_tokens = tokens.len();
+    anyhow::ensure!(n_tokens >= 1, "{} holds no token ids", ids_path.display());
+    anyhow::ensure!(
+        n_tokens <= model.max_ctx(),
+        "{n_tokens} tokens but max_ctx is {} — raise --max-ctx (the pass is one continuous \
+         context, never truncated)",
+        model.max_ctx()
+    );
+    if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab) {
+        anyhow::bail!("token id {bad} is outside the vocabulary of {vocab}");
+    }
+
+    let with_ext = |ext: &str| {
+        let mut s = out.as_os_str().to_owned();
+        s.push(ext);
+        PathBuf::from(s)
+    };
+    let f32_path = with_ext(".f32");
+    let mut f32_out = std::io::BufWriter::new(
+        std::fs::File::create(&f32_path)
+            .with_context(|| format!("creating {}", f32_path.display()))?,
+    );
+
+    let chunk = model.prefill_chunk();
+    let mut argmax: Vec<u32> = Vec::with_capacity(n_tokens);
+    let mut last_row: Vec<f32> = Vec::new();
+    let mut nonfinite: u64 = 0;
+    let mut pos = 0usize;
+    let started = std::time::Instant::now();
+    for c in tokens.chunks(chunk) {
+        let input = Tensor::new(c, device)?;
+        let logits = model.forward_all_logits(&input, pos)?; // [chunk, vocab]
+        let host = logits.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        let rows = host.to_vec2::<f32>()?;
+        anyhow::ensure!(
+            rows.len() == c.len() && rows.iter().all(|r| r.len() == vocab),
+            "forward_all_logits returned {:?} for a {}-token chunk at vocab {vocab}",
+            logits.dims(),
+            c.len()
+        );
+        for row in &rows {
+            let mut bytes = Vec::with_capacity(row.len() * 4);
+            for &x in row {
+                if !x.is_finite() {
+                    nonfinite += 1;
+                }
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+            f32_out.write_all(&bytes)?;
+            argmax.push(topk(row, 1)[0].0);
+        }
+        last_row = rows.into_iter().last().unwrap_or_default();
+        pos += c.len();
+    }
+    f32_out.flush()?;
+    drop(f32_out);
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let top5 = topk(&last_row, 5.min(vocab));
+    let argmax_json = json!({
+        "n_tokens": n_tokens,
+        "argmax": argmax,
+        "top5_last": top5.iter().map(|&(id, logit)| json!({"id": id, "logit": logit})).collect::<Vec<_>>(),
+    });
+    let am_path = with_ext(".argmax.json");
+    std::fs::write(&am_path, serde_json::to_string_pretty(&argmax_json)?)
+        .with_context(|| format!("writing {}", am_path.display()))?;
+
+    let attn = model
+        .qwen3_parts()
+        .map(|p| p.attn_impl().label())
+        .unwrap_or("trunk");
+    let checkpoint = model.checkpoint_id();
+    let meta = json!({
+        "tool": "logits-dump",
+        "mode": "all-positions",
+        "n_tokens": n_tokens,
+        "n_vocab": vocab,
+        "dtype": "f32",
+        "layout": "[n_tokens, n_vocab] row-major little-endian",
+        "backend": "xwen-metal",
+        "model_path": model_path.display().to_string(),
+        "model_size": cli.model_size.map(|m| m.full_name()),
+        "checkpoint_id": format!("{}:{}", checkpoint.dir_name(), checkpoint.file_len()),
+        "ids_path": ids_path.display().to_string(),
+        "prefill_chunk": chunk,
+        "kv_type": "f16",
+        "attn": attn,
+        "attn_mm": model.attn_mm(),
+        "moe_impl": cli.moe_impl,
+        "nonfinite": nonfinite,
+        "seconds": elapsed,
+        "provenance": provenance(&model, &cli.moe_impl, n_tokens)?,
+    });
+    let meta_path = with_ext(".json");
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)
+        .with_context(|| format!("writing {}", meta_path.display()))?;
+    eprintln!(
+        "logits-dump: {n_tokens} positions x {vocab} logits in {elapsed:.2}s -> {} (+ .json, .argmax.json)",
+        f32_path.display()
     );
     Ok(())
 }

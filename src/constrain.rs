@@ -38,6 +38,13 @@
 //! arms itself when it sees `</think>` commit — the same activation edge
 //! `ThinkBudget` uses, and correct under DFlash because activation rides
 //! `on_committed`, which the verify walk calls per row in commit order.
+//!
+//! On a template that leaves the `<think>` opener to the model
+//! (`chat::ThinkingEntry::ModelOpens`) there is one more state: the reply's
+//! first token is what says whether a block is being opened at all, so that
+//! single draw is masked by the grammar WITH `<think>` added and the token
+//! itself resolves the state — dormant if it opened the block, live and
+//! consumed if it did not.
 
 use std::sync::{Arc, OnceLock};
 
@@ -47,6 +54,7 @@ use llguidance::{Matcher, ParserFactory};
 use toktrie::{SimpleVob, TokEnv};
 use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 
+use crate::chat::ThinkingEntry;
 use crate::tokenizer::{EMBEDDED_TOKENIZER_JSON, LagunaTokenizer, Specials};
 
 /// Token trie + parser factory over the embedded vocabulary. Build once and
@@ -158,16 +166,19 @@ impl Grammar {
         &self.warnings
     }
 
-    /// Turns the compiled grammar into decode-loop state. `in_thinking` says
-    /// whether generation starts inside a `<think>` block; if so the state
-    /// stays dormant until `</think>` commits. `specials` are the running
-    /// vocabulary's marker ids, which is what the state watches the committed
-    /// stream for — the ids differ between checkpoint families.
-    pub fn into_state(self, in_thinking: bool, specials: Specials) -> GrammarState {
+    /// Turns the compiled grammar into decode-loop state. `entry` says where
+    /// the prompt left the model: inside a `<think>` block (dormant until
+    /// `</think>` commits), in the answer (live from the first draw), or
+    /// waiting on the model's own opener (see [`GrammarState::awaiting_opener`]).
+    /// `specials` are the running vocabulary's marker ids, which is what the
+    /// state watches the committed stream for — the ids differ between
+    /// checkpoint families.
+    pub fn into_state(self, entry: ThinkingEntry, specials: Specials) -> GrammarState {
         GrammarState {
             matcher: self.matcher,
             specials,
-            active: !in_thinking,
+            active: matches!(entry, ThinkingEntry::Answer),
+            awaiting_opener: matches!(entry, ThinkingEntry::ModelOpens),
             done: false,
             mask: None,
         }
@@ -190,6 +201,18 @@ pub struct GrammarState {
     /// False while the model is still thinking; nothing is masked or consumed
     /// until `</think>` commits.
     active: bool,
+    /// The reply's first token has not landed yet and it is the token that
+    /// decides whether this is a reasoning block or the answer
+    /// ([`ThinkingEntry::ModelOpens`]).
+    ///
+    /// That one draw is masked by the grammar WITH `<think>` added, which is
+    /// what keeps the choice open without ever handing out an unconstrained
+    /// draw: the model either opens the block, and the state goes dormant until
+    /// `</think>`, or it writes a token the schema already allowed, and the
+    /// state arms and consumes it. Letting that draw go unmasked instead would
+    /// risk a first answer token the matcher then has to reject, which poisons
+    /// it for the rest of the request.
+    awaiting_opener: bool,
     /// The grammar reached a state it cannot extend: the value is complete.
     done: bool,
     /// The most recent mask, held so the sampler can borrow its words.
@@ -201,13 +224,20 @@ impl GrammarState {
     /// `None` while dormant. Packed 32-bit words, index `t / 32`, LSB-first —
     /// the layout `SampleControl::allowed` applies.
     pub fn mask_words(&mut self) -> Result<Option<&[u32]>> {
-        if !self.active || self.done {
+        if (!self.active && !self.awaiting_opener) || self.done {
             return Ok(None);
         }
-        let vob = self
+        let mut vob = self
             .matcher
             .compute_mask()
             .map_err(|e| anyhow!("constrain: grammar mask failed: {e}"))?;
+        if self.awaiting_opener {
+            // The one draw where opening a reasoning block is as legal as
+            // starting the value. Adding the single marker id is all it takes:
+            // the trie holds it as a control token, so the grammar itself never
+            // offers it and no other draw ever can.
+            vob.allow_token(self.specials.think_open);
+        }
         self.mask = Some(vob);
         Ok(self.mask.as_ref().map(|m| m.as_slice()))
     }
@@ -245,14 +275,27 @@ impl GrammarState {
         Ok(())
     }
 
-    /// Observe a committed token, in commit order. Dormant: watches for
-    /// `</think>` and arms itself. Active: advances the grammar; when the
-    /// grammar can no longer be extended the state flips to done. EOG ids are
-    /// never fed to the matcher — the loops break on them, and the mask only
-    /// offers them when stopping is already legal.
+    /// Observe a committed token, in commit order. Waiting on the opener: the
+    /// token decides, and either sends the state dormant or arms it and is then
+    /// consumed as the value's first token. Dormant: watches for `</think>` and
+    /// arms itself. Active: advances the grammar; when the grammar can no
+    /// longer be extended the state flips to done. EOG ids are never fed to the
+    /// matcher — the loops break on them, and the mask only offers them when
+    /// stopping is already legal.
     pub fn on_committed(&mut self, token: u32) -> Result<()> {
         if self.done || self.specials.eog().contains(&token) {
             return Ok(());
+        }
+        if self.awaiting_opener {
+            // Only the reply's first token can open the block, so the wait ends
+            // here whichever way it went.
+            self.awaiting_opener = false;
+            if token == self.specials.think_open {
+                return Ok(());
+            }
+            // No block: the value starts here, and this token was drawn under
+            // the grammar's own mask, so the matcher can take it.
+            self.active = true;
         }
         if !self.active {
             if token == self.specials.think_close {
@@ -327,7 +370,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(false, embedded_specials());
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         for (i, &id) in ids.iter().enumerate() {
             let words = state
                 .mask_words()
@@ -370,7 +413,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(false, embedded_specials());
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let words = state
             .mask_words()
             .unwrap()
@@ -396,7 +439,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(false, embedded_specials());
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let ids = tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap();
         let mut widest = 0;
         for (step, &id) in ids.iter().enumerate() {
@@ -435,7 +478,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(false, embedded_specials());
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let words = state.mask_words().unwrap().unwrap();
         assert!(bit(words, open[0]), "opening brace must be legal");
         assert!(!bit(words, close_bracket[0]), "']' cannot open an object");
@@ -449,7 +492,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(true, embedded_specials());
+            .into_state(ThinkingEntry::Seeded, embedded_specials());
         assert!(state.mask_words().unwrap().is_none());
         // Arbitrary thinking-text tokens pass through without touching the
         // grammar.
@@ -462,6 +505,97 @@ mod tests {
         assert!(bit(words, tok.encode("{").unwrap()[0]));
     }
 
+    // A prompt that leaves the `<think>` opener to the model puts the grammar in
+    // a third state. The first draw is masked by the grammar WITH `<think>`
+    // allowed, so the model can still open a block — and the token it draws is
+    // grammar-legal either way, which is what keeps an unconstrained first token
+    // from ever reaching (and poisoning) the matcher.
+    #[test]
+    fn a_model_opened_block_is_offered_alongside_the_values_first_token() {
+        let tok = LagunaTokenizer::embedded().unwrap();
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::ModelOpens, embedded_specials());
+
+        let words = state
+            .mask_words()
+            .unwrap()
+            .expect("the deciding draw is masked, not skipped");
+        assert!(
+            bit(words, LagunaTokenizer::THINK_OPEN),
+            "<think> has to stay reachable on this one draw"
+        );
+        assert!(
+            bit(words, tok.encode("{").unwrap()[0]),
+            "so does the value's own opening brace"
+        );
+        assert!(
+            !bit(words, tok.encode("]").unwrap()[0]),
+            "everything else is still the schema's business"
+        );
+        for eog in LagunaTokenizer::EOG {
+            assert!(
+                !bit(words, eog),
+                "EOG {eog} offered before the value started"
+            );
+        }
+    }
+
+    // The model opens the block: the state goes dormant and arms on `</think>`,
+    // exactly as a seeded prompt's would, and the reasoning never touches the
+    // matcher.
+    #[test]
+    fn opening_the_block_sends_the_grammar_dormant_until_think_close() {
+        let tok = LagunaTokenizer::embedded().unwrap();
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::ModelOpens, embedded_specials());
+        state.mask_words().unwrap().expect("the deciding draw");
+        state.on_committed(LagunaTokenizer::THINK_OPEN).unwrap();
+
+        assert!(
+            state.mask_words().unwrap().is_none(),
+            "reasoning decodes unconstrained"
+        );
+        for id in tok.encode("let me reason about ] this } first").unwrap() {
+            state.on_committed(id).unwrap();
+        }
+        assert!(state.mask_words().unwrap().is_none());
+        state.on_committed(LagunaTokenizer::THINK_CLOSE).unwrap();
+        let words = state.mask_words().unwrap().expect("armed after </think>");
+        assert!(bit(words, tok.encode("{").unwrap()[0]));
+    }
+
+    // The model answers without opening a block: the first token is the value's
+    // own, so the state arms on it and consumes it — the document walks to
+    // completion from there, with no token lost and none drawn unconstrained.
+    #[test]
+    fn answering_without_a_block_arms_the_grammar_on_the_first_token() {
+        let tok = LagunaTokenizer::embedded().unwrap();
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::ModelOpens, embedded_specials());
+        let ids = tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap();
+        for (i, &id) in ids.iter().enumerate() {
+            let words = state
+                .mask_words()
+                .unwrap()
+                .expect("live grammar yields a mask");
+            assert!(bit(words, id), "token {id} (step {i}) missing from mask");
+            // `<think>` is offered on the deciding draw and never again.
+            assert_eq!(
+                bit(words, LagunaTokenizer::THINK_OPEN),
+                i == 0,
+                "<think> reachability at step {i}"
+            );
+            state.on_committed(id).unwrap();
+        }
+        assert!(state.is_done(), "grammar not complete after the full value");
+    }
+
     // A prefix the caller already put in the prompt is consumed before the first
     // draw, and the grammar carries on from there: the mask continues the
     // document mid-string rather than offering a fresh one, and the rest of the
@@ -472,7 +606,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(false, embedded_specials());
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         state
             .consume_prefix(&tok.encode("{\"name\": \"laguna\",").unwrap())
             .unwrap();
@@ -501,7 +635,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(false, embedded_specials());
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{\"name\": [1").unwrap())
             .expect_err("an array is not a string");
@@ -517,7 +651,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(false, embedded_specials());
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap())
             .expect_err("a complete value leaves nothing to generate");
@@ -532,7 +666,7 @@ mod tests {
         let mut state = factory()
             .compile(&schema())
             .unwrap()
-            .into_state(true, embedded_specials());
+            .into_state(ThinkingEntry::Seeded, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{").unwrap())
             .expect_err("a dormant grammar has nothing to consume with");
@@ -564,7 +698,7 @@ mod tests {
         let mut state = factory()
             .compile_any_object()
             .unwrap()
-            .into_state(false, embedded_specials());
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         for &id in &ids {
             let words = state.mask_words().unwrap().unwrap();
             assert!(bit(words, id), "token {id} missing from json_object mask");

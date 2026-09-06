@@ -31,7 +31,7 @@ use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_m
 use crossterm::{cursor, execute, queue};
 use unicode_width::UnicodeWidthChar;
 
-use xwen::chat::{ChatOptions, Message, build_prompt_with_spans};
+use xwen::chat::{ChatOptions, Message, ThinkingEntry, build_prompt_with_spans};
 use xwen::generate::{GenStats, Generator};
 use xwen::metrics::{self, RunRecord};
 
@@ -110,7 +110,7 @@ pub fn run(
         }
         history.push(input.clone());
         messages.push(Message::User(input));
-        let (prompt, content_ranges) = build_prompt_with_spans(&messages, &opts)?;
+        let (prompt, content_ranges, entry) = build_prompt_with_spans(&messages, &opts)?;
 
         // Clear cancel BEFORE raising `generating`: a Ctrl-C that raced the end
         // of the previous turn must not instantly cancel this one.
@@ -120,9 +120,9 @@ pub fn run(
             generator,
             &prompt,
             &content_ranges,
+            entry,
             max_tokens,
             show_thinking,
-            opts.enable_thinking,
             &cancel,
             &mut out,
         );
@@ -710,9 +710,9 @@ fn stream_reply(
     generator: &mut Generator,
     prompt: &str,
     content_ranges: &[std::ops::Range<usize>],
+    entry: ThinkingEntry,
     max_tokens: usize,
     show_thinking: bool,
-    thinking: bool,
     cancel: &AtomicBool,
     out: &mut Stdout,
 ) -> Result<(String, GenStats)> {
@@ -720,9 +720,12 @@ fn stream_reply(
     out.flush()?;
 
     let mut full = String::new();
-    // With thinking off the prompt already closed the `<think>` block, so the
-    // whole reply is answer text: there is no `</think>` to wait for.
-    let mut in_think = thinking;
+    // Only a prompt that ended inside an open `<think>` block puts the reply
+    // in reasoning from its first chunk. With thinking off the block was closed
+    // by the header, and under a template that leaves the opener to the model
+    // the reply may hold no block at all — either way there is no `</think>`
+    // this scan should wait for.
+    let mut in_think = entry.starts_in_thinking();
     // Whether the pending/thinking indicator line has been cleared yet.
     let mut started = false;
     let mut think_chunks = 0usize;
@@ -731,6 +734,7 @@ fn stream_reply(
         generator.generate_with_content_ranges(
             prompt,
             content_ranges,
+            entry,
             max_tokens,
             &mut |chunk| {
                 full.push_str(chunk);
@@ -894,14 +898,15 @@ fn pipe_repl(
         }
 
         messages.push(Message::User(line));
-        let (prompt, content_ranges) = build_prompt_with_spans(&messages, &opts)?;
+        let (prompt, content_ranges, entry) = build_prompt_with_spans(&messages, &opts)?;
 
         let mut full = String::new();
-        // As in `stream_reply`: with thinking off the reply is all answer text.
-        let mut in_think = opts.enable_thinking;
+        // As in `stream_reply`: only a seeded block puts the reply in reasoning.
+        let mut in_think = entry.starts_in_thinking();
         let stats = generator.generate_with_content_ranges(
             &prompt,
             &content_ranges,
+            entry,
             max_tokens,
             &mut |chunk| {
                 full.push_str(chunk);

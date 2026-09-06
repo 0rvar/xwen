@@ -22,7 +22,10 @@
 //   1. A conversation ending in an assistant message is an assistant PREFILL:
 //      the turn is rendered open, with neither its `<|im_end|>` nor the
 //      generation prompt, whatever `add_generation_prompt` says. Such cases
-//      carry `prefill: true` and are compared with that fixed tail removed.
+//      carry `prefill: true` and their CONTEXT alone is compared, with that
+//      tail cut off the fixture. xwen has no prefill mode — it closes the turn
+//      and starts a new one — so what the two renderers do with a trailing
+//      assistant turn is compared only up to where they part ways.
 //   2. Assistant content holding an inline `<think>` block is parsed by the
 //      server's own reasoning parser first, which sets `reasoning_content` to
 //      the empty string and passes the content through whole — so the
@@ -79,9 +82,16 @@ if (!model) {
 /** The generation prompt both templates write, and the turn terminator before
  *  it. A conversation ending in an assistant message is an ASSISTANT PREFILL to
  *  llama-server: it renders the turn open, dropping both of these, whatever
- *  `add_generation_prompt` says. Such a case is marked `prefill` and its
- *  fixture is compared with that tail removed — the tail itself is fixed text
- *  every other case already pins. */
+ *  `add_generation_prompt` says.
+ *
+ *  A case marked `prefill` is therefore compared with that tail cut off its
+ *  fixture, and the comparison covers the CONTEXT only. What it does not check
+ *  is that xwen's renderer appends the same tail here, because xwen has no
+ *  prefill mode: `build_prompt` closes the trailing assistant turn and writes a
+ *  fresh generation prompt, which is a different rendering of the same
+ *  conversation and not one this endpoint can produce. The tail's own bytes are
+ *  pinned by every non-prefill case; that xwen writes them after a trailing
+ *  assistant turn is pinned only by the fixture in src/chat.rs. */
 const TURN_END_AND_GENERATION_PROMPT = "<|im_end|>\n<|im_start|>assistant\n";
 
 type Case = {
@@ -356,7 +366,7 @@ async function runCases(cases: Case[]): Promise<number> {
       expected = expected.slice(0, -TURN_END_AND_GENERATION_PROMPT.length);
     }
     if (got === expected) {
-      console.log(`PASS ${c.name}${c.prefill ? " (context only; assistant prefill)" : ""}`);
+      console.log(`PASS ${c.name}${c.prefill ? " (CONTEXT ONLY: assistant prefill; the generation prompt is not checked here)" : ""}`);
       continue;
     }
     fail++;

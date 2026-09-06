@@ -777,9 +777,43 @@ impl Model {
     /// needs somewhere to say no. It is not a policy knob: a checkpoint answers
     /// false here only while some part of its state has no image.
     pub const fn servable(self) -> bool {
+        self.not_servable_reason().is_none()
+    }
+
+    /// WHY this checkpoint cannot be served or batched, in a clause that
+    /// completes "…cannot be served or batched: ", or `None` for one that can.
+    ///
+    /// [`Model::servable`] is derived from this rather than the other way
+    /// round, so a checkpoint cannot be refused without saying why. The reasons
+    /// are genuinely different and so is the operator's next move — one is a
+    /// build away, the other is permanent and has a different command to
+    /// reach for — and a single "not supported" would send them both nowhere.
+    pub const fn not_servable_reason(self) -> Option<&'static str> {
         match self {
-            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => true,
-            Model::Qwen34B | Model::Qwen34BInstruct2507 | Model::ZImageTurboEncoder => false,
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => None,
+            Model::Qwen34B | Model::Qwen34BInstruct2507 => Some(
+                "the qwen3 layer stack is not implemented in this build, so nothing can run \
+                 this checkpoint yet",
+            ),
+            Model::ZImageTurboEncoder => Some(
+                "it is an encode-only conditioning encoder, and its weights are not a \
+                 faithful language model — layer 35's MLP arrives zero-filled in the \
+                 Z-Image copy, which generation would run and encoding never reaches; use \
+                 `xwen encode-text`",
+            ),
+        }
+    }
+
+    /// The one sentence every surface that moves cache state says when it is
+    /// asked for a checkpoint it cannot run — the CLI at startup, before a byte
+    /// is downloaded, and the HTTP APIs as the body of a 400.
+    ///
+    /// Phrased for both, because they are refusing the same thing for the same
+    /// reason and two wordings would be two things to keep true.
+    pub fn not_servable_message(self) -> String {
+        match self.not_servable_reason() {
+            Some(reason) => format!("{} cannot be served or batched: {reason}", self.full_name()),
+            None => format!("{} can be served", self.full_name()),
         }
     }
 
@@ -1016,21 +1050,84 @@ impl Model {
     /// with `--model-size` — which is exactly the shape of the GGUF rule, for
     /// the same reason.
     ///
+    /// Provenance is measured against the entry's REPO directory, not against
+    /// whichever snapshot `refs/main` currently points at. A cache holds every
+    /// commit it has ever fetched, and an older snapshot of `Qwen/Qwen3-4B` is
+    /// still `Qwen/Qwen3-4B` — the ref only says which one is current. Matching
+    /// the current snapshot alone made a perfectly good checkpoint identify as
+    /// nothing the moment upstream pushed a README.
+    ///
+    /// Within a snapshot the SUBDIRECTORY has to match too, and that is what
+    /// keeps the two theta-1e6 checkpoints apart from each other rather than
+    /// merely apart from Instruct-2507: the Z-Image encoder is
+    /// `snapshots/<commit>/text_encoder` and a Qwen3-4B checkpoint is
+    /// `snapshots/<commit>` itself. They are in different repos as well, so
+    /// this is belt and braces — but the config cannot tell them apart at all,
+    /// and this is the only thing that can.
+    ///
     /// `path` may be the directory or a file inside it (`ensure_model` hands
     /// back `config.json`), and only DIRECTORIES are canonicalized: the cache's
     /// files are symlinks into a shared `blobs/` store, so resolving one would
     /// compare the blob directory against itself for every entry.
     fn identify_cached_dir(path: &Path) -> Option<Model> {
+        Self::identify_cached_dir_in(&hub_cache_root()?, path)
+    }
+
+    /// [`Model::identify_cached_dir`] against an explicit cache root — the same
+    /// split as `cached_file_in` in this module's tests, and for the same
+    /// reason: the rule is what matters and the environment variable it
+    /// normally reads is not something a test may change out from under the
+    /// threads it shares a process with.
+    fn identify_cached_dir_in(root: &Path, path: &Path) -> Option<Model> {
         let dir = canonical_checkpoint_dir(path)?;
         MODELS
             .into_iter()
             .filter(|model| model.is_safetensors())
-            .find(|model| {
-                cached_model(*model)
-                    .as_deref()
-                    .and_then(canonical_checkpoint_dir)
-                    .is_some_and(|cached| cached == dir)
-            })
+            .find(|model| model.is_cached_snapshot_in(root, &dir))
+    }
+
+    /// Whether `dir` — already canonicalized — is one of this entry's snapshots
+    /// under the cache at `root`, at the subdirectory this entry's files live
+    /// in.
+    ///
+    /// The last clause is not a formality: an interrupted download leaves the
+    /// config and the index in place and the shards missing, and a directory
+    /// like that is not the official weights however official its provenance.
+    /// So every file the entry names has to be there before this says yes.
+    fn is_cached_snapshot_in(self, root: &Path, dir: &Path) -> bool {
+        let Some(snapshots) = self.cached_snapshots_dir_in(root) else {
+            return false;
+        };
+        let Ok(within) = dir.strip_prefix(&snapshots) else {
+            return false;
+        };
+        let mut parts = within.components();
+        // The first component is the commit; whatever follows must be exactly
+        // the subdirectory this checkpoint sits in — empty for the two language
+        // models, `text_encoder` for the encoder.
+        let Some(commit) = parts.next() else {
+            return false;
+        };
+        if parts.as_path() != self.snapshot_subdir() {
+            return false;
+        }
+        let snapshot = snapshots.join(commit);
+        self.files().iter().all(|file| snapshot.join(file).exists())
+    }
+
+    /// This entry's `snapshots/` directory under the cache at `root`,
+    /// canonicalized, or `None` when the repo has never been fetched there.
+    fn cached_snapshots_dir_in(self, root: &Path) -> Option<PathBuf> {
+        let repo = format!("models--{}", self.repo().replace('/', "--"));
+        std::fs::canonicalize(root.join(repo).join("snapshots")).ok()
+    }
+
+    /// Where inside one snapshot this checkpoint's directory sits, derived from
+    /// the config path the entry already lists rather than stated twice: empty
+    /// for a repo whose files are at its root, `text_encoder` for the Z-Image
+    /// encoder.
+    fn snapshot_subdir(self) -> &'static Path {
+        Path::new(self.file()).parent().unwrap_or(Path::new(""))
     }
 
     /// The deepest draft this checkpoint's drafter is asked for when the run did
@@ -1839,6 +1936,52 @@ mod tests {
         );
     }
 
+    /// A checkpoint is never refused without a reason, and the reasons are
+    /// different reasons: `servable` is DERIVED from the explanation, so the two
+    /// cannot fall out of step.
+    ///
+    /// The distinction earns its keep because the operator's next move differs.
+    /// The two language models are waiting on a build. The encoder is not
+    /// waiting on anything — it is an encoder, its weights are not a working
+    /// language model, and the answer is a different command.
+    #[test]
+    fn a_refused_checkpoint_says_which_refusal_it_is() {
+        for model in MODELS {
+            assert_eq!(
+                model.not_servable_reason().is_none(),
+                model.servable(),
+                "{model:?}"
+            );
+        }
+
+        for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
+            let message = model.not_servable_message();
+            assert!(message.starts_with(model.full_name()), "{message}");
+            assert!(message.contains("cannot be served or batched"), "{message}");
+            assert!(
+                message.contains("layer stack is not implemented"),
+                "{message}"
+            );
+        }
+
+        let encoder = Model::ZImageTurboEncoder.not_servable_message();
+        assert!(encoder.contains("encode-only"), "{encoder}");
+        // Names the actual defect and the command that does work, because
+        // "not supported" would leave someone holding these weights nowhere.
+        assert!(encoder.contains("zero-filled"), "{encoder}");
+        assert!(encoder.contains("encode-text"), "{encoder}");
+        assert!(
+            !encoder.contains("layer stack is not implemented"),
+            "the encoder's refusal must not read as one a later build lifts: {encoder}"
+        );
+
+        // The wire says the same thing the CLI does, for the same checkpoint.
+        assert_eq!(
+            crate::serve::unselectable_model_message(Model::Qwen34B),
+            Model::Qwen34B.not_servable_message()
+        );
+    }
+
     /// The qwen3 cache figures. All three checkpoints share one geometry — the
     /// releases differ only in `rope_theta` and context length — and its
     /// snapshot cost is genuinely zero: every layer is full attention, so the
@@ -1990,6 +2133,79 @@ mod tests {
                 "{model:?} via its config.json"
             );
         }
+    }
+
+    /// Provenance is the entry's REPO in the cache, not the snapshot `refs/main`
+    /// happens to point at today, and within a snapshot the SUBDIRECTORY has to
+    /// match too.
+    ///
+    /// Built against a synthetic cache rather than this machine's, so it can
+    /// hold two snapshots of one repo and a half-downloaded third — states a
+    /// real cache reaches and a test cannot wait around for.
+    #[test]
+    fn every_intact_snapshot_of_an_entrys_repo_identifies_as_that_entry() {
+        let root = scratch("snapshots");
+        // Two commits of Qwen/Qwen3-4B, as a cache that has fetched the repo
+        // twice holds. Neither is "current" here — there is no refs/main at all,
+        // which is the point: the ref says which snapshot is newest, not which
+        // ones are that repo.
+        let base_old = install_set(&root, Model::Qwen34B, "aaa111");
+        let base_new = install_set(&root, Model::Qwen34B, "bbb222");
+        let encoder = install_set(&root, Model::ZImageTurboEncoder, "ccc333");
+
+        let identify = |dir: &Path| Model::identify_cached_dir_in(&root, dir);
+
+        // Both snapshots are Qwen3-4B. Matching only the current one made an
+        // intact checkpoint identify as nothing the moment upstream pushed a
+        // README.
+        assert_eq!(identify(&base_old), Some(Model::Qwen34B));
+        assert_eq!(identify(&base_new), Some(Model::Qwen34B));
+        // And so is the config.json inside one, which is the path
+        // `ensure_model` hands back.
+        assert_eq!(
+            identify(&base_new.join("config.json")),
+            Some(Model::Qwen34B)
+        );
+
+        // The encoder is its own entry, and the two are never each other —
+        // which nothing else can decide, since their configs are identical
+        // down to the byte.
+        assert_eq!(identify(&encoder), Some(Model::ZImageTurboEncoder));
+        assert_ne!(identify(&encoder), Some(Model::Qwen34B));
+        assert_ne!(identify(&base_new), Some(Model::ZImageTurboEncoder));
+
+        // The SNAPSHOT ROOT of the encoder's repo is not the encoder: the
+        // checkpoint is `text_encoder/` inside it, and the root holds a
+        // tokenizer and nothing else this build can run.
+        assert_eq!(identify(encoder.parent().unwrap()), None);
+
+        // A half-downloaded snapshot is not the official weights, however
+        // official its provenance: the config and the index arrive first and
+        // the shards do not.
+        let partial = install_set(&root, Model::Qwen34B, "ddd444");
+        std::fs::remove_file(partial.join("model-00002-of-00003.safetensors")).unwrap();
+        assert_eq!(identify(&partial), None);
+
+        // A directory outside the cache is nobody's checkpoint, whatever it is
+        // called.
+        let outside = root.join("Qwen3-4B");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(identify(&outside), None);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// One snapshot of `model` under the cache at `root`, with every file the
+    /// registry says the checkpoint has. Returns the CHECKPOINT directory,
+    /// which for the encoder is a subdirectory of the snapshot.
+    fn install_set(root: &Path, model: Model, commit: &str) -> PathBuf {
+        let snapshot = repo_dir(root, model.repo()).join("snapshots").join(commit);
+        for file in model.files() {
+            let path = snapshot.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        snapshot.join(model.snapshot_subdir())
     }
 
     /// A synthetic `XwenConfig` on the qwen3 architecture at a given rope base.

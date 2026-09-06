@@ -3,9 +3,10 @@ use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use candle_core::{D, DType, Device, Tensor};
 
+use crate::chat::ThinkingEntry;
 use crate::config::XwenConfig;
 use crate::constrain::GrammarState;
 use crate::dflash::DrafterImage;
@@ -16,7 +17,7 @@ use crate::mtp::MtpDrafter;
 use crate::ops::ExpertRunner;
 use crate::sampler::{SampleControl, Sampler, SamplerOptions};
 use crate::stack_profile::Phase;
-use crate::tokenizer::LagunaTokenizer;
+use crate::tokenizer::{LagunaTokenizer, Specials};
 
 /// Chunked prefill (512-token chunks) + single-token decode loop with a
 /// streaming callback. One GPU->CPU sync per decoded token (the logits
@@ -983,6 +984,22 @@ impl ThinkBudget {
         }
     }
 
+    /// Hold the schedule until the model opens its reasoning block.
+    ///
+    /// Called by the decode loops under [`ThinkingEntry::ModelOpens`], where the
+    /// reply may hold no block at all: a schedule ticking from the first token
+    /// would pace the ANSWER, and its wrap-up and transition injections would
+    /// land in it. [`ThinkBudget::arm`] starts it once the opener commits.
+    fn hold_for_opener(&mut self) {
+        self.armed = false;
+    }
+
+    /// Start the schedule on the token that opened the block. A no-op when no
+    /// ceiling was set, and never reached on a prompt that seeded the opener.
+    fn arm(&mut self) {
+        self.armed = self.budget > 0;
+    }
+
     /// Clear the per-call state, keeping the scanned vocab sets.
     fn reset(&mut self) {
         self.armed = self.budget > 0;
@@ -1412,11 +1429,20 @@ impl Generator {
     /// Open a checkpoint on `device` and assemble a generator around it: the
     /// weights, their config, the tokenizer and the sampler's EOG set all come
     /// from one place so the CLI and the server load a model identically.
-    /// `tokenizer` is override-only — `None` uses the vocabulary embedded in
-    /// the binary (`LagunaTokenizer::embedded`), which is what every default
-    /// path wants. Attaching a drafter stays the caller's business —
-    /// it needs the same `device`, which is why the device is passed in
-    /// rather than made here.
+    /// `tokenizer` is override-only. With `None` the vocabulary comes from the
+    /// CHECKPOINT: the copy compiled into the binary for a GGUF, whose
+    /// vocabulary that is, and the set's own `tokenizer.json` for a safetensors
+    /// checkpoint, whose vocabulary it is not. Attaching a drafter stays the
+    /// caller's business — it needs the same `device`, which is why the device
+    /// is passed in rather than made here.
+    ///
+    /// That second arm is not a convenience. Qwen3 is a different vocabulary
+    /// from Qwen 3.6: 151936 ids against 248320, and `<|im_end|>` at 151645
+    /// against 248046. Loading the embedded one for a Qwen3 checkpoint produces
+    /// a run that tokenizes the prompt into ids meaning something else, never
+    /// recognizes its own stop token, and reads as a model that will not stop —
+    /// the exact failure the Qwen note in AGENTS.md warns about, arrived at from
+    /// the other direction.
     ///
     /// `model` is whatever `--model` or the registry resolved: a GGUF, or a
     /// safetensors directory. `entry` is the registry checkpoint the caller
@@ -1434,13 +1460,32 @@ impl Generator {
     ) -> Result<Self> {
         let source = crate::checkpoint::CheckpointSource::open(model, device, entry)?;
         let cfg = source.config()?;
-        let tok = match tokenizer {
-            Some(path) => LagunaTokenizer::from_file(path)?,
-            None => LagunaTokenizer::embedded()?,
-        };
+        let tok = Self::load_tokenizer(&source, tokenizer)?;
         let sampler = Sampler::new(sampling, cfg.eog_tokens.clone(), tok.vocab_size());
         let model = XwenModel::load(source, runner, max_ctx)?;
         Ok(Self::new(model, tok, sampler))
+    }
+
+    /// The vocabulary a load runs on: the caller's override, else the
+    /// checkpoint's own.
+    ///
+    /// Split out of [`Generator::load`] so the rule can be exercised without a
+    /// Metal device or a 20 GB load — the choice is the part that goes wrong,
+    /// and it goes wrong silently.
+    fn load_tokenizer(
+        source: &crate::checkpoint::CheckpointSource,
+        override_path: Option<&Path>,
+    ) -> Result<LagunaTokenizer> {
+        if let Some(path) = override_path {
+            return LagunaTokenizer::from_file(path)
+                .with_context(|| format!("reading the tokenizer {}", path.display()));
+        }
+        match source.tokenizer_path() {
+            Some(path) => LagunaTokenizer::from_file(path).with_context(|| {
+                format!("reading this checkpoint's own tokenizer {}", path.display())
+            }),
+            None => LagunaTokenizer::embedded(),
+        }
     }
 
     /// Rebuild the sampler from `opts`, keeping the loaded EOG set. Lets a
@@ -1509,6 +1554,13 @@ impl Generator {
     /// ids (banning EOG too keeps the forcing window from ending the reply
     /// outright). Empty in the default configuration, so the default path stays
     /// on the unmasked sampler.
+    ///
+    /// The floor set is only ever selected while the decoder is INSIDE a
+    /// reasoning block. That is every one of its first `min_think` tokens on a
+    /// prompt that seeded the opener, and it is the point on a prompt that left
+    /// the opener to the model: a reply that opens no block has no reasoning to
+    /// hold the model in, and banning the EOG ids there would turn a reasoning
+    /// floor into a minimum ANSWER length.
     fn ban_ids(&self, with_think_exit: bool) -> Vec<u32> {
         let mut ban = self.blacklist.clone();
         if with_think_exit && self.min_think > 0 {
@@ -1654,6 +1706,9 @@ impl Generator {
     /// prepends it). This method never injects a BOS of its own, and it treats
     /// every byte as trusted — chat callers with client content in the prompt
     /// should use `generate_with_content_ranges` instead.
+    ///
+    /// A raw prompt has no template and so no reasoning block:
+    /// `ThinkingEntry::Answer` is the only entry that describes it.
     pub fn generate(
         &mut self,
         prompt: &str,
@@ -1661,24 +1716,43 @@ impl Generator {
         on_text: &mut dyn FnMut(&str),
         should_stop: &mut dyn FnMut() -> bool,
     ) -> Result<GenStats> {
-        self.generate_with_content_ranges(prompt, &[], max_tokens, on_text, should_stop)
+        self.generate_with_content_ranges(
+            prompt,
+            &[],
+            ThinkingEntry::Answer,
+            max_tokens,
+            on_text,
+            should_stop,
+        )
     }
 
-    /// `generate` for a chat-rendered prompt: `content_ranges` are the
-    /// client-content byte ranges reported by `chat::build_prompt_with_spans`,
-    /// and the prompt is encoded via `LagunaTokenizer::encode_prompt` so
+    /// `generate` for a chat-rendered prompt: `content_ranges` and `entry` are
+    /// what `chat::build_prompt_with_spans` reports alongside the string, and
+    /// the prompt is encoded via `LagunaTokenizer::encode_prompt` so
     /// added-token strings inside client content stay plain text instead of
     /// becoming control tokens.
+    ///
+    /// `entry` is what holds the think budget off a reply that may hold no
+    /// reasoning block at all: under `ThinkingEntry::ModelOpens` the schedule
+    /// stays inert until the model writes its own `<think>`.
     pub fn generate_with_content_ranges(
         &mut self,
         prompt: &str,
         content_ranges: &[Range<usize>],
+        entry: ThinkingEntry,
         max_tokens: usize,
         on_text: &mut dyn FnMut(&str),
         should_stop: &mut dyn FnMut() -> bool,
     ) -> Result<GenStats> {
         if self.drafter.is_some() {
-            return self.generate_spec(prompt, content_ranges, max_tokens, on_text, should_stop);
+            return self.generate_spec(
+                prompt,
+                content_ranges,
+                entry,
+                max_tokens,
+                on_text,
+                should_stop,
+            );
         }
         self.model.reset_cache()?;
         // Any logits a previous `prefill_tokens` left behind describe a cache
@@ -1785,7 +1859,7 @@ impl Generator {
         let outcome = self.decode_tokens(
             logits,
             pos,
-            false,
+            entry,
             max_tokens,
             &mut forward_text,
             should_stop,
@@ -2096,10 +2170,12 @@ impl Generator {
 
     /// Decode from the logits `prefill_tokens` left behind, emitting one
     /// [`GenEvent`] per token. `start_pos` is the absolute position the first
-    /// decoded token occupies (the prefilled length). `starts_in_thinking` says
-    /// the prompt ended inside a `<think>` block, so tokens are reported as
-    /// reasoning until `</think>` is sampled — that token is the last
-    /// `ThinkingTok`, and everything after it is answer text.
+    /// decoded token occupies (the prefilled length). `entry` says where the
+    /// rendered prompt left the model: inside a `<think>` block the header
+    /// opened, in the answer, or waiting on an opener the model writes itself
+    /// (see [`ThinkingEntry`]). Tokens are reported as reasoning for as long as
+    /// the block is open, up to and including the `</think>` that closes it;
+    /// everything after that is answer text.
     ///
     /// Stops on any EOG token, at `max_new` emitted tokens, or when
     /// `should_stop` (polled once per token, before the draw) returns true. The
@@ -2113,7 +2189,7 @@ impl Generator {
     pub fn decode_loop(
         &mut self,
         start_pos: usize,
-        starts_in_thinking: bool,
+        entry: ThinkingEntry,
         max_new: usize,
         on_event: &mut dyn FnMut(GenEvent),
         should_stop: &mut dyn FnMut() -> bool,
@@ -2131,14 +2207,7 @@ impl Generator {
             .take()
             .ok_or_else(|| anyhow!("decode_loop: no prefill logits; call prefill_tokens first"))?;
         self.think.reset();
-        self.decode_tokens(
-            logits,
-            start_pos,
-            starts_in_thinking,
-            max_new,
-            on_event,
-            should_stop,
-        )
+        self.decode_tokens(logits, start_pos, entry, max_new, on_event, should_stop)
     }
 
     /// Speculative counterpart to [`decode_loop`](Self::decode_loop): same
@@ -2164,7 +2233,7 @@ impl Generator {
     pub fn decode_loop_spec(
         &mut self,
         start_pos: usize,
-        starts_in_thinking: bool,
+        entry: ThinkingEntry,
         max_new: usize,
         on_event: &mut dyn FnMut(GenEvent),
         should_stop: &mut dyn FnMut() -> bool,
@@ -2200,13 +2269,7 @@ impl Generator {
         // of both shapes. Dispatched here, before `self` is split into field
         // borrows, because the other loop needs all of `self` back.
         if matches!(self.drafter, Some(AttachedDrafter::Mtp(_))) {
-            return self.decode_loop_mtp(
-                start_pos,
-                starts_in_thinking,
-                max_new,
-                on_event,
-                should_stop,
-            );
+            return self.decode_loop_mtp(start_pos, entry, max_new, on_event, should_stop);
         }
         let ban_floor = self.ban_ids(true);
         let ban_plain = self.ban_ids(false);
@@ -2248,9 +2311,6 @@ impl Generator {
         let target_max_ctx = model.max_ctx();
         let draft_ctx = drafter.max_ctx();
 
-        // The reasoning/answer boundary is a vocabulary fact, read once per call:
-        // the decode stream holds the tokenizer for the rest of the loop.
-        let think_close = tokenizer.specials().think_close;
         let decode_start = Instant::now();
         let mut stream = tokenizer.decode_stream();
         let mut stats = SpecStats::default();
@@ -2258,8 +2318,13 @@ impl Generator {
         // forwarded, and equally the number of tokens the KV cache holds.
         let mut n_past = start_pos;
         let mut decoded = 0usize;
-        let mut thinking_tokens = 0usize;
-        let mut in_thinking = starts_in_thinking;
+        // The reasoning/answer cursor: which section each committed token lands
+        // in, and whether an opener the prompt left to the model is still
+        // owed. Built before the decode stream borrows the tokenizer.
+        let mut section = SectionState::new(entry, tokenizer.specials());
+        if matches!(entry, ThinkingEntry::ModelOpens) {
+            think.hold_for_opener();
+        }
         let mut hit_eog = false;
         let mut cancelled = false;
         // Wall-clock auto-pause, constructed per call: its EMAs describe THIS
@@ -2297,7 +2362,7 @@ impl Generator {
         // does. Every later token is committed by a verify round. Emitted index 0,
         // so the forced-reasoning ban applies whenever the floor is nonzero.
         let mut id_last = {
-            let banned = if min_think > 0 {
+            let banned = if min_think > 0 && section.in_thinking {
                 &ban_floor
             } else {
                 &ban_plain
@@ -2325,18 +2390,18 @@ impl Generator {
         };
         if sampler.is_eog(id_last) {
             device.synchronize()?;
-            return Ok(finish(0, 0, true, false, stats));
+            return Ok(finish(0, section.thinking_tokens, true, false, stats));
         }
         {
             let chunk = stream.step(id_last)?;
             think.on_emitted(chunk.as_deref());
-            on_event(section_event(
-                id_last,
-                chunk.unwrap_or_default(),
-                think_close,
-                &mut in_thinking,
-                &mut thinking_tokens,
-            ));
+            let event = section.tag(id_last, chunk.unwrap_or_default());
+            // A block the model opened itself starts the schedule here; a seeded
+            // one was armed before the first draw and never reaches this.
+            if section.opened_now {
+                think.arm();
+            }
+            on_event(event);
             decoded += 1;
             // Polled only while more tokens are owed: with the budget already met
             // the round loop below never starts, and a cancellation that lands
@@ -2351,7 +2416,13 @@ impl Generator {
         // on the first draw; the round loop must not start.
         if grammar.as_ref().is_some_and(|g| g.is_done()) {
             device.synchronize()?;
-            return Ok(finish(decoded, thinking_tokens, true, cancelled, stats));
+            return Ok(finish(
+                decoded,
+                section.thinking_tokens,
+                true,
+                cancelled,
+                stats,
+            ));
         }
 
         while !cancelled && decoded < max_new {
@@ -2437,7 +2508,7 @@ impl Generator {
                     let fused = drafter.encode(&taps)?;
                     drafter.inject(&fused, n_past)?;
                 }
-                let banned = if decoded < min_think {
+                let banned = if decoded < min_think && section.in_thinking {
                     &ban_floor
                 } else {
                     &ban_plain
@@ -2496,7 +2567,7 @@ impl Generator {
                 let (m, accepted) = accept_drafts(&drafts, max_new - decoded, |i| {
                     let row = logits_cpu.narrow(0, i, 1)?;
                     let t = decoded + i;
-                    let banned = if t < min_think {
+                    let banned = if t < min_think && section.in_thinking {
                         &ban_floor
                     } else {
                         &ban_plain
@@ -2555,13 +2626,13 @@ impl Generator {
                 }
                 let chunk = stream.step(tok)?;
                 think.on_emitted(chunk.as_deref());
-                on_event(section_event(
-                    tok,
-                    chunk.unwrap_or_default(),
-                    think_close,
-                    &mut in_thinking,
-                    &mut thinking_tokens,
-                ));
+                let event = section.tag(tok, chunk.unwrap_or_default());
+                // A block the model opened itself starts the schedule here; a seeded
+                // one was armed before the first draw and never reaches this.
+                if section.opened_now {
+                    think.arm();
+                }
+                on_event(event);
                 decoded += 1;
                 emitted_here += 1;
                 if decoded >= max_new {
@@ -2661,7 +2732,13 @@ impl Generator {
         }
 
         device.synchronize()?;
-        Ok(finish(decoded, thinking_tokens, hit_eog, cancelled, stats))
+        Ok(finish(
+            decoded,
+            section.thinking_tokens,
+            hit_eog,
+            cancelled,
+            stats,
+        ))
     }
 
     /// The MTP head's decode loop — the chain-drafting counterpart of
@@ -2690,7 +2767,7 @@ impl Generator {
     fn decode_loop_mtp(
         &mut self,
         start_pos: usize,
-        starts_in_thinking: bool,
+        entry: ThinkingEntry,
         max_new: usize,
         on_event: &mut dyn FnMut(GenEvent),
         should_stop: &mut dyn FnMut() -> bool,
@@ -2740,9 +2817,6 @@ impl Generator {
         let target_max_ctx = model.max_ctx();
         let draft_ctx = head.max_ctx();
 
-        // The reasoning/answer boundary is a vocabulary fact, read once per call:
-        // the decode stream holds the tokenizer for the rest of the loop.
-        let think_close = tokenizer.specials().think_close;
         let decode_start = Instant::now();
         let mut stream = tokenizer.decode_stream();
         let mut stats = SpecStats::default();
@@ -2750,8 +2824,13 @@ impl Generator {
         // forwarded, and equally the number of tokens the KV cache holds.
         let mut n_past = start_pos;
         let mut decoded = 0usize;
-        let mut thinking_tokens = 0usize;
-        let mut in_thinking = starts_in_thinking;
+        // The reasoning/answer cursor: which section each committed token lands
+        // in, and whether an opener the prompt left to the model is still
+        // owed. Built before the decode stream borrows the tokenizer.
+        let mut section = SectionState::new(entry, tokenizer.specials());
+        if matches!(entry, ThinkingEntry::ModelOpens) {
+            think.hold_for_opener();
+        }
         let mut hit_eog = false;
         let mut cancelled = false;
         let mut pause = PauseController::new(params.pause_margin as f64);
@@ -2785,7 +2864,7 @@ impl Generator {
         // First token: sampled from the prefill logits, exactly as plain decode
         // does. Every later token is committed by a verify round.
         let mut id_last = {
-            let banned = if min_think > 0 {
+            let banned = if min_think > 0 && section.in_thinking {
                 &ban_floor
             } else {
                 &ban_plain
@@ -2813,18 +2892,18 @@ impl Generator {
         };
         if sampler.is_eog(id_last) {
             device.synchronize()?;
-            return Ok(finish(0, 0, true, false, stats));
+            return Ok(finish(0, section.thinking_tokens, true, false, stats));
         }
         {
             let chunk = stream.step(id_last)?;
             think.on_emitted(chunk.as_deref());
-            on_event(section_event(
-                id_last,
-                chunk.unwrap_or_default(),
-                think_close,
-                &mut in_thinking,
-                &mut thinking_tokens,
-            ));
+            let event = section.tag(id_last, chunk.unwrap_or_default());
+            // A block the model opened itself starts the schedule here; a seeded
+            // one was armed before the first draw and never reaches this.
+            if section.opened_now {
+                think.arm();
+            }
+            on_event(event);
             decoded += 1;
             if decoded < max_new && should_stop() {
                 cancelled = true;
@@ -2832,7 +2911,13 @@ impl Generator {
         }
         if grammar.as_ref().is_some_and(|g| g.is_done()) {
             device.synchronize()?;
-            return Ok(finish(decoded, thinking_tokens, true, cancelled, stats));
+            return Ok(finish(
+                decoded,
+                section.thinking_tokens,
+                true,
+                cancelled,
+                stats,
+            ));
         }
 
         while !cancelled && decoded < max_new {
@@ -2893,7 +2978,7 @@ impl Generator {
                 if spec_live {
                     mtp_sync_capped(model, head, &[id_last], &hidden, n_past)?;
                 }
-                let banned = if decoded < min_think {
+                let banned = if decoded < min_think && section.in_thinking {
                     &ban_floor
                 } else {
                     &ban_plain
@@ -2939,7 +3024,7 @@ impl Generator {
                 let (m, accepted) = accept_drafts(&drafts, max_new - decoded, |i| {
                     let row = logits_cpu.narrow(0, i, 1)?;
                     let t = decoded + i;
-                    let banned = if t < min_think {
+                    let banned = if t < min_think && section.in_thinking {
                         &ban_floor
                     } else {
                         &ban_plain
@@ -2986,13 +3071,13 @@ impl Generator {
                 }
                 let chunk = stream.step(tok)?;
                 think.on_emitted(chunk.as_deref());
-                on_event(section_event(
-                    tok,
-                    chunk.unwrap_or_default(),
-                    think_close,
-                    &mut in_thinking,
-                    &mut thinking_tokens,
-                ));
+                let event = section.tag(tok, chunk.unwrap_or_default());
+                // A block the model opened itself starts the schedule here; a seeded
+                // one was armed before the first draw and never reaches this.
+                if section.opened_now {
+                    think.arm();
+                }
+                on_event(event);
                 decoded += 1;
                 emitted_here += 1;
                 if decoded >= max_new {
@@ -3082,7 +3167,13 @@ impl Generator {
         }
 
         device.synchronize()?;
-        Ok(finish(decoded, thinking_tokens, hit_eog, cancelled, stats))
+        Ok(finish(
+            decoded,
+            section.thinking_tokens,
+            hit_eog,
+            cancelled,
+            stats,
+        ))
     }
 
     /// The single-token decode loop both `generate` and `decode_loop` run:
@@ -3094,7 +3185,7 @@ impl Generator {
         &mut self,
         mut logits: Tensor,
         start_pos: usize,
-        starts_in_thinking: bool,
+        entry: ThinkingEntry,
         max_new: usize,
         on_event: &mut dyn FnMut(GenEvent),
         should_stop: &mut dyn FnMut() -> bool,
@@ -3114,11 +3205,12 @@ impl Generator {
         let mut presence = self.sampler.presence_history();
         let mut pos = start_pos;
         let mut decoded = 0usize;
-        let mut thinking_tokens = 0usize;
-        let mut in_thinking = starts_in_thinking;
-        // The reasoning/answer boundary is a vocabulary fact, read once per call
-        // so the emit loop below does not reborrow the tokenizer per token.
-        let think_close = self.tokenizer.specials().think_close;
+        // The reasoning/answer cursor: which section each committed token lands
+        // in, and whether an opener the prompt left to the model is still owed.
+        let mut section = SectionState::new(entry, self.tokenizer.specials());
+        if matches!(entry, ThinkingEntry::ModelOpens) {
+            self.think.hold_for_opener();
+        }
         let mut hit_eog = false;
         let mut cancelled = false;
         while decoded < max_new {
@@ -3126,7 +3218,7 @@ impl Generator {
                 cancelled = true;
                 break;
             }
-            let banned = if decoded < self.min_think {
+            let banned = if decoded < self.min_think && section.in_thinking {
                 &ban_floor
             } else {
                 &ban_plain
@@ -3164,13 +3256,13 @@ impl Generator {
             let chunk = stream.step(token)?;
             self.think.on_emitted(chunk.as_deref());
             let text = chunk.unwrap_or_default();
-            on_event(section_event(
-                token,
-                text,
-                think_close,
-                &mut in_thinking,
-                &mut thinking_tokens,
-            ));
+            let event = section.tag(token, text);
+            // A block the model opened itself starts the schedule here; a seeded
+            // one was armed before the first draw and never reaches this.
+            if section.opened_now {
+                self.think.arm();
+            }
+            on_event(event);
             decoded += 1;
             // A completed grammar ends the reply: every remaining legal token is
             // an EOG, and drawing one costs a forward this break skips. Reported
@@ -3189,7 +3281,7 @@ impl Generator {
         device.synchronize()?;
         Ok(DecodeOutcome {
             tokens_out: decoded,
-            thinking_tokens,
+            thinking_tokens: section.thinking_tokens,
             hit_eog,
             cancelled,
             decode_secs: decode_start.elapsed().as_secs_f64(),
@@ -3210,6 +3302,7 @@ impl Generator {
         &mut self,
         prompt: &str,
         content_ranges: &[Range<usize>],
+        entry: ThinkingEntry,
         max_tokens: usize,
         on_text: &mut dyn FnMut(&str),
         should_stop: &mut dyn FnMut() -> bool,
@@ -3227,7 +3320,14 @@ impl Generator {
         // Same split as `decode_loop_spec`: the MTP head chains and takes its
         // own loop, dispatched before the field borrows below.
         if matches!(self.drafter, Some(AttachedDrafter::Mtp(_))) {
-            return self.generate_mtp(prompt, content_ranges, max_tokens, on_text, should_stop);
+            return self.generate_mtp(
+                prompt,
+                content_ranges,
+                entry,
+                max_tokens,
+                on_text,
+                should_stop,
+            );
         }
         let ban_floor = self.ban_ids(true);
         let ban_plain = self.ban_ids(false);
@@ -3383,7 +3483,7 @@ impl Generator {
         // committed token of a verify round. Emitted index 0, so the forced-
         // reasoning ban applies whenever the floor is nonzero.
         let mut id_last = {
-            let banned = if min_think > 0 {
+            let banned = if min_think > 0 && entry.starts_in_thinking() {
                 &ban_floor
             } else {
                 &ban_plain
@@ -3514,7 +3614,7 @@ impl Generator {
                         let fused = drafter.encode(&taps)?;
                         drafter.inject(&fused, n_past)?;
                     }
-                    let banned = if decoded < min_think {
+                    let banned = if decoded < min_think && entry.starts_in_thinking() {
                         &ban_floor
                     } else {
                         &ban_plain
@@ -3557,7 +3657,7 @@ impl Generator {
                     let (m, accepted) = accept_drafts(&drafts, max_tokens - decoded, |i| {
                         let row = logits_cpu.narrow(0, i, 1)?;
                         let t = decoded + i;
-                        let banned = if t < min_think {
+                        let banned = if t < min_think && entry.starts_in_thinking() {
                             &ban_floor
                         } else {
                             &ban_plain
@@ -3691,6 +3791,7 @@ impl Generator {
         &mut self,
         prompt: &str,
         content_ranges: &[Range<usize>],
+        entry: ThinkingEntry,
         max_tokens: usize,
         on_text: &mut dyn FnMut(&str),
         should_stop: &mut dyn FnMut() -> bool,
@@ -3761,7 +3862,7 @@ impl Generator {
         };
         let outcome = self.decode_loop_mtp(
             tokens.len(),
-            false,
+            entry,
             max_tokens,
             &mut forward_text,
             should_stop,
@@ -4152,40 +4253,90 @@ fn retained_commits(committed: usize, emitted: usize, hit_eog: bool) -> usize {
     if hit_eog { committed } else { emitted }
 }
 
-/// Tag one committed token with the section of the reply it belongs to, advancing
-/// the caller's reasoning bookkeeping. `text` is what the streaming decoder
-/// finalized for this token (empty when it withheld it).
+/// Which section of the reply the decoder is in, and what would move it.
 ///
-/// `in_thinking` starts true when the prompt ended inside a `<think>` block and
-/// flips off on the `</think>` token, which is the LAST `ThinkingTok` and carries
-/// the marker stripped from its text: a decode step finalizes text only through
-/// the token just fed, so `</think>` is that chunk's tail — what precedes it is
-/// the last of the reasoning and nothing follows it. `thinking_tokens` counts
-/// every token inside the block, including the closing one.
+/// One instance per decode call, driven token by token through
+/// [`SectionState::tag`]. Shared by the plain and speculative loops so the
+/// reasoning/answer split has exactly one implementation.
 ///
-/// Shared by the plain and speculative decode loops so the reasoning/answer split
-/// has exactly one implementation.
-fn section_event(
-    token: u32,
-    text: String,
+/// The block is entered either because the prompt's header already opened it
+/// ([`ThinkingEntry::Seeded`] — the 3.6 lineage always) or because the model
+/// wrote the opener itself as the reply's very first token
+/// ([`ThinkingEntry::ModelOpens`] — the Qwen3 base template with thinking on).
+/// It is left on `</think>`. Under [`ThinkingEntry::Answer`] neither marker
+/// means anything and every token is answer text.
+struct SectionState {
+    /// The decoder is inside a reasoning block.
+    in_thinking: bool,
+    /// No token has been tagged yet and the first one decides whether a block
+    /// opens. Cleared by that token whichever way it goes: the model opens its
+    /// block immediately or not at all, so a `<think>` later in the reply is
+    /// ordinary text.
+    awaiting_opener: bool,
+    think_open: u32,
     think_close: u32,
-    in_thinking: &mut bool,
-    thinking_tokens: &mut usize,
-) -> GenEvent {
-    if !*in_thinking {
-        return GenEvent::TextTok { id: token, text };
+    /// Tokens inside the block, both markers included.
+    thinking_tokens: usize,
+    /// Set by the token that just opened a model-written block, cleared by
+    /// every other. The decode loop arms the think budget on it: the budget
+    /// paces a block, and until one exists there is nothing to pace. Never true
+    /// on a seeded prompt, whose budget was armed before the first draw.
+    opened_now: bool,
+}
+
+impl SectionState {
+    fn new(entry: ThinkingEntry, specials: &Specials) -> Self {
+        Self {
+            in_thinking: entry.starts_in_thinking(),
+            awaiting_opener: matches!(entry, ThinkingEntry::ModelOpens),
+            think_open: specials.think_open,
+            think_close: specials.think_close,
+            thinking_tokens: 0,
+            opened_now: false,
+        }
     }
-    *thinking_tokens += 1;
-    if token != think_close {
-        return GenEvent::ThinkingTok { id: token, text };
-    }
-    *in_thinking = false;
-    let reasoning = text
-        .split_once("</think>")
-        .map_or(text.as_str(), |(before, _)| before);
-    GenEvent::ThinkingTok {
-        id: token,
-        text: reasoning.to_string(),
+
+    /// Tag one committed token with the section it belongs to, advancing the
+    /// reasoning bookkeeping. `text` is what the streaming decoder finalized
+    /// for this token (empty when it withheld it).
+    ///
+    /// Both markers are stripped from the text they arrive in and neither is
+    /// reported as reasoning prose, so a seeded block and a model-opened one
+    /// deliver the same event stream: a decode step finalizes text only through
+    /// the token just fed, so `</think>` is its chunk's tail and `<think>` is
+    /// its chunk's head. Each still counts toward `thinking_tokens`.
+    fn tag(&mut self, token: u32, text: String) -> GenEvent {
+        self.opened_now = false;
+        if self.awaiting_opener {
+            self.awaiting_opener = false;
+            if token == self.think_open {
+                self.in_thinking = true;
+                self.opened_now = true;
+                self.thinking_tokens += 1;
+                let opened = text
+                    .split_once("<think>")
+                    .map_or(text.as_str(), |(_, after)| after);
+                return GenEvent::ThinkingTok {
+                    id: token,
+                    text: opened.to_string(),
+                };
+            }
+        }
+        if !self.in_thinking {
+            return GenEvent::TextTok { id: token, text };
+        }
+        self.thinking_tokens += 1;
+        if token != self.think_close {
+            return GenEvent::ThinkingTok { id: token, text };
+        }
+        self.in_thinking = false;
+        let reasoning = text
+            .split_once("</think>")
+            .map_or(text.as_str(), |(before, _)| before);
+        GenEvent::ThinkingTok {
+            id: token,
+            text: reasoning.to_string(),
+        }
     }
 }
 
@@ -4284,6 +4435,61 @@ mod tests {
     /// EOG marker used by the tests: any token >= 900 "ends generation".
     fn test_eog(t: u32) -> bool {
         t >= 900
+    }
+
+    /// A safetensors checkpoint runs on ITS OWN vocabulary, not the one
+    /// compiled into the binary.
+    ///
+    /// This is the quietest way the qwen3 work could have gone wrong. The two
+    /// vocabularies overlap in shape and in nothing else: 151936 ids against
+    /// 248320, `<|im_end|>` at 151645 against 248046. A generator built with the
+    /// wrong one loads, prefills, decodes and never fails — it just tokenizes
+    /// the prompt into ids that mean other words and runs straight through
+    /// every turn boundary, which reads as a model that will not stop.
+    ///
+    /// Skips itself when the checkpoint is not in the local cache; asserts the
+    /// ids rather than the file name, because the file name is not the thing
+    /// that would be wrong.
+    #[test]
+    fn a_safetensors_checkpoint_brings_its_own_vocabulary() {
+        let Some(config) = crate::hub::cached_model(crate::hub::Model::Qwen34B) else {
+            eprintln!("skipping: Qwen/Qwen3-4B is not in the Hugging Face cache");
+            return;
+        };
+        let dir = config.parent().unwrap();
+        let source = crate::checkpoint::CheckpointSource::open(
+            dir,
+            &Device::Cpu,
+            Some(crate::hub::Model::Qwen34B),
+        )
+        .expect("opening the cached Qwen3-4B set");
+
+        // The set names a tokenizer; a GGUF does not, and keeps the embedded
+        // one — which is the arm that must not change.
+        assert!(source.tokenizer_path().is_some());
+
+        let tok = Generator::load_tokenizer(&source, None).expect("the checkpoint's tokenizer");
+        let specials = tok.specials();
+        assert_eq!(specials.im_start, 151644);
+        assert_eq!(specials.im_end, 151645);
+        assert_eq!(specials.endoftext, 151643);
+        assert_eq!(specials.think_open, 151667);
+        assert_eq!(specials.think_close, 151668);
+        assert_eq!(specials.eog(), crate::qwen3::QWEN3_EOG);
+
+        // And it is emphatically not the embedded one: same specials, different
+        // ids, different width. Comparing against the real thing rather than
+        // against literals is what makes this fail if the wrong file is loaded.
+        let embedded = LagunaTokenizer::embedded().expect("the embedded tokenizer");
+        assert_ne!(specials.im_end, embedded.specials().im_end);
+        assert_ne!(tok.vocab_size(), embedded.vocab_size());
+
+        // An explicit --tokenizer still wins over the checkpoint's own, which is
+        // the whole point of the flag.
+        let override_path = dir.join("tokenizer.json");
+        let overridden = Generator::load_tokenizer(&source, Some(&override_path))
+            .expect("an explicit tokenizer path");
+        assert_eq!(overridden.specials().im_end, 151645);
     }
 
     /// Drive `accept_drafts` with a fixed list of "target samples", tracking how
@@ -4546,84 +4752,181 @@ mod tests {
 
     // ---- The reasoning/answer split, shared by the plain and speculative loops.
 
+    /// The embedded vocabulary's marker ids, which the cases below spell in
+    /// terms of. Pinned to the constants by
+    /// `tokenizer::tests::the_embedded_vocabulary_resolves_to_the_named_constants`.
+    fn section_specials() -> Specials {
+        static SPECIALS: std::sync::OnceLock<Specials> = std::sync::OnceLock::new();
+        *SPECIALS.get_or_init(|| *LagunaTokenizer::embedded().unwrap().specials())
+    }
+
     // `</think>` is the last ThinkingTok and its text stops at the marker; the
     // token itself counts toward the reasoning total, and everything after it is
     // answer text that does not.
     #[test]
-    fn section_event_ends_reasoning_at_the_marker() {
-        let mut in_thinking = true;
-        let mut thinking = 0usize;
+    fn a_seeded_block_ends_its_reasoning_at_the_marker() {
+        let mut section = SectionState::new(ThinkingEntry::Seeded, &section_specials());
 
-        let event = section_event(
-            7,
-            "step one".into(),
-            LagunaTokenizer::THINK_CLOSE,
-            &mut in_thinking,
-            &mut thinking,
-        );
+        let event = section.tag(7, "step one".into());
         assert!(matches!(event, GenEvent::ThinkingTok { id: 7, .. }));
         assert_eq!(event.text(), "step one");
-        assert!(in_thinking);
-        assert_eq!(thinking, 1);
+        assert!(section.in_thinking);
+        assert_eq!(section.thinking_tokens, 1);
 
-        let event = section_event(
-            LagunaTokenizer::THINK_CLOSE,
-            "done.</think>".into(),
-            LagunaTokenizer::THINK_CLOSE,
-            &mut in_thinking,
-            &mut thinking,
-        );
+        let event = section.tag(LagunaTokenizer::THINK_CLOSE, "done.</think>".into());
         assert!(matches!(event, GenEvent::ThinkingTok { .. }));
         assert_eq!(event.text(), "done.");
-        assert!(!in_thinking);
-        assert_eq!(thinking, 2);
+        assert!(!section.in_thinking);
+        assert_eq!(section.thinking_tokens, 2);
 
-        let event = section_event(
-            9,
-            "the answer".into(),
-            LagunaTokenizer::THINK_CLOSE,
-            &mut in_thinking,
-            &mut thinking,
-        );
+        let event = section.tag(9, "the answer".into());
         assert!(matches!(event, GenEvent::TextTok { id: 9, .. }));
         assert_eq!(event.text(), "the answer");
-        assert_eq!(thinking, 2);
+        assert_eq!(section.thinking_tokens, 2);
+        // A seeded prompt's budget is armed before the first draw, so nothing
+        // here ever asks the loop to arm it.
+        assert!(!section.opened_now);
     }
 
     // A run that never started in a `<think>` block reports every token as answer
     // text, `</think>` included — there is no block for it to close.
     #[test]
-    fn section_event_outside_a_think_block_counts_nothing() {
-        let mut in_thinking = false;
-        let mut thinking = 0usize;
-        let event = section_event(
-            LagunaTokenizer::THINK_CLOSE,
-            "</think>".into(),
-            LagunaTokenizer::THINK_CLOSE,
-            &mut in_thinking,
-            &mut thinking,
-        );
+    fn an_answer_entry_counts_nothing_as_reasoning() {
+        let mut section = SectionState::new(ThinkingEntry::Answer, &section_specials());
+        let event = section.tag(LagunaTokenizer::THINK_CLOSE, "</think>".into());
         assert!(matches!(event, GenEvent::TextTok { .. }));
         assert_eq!(event.text(), "</think>");
-        assert_eq!(thinking, 0);
+        assert_eq!(section.thinking_tokens, 0);
+        // Not even the opener: with no block expected, `<think>` is text.
+        let event = section.tag(LagunaTokenizer::THINK_OPEN, "<think>".into());
+        assert!(matches!(event, GenEvent::TextTok { .. }));
+        assert_eq!(event.text(), "<think>");
+        assert_eq!(section.thinking_tokens, 0);
+        assert!(!section.opened_now);
     }
 
     // A token the streaming decoder withheld (mid-UTF-8, or a partial tag prefix)
     // still counts and still carries its real id — only its text is empty.
     #[test]
-    fn section_event_counts_withheld_tokens() {
-        let mut in_thinking = true;
-        let mut thinking = 0usize;
-        let event = section_event(
-            42,
-            String::new(),
-            LagunaTokenizer::THINK_CLOSE,
-            &mut in_thinking,
-            &mut thinking,
-        );
+    fn a_withheld_token_still_counts_as_reasoning() {
+        let mut section = SectionState::new(ThinkingEntry::Seeded, &section_specials());
+        let event = section.tag(42, String::new());
         assert_eq!(event.id(), 42);
         assert!(event.text().is_empty());
-        assert_eq!(thinking, 1);
+        assert_eq!(section.thinking_tokens, 1);
+    }
+
+    // The model-opened block, which is what a Qwen3 thinking-on prompt produces:
+    // the reply's first token is the opener, everything to `</think>` is
+    // reasoning, and the rest is the answer. The opener carries no text of its
+    // own — the marker is stripped, exactly as the closer's is — so a seeded
+    // block and this one hand out the same event stream.
+    #[test]
+    fn a_model_written_opener_enters_the_block() {
+        let mut section = SectionState::new(ThinkingEntry::ModelOpens, &section_specials());
+        assert!(!section.in_thinking, "the header opened nothing");
+
+        let event = section.tag(LagunaTokenizer::THINK_OPEN, "<think>".into());
+        assert!(matches!(event, GenEvent::ThinkingTok { .. }));
+        assert_eq!(event.text(), "", "the opener is a marker, not reasoning");
+        assert!(section.in_thinking);
+        assert_eq!(section.thinking_tokens, 1);
+        assert!(section.opened_now, "the loop arms the think budget here");
+
+        let event = section.tag(7, "step one".into());
+        assert!(matches!(event, GenEvent::ThinkingTok { id: 7, .. }));
+        assert_eq!(event.text(), "step one");
+        assert!(!section.opened_now, "the flag is one token wide");
+
+        let event = section.tag(LagunaTokenizer::THINK_CLOSE, "done.</think>".into());
+        assert_eq!(event.text(), "done.");
+        assert!(!section.in_thinking);
+        assert_eq!(section.thinking_tokens, 3);
+
+        let event = section.tag(9, "the answer".into());
+        assert!(matches!(event, GenEvent::TextTok { id: 9, .. }));
+        assert_eq!(section.thinking_tokens, 3);
+    }
+
+    // The model answers without thinking: no opener, so the whole reply is text
+    // and nothing ever arms the budget.
+    #[test]
+    fn a_reply_with_no_opener_is_all_answer_text() {
+        let mut section = SectionState::new(ThinkingEntry::ModelOpens, &section_specials());
+        for (token, text) in [(1u32, "The"), (2, " answer"), (3, " is 4.")] {
+            let event = section.tag(token, text.into());
+            assert!(matches!(event, GenEvent::TextTok { .. }), "{text:?}");
+            assert!(!section.opened_now);
+        }
+        assert_eq!(section.thinking_tokens, 0);
+        assert!(!section.in_thinking);
+    }
+
+    // Only the FIRST token can open the block. The Qwen3 template's model opens
+    // its block immediately when it thinks at all, so a `<think>` further into
+    // the reply is the model writing about one — text, not a section change.
+    #[test]
+    fn an_opener_that_is_not_first_is_ordinary_text() {
+        let mut section = SectionState::new(ThinkingEntry::ModelOpens, &section_specials());
+        let event = section.tag(1, "Let me ".into());
+        assert!(matches!(event, GenEvent::TextTok { .. }));
+
+        let event = section.tag(LagunaTokenizer::THINK_OPEN, "<think>".into());
+        assert!(matches!(event, GenEvent::TextTok { .. }));
+        assert_eq!(event.text(), "<think>", "the marker is delivered verbatim");
+        assert!(!section.in_thinking);
+        assert!(!section.opened_now);
+        assert_eq!(section.thinking_tokens, 0);
+    }
+
+    // Instruct-2507 renders no thinking at all, so its prompts carry
+    // `ThinkingEntry::Answer` and nothing the model writes enters a block.
+    #[test]
+    fn a_template_without_thinking_never_enters_a_block() {
+        let entry = crate::chat::build_prompt_parts_with_spans(
+            &[crate::chat::Message::User("Hi".into())],
+            &crate::chat::ChatOptions::for_dialect(crate::chat::ChatDialect::Qwen3Instruct),
+        )
+        .unwrap()
+        .thinking_entry;
+        assert_eq!(entry, ThinkingEntry::Answer);
+
+        let mut section = SectionState::new(entry, &section_specials());
+        let event = section.tag(LagunaTokenizer::THINK_OPEN, "<think>".into());
+        assert!(matches!(event, GenEvent::TextTok { .. }));
+        assert!(!section.in_thinking);
+        assert_eq!(section.thinking_tokens, 0);
+    }
+
+    // The think budget is held off a reply that may hold no block, and starts
+    // on the opener. A budget that ticked from the first token would pace the
+    // ANSWER and inject its wrap-up prose into it.
+    #[test]
+    fn the_think_budget_waits_for_a_model_written_opener() {
+        let mut b = budget(100);
+        b.hold_for_opener();
+        // Held: the schedule hands out nothing, however far into the reply.
+        assert_eq!(b.phase(95), ThinkPhase::Done);
+        assert!(at(&mut b, 95).pull.is_none());
+        assert!(at(&mut b, 95).force.is_none());
+        assert!(at(&mut b, 95).bias.is_empty());
+
+        b.arm();
+        // Armed, and the clock starts at the token after the opener.
+        assert_eq!(b.phase(0), ThinkPhase::Free);
+        let (id, _) = at(&mut b, 90).pull.expect("pulling by 90%");
+        assert_eq!(id, LagunaTokenizer::THINK_CLOSE);
+    }
+
+    // With no ceiling set there is nothing to arm: a held budget of zero stays
+    // inert, so the opener does not switch a schedule on that was never asked for.
+    #[test]
+    fn arming_a_zero_budget_does_nothing() {
+        let mut b = ThinkBudget::off();
+        b.hold_for_opener();
+        b.arm();
+        assert!(!b.enabled());
+        assert_eq!(b.phase(0), ThinkPhase::Done);
     }
 
     // ---- PauseController: a pure state machine, tested without any GPU by

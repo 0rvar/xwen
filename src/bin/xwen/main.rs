@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 
 use xwen::batch::{BatchRequest, BatchResponse};
-use xwen::chat::{ChatOptions, Message, ReasoningEffort, build_prompt_with_spans};
+use xwen::chat::{ChatOptions, Message, ReasoningEffort, ThinkingEntry, build_prompt_with_spans};
 use xwen::checkpoint::CheckpointSource;
 use xwen::config::Identity;
 use xwen::dflash::DflashDrafter;
@@ -527,6 +527,46 @@ enum Cmd {
     },
     /// Serve the model over HTTP (Anthropic Messages + OpenAI Chat Completions).
     Serve(ServeArgs),
+    /// Encode a prompt into hidden states, as a diffusion pipeline's text
+    /// encoder does: render it as one user turn in the checkpoint's chat
+    /// template, tokenize with the checkpoint's own tokenizer, run the
+    /// layers up to the requested hidden state and write `hidden` [T, hidden]
+    /// bf16 plus `input_ids` [T] i64 to a safetensors file.
+    EncodeText {
+        /// Hugging Face safetensors directory of a Qwen3 checkpoint (default:
+        /// the checkpoint --model-size names, ensured in the Hugging Face
+        /// cache — downloaded on first use, cached forever after).
+        #[arg(short, long)]
+        model: Option<PathBuf>,
+        /// Which Qwen3 checkpoint to encode with: zimage-turbo (the Z-Image
+        /// text encoder; the default here, unlike every other command),
+        /// qwen3-4b or qwen3-4b-instruct-2507. A GGUF checkpoint has no
+        /// hidden-state encoder.
+        #[arg(long, value_name = "zimage-turbo|qwen3-4b|qwen3-4b-instruct-2507")]
+        model_size: Option<Model>,
+        /// The HF `hidden_states` index to return: 0 is the embedding output,
+        /// N the residual after layer N-1 (before the final norm), 36 the
+        /// normed output. Default: what the checkpoint's pipeline reads (35 on
+        /// zimage-turbo), or the normed output on a plain language model.
+        #[arg(long)]
+        layer: Option<usize>,
+        /// The prompt text.
+        #[arg(long, conflicts_with = "prompt_file")]
+        prompt: Option<String>,
+        /// Read the prompt from this file instead, verbatim.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// The safetensors file to write.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Context ceiling in tokens (the prompt must fit; an encoder entry
+        /// truncates to its pipeline's own limit first).
+        #[arg(long, default_value_t = DEFAULT_MAX_CTX)]
+        max_ctx: usize,
+        /// Also print the rendered prompt and the token ids to stderr.
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 /// `xwen serve` flags. Every value is optional so the config merge can tell a
@@ -808,6 +848,11 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         // question the rule answers. The two agree today; the indirection is
         // what keeps them agreeing on purpose rather than by coincidence.
         let size = selected.unwrap_or_else(Model::default_servable);
+        // BEFORE `resolve_model`, which fetches. A checkpoint this build cannot
+        // serve must be refused while the refusal is still free: downloading
+        // 8 GB, starting the server, listing the model and then dying on the
+        // first request is the worst possible order to learn it in.
+        ensure_servable(size)?;
         overrides.model = Some(resolve_model(None, size)?);
     }
 
@@ -829,6 +874,11 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         .with_context(|| format!("reading {}", settings.model.display()))?;
     let (served_target, _) =
         xwen::serve::engine::identify_checkpoint(&settings, &served_cfg, selected)?;
+    // The second gate, and it catches a different case from the first: a
+    // `--model` path whose IDENTITY is a checkpoint this build cannot serve.
+    // A safetensors directory nobody named resolves to `Assumed(Qwen3-4B)`, so
+    // it arrives here having downloaded nothing and passed every earlier check.
+    ensure_servable(served_target.model)?;
 
     match &settings.draft {
         DraftMode::Off => {}
@@ -921,7 +971,11 @@ fn one_shot_checkpoint(
                 path.display(),
                 assumed.full_name()
             );
-            Checkpoint::assumed(assumed, &source.label())
+            // The label is the path the OPERATOR named, not one read back off
+            // the opened checkpoint: a `GgufFile` knows only shard 0, so a run
+            // started on shard 2 of a split set would otherwise file itself
+            // under shard 0's name while the server reports shard 2's.
+            Checkpoint::assumed(assumed, &xwen::checkpoint::label_for(path))
         }
     })
 }
@@ -961,6 +1015,52 @@ impl Checkpoint {
     }
 }
 
+/// What `xwen inspect` prints for a safetensors checkpoint, in place of the
+/// GGUF tensor listing.
+///
+/// The zero-run report is the part worth having on stdout. The loader already
+/// logs it as an operational line, but that goes to stderr with everything else
+/// a load says, and `inspect` exists to answer "what IS this file" — for the
+/// Z-Image encoder the answer includes "two of its planes are zero-filled and
+/// this build knows it", which is not a footnote.
+fn describe_safetensors_set(set: &xwen::qwen3::Qwen3Set) {
+    println!("safetensors set: {}", set.dir().display());
+    println!("tokenizer: {}", set.tokenizer_path().display());
+    for shard in set.shard_paths() {
+        println!("shard: {}", shard.display());
+    }
+    let scan = set.range_scan();
+    println!(
+        "bf16 range: {} of {} projection values below f16's subnormal floor, {} above f16 max",
+        scan.below_f16_subnormal, scan.elements, scan.above_f16_max
+    );
+    match set.zero_runs() {
+        [] => println!("zero-filled planes: none"),
+        runs => {
+            println!(
+                "zero-filled planes (allowlisted for this checkpoint, so this build accepts \
+                 them; any other plane would be an error):"
+            );
+            for (name, run) in runs {
+                println!("  {name}: {} zeros from element {}", run.len, run.start);
+            }
+        }
+    }
+}
+
+/// The gate `xwen serve` and `xwen batch` apply before they commit to a
+/// checkpoint — both of them move cache state, and both would otherwise learn
+/// that this build cannot run one only at the lazy load, behind a download and
+/// a started server.
+///
+/// The message is [`Model::not_servable_message`], the same sentence the HTTP
+/// APIs answer a request for an unrunnable checkpoint with, so the CLI and the
+/// wire cannot drift into explaining the same refusal differently.
+fn ensure_servable(size: Model) -> Result<()> {
+    ensure!(size.servable(), "{}", size.not_servable_message());
+    Ok(())
+}
+
 /// `-m` given: use it verbatim. Omitted: the selected official checkpoint,
 /// ensured in the standard Hugging Face cache (idempotent — the cached path
 /// comes back without a request; only a missing file is downloaded, with
@@ -970,18 +1070,32 @@ fn resolve_model(model: Option<PathBuf>, size: Model) -> Result<PathBuf> {
         Some(path) => Ok(path),
         None => {
             if xwen::hub::cached_model(size).is_none() {
-                // A split checkpoint needs every shard beside the one the
-                // loader opens, and the size quoted is the whole set's — so
-                // say how many files that is rather than name one and leave
-                // the figure looking like its size.
-                let what = match size.files() {
-                    [one] => one.to_string(),
-                    shards => format!("{} ({} shards)", shards[0], shards.len()),
+                // A checkpoint that is more than one file needs all of them
+                // beside the one the loader opens, and the size quoted is the
+                // WHOLE set's — so say how many files that is, and say "total"
+                // next to the figure, rather than naming one file and leaving
+                // the size looking like that file's.
+                //
+                // A gguf-split set is counted in shards because that is what its
+                // files are. A safetensors checkpoint is not: six files, of
+                // which three are weight shards and three are a config, an index
+                // and a tokenizer, so calling any of those a shard would be
+                // wrong about most of them.
+                //
+                // The repo goes INSIDE the subject rather than being prefixed
+                // onto it, because only two of the three shapes end in a file
+                // name: "Qwen/Qwen3-4B/6 files" is not a path and does not read
+                // as one.
+                let (what, total) = match (size.files(), size.is_safetensors()) {
+                    ([one], _) => (format!("{}/{one}", size.repo()), ""),
+                    (files, true) => (format!("{} ({} files)", size.repo(), files.len()), " total"),
+                    (shards, false) => (
+                        format!("{}/{} ({} shards)", size.repo(), shards[0], shards.len()),
+                        " total",
+                    ),
                 };
                 eprintln!(
-                    "xwen: {}/{} is not in the Hugging Face cache; downloading ({}, resumes in place)",
-                    size.repo(),
-                    what,
+                    "xwen: {what} is not in the Hugging Face cache; downloading ({}{total}, resumes in place)",
                     size.size(),
                 );
             }
@@ -1289,6 +1403,11 @@ fn batch_request(
         Model::default_servable(),
     )?;
     let size = checkpoint.model;
+    // Batch snapshots the shared prefix and restores per item, so it moves cache
+    // state exactly as the server does and answers the same question about a
+    // checkpoint. Gated here, BEFORE `resolve_model` fetches: the refusal costs
+    // nothing now and a download later.
+    ensure_servable(size)?;
 
     let load_start = std::time::Instant::now();
     let mut generator = build_generator(
@@ -1515,16 +1634,41 @@ fn main() -> Result<()> {
             run_stats(&query, json)
         }
         Some(Cmd::Inspect { model, select }) => {
-            let model = resolve_model(model, select.size())?;
+            // `select.model_size`, not `select.size()`: the Option is what
+            // `identify` needs. Defaulting it here would tell the cross-check
+            // that every run named a checkpoint, and a `--model` pointing at
+            // something else would then be a contradiction that never fired.
+            let selected = select.model_size;
+            let path = resolve_model(model, select.size())?;
             let device = candle_core::Device::Cpu;
-            let source = CheckpointSource::open(&model, &device, Some(select.size()))?;
+            let source = CheckpointSource::open(&path, &device, selected)?;
+            let cfg = source.config()?;
+            // Inspect applies the selected entry's zero-run allowlist when it
+            // opens, so it has to apply that entry's cross-check too — otherwise
+            // `--model <instruct dir> --model-size qwen3-4b` is a contradiction
+            // every other surface refuses and this one describes.
+            let identity = source.identify(&cfg, selected, "--model-size")?;
             // The tensor listing is a GGUF rendering of a GGUF file table; a
             // safetensors set has its own and no describer yet, so it prints
-            // the config alone rather than nothing.
+            // what a set knows about itself instead.
             if let Some(gguf) = source.gguf() {
                 print!("{}", gguf::describe_file(gguf));
             }
-            println!("\nparsed config: {:#?}", source.config()?);
+            if let Some(set) = source.safetensors() {
+                describe_safetensors_set(set);
+            }
+            println!(
+                "\nidentifies as: {}",
+                match identity {
+                    Identity::Official(model) => format!("{} (official)", model.full_name()),
+                    Identity::Assumed(model) => format!(
+                        "{} — assumed, nothing in {} names a checkpoint",
+                        model.full_name(),
+                        path.display()
+                    ),
+                }
+            );
+            println!("\nparsed config: {cfg:#?}");
             Ok(())
         }
         Some(Cmd::Generate {
@@ -1614,8 +1758,9 @@ fn main() -> Result<()> {
             // Raw prompts are trusted whole (no content ranges); chat prompts
             // carry the user text's ranges so literal control-token strings in
             // it encode as plain text.
-            let (text, content_ranges) = if raw {
-                (prompt.clone(), Vec::new())
+            let (text, content_ranges, entry) = if raw {
+                // A raw prompt has no template and so no reasoning block.
+                (prompt.clone(), Vec::new(), ThinkingEntry::Answer)
             } else {
                 // The checkpoint's own template dialect, with the run's
                 // thinking and effort knobs applied.
@@ -1626,6 +1771,7 @@ fn main() -> Result<()> {
             let gstats = generator.generate_with_content_ranges(
                 &text,
                 &content_ranges,
+                entry,
                 max_tokens,
                 &mut |chunk| {
                     print!("{chunk}");
@@ -1835,7 +1981,172 @@ fn main() -> Result<()> {
             draft,
         }) => run_batch(model, tokenizer, &moe_impl, max_ctx, &draft),
         Some(Cmd::Serve(args)) => run_serve(args),
+        Some(Cmd::EncodeText {
+            model,
+            model_size,
+            layer,
+            prompt,
+            prompt_file,
+            output,
+            max_ctx,
+            verbose,
+        }) => run_encode_text(
+            model,
+            model_size,
+            layer,
+            prompt,
+            prompt_file,
+            &output,
+            max_ctx,
+            verbose,
+        ),
     }
+}
+
+/// `xwen encode-text`: the text-encoder reading of a Qwen3 checkpoint.
+///
+/// The prompt is rendered exactly as diffusers' `ZImagePipeline._encode_prompt`
+/// renders it — one user turn, generation prompt appended, thinking enabled,
+/// which on the Qwen3 dialect opens no `<think>` block — through the same
+/// renderer the chat surfaces use, so the two cannot drift. Tokenized with the
+/// checkpoint's OWN `tokenizer.json` (never the embedded Qwen 3.6 one: a
+/// different vocabulary), truncated to the encoder entry's `max_tokens` when it
+/// has one (the pipeline's `max_length`), then run through
+/// `XwenModel::encode` at the requested hidden-state index.
+///
+/// The load goes through `XwenModel::load_encoder`, the one entry that accepts
+/// a checkpoint with zero-filled planes, because the layer such a plane sits in
+/// is never run: `--layer` above the entry's `max_layer` is refused here, naming
+/// the planes.
+#[allow(clippy::too_many_arguments)]
+fn run_encode_text(
+    model: Option<PathBuf>,
+    model_size: Option<Model>,
+    layer: Option<usize>,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    output: &Path,
+    max_ctx: usize,
+    verbose: bool,
+) -> Result<()> {
+    let prompt = match (prompt, prompt_file) {
+        (Some(text), None) => text,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("reading the prompt file {}", path.display()))?,
+        (None, None) => {
+            bail!("encode-text needs a prompt: pass --prompt <text> or --prompt-file <path>")
+        }
+        (Some(_), Some(_)) => bail!("--prompt and --prompt-file are mutually exclusive"),
+    };
+    // Unlike every other command, the zero-flag default is the encoder entry:
+    // encoding is what that checkpoint is for, and the global default
+    // (Flash-Next, a GGUF) has no hidden-state encoder at all.
+    let checkpoint = one_shot_checkpoint(
+        model.as_deref(),
+        model_size,
+        "--model-size",
+        Model::ZImageTurboEncoder,
+    )?;
+    let size = checkpoint.model;
+    ensure!(
+        size.is_safetensors(),
+        "{} is a GGUF checkpoint; the hidden-state encoder runs the Qwen3 dense safetensors \
+         checkpoints only (--model-size zimage-turbo, qwen3-4b or qwen3-4b-instruct-2507)",
+        size.full_name()
+    );
+    let path = resolve_model(model, size)?;
+    let device = gguf::metal_device()?;
+    let source = CheckpointSource::open(&path, &device, Some(size))?;
+    let set = source
+        .safetensors()
+        .with_context(|| format!("{} did not open as a safetensors set", path.display()))?
+        .clone();
+    let n_layer = set.config().n_layer;
+
+    // The hidden-state index: the flag, else the entry's pipeline reading,
+    // else the normed output of a plain language model.
+    let spec = size.encoder_spec();
+    let layer = layer.unwrap_or_else(|| spec.map(|s| s.layer).unwrap_or(n_layer));
+    ensure!(
+        layer <= n_layer,
+        "--layer {layer} is past the last hidden state: {} has {n_layer} layers, so its \
+         indices run 0 (the embeddings) through {n_layer} (after the final norm)",
+        size.full_name()
+    );
+    if let Some(spec) = spec {
+        ensure!(
+            layer <= spec.max_layer,
+            "--layer {layer} would evaluate layers this checkpoint cannot compute: {} ships {} \
+             zero-filled ({}), so its hidden states are trustworthy only through index {}",
+            size.full_name(),
+            if set.zero_runs().len() == 1 {
+                "one plane"
+            } else {
+                "planes"
+            },
+            set.zero_runs()
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            spec.max_layer
+        );
+    }
+
+    // The pipeline's rendering: one user turn, generation prompt, thinking
+    // on (the dialect default), through the checkpoint's own template.
+    let chat_opts = ChatOptions::for_dialect(size.chat_dialect());
+    // The third element is the thinking state the generation prompt leaves
+    // the model in; an encoder generates nothing, so it has no reader here.
+    let (text, content_ranges, _thinking) =
+        build_prompt_with_spans(&[Message::User(prompt)], &chat_opts)?;
+    let tokenizer = xwen::tokenizer::LagunaTokenizer::from_file(set.tokenizer_path())
+        .with_context(|| format!("loading {}", set.tokenizer_path().display()))?;
+    let mut ids = tokenizer.encode_prompt(&text, &content_ranges)?;
+    if let Some(spec) = spec {
+        if ids.len() > spec.max_tokens {
+            eprintln!(
+                "xwen: prompt is {} tokens, truncated to {}'s pipeline limit of {} (the text \
+                 past that is not encoded)",
+                ids.len(),
+                size.full_name(),
+                spec.max_tokens
+            );
+            ids.truncate(spec.max_tokens);
+        }
+    }
+    ensure!(!ids.is_empty(), "the rendered prompt tokenized to nothing");
+    if verbose {
+        eprintln!("xwen: rendered prompt ({} bytes):\n{text}", text.len());
+        eprintln!("xwen: {} token ids: {ids:?}", ids.len());
+        eprintln!("xwen: hidden-state index {layer} of 0..={n_layer}");
+    }
+
+    let load_start = std::time::Instant::now();
+    let mut model = xwen::model::XwenModel::load_encoder(source, max_ctx)?;
+    eprintln!(
+        "xwen: model loaded in {:.1}s",
+        load_start.elapsed().as_secs_f64()
+    );
+    let encode_start = std::time::Instant::now();
+    let (hidden, n_tokens) = model.encode(&ids, layer)?;
+    let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
+
+    // `input_ids` as i64, the dtype a torch-side consumer expects for ids.
+    let input_ids: Vec<i64> = ids.iter().map(|&id| i64::from(id)).collect();
+    let input_ids = candle_core::Tensor::new(input_ids.as_slice(), &candle_core::Device::Cpu)?;
+    let tensors: std::collections::HashMap<&str, candle_core::Tensor> =
+        [("hidden", hidden), ("input_ids", input_ids)]
+            .into_iter()
+            .collect();
+    candle_core::safetensors::save(&tensors, output)
+        .with_context(|| format!("writing {}", output.display()))?;
+    println!(
+        "{n_tokens} tokens, hidden state {layer} [{n_tokens}, {}] bf16 written to {} ({encode_ms:.0}ms)",
+        set.config().hidden_size,
+        output.display()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2019,13 +2330,64 @@ mod tests {
     /// lives; this covers only the naming.
     #[test]
     fn a_file_that_names_no_checkpoint_is_recorded_under_its_own_name() {
-        let assumed = Checkpoint::assumed(Model::Qwen27B, "laguna-s-2.1-Q4_K_M");
-        assert_eq!(assumed.model, Model::Qwen27B);
-        assert_eq!(assumed.label, "laguna-s-2.1-Q4_K_M");
+        // Through the extraction the command itself uses, from the path the
+        // operator typed — handing in the finished string would have tested
+        // that a struct stores what it is given.
+        let assumed = |path: &str| {
+            Checkpoint::assumed(
+                Model::Qwen27B,
+                &xwen::checkpoint::label_for(Path::new(path)),
+            )
+        };
+        let laguna = assumed("/models/laguna-s-2.1-Q4_K_M.gguf");
+        assert_eq!(laguna.model, Model::Qwen27B);
+        assert_eq!(laguna.label, "laguna-s-2.1-Q4_K_M");
+        // A safetensors checkpoint answers under its directory's name.
+        assert_eq!(assumed("/models/my-qwen3-4b").label, "my-qwen3-4b");
+        // And a split set answers under the shard the operator named, which is
+        // what `serve::model_id` reports for the same path — the reason both
+        // resolve through one function.
+        assert_eq!(
+            assumed("/m/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf").label,
+            "Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004"
+        );
         assert_eq!(
             Checkpoint::official(Model::Qwen27B).label,
             Model::Qwen27B.full_name()
         );
+    }
+
+    /// `xwen serve` and `xwen batch` refuse a checkpoint this build cannot run
+    /// BEFORE anything is downloaded, and say which one and why.
+    ///
+    /// The gate is a function rather than an inline `ensure!` precisely so this
+    /// can be asserted without a server, a network or 8 GB — but it is the same
+    /// function both startup paths call, sitting ahead of `resolve_model` in
+    /// each.
+    #[test]
+    fn the_cache_moving_surfaces_refuse_a_checkpoint_they_cannot_run() {
+        for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
+            let err = ensure_servable(model).unwrap_err().to_string();
+            assert!(err.contains(model.full_name()), "{err}");
+            assert!(err.contains("layer stack is not implemented"), "{err}");
+        }
+        // The encoder is refused for a different reason, and says so: this one
+        // does not lift when the stack lands, and the operator's next move is a
+        // different command rather than a different build.
+        let err = ensure_servable(Model::ZImageTurboEncoder)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("encode-only"), "{err}");
+        assert!(err.contains("zero-filled"), "{err}");
+        assert!(err.contains("encode-text"), "{err}");
+
+        for model in xwen::hub::MODELS {
+            assert_eq!(
+                ensure_servable(model).is_ok(),
+                model.servable(),
+                "{model:?}"
+            );
+        }
     }
 
     /// A checkpoint whose graph has no speculative verify seam refuses a drafter

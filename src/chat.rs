@@ -197,11 +197,13 @@ pub enum Message {
 
 /// Which release's chat template a conversation renders under.
 ///
-/// The 3.6 and 3.8 templates differ only around the system block (the 3.8
-/// `reasoning_effort` preamble and its empty-system handling) and in their
-/// `preserve_thinking` default ([`ChatOptions::for_dialect`]); every turn and
-/// the generation prompt render identically. The two Qwen3 templates are a
-/// different lineage and diverge further — see [`ChatDialect::Qwen3`].
+/// The 3.6 and 3.8 templates are one lineage, differing only around the system
+/// block (the 3.8 `reasoning_effort` preamble and its empty-system handling),
+/// in their `preserve_thinking` default ([`ChatOptions::for_dialect`]) and in
+/// whether an assistant turn's inline `<think>` block is split out of its
+/// content ([`ChatDialect::splits_inline_reasoning`]); every turn body and the
+/// generation prompt render identically. The two Qwen3 templates are a second
+/// lineage and diverge much further — see [`ChatDialect::Qwen3`].
 ///
 /// A checkpoint's dialect is [`crate::hub::Model::chat_dialect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -279,6 +281,19 @@ impl ChatDialect {
     /// its generation prompt is fixed and it renders no `<think>` block.
     pub fn supports_thinking(self) -> bool {
         !matches!(self, Self::Qwen3Instruct)
+    }
+
+    /// Whether a thinking-on generation prompt leaves the `<think>` opener to
+    /// the MODEL instead of seeding it.
+    ///
+    /// The 3.6 lineage ends its header inside an open block, so the first
+    /// decoded token is reasoning by construction. The Qwen3 base template ends
+    /// at `<|im_start|>assistant\n` and the model writes its own `<think>` — or
+    /// does not, and answers directly. That makes the reply's opening token the
+    /// thing that decides, which is what [`ThinkingEntry::ModelOpens`] carries
+    /// into the decode loop.
+    pub fn model_opens_thinking(self) -> bool {
+        matches!(self, Self::Qwen3)
     }
 
     /// Whether the template takes a `reasoning_effort` parameter. Only 3.8's
@@ -555,6 +570,50 @@ fn format_double_as_ostream(value: f64) -> String {
     }
 }
 
+/// How a rendered generation prompt leaves the model with respect to its
+/// reasoning block: what the first decoded token already is, and what could
+/// still change it.
+///
+/// The distinction exists because the two template lineages hand the reasoning
+/// block over differently. The 3.6 lineage always seeds the opener, so the
+/// answer is settled before the first draw. The Qwen3 base template ends at the
+/// assistant role line with thinking on and leaves the opener to the model,
+/// which makes the reply's FIRST token the thing that decides — and everything
+/// keyed on being inside the block (the reasoning/answer split, the think
+/// budget, a schema grammar's activation) has to wait for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingEntry {
+    /// The reply begins in the answer and stays there: thinking is off, the
+    /// template has no thinking mode, or the header already closed the span.
+    /// A `<think>` the model writes anyway is ordinary text.
+    #[default]
+    Answer,
+    /// The header ends inside an open `<think>` block, so the first decoded
+    /// token is already reasoning and `</think>` ends it.
+    Seeded,
+    /// Thinking is on and the template left the opener to the model
+    /// ([`ChatDialect::model_opens_thinking`]). The reply is reasoning if and
+    /// only if its FIRST token is `<think>`; anything else settles it as answer
+    /// text, and a `<think>` further in is text like any other token.
+    ModelOpens,
+}
+
+impl ThinkingEntry {
+    /// Whether the first decoded token is reasoning already. False under
+    /// [`ThinkingEntry::ModelOpens`], where that token is what decides.
+    pub fn starts_in_thinking(self) -> bool {
+        matches!(self, Self::Seeded)
+    }
+
+    /// Whether this reply can hold a reasoning block at all — the question a
+    /// think budget or a reasoning channel asks, since under
+    /// [`ThinkingEntry::ModelOpens`] the answer is not known until the first
+    /// token lands.
+    pub fn may_think(self) -> bool {
+        !matches!(self, Self::Answer)
+    }
+}
+
 /// A rendered conversation split at the generation prompt, with the byte
 /// ranges of client-supplied content marked for the tokenizer.
 ///
@@ -585,9 +644,9 @@ pub struct PromptParts {
     /// is refused (it would join that run instead of starting after it)
     /// (`tests::a_rendered_prefix_starts_on_a_token_boundary`).
     pub header_prefix_start: Option<usize>,
-    /// Whether the header leaves the model inside an open thinking span, so the
-    /// first decoded token is reasoning rather than answer text.
-    pub starts_in_thinking: bool,
+    /// Where in the reply the first decoded token sits, and what could still
+    /// move it. See [`ThinkingEntry`].
+    pub thinking_entry: ThinkingEntry,
     /// Byte offset in `context` just past the leading system block — its closing
     /// `<|im_end|>` and the newline after it — or `None` when the conversation
     /// renders no such block (no system message and no tools).
@@ -613,22 +672,29 @@ pub fn build_prompt(messages: &[Message], opts: &ChatOptions) -> Result<String> 
     Ok(prompt)
 }
 
-/// `build_prompt` plus the client-content byte ranges, for callers that encode
-/// the whole prompt in one go (`LagunaTokenizer::encode_prompt`). The ranges
-/// index into the returned string; the appended generation header holds no
-/// client content, so they are the context ranges unchanged.
+/// `build_prompt` plus the client-content byte ranges and the reply's thinking
+/// entry, for callers that encode the whole prompt in one go
+/// (`LagunaTokenizer::encode_prompt`). The ranges index into the returned
+/// string; the appended generation header holds no client content, so they are
+/// the context ranges unchanged.
+///
+/// The [`ThinkingEntry`] comes back with them because a caller that splits
+/// reasoning from answer, or sets a think budget, cannot derive it from the
+/// options alone — the dialect and the header's own shape both decide, and
+/// re-deriving it beside the renderer is how the two drift.
 pub fn build_prompt_with_spans(
     messages: &[Message],
     opts: &ChatOptions,
-) -> Result<(String, Vec<Range<usize>>)> {
+) -> Result<(String, Vec<Range<usize>>, ThinkingEntry)> {
     let PromptParts {
         mut context,
         header,
         content_ranges,
+        thinking_entry,
         ..
     } = build_prompt_parts_with_spans(messages, opts)?;
     context.push_str(&header);
-    Ok((context, content_ranges))
+    Ok((context, content_ranges, thinking_entry))
 }
 
 /// The same rendering as `build_prompt`, split into `(context, gen_header)` with
@@ -708,11 +774,12 @@ fn trim(text: &str) -> &str {
 }
 
 /// Split an assistant turn's content into `(reasoning, answer)` for a turn that
-/// carries its reasoning inline rather than in a separate field. A 3.6-dialect
-/// behavior only: the 3.8 template dropped this parsing, so its renderer never
-/// calls this.
+/// carries its reasoning inline rather than in a separate field. Called only
+/// under the dialects whose template does this parsing — 3.6 and the Qwen3 base
+/// one ([`ChatDialect::splits_inline_reasoning`]); 3.8 dropped it and
+/// Instruct-2507 never had it, and those two render the content verbatim.
 ///
-/// The two halves are cut at different places, as the 3.6 template cuts them: the
+/// The two halves are cut at different places, as both templates cut them: the
 /// reasoning is what precedes the FIRST `</think>` (after its last `<think>`
 /// opener, if it has one), while the answer is what follows the LAST one. A
 /// turn with a single well-formed block — the shape a decode produces — sees no
@@ -1096,8 +1163,20 @@ pub fn build_prompt_parts_with_spans_continued(
         header_prefix_start,
         // Only a header that actually wrote an unclosed `<think>` leaves the
         // model inside one. Under the Qwen3 dialect a plain thinking-on prompt
-        // does not, so the first decoded token is the model's own `<think>`.
-        starts_in_thinking: opens_think_block && !closes_thinking,
+        // writes no opener, so the reply's own first token decides — unless a
+        // continuation already opened or closed the span, in which case the
+        // header settled it after all.
+        thinking_entry: if opens_think_block {
+            if closes_thinking {
+                ThinkingEntry::Answer
+            } else {
+                ThinkingEntry::Seeded
+            }
+        } else if thinking && dialect.model_opens_thinking() {
+            ThinkingEntry::ModelOpens
+        } else {
+            ThinkingEntry::Answer
+        },
         system_end,
     })
 }
@@ -2291,7 +2370,8 @@ mod tests {
                 .unwrap();
             split.extend(tok.encode(&parts.header).unwrap());
 
-            let (whole, ranges) = build_prompt_with_spans(&msgs, &thinking(on)).unwrap();
+            let (whole, ranges, entry) = build_prompt_with_spans(&msgs, &thinking(on)).unwrap();
+            assert_eq!(entry, parts.thinking_entry);
             assert_eq!(whole, format!("{}{}", parts.context, parts.header));
             assert_eq!(ranges, parts.content_ranges);
             assert_eq!(split, tok.encode_prompt(&whole, &ranges).unwrap());
@@ -2434,14 +2514,15 @@ mod tests {
         for (on, continuation, expected) in cases {
             let parts = rendered(on, continuation.as_ref());
             assert_eq!(
-                parts.starts_in_thinking, expected,
+                parts.thinking_entry.starts_in_thinking(),
+                expected,
                 "thinking={on} {continuation:?}"
             );
         }
         // The header sniff this flag replaces, and where it parts company: a
         // turn whose reasoning was handed to it still starts inside the span.
         let parts = rendered(true, Some(&cont(Some("plan"), false, None)));
-        assert!(parts.starts_in_thinking && !parts.header.ends_with("<think>\n"));
+        assert!(parts.thinking_entry.starts_in_thinking() && !parts.header.ends_with("<think>\n"));
     }
 
     // The continuations with no rendering at all. Callers validate them first
@@ -2650,7 +2731,7 @@ mod tests {
 
         let parts = build_prompt_parts_with_spans(&msgs, &qwen3(true)).unwrap();
         assert!(
-            !parts.starts_in_thinking,
+            !parts.thinking_entry.starts_in_thinking(),
             "nothing in the header leaves the model inside a block"
         );
         assert_eq!(parts.header, "<|im_start|>assistant\n");
@@ -2665,7 +2746,7 @@ mod tests {
             "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
         assert_eq!(build_prompt(&msgs, &qwen3(false)).unwrap(), expected);
         let parts = build_prompt_parts_with_spans(&msgs, &qwen3(false)).unwrap();
-        assert!(!parts.starts_in_thinking);
+        assert!(!parts.thinking_entry.starts_in_thinking());
     }
 
     // (c) and (d) The system block: written whenever the conversation opens with
@@ -2890,7 +2971,7 @@ mod tests {
         };
         assert_eq!(build_prompt(&msgs, &forced).unwrap(), bare);
         let parts = build_prompt_parts_with_spans(&msgs, &forced).unwrap();
-        assert!(!parts.starts_in_thinking);
+        assert!(!parts.thinking_entry.starts_in_thinking());
 
         let msgs = [
             Message::System("You are a pirate.".into()),
@@ -2980,7 +3061,7 @@ mod tests {
             format!("{}{}", parts.context, parts.header),
             format!("{head}<think>\npart of a thought")
         );
-        assert!(parts.starts_in_thinking);
+        assert!(parts.thinking_entry.starts_in_thinking());
 
         let closed = Continuation {
             thinking: Some("done thinking".into()),
@@ -2993,7 +3074,7 @@ mod tests {
             format!("{}{}", parts.context, parts.header),
             format!("{head}<think>\ndone thinking\n</think>\n\nThe answer is")
         );
-        assert!(!parts.starts_in_thinking);
+        assert!(!parts.thinking_entry.starts_in_thinking());
 
         // Instruct-2507 has no block for reasoning to go in, so injecting some
         // is refused; a bare prefix continues the turn directly.
