@@ -2913,3 +2913,19 @@ blocks use of the feature; item (a) is the one with a known trigger.
 ## Deferred from the long-context envelope arc (2026-09-06)
 
 [Opened 2026-09-06 by the arc recorded in docs/records/long-context-envelope.md. Nothing closed here yet; the heading exists so this arc's items have somewhere to land.]
+
+[Duplicate of the open item «QSA prefill selection round-trips through the host per sparse layer per chunk, and it is the Flash-Next long-context tax», folded and moved verbatim on 2026-09-06; the memory half is carried there, its throughput conclusion is contested there.]
+
+- [ ] [measured] **The QSA indexer's host-built mask is 42 GB of Flash-Next's peak footprint at
+  131072.** **2026-09-06.** Moving the CAUSAL prefill mask to the device took the 35B's
+  131072 peak from 42-69 GB to a flat 17 GB, and moved Flash-Next's not at all (59 GB
+  either way): its indexer builds its own `n x n_kv` f32 mask on the host through
+  `Tensor::from_vec` (`qwen4exp/indexer.rs`, `select_with`), per sparse layer per chunk,
+  and above the 2048 budget that is every chunk — so no two allocations ask the pool for
+  the same size and none is recycled. The fix is the same shape that worked for the
+  causal one: build the -inf plane on the device and scatter zeros at the selected
+  columns, same values, behind a kill switch. Do NOT expect throughput from it — the
+  causal mask's own A/B was a dead heat on time on both checkpoints, because candle fills
+  the next chunk's mask while the GPU is still on this one. This is a memory item.
+  [Record](records/long-context-envelope.md).
+  From: Deferred from the long-context envelope arc (2026-09-06).

@@ -49,16 +49,16 @@ checkpoints is no longer "launches x 4 us": that price holds only for launches u
 reading after the probe priced its projection at zero; the audit in the Front's first
 entry is what would find the rest) and the syncs plus the serial scan.]
 
-1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
-2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
-3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
-4. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
-5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
-6. **Above the 2048 indexer budget: +165 dispatches** (Decode performance, measured): 0.66 ms of dispatch cost plus 0.24 ms of QSA score tail, at every context past 2048 tokens; that 0.90 ms works out to ~+4% of a 18.9 ms token, a figure derived here and not stated in the item
-7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
-8. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line earlier** (Decode performance, measured): +0.3 ms/token, +1.4%, no math change and no new kernel
-9. **GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger** (Decode performance, measured): the three-projection merge is -72 dispatches, about +1.4%
-10. **serve at 32k decodes 4-7% under `generate` and the cause is unconfirmed** (Serve, batch and CLI, measured): 4-7% of serve decode on the default checkpoint, settled or refuted by three arms of one prompt
+1. **QSA prefill selection round-trips through the host per sparse layer per chunk, and it is the Flash-Next long-context tax** (Prefill performance, measured): the default checkpoint's prefill is 4x slower at 128k than at 8k and three times the 35B's growth, a maximal prefill takes 569 s, and 42 GB of peak memory rides the same path; pricing it is an hour and the fix is a device-side selection with no readback
+2. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
+3. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
+4. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
+5. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
+6. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
+7. **Above the 2048 indexer budget: +165 dispatches** (Decode performance, measured): 0.66 ms of dispatch cost plus 0.24 ms of QSA score tail, at every context past 2048 tokens; that 0.90 ms works out to ~+4% of a 18.9 ms token, a figure derived here and not stated in the item
+8. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
+9. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line earlier** (Decode performance, measured): +0.3 ms/token, +1.4%, no math change and no new kernel
+10. **GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger** (Decode performance, measured): the three-projection merge is -72 dispatches, about +1.4%
 
 ## Decode performance
 
@@ -333,6 +333,27 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   From: Qwen3.8-Flash-Next port (decided 2026-08-25, blocked on release + upstream).
   Promoted from the item «Port Qwen3.8-Flash-Next» on 2026-09-06; dated 2026-08-29 there.
 
+- [ ] [measured] **QSA prefill selection round-trips through the host per sparse layer per chunk, and it is the Flash-Next long-context tax.** Flash-Next prefill falls 925 → 584 → 403 → 231 tok/s from 8k to
+  128k (2026-09-06, [record](docs/records/long-context-envelope.md)), i.e. 1.08 → 4.33
+  ms/token, three times the growth the 35B-A3B shows over the same range (0.43 → 1.50),
+  while Flash-Next decode stays flat (47 → 42). The only work Flash-Next does that the 35B
+  does not is the sparse selection: per QSA layer per 2048-token chunk, `select_with`
+  (`qwen4exp/indexer.rs`) reads the score plane back to the host, fills an `n x n_kv`
+  f32 mask there, uploads it and converts to f16 — roughly a gigabyte each way per layer
+  per chunk at 128k, twelve layers, sixty-four chunks — and unlike the causal mask it is
+  on the critical path, because the GPU waits for the readback before the mask exists.
+  That is why the causal-mask A/B priced at 0% of wall (candle builds that one ahead of
+  the GPU) and why that result does not transfer here. The same path is the 42 GB of
+  Flash-Next's 59 GB peak at 128k that the device causal mask did not move (no two
+  `Tensor::from_vec` allocations ask the pool for the same size, so none is recycled).
+  Unpriced as a share of wall: the 128k profile was skipped. Step one is an hour's timer
+  around the readback, fill and upload at 128k; if it confirms, build the selection and
+  the -inf plane with scattered zeros on the device, same values, behind a kill switch,
+  no readback. The decode-side cousins (device partial top-k, cooperative threshold
+  walk) are folded into «Above the 2048 indexer budget: +165 dispatches» in "Decode
+  performance"; the retired per-chunk readback item's reopen condition is this number.
+  From: Deferred from the long-context envelope arc (2026-09-06).
+
 ## Drafting
 
 - [ ] [measured] **The DFlash drafter's per-token cache sync, its unre-derived draft-ctx
@@ -457,6 +478,9 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   still the standing retune (`bun scripts/retune-draft.ts`) on the 35B, now at more than
   one context length, which either refits `p_min`/depth or shows drafting should default
   off on this checkpoint.
+  **2026-09-06: the default flipped off** on this checkpoint alone
+  (`Model::draft_default_on`); `p_min` and depth are untouched and the retune still
+  decides whether it comes back (docs/log.md, docs/decisions/speculative-decoding.md).
   [Record](docs/records/presence-penalty.md).
   From: Deferred from the presence-penalty arc (2026-09-06).
 
@@ -513,20 +537,6 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   a real number and it grows with `n_expert`.
   From: Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4).
   Promoted from the item «MoE FFN: 576 dispatches/token (30%)» on 2026-09-06; dated 2026-09-06 there.
-
-- [ ] [measured] **The QSA indexer's host-built mask is 42 GB of Flash-Next's peak footprint at
-  131072.** **2026-09-06.** Moving the CAUSAL prefill mask to the device took the 35B's
-  131072 peak from 42-69 GB to a flat 17 GB, and moved Flash-Next's not at all (59 GB
-  either way): its indexer builds its own `n x n_kv` f32 mask on the host through
-  `Tensor::from_vec` (`qwen4exp/indexer.rs`, `select_with`), per sparse layer per chunk,
-  and above the 2048 budget that is every chunk — so no two allocations ask the pool for
-  the same size and none is recycled. The fix is the same shape that worked for the
-  causal one: build the -inf plane on the device and scatter zeros at the selected
-  columns, same values, behind a kill switch. Do NOT expect throughput from it — the
-  causal mask's own A/B was a dead heat on time on both checkpoints, because candle fills
-  the next chunk's mask while the GPU is still on this one. This is a memory item.
-  [Record](docs/records/long-context-envelope.md).
-  From: Deferred from the long-context envelope arc (2026-09-06).
 
 - [ ] [measured] **Three shrinks for Flash-Next's ~15 GB of private memory.**
   xwen dirties ~15 GB of private memory where llama-server dirties 751 MB on the same

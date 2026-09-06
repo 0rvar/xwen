@@ -4,6 +4,21 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-06 — Drafting off by default on the 35B-A3B
+
+A policy change, no math touched. Two independent measurements the same day read the
+35B-A3B's drafted arm below plain at every length — -8% at 1046 tokens deepening to -37%
+at 16409 on long-document prose, and -4% on a 256-token code prompt — because plain
+decode gained 10.3% from the router gemv while the drafted defaults were fitted on
+2026-08-08 against a level three improvements older. A zero-flag run on that checkpoint
+now decodes plain and says so; `--draft official`, or a serve config that names the
+official drafter, still attaches the sidecar, and the 27B and 3.8-27B are unchanged. What
+silence means is `Model::draft_default_on()`, read by the CLI and by serve's new
+`DraftMode::Default`. The fitted `p_min` 0.3 and depth 15 are left alone on purpose: the
+retune (Front item 1) is what decides whether the default comes back, and it needs more
+than one context length to see the loss.
+[Decision](decisions/speculative-decoding.md).
+
 ## 2026-09-06 — The 128k envelope measured, and the prefill mask is a 25 GB memory fix
 
 The oldest open ledger item closed. `scripts/longctx.ts` is the new instrument: it cuts

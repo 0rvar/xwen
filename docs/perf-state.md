@@ -32,8 +32,8 @@ reasoning behind the choice that produced it lives in [decisions](decisions.md).
 | Qwen3.6-27B | prefill @880 | 702 tok/s (chunk 512) | 2026-07-29, not re-measured; recorded as `@925` at the time, which is the fixture's NAME | not recorded |
 | Qwen3.6-27B | prefill @3851 | 445 tok/s (chunk 512) | 2026-07-29, not re-measured; recorded as `@4k` at the time | not recorded |
 | Qwen3.6-35B-A3B | plain decode | 127.0 tok/s | 2026-09-06, 24c4069; the `XWEN_ROUTER_MV_CLASSIC` arm read 115.1 in the same session, so +10.3%, ahead in every round | not recorded |
-| Qwen3.6-35B-A3B | drafted decode, code | 133.6-134.8 tok/s (+26-28%) | fitted 2026-08-08, against the pre-fold plain level | `lowpowermode 0` |
-| Qwen3.6-35B-A3B | drafted decode, chat | 122.3-123.7 tok/s (+15-17%) | fitted 2026-08-08, against the pre-fold plain level | `lowpowermode 0` |
+| Qwen3.6-35B-A3B | drafted decode, code | 133.6-134.8 tok/s (+26-28%) | fitted 2026-08-08, against the pre-fold plain level; superseded 2026-09-06: reads below plain; off by default | `lowpowermode 0` |
+| Qwen3.6-35B-A3B | drafted decode, chat | 122.3-123.7 tok/s (+15-17%) | fitted 2026-08-08, against the pre-fold plain level; superseded 2026-09-06: reads below plain; off by default | `lowpowermode 0` |
 | Qwen3.6-35B-A3B | presence penalty A/B, code, 256 tokens | plain 126.5 (p 0) / 126.9 (p 1.5); drafted 121.1 at 63.0% acceptance (p 0) / 119.6 at 59.4% (p 1.5) | 2026-09-06, pinned build of the penalty tree, 3 interleaved reps, medians | `lowpowermode 0` |
 | Qwen3.6-35B-A3B | prefill @3851 | 2634 tok/s at chunk 2048, 2429 at 512 | 2026-08-30 | `powermode 0` |
 | Qwen3.6-35B-A3B | prefill @3803 | 3081-3090 tok/s after the FFN-glue levers; the same sweep's all-classic arm read 2746-2755 | 2026-08-30 | `powermode 0` |

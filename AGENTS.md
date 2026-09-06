@@ -311,7 +311,14 @@ ceilings that rank the remaining levers are in perf-state.md.
 ## Drafting (SHIPPED and ON BY DEFAULT; all three checkpoints as of 2026-08-15)
 
 TWO drafter kinds, one verify machinery. `--no-draft` opts out; a zero-flag run fetches
-and loads the checkpoint's own sidecar. Which kind a checkpoint ships is
+and loads the checkpoint's own sidecar. **Except on the 35B-A3B as of 2026-09-06**, where
+the default is off: its drafted arm now reads below plain at every length (-8% at 1k
+tokens, -37% at 16k), the router gemv having lifted plain decode by 10.3% past the level
+the drafting defaults were fitted against, so there `--draft official` is the opt-IN. The
+heading above still holds for the other two. What silence means is
+`Model::draft_default_on()`, on every surface; the fitted `p_min` and depth are
+untouched, and the standing retune decides whether the 35B goes back on. Which kind a
+checkpoint ships is
 `Model::drafter_kind()`, the file itself is the authority once opened
 (`drafter::classify`), and `src/drafter.rs` is the seam. Everything downstream of the
 proposal — checkpoint, batched `forward_all_logits`, `accept_drafts`, `kv_rollback`, the

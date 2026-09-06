@@ -330,7 +330,11 @@ async function runOne(target: number, prompt: string, rep: number, warmup: boole
     // decode run, so `--max-ctx` never becomes the thing being measured.
     "--max-ctx",
     String(target + 1024),
-    ...(noDraft ? ["--no-draft"] : []),
+    // `--draft official` is passed rather than relying on the zero-flag
+    // default, because that default is per checkpoint: it is off on the
+    // 35B-A3B since 2026-09-06, and a bare run there would be a plain arm
+    // labelled "drafted".
+    ...(noDraft ? ["--no-draft"] : ["--draft", "official"]),
     ...(draftCtx ? ["--draft-ctx", draftCtx] : []),
     ...passthrough,
     "--prompt",

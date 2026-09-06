@@ -487,6 +487,53 @@ impl Model {
         }
     }
 
+    /// Whether a run that said nothing about drafting speculates on this
+    /// checkpoint. Not whether it CAN (that is
+    /// [`Model::supports_drafting`]) and not whether a sidecar exists (that is
+    /// [`Model::drafter_kind`]) — only what silence means. An explicit
+    /// `--draft official` (or the serve config's `draft.path`/`draft.enabled`)
+    /// still attaches the sidecar where this is false, and `--no-draft` still
+    /// declines it where this is true.
+    ///
+    /// True on the 27B and the 3.8-27B, whose drafted arms were measured well
+    /// above plain at their fitted defaults — +46 to +52% and +44 to +45% on
+    /// code — and stay there.
+    ///
+    /// False on the 35B-A3B since 2026-09-06. Two independent measurements that
+    /// day read its drafted arm BELOW plain at every length: -8% at 1k tokens
+    /// deepening to -37% at 16k, and -4% on a 256-token code prompt. The cause
+    /// is not the drafter: the router gemv lifted PLAIN decode on this
+    /// checkpoint by 10.3%, and the drafting defaults were fitted against the
+    /// old plain level, so what used to be a +26 to +28% win is now a loss. The
+    /// fitted floor and depth below are deliberately untouched — refitting them
+    /// is the experiment that decides whether this arm goes back to true.
+    /// See docs/decisions/speculative-decoding.md and docs/log.md, 2026-09-06.
+    ///
+    /// False for a checkpoint that cannot be drafted for at all, which has
+    /// nothing for silence to turn on.
+    pub const fn draft_default_on(self) -> bool {
+        match self {
+            Model::Qwen27B | Model::Qwen3827B => true,
+            Model::Qwen35BA3B => false,
+            Model::Qwen38FlashNext => false,
+        }
+    }
+
+    /// The one sentence every surface says when a run that asked for nothing
+    /// decodes plain only because this checkpoint's default is off. It ships a
+    /// drafter, so saying nothing would read as a missing sidecar.
+    ///
+    /// `opt_in` is the surface's own spelling of the flag that turns it on,
+    /// because the CLI and a config file spell it differently and a line that
+    /// named the wrong one would be worse than no line.
+    pub fn draft_default_off_message(self, opt_in: &str) -> String {
+        format!(
+            "drafting is off by default on {} (it read below plain on 2026-09-06); \
+             {opt_in} to enable",
+            self.full_name()
+        )
+    }
+
     /// The one sentence every surface says when a run asks a checkpoint that
     /// cannot be drafted for to draft.
     pub fn no_drafting_message(self) -> String {
@@ -1089,6 +1136,37 @@ mod tests {
         // by the Stage C sweep (2026-08-15), which moved it off llama.cpp's 3
         // and bracketed the optimum on both sides.
         assert_eq!(Model::Qwen3827B.draft_max_default(), Some(4));
+    }
+
+    /// What a zero-flag run does per checkpoint, pinned because it is a policy
+    /// and not a fitted value: the 35B-A3B arm went false on 2026-09-06 after
+    /// its drafted arm read below plain at every length, and it goes back to
+    /// true only on a retune that reads above plain again. The other two arms
+    /// are the measured wins they always were.
+    ///
+    /// Deliberately independent of `drafter_kind`: the 35B-A3B still SHIPS a
+    /// sidecar and still attaches it on `--draft official`. What changed is
+    /// what silence means.
+    #[test]
+    fn drafting_defaults_on_per_checkpoint() {
+        assert!(Model::Qwen27B.draft_default_on());
+        assert!(Model::Qwen3827B.draft_default_on());
+        assert!(!Model::Qwen35BA3B.draft_default_on());
+        // Nothing to default on: no verify seam, and no sidecar.
+        assert!(!Model::Qwen38FlashNext.draft_default_on());
+
+        // The 35B-A3B is the one checkpoint where the two questions part ways,
+        // which is the whole reason this accessor exists rather than being read
+        // off the registry.
+        assert!(Model::Qwen35BA3B.drafter_kind().is_some());
+        assert!(Model::Qwen35BA3B.supports_drafting());
+
+        // A checkpoint nothing can draft for cannot default to drafting.
+        for model in MODELS {
+            if !model.supports_drafting() {
+                assert!(!model.draft_default_on(), "{model:?}");
+            }
+        }
     }
 
     #[test]

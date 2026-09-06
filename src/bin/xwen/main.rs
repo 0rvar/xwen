@@ -218,7 +218,9 @@ impl ThinkArgs {
 
 /// DFlash speculative-decode knobs. Speculation is opt-OUT on xwen: decoding
 /// speculates with the checkpoint's official drafter unless `--no-draft` says
-/// otherwise, and `--draft <gguf>` swaps in a custom one.
+/// otherwise, and `--draft <gguf>` swaps in a custom one. Per checkpoint,
+/// though — [`Model::draft_default_on`] decides what silence means, and it is
+/// false on the 35B-A3B, where `--draft official` is the opt-IN.
 #[derive(Parser)]
 struct DraftArgs {
     /// Speculate with a custom drafter GGUF — either kind, a DFlash sidecar or
@@ -226,11 +228,13 @@ struct DraftArgs {
     /// `official`, and the default, select).
     #[arg(long, value_name = "GGUF", conflicts_with = "no_draft")]
     draft: Option<PathBuf>,
-    /// Decode without speculation. Drafting is on by default: measured faster on
-    /// every checkpoint, at each one's fitted defaults — 27B +46 to +52%,
-    /// 35B-A3B +26 to +28% on code and +15 to +17% on chat (both 2026-08-08),
-    /// 3.8-27B +44 to +45% on code and +37 to +38% on chat (2026-08-15). See
-    /// docs/decisions.md, "Speculative decoding".
+    /// Decode without speculation. Drafting is on by default on the 27B (+46 to
+    /// +52%, 2026-08-08) and the 3.8-27B (+44 to +45% on code, +37 to +38% on
+    /// chat, 2026-08-15), each at its own fitted defaults. NOT on the 35B-A3B
+    /// since 2026-09-06: its drafted arm now reads below plain at every length,
+    /// the router gemv having lifted plain decode past what the drafting
+    /// defaults were fitted against, so `--draft official` is what turns it on
+    /// there. See docs/decisions.md, "Speculative decoding".
     #[arg(long)]
     no_draft: bool,
     /// Max draft tokens proposed per verify round. The default is per-model,
@@ -666,10 +670,11 @@ struct ServeArgs {
     /// differently.
     #[arg(long, value_name = "GGUF", conflicts_with = "no_draft")]
     draft: Option<PathBuf>,
-    /// Decode without speculation. Drafting is on by default: measured faster on
-    /// every checkpoint, at each one's fitted defaults — 27B +46 to +52%,
-    /// 35B-A3B +26 to +28% on code and +15 to +17% on chat (both 2026-08-08),
-    /// 3.8-27B +44 to +45% on code and +37 to +38% on chat (2026-08-15). It
+    /// Decode without speculation. Drafting is on by default on the 27B (+46 to
+    /// +52%, 2026-08-08) and the 3.8-27B (+44 to +45% on code, +37 to +38% on
+    /// chat, 2026-08-15), each at its own fitted defaults, and NOT on the
+    /// 35B-A3B since 2026-09-06, whose drafted arm now reads below plain at
+    /// every length (`--draft official` turns it on there). Where it is on it
     /// costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the 35B-A3B,
     /// 3.2 GB on the 3.8-27B) plus drafter planes per cache slot (see
     /// --draft-ctx).
@@ -817,7 +822,12 @@ fn run_serve(args: ServeArgs) -> Result<()> {
                 bail!("drafter {} does not exist", path.display());
             }
         }
-        DraftMode::Official => {
+        // Nothing in the config asked, and the checkpoint being served does not
+        // draft unasked: nothing to prefetch, and the engine says so when it
+        // loads. Other checkpoints this server may load resolve their own
+        // defaults then, exactly as they resolve their own sidecars.
+        DraftMode::Default if !served_target.model.draft_default_on() => {}
+        DraftMode::Official | DraftMode::Default => {
             // Each checkpoint drafts with its own sidecar, resolved when it
             // loads — this only prefetches the one for the checkpoint being
             // SERVED, so a first request does not stall behind a 3.5 GB
@@ -962,6 +972,22 @@ fn resolve_model(model: Option<PathBuf>, size: Model) -> Result<PathBuf> {
             xwen::hub::ensure_model(size)
         }
     }
+}
+
+/// Whether a run that named no drafter decodes plain because the CHECKPOINT's
+/// default says so.
+///
+/// The one outcome that is neither "asked for a drafter and got one" nor "there
+/// was never a drafter to get", and so the one that needs a line of its own: the
+/// sidecar is sitting in the cache, `--draft official` would attach it, and
+/// silence about it would read as a missing file rather than a policy. False
+/// once the run asks by name — an explicit request is honored on every
+/// checkpoint whose graph has a verify seam, whatever its default is.
+///
+/// Extracted from [`configure_generator`] so the rule is testable without a
+/// Metal device or a sidecar on disk.
+fn draft_defaults_off(size: Model, explicit: bool) -> bool {
+    !explicit && size.drafter_kind().is_some() && !size.draft_default_on()
 }
 
 /// A draft path of literally `official` (the serve config's opt-out default)
@@ -1325,16 +1351,29 @@ fn build_generator(
         load_start.elapsed().as_secs_f64()
     );
 
-    // Speculation is opt-out: a zero-flag run speculates with the official
-    // drafter, which a first run fetches into the Hugging Face cache (3.5 GB on
-    // the 27B, 0.8 GB on the 35B-A3B, with the same download notice the target
-    // gets). `--no-draft` decodes plain, and so does a checkpoint that ships no
-    // sidecar — with a line saying so, unless the run asked for one by name.
+    // Speculation is opt-out per checkpoint: a zero-flag run speculates with the
+    // official drafter on a checkpoint whose `draft_default_on` is true, which a
+    // first run fetches into the Hugging Face cache (3.5 GB on the 27B, 3.2 GB
+    // on the 3.8-27B, with the same download notice the target gets).
+    // `--no-draft` decodes plain, and so does a checkpoint that ships no sidecar
+    // — with a line saying so, unless the run asked for one by name.
     if let Some(draft) = draft.filter(|d| !d.no_draft) {
         // resolve_draft keeps `--draft official` — and the default, which is
         // that same symbolic path — meaning the same thing here as in the serve
         // config.
         let explicit = draft.draft.is_some();
+        // Asked for nothing, on a checkpoint that ships a drafter it does not
+        // attach unasked (the 35B-A3B since 2026-09-06). Decided BEFORE
+        // `resolve_draft` so a default run does not fetch a sidecar it will not
+        // load. A checkpoint with no sidecar at all falls through instead, so it
+        // keeps saying the other, truer thing about itself below.
+        if draft_defaults_off(size, explicit) {
+            eprintln!(
+                "xwen: {}",
+                size.draft_default_off_message("pass --draft official")
+            );
+            return Ok(generator);
+        }
         let requested = draft
             .draft
             .clone()
@@ -2000,6 +2039,40 @@ mod tests {
             Some(custom.to_path_buf())
         );
         assert!(Model::Qwen27B.supports_drafting());
+    }
+
+    /// What a zero-flag `generate`/`chat` run does per checkpoint, and what an
+    /// explicit `--draft` does to that.
+    ///
+    /// The 35B-A3B is the interesting row: it ships a sidecar, `--draft
+    /// official` still attaches it, and a run that asks for nothing decodes
+    /// plain with a line — since 2026-09-06, when its drafted arm read below
+    /// plain at every length.
+    #[test]
+    fn a_zero_flag_run_follows_the_checkpoints_own_drafting_default() {
+        assert!(draft_defaults_off(Model::Qwen35BA3B, false));
+        assert!(!draft_defaults_off(Model::Qwen27B, false));
+        assert!(!draft_defaults_off(Model::Qwen3827B, false));
+        // No sidecar at all: this is not the case that gets the line, because
+        // the caller has a truer thing to say about a graph with no verify seam.
+        assert!(!draft_defaults_off(Model::Qwen38FlashNext, false));
+
+        // Asking by name is honored on every checkpoint, whatever its default.
+        for model in [
+            Model::Qwen27B,
+            Model::Qwen35BA3B,
+            Model::Qwen3827B,
+            Model::Qwen38FlashNext,
+        ] {
+            assert!(!draft_defaults_off(model, true), "{model:?}");
+        }
+
+        // The line names the checkpoint and the flag that turns it back on, so
+        // an operator who wanted the old behaviour can get it from the line
+        // alone.
+        let line = Model::Qwen35BA3B.draft_default_off_message("pass --draft official");
+        assert!(line.contains("Qwen3.6-35B-A3B"), "{line}");
+        assert!(line.contains("--draft official"), "{line}");
     }
 
     // Unset sampling flags resolve to the recommended set for the run's

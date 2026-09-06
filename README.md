@@ -43,7 +43,7 @@ cache and downloaded on first use:
 | --- | --- | --- | --- |
 | `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` (default) | none |
 | `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash block drafter, 3.5 GB |
-| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` | DFlash block drafter, 0.8 GB |
+| `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` | DFlash block drafter, 0.8 GB, off by default |
 | `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | MTP head, 3.2 GB |
 
 **Flash-Next is the default (2026-08-30), so a zero-flag first run downloads 111 GB**
@@ -199,13 +199,23 @@ dashboard's `draft` cell reports what the LOADED checkpoint is doing rather than
 configured. The default costs a sidecar load per run (3.5 GB on the 27B, 0.8 GB on the
 35B-A3B, 3.2 GB on the 3.8-27B).
 
+**On the 35B-A3B the default is OFF as of 2026-09-06**, and it is the only checkpoint
+where opt-out and opt-in differ. Its drafted arm now reads below plain at every length
+(-8% at 1k tokens deepening to -37% at 16k, and -4% on a 256-token code prompt) because
+plain decode gained 10.3% from the router gemv while the table below was fitted against
+the older level. The sidecar still ships and still works: `--draft official` on the CLI,
+or `[draft] enabled = true` / `path = "official"` in a serve config, attaches it, and
+either one also attaches it on every other checkpoint that server loads. A zero-flag run
+says which it is doing in a startup line. The fitted floor and depth are deliberately
+left where they are — a retune is what decides whether the default comes back.
+
 Measured over plain decode on the same machine state (greedy, 128 tokens, warm, medians
 of 3 reps, arms interleaved, `lowpowermode 0` on AC):
 
 | Checkpoint | code | chat | acceptance | fitted |
 | --- | --- | --- | --- | --- |
 | `Qwen3.6-27B` | +46 to +52% | +46 to +52% | 78-86% | 2026-08-08 |
-| `Qwen3.6-35B-A3B` | +26 to +28% | +15 to +17% | 68-74% | 2026-08-08 |
+| `Qwen3.6-35B-A3B` | +26 to +28% | +15 to +17% | 68-74% | 2026-08-08, superseded 2026-09-06: below plain, off by default |
 | `Qwen3.8-27B` | +44 to +45% | +37 to +38% | 78-80% | 2026-08-15 |
 
 The 35B-A3B's PLAIN decode level moved on 2026-08-30 (105.1 → 114.4 tok/s, the

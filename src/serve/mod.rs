@@ -209,7 +209,12 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
     // only thing `--tui` decides; every site logs the same events either way.
     let (logger, _sink) = if settings.tui {
         log::spawn_tui_sink(
-            tui::Vitals::new(model_id.clone(), &settings, Arc::clone(&resident)),
+            tui::Vitals::new(
+                model_id.clone(),
+                &settings,
+                default_target.model,
+                Arc::clone(&resident),
+            ),
             quit.clone(),
         )
     } else {

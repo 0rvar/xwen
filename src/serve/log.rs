@@ -248,6 +248,12 @@ pub enum ServeLog {
     /// The checkpoint a job needs ships no drafter sidecar, so it runs without
     /// speculative decoding however the drafter is configured.
     NoDrafterAvailable { model: crate::hub::Model },
+    /// The checkpoint a job needs SHIPS a drafter but does not attach one
+    /// unasked, and nothing in the config asked. Distinct from
+    /// `NoDrafterAvailable`, which is about a checkpoint with no sidecar to
+    /// attach: this one is a policy an operator can reverse, so the line says
+    /// how.
+    DraftDefaultOff { model: crate::hub::Model },
     /// The batch runner reported progress: a shared prefill, or one item done.
     BatchProgress(crate::batch::BatchProgress),
     /// The speculative drafter finished loading, alongside the model.
@@ -485,6 +491,12 @@ impl ServeLog {
             ServeLog::NoDrafterAvailable { model } => format!(
                 "xwen serve: no drafter available for {}; running without speculative decoding",
                 model.full_name()
+            ),
+            ServeLog::DraftDefaultOff { model } => format!(
+                "xwen serve: {}",
+                model.draft_default_off_message(
+                    "pass --draft official (or set [draft] path = \"official\")"
+                )
             ),
             ServeLog::BatchProgress(progress) => match progress {
                 crate::batch::BatchProgress::SharedPrefix { tokens, ms } => {

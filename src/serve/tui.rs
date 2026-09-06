@@ -115,10 +115,16 @@ pub struct Vitals {
     /// then driven by the engine's own drafter events, because which checkpoint
     /// is resident decides this and a swap can change it.
     pub draft: bool,
-    /// What the SETTINGS asked for, which is what the cell falls back to
-    /// whenever nothing is loaded (a swap, an idle unload). Without it the cell
-    /// would have to invent an answer for "no model resident" — and inventing
-    /// "off" there would read as a configuration problem on a drafting server.
+    /// What the SETTINGS asked for OF THE DEFAULT CHECKPOINT, which is what the
+    /// cell falls back to whenever nothing is loaded (a swap, an idle unload).
+    /// Without it the cell would have to invent an answer for "no model
+    /// resident" — and inventing "off" there would read as a configuration
+    /// problem on a drafting server.
+    ///
+    /// Resolved against the default checkpoint rather than off the settings
+    /// alone because the settings' own default defers to the checkpoint: a
+    /// server on a checkpoint that does not draft unasked would otherwise
+    /// advertise speculation it will never do.
     pub draft_configured: bool,
     /// Whether the on-disk prefix cache is on, which is what decides whether the
     /// header carries a cell for it: a server that keeps nothing on disk has no
@@ -127,15 +133,21 @@ pub struct Vitals {
 }
 
 impl Vitals {
-    pub fn new(model_id: String, settings: &ServeSettings, resident: Arc<ResidentModel>) -> Self {
+    pub fn new(
+        model_id: String,
+        settings: &ServeSettings,
+        default_model: crate::hub::Model,
+        resident: Arc<ResidentModel>,
+    ) -> Self {
+        let draft = settings.draft.is_on_for(default_model);
         Self {
             model_id,
             resident,
             model_bytes: file_size(&settings.model),
             context_length: settings.context_length,
             port: settings.port,
-            draft: settings.draft.is_on(),
-            draft_configured: settings.draft.is_on(),
+            draft,
+            draft_configured: draft,
             disk_cache: settings.disk_cache && settings.cache_dir.is_some(),
         }
     }
@@ -381,7 +393,9 @@ impl Dashboard {
             // nothing loaded the cell shows the configured intent, which is the
             // honest answer before a checkpoint has been chosen.
             ServeLog::DrafterLoaded { .. } => self.vitals.draft = true,
-            ServeLog::NoDrafterAvailable { .. } => self.vitals.draft = false,
+            ServeLog::NoDrafterAvailable { .. } | ServeLog::DraftDefaultOff { .. } => {
+                self.vitals.draft = false
+            }
             ServeLog::CheckpointSwappingOut { .. } | ServeLog::IdleUnloaded { .. } => {
                 self.vitals.draft = self.vitals.draft_configured;
             }
@@ -1731,6 +1745,22 @@ mod tests {
         // Swapped out for one that ships no sidecar.
         let text = frame(&mut app, vec![swap(), no_drafter(), loaded(3800)]);
         assert!(!app.vitals.draft, "a sidecar-less checkpoint reads off");
+        assert!(text.contains("draft off"), "{text}");
+
+        // Same cell, different reason: a checkpoint that SHIPS a sidecar and
+        // does not attach it unasked reads off too. The header says what is
+        // happening, not why; the LOG pane carries the reason.
+        let text = frame(
+            &mut app,
+            vec![
+                swap(),
+                ServeLog::DraftDefaultOff {
+                    model: crate::hub::Model::Qwen35BA3B,
+                },
+                loaded(3800),
+            ],
+        );
+        assert!(!app.vitals.draft, "a default-off checkpoint reads off");
         assert!(text.contains("draft off"), "{text}");
 
         // And back: the cell recovers rather than staying off for the process.

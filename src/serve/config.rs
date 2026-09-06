@@ -151,12 +151,18 @@ pub const DEFAULT_SCHEDULE_AGE_LIMIT_SECS: u64 = 20;
 /// GB on the 27B, 0.8 GB on the 35B-A3B). See docs/decisions.md, "Speculative
 /// decoding".
 ///
-/// `p_min` is the one drafter default that is not a constant here: it is fitted
-/// per checkpoint and lives on [`crate::hub::Model::draft_p_min_default`]. The
-/// merge leaves it unresolved (`None`) because one server loads whichever
-/// checkpoint a request names; the engine resolves it when it attaches the
-/// drafter, once the checkpoint is known. `draft.p_min` in the config file, and
-/// `--draft-p-min`, pin one floor for every checkpoint instead.
+/// `p_min` is not the only drafter default that is not a constant here, and
+/// since 2026-09-06 neither is this one. `p_min` is fitted per checkpoint and
+/// lives on [`crate::hub::Model::draft_p_min_default`]; WHETHER a checkpoint
+/// drafts at all when nothing asked lives on
+/// [`crate::hub::Model::draft_default_on`], and is false on the 35B-A3B. So
+/// `true` here does not mean "every checkpoint drafts" — it means "nothing
+/// declined it, ask the checkpoint", which the merge spells
+/// [`DraftMode::Default`]. An `enabled = true` written down in a config file
+/// resolves to [`DraftMode::Official`] instead and DOES draft on every
+/// checkpoint. Both are resolved when the checkpoint loads, because one server
+/// loads whichever checkpoint a request names. `draft.p_min` in the config
+/// file, and `--draft-p-min`, pin one floor for every checkpoint likewise.
 pub const DEFAULT_DRAFT_ENABLED: bool = true;
 pub const DEFAULT_DRAFT_MAX: usize = 15;
 pub const DEFAULT_DRAFT_PAUSE_MARGIN: f32 = 1.0;
@@ -394,10 +400,21 @@ pub enum DraftMode {
     /// `--no-draft`, or `enabled = false`: nothing speculates, whatever is
     /// loaded.
     Off,
-    /// The default: each checkpoint drafts with its own official sidecar,
-    /// resolved (and fetched) when that checkpoint loads. One that ships none
-    /// decodes plain, with a line saying so.
+    /// Nothing said anything about drafting, so each checkpoint follows its own
+    /// default ([`crate::hub::Model::draft_default_on`]) when it loads: the 27B
+    /// and the 3.8-27B attach their sidecars, the 35B-A3B decodes plain with a
+    /// line saying so.
+    ///
+    /// Distinct from [`DraftMode::Official`] precisely because those two arms
+    /// differ. Collapsing them would make a server that named the official
+    /// drafter explicitly quietly not use it on one checkpoint, which is the
+    /// thing an explicit request exists to rule out.
     #[default]
+    Default,
+    /// The official sidecar, asked for BY NAME — `--draft official`,
+    /// `draft.path = "official"`, or `draft.enabled = true`. It attaches on
+    /// every checkpoint that ships one, including a checkpoint whose own
+    /// default is off. One that ships none decodes plain, with a line saying so.
     Official,
     /// A custom drafter GGUF. It belongs to the checkpoint it was validated
     /// against — the default one — and never transfers, so any other checkpoint
@@ -406,11 +423,25 @@ pub enum DraftMode {
 }
 
 impl DraftMode {
-    /// Whether this server speculates at all. Not whether the checkpoint that
-    /// is loaded right now does: that also depends on whether it ships a
-    /// sidecar, which only the engine knows.
+    /// Whether this server speculates at all, before any checkpoint is known.
+    /// Not whether the checkpoint that is loaded right now does: that also
+    /// depends on whether it ships a sidecar and on its own default, which is
+    /// [`DraftMode::is_on_for`].
     pub fn is_on(&self) -> bool {
         !matches!(self, DraftMode::Off)
+    }
+
+    /// Whether `size` speculates under this mode, as far as the settings can
+    /// say. [`DraftMode::Default`] defers to the checkpoint's own default;
+    /// every other mode is the same answer for every checkpoint. Still not the
+    /// last word — a checkpoint that ships no sidecar decodes plain under
+    /// `Official` too, and only the engine can see that.
+    pub fn is_on_for(&self, size: crate::hub::Model) -> bool {
+        match self {
+            DraftMode::Off => false,
+            DraftMode::Default => size.draft_default_on(),
+            DraftMode::Official | DraftMode::Custom(_) => true,
+        }
     }
 
     /// The custom drafter GGUF, when one was named.
@@ -555,8 +586,9 @@ pub struct ServeSettings {
     pub cache_snapshots: usize,
     /// Conversations kept warm at once, at least 1.
     pub cache_slots: usize,
-    /// How this server speculates. Speculation is opt-out, so the resolved
-    /// default is [`DraftMode::Official`] — which sidecar that is depends on the
+    /// How this server speculates. Speculation is opt-out PER CHECKPOINT, so
+    /// the resolved default is [`DraftMode::Default`] — which sidecar that is,
+    /// and whether the checkpoint attaches one unasked at all, depends on the
     /// checkpoint, so the resolution stays out of the merge (which is pure) and
     /// out of the settings: one server loads whichever checkpoint a request
     /// names. The settings below apply to whatever drafter ends up attached.
@@ -975,6 +1007,11 @@ pub fn resolve(
                 origin,
                 &mut warnings,
             );
+            // Whether anything at all said drafting is on, as opposed to it
+            // being on because the default is. The two part ways on a
+            // checkpoint whose own default is off, where a stated `enabled =
+            // true` attaches the sidecar and silence does not.
+            let enabled_named = cli.draft_enabled.is_some() || file.draft.enabled.is_some();
             // Opt-out speculation: the default enables on its own, and the
             // `|| path.is_some()` keeps a config that sets only `path` drafting
             // whichever way DEFAULT_DRAFT_ENABLED is set.
@@ -998,7 +1035,15 @@ pub fn resolve(
                 (false, _) => DraftMode::Off,
                 (true, Some(path)) if path == Path::new(OFFICIAL_DRAFTER) => DraftMode::Official,
                 (true, Some(path)) => DraftMode::Custom(path),
-                (true, None) => DraftMode::Official,
+                // On, with no path: `Official` when something SAID so and
+                // `Default` when the opt-out default is the only reason it is
+                // on. Every checkpoint reads those two the same way except one
+                // whose own default is off, and there the difference is the
+                // whole point — an operator who wrote `enabled = true` gets the
+                // sidecar, an operator who wrote nothing gets the checkpoint's
+                // own answer.
+                (true, None) if enabled_named => DraftMode::Official,
+                (true, None) => DraftMode::Default,
             }
         },
         draft_max: pick_opt(
@@ -1570,15 +1615,20 @@ slots = {slots}
 # anyway is committed for free. Which drafter depends on the checkpoint — the 3.6
 # files ship DFlash sidecars that propose a block per forward, the 3.8 an MTP head
 # that chains a few steps. Greedy output matches decoding
-# without it except where a near-tie lands differently. On by default: measured
-# faster on both checkpoints on 2026-07-29 — 27B +19.3 to +21.0% on code and
-# +7.6 to +8.4% on chat, 35B-A3B +18.1 to +19.8% on code and +12.6 to +12.8% on
-# chat (greedy, 128 tokens, warm). It uses the official drafter for the
-# checkpoint, fetched into the Hugging Face cache on first use (3.5 GB on the
-# 27B, 0.8 GB on the 35B-A3B, 3.2 GB on the 3.8-27B); `path` names a custom
-# drafter GGUF instead, of either kind.
-# `enabled = false` decodes plain.
-enabled = {draft_enabled}
+# without it except where a near-tie lands differently.
+#
+# Left unset here because the default is PER CHECKPOINT and there is no one
+# value to write: on for Qwen3.6-27B and Qwen3.8-27B, where the drafted arm
+# measured well above plain (+46 to +52% and +44 to +45% on code), and off for
+# Qwen3.6-35B-A3B since 2026-09-06, whose drafted arm now reads below plain at
+# every length — the router gemv lifted plain decode past what the drafting
+# defaults were fitted against. Setting `enabled = {draft_enabled}` here asks for the
+# official drafter on EVERY checkpoint this server loads, the 35B-A3B included;
+# `enabled = false` decodes plain on all of them. Either way the sidecar is
+# fetched into the Hugging Face cache on first use (3.5 GB on the 27B, 0.8 GB on
+# the 35B-A3B, 3.2 GB on the 3.8-27B); `path` names a custom drafter GGUF
+# instead, of either kind.
+# enabled = {draft_enabled}
 # path = "/path/to/custom-drafter.gguf"
 
 # Max draft tokens proposed per verify round. Unset, each checkpoint the server
@@ -1749,9 +1799,12 @@ mod tests {
         assert_eq!(s.cache_dir, default_cache_dir());
         assert_eq!(s.disk_max_gib, DEFAULT_DISK_MAX_GIB);
         assert_eq!(s.disk_min_tokens, DEFAULT_DISK_MIN_TOKENS);
-        // Speculation is opt-out: a zero-flag server speculates with the
-        // official sidecar, named symbolically for the caller to resolve.
-        assert_eq!(s.draft, DraftMode::Official);
+        // Speculation is opt-out PER CHECKPOINT: a zero-flag server leaves the
+        // decision to whichever checkpoint a request names, resolved when that
+        // checkpoint loads. `Official` is what an operator who SAYS so gets,
+        // and it differs on the 35B-A3B, whose own default went off on
+        // 2026-09-06.
+        assert_eq!(s.draft, DraftMode::Default);
         // Both unresolved on purpose: the depth and the floor are fitted per
         // checkpoint, and which checkpoint is only known when the engine
         // attaches the drafter.
@@ -1854,17 +1907,23 @@ mod tests {
     /// Speculation is opt-out: it needs no request at all, and every way of
     /// making one anyway still selects the drafter it names.
     ///
-    /// The default is on because drafting measured faster on both checkpoints
-    /// once the fused verify landed — so a zero-flag run asks for a drafter.
+    /// The default is on because drafting measured faster on most checkpoints
+    /// once the fused verify landed — so a zero-flag run asks for a drafter,
+    /// though which checkpoints actually attach one is
+    /// `Model::draft_default_on`'s answer and not the merge's.
     #[test]
     fn speculation_is_on_unless_something_declines_it() {
-        // Nothing named, nothing enabled: the official drafter, by default.
+        // Nothing named, nothing enabled: on, but deferred to the checkpoint.
         let empty: ServeToml = toml::from_str("").unwrap();
         let (settings, warnings) = resolve(&empty, None, &model_only()).unwrap();
-        assert_eq!(settings.draft, DraftMode::Official);
+        assert_eq!(settings.draft, DraftMode::Default);
+        assert!(settings.draft.is_on());
         assert!(warnings.is_empty());
 
-        // `enabled = true` restates the default and means the same drafter.
+        // `enabled = true` is not a restatement of that default: it NAMES the
+        // official drafter, and so attaches it even on a checkpoint whose own
+        // default is off. This is the one distinction `DraftMode::Default`
+        // exists to keep.
         let file: ServeToml = toml::from_str("[draft]\nenabled = true\n").unwrap();
         let (settings, _) = resolve(&file, None, &model_only()).unwrap();
         assert_eq!(settings.draft, DraftMode::Official);
@@ -2701,13 +2760,16 @@ mod tests {
         let (from_template, warnings) = resolve(&parsed, None, &model_only()).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(from_template, defaults());
-        // `model`, `api_key`, the drafter path and the cache directory have no
-        // baked default — the last resolves from $HOME — so the template leaves
-        // them commented out rather than shipping a value that cannot work or a
-        // path that would be wrong on another machine.
+        // `model`, `api_key`, the drafter path, `draft.enabled` and the cache
+        // directory have no baked default — the cache dir resolves from $HOME,
+        // and drafting resolves from the checkpoint — so the template leaves
+        // them commented out rather than shipping a value that cannot work, a
+        // path that would be wrong on another machine, or a `true` that would
+        // silently mean "draft on the 35B-A3B too".
         assert_eq!(parsed.model, None);
         assert_eq!(parsed.api_key, None);
         assert_eq!(parsed.draft.path, None);
+        assert_eq!(parsed.draft.enabled, None);
         assert_eq!(parsed.cache_dir, None);
         assert_eq!(parsed.disk_cache, Some(DEFAULT_DISK_CACHE));
     }

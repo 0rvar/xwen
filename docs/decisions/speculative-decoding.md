@@ -355,3 +355,37 @@ xwen's raw continuation against llama.cpp's chain-of-thought and produced a spur
 `llama-server`'s `/completion` endpoint, which takes the prompt verbatim, and read
 `timings.draft_n` / `draft_n_accepted`. And both sides MUST run at `p_min` 0, because the
 two `p_min` definitions differ (see above) (2026-08-15).
+
+**Drafting is off by default on Qwen3.6-35B-A3B as of 2026-09-06, and the fitted floor
+and depth are left exactly where they are.** Two independent measurements that day read
+the drafted arm below plain on that checkpoint, at every length either of them covered.
+The presence-penalty A/B (code prompt, 256 tokens, 3 interleaved reps, pinned build) read
+drafted 121.1 tok/s against plain 126.5 at penalty 0, and 119.6 against 126.9 at the
+shipped 1.5, at 63.0% and 59.4% acceptance. The long-context sweep read the same
+direction on long-document prose with a forced thinking decode, medians of 2, drafted
+against plain: 111.9 vs 121.9 at 1046 tokens (80.6% acceptance), 85.3 vs 116.3 at 4117
+(70.9%), 73.1 vs 104.2 at 8201 (58.5%), 62.8 vs 99.1 at 16409 (57.4%). So it is -8%
+already at 1k tokens and inside the acceptance band the fits were made at, and -37% by
+16k. Nothing about the drafter changed: PLAIN decode gained +10.3% from the router gemv
+the same day (115.1 to 127.0), on top of the beta|alpha fold and the fused shared expert
+before it, and the +26 to +28% in docs/perf-state.md was fitted on 2026-08-08 against a
+level three improvements older. A default measured against a baseline that has moved is
+no longer a default anyone measured.
+
+Off by DEFAULT and not removed: `Model::draft_default_on()` is what silence resolves to,
+and `--draft official` (or a serve config that says `enabled = true` or
+`path = "official"`) still attaches the sidecar on this checkpoint exactly as before. The
+serve merge distinguishes `DraftMode::Default` from `DraftMode::Official` for that
+reason alone — collapsing them would make a server that named the official drafter
+quietly not use it on one checkpoint, which is the one thing an explicit request exists
+to rule out.
+
+`draft_p_min_default` (0.3) and `draft_max_default` (15) are deliberately untouched. They
+are the best values anyone has measured for this drafter, and the reason the arm loses is
+not that they are wrong but that the target forward they were fitted against got faster —
+refitting them by hand off two workloads that were measuring something else would be
+guessing. The reopen condition is a retune (`bun scripts/retune-draft.ts` on the 35B, at
+more than one context length, since a short-prompt-only sweep sees less than half of the
+loss) whose drafted arm reads above plain from 1k through 16k. If it does, this arm goes
+back to true with the refitted values; if it does not, the item is retired and the sidecar
+stays a flag (2026-09-06).

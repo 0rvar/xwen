@@ -257,11 +257,15 @@ fn startup_drafter(settings: &ServeSettings, served: Target) -> Option<std::path
     match &settings.draft {
         DraftMode::Off => None,
         DraftMode::Custom(path) => Some(path.clone()),
+        // Nothing asked, and this checkpoint does not draft unasked: there is
+        // no drafter for startup to judge, and fetching one to judge it would
+        // be work for a file no request will attach.
+        DraftMode::Default if !served.model.draft_default_on() => None,
         // The served checkpoint's own sidecar, offline: whatever the CLI's
         // prefetch left in the cache. A checkpoint that ships none yields
         // nothing to check, and on a cache miss the attach's own check is the
         // only one there can be.
-        DraftMode::Official => hub::cached_drafter(served.model),
+        DraftMode::Default | DraftMode::Official => hub::cached_drafter(served.model),
     }
 }
 
@@ -435,7 +439,18 @@ fn checkpoint_paths(
     let draft = match &settings.draft {
         DraftMode::Off => None,
         DraftMode::Custom(path) if local => Some(path.clone()),
-        DraftMode::Custom(_) | DraftMode::Official => official_drafter(size, logger)?,
+        // Nothing in the config asked, and this checkpoint ships a sidecar it
+        // does not attach unasked (the 35B-A3B since 2026-09-06). Said out
+        // loud, because a drafter that is present and unused otherwise reads as
+        // a fetch that failed. A checkpoint with no sidecar at all falls
+        // through instead and keeps saying the truer thing about itself.
+        DraftMode::Default if size.drafter_kind().is_some() && !size.draft_default_on() => {
+            logger.log(ServeLog::DraftDefaultOff { model: size });
+            None
+        }
+        DraftMode::Custom(_) | DraftMode::Official | DraftMode::Default => {
+            official_drafter(size, logger)?
+        }
     };
     Ok((model, draft))
 }
@@ -6546,6 +6561,56 @@ mod tests {
             startup_drafter(&settings, Target::official(hub::Model::Qwen3827B)),
             hub::cached_drafter(hub::Model::Qwen3827B)
         );
+    }
+
+    /// A server that configured nothing takes each checkpoint's own drafting
+    /// default, and one that named the official drafter takes it on every
+    /// checkpoint that ships one.
+    ///
+    /// The 35B-A3B is where the two part: its own default went off on
+    /// 2026-09-06 after the drafted arm read below plain at every length, so
+    /// `Default` finds nothing to preflight there while `Official` still
+    /// preflights the sidecar the operator asked for. The other checkpoints
+    /// answer the same under both, which is what keeps this a policy change and
+    /// not a behaviour change everywhere.
+    #[test]
+    fn an_unconfigured_server_follows_each_checkpoints_drafting_default() {
+        let mut settings = crate::serve::testutil::settings();
+        settings.draft = DraftMode::Default;
+
+        // Nothing to judge: this checkpoint will not attach a drafter unasked.
+        assert_eq!(
+            startup_drafter(&settings, Target::official(hub::Model::Qwen35BA3B)),
+            None
+        );
+        // ...while an explicit request still preflights it.
+        settings.draft = DraftMode::Official;
+        assert_eq!(
+            startup_drafter(&settings, Target::official(hub::Model::Qwen35BA3B)),
+            hub::cached_drafter(hub::Model::Qwen35BA3B)
+        );
+
+        // The drafting-by-default checkpoints read the same either way.
+        for model in [hub::Model::Qwen27B, hub::Model::Qwen3827B] {
+            for mode in [DraftMode::Default, DraftMode::Official] {
+                settings.draft = mode;
+                assert_eq!(
+                    startup_drafter(&settings, Target::official(model)),
+                    hub::cached_drafter(model),
+                    "{model:?}"
+                );
+            }
+        }
+
+        // And `--no-draft` still means nothing, on every checkpoint.
+        settings.draft = DraftMode::Off;
+        for model in [
+            hub::Model::Qwen27B,
+            hub::Model::Qwen35BA3B,
+            hub::Model::Qwen3827B,
+        ] {
+            assert_eq!(startup_drafter(&settings, Target::official(model)), None);
+        }
     }
 
     /// The per-request speculation report: made once, and only when speculation was
