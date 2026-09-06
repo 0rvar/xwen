@@ -353,10 +353,10 @@ at once. 700 MB/s is that same measurement rounded down; the write rate was NOT
 re-measured in this arc, so it is the weakest number here and the one to replace with a
 real page-out timing (the small-image line `113 MiB in 1229 ms` is fixed cost, not rate,
 which is exactly why the shape is a floor plus a rate rather than either alone).
-Observed later the same day on a 96k-token Flash-Next serve session (the Qwen review
-driving `serve` through 131072 KV positions): page-outs of 1.8-2.9 GiB in 318-693 ms,
-i.e. 3.6-5.7 GB/s, so 700 MB/s is a floor by a factor of five and the budget errs long,
-which is the safe direction for a shutdown flush. The
+(A 96k-token Flash-Next serve session later the same day logged slot page-outs of
+1.8-2.9 GiB in 318-693 ms; those are device-to-HOST image copies, the disk tier being
+opt-in and off in that session, so they say nothing about the disk write rate. The 700
+MB/s floor is still the un-re-measured number.) The
 wait stays bounded and its expiry stays reported rather than retried: an image that does
 not land costs the next server a re-prefill, while a shutdown that hangs costs the
 operator a `kill -9`. The shutdown watchdog uses the same budget (2026-09-06 review
