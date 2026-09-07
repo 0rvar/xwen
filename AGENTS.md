@@ -357,12 +357,14 @@ Traps, each of which has already cost someone time:
   then an ERROR naming the fetch. Never add a fallback to the embedded tokenizer: it would
   answer fluently in the wrong vocabulary. Mask width is `VocabFamily::logit_width()`,
   248320 against 151936, a registry constant because it is asked before any file is open.
-- **`AppState.max_ctx` is the SERVED checkpoint's, not the request target's.** The
-  handler's prompt-fits check therefore uses the served window even for a request naming
-  another checkpoint, so on a base-default server Instruct-2507's trained 262144 is
-  clamped to 40960 with a warning. Pre-existing across the GGUF checkpoints, visible now
-  that one family holds two windows six times apart. The engine re-derives its own at load
-  and that is authoritative; do not "fix" one without the other.
+- **Prompt admission uses the REQUEST TARGET's trained context, not the served
+  checkpoint's** (fixed 2026-09-07, d48a3f4). `Model::trained_context()` is the registry
+  constant, read off the cached files: 262144 everywhere except `Qwen/Qwen3-4B` and the
+  Z-Image encoder at 40960. The handler caps it by `--context-length` and names the
+  checkpoint in the refusal. Before the fix the check used `AppState.max_ctx`, the served
+  checkpoint's, which on a base-default server clamped Instruct-2507's 262144 to 40960;
+  do not reintroduce that by reaching for the served window in a handler. The engine
+  re-derives its own limit at load and that stays authoritative for what actually runs.
 
 ## The candle situation
 

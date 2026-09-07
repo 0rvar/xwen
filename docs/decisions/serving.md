@@ -440,10 +440,14 @@ this found the gate missing from `generate` and `chat`, where loading it SUCCEED
 weights parse and its config is a language model's, so those two surfaces would have
 generated fluent-looking garbage out of the zero-filled layer 35 rather than failing. The
 gate runs on all four surfaces now, before the fetch, and the shared sentence says "cannot
-be run" because that is what it now means. One known asymmetry, recorded rather than
-fixed: `AppState.max_ctx` is the SERVED checkpoint's, so the handler's prompt-fits check
-uses it even for a request naming another checkpoint, which clamps Instruct-2507's trained
-262144 to the base model's 40960 on a base-default server, with a warning. It is
-pre-existing across the GGUF checkpoints and merely visible now that one family holds two
-windows six times apart; the engine re-derives its own at load and that stays
-authoritative (2026-09-07).
+be run" because that is what it now means. **Prompt admission asks the REQUEST TARGET
+what fits, not the served checkpoint** (d48a3f4, same day). The check had used
+`AppState.max_ctx`, which is the served checkpoint's window, so a base-default server
+clamped Instruct-2507's trained 262144 to the base model's 40960 and refused prompts the
+target would have taken. It was pre-existing across the GGUF checkpoints, where every
+window is the same and nothing could show it; one family holding two windows six times
+apart is what made it visible, and being visible is what got it fixed rather than
+recorded. `Model::trained_context()` is a registry constant read off the cached files,
+capped by the configured limit, and the refusal names the checkpoint it applies to. The
+engine still re-derives its own limit at load, which stays authoritative for what runs
+(2026-09-07).

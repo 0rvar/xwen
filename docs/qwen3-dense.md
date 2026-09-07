@@ -18,7 +18,10 @@ Restated per arc; as of **2026-09-07** (Arc 3).
 `encode-text` all work on `Qwen3-4B` and `Qwen3-4B-Instruct-2507`, and both are listed by
 `/v1/models` and selectable by full name while cached. Serve carries a second vocabulary
 for them, resolved per request target rather than per process (decisions.md "The tokenizer
-and the grammar trie follow the request's target").
+and the grammar trie follow the request's target"), and asks the request target rather
+than the served checkpoint what context fits: `Model::trained_context()` is 40960 for the
+base model and the encoder, 262144 for Instruct-2507 and every GGUF entry, capped by
+`--context-length`.
 
 **The encoder entry runs `encode-text` and nothing else.** Its weights are not a faithful
 language model, so every generating surface refuses it with one sentence saying why. That

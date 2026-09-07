@@ -413,7 +413,8 @@ cannot disagree, cached lazily behind a short mutex that is never held across a 
 pair costs about 150 ms, dominated by the trie, so a server whose clients never ask for
 the other family never pays for it; two racing first requests may both build one and the
 loser is dropped, which is the trade that keeps one family's request off the other's
-build. Every tokenizer reader and every grammar-factory site in serve now resolves from
+build. The review round below revisited both halves of that: the build is now once per
+family under a `OnceLock`, and every reachable family is warmed at startup anyway. Every tokenizer reader and every grammar-factory site in serve now resolves from
 the target, and `constrain::shared()` is off the request path entirely.
 
 Two smaller decisions inside that carry the weight. The trie is built from the file the
@@ -483,19 +484,34 @@ running in the background, are in [perf-state.md](../perf-state.md).
   400 or a CLI error naming `xwen fetch` rather than an 8 GB download inside a request.
   Reopen when someone wants a zero-flag run of the 4B and is willing to have the first
   one download 8 GB.
-- **`AppState.max_ctx` is the SERVED checkpoint's, not the request target's.** The
-  handler-side "does this prompt fit" check therefore uses the served checkpoint's
-  window even for a request naming another, so Instruct-2507's trained 262144 is clamped
-  to the base model's 40960 on a base-default server, with a warning printed. This is
-  pre-existing across the GGUF checkpoints and merely more visible now that two
-  checkpoints of one family have windows six times apart. The engine re-derives its own
-  at load and that stays authoritative. Reopen when someone serves Instruct-2507 past
-  40960 alongside the base model.
+- ~~**`AppState.max_ctx` is the SERVED checkpoint's, not the request target's.**~~
+  **TAKEN the same day, d48a3f4**, and it is worth saying why it did not stay deferred.
+  The reopen condition was "when someone serves Instruct-2507 past 40960 alongside the
+  base model", which is a plain description of the default two-checkpoint server this arc
+  had just shipped, so the condition was already met when it was written. Prompt admission
+  now asks the REQUEST TARGET what fits: `Model::trained_context()`, a registry constant
+  read off the cached files (262144 everywhere except `Qwen/Qwen3-4B` and the encoder at
+  40960), capped by the configured limit, with the refusal naming the checkpoint. The bug
+  was pre-existing across the GGUF checkpoints, where every window is the same; one family
+  holding two windows six times apart is what made it visible.
 - **A unit-tested snapshot round trip on a safetensors checkpoint.** What is tested at
   this level is the seam that changed, the disk tier deriving a stable distinct id from a
   safetensors set; the binding logic below it is id-agnostic and already covered with
   synthetic ids, and the real round trip was smoked on the GPU rather than pinned by a
   test, because it needs a device. Reopen at the first serve regression there.
+
+### The review round, d48a3f4
+
+Four fixes landed on top of the arc the same day, and one of them closed a "not taken
+now" above. Prompt admission moved to the request target's trained context. A native
+continuation prefix on Instruct-2507 renders again: the effective thinking mode is the
+resolved value AND `supports_thinking()`, where taking the resolved value alone made a
+prefix unrenderable on a checkpoint with no reasoning mode. Anthropic `count_tokens`
+refuses the same unsupported-thinking bodies `/v1/messages` refuses, through one shared
+check rather than two that could drift. And the vocabulary cache builds once per family
+behind a per-family `OnceLock` with the map lock released before the build, and warms
+every reachable family at startup, which replaces the arc's accepted "two racing
+requests may both build one and the loser is dropped" with never building twice at all.
 
 ### Next
 
