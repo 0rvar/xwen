@@ -387,6 +387,22 @@ harness**; its check is `bun scripts/flashnext-replay.ts --control <kill switch>
 /tmp; a mismatch is excused when the oracle OR the control arm held the decision by
 less than the band, ≤8 excuses, everything else hard; docs/parity.md "Limitations").
 
+**A green `cargo test` does not mean the cache-backed tests ran.** A great many read the
+real checkpoints and self-skip when the HF cache lacks them. Every one of those skips goes
+through `crate::test_support` (2026-09-07), which prints a SKIPPED line naming the file
+and the fetch that would supply it, and `XWEN_REQUIRE_HF_CACHE=1` turns every skip into a
+failure. Run `XWEN_REQUIRE_HF_CACHE=1 cargo test --release` when green has to mean those
+paths really executed, and route any NEW self-skip through `test_support` rather than an
+`eprintln!` and a `return`: an outside review found the two tests proving the Qwen3
+vocabulary never crosses over were silently vacuous on a clean checkout.
+
+**A bit-identical A/B is a result only when the two sides are known to be different
+code.** `XWEN_QWEN3_ATTN=sdpa` was read as ruling out the flash kernel because it matched
+to the bit; candle's Metal sdpa above one token dispatches the steel kernel that
+`flash.metal` is a copy of, so it was one kernel compared with itself. The arm is a real
+f32 chain since 30995b9 and its tiny-model test asserts a NONZERO difference under the
+bar, which is the shape a reference arm's test should have.
+
 ## Operational hazards (each has already bitten laguna once; the machine is the same)
 
 - One large model process at a time or GPU OOM. Two 20 GB processes fit RAM but not

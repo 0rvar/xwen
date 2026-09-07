@@ -309,13 +309,20 @@ each other.** A 2e-2 max-abs bar with 100% argmax agreement is therefore not a b
 llama.cpp meets against itself on these prompts, and holding xwen to it would be holding
 it to a standard the reference does not have.
 
-Two ablations say the error is not where one would first look. `XWEN_QWEN3_ATTN=sdpa`
-produces numbers identical to the flash arm on six prompts, so the flash kernel, this
-being its first production use, is not the source. And `XWEN_ATTN_MM_CLASSIC=1` is
-**worse**, pooled 0.337 against 0.222 and 0.217 against 0.073 on the corpus-middle
-prompt, so the tensor gemm is more accurate here than the classic chain it replaces,
-which is the same direction the dense-FFN gemm went and the opposite of the `dense_mm`
-case.
+One ablation says something and the other said nothing, which took a second review to
+notice. `XWEN_ATTN_MM_CLASSIC=1` is **worse**, pooled 0.337 against 0.222 and 0.217
+against 0.073 on the corpus-middle prompt, so the tensor gemm is more accurate here than
+the classic chain it replaces, the same direction the dense-FFN gemm went and the
+opposite of the `dense_mm` case. **The `XWEN_QWEN3_ATTN=sdpa` result was VACUOUS and is
+withdrawn.** It read identical to the flash arm to the bit, which was taken as evidence
+that the flash kernel is not the error source; the real reason is that candle's Metal
+sdpa at more than one token dispatches the steel attention kernel that `flash.metal` is a
+copy of, so the two arms were the same kernel and the arm was no reference at all. A bit
+-identical A/B is a result only when the two sides are known to be different code. The arm
+is an explicit f32 chain since 30995b9 (widened K/V, GQA as a broadcast over the group
+axis, Q·Kᵀ, an additive causal mask, softmax, P·V, no attention kernel), with the tiny
+model asserting a NONZERO difference under the bar, 6.5e-4 on prefill and 5.1e-4 on
+decode. The Stage 1 ablation against that real arm has not been run: _pending_.
 
 Error does not grow with position, which is the shape a cache or rope bug would have. Per
 prompt the max-abs runs 1.8e-5 at 1 token, 6.3e-3 at 8, 9.6e-3 at 16, 2.5e-2 at 53,
@@ -512,6 +519,97 @@ check rather than two that could drift. And the vocabulary cache builds once per
 behind a per-family `OnceLock` with the map lock released before the build, and warms
 every reachable family at startup, which replaces the arc's accepted "two racing
 requests may both build one and the loser is dropped" with never building twice at all.
+
+### Decode consistency, tabulated (2026-09-07)
+
+`tests/qwen3_consistency.rs` on the real base checkpoint, every comparison tabulated
+before anything is asserted, so one run reports all of them. Two results, and the second
+explains the first.
+
+The encode indices are EXACT, all three of them: index 0 against the embedding rows,
+index 35 against the `l_out-34` tap and index 36 against `final_norm(l_out-35)` each read
+max absolute difference 0.0 over 199 positions. And **argmax agrees at every position of
+every row below**, which is what says none of this is a correctness problem.
+
+The spread is entirely between the two matmul paths. Chunks 1, 7 and 8 take the gemv
+below 8 rows with f32 activations; chunks 9 and 16, and the single-pass prefill they are
+all compared against, take the tensor gemm with activations staged to half:
+
+| prompt | chunk 1 | chunk 7 | chunk 8 | chunk 9 | chunk 16 |
+| --- | --- | --- | --- | --- | --- |
+| parity-code-short, 53 tokens | 4.4e-2 (12) | 4.9e-2 (11) | 4.9e-2 (11) | 2.0e-2 (1) | 2.1e-2 (1) |
+| corpus-middle, 199 tokens | 1.22e-1 (35) | 1.49e-1 (31) | 1.49e-1 (31) | 8.6e-3 (0) | 1.4e-2 (0) |
+| parity-long-mixed, 610 tokens | 5.1e-2 (28) | 4.3e-2 (16) | 4.3e-2 (16) | 1.5e-2 (0) | 1.5e-2 (0) |
+
+Max absolute logit difference against the single pass, with the count of positions over
+2e-2 in brackets. The gemv rows are an order of magnitude worse than the gemm rows and
+carry 11 to 35 offending positions where the gemm rows carry at most one. The worst
+position of each prompt is the same one at every chunk size, 23, 76 and 331.
+
+**The same position 76 of corpus-middle is the Stage 1 outlier against the Metal
+oracle**, and llama.cpp's bf16 gemm stages activations to half exactly as ours does. So
+the two open bars are one phenomenon seen twice: **decode and prefill legitimately differ
+by up to ~0.15 logits at a few positions on this checkpoint**, because they are different
+matmul paths, and any bar has to be a statement about which of them is the reference. The
+consistency bar is therefore part of the same decision as the Stage 1 bars and is
+ledgered with them, not separately. The bar is an environment override,
+`XWEN_QWEN3_CONSISTENCY_MAX_ABS`, so it can be set once the decision is made rather than
+edited into the test.
+
+One caveat on that run: its `sdpa` rows were taken with the hollow arm and read 0.0
+against flash, which is the same measurement the withdrawn Stage 1 ablation made. They
+say nothing and are not reproduced above.
+
+### Review rounds
+
+Two outside models, each on a different cut of the branch. **Codex** reviewed every
+commit as it landed, loader, tokenizer and chat, registry, stack and serve, each round
+followed by fixes. **Qwen**, which is Flash-Next through the local review wrapper,
+reviewed the branch in four slices: model and loader, registry and serving, the chat
+renderer, and the generate loop, the last of which is running as this is written and its
+verdict is _pending_.
+
+Both verdicts on the three finished slices were to ship, and the value was in what they
+checked and found correct as much as in the findings: the projection orientation and the
+tied head, GQA as repeat_interleave down to the kernel's `tid.y / gqa_factor`, QK-norm
+strictly before rope, full-width NEoX with `rotary_dim == head_dim` enforced at load, the
+index convention validated before the cache reset with the cache reset on both exit
+paths, the checkpoint id hashing metadata and summing lengths exactly as documented, the
+zero-run tolerance sourced only from the named registry entry, and, on the serving slice,
+all six invariants it was asked to break: existing GGUF keys unchanged, identity never by
+substring, unknown names as 400s with no `unwrap_or` anywhere, the encoder refused on
+every surface, per-family tokenizer and grammar with no reachable cross-over, and no new
+dependencies. The renderer slice walked both new dialects clause by clause against the
+vendored jinja and found them faithful.
+
+What was fixed. An unbounded allocation: `expected_tensors` materialized `11·n_layer + 2`
+heap entries from an untrusted `num_hidden_layers` BEFORE the check that would have
+rejected it, so a small crafted `config.json` claiming ten million layers aborted the
+process on allocation rather than erroring; it is now an O(1) bound against the index's
+own entry count, which is bounded by the index file's size. `hidden_act` became
+required. An inverted causal comment on the prefill chunk, which cited the ABSENCE of an
+expert batch as the reason 2048 wins on the checkpoints that have one. A test asserting
+that `std::env::temp_dir()` is a symlink, which is a precondition failure dressed as a
+product bug on any host where it is not; it makes its own symlink now.
+
+And the largest class: **self-skipping tests that report success**. Every HF-cache skip
+now goes through `crate::test_support`, prints a SKIPPED line naming the file and the
+fetch, and becomes a hard failure under `XWEN_REQUIRE_HF_CACHE=1`. The two tests proving
+the Qwen3 family gets its own ids, stops and mask width were among them, which meant the
+branch's headline invariant was verified by nothing on a clean checkout; the family test
+now always runs over a tokenizer.json the test fabricates. A companion test pins that all
+three Qwen3 releases ship byte-identical tokenizer files, which is the assumption that
+lets one family share one tokenizer, and it was previously a comment.
+
+**One finding recorded as a design limit rather than fixed.** A `text_encoder` directory
+copied out of the hub cache identifies as `Assumed(Qwen34B)`, its config being
+byte-identical to the base model's, and is then refused only by the zero-run scan at
+load. That is one downstream check standing between a corrupt encoder and fluent output
+from a corrupt layer, and a future corruption shaped as anything other than a long zero
+run would pass it. It is not fixed because the fix worth having is an identity decision
+rather than another scan, and there is exactly one encoder-shaped checkpoint in the
+registry to design it against. Reopen when a second encoder-only checkpoint arrives, or
+when a corruption of another shape is seen in the wild.
 
 ### Next
 

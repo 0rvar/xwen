@@ -187,8 +187,15 @@ recommendation on the table is to gate pooled top-5 at 99.9%, gate argmax as "no
 outside the near-tie band", and report max-abs against the oracle's own backend spread
 rather than a fixed number. The counter-argument is that such a bar certifies only "as
 close as llama.cpp is to itself" and would not catch a systematic error under 0.358.
-The evidence, the ablations that rule out the flash kernel and the classic matmul, and
-the ledger item are in [records/qwen3-dense.md](records/qwen3-dense.md).
+The consistency bar is part of the SAME decision and is ledgered with it: the whole
+internal spread is the gemv path (chunks 1, 7 and 8, f32 activations) against the tensor
+gemm (chunk 9 and up, activations staged to half), it peaks at 1.49e-1 on one position,
+argmax agrees everywhere, and the worst position is the same one the Stage 1 comparison
+calls an outlier against an oracle whose own bf16 gemm stages activations the same way.
+Decode and prefill legitimately differ by up to ~0.15 logits at a few positions here, so
+a bar is a statement about which of them is the reference. The evidence, the ablation that
+rules out the classic matmul, the one that was withdrawn as vacuous, and the ledger item
+are in [records/qwen3-dense.md](records/qwen3-dense.md).
 
 Pooled top-5 is pooled on purpose: per-position overlap of five items moves in 20%
 steps, so 99.9% only means something summed over positions, as

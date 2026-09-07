@@ -595,10 +595,15 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   pooled top-5 at 99.9%, gate argmax as "no flip outside the near-tie band", and report
   max-abs against the oracle's own backend spread instead of a fixed number. Counter:
   such a bar certifies only "as close as llama.cpp is to itself" and would not catch a
-  systematic error under 0.358. The same decision settles whether the decode-consistency
-  test's 2.59e-2 at chunk 1 is a failure or the resolution of the metric. Until it is
-  made, neither gate can be called a gate. [Record](docs/records/qwen3-dense.md),
-  [runbook](docs/parity.md).
+  systematic error under 0.358. **The consistency bar is the same decision** (2026-09-07,
+  tabulated): the whole internal spread is the gemv path at chunks 1/7/8 against the
+  tensor gemm at 9/16, peaking at 1.49e-1 on one position with argmax agreeing everywhere,
+  and that position is the Stage 1 outlier too, against an oracle whose bf16 gemm stages
+  activations to half exactly as ours does. Decode and prefill legitimately differ by up
+  to ~0.15 logits at a few positions, so a bar is a statement about which is the
+  reference; `XWEN_QWEN3_CONSISTENCY_MAX_ABS` is the override to set once it is decided.
+  Until then neither gate can be called a gate.
+  [Record](docs/records/qwen3-dense.md), [runbook](docs/parity.md).
   From: Deferred from the dense Qwen3-4B arcs (2026-09-07).
 
 - [ ] [small] **The 27B's interactive generate/chat smoke run was never done, and its

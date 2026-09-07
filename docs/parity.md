@@ -929,14 +929,31 @@ refuses the Z-Image zero-filled planes.
 Decode consistency, which needs no oracle at all:
 
 ```
-cargo test --release --test qwen3_consistency -- --ignored --nocapture
+XWEN_QWEN3_CONSISTENCY_MAX_ABS=<bar> \
+  cargo test --release --test qwen3_consistency -- --ignored --nocapture
 ```
 
 It teacher-forces the same ids at chunks 1, 7, 8, 9 and 16 against one single-pass
 prefill, on the fused arm and then again under `XWEN_QWEN3_ATTN=sdpa`, and also compares
 the two attention arms directly. All-position prefill never exercises the one-token sdpa
-path or the gemv below 8 rows, so this is where the gemv-versus-gemm and
-flash-versus-sdpa splits show. `XWEN_QWEN3_DIR` overrides the checkpoint.
+path or the gemv below 8 rows, so this is where the gemv-versus-gemm split shows, and it
+does: the whole spread is chunks 1/7/8, the gemv path with f32 activations, against 9/16
+and the single pass, which are the tensor gemm with activations staged to half. Numbers
+in [records/qwen3-dense.md](records/qwen3-dense.md). The bar is the environment override
+above because what it should be is part of the same open decision as Stage 1's;
+`XWEN_QWEN3_DIR` overrides the checkpoint. It tabulates every comparison before
+asserting, so one run reports all of them rather than stopping at the first failure.
+
+**Running the suite honestly on this machine.** A great many tests read the real
+checkpoints and self-skip when the HF cache lacks them, which means a green run can mean
+they did not execute. `crate::test_support` routes every one of those skips through one
+place, printing a SKIPPED line naming the file and the fetch that would supply it, and
+`XWEN_REQUIRE_HF_CACHE=1` turns every skip into a failure. Use it when a green run has to
+mean the cache-backed paths really ran:
+
+```
+XWEN_REQUIRE_HF_CACHE=1 cargo test --release
+```
 
 Track A bisection is implemented and source-verified: `scripts/parity.ts --arch qwen3`
 (and `scripts/ref-dump.sh --arch qwen3`, which also switches the fixture file) maps our
@@ -969,10 +986,13 @@ Every argmax flip on every arm is inside the 2e-2 near-tie band. Error does not 
 position: per prompt the max-abs runs 1.8e-5 at 1 token, 6.3e-3 at 8, 9.6e-3 at 16,
 2.5e-2 at 53, 7.3e-2 at 199, 5.3e-2 at 610 and 0.222 at 3890, and within the 3890-token
 prompt the failing fraction is about 7% in every position bucket with a median of 2.3e-2,
-the outliers at positions 853 and 1084 being isolated. Two ablations against the Metal
-oracle on six prompts: `XWEN_QWEN3_ATTN=sdpa` reproduces the flash arm's numbers exactly,
-so the flash kernel is not the source, and `XWEN_ATTN_MM_CLASSIC=1` is worse (pooled
-0.337 against 0.222), so the tensor gemm is the more accurate path here.
+the outliers at positions 853 and 1084 being isolated. One ablation against the Metal oracle
+on six prompts holds: `XWEN_ATTN_MM_CLASSIC=1` is worse (pooled 0.337 against 0.222), so
+the tensor gemm is the more accurate path here. **The `XWEN_QWEN3_ATTN=sdpa` ablation is
+WITHDRAWN**: it read bit-identical to the flash arm, which was taken as ruling the flash
+kernel out, but candle's Metal sdpa above one token dispatches the steel kernel that
+`flash.metal` is a copy of, so both arms were the same code. The arm is a real f32 chain
+since 30995b9 and the ablation against it is _pending_.
 
 Decode consistency reaches max absolute logit difference 2.59e-2 at one position of the
 53-token prompt at chunk 1, over the proposed 2e-2. The other chunkings are untabulated
