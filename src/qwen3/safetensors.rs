@@ -231,6 +231,17 @@ fn expected_tensors(cfg: &Qwen3Config) -> Vec<Expected> {
 /// The name a present-but-optional LM head goes under.
 const LM_HEAD: &str = "lm_head.weight";
 
+/// How many tensors one transformer layer contributes to the expected table,
+/// and how many the model contributes outside its layers
+/// (`model.embed_tokens.weight` and `model.norm.weight`).
+///
+/// [`expected_tensors`] is the authority; these mirror it so a layer count can
+/// be bounded BEFORE that table is built, and
+/// `the_expected_table_matches_the_counts_it_is_bounded_by` asserts the two do
+/// not drift apart.
+const TENSORS_PER_LAYER: usize = 11;
+const TENSORS_OUTSIDE_LAYERS: usize = 2;
+
 /// A validated, opened `qwen3` safetensors checkpoint.
 ///
 /// Holding one keeps every shard mmapped. Nothing is on a device yet; call
@@ -304,6 +315,33 @@ impl Qwen3Set {
             !weight_map.is_empty(),
             "{} lists no tensors",
             index_path.display()
+        );
+
+        // The layer count came out of config.json and nothing has cross-checked
+        // it yet, while the expected table costs eleven heap-allocated names per
+        // layer. A config claiming a hundred million layers would therefore be an
+        // out-of-memory abort BEFORE the per-name check that would have rejected
+        // it. The index is the bound, and it is already parsed and O(1) to
+        // consult: whatever else is wrong, a set cannot list fewer tensors than
+        // the layer count needs. The per-name check still does the real work.
+        let least = config
+            .n_layer
+            .checked_mul(TENSORS_PER_LAYER)
+            .and_then(|n| n.checked_add(TENSORS_OUTSIDE_LAYERS))
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} declares {} layers, more tensors than can be counted",
+                    config_path.display(),
+                    config.n_layer
+                )
+            })?;
+        ensure!(
+            weight_map.len() >= least,
+            "{} lists {} tensors, but the {} layers {} declares need at least {least}",
+            index_path.display(),
+            weight_map.len(),
+            config.n_layer,
+            config_path.display()
         );
 
         // Shards in the order the index first mentions them, deduplicated and
@@ -1608,6 +1646,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The two counts `open` bounds a layer count by must stay equal to what
+    /// the expected table actually contains, or the bound stops being one.
+    #[test]
+    fn the_expected_table_matches_the_counts_it_is_bounded_by() {
+        let cfg = Qwen3Config::from_json_bytes(fixture::config_json().as_bytes()).unwrap();
+        for n_layer in [1usize, 2, 7, 36] {
+            let cfg = Qwen3Config {
+                n_layer,
+                ..cfg.clone()
+            };
+            assert_eq!(
+                expected_tensors(&cfg).len(),
+                TENSORS_PER_LAYER * n_layer + TENSORS_OUTSIDE_LAYERS,
+                "at {n_layer} layers"
+            );
+        }
+    }
+
+    /// A layer count from config.json is untrusted until something honest bounds
+    /// it. Eleven heap-allocated names per layer means a file claiming ten
+    /// million layers would be an out-of-memory abort, so the index's own size
+    /// has to refuse it first, in O(1) and before the table is built.
+    #[test]
+    fn an_absurd_layer_count_is_refused_against_the_index_without_building_the_table() {
+        let dir = scratch("absurd_layers");
+        write_set(&dir, &Tweaks::intact()).unwrap();
+        let config = dir.join("config.json");
+        let text = std::fs::read_to_string(&config).unwrap().replace(
+            &format!("\"num_hidden_layers\":{}", fixture::LAYERS),
+            "\"num_hidden_layers\":10000000",
+        );
+        assert!(text.contains("10000000"));
+        std::fs::write(&config, text).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = Qwen3Set::open(&dir, None, &[]).unwrap_err().to_string();
+        let elapsed = started.elapsed();
+
+        assert!(err.contains("10000000"), "{err}");
+        assert!(err.contains("110000002"), "{err}");
+        assert!(err.contains("24 tensors"), "{err}");
+        // Not a benchmark: a bound that is O(1) returns in microseconds, and
+        // building the table first would mean gigabytes of allocation or death.
+        // Any answer inside a second means the check ran where it has to.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the layer bound took {elapsed:?}; it must precede the expected table"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An honest set with one layer too few in its index is the same check doing
+    /// its ordinary job.
+    #[test]
+    fn an_index_too_small_for_the_layer_count_is_refused() {
+        let dir = scratch("short_index");
+        write_set(&dir, &Tweaks::intact()).unwrap();
+        let config = dir.join("config.json");
+        let text = std::fs::read_to_string(&config).unwrap().replace(
+            &format!("\"num_hidden_layers\":{}", fixture::LAYERS),
+            "\"num_hidden_layers\":3",
+        );
+        std::fs::write(&config, text).unwrap();
+        let err = Qwen3Set::open(&dir, None, &[]).unwrap_err().to_string();
+        assert!(err.contains("at least 35"), "{err}");
+        assert!(err.contains("24 tensors"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tensor the config requires and the set does not have is reported by
+    /// NAME, not as a count.
+    ///
+    /// The set here also ships the optional `lm_head.weight`, which the layer
+    /// bound in front of this check does not count as required. That one tensor
+    /// of slack is what keeps the bound quiet so the per-name check can speak;
+    /// without it the index is one entry short of the layer count and the bound
+    /// answers first, which
+    /// `an_index_too_small_for_the_layer_count_is_refused` covers.
     #[test]
     fn a_missing_tensor_is_named() {
         let name = "model.layers.1.mlp.up_proj.weight";
@@ -1615,6 +1731,7 @@ mod tests {
             "missing",
             &Tweaks {
                 drop: Some(name),
+                lm_head: Some(LmHead::Tied),
                 ..Tweaks::intact()
             },
             &[],

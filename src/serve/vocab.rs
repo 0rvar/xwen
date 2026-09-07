@@ -309,19 +309,208 @@ pub(super) fn missing_vocabulary(family: VocabFamily) -> anyhow::Error {
 mod tests {
     use super::*;
 
-    /// The Qwen3 family needs a `tokenizer.json` on this machine; the tests that
-    /// exercise two families skip themselves without one, because what they are
-    /// about is the SWITCH and a machine with one checkpoint cannot show it.
+    /// The nine marker ids the synthetic vocabulary below places its specials at.
     ///
-    /// Absence is the ONLY thing this reports. A file that is present and does
-    /// not build is the breakage these tests exist to catch, and it has to fail
-    /// them rather than skip them.
-    fn qwen3_available() -> bool {
-        Vocabularies::hub_only()
-            .tokenizer_source(VocabFamily::Qwen3)
-            .is_some()
+    /// Deliberately neither family's numbers: the Qwen 3.6 markers live around
+    /// 248044 and the Qwen3 ones around 151643, so a test that reads these back
+    /// is reading the vocabulary it was handed and not a constant that happens to
+    /// be right.
+    const SYNTHETIC_MARKERS: [(&str, u32); 9] = [
+        ("<|endoftext|>", 256),
+        ("<|im_start|>", 257),
+        ("<|im_end|>", 258),
+        ("<think>", 259),
+        ("</think>", 260),
+        ("<tool_call>", 261),
+        ("</tool_call>", 262),
+        ("<tool_response>", 263),
+        ("</tool_response>", 264),
+    ];
+
+    /// GPT-2's byte-to-unicode alphabet: the 256 single-byte tokens a byte-level
+    /// BPE vocabulary is built on, so any text at all encodes.
+    fn byte_alphabet() -> Vec<char> {
+        let printable: Vec<u32> = (0x21..=0x7e)
+            .chain(0xa1..=0xac)
+            .chain(0xae..=0xff)
+            .collect();
+        let mut mapped = vec![None; 256];
+        for &b in &printable {
+            mapped[b as usize] = Some(char::from_u32(b).unwrap());
+        }
+        let mut next = 0u32;
+        for slot in mapped.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(char::from_u32(256 + next).unwrap());
+                next += 1;
+            }
+        }
+        mapped.into_iter().map(Option::unwrap).collect()
     }
 
+    /// A complete, minimal `tokenizer.json`: byte-level BPE over the 256 single
+    /// bytes with no merges, plus the nine structural markers as added tokens at
+    /// [`SYNTHETIC_MARKERS`].
+    ///
+    /// Written rather than downloaded so the ids/stops/mask-width property is
+    /// checked on EVERY machine. A test that only ran where a checkpoint happened
+    /// to be cached would report a pass for a family-switch nobody exercised,
+    /// which is the failure this whole module exists to prevent.
+    fn synthetic_tokenizer_json() -> String {
+        let vocab: String = byte_alphabet()
+            .into_iter()
+            .enumerate()
+            .map(|(id, ch)| format!("{}:{id}", serde_json::to_string(&ch.to_string()).unwrap()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let added: String = SYNTHETIC_MARKERS
+            .iter()
+            .map(|(text, id)| {
+                format!(
+                    r#"{{"id":{id},"content":{},"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}}"#,
+                    serde_json::to_string(text).unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"version":"1.0","truncation":null,"padding":null,
+               "added_tokens":[{added}],"normalizer":null,
+               "pre_tokenizer":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}},
+               "post_processor":null,
+               "decoder":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}},
+               "model":{{"type":"BPE","dropout":null,"unk_token":null,
+                 "continuing_subword_prefix":null,"end_of_word_suffix":null,
+                 "fuse_unk":false,"byte_fallback":false,"ignore_merges":true,
+                 "vocab":{{{vocab}}},"merges":[]}}}}"#
+        )
+    }
+
+    /// A checkpoint directory carrying that tokenizer, as a server started on a
+    /// safetensors set would find it.
+    fn synthetic_checkpoint(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "xwen_vocab_{}_{label}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), synthetic_tokenizer_json()).unwrap();
+        dir
+    }
+
+    /// The ids/stops/mask-width property, on every machine.
+    ///
+    /// The Qwen3 slot is filled by a fabricated vocabulary whose markers sit at
+    /// ids neither real family uses, so reading them back proves the object in
+    /// hand came from the file this server was pointed at. The mask is still
+    /// sized by `VocabFamily::Qwen3.logit_width()`, which is the wiring under
+    /// test: the trie pads its tail out to the model's logit width, and the
+    /// padded ids are unreachable by construction.
+    ///
+    /// `each_family_gets_its_own_ids_stops_and_mask_width` is the same property
+    /// against the REAL files, and skips without them.
+    #[test]
+    fn a_fabricated_vocabulary_is_used_in_place_of_the_embedded_one() {
+        let dir = synthetic_checkpoint("synthetic");
+        let served = Target::served(Model::Qwen34B);
+        let vocabs = Vocabularies::new(&dir, served);
+        let synthetic = vocabs
+            .for_target(served)
+            .expect("the fabricated set builds");
+        let embedded = vocabs.for_family(VocabFamily::Qwen36).unwrap();
+
+        // The ids are the ones the file declares, not either real family's.
+        let specials = synthetic.tokenizer().specials();
+        for (text, id) in SYNTHETIC_MARKERS {
+            let resolved = match text {
+                "<|endoftext|>" => specials.endoftext,
+                "<|im_start|>" => specials.im_start,
+                "<|im_end|>" => specials.im_end,
+                "<think>" => specials.think_open,
+                "</think>" => specials.think_close,
+                "<tool_call>" => specials.tool_call_open,
+                "</tool_call>" => specials.tool_call_close,
+                "<tool_response>" => specials.tool_response_open,
+                _ => specials.tool_response_close,
+            };
+            assert_eq!(resolved, id, "{text}");
+        }
+        // The stops the decode loop will watch for are this file's, and neither
+        // real family's.
+        assert_eq!(specials.eog(), [258, 256]);
+        assert_ne!(specials.eog(), crate::tokenizer::LagunaTokenizer::EOG);
+        assert_ne!(specials.eog(), crate::qwen3::QWEN3_EOG);
+
+        // Two vocabularies, one string, two id sequences — each round-tripping
+        // through its own tokenizer.
+        let text = "The quick brown fox.";
+        let mine = synthetic.tokenizer().encode(text).unwrap();
+        let theirs = embedded.tokenizer().encode(text).unwrap();
+        assert_ne!(mine, theirs);
+        assert_eq!(synthetic.tokenizer().decode(&mine).unwrap(), text);
+        assert_eq!(embedded.tokenizer().decode(&theirs).unwrap(), text);
+
+        // And the masks: each covers its own family's logits and neither
+        // stretches to the other's.
+        let narrow = mask_width(&synthetic);
+        let wide = mask_width(&embedded);
+        assert!(narrow >= VocabFamily::Qwen3.logit_width());
+        assert!(narrow < VocabFamily::Qwen3.logit_width() + 64);
+        assert!(wide >= VocabFamily::Qwen36.logit_width());
+        assert!(
+            narrow < VocabFamily::Qwen36.logit_width(),
+            "the Qwen3 mask must not be wide enough to be the other family's"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The three `qwen3` releases really do ship one `tokenizer.json`.
+    ///
+    /// `tokenizer_source` leans on this: asked for the Qwen3 family it answers
+    /// with whichever release is cached, on the grounds that they are the same
+    /// file. If that ever stopped being true, a server would encode an
+    /// Instruct-2507 conversation with the base release's ids and nothing would
+    /// fail — so it is pinned here rather than believed.
+    #[test]
+    fn every_qwen3_release_ships_the_same_tokenizer() {
+        let mut seen: Vec<(Model, Vec<u8>)> = Vec::new();
+        for model in hub::MODELS
+            .into_iter()
+            .filter(|model| model.vocab_family() == VocabFamily::Qwen3)
+        {
+            let Some(path) = crate::test_support::tokenizer_or_skip(model) else {
+                continue;
+            };
+            seen.push((model, std::fs::read(&path).expect("the tokenizer reads")));
+        }
+        // One cached release proves nothing about the others, and saying so is
+        // the point: this is an assumption about a SET of files.
+        if seen.len() < 2 {
+            eprintln!(
+                "SKIPPED every_qwen3_release_ships_the_same_tokenizer: fewer than two qwen3 \
+                 releases are cached, so there is nothing to compare"
+            );
+            return;
+        }
+        let (first, bytes) = &seen[0];
+        for (model, other) in &seen[1..] {
+            assert_eq!(
+                bytes.len(),
+                other.len(),
+                "{first} and {model} ship tokenizer.json files of different lengths"
+            );
+            assert!(
+                bytes == other,
+                "{first} and {model} ship different tokenizer.json files; \
+                 `Vocabularies::tokenizer_source` answers one family from whichever \
+                 release is cached and can no longer do so"
+            );
+        }
+    }
     /// The two families are two different vocabularies, and the object that
     /// answers for one must never answer for the other.
     ///
@@ -332,8 +521,7 @@ mod tests {
     /// the outside.
     #[test]
     fn each_family_gets_its_own_ids_stops_and_mask_width() {
-        if !qwen3_available() {
-            eprintln!("skipping: no Qwen3 tokenizer in the Hugging Face cache");
+        if crate::test_support::tokenizer_or_skip(Model::Qwen34B).is_none() {
             return;
         }
         let vocabs = Vocabularies::hub_only();
@@ -443,8 +631,7 @@ mod tests {
     /// trained against.
     #[test]
     fn the_served_files_own_tokenizer_wins() {
-        if !qwen3_available() {
-            eprintln!("skipping: no Qwen3 tokenizer in the Hugging Face cache");
+        if crate::test_support::tokenizer_or_skip(Model::Qwen34B).is_none() {
             return;
         }
         let cached = Vocabularies::hub_only()

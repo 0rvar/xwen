@@ -472,17 +472,27 @@ mod tests {
     #[test]
     fn a_file_resolves_to_its_canonical_directory() {
         let dir = scratch("relative");
-        std::fs::write(dir.join("config.json"), b"{}").unwrap();
-        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let real = dir.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("config.json"), b"{}").unwrap();
+        // The test makes its own symlink rather than counting on the platform's
+        // temp directory being one. It is on macOS, where `/var` links into
+        // `/private/var`, and it is not on a host whose TMPDIR is already
+        // canonical — where the assertion below would have compared a path with
+        // itself and passed while checking nothing.
+        let linked = dir.join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        assert_ne!(
+            linked, canonical,
+            "the symlink this test just created must not be its own target"
+        );
 
         assert_eq!(
-            safetensors_dir(&dir.join("config.json")).unwrap(),
-            Some(canonical.clone())
+            safetensors_dir(&linked.join("config.json")).unwrap(),
+            Some(canonical),
+            "a file resolves to the directory it is really in"
         );
-        // The premise of the assertion above: the typed path and the canonical
-        // one really are different here, so equality with the canonical one is
-        // evidence and not a tautology.
-        assert_ne!(dir, canonical, "temp_dir is expected to be a symlink here");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -4518,8 +4518,8 @@ mod tests {
     /// that would be wrong.
     #[test]
     fn a_safetensors_checkpoint_brings_its_own_vocabulary() {
-        let Some(config) = crate::hub::cached_model(crate::hub::Model::Qwen34B) else {
-            eprintln!("skipping: Qwen/Qwen3-4B is not in the Hugging Face cache");
+        let Some(config) = crate::test_support::checkpoint_or_skip(crate::hub::Model::Qwen34B)
+        else {
             return;
         };
         let dir = config.parent().unwrap();

@@ -25,6 +25,9 @@ pub mod rope;
 pub mod sampler;
 pub mod serve;
 pub mod stack_profile;
+/// Shared test helpers. Compiled only for tests: nothing here ships.
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tokenizer;
 
 pub use checkpoint::CheckpointSource;

@@ -89,9 +89,15 @@ pub struct HfQwen3Config {
     /// a scaling scheme (YaRN, linear, …) this loader does not implement.
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
-    /// `"silu"` on every shipped config; the FFN is SwiGLU with no other option.
-    #[serde(default)]
-    pub hidden_act: Option<String>,
+    /// `"silu"` on every shipped config; the FFN is SwiGLU with no other
+    /// option.
+    ///
+    /// Required rather than defaulted. This struct's whole doctrine is that the
+    /// file names every key that changes the math, and a checkpoint that does
+    /// not name its activation is one nothing has shown this FFN to be right
+    /// for. Assuming the activation we happen to implement is how a wrong FFN
+    /// runs to completion and returns plausible numbers.
+    pub hidden_act: String,
 }
 
 impl HfQwen3Config {
@@ -192,14 +198,11 @@ impl Qwen3Config {
             ),
             _ => {}
         }
-        // Not in the brief's list, but a non-SwiGLU activation is the kind of
-        // divergence that runs to completion and returns wrong numbers.
-        if let Some(act) = &hf.hidden_act {
-            ensure!(
-                act == "silu",
-                "config.json declares hidden_act {act:?}; the qwen3 FFN is SwiGLU over silu"
-            );
-        }
+        ensure!(
+            hf.hidden_act == "silu",
+            "config.json declares hidden_act {:?}; the qwen3 FFN is SwiGLU over silu",
+            hf.hidden_act
+        );
         ensure!(
             hf.num_hidden_layers > 0,
             "config.json declares {} layers",
@@ -487,6 +490,15 @@ mod tests {
         v["hidden_act"] = "gelu".into();
         let err = parse(v).unwrap_err().to_string();
         assert!(err.contains("gelu"), "{err}");
+    }
+
+    /// An absent activation is not an implicit silu: see [`HfQwen3Config`].
+    #[test]
+    fn an_absent_hidden_act_is_refused() {
+        let mut v = valid_json();
+        v.as_object_mut().unwrap().remove("hidden_act");
+        let err = format!("{:#}", parse(v).unwrap_err());
+        assert!(err.contains("hidden_act"), "{err}");
     }
 
     #[test]

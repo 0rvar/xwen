@@ -93,6 +93,15 @@ pub enum VocabFamily {
     /// Qwen 3.6/3.8 — 248320 ids padded, real tokens to 248076.
     Qwen36,
     /// Qwen3 — 151936 ids padded, real tokens to 151668.
+    ///
+    /// One `tokenizer.json`, shared by all three `qwen3` releases: the file is
+    /// sha256-identical in `Qwen/Qwen3-4B`, `Qwen/Qwen3-4B-Instruct-2507` and
+    /// `Tongyi-MAI/Z-Image-Turbo`. `serve::vocab::Vocabularies` relies on it —
+    /// asked for this family it answers with whichever release happens to be
+    /// cached — and would encode one release's conversation with another's ids
+    /// if it stopped being true, silently.
+    /// `serve::vocab::tests::every_qwen3_release_ships_the_same_tokenizer`
+    /// compares the bytes rather than leaving that believed.
     Qwen3,
 }
 
@@ -2191,8 +2200,7 @@ mod tests {
     #[test]
     fn the_cached_snapshot_of_an_entry_identifies_as_that_entry() {
         for model in MODELS.into_iter().filter(|m| m.is_safetensors()) {
-            let Some(config) = cached_model(model) else {
-                eprintln!("skipping {model}: not in the Hugging Face cache");
+            let Some(config) = crate::test_support::checkpoint_or_skip(model) else {
                 continue;
             };
             let dir = config.parent().unwrap();

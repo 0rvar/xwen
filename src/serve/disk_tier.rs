@@ -2425,8 +2425,8 @@ mod tests {
     /// metadata-only on both arms, so this reads headers rather than weights.
     #[test]
     fn a_safetensors_checkpoint_has_its_own_stable_disk_tier_id() {
-        let Some(qwen3) = crate::hub::cached_model(crate::hub::Model::Qwen34B) else {
-            eprintln!("skipping: Qwen/Qwen3-4B is not in the Hugging Face cache");
+        let Some(qwen3) = crate::test_support::checkpoint_or_skip(crate::hub::Model::Qwen34B)
+        else {
             return;
         };
         let id = checkpoint_id(&qwen3).expect("a safetensors set has an id");

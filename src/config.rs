@@ -131,8 +131,10 @@ impl Arch {
     /// has no expert batch to feed and reads 5-6% SLOWER at 2048, so it keeps
     /// 512. 4096 loses on both counts. `XWEN_PREFILL_CHUNK` overrides.
     ///
-    /// Qwen3-4B takes the dense arm unmeasured: it has no expert batch to feed
-    /// either, which is the whole reason 2048 wins on the other two.
+    /// Qwen3-4B takes the dense arm unmeasured, for the reason the dense 27B is
+    /// on it: with no experts, a wider chunk buys no expert batch and pays the
+    /// attention working set for nothing, which is what made 2048 read SLOWER on
+    /// the dense 27B. The expert batch is what 2048 wins on the other two.
     pub fn prefill_chunk_default(&self) -> usize {
         match self {
             Arch::Dense | Arch::Qwen3 => 512,
@@ -1660,8 +1662,8 @@ mod tests {
     /// for an architecture that has none, and nothing else would notice.
     #[test]
     fn the_real_qwen3_config_round_trips_into_an_xwen_config() {
-        let Some(config) = crate::hub::cached_model(crate::hub::Model::Qwen34B) else {
-            eprintln!("skipping: Qwen/Qwen3-4B is not in the Hugging Face cache");
+        let Some(config) = crate::test_support::checkpoint_or_skip(crate::hub::Model::Qwen34B)
+        else {
             return;
         };
         let bytes = std::fs::read(&config).unwrap();
@@ -1731,8 +1733,9 @@ mod tests {
     /// the identity rule reads, and the context length everything sizes against.
     #[test]
     fn the_instruct_release_carries_its_own_theta_and_context() {
-        let Some(config) = crate::hub::cached_model(crate::hub::Model::Qwen34BInstruct2507) else {
-            eprintln!("skipping: Qwen3-4B-Instruct-2507 is not in the Hugging Face cache");
+        let Some(config) =
+            crate::test_support::checkpoint_or_skip(crate::hub::Model::Qwen34BInstruct2507)
+        else {
             return;
         };
         let bytes = std::fs::read(&config).unwrap();

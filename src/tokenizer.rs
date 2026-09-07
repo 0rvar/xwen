@@ -606,36 +606,16 @@ mod tests {
         LagunaTokenizer::from_file(path).expect("load reference tokenizer")
     }
 
-    /// The Qwen3 `tokenizer.json`, from the HF cache. Every Qwen3-4B
-    /// checkpoint ships the same file (base, Instruct-2507 and the Z-Image
-    /// text encoder are sha256-identical), so any one of them serves; the
-    /// tests that need it skip themselves when none is downloaded.
+    /// The Qwen3 `tokenizer.json`, from the HF cache, through the shared
+    /// skip rule ([`crate::test_support`]): absent means a visible skip, or a
+    /// failure under `XWEN_REQUIRE_HF_CACHE=1`.
+    ///
+    /// The base release's copy, and any of the three would do — they are
+    /// sha256-identical, which
+    /// `serve::vocab::tests::every_qwen3_release_ships_the_same_tokenizer` is
+    /// what pins rather than what assumes.
     fn qwen3_tokenizer_path() -> Option<std::path::PathBuf> {
-        let hub = std::env::var_os("HF_HUB_CACHE")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HF_HOME").map(|home| std::path::PathBuf::from(home).join("hub"))
-            })
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| std::path::PathBuf::from(home).join(".cache/huggingface/hub"))
-            })?;
-        for repo in [
-            "models--Qwen--Qwen3-4B",
-            "models--Qwen--Qwen3-4B-Instruct-2507",
-        ] {
-            let snapshots = hub.join(repo).join("snapshots");
-            let Ok(entries) = std::fs::read_dir(&snapshots) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let candidate = entry.path().join("tokenizer.json");
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
+        crate::test_support::tokenizer_or_skip(crate::hub::Model::Qwen34B)
     }
 
     /// The embedded vocabulary's markers resolve to exactly the constants that
@@ -665,7 +645,6 @@ mod tests {
     #[test]
     fn the_qwen3_vocabulary_resolves_to_its_own_ids() {
         let Some(path) = qwen3_tokenizer_path() else {
-            eprintln!("skipping: no Qwen3-4B tokenizer.json in the HF cache");
             return;
         };
         let t = LagunaTokenizer::from_file(&path).expect("load the Qwen3 tokenizer");
@@ -743,7 +722,6 @@ mod tests {
     #[test]
     fn the_qwen3_fixture_prompts_round_trip_against_the_oracles_ids() {
         let Some(path) = qwen3_tokenizer_path() else {
-            eprintln!("skipping: no Qwen3-4B tokenizer.json in the HF cache");
             return;
         };
         let t = LagunaTokenizer::from_file(&path).expect("load the Qwen3 tokenizer");

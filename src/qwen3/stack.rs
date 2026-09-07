@@ -32,9 +32,12 @@
 //! production caller: causal mask and GQA in-kernel, K/V read straight out of
 //! the f16 cache views by stride) and candle's f16 vector sdpa for a one-token
 //! decode step — the split the shipped attention block would use at this head
-//! size. `XWEN_QWEN3_ATTN=sdpa` swaps both for candle's f32 sdpa over widened
-//! K/V and a materialized causal mask, which is the reference chain the flash
-//! kernel's tests grade it against; it exists for bisecting, not for speed.
+//! size. `XWEN_QWEN3_ATTN=sdpa` swaps both for an explicit f32 chain — Q·Kᵀ by
+//! plain candle matmul over widened K, an additive causal mask, f32 softmax,
+//! P·V — that shares no attention kernel with the shipped arm. It exists for
+//! bisecting, not for speed. (candle's own Metal sdpa is NOT that reference:
+//! `flash.metal` is a copy of candle's steel attention kernel with the same
+//! accumulation order, so the two agree to the bit and would bisect nothing.)
 //! K and V land in the cache as f16 (rope stores K f16 directly); everything
 //! else stays f32 until the encode output, which is the one place a bf16 cast
 //! happens.
@@ -62,9 +65,9 @@ pub enum AttnImpl {
     /// The shipped path: `ops::flash_attn` for `t > 1`, candle's f16 vector
     /// sdpa over the f16 cache views for `t == 1`.
     Fused,
-    /// candle's f32 sdpa over widened K/V with a materialized causal mask, for
-    /// every `t`. Bit-for-bit the composed reference `flash_attn`'s own tests
-    /// compare against, which is what makes it the bisect arm.
+    /// The explicit f32 chain for every `t`: Q·Kᵀ via candle's matmul over
+    /// widened K, additive causal mask, f32 softmax, P·V — no attention kernel
+    /// in common with the shipped arm, which is what makes it the bisect arm.
     Sdpa,
 }
 
@@ -534,10 +537,16 @@ fn attention(
     Ok((o, want_kqv.then_some(kqv)))
 }
 
-/// The bisect arm: candle's f32 sdpa with the cache's f16 K/V widened (exact)
-/// and the causal mask materialized as `kv_cache::attn_mask_for` builds it —
-/// the composed reference `ops::flash_attn`'s tests grade the kernel against.
-/// `q` is `[n_head, t, hd]` f32; returns the same shape.
+/// The bisect arm: `softmax(q·kᵀ·scale + mask)·v` spelled out in f32 with
+/// candle's general matmul and softmax, never an attention kernel. The cache's
+/// f16 K/V are widened (exact; the widening also packs the head-strided views
+/// contiguous), GQA is a broadcast over the query-group axis (query head `h`
+/// reads KV head `h / g`), and the causal mask is the additive `[t, K]` plane
+/// `kv_cache::attn_mask_for` builds for a full-attention layer (key offset 0,
+/// so key column `j` is absolute position `j` and query row `i` is `pos + i`);
+/// at `t == 1` there is no mask, a single query row sees every cached key.
+/// Mirrors `AttnBlock::manual_attention`, the non-Metal reference of the
+/// shipped block. `q` is `[n_head, t, hd]` f32; returns the same shape.
 fn sdpa_f32(
     q: &Tensor,
     k_all: &Tensor,
@@ -546,27 +555,36 @@ fn sdpa_f32(
     n_head: usize,
     scale: f32,
 ) -> Result<Tensor> {
-    let t = q.dim(1)?;
-    let k_len = k_all.dim(1)?;
-    let q = q.unsqueeze(0)?; // [1, n_head, t, hd]
-    let k = k_all.to_dtype(DType::F32)?.unsqueeze(0)?;
-    let v = v_all.to_dtype(DType::F32)?.unsqueeze(0)?;
-    // `None` at t == 1: a single query row sees every cached key.
-    let mask = crate::kv_cache::attn_mask_for(MaskKind::Full, t, pos, q.device())?
-        .map(|raw| -> Result<Tensor> {
+    let (_, t, hd) = q.dims3()?;
+    let (n_kv, k_len, _) = k_all.dims3()?;
+    ensure!(
+        n_kv > 0 && n_head.is_multiple_of(n_kv),
+        "qwen3 sdpa: {n_head} query heads over {n_kv} KV heads"
+    );
+    let g = n_head / n_kv;
+    let k = k_all.to_dtype(DType::F32)?; // [n_kv, K, hd], packed by the widening
+    let v = v_all.to_dtype(DType::F32)?;
+
+    let q4 = q.reshape((n_kv, g, t, hd))?;
+    let k4 = k.reshape((n_kv, 1, k_len, hd))?;
+    let v4 = v.reshape((n_kv, 1, k_len, hd))?;
+    let scores = q4
+        .broadcast_matmul(&k4.transpose(2, 3)?)?
+        .affine(scale as f64, 0.0)?; // [n_kv, g, t, K]
+    let scores = match crate::kv_cache::attn_mask_for(MaskKind::Full, t, pos, q.device())? {
+        Some(raw) => {
             ensure!(
                 raw.dims() == [t, k_len],
                 "qwen3 sdpa: mask {:?} for {t} queries over {k_len} keys",
                 raw.dims()
             );
-            Ok(raw
-                .reshape((1, 1, t, k_len))?
-                .broadcast_as((1, n_head, t, k_len))?
-                .contiguous()?)
-        })
-        .transpose()?;
-    let out = candle_nn::ops::sdpa(&q, &k, &v, mask.as_ref(), false, scale, 1.0)?;
-    Ok(out.squeeze(0)?)
+            scores.broadcast_add(&raw.reshape((1, 1, t, k_len))?)?
+        }
+        None => scores,
+    };
+    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    let out = probs.broadcast_matmul(&v4)?; // [n_kv, g, t, hd]
+    Ok(out.reshape((n_head, t, hd))?)
 }
 
 /// The SwiGLU FFN over the normed input `[t, hidden]`:
@@ -848,7 +866,11 @@ mod tests {
     }
 
     /// The sdpa bisect arm and the shipped fused arm agree on the same
-    /// weights and ids, as one prefill and as one-token steps.
+    /// weights and ids, as one prefill and as one-token steps — within the
+    /// bar, and NOT to the bit: the two are different computations (an
+    /// explicit matmul/softmax/matmul chain against the flash kernel and the
+    /// f16 vector sdpa), and a bit-identical result would mean the switch
+    /// selected the same kernel twice and the arm bisects nothing.
     #[test]
     fn the_sdpa_arm_matches_the_fused_arm() {
         let Some(dev) = device_or_skip("the_sdpa_arm_matches_the_fused_arm") else {
@@ -863,17 +885,24 @@ mod tests {
         let diff = max_abs_diff(&a, &b);
         eprintln!("prefill flash vs sdpa: max |Δlogit| {diff:.3e}");
         assert!(diff <= 2e-2, "prefill: max abs diff {diff}");
+        assert!(
+            diff > 0.0,
+            "prefill: the two arms produced bit-identical logits, so they ran the same kernel"
+        );
 
         // Decode steps: the f16 vector sdpa against the f32 chain.
+        let mut worst = 0f32;
         for (i, &id) in ids.iter().enumerate().skip(10) {
             let t = Tensor::new(&[id], &dev).unwrap();
             let pos = 19 + (i - 10);
             let x = fused.forward(&t, pos).unwrap().to_vec1::<f32>().unwrap();
             let y = sdpa.forward(&t, pos).unwrap().to_vec1::<f32>().unwrap();
             let d = max_abs_diff(&[x.clone()], &[y.clone()]);
+            worst = worst.max(d);
             assert!(d <= 2e-2, "decode step {i}: max abs diff {d}");
             assert_eq!(argmax(&x), argmax(&y), "decode step {i}: argmax");
         }
+        eprintln!("decode flash vs sdpa: max |Δlogit| {worst:.3e} over 9 steps");
     }
 
     /// `encode` follows the HF `hidden_states` numbering: index 0 is the
