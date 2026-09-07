@@ -20,8 +20,8 @@ its own reference gate at cosine 0.99999449.
 **And since 2026-09-07 one thing here is not a language model.** `xwen image` renders a
 prompt to a PNG through the Z-Image-Turbo diffusion pipeline, conditioned on that same
 4B encoder in process. It produces coherent, prompt-faithful 1024x1024 images in about
-52 s and its arithmetic is not yet graded against a reference dump, so treat it as
-working rather than verified (Models, below).
+38 s, and its transformer is graded against a diffusers fp32 dump at a step-0 velocity
+cosine of 0.999999 (Models, below).
 
 ## Docs
 
@@ -206,8 +206,13 @@ and neither side past 8192 px; 1024x1024, 1024x768, 512x512 and 1536x1024 all sa
 three. Anything else is refused with the reason, because the padded-image path is not
 implemented and 8192 px is as far as the model's position tables reach.
 
-One image at 1024x1024 takes about 52 s warm, roughly 42 s of it in the
-eight transformer steps, and no performance work has been done on it. The transformer is
+One image at 1024x1024 takes about 38 s warm, roughly 28 s of it in the eight transformer
+steps and 5 s in the VAE decode; 512x512 takes about 10 s. Those are after the 2026-09-07
+arc that moved the transformer's linears onto xwen's Metal-4 tensor gemm, which took a
+1024x1024 step from 5.0-5.25 s to 3.6 s (3.06 s for the first step of a cool run, then a
+bounded ramp to a 3.6 s plateau). `XWEN_ZIMAGE_LINEAR=candle` runs the previous path as a
+bisect arm, `XWEN_ZIMAGE_PROFILE=1` prints per-stage times for a run, and the VAE has had
+no performance work. The transformer is
 graded against a diffusers fp32 dump (`tests/zimage_parity.rs`, docs/parity.md).
 `docs/zimage.md` is the architecture and the traps, `docs/records/zimage-pipeline.md` the
 arcs, `docs/perf-state.md` the timings and their conditions.
@@ -490,7 +495,9 @@ it as `image_model_loaded`. Fields: `prompt`, `size` (`WxH` or `auto`, default 1
 `n` (1 to 4), `seed`, `steps` (default 8), `response_format` (`b64_json` only); `model` is
 `Z-Image-Turbo` or absent, and anything the ComfyUI dropdown says on the proxy path. A
 negative prompt or a guidance scale is a 400, since Turbo runs without guidance and would
-ignore them silently. 1024x1024 takes about 49 s warm and 80 s cold, load included.
+ignore them silently. 1024x1024 measured 49 s warm and 80 s cold with load included, both
+taken before the tensor-gemm arc cut about 16 s off the eight steps; the route has not
+been re-timed since.
 
 ```
 curl -sS http://127.0.0.1:8080/v1/images/generations \

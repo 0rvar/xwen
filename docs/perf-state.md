@@ -243,25 +243,66 @@ scope as a correctness target, and this figure exists so that it can be known
 first"). Nothing here ranks a lever, and nothing here justifies a change to the language
 models' hot path.
 
-Measured 2026-09-07 on a dev-tree release build of 493ae2e, which is **not a pinned
-binary**, at 1024x1024, batch 1, 8 steps, no CFG. `pmset -g` read `lowpowermode 0`; no
-high-power claim. First readings on code that has had no performance work at all, so read
-them as an order of magnitude rather than as a baseline for an A/B.
+Measured 2026-09-07 on dev-tree release builds of e54801f and ab1cde2, which are **not
+pinned binaries** though each was copied to `/tmp` before its run, batch 1, 8 steps, no
+CFG. `pmset -g` read `lowpowermode 0`; no high-power
+claim. The figures are after the tensor-gemm arc of that evening
+([records/zimage-perf.md](records/zimage-perf.md)); the before column is the same
+session, same build tree, the same afternoon.
 
-| Figure | Value |
+| Figure | 1024x1024 | 512x512 |
+| --- | --- | --- |
+| transformer step, steady state | **3.6 s** (was 5.02-5.25) | 0.63-0.68 s (was 1.17-1.25) |
+| transformer step, first step of a cool run | 3.06 s | |
+| transformer step, spread over an 8-step run | 3.06-3.59 s | |
+| VAE decode | 4.93 s cool, 5.15 s hot (was 4.88, untouched) | 1.08 s (was 1.13) |
+| total wall, one image, warm | 37.7 s (was 50.2) | 10.3 s (was 14.7) |
+| step, `XWEN_ZIMAGE_LINEAR=candle` | | 1.20-1.26 s |
+
+**Quote the steady state, never an 8-step mean.** A 1024x1024 step ramps 3.06 to 3.57
+over the first eight steps and then goes flat at 3.55-3.67 through step 24, and a cooled
+machine starts at 3.05 again, so the ramp is bounded at +19% and reversible
+(decisions.md "A Z-Image step is quoted at steady state").
+
+| Figure, resolution-independent | Value |
 | --- | --- |
-| transformer step, each of 8 | 5.0-5.5 s |
-| VAE decode | 4.86-5.11 s |
 | encode, 23-39 tokens | 6 ms warm, 166 ms cold |
-| total wall, one image | 51.7-52.5 s warm, 82.3 s cold |
-| transformer + VAE load | 3.3 s warm, 31.9 s cold (fp32 to bf16 cast) |
+| transformer + VAE load | 3.1-3.2 s warm (3.0 before the load-time weight guard), 31.9 s cold (fp32 to bf16 cast) |
 | text encoder load | 0.8 s warm, 3.3 s cold |
 
-Steps creep from 5.0 to 5.5 s across a run, which is most likely thermal and was not
-isolated. Footprint was **not measured**: `footprint`, `ps` and `vmmap` were all refused
-from the agent sandbox. The load figures predict about 20 GB resident (7.6 GB encoder,
-12.3 GB bf16 transformer, 0.34 GB f32 VAE) plus activations, and measuring it from a user
-shell is a ledger item.
+A 1024x1024 step is about 62 TFLOP, so 3.6 s is **roughly 17 TFLOPS end to end**, against
+11.6-12.4 before. **The gemms themselves run at 30-39 TFLOP/s in situ**, measured by the
+per-stage profiler against each projection's own FLOP count: 30.0 for q, k and v, 31.6
+for the output projection, 24.5 for the SwiGLU pair and 38.7 for its down projection. So
+the step runs at about half the rate of its own dominant kernel, and the difference is
+named rather than guessed now. Where it goes, per step, deflated:
+
+| bucket | ms per step | share of a 3.45-3.6 s step |
+| --- | --- | --- |
+| the four gemms | 1530 | 44% |
+| `attn.sdpa` | 740 | 21% |
+| `attn.rope` | ~465 | ~13% |
+| norms and modulation | ~370 | ~11% |
+| attention transpose copies | ~235 | ~7% |
+| `ffn.silu_mul` | ~118 | ~3% |
+| refiners and everything outside the blocks | ~170 | ~5% |
+
+The gemm and sdpa rows are measurements; the rest are deflated from a profiled table that
+runs 1.39x high at this size, and the ranking with ceilings and expected gains is
+[records/zimage-perf.md](records/zimage-perf.md) "Lever ledger".
+
+Footprint was **not measured**: `footprint`, `ps` and `vmmap` were all refused from the
+agent sandbox. The load figures
+predict about 20 GB resident (7.6 GB encoder, 12.3 GB bf16 transformer, 0.34 GB f32 VAE)
+plus activations, and measuring it from a user shell is a ledger item. One residency fact
+came out of reading the VAE path rather than measuring it: candle's im2col conv rounds
+its 9x-inflated buffer up to a power of two and pools it without ever freeing, so a
+process that has decoded once at 1024x1024 holds a 16 GB Metal private buffer for its
+lifetime.
+
+Earlier readings, kept as history: the first ones, 2026-09-07 on 493ae2e before any
+performance work, were 5.0-5.5 s per 1024x1024 step, VAE 4.86-5.11 s, total wall
+51.7-52.5 s warm and 82.3 s cold.
 
 **Under the serve route, 2026-09-07.** The same pipeline behind `POST
 /v1/images/generations` (Arc C), on a dev-tree release build, the language model never
@@ -274,8 +315,11 @@ loaded, power mode NOT read; ordered against the CLI figures above, not calibrat
 | 512x512, 8 steps, `n: 2`, warm | 23.3 s, 11.6 s per image |
 
 The warm 1024x1024 time per image under the route is the figure to quote for "how long
-does ComfyUI wait"; it is the CLI's 52 s less the process start, and it will move only
-when the step time does ([records/zimage-pipeline.md](records/zimage-pipeline.md) "Arc C").
+does ComfyUI wait"; it is the CLI wall less the process start, and it moves only when the
+step time does ([records/zimage-pipeline.md](records/zimage-pipeline.md) "Arc C"). These
+three rows were taken before the tensor-gemm arc and the route has not been re-timed
+since, so subtract about 16 s from each on the strength of the CLI figures above rather
+than quoting them as current.
 
 **The first cross-implementation datum, 2026-09-07, 512x512.** The Stage 3 dump ran the
 same weights through diffusers 0.40 on torch 2.14 mps, so the two sides were timed on one
@@ -283,36 +327,46 @@ machine within minutes of each other, on the same 512x512 case. Power mode was N
 in that session, so these are ordered, not calibrated; dev-tree build, not a pinned
 binary.
 
-| 512x512, per transformer step | xwen bf16 | torch mps bf16 | torch mps fp32 |
+| 512x512, per transformer step | xwen, as measured then | torch mps bf16 | torch mps fp32 |
 | --- | --- | --- | --- |
 | transformer step | 1.23 s | 0.35 s | 1.10 s |
 | VAE decode, f32 | 1.06 s | 0.7 s | |
 
-torch's bf16 arm is about 3.5x faster per step than xwen at this size, and torch's fp32
-arm runs level with xwen's bf16. That is the ceiling evidence the step-time ledger item
-lacked: the reported large-matmul rate said 1.6x of headroom at 1024x1024, a working
-implementation on the same GPU says at least 3.5x at 512x512. Which of the two holds at
-1024x1024, where attention is a larger share, is the first measurement of any perf arc
-here ([records/zimage-pipeline.md](records/zimage-pipeline.md)).
+torch's bf16 arm was about 3.5x faster per step than xwen at this size, and torch's fp32
+arm ran level with xwen. That was the ceiling evidence the step-time ledger item lacked,
+and the tensor-gemm arc of the same evening spent most of it: xwen's 512x512 step is
+0.63-0.68 s against torch's 0.35, so the remaining gap is about 1.9x. torch was not
+re-timed and the VAE gap is untouched. On the VAE, torch's 0.7 s at 512x512 extrapolates
+to roughly 2.8 s at 1024x1024, since decoder work scales with pixel count, so xwen's 5.0 s
+is about 1.75x off and not an order of magnitude
+([records/zimage-perf.md](records/zimage-perf.md)).
 
 **The ceiling to read a step against is compute, not bandwidth, and that inverts every
 intuition the rest of this file has built up.** A 1024x1024 step is about 62 TFLOP (roughly
 57 of linear layers at ~4200 tokens and ~10 of attention) against 12.3 GB of weight
 traffic, an arithmetic intensity near 5100 FLOP/byte where this machine's ridge point is
-24 to 114. Reading the weights is about 20 ms of a multi-second step. At the ~19.9 TFLOP/s
-a large fp16 matmul is reported to reach on this chip a step would be about 3.1 s, so
-today's 5.0-5.5 s is roughly 60% of that; at the theoretical ~70 TFLOP/s with the neural
-accelerators engaged it would be 0.9 s. Both of those inputs are secondary reports rather
-than measurements taken here, so the honest statement is that there is between 1.6x and
-6x of headroom and that the first job of any perf arc on this graph is to measure the
-matmul rate it actually achieves. Quantization is not on that list: it is a footprint
-lever here and cannot move a step (decisions.md "The transformer runs bf16 end to end").
+24 to 114. Reading the weights is about 20 ms of a multi-second step. So achieved GEMM
+rate sets the time and nothing else does, and the numbers to rank a lever against are
+these three. The hardware peak is **about 70 TFLOPS fp16 and bf16 at medium confidence**,
+an extrapolation from a 5-core A19 microbenchmark of 1024 fp16 FLOP per core per cycle
+scaled to 40 cores at an assumed 1.75 GHz, not a measurement; the published measured
+figures for this chip all sit far below it and are a floor rather than a ceiling, because
+this machine has beaten them. **38 TFLOPS is demonstrated by another implementation**,
+torch MPS bf16 on this model at 512x512. **36-38 TFLOPS is what xwen's own tensor gemm
+measures** at the model's shapes in isolation, and the step now runs at 17-20 end to end,
+so half the remaining headroom is inside the step's non-GEMM work and half is in the
+kernel rate itself. At 70 TFLOPS a step would be 0.85 s. Quantization is not on that
+list: it is a footprint lever here and cannot move a step (decisions.md "The transformer
+runs bf16 end to end"). The lever ranking itself lives in
+[records/zimage-perf.md](records/zimage-perf.md).
 
 ## History
 
 Narrative, protocol and the tables that produced these figures live in the log and its
 records, not here:
 
+- [records/zimage-perf.md](records/zimage-perf.md), the 2026-09-07 tensor-gemm arc: the
+  microbench that priced the step, the kernel-class A/B, the roofline and the shares left.
 - [records/zimage-pipeline.md](records/zimage-pipeline.md), the 2026-09-07 first image and
   the conditions its timings were taken under.
 - [records/router-gemv.md](records/router-gemv.md), the 2026-09-06 occupancy lever.

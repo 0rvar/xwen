@@ -3030,3 +3030,25 @@ blocks use of the feature; item (a) is the one with a known trigger.
   (img2img, inpainting, LoRA, upscale chain), not part of this item.
   [Record](records/zimage-pipeline.md).
   From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
+
+[Shipped 2026-09-07, late the same day, by the tensor-gemm arc (log.md "The Z-Image transformer's linears on the Metal-4 tensor gemm"): the matmul rate this item existed to measure is measured, 30-39 TFLOP/s in situ against candle's 14-15.6, and the lever it named was taken, so a 1024x1024 step went 5.02-5.25 s to 3.6 s steady state and an image 50.2 s to ~37 s. The ceiling paragraph it quoted is rewritten in docs/perf-state.md around three numbers instead of one secondary report. Its open remainder is not one item but six priced ones, all under "Image generation" with From: lines naming the tensor-gemm and profiler arcs; the remaining distance from 30-39 TFLOP/s to the ~70 peak is deliberately a record line and not an item, the step now running at the rate the kernel gives.]
+
+- [x] [measured] **Z-Image step time: 5.0-5.5 s per step against a ~3.1 s compute ceiling.**
+  A 1024x1024 step is ~62 TFLOP (roughly 57 of linears at ~4200 tokens, ~10 of attention)
+  against 12.3 GB of weight traffic, so it is compute-bound by 45-160x and weight
+  quantization cannot move it (decisions.md "The transformer runs bf16 end to end"). At
+  the ~19.9 TFLOP/s a large fp16 matmul is reported to reach on this chip the step would
+  be ~3.1 s and at the theoretical ~70 TFLOP/s ~0.9 s, so the headroom is between 1.6x and
+  6x, on inputs that are secondary reports rather than measurements taken here. First step
+  is therefore to measure what this graph's matmuls actually achieve, not to fuse
+  anything. Do not start before Stage 3 exists: there would be nothing to regress against
+  (2026-09-07).
+  Stage 3 exists as of 2026-09-07 (later) and priced the ceiling: torch bf16 on mps runs the
+  same weights at 0.35 s per 512x512 step against xwen's 1.23 s, about 3.5x (power mode not
+  read), so the headroom is at least 3.5x on a working implementation, not the 1.6x above.
+  [Figures](perf-state.md).
+  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
+
+## Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07)
+
+[Nothing closed here yet; the heading exists because TODO.md items name it in their From: line.]

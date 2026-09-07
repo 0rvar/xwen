@@ -65,7 +65,10 @@ cast happens at load, one tensor at a time, and the resident transformer is 12.3
 taken.** bf16 is what both reference implementations execute and it is the arithmetic
 the correctness bars will be read against; whether F32 activations against bf16 weights
 would buy anything here, the way they demonstrably do in the encoder, is a question for
-the step-0 parity gap and not for a guess before the gap exists. fp16 is refuted with
+the step-0 parity gap and not for a guess before the gap exists. **Amended 2026-09-07:**
+that question is answered and the answer was yes on both counts, so the weights are bf16
+and everything between layers is f32 (see "The transformer's linears run on xwen's
+Metal-4 tensor gemm" below); the rest of this paragraph stands. fp16 is refuted with
 evidence rather than deferred: Z-Image's activations exceed fp16's 65504 ceiling, and
 upstream `Tongyi-MAI/Z-Image` issue #14 reports pure black images from NaN latents in
 `torch.float16` while bf16 and fp32 are fine, corroborated on the training side by
@@ -328,3 +331,52 @@ weights are uniform on ±0.1, so the logits span ±1.3e-2 and the softmax is uni
 2e-4, and a mutation of a softmax that is already uniform is invisible. The mutation check
 therefore drives the arms directly with q and k at unit RMS, which is what QK-RMSNorm
 produces on trained weights (2026-09-07).
+
+**The transformer's linears run on xwen's Metal-4 tensor gemm, with an f32 activation
+stream over bf16 weights.** Every projection went through candle's steel gemm, which
+measures 14-15.6 TFLOPS on this chip whatever dtype it is handed, and the linears are
+about 57 of a step's 62 TFLOP, so the step ran at roughly 11.6 TFLOPS.
+`crate::ops::matmul_bf16`, the cooperative-tensor kernel the language models prefill on,
+measures 36.6-38.6 TFLOPS at the same shapes and the same sequence length, so the
+transformer runs on it (`src/zimage/linear.rs`). The stream between layers is f32 for
+four reasons, in the order they mattered. The kernel's contract is a bf16 weight against
+an f32 activation returning f32, so a drop-in inside a bf16 stream pays a widen in and a
+narrow out, measured at 0.10-0.12 s a step or about 9% of what the kernel wins, and the
+f32 stream removes every one of them. Parity improved rather than held: step-0 velocity
+cosine 0.999302 to 0.999999 and mean relative error 0.0205 to 0.0008, image PSNR 29.71 to
+47.03 dB against the reference's own bf16 arm at 32.40, so xwen went from 1.6x noisier
+than torch's bf16 to inside its spread. Resident memory is unchanged, the weights staying
+bf16 on the device at 12.3 GB; norm weights, pad tokens and biases load f32. And the
+elementwise tail costs nothing measurable in f32: the `candle` bisect arm runs the same
+f32 stream and reproduces the old step time to within noise. A guard comes with it,
+because the kernel stages each weight tile to f16 and a weight past f16's finite range
+would be silent garbage: `ensure_weights_fit_f16` refuses any projection with |w| above
+65504 at load, naming the tensor, for 0.2 s of load time, and the shipped checkpoint's
+largest weight is 14.0. `XWEN_ZIMAGE_LINEAR=candle` keeps the old path as a bisect arm
+that shares no matmul code with the shipped one. **Refuted: that candle's gemm was a
+tuning problem.** The obvious next move was a tile config, `TILE_64_64_16_1_2` being what
+its selector picks for these shapes. An A/B over the same host code and the same weights
+killed it: xwen's own classic simdgroup kernel lands on candle's rate to within 5% (15.30
+against 15.43 TFLOPS at T 4128) and the cooperative-tensor kernel on the same call is
+2.4-2.7x faster. It is the kernel class and not the tuning, which also explains candle's
+dtype-blindness, a simdgroup-matrix kernel with f32 accumulate getting little from a
+narrower input type. Steps went 5.02-5.25 s to 3.06-3.59 s at 1024x1024 and 1.17-1.25 s
+to 0.63-0.68 s at 512x512 ([records/zimage-perf.md](../records/zimage-perf.md),
+2026-09-07).
+
+**The VAE decodes in f32 and bf16 is refuted, with the interesting half being that it
+buys nothing.** The decoder was the obvious second target after the transformer's step
+time came down, and bf16 was the two-line version of it: the VarBuilder dtype in `load`
+and the incoming latent's cast in `decode`. It was built, timed unprofiled, graded and
+reverted. It fails the gate, the VAE-alone PSNR falling to 54.38 dB against the 60 dB bar
+where f32 reads 92.62, and it is not worth the failure anyway: a 1024x1024 decode moved
+from 4.93 s to 4.79 s, and 512x512 from 1.08 s to 1.09 s. Halving every byte of
+convolution traffic and taking the bf16 matmul path is worth 140 ms of a 4.93 s decode,
+which says plainly that the decode is not bandwidth-bound at f32. Its cost is the
+structure candle's Metal `conv2d` imposes, a 9x im2col materialization plus a narrow-`n`
+gemm plus an NHWC-to-NCHW permute per convolution, all of which shrink with dtype and
+none of which get fewer. So the only structural fix is a direct 3x3 kernel or MPSGraph
+convolution, which is a ledger item with 9.89 TFLOP and ~2.0 effective TFLOP/s behind it
+(TODO.md, "Image generation"). Reopen the dtype question only on a conv path that is
+bandwidth-bound, where halving the bytes would mean something; on this one it does not
+([records/zimage-perf.md](../records/zimage-perf.md), 2026-09-07).

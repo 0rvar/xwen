@@ -122,6 +122,27 @@ The probe therefore cannot price a latency-bound decode stage. Measured: the sha
 floors at 0.43 ms of a 19.65 ms token, while MoE glue and the router projection both read
 zero.
 
+**The image pipeline has its own profiler and its own deflator** (`XWEN_ZIMAGE_PROFILE=1`,
+2026-09-07). `XWEN_ZIMAGE_PROFILE=1 xwen image --prompt <text> --width 1024 --height 1024`
+prints two tables at the end of the run: the transformer's per-stage milliseconds as a
+mean per step over steps 2 through 8, split by phase so the refiners and the 30 main
+layers are separate, and the VAE decode's per-stage milliseconds for the one decode. The
+same warning as above applies and then some. Beyond the syncs, candle's
+`wait_until_completed` calls `drop_unused_buffers`, so every mark evicts the buffer pool
+and the next op re-allocates and re-zeros a power-of-two-rounded buffer. Measured
+inflation against the same run's unprofiled steady state is 1.39x for a 1024x1024 step,
+1.60x at 512x512, 1.45x for the VAE at 1024x1024 and 1.57x at 512x512. Within a table the
+rows are not equally inflated: the four gemm rows and the sdpa row are single large
+dispatches, hold up against their own FLOP counts, and are measurements; the small
+elementwise and copy rows carry the whole inflation and read about 1.9x high. Deflate them
+by that factor or read the deflated table in
+[records/zimage-perf.md](records/zimage-perf.md) "Lever ledger". Two more rules for this
+pipeline: quote a 1024x1024 step at its 3.6 s steady state and not as an 8-step mean, the
+first step of a cool run being 3.06 s (decisions.md "A Z-Image step is quoted at steady
+state"); and price an op rather than a stage with `cargo test --release --test
+zimage_microbench -- --ignored --nocapture`, the ignored bench that holds the gemm, sdpa
+and elementwise arms at the model's own shapes.
+
 **Neither instrument sees occupancy.** A kernel that leaves the GPU mostly idle is
 invisible to both the byte budget and the probe; see the third refinement under
 [perf-state.md](perf-state.md)'s Ceilings, where a dispatch that read zero on the probe

@@ -390,8 +390,11 @@ Shape: 6,154,908,736 parameters, dim 3840, 30 heads of 128 with no GQA, SwiGLU 1
 34 blocks executed (30 `layers` plus 2 `noise_refiner`, all modulated, plus 2
 `context_refiner` that are not), RMSNorm eps 1e-5 in the HF `+eps` form, one
 affine-free LayerNorm at eps 1e-6 in the final layer. Latent 16 channels at 8x, patch 2,
-so 1024x1024 is 4096 image tokens. Shipped F32 (24.6 GB, three shards), run bf16
-(12.3 GB resident). VAE is the Flux VAE, bf16 on disk, 168 MB, run in f32 under
+so 1024x1024 is 4096 image tokens. Shipped F32 (24.6 GB, three shards) but bf16 values
+in an F32 container, so the load-time cast to bf16 loses nothing (12.3 GB resident);
+**activations are f32 and only the weights bf16** as of 2026-09-07, which is what the
+tensor gemm takes and what took step-0 parity to cosine 0.999999. VAE is the Flux VAE,
+bf16 on disk, 168 MB, run in f32 under
 `force_upcast`, `shift_factor` 0.1159 and `scaling_factor` 0.3611. Scheduler is
 `FlowMatchEulerDiscreteScheduler`, static `shift` 3.0, 8 steps, no CFG.
 
@@ -403,6 +406,26 @@ The seams, so a change lands in one place:
   in f32; QK-norm eps from the config). `src/zimage/pipeline.rs` is ours. Never
   "resync" it with upstream: the corrections are the point, and its scheduler, padding
   and step count were all wrong.
+- **`src/zimage/linear.rs`** is every projection in the transformer, and it is ours, not
+  vendored (2026-09-07): a bf16 `[out, in]` weight plane through `ops::matmul_bf16`, the
+  Metal-4 cooperative-tensor kernel the language models prefill on, at 36.6-38.6 TFLOPS
+  where candle's steel gemm does 14-15.6 whatever dtype it is handed. Two things there
+  fail silently if changed. The activation stream is f32 because the kernel's contract is
+  f32 in and f32 out, so a bf16 stream reintroduces a cast at every one of the seven
+  token-width linears per block. And the kernel stages each weight tile to f16, so
+  `ensure_weights_fit_f16` refuses at load, by tensor name, any projection with
+  `|w| > 65504`; never widen that to make a load succeed, the shipped checkpoint's
+  largest weight being 14.0. `XWEN_ZIMAGE_LINEAR=candle` is the bisect arm beside
+  `XWEN_ZIMAGE_ATTN`, sharing no matmul code with the shipped path, and
+  `tests/zimage_microbench.rs` is the ignored bench that priced the choice
+  (decisions/zimage.md "The transformer's linears run on xwen's Metal-4 tensor gemm").
+- **`src/zimage/profile.rs`** is the per-stage profiler, `XWEN_ZIMAGE_PROFILE=1`, printing
+  transformer stages as a mean per step over steps 2..8 and the VAE decode's stages; off,
+  it is one `Option` check per site. **Profiled numbers are not figures**: every mark syncs
+  AND evicts candle's buffer pool, so a table runs 1.39x high at 1024x1024 and its small
+  elementwise rows about 1.9x, while the gemm and sdpa rows hold up. Quote a step at its
+  3.6 s steady state, never as an 8-step mean (docs/benching.md, and
+  decisions/measurement-discipline.md "A Z-Image step is quoted at steady state").
 - **`Model::text_encoder()`** is where the conditioning comes from. The pipeline entry
   holds no encoder spec of its own and `src/zimage/` has no text encoder: it takes a
   `[T, 2560]` caption tensor and `XwenModel::encode` produces it. candle's own
@@ -452,7 +475,7 @@ says; the static shift is 3.0 and `calculate_shift` is dead code; fp16 is disqua
 not merely slower, because activations exceed 65504 and the image comes out black.
 
 The transformer IS graded, as of 2026-09-07: `tests/zimage_parity.rs` (run with
-`--ignored`, 19 s) gates the step-0 velocity against diffusers' fp32 run of the same
+`--ignored`, 13-14 s) gates the step-0 velocity against diffusers' fp32 run of the same
 weights at cosine 0.998 and mean relative error 0.04, with two wrong-graph brackets run
 every time, gates the VAE alone at 60 dB PSNR, and reports the final latent and the image
 PSNR after eight steps. The fixture under `tests/fixtures/zimage-transformer/` holds BOTH
@@ -460,8 +483,11 @@ inputs, the noise and the caption features, so the gate grades the transformer a
 encoder; `scripts/zimage-ref-dump.py --stage transformer` regenerates it in under two
 minutes, and `xwen image --latents <file> --cap-feats <file> --dump <dir>` runs the same
 comparison by hand (`--cap-feats` skips the encoder entirely and the prompt is ignored).
-xwen's bf16 arithmetic is about 1.6x noisier than torch's bf16 on the same inputs; that is
-a record line, not a bug (docs/records/zimage-pipeline.md). One thing not to expect: there
+It reads cosine 0.999999 and mean relative error 0.0008 as of 2026-09-07, an order of
+magnitude inside torch's own bf16 spread, on the f32 activation stream; on the bf16
+stream it read 0.999302 / 0.0205, which was 1.6x noisier than torch and was the
+activations rather than the sdpa kernel (docs/records/zimage-perf.md). One thing not to
+expect: there
 is no `CheckpointSource` arm for diffusion weights; `ZImagePipeline::load` goes through
 candle's `VarBuilder` directly, casting fp32 to bf16 one tensor at a time, which is a
 deliberate deferral until a second consumer exists.

@@ -4,6 +4,38 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — The Z-Image transformer's linears on the Metal-4 tensor gemm: a 1024x1024 step from 5.0-5.25 s to 3.06-3.59 s, image PSNR 29.71 to 47.03 dB
+
+Every projection in the transformer went through candle's steel gemm, which measures
+14-15.6 TFLOPS on this chip whatever dtype it is handed, and the linears are 57 of a
+step's 62 TFLOP, so the step ran at about 11.6 TFLOPS. `crate::ops::matmul_bf16`, the
+cooperative-tensor kernel the language models prefill on, measures 36.6-38.6 at the same
+shapes, so the transformer runs on it now (`src/zimage/linear.rs`). An A/B killed the
+obvious alternative of tuning candle's tile config: xwen's own classic simdgroup kernel
+lands on candle's rate to within 5%, so it is the kernel class and not the tuning.
+**Steps 5.02-5.25 s to 3.06-3.59 s at 1024x1024 and 1.17-1.25 s to 0.63-0.68 s at
+512x512, a whole image 50.2 s to 37.7 s** with the VAE's 5 s untouched; `pmset -g` read
+`lowpowermode 0`. The activation stream is f32 between layers, which avoids every cast at
+the kernel boundary and improved parity rather than holding it: step-0 velocity cosine
+0.999302 to 0.999999, mean relative error 0.0205 to 0.0008, image PSNR 29.71 to 47.03 dB
+against the reference's own bf16 arm at 32.40. Weights stay bf16 at 12.3 GB resident, and
+a load-time guard refuses any projection past f16's finite range because the kernel
+stages weight tiles to f16; the shipped checkpoint's largest weight is 14.0.
+`XWEN_ZIMAGE_LINEAR=candle` is the bisect arm and `tests/zimage_microbench.rs` the
+ignored bench that priced all of it. A per-stage profiler followed the same evening
+(ab1cde2, `XWEN_ZIMAGE_PROFILE=1`, `src/zimage/profile.rs`) and ranked what is left, so the
+18% that was attributed to nothing now has names: **gemms 1530 ms of a 3.6 s step at
+30-39 TFLOP/s, sdpa 740 at 11.3, rope 465, norms and modulation 370, attention copies
+235**, and taking the four largest would put a step near 2.1 s and a render near 18 s. Two
+of them are promoted to the Front, a fused interleaved-pair rope kernel and a
+bidirectional mode on xwen's flash kernel; four more are area items. A 1024x1024 step is
+quoted at 3.6 s steady state from here on, the 3.06-to-3.57 ramp being bounded and
+reversible over 24 steps. The VAE stays f32: bf16 was built, timed and reverted, worth
+140 ms of a 4.93 s decode and failing the 60 dB bar at 54.38, so that decode is not
+bandwidth-bound and only its conv structure can move it.
+[Record](records/zimage-perf.md), [decisions](decisions/zimage.md),
+[architecture](zimage.md), [figures](perf-state.md), [profiling](benching.md).
+
 ## 2026-09-07 — `xwen serve` renders images: `POST /v1/images/generations` in the OpenAI shape, 1024x1024 in 48.6 s warm and 80.4 s cold
 
 Arc C, the route the user was waiting for. One handler answers on three paths,

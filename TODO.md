@@ -70,14 +70,23 @@ conditional by the same-day amendment rather than a piece of the item; the Front
 eight and nothing was promoted into the gap. What the route still owes is a proof from
 the laptop with the stock node, which is a record line, not an item.]
 
+[Amended 2026-09-07, late: the step-time item shipped (log.md "The Z-Image transformer's
+linears on the Metal-4 tensor gemm") and moved to the archive, and the per-stage
+profiler that followed it priced every remaining share, so two of them are promoted into
+the gap and the Front is nine. The gemm-versus-peak gap is deliberately NOT an item: the
+step now runs at the rate the kernel gives, 30-39 TFLOP/s, and the rest of the distance
+to the ~70 TFLOP/s peak is a record line
+([the record](docs/records/zimage-perf.md), "Lever ledger").]
+
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
 2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
 3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
 4. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
 5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
-6. **Z-Image step time: 5.0-5.5 s per step against a ~3.1 s compute ceiling** (Image generation, measured): a step is ~62 TFLOP and the reported large-matmul rate on this chip puts it at ~3.1 s, so there is ~1.6x on the reading we have and up to 6x on the theoretical peak; ranked below every decode entry above it on purpose, because images are not a tok/s target
-7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
-8. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
+6. **A fused interleaved-pair rope kernel for the Z-Image transformer** (Image generation, measured): 465 ms of a 3.6 s step, 6-7x slower than its traffic explains because the pair halves are strided views, worth ~2.9 s per 1024x1024 image; the largest single Z-Image lever left, and ranked below every decode entry above it on purpose, because images are not a tok/s target
+7. **A bidirectional mode on xwen's flash kernel, for Z-Image attention** (Image generation, measured): candle's sdpa is 740 ms of the step at 11.3 TFLOPS where the same chip's gemms reach 30-39, worth ~3.5 s per image, and the edit is one mask site, two block-skip bounds and a host guard
+8. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
+9. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
 
 ## Decode performance
 
@@ -753,21 +762,85 @@ the laptop with the stock node, which is a record line, not an item.]
 
 ## Image generation
 
-- [ ] [measured] **Z-Image step time: 5.0-5.5 s per step against a ~3.1 s compute ceiling.**
-  A 1024x1024 step is ~62 TFLOP (roughly 57 of linears at ~4200 tokens, ~10 of attention)
-  against 12.3 GB of weight traffic, so it is compute-bound by 45-160x and weight
-  quantization cannot move it (decisions.md "The transformer runs bf16 end to end"). At
-  the ~19.9 TFLOP/s a large fp16 matmul is reported to reach on this chip the step would
-  be ~3.1 s and at the theoretical ~70 TFLOP/s ~0.9 s, so the headroom is between 1.6x and
-  6x, on inputs that are secondary reports rather than measurements taken here. First step
-  is therefore to measure what this graph's matmuls actually achieve, not to fuse
-  anything. Do not start before Stage 3 exists: there would be nothing to regress against
+- [ ] [measured] **A fused interleaved-pair rope kernel for the Z-Image transformer.**
+  `apply_rotary_emb` is ~465 ms of a 3.6 s step at 1024x1024, ~13%, so ~2.9 s of a ~37 s
+  image, and it is 6-7x slower than its own traffic explains: 700 MB per call at 400 GB/s
+  would be 119 ms per step over the 68 calls, not 465. The cause is in the graph and not
+  the kernel count. The real and imaginary halves are strided views (`x.i((..,..,..,..,0))`,
+  stride 2 on the last axis), so all six broadcast multiplies and adds run candle's strided
+  binary kernel with uncoalesced reads, and `Tensor::stack` copies the result back. A fused
+  kernel is the fix and it is the same shape of kernel `src/ops` already ships, except that
+  `ops::rope_neox` is by-halves and does NOT transfer: Z-Image is interleaved-pair, so this
+  is a new kernel. It re-runs the parity gate, the f32 rotation being one of the four
+  deliberate corrections toward the reference (2026-09-07).
+  [Record](docs/records/zimage-perf.md), [figures](docs/perf-state.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+- [ ] [measured] **A bidirectional mode on xwen's flash kernel, for Z-Image attention.**
+  candle's fused sdpa is 740 ms of a 3.6 s step at 1024x1024, 21%, and it runs at 11.3
+  TFLOP/s where the same chip's tensor gemm reaches 30-39 in the same step. At the gemm's
+  rate attention would be ~300 ms, so ~3.5 s of a ~37 s image. `ops::flash_attn` is the
+  candidate and head_dim 128 already matches, but it is causal-only: the edit is a
+  bidirectional flag through `FlashAttnArgs`, dropping the future test in the one mask
+  block, opening the two block-skip bounds (the `disable_skip` plumbing exists), and
+  relaxing the two host causal guards. Its K and V must be f16, which is a precision
+  decision on this graph rather than a correctness one, there being no mask to interact
+  with; the parity gate arbitrates. Attention also grows quadratically in tokens, so this
+  is the first term at any size above 1024x1024 (2026-09-07).
+  [Record](docs/records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+- [ ] [measured] **Fold the Z-Image modulation scale and gate into the norm kernel.**
+  Norms and modulation are ~370 ms of a 3.6 s step, ~11%, so ~3.0 s of an image. Per block
+  there are four fused RMSNorms plus two QK-norms, and each is followed by a separate
+  `broadcast_mul` for the scale or the gate and a separate residual add: five extra
+  full-tensor passes over 63 MB per block that a norm-with-scale kernel folds in. The
+  microbench also priced the broadcast itself, 48 GB/s against 530 for the contiguous
+  `mul`, so even materializing the `[1, 3840]` row before multiplying recovers most of the
+  four modulation applications. No new math and no parity risk beyond the usual re-run
   (2026-09-07).
-  Stage 3 exists as of 2026-09-07 (later) and priced the ceiling: torch bf16 on mps runs the
-  same weights at 0.35 s per 512x512 step against xwen's 1.23 s, about 3.5x (power mode not
-  read), so the headroom is at least 3.5x on a working implementation, not the 1.6x above.
-  [Figures](docs/perf-state.md).
-  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
+  [Record](docs/records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+- [ ] [measured] **The 10240-wide f32 activation write in Z-Image's SwiGLU.**
+  `ffn.w1w3` runs at 24.5 TFLOP/s against `ffn.w2`'s 38.7 for identical FLOPs, and the
+  difference is the f32 activation it writes: 4128x10240 f32 is 169 MB each against w2's
+  63 MB. About 5 ms per wide gemm, ~300 ms per step, ~2.4 s per image, and it is the price
+  of the f32 activation stream at the one place the stream is 10240 wide. Two fixes and
+  they are not equivalent: a `silu_mul` epilogue on the gemm removes the intermediate
+  entirely and is not a precision change, while having the gemm write bf16 for the SwiGLU
+  intermediate is, and the parity gate arbitrates that one. `ffn.silu_mul` is a further
+  ~118 ms per step that the epilogue would also absorb (2026-09-07).
+  [Record](docs/records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+- [ ] [measured] **The four full-tensor copies around Z-Image's attention.**
+  ~235 ms of a 3.6 s step, ~7%, so ~1.9 s per image: `transpose(1,2).contiguous()` on q, k
+  and v plus the untranspose on the output, four copies of ~64 MB per block. The question
+  to answer first is whether candle's Metal SDPA can read the token-major layout directly;
+  if it cannot, the output-side copy is still removable on its own, and `ops::permute_01`
+  and `ops::permute_01_f16` are single-pass generic copies that already exist for exactly
+  this shape. Cheaper than the two Front items and worth less; take it beside one of them
+  rather than on its own (2026-09-07).
+  [Record](docs/records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+- [ ] [measured] **The VAE decode's conv path: 4.93 s, and not bandwidth-bound.**
+  One decode is 4.93 s cool and 5.15 s hot against eight 3.6 s steps, so it is 13% of a
+  ~37 s image and a second saved there is worth 130 ms of step time. It is 9.89 TFLOP of
+  f32 convolution at ~2.0 effective TFLOP/s; at the tensor gemm's rate that arithmetic is
+  ~0.3 s, and 1-1.5 s is the realistic target for a direct 3x3 kernel or MPSGraph. bf16 is
+  REFUTED as the cheap version of this, measured and reverted: 4.79 s against 4.93 at
+  1024x1024 and 1.09 against 1.08 at 512x512, and the VAE-alone PSNR fell to 54.38 dB
+  against the 60 dB bar (decisions.md "The VAE decodes in f32 and bf16 is refuted"). The
+  cost is candle's im2col structure, a 9x materialization plus a narrow-`n` gemm plus an
+  NHWC-to-NCHW permute per conv, all of which shrink with dtype and none of which get
+  fewer. `up3.resnets` alone is a third of the decode and the top two resolutions are 68%.
+  The cheap wins first: `Activation::Swish` to the fused `Activation::Silu` at 28 sites,
+  SDPA for the mid-block's materialized 16384-token softmax, a fused GroupNorm for nine
+  full-tensor passes (2026-09-07).
+  [Record](docs/records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
 
 - [ ] [unpriced] **The image pad-token path: sizes whose token count is not a multiple of 32.**
   `check_size` accepts a width and height only when both are positive multiples of 16 and

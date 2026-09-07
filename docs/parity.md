@@ -937,7 +937,7 @@ variable and no dump directory: the fixture is committed.
 cargo test --release --test zimage_parity -- --ignored --nocapture
 ```
 
-One pipeline load and about 19 s. It grades every case directory under
+One pipeline load and 13-14 s. It grades every case directory under
 `tests/fixtures/zimage-transformer/`, gates the step-0 velocity (cosine >= 0.998, mean
 relative error <= 0.04, two wrong-graph brackets asserted outside the bar every run) and
 the VAE alone (the reference latent through xwen's decoder, PSNR >= 60 dB), and reports the
@@ -948,7 +948,11 @@ from the fixture. Regenerating the fixture, or adding a case at another size, is
 Stage 2 venv plus `diffusers accelerate` (its header has the lines), about two minutes.
 The same comparison by hand is `xwen image --latents <case>/latents0.safetensors
 --cap-feats <case>/cap_feats.safetensors --dump <dir>` (docs/zimage.md "The transformer
-reference dump, Stages 3 and 4").
+reference dump, Stages 3 and 4"). Two bisect arms run the gate on different code:
+`XWEN_ZIMAGE_ATTN=basic` swaps candle's Metal SDPA for an explicit matmul chain, and
+`XWEN_ZIMAGE_LINEAR=candle` swaps xwen's tensor gemm and its f32 activation stream for
+candle's gemm over bf16 activations, which is where the pre-2026-09-07 velocity figures
+came from.
 
 Decode consistency, which needs no oracle at all:
 

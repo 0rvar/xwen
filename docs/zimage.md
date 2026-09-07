@@ -276,35 +276,43 @@ terminal zero, which is the grid in "The scheduler and the Euler loop" exactly, 
 script asserts it. The whole dump, encoder included, ran in under two minutes.
 
 `tests/zimage_parity.rs` grades xwen against it (`cargo test --release --test
-zimage_parity -- --ignored --nocapture`, 18.9 s). xwen's side is `ZImagePipeline::
+zimage_parity -- --ignored --nocapture`, 13-14 s). xwen's side is `ZImagePipeline::
 velocity` for the single forward and `generate` for the full run, and on the CLI the same
 two inputs go in through `xwen image --latents <file> --cap-feats <file>`, with `--dump
 <dir>` writing the step-0 velocity and the final latent for grading by hand.
 
 | 512x512, prompt 1 (73 caption tokens), seed 0 | cosine | mean rel | max rel |
 | --- | --- | --- | --- |
-| step-0 velocity, xwen bf16 vs fp32 reference | 0.999302 | 0.0205 | 0.1006 |
+| step-0 velocity, xwen vs fp32 reference | 0.999999 | 0.0008 | 0.0045 |
 | step-0 velocity, reference bf16 vs fp32 (its own spread) | 0.999560 | 0.0175 | 0.0890 |
-| bracket: timestep one grid point off | 0.6045 | 0.6288 | 0.9541 |
-| bracket: caption tokens reversed | 0.8633 | 0.3259 | 0.6536 |
-| final latent after 8 steps, xwen vs fp32 | 0.990845 | 0.0631 | |
+| bracket: timestep one grid point off | 0.610825 | | |
+| bracket: caption tokens reversed | 0.870767 | | |
+| final latent after 8 steps, xwen vs fp32 | 0.999708 | 0.0064 | |
 | final latent after 8 steps, reference bf16 vs fp32 | 0.994750 | 0.0492 | |
 
-Image PSNR against the reference PNG: xwen 29.71 dB, the reference's own bf16 arm
+Image PSNR against the reference PNG: xwen 47.03 dB, the reference's own bf16 arm
 32.40 dB. The reference's final latent decoded through xwen's VAE against the reference
-PNG: 92.62 dB. xwen against the reference's bf16 arm directly: cosine 0.99971, closer than
-to fp32, which is the shared bf16 rounding showing.
+PNG: 92.62 dB.
+
+Those xwen rows are as of 2026-09-07 evening, with an f32 activation stream over bf16
+weights. **The bf16-stream numbers they replace are history worth keeping**, because they
+are what the graph reads at when its activations are bf16: step-0 velocity 0.999302 /
+0.0205 / 0.1006, final latent 0.990845 / 0.0631, image PSNR 29.71 dB, brackets 0.6045 and
+0.8633. Against the reference's own bf16 arm directly the bf16 stream read cosine 0.99971,
+closer than to fp32, which was the shared bf16 rounding showing.
 
 **Stage 3 is the gate**, at cosine >= 0.998 and mean relative error <= 0.04 on the step-0
 velocity; **Stage 4 is reported**, the final latent and the PSNR, because eight Euler steps
 compound the bf16 differences on both sides; and **the VAE alone is gated** at 60 dB,
 because it decodes in f32 on both sides and 92.6 dB is a handful of pixels one level off.
 The bars and their bracketing are decisions.md "Verification is a torch dump with an
-injected latent". One reading matters for the future: xwen's bf16 loss (1 - cosine,
-7.0e-4) is about 1.6x the reference's own bf16 loss (4.4e-4), so the graph is right and
-its arithmetic is a little noisier than torch's; the candidates are candle's Metal sdpa
-accumulation and the bf16 elementwise chains inside the block, and the record says when
-that is worth chasing.
+injected latent". One reading mattered for a day and is now closed. On the bf16 stream
+xwen's loss (1 - cosine, 7.0e-4) was about 1.6x the reference's own bf16 loss (4.4e-4),
+which said the graph was right and its arithmetic a little noisier than torch's, and the
+suspects were candle's Metal sdpa accumulation and the bf16 elementwise chains inside the
+block. It was the second one: the f32 activation stream took the loss to 1e-6, an order
+of magnitude inside torch's own bf16 spread, and no sdpa change was needed
+([records/zimage-perf.md](records/zimage-perf.md)).
 
 ## The transformer
 
@@ -339,6 +347,20 @@ attention heads, but 3840 / 32 = 120 is not 128, `norm_q.weight` is [128], and t
 The weights ship **F32, every tensor**, three shards totalling 24.62 GB, and both
 reference implementations load them as bf16. xwen casts at load, so the resident
 transformer is 12.3 GB (decisions.md "Weights load through candle's `VarBuilder`").
+**The shards are bf16 values in an F32 container**, verified 2026-09-07 by scanning
+117 M words and finding the low mantissa bits zero throughout, so that cast loses
+nothing whatever. The largest weight in the whole set is 14.0, in
+`layers.6.feed_forward.w2.weight`, and 0.0347% of projection values sit below f16's
+normal floor of 6.1e-5. Both of those numbers are load-time gates now, because the tensor
+gemm stages its weight tiles to f16 (see "The linear layers run on the Metal-4 tensor
+gemm" below).
+
+**Activations are f32 and only the weights are bf16**, as of 2026-09-07: the tensor gemm
+takes an f32 activation against a bf16 weight and returns f32, so keeping the whole block
+f32 avoids a cast at every kernel boundary, and it is also what took the step-0 parity
+from cosine 0.999302 to 0.999999. Resident memory is unchanged. Anything that reads "the
+transformer is bf16 end to end" predates that evening
+(decisions.md "The transformer's linears run on xwen's Metal-4 tensor gemm").
 
 **34 blocks execute and 32 of them are modulated.** Two `context_refiner` blocks see
 only the caption and are UNMODULATED, with no adaLN tensor at all; two `noise_refiner`
@@ -592,8 +614,8 @@ None of these fails loudly. They are ordered by how easy they are to get wrong.
   `calculate_shift` because both pipelines call it reproduces neither reference.
 - **fp16 is disqualified**, not merely inadvisable: activations exceed 65504 and the
   result is NaN latents and a black image
-  (decisions.md "The transformer runs bf16 end to end"). The transformer is bf16 with f32
-  accumulation.
+  (decisions.md "The transformer runs bf16 end to end"). The transformer's weights are
+  bf16 and its activations f32, with f32 accumulation throughout (2026-09-07).
 - **The VAE is bf16 on disk and runs in f32** under `force_upcast`, with the Flux
   `shift_factor` 0.1159 and `scaling_factor` 0.3611 applied as
   `latents / scale + shift` on the way in.
@@ -640,3 +662,46 @@ kernel, and the unit test asserts their outputs differ by a NONZERO amount under
 because a bit-identical result would mean the switch selected one kernel twice. It was
 unreachable and untested in the first arc, which is the shape the `XWEN_QWEN3_ATTN=sdpa`
 ablation was vacuous in for a whole arc (AGENTS.md "Verification workflow").
+
+## The linear layers run on the Metal-4 tensor gemm
+
+Since 2026-09-07, `src/zimage/linear.rs` is the seam every projection in the transformer
+goes through, and it is xwen's own code rather than anything vendored. `Projection` holds
+a bf16 `[out, in]` weight plane and an optional f32 bias, reshapes a rank-2 or rank-3
+input to `[t, k]`, and calls `crate::ops::matmul_bf16` on Metal, which is the
+cooperative-tensor kernel the language models prefill on. It measures 36.6-38.6 TFLOPS at
+this model's shapes where candle's steel gemm measures 14-15.6 whatever dtype it is
+handed, and the linears are 57 of a step's 62 TFLOP. Off Metal the kernel does not exist
+and the candle chain runs instead.
+
+Three things about it will not survive being changed casually.
+
+- **The stream is f32 because the kernel's contract is.** It takes an f32 activation
+  against the bf16 weight and returns f32, so a bf16 stream would pay a widen and a
+  narrow at every one of the seven token-width linears per block. Norm weights, pad
+  tokens and biases load f32; the projection weights alone are fetched bf16, so resident
+  bytes are unchanged. The pipeline's `dtype` field means the activation dtype now.
+- **A weight past f16's finite range would be silent garbage**, the kernel staging each
+  weight tile to f16 on its way into the tensor unit. `ensure_weights_fit_f16` refuses
+  such a checkpoint at load, naming the tensor, for 0.2 s of load time. Do not widen that
+  to make a load succeed: the shipped checkpoint's largest weight is 14.0, so a refusal
+  means the weights are not the ones this graph was read against.
+- **`in % 32 == 0 && out % 4 == 0`** is the kernel's shape requirement, asserted in
+  `Projection::new` on Metal only, the CPU tests using a `cap_feat_dim` of 16 that the
+  kernel never sees.
+
+A third switch profiles a run rather than changing it. `XWEN_ZIMAGE_PROFILE=1 xwen image
+...` prints per-stage milliseconds for the transformer, as a mean per step over steps 2
+through 8 and split by phase, and for the one VAE decode; `src/zimage/profile.rs` is the
+whole instrument and off it costs one `Option` check per site. Its numbers are NOT
+figures: every mark syncs and also evicts candle's buffer pool, so a table runs 1.39x
+high at 1024x1024 and its small rows about 1.9x, which
+[docs/benching.md](benching.md) spells out and
+[records/zimage-perf.md](records/zimage-perf.md) deflates.
+
+`XWEN_ZIMAGE_LINEAR=candle` is the bisect arm, beside `XWEN_ZIMAGE_ATTN` and read the
+same way, when the `Config` is built: candle's own bf16 gemm over bf16-rounded
+activations, sharing no matmul code with the shipped path, with a unit test asserting the
+two agree to a nonzero 2.34e-3 under a 5e-3 bar. A value naming neither arm is a load
+error. `tests/zimage_microbench.rs` is the ignored bench that priced the kernel choice,
+and [records/zimage-perf.md](records/zimage-perf.md) is where its tables live.

@@ -185,3 +185,22 @@ estimate rather than a measurement: it assumes the plain rate the run did exhibi
 rate a fully plain run would have exhibited, which a real `--no-draft` A/B still owns.
 The per-round averages it replaced divided by all rounds and inverted the reading of a
 mostly-paused run; `draft` now divides by the rounds that actually drafted (2026-08-09).
+
+**A Z-Image step is quoted at steady state, and the per-stage profiler's small rows are
+upper bounds.** Two reading rules came out of instrumenting the image pipeline, and both
+are the same shape as the `XWEN_STACK_PROFILE` rules above. First, a 1024x1024 step at
+the state of 2026-09-07 ramps: 3.06 s on the first step, 3.57 by the eighth, then flat at
+3.55-3.67 through step 24 with no further trend, and a machine that has cooled starts at
+3.05 again, so the ramp is reproducible and reversible. Quote 3.6 s as the steady state
+and 3.06 s as a first step; an 8-step mean is neither of those and is what a run's step
+count happens to be, so it is never the figure. Second, `XWEN_ZIMAGE_PROFILE=1` inflates
+what it measures by more than the syncs alone explain: candle's
+`wait_until_completed` calls `drop_unused_buffers`, so every mark also evicts the buffer
+pool and the next op re-allocates and re-zeros a power-of-two-rounded buffer. Measured
+inflation against the same run's unprofiled steady state is 1.39x for a 1024x1024 step,
+1.60x at 512x512 and about 1.45x for the VAE decode. The four gemm rows and the sdpa row
+are single large dispatches and their milliseconds hold up against arithmetic, which is
+what licenses deflating the rest: the elementwise and copy rows carry the whole inflation
+and read about 1.9x high. So take a gemm or sdpa row as a measurement, take a small row
+as an upper bound, and take a bucket share only from the deflated table in
+[records/zimage-perf.md](../records/zimage-perf.md) "Lever ledger" (2026-09-07).
