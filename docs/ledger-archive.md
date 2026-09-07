@@ -2271,6 +2271,18 @@ blocks use of the feature; item (a) is the one with a known trigger.
   session out by hand today.
   From: Deferred from the metrics arc (2026-09-05).
 
+[Item shipped 2026-09-07 (settled from the live history file), moved verbatim.]
+
+- [ ] [small] **Whether the header's session id equals the transcript id `claude --resume` shows
+  is unconfirmed.** `x-claude-code-session-id` is documented as a per-session identifier
+  and is what `--by session` keys on, which works regardless. What is not established is
+  that the uuid in the header is the same uuid that names the transcript on disk — if it
+  is, a row of the table maps to a resumable conversation and that is worth documenting;
+  if it is not, nobody should assume it. Settle it by capturing one request's header
+  next to the session id that `claude --resume` lists for the same conversation. Until
+  then no doc claims the two are the same (README says so explicitly).
+  From: Deferred from the metrics arc (2026-09-05).
+
 ## Deferred from the presence-penalty arc (2026-09-06)
 
 [Nothing closed here yet; the heading exists because TODO.md items name it in their From: line.]

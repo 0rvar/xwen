@@ -4,6 +4,28 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — Metrics: harness runs record to their own files, and the client id keeps its session id
+
+`XWEN_METRICS_TAG=bench` now resolves `metrics-bench.jsonl` beside `metrics.jsonl`
+rather than tagging a row inside it, one file per tag, and `xwen stats` reads the file
+its query names: the default one, the tag's under `--tag`, and `metrics.jsonl` plus
+every `metrics-<name>.jsonl` in the directory under `--all-tags`, whose footer names
+the directory and the file count.
+The tag stays on the record and the read-time filter stays with it, because a `--file`
+can hold a mix and every history written before today does. Why the split beats the
+filter: a filter is a thing to remember, and `jq` or `wc -l` over the same file never
+had it ([decision](decisions/metrics.md), superseding the 2026-09-06 tag paragraph).
+`XWEN_METRICS_FILE` still wins outright on both sides. Second change, same area:
+`CLIENT_ID_MAX_CHARS` 128 → 256, Claude Code's body id being a JSON blob about 190
+characters long that 128 cut inside its session uuid — every body id in the live history
+ends mid-id — and that field is what `session_key` falls back to without the header. The
+live file also settled the item the metrics arc left open: the recorded
+`x-claude-code-session-id` names a real transcript at
+`~/.claude/projects/<project>/<id>.jsonl`, so a `--by session` row is a conversation
+`claude --resume` can reopen. Verified by 36 metrics unit tests (7 new), 457 serve, 13
+binary, and a fixture smoke over a scratch `HOME` covering the default read, `--tag`,
+`--all-tags`, `--json`, a mixed `--file`, and the three ways there is nothing to read.
+
 ## 2026-09-06 — QSA layers attend sparsely at prefill: 128k prefill 282-296 → 428-456 tok/s
 
 The probe the device-mask record asked for, and the route it justified, the same evening.

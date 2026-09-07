@@ -246,3 +246,40 @@ actionable of the two. So the header is read beside the session one, bounded the
 without one `-`, the same marker `--by client` and `--by session` use, so the subagent
 traffic and the rest of a session read as separate rows without either grouping
 disturbing the other. Recorded on the owner's decision (2026-09-06).
+
+**Each harness records into a file of its own, and the default report reads only the
+file real use writes.** This supersedes the tag paragraph above, keeping the tag and
+moving where the record lands. Filtering at read time worked, and its weakness is that
+it is a filter: `xwen stats` was clean only because a default argued for it, and every
+other reader of the file — `jq`, `wc -l`, a script, whatever surface reads it next — got
+the sweep back with no way to know. Splitting at write time costs nothing the tag
+approach was buying, because the data is still all there and still all readable
+together. So `XWEN_METRICS_TAG=bench` resolves `metrics-bench.jsonl` beside
+`metrics.jsonl`, one file per tag, and `xwen stats` reads what the query names: the
+default file, the tag's file under `--tag`, and `metrics.jsonl` plus every
+`metrics-<name>.jsonl` in the directory under `--all-tags`, whose footer names the
+directory and the file count rather than pretending the rows came from one place. Any
+file of that shape is a history, so an archive kept beside them wants a different name.
+An unreadable directory is an error, for the same reason an unreadable file is: a report
+that answered it with "no metrics recorded yet" would claim zero runs on a machine that
+has run thousands. Two things deliberately did not change. The
+record still carries its `tag`, because a file read through `--file` may hold a mix and
+every history written before this date does; and `TagFilter` still runs over whatever
+was read, which is what keeps the "N harness runs excluded" footer honest on such a
+file. `XWEN_METRICS_FILE` still wins outright on both sides, writing and reading, so a
+script that wants one scratch file for a mixed sweep still gets one. The tag is
+sanitized to `[A-Za-z0-9_-]` before it names a file: it is an environment variable, so
+it can hold a slash or a `..`, and it names a file in the state directory or nothing
+(2026-09-07).
+
+**A client-supplied id is cut to 256 characters, not 128.** This supersedes the bound in
+the paragraph above; the reason for having a bound is unchanged, and only the number was
+wrong. Claude Code's body id is a JSON blob carrying a device id, an account uuid and a
+session uuid, about 190 characters with the account field filled in, and 128 cut it
+partway through the session uuid — visible in the live history, where every stored body
+id ends mid-id. That is exactly the field `session_key` falls back to when a request
+carries no session header, so the bound was destroying the only evidence those records
+had of which conversation they belonged to. The mistake worth naming is setting the
+bound at what the ids were assumed to need (a uuid is 36) instead of comfortably above
+what they are; 256 is still nowhere near a size that costs anything, and the file is
+still the one place a client's own bytes land unfiltered (2026-09-07).

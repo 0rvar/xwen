@@ -493,16 +493,6 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   minutes with the GPU free; do it before trusting any number the history reports.
   From: Deferred from the metrics arc (2026-09-05).
 
-- [ ] [small] **Whether the header's session id equals the transcript id `claude --resume` shows
-  is unconfirmed.** `x-claude-code-session-id` is documented as a per-session identifier
-  and is what `--by session` keys on, which works regardless. What is not established is
-  that the uuid in the header is the same uuid that names the transcript on disk — if it
-  is, a row of the table maps to a resumable conversation and that is worth documenting;
-  if it is not, nobody should assume it. Settle it by capturing one request's header
-  next to the session id that `claude --resume` lists for the same conversation. Until
-  then no doc claims the two are the same (README says so explicitly).
-  From: Deferred from the metrics arc (2026-09-05).
-
 ## Cache images, memory and context
 
 - [ ] [measured] **The router gemv holds `ffn_gate_inp` twice, ~251 MB resident f32 on Flash-Next.**

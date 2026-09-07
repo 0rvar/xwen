@@ -315,8 +315,10 @@ enum Cmd {
     /// setting it to an empty string counts as not setting it.
     ///
     /// A run recorded under `XWEN_METRICS_TAG` was driven by a harness rather
-    /// than asked for: the bench and parity scripts set it, and this report
-    /// leaves those runs out unless `--tag` or `--all-tags` asks for them.
+    /// than asked for: the bench and parity scripts set it, and those runs go
+    /// to `metrics-<tag>.jsonl` beside the default file. So this report covers
+    /// real use, `--tag <name>` reads one harness's file and `--all-tags`
+    /// reads every history in the directory at once.
     Stats {
         /// What a row covers: day|week|month|model|surface|client|session|agent|all.
         #[arg(long, default_value = "day")]
@@ -338,12 +340,14 @@ enum Cmd {
         /// Only runs whose session id contains this text.
         #[arg(long)]
         session: Option<String>,
-        /// Only runs a harness recorded under this tag (`bench`, `parity`),
-        /// instead of the real use the default report covers.
+        /// Read the runs a harness recorded under this tag (`bench`,
+        /// `parity`), instead of the real use the default report covers.
         #[arg(long, conflicts_with = "all_tags")]
         tag: Option<String>,
-        /// Report on every run in the history, the harness-driven ones
-        /// included. The default leaves them out and says how many.
+        /// Report on real use and every harness at once. With no `--file` and
+        /// no `XWEN_METRICS_FILE` that is every history in the state directory;
+        /// where either names a file, that one file is what is read and this
+        /// asks for all of it.
         #[arg(long)]
         all_tags: bool,
         /// Print the rows as JSON instead of a table.
@@ -1105,9 +1109,20 @@ fn run_stats(query: &metrics::StatsQuery, json: bool) -> Result<()> {
         // Stdout stays machine-readable whatever happened: a caller parsing
         // `--json` gets an empty array rather than a sentence, and the reason
         // there is nothing to show goes to stderr with the rest of the notes.
-        let note = match metrics::query_path(query) {
-            Some(path) => format!("no metrics recorded yet ({})", path.display()),
-            None => format!("metrics recording is off ({}=off)", metrics::METRICS_ENV),
+        let note = match metrics::query_source(query)? {
+            metrics::StatsTarget::Read(source) => {
+                format!("no metrics recorded yet ({})", source.path().display())
+            }
+            metrics::StatsTarget::RecordingOff => {
+                format!("metrics recording is off ({}=off)", metrics::METRICS_ENV)
+            }
+            // Not the same as recording being off, and answered differently:
+            // there is nowhere to resolve the default path, so the report needs
+            // to be pointed at a file rather than turned back on.
+            metrics::StatsTarget::NoHome => format!(
+                "no HOME to resolve the metrics history under (set {} or --file)",
+                metrics::METRICS_ENV
+            ),
         };
         if json {
             println!("[]");
@@ -1129,12 +1144,23 @@ fn run_stats(query: &metrics::StatsQuery, json: bool) -> Result<()> {
     }
     stdout.flush()?;
 
-    let mut footer = format!(
-        "\n{} \u{b7} {} run{}",
-        report.path.display(),
+    // Under `--all-tags` the report is several files read as one, so the footer
+    // names the directory they came out of and how many there were: naming one
+    // of them would misattribute every row that came from another.
+    let mut footer = match &report.source {
+        metrics::StatsSource::File(path) => format!("\n{}", path.display()),
+        metrics::StatsSource::Directory { dir, files } => format!(
+            "\n{} \u{b7} {} file{}",
+            dir.display(),
+            files.len(),
+            plural(files.len())
+        ),
+    };
+    footer.push_str(&format!(
+        " \u{b7} {} run{}",
         report.matched,
         plural(report.matched)
-    );
+    ));
     if report.matched != report.records {
         footer.push_str(&format!(" of {}", report.records));
     }
@@ -1482,7 +1508,7 @@ fn main() -> Result<()> {
                 client,
                 session,
                 tag: match (tag, all_tags) {
-                    (Some(tag), _) => metrics::TagFilter::Only(tag),
+                    (Some(tag), _) => metrics::TagFilter::only(&tag)?,
                     (None, true) => metrics::TagFilter::All,
                     (None, false) => metrics::TagFilter::Untagged,
                 },

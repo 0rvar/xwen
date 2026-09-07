@@ -22,6 +22,15 @@ use unicode_width::UnicodeWidthStr;
 /// Where the history lives under `$HOME` when nothing names a path. The XDG
 /// state directory, not the cache one: a lost cache costs a re-download, a lost
 /// history is gone.
+pub const METRICS_DIR_RELATIVE: &str = ".local/state/xwen";
+
+/// The file real use records into. Every harness records beside it under
+/// [`metrics_file_name`], one file per tag.
+pub const METRICS_FILE_NAME: &str = "metrics.jsonl";
+
+/// The untagged history under `$HOME`: [`METRICS_DIR_RELATIVE`] and
+/// [`METRICS_FILE_NAME`] joined, which is the path `xwen stats` reads by
+/// default and `XWEN_METRICS_FILE` overrides.
 pub const METRICS_RELATIVE_PATH: &str = ".local/state/xwen/metrics.jsonl";
 
 /// Names the file to record into, or `off` (in any casing) to record nothing.
@@ -29,9 +38,9 @@ pub const METRICS_RELATIVE_PATH: &str = ".local/state/xwen/metrics.jsonl";
 pub const METRICS_ENV: &str = "XWEN_METRICS_FILE";
 
 /// Tags every record this process writes as harness-driven rather than real
-/// use. The scripts that drive the binary export it (`bench` for the bench and
-/// tuning sweeps, `parity` for the gate); nothing else sets it, and an empty
-/// value counts as unset.
+/// use, and sends it to a file of its own. The scripts that drive the binary
+/// export it (`bench` for the bench and tuning sweeps, `parity` for the gate);
+/// nothing else sets it, and an empty value counts as unset.
 pub const TAG_ENV: &str = "XWEN_METRICS_TAG";
 
 /// The current record schema. Readers accept any version and ignore fields they
@@ -106,17 +115,18 @@ pub struct RunRecord {
     /// one row however many agents worked inside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    /// What kind of run this was, for a history that mixes real use with the
-    /// runs a harness drove. `None` is a real run — a person or a client asked
-    /// for it — and every tagged value names the harness that did
+    /// What kind of run this was. `None` is a real run — a person or a client
+    /// asked for it — and every tagged value names the harness that drove it
     /// (`bench`, `parity`). Set from [`TAG_ENV`] at the moment the record is
     /// stamped, so a script exports it once and every surface it drives records
     /// it without knowing the field exists.
     ///
-    /// `xwen stats` leaves tagged records out of its default report: a sweep's
-    /// several hundred runs would otherwise read as a day of inference nobody
-    /// did. The exclusion is always stated in the footer, never silent, and
-    /// `--all-tags` puts them back.
+    /// What keeps a sweep out of the default report is the FILE: a tag also
+    /// picks the file the run is recorded to ([`metrics_path_from`]), so real
+    /// use and each harness are separate histories. The field is what makes a
+    /// record still say which it is once the files are read together, or read
+    /// through a `--file` that holds a mix — which every history written before
+    /// 2026-09-07 does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
     /// Whether the run reached its own natural end: an end-of-generation token
@@ -176,6 +186,35 @@ pub fn tag_from(env: Option<&OsStr>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The file a tag records into: `metrics.jsonl` for real use, and
+/// `metrics-<tag>.jsonl` for each harness.
+pub fn metrics_file_name(tag: Option<&str>) -> String {
+    match tag {
+        Some(tag) => format!("metrics-{}.jsonl", sanitize_tag(tag)),
+        None => METRICS_FILE_NAME.to_string(),
+    }
+}
+
+/// A tag as a file name spells it: trimmed, then `[A-Za-z0-9_-]` survives and
+/// every other character becomes `_`. The tag is an environment variable a
+/// script exports, so it can hold a slash, a space or a `..`, and this name is
+/// joined onto the state directory — a tag names a file in that directory and
+/// never anything else. Trimming is what makes the writer and the reader agree:
+/// a record's own tag is trimmed by [`tag_from`], so `--tag " bench "` has to
+/// reach the same file the runs it names were written to.
+pub fn sanitize_tag(tag: &str) -> String {
+    tag.trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// The label `--by session`, `--by client` and `--by agent` use for a run that
 /// named nobody.
 pub const UNATTRIBUTED: &str = "-";
@@ -232,6 +271,7 @@ pub fn now_secs() -> u64 {
 pub fn metrics_path() -> Option<PathBuf> {
     metrics_path_from(
         std::env::var_os(METRICS_ENV).as_deref(),
+        std::env::var_os(TAG_ENV).as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
 }
@@ -239,23 +279,40 @@ pub fn metrics_path() -> Option<PathBuf> {
 /// [`metrics_path`] over values rather than the process environment, which is
 /// what makes the rule testable: a test that set the variable would be changing
 /// state every other thread in the runner shares.
-pub fn metrics_path_from(env: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    // Case-insensitive: `off`, `OFF` and `Off` are one instruction, and a shell
-    // that spells it the second way must not silently keep recording.
-    let off = env
-        .and_then(OsStr::to_str)
-        .is_some_and(|value| value.eq_ignore_ascii_case("off"));
-    if off {
+///
+/// `XWEN_METRICS_FILE` wins outright, tag or no tag — it names one file and
+/// that is where the run is recorded. Otherwise a tagged process records into
+/// a file of its own beside the default one, so the history a person reads
+/// holds real use and nothing else.
+pub fn metrics_path_from(
+    file_env: Option<&OsStr>,
+    tag_env: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if recording_off(file_env) {
         return None;
     }
-    match env {
+    match file_env {
         // An empty value is how a shell spells "unset" by accident — `FOO=`
         // and an unexported FOO reach a process alike. It names no file, so it
         // falls through to the default rather than disabling recording, which
         // only `off` does.
         Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
-        _ => home.map(|home| PathBuf::from(home).join(METRICS_RELATIVE_PATH)),
+        _ => home.map(|home| {
+            PathBuf::from(home)
+                .join(METRICS_DIR_RELATIVE)
+                .join(metrics_file_name(tag_from(tag_env).as_deref()))
+        }),
     }
+}
+
+/// Whether `XWEN_METRICS_FILE` turns recording off. Case-insensitive: `off`,
+/// `OFF` and `Off` are one instruction, and a shell that spells it the second
+/// way must not silently keep recording.
+fn recording_off(file_env: Option<&OsStr>) -> bool {
+    file_env
+        .and_then(OsStr::to_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("off"))
 }
 
 /// Append one record to `path`, creating the file and, if it is missing, the
@@ -564,23 +621,41 @@ pub fn parse_since(spec: &str, now: u64, utc_offset: i64) -> Result<u64> {
 
 /// Which population of the history a report covers.
 ///
-/// The history records everything, harness runs included — silent exclusion at
-/// write time is the harder mistake to notice (decisions.md "Metrics"). The
-/// separation therefore happens at read time, and the default is the question
-/// the table is nearly always asked: what did real use cost.
+/// It picks the file to read as well as the records to keep: a tag records into
+/// a file of its own, so the default report reads real use alone and `--tag`
+/// reads one harness (decisions.md "Metrics"). The filter still runs over what
+/// was read, because a `--file` may hold a mix — the history predating the
+/// split does, and so does anything `XWEN_METRICS_FILE` pointed several runs
+/// at — and because the count it leaves out is what the footer reports.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TagFilter {
-    /// Untagged records only: real use, with every harness run left out. The
-    /// count left out is reported, so the exclusion is never silent.
+    /// Real use: the default file, and within it the records no tag claims.
+    /// Where a file holds both, the count left out is reported, so the
+    /// exclusion is never silent.
     #[default]
     Untagged,
-    /// One tag's records and nothing else, for reading a sweep on its own.
+    /// One harness on its own: that tag's file, and within it that tag's
+    /// records.
     Only(String),
-    /// Everything in the file, tagged and untagged alike.
+    /// Every history in the directory at once, tagged and untagged alike, with
+    /// nothing filtered out of any of them.
     All,
 }
 
 impl TagFilter {
+    /// The filter `--tag <name>` asks for. The name is trimmed, because a
+    /// record's own tag is, so a name typed with a stray space still reaches
+    /// both the file that tag wrote and the records inside it. A name that is
+    /// nothing but space names no harness and is refused rather than resolving
+    /// a file called `metrics-.jsonl` that nothing writes.
+    pub fn only(name: &str) -> Result<Self> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("--tag needs a name (e.g. --tag bench)");
+        }
+        Ok(TagFilter::Only(name.to_string()))
+    }
+
     /// Whether this record belongs in the report.
     pub fn keeps(&self, rec: &RunRecord) -> bool {
         match self {
@@ -778,10 +853,57 @@ pub fn load(path: &Path) -> Result<Option<History>> {
     Ok(Some(history))
 }
 
+/// The history a report reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatsSource {
+    /// One named file: `--file`, `XWEN_METRICS_FILE`, or the file the query's
+    /// tag records into.
+    File(PathBuf),
+    /// Every history file in the state directory, read as one history. This is
+    /// what `--all-tags` means now that each harness has a file of its own.
+    Directory { dir: PathBuf, files: Vec<PathBuf> },
+}
+
+/// What a query resolved to: a history to read, or why there is none.
+///
+/// Neither of the last two is an error. A machine with recording turned off has
+/// nothing to report and has not failed, and the two are told apart because
+/// they are answered differently — one is a setting, the other is a missing
+/// environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatsTarget {
+    Read(StatsSource),
+    /// `XWEN_METRICS_FILE=off`, so no run was ever recorded to read back.
+    RecordingOff,
+    /// Nothing named a file and there is no `$HOME` to resolve the default path
+    /// under, which is a report that cannot be pointed anywhere rather than one
+    /// that was turned off.
+    NoHome,
+}
+
+impl StatsSource {
+    /// The files to read, in the order they are read.
+    pub fn files(&self) -> &[PathBuf] {
+        match self {
+            StatsSource::File(path) => std::slice::from_ref(path),
+            StatsSource::Directory { files, .. } => files,
+        }
+    }
+
+    /// What a message about this history names: the file, or the directory the
+    /// files were found in.
+    pub fn path(&self) -> &Path {
+        match self {
+            StatsSource::File(path) => path,
+            StatsSource::Directory { dir, .. } => dir,
+        }
+    }
+}
+
 /// What one `xwen stats` run found.
 #[derive(Debug, Clone)]
 pub struct StatsReport {
-    pub path: PathBuf,
+    pub source: StatsSource,
     pub by: GroupBy,
     pub rows: Vec<Bucket>,
     /// Records in the file, before the query's filters.
@@ -803,6 +925,18 @@ pub struct StatsReport {
 /// Answer a query against the history. `None` when recording is off, or when
 /// there is no history yet — nothing to report is not an error.
 pub fn report(query: &StatsQuery) -> Result<Option<StatsReport>> {
+    report_from(query, || query_source(query))
+}
+
+/// [`report`] against a history the caller names rather than one resolved from
+/// the environment, which is what lets a test drive the whole read path: the
+/// alternative is setting `HOME`, which every other thread in the runner
+/// shares. The source is a closure so that it is resolved after the arguments
+/// are judged, never before.
+pub fn report_from(
+    query: &StatsQuery,
+    source: impl FnOnce() -> Result<StatsTarget>,
+) -> Result<Option<StatsReport>> {
     // Arguments are judged before the history is looked at, so that a
     // misspelled `--since` is the same error whether or not any runs have been
     // recorded yet. Otherwise the first thing a new user sees on a typo is
@@ -815,13 +949,22 @@ pub fn report(query: &StatsQuery) -> Result<Option<StatsReport>> {
         .map(|spec| parse_since(spec, now_secs(), utc_offset))
         .transpose()?;
 
-    let path = match query.file.clone().or_else(metrics_path) {
-        Some(path) => path,
-        None => return Ok(None),
-    };
-    let Some(history) = load(&path)? else {
+    let StatsTarget::Read(source) = source()? else {
         return Ok(None);
     };
+    let mut history = History::default();
+    let mut read_anything = false;
+    for file in source.files() {
+        let Some(part) = load(file)? else {
+            continue;
+        };
+        read_anything = true;
+        history.records.extend(part.records);
+        history.skipped += part.skipped;
+    }
+    if !read_anything {
+        return Ok(None);
+    }
     if history.records.is_empty() && history.skipped == 0 {
         return Ok(None);
     }
@@ -862,7 +1005,7 @@ pub fn report(query: &StatsQuery) -> Result<Option<StatsReport>> {
         .collect();
     let matched = kept.len();
     Ok(Some(StatsReport {
-        path,
+        source,
         by: query.by,
         rows: aggregate(kept.into_iter(), query.by, utc_offset),
         records,
@@ -873,10 +1016,94 @@ pub fn report(query: &StatsQuery) -> Result<Option<StatsReport>> {
     }))
 }
 
-/// The path `xwen stats` would read for a query, for a message about a history
-/// that is not there yet.
-pub fn query_path(query: &StatsQuery) -> Option<PathBuf> {
-    query.file.clone().or_else(metrics_path)
+/// The history `xwen stats` reads for a query, which is also what names the
+/// place in a message about a history that is not there yet. `None` when
+/// recording is off and the query named no file of its own.
+pub fn query_source(query: &StatsQuery) -> Result<StatsTarget> {
+    stats_source_from(
+        query,
+        std::env::var_os(METRICS_ENV).as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// [`query_source`] over values rather than the process environment.
+///
+/// `XWEN_METRICS_TAG` is deliberately not read here: which population a report
+/// covers is what the query says, not what the shell it was typed in happens to
+/// export. A `xwen stats` run inside a sweep's shell reports real use like any
+/// other.
+pub fn stats_source_from(
+    query: &StatsQuery,
+    file_env: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<StatsTarget> {
+    // A named file is read as it is given, mixed populations and all.
+    if let Some(file) = &query.file {
+        return Ok(StatsTarget::Read(StatsSource::File(file.clone())));
+    }
+    if recording_off(file_env) {
+        return Ok(StatsTarget::RecordingOff);
+    }
+    // The variable names one file for reading exactly as it does for writing,
+    // so a report of runs recorded elsewhere reads where they were written.
+    if let Some(value) = file_env.filter(|value| !value.is_empty()) {
+        return Ok(StatsTarget::Read(StatsSource::File(PathBuf::from(value))));
+    }
+    let Some(home) = home else {
+        return Ok(StatsTarget::NoHome);
+    };
+    let dir = PathBuf::from(home).join(METRICS_DIR_RELATIVE);
+    let source = match &query.tag {
+        TagFilter::Untagged => StatsSource::File(dir.join(METRICS_FILE_NAME)),
+        // The name is spelled into a file exactly as the recording process
+        // spelled it, so `--tag` reaches the file that tag wrote.
+        TagFilter::Only(tag) => StatsSource::File(dir.join(metrics_file_name(Some(tag)))),
+        TagFilter::All => {
+            let files = history_files(&dir)?;
+            StatsSource::Directory { dir, files }
+        }
+    };
+    Ok(StatsTarget::Read(source))
+}
+
+/// Every history file in `dir`, real use and each harness's, in name order so
+/// that two runs of the same report read the same files in the same order.
+///
+/// A directory that is not there yet is a history nobody has written and comes
+/// back empty. Every other failure is an error, because a report that answered
+/// an unreadable directory with "no metrics recorded yet" would be claiming
+/// zero runs on a machine that has run thousands — the same reason one
+/// unreadable file among several is an error rather than a gap.
+fn history_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", dir.display()));
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let path = entry.path();
+        if is_history_file(&path) && path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Whether a name is one of this directory's histories: `metrics.jsonl`, or the
+/// `metrics-<tag>.jsonl` a harness records into. The state directory holds other
+/// things, and none of them are runs.
+fn is_history_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name == METRICS_FILE_NAME || (name.starts_with("metrics-") && name.ends_with(".jsonl"))
+        })
 }
 
 // ---------------------------------------------------------------- rendering --
@@ -1072,6 +1299,42 @@ mod tests {
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    /// A temporary directory tree that goes away when the test does, whether
+    /// the test passed or panicked: an assertion that fails partway through
+    /// otherwise leaves the tree behind, and the next run of the same test
+    /// starts against somebody else's files.
+    struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        /// A scratch `$HOME` under a name unique to this test and process.
+        fn home(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("xwen-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a scratch home");
+            Self { path }
+        }
+
+        /// The state directory a metrics path resolves to under this home,
+        /// created.
+        fn state(&self) -> PathBuf {
+            let state = self.path.join(METRICS_DIR_RELATIVE);
+            std::fs::create_dir_all(&state).expect("a state dir");
+            state
+        }
+
+        fn as_os(&self) -> std::ffi::OsString {
+            std::ffi::OsString::from(&self.path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     fn run(ts: u64, surface: &str, model: &str) -> RunRecord {
@@ -1830,35 +2093,357 @@ mod tests {
         // home directory would have resolved.
         for spelling in ["off", "OFF", "Off"] {
             assert_eq!(
-                metrics_path_from(env(spelling).as_deref(), home.as_deref()),
+                metrics_path_from(env(spelling).as_deref(), None, home.as_deref()),
                 None,
                 "{spelling} turns recording off"
             );
         }
         // A value that merely starts with it is a file name, not the switch.
         assert_eq!(
-            metrics_path_from(env("offline.jsonl").as_deref(), home.as_deref()),
+            metrics_path_from(env("offline.jsonl").as_deref(), None, home.as_deref()),
             Some(PathBuf::from("offline.jsonl"))
         );
         // Any other value names the file outright.
         assert_eq!(
-            metrics_path_from(env("/tmp/elsewhere.jsonl").as_deref(), home.as_deref()),
+            metrics_path_from(
+                env("/tmp/elsewhere.jsonl").as_deref(),
+                None,
+                home.as_deref()
+            ),
             Some(PathBuf::from("/tmp/elsewhere.jsonl"))
         );
         // Nothing said, or nothing but an empty string, falls back to the
         // state directory under HOME.
         for unset in [None, env("")] {
             assert_eq!(
-                metrics_path_from(unset.as_deref(), home.as_deref()),
+                metrics_path_from(unset.as_deref(), None, home.as_deref()),
                 Some(PathBuf::from("/home/someone").join(METRICS_RELATIVE_PATH))
             );
         }
         // No home to resolve under and no file named leaves recording off
         // rather than guessing at a writable path.
-        assert_eq!(metrics_path_from(None, None), None);
+        assert_eq!(metrics_path_from(None, None, None), None);
         assert_eq!(
-            metrics_path_from(env("/tmp/named.jsonl").as_deref(), None),
+            metrics_path_from(env("/tmp/named.jsonl").as_deref(), None, None),
             Some(PathBuf::from("/tmp/named.jsonl"))
         );
+    }
+
+    /// A tagged process records into a file of its own, so the default history
+    /// holds real use and there is no filter for a reader to remember. The
+    /// named file still wins over the tag: it names one file and that is where
+    /// the run goes, tag or no tag.
+    #[test]
+    fn a_tag_records_into_a_file_of_its_own_unless_a_file_is_named() {
+        let env = |value: &str| Some(OsStr::new(value).to_owned());
+        let home = Some(OsStr::new("/home/someone").to_owned());
+        let under = |name: &str| {
+            Some(
+                PathBuf::from("/home/someone")
+                    .join(METRICS_DIR_RELATIVE)
+                    .join(name),
+            )
+        };
+
+        assert_eq!(
+            metrics_path_from(None, env("bench").as_deref(), home.as_deref()),
+            under("metrics-bench.jsonl")
+        );
+        assert_eq!(
+            metrics_path_from(None, env("parity").as_deref(), home.as_deref()),
+            under("metrics-parity.jsonl")
+        );
+        // An empty or whitespace-only tag is how a shell spells "unset" by
+        // accident, and it names no file of its own.
+        for unset in [None, env(""), env("   ")] {
+            assert_eq!(
+                metrics_path_from(None, unset.as_deref(), home.as_deref()),
+                under(METRICS_FILE_NAME),
+                "an empty tag records where every untagged run does"
+            );
+        }
+        // The named file wins whether or not a tag is set, and `off` still
+        // turns recording off for a tagged process too.
+        assert_eq!(
+            metrics_path_from(
+                env("/tmp/named.jsonl").as_deref(),
+                env("bench").as_deref(),
+                home.as_deref()
+            ),
+            Some(PathBuf::from("/tmp/named.jsonl"))
+        );
+        assert_eq!(
+            metrics_path_from(
+                env("off").as_deref(),
+                env("bench").as_deref(),
+                home.as_deref()
+            ),
+            None
+        );
+    }
+
+    /// The tag reaches a file name, and a tag is an environment variable a
+    /// script exports: a slash or a `..` in one must name a file in the state
+    /// directory and never a path out of it.
+    #[test]
+    fn a_tag_is_sanitized_before_it_names_a_file() {
+        assert_eq!(sanitize_tag("bench"), "bench");
+        assert_eq!(sanitize_tag("bench-27b_v2"), "bench-27b_v2");
+        assert_eq!(sanitize_tag("../../etc/passwd"), "______etc_passwd");
+        assert_eq!(sanitize_tag("a b"), "a_b");
+        assert_eq!(sanitize_tag("日本"), "__");
+
+        assert_eq!(metrics_file_name(None), METRICS_FILE_NAME);
+        assert_eq!(metrics_file_name(Some("bench")), "metrics-bench.jsonl");
+
+        let home = Some(OsStr::new("/home/someone").to_owned());
+        let odd = Some(OsStr::new("../sneaky").to_owned());
+        let path = metrics_path_from(None, odd.as_deref(), home.as_deref()).expect("a path");
+        assert_eq!(
+            path,
+            PathBuf::from("/home/someone")
+                .join(METRICS_DIR_RELATIVE)
+                .join("metrics-___sneaky.jsonl")
+        );
+        assert_eq!(
+            path.parent(),
+            Some(PathBuf::from("/home/someone/.local/state/xwen").as_path())
+        );
+    }
+
+    /// Which history a report reads is what the query asks for: the default
+    /// file for real use, the tag's own file for a harness, and every file in
+    /// the directory under `--all-tags`.
+    #[test]
+    fn the_query_picks_the_history_files_it_reads() {
+        let home_dir = ScratchDir::home("stats-home");
+        let state = home_dir.state();
+        for name in [
+            "metrics.jsonl",
+            "metrics-bench.jsonl",
+            // Neither of these is a history and neither may be read as one.
+            "notes.txt",
+            "metrics-bench.jsonl.tmp",
+        ] {
+            std::fs::write(state.join(name), b"").expect("a file");
+        }
+        let home = Some(home_dir.as_os());
+        let query = |tag: TagFilter| StatsQuery {
+            tag,
+            ..StatsQuery::default()
+        };
+        let source = |tag: TagFilter| match stats_source_from(&query(tag), None, home.as_deref())
+            .expect("a source")
+        {
+            StatsTarget::Read(source) => source,
+            other => panic!("expected a history to read, got {other:?}"),
+        };
+
+        assert_eq!(
+            source(TagFilter::Untagged),
+            StatsSource::File(state.join("metrics.jsonl"))
+        );
+        assert_eq!(
+            source(TagFilter::Only("bench".to_string())),
+            StatsSource::File(state.join("metrics-bench.jsonl"))
+        );
+        // A tag with no file yet still resolves to the file it would be in, so
+        // the message names a path rather than nothing.
+        assert_eq!(
+            source(TagFilter::Only("parity".to_string())),
+            StatsSource::File(state.join("metrics-parity.jsonl"))
+        );
+
+        let all = source(TagFilter::All);
+        assert_eq!(
+            all.files(),
+            [
+                state.join("metrics-bench.jsonl"),
+                state.join("metrics.jsonl")
+            ],
+            "every history in the directory, in name order, and nothing else"
+        );
+        assert_eq!(all.path(), state, "and the directory is what names them");
+
+        // A named file is read as given, whatever the query asks about tags,
+        // and `off` leaves nothing to read at all.
+        let named = StatsQuery {
+            tag: TagFilter::All,
+            file: Some(PathBuf::from("/tmp/elsewhere.jsonl")),
+            ..StatsQuery::default()
+        };
+        assert_eq!(
+            stats_source_from(&named, Some(OsStr::new("off")), home.as_deref()).expect("a source"),
+            StatsTarget::Read(StatsSource::File(PathBuf::from("/tmp/elsewhere.jsonl")))
+        );
+        assert_eq!(
+            stats_source_from(
+                &query(TagFilter::All),
+                Some(OsStr::new("off")),
+                home.as_deref()
+            )
+            .expect("a source"),
+            StatsTarget::RecordingOff
+        );
+        // The variable names one file for reading as it does for writing.
+        assert_eq!(
+            stats_source_from(
+                &query(TagFilter::All),
+                Some(OsStr::new("/tmp/named.jsonl")),
+                home.as_deref()
+            )
+            .expect("a source"),
+            StatsTarget::Read(StatsSource::File(PathBuf::from("/tmp/named.jsonl")))
+        );
+    }
+
+    /// A tag names the same file on the read side as on the write side, which
+    /// means the reader normalizes it the same way: trimmed, then sanitized. A
+    /// tag that is nothing but space names no harness, and resolving it to a
+    /// `metrics-.jsonl` nothing writes would report an empty history instead of
+    /// saying so.
+    #[test]
+    fn the_read_side_normalizes_a_tag_the_way_the_writer_does() {
+        let home_dir = ScratchDir::home("stats-tag");
+        let state = home_dir.state();
+        let home = Some(home_dir.as_os());
+
+        let filter = TagFilter::only(" bench ").expect("a named tag");
+        assert_eq!(
+            filter,
+            TagFilter::Only("bench".to_string()),
+            "the filter matches records whose own tag was trimmed when stamped"
+        );
+        let query = StatsQuery {
+            tag: filter,
+            ..StatsQuery::default()
+        };
+        assert_eq!(
+            stats_source_from(&query, None, home.as_deref()).expect("a source"),
+            StatsTarget::Read(StatsSource::File(state.join("metrics-bench.jsonl"))),
+            "and it reads the file that tag's runs were written to"
+        );
+        // The write side resolves the same file from the same spelling.
+        assert_eq!(
+            metrics_path_from(None, Some(OsStr::new(" bench ")), home.as_deref()),
+            Some(state.join("metrics-bench.jsonl"))
+        );
+
+        for empty in ["", "   ", "\t"] {
+            assert!(
+                TagFilter::only(empty).is_err(),
+                "{empty:?} names no harness"
+            );
+        }
+    }
+
+    /// A directory that cannot be read is an error, not an empty report: a
+    /// `--all-tags` that answered "no metrics recorded yet" over an unreadable
+    /// state directory would claim zero runs on a machine that has run
+    /// thousands. A directory that is simply not there yet is the other case
+    /// and stays a history nobody has written.
+    #[test]
+    fn an_unreadable_directory_is_an_error_and_a_missing_one_is_not() {
+        let home_dir = ScratchDir::home("stats-dir");
+        let query = StatsQuery {
+            tag: TagFilter::All,
+            ..StatsQuery::default()
+        };
+        let home = Some(home_dir.as_os());
+
+        // Nothing created yet: the state directory does not exist.
+        let missing = stats_source_from(&query, None, home.as_deref()).expect("a source");
+        match missing {
+            StatsTarget::Read(StatsSource::Directory { files, .. }) => assert!(files.is_empty()),
+            other => panic!("expected an empty directory, got {other:?}"),
+        }
+
+        // A file where the directory should be: reading it as a directory
+        // fails, and that failure is the report's.
+        std::fs::create_dir_all(home_dir.path.join(".local/state")).expect("the parent");
+        std::fs::write(home_dir.path.join(METRICS_DIR_RELATIVE), b"not a directory")
+            .expect("a file in the directory's place");
+        let error = stats_source_from(&query, None, home.as_deref())
+            .expect_err("an unreadable directory is an error");
+        assert!(
+            format!("{error:#}").contains("state/xwen"),
+            "the error names the directory it could not read: {error:#}"
+        );
+
+        // The same query with `--file` never looks at the directory at all.
+        let named = StatsQuery {
+            file: Some(PathBuf::from("/tmp/elsewhere.jsonl")),
+            ..query.clone()
+        };
+        assert!(stats_source_from(&named, None, home.as_deref()).is_ok());
+    }
+
+    /// No `$HOME` and no file named is not the same as recording being turned
+    /// off, and the two are answered differently: one wants a path, the other
+    /// wants the variable unset.
+    #[test]
+    fn no_home_and_recording_off_are_different_answers() {
+        let query = StatsQuery::default();
+        assert_eq!(
+            stats_source_from(&query, None, None).expect("a source"),
+            StatsTarget::NoHome
+        );
+        assert_eq!(
+            stats_source_from(&query, Some(OsStr::new("off")), None).expect("a source"),
+            StatsTarget::RecordingOff
+        );
+        // Either way, a file named outright still resolves without a home.
+        assert_eq!(
+            stats_source_from(&query, Some(OsStr::new("/tmp/named.jsonl")), None)
+                .expect("a source"),
+            StatsTarget::Read(StatsSource::File(PathBuf::from("/tmp/named.jsonl")))
+        );
+    }
+
+    /// `--all-tags` reads the separate files as one history: the rows sum
+    /// across them, and nothing is excluded, because the split is what the
+    /// filter used to do.
+    #[test]
+    fn all_tags_reads_every_file_in_the_directory_as_one_history() {
+        let home_dir = ScratchDir::home("stats-all");
+        let state = home_dir.state();
+
+        let mut real = run(10, "generate", "Qwen3.8-27B");
+        real.decode_tokens = 10;
+        append(&state.join("metrics.jsonl"), &real).expect("a record appends");
+        let mut benched = run(20, "generate", "Qwen3.8-27B");
+        benched.tag = Some("bench".to_string());
+        benched.decode_tokens = 20;
+        append(&state.join("metrics-bench.jsonl"), &benched).expect("a record appends");
+
+        let home = Some(home_dir.as_os());
+        let read = |tag: TagFilter| {
+            let query = StatsQuery {
+                by: GroupBy::All,
+                tag,
+                ..StatsQuery::default()
+            };
+            report_from(&query, || stats_source_from(&query, None, home.as_deref()))
+                .expect("the history reads")
+                .expect("a history")
+        };
+
+        let default = read(TagFilter::Untagged);
+        assert_eq!(default.rows[0].decode_tokens, 10, "the default file alone");
+        assert_eq!(
+            default.excluded_by_tag, 0,
+            "the harness's runs are in another file, not filtered out of this one"
+        );
+        let bench = read(TagFilter::Only("bench".to_string()));
+        assert_eq!(bench.rows[0].decode_tokens, 20, "the harness's file alone");
+
+        let all = read(TagFilter::All);
+        assert_eq!(all.rows[0].runs, 2);
+        assert_eq!(
+            all.rows[0].decode_tokens, 30,
+            "both files, read as one history"
+        );
+        assert_eq!(all.source.files().len(), 2);
+        assert_eq!(all.source.path(), state, "the footer names the directory");
     }
 }

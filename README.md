@@ -467,8 +467,10 @@ what it cost, and who asked for it. `generate`, `chat`, `batch` and every served
 record themselves, on by default. `XWEN_METRICS_FILE=<path>` records somewhere else and
 `XWEN_METRICS_FILE=off`, in any casing, records nothing; setting the variable to an
 empty string is not setting it and the default path applies. `XWEN_METRICS_TAG=<name>`
-marks the runs of that process as harness-driven rather than asked for, which is how a
-sweep stays in the history and out of the default report. A write that fails prints
+marks the runs of that process as harness-driven rather than asked for and records them
+to `metrics-<name>.jsonl` beside the default file, so a sweep is kept and the file a
+person reads holds real use alone; the tag is stamped on the record too. A path named by
+`XWEN_METRICS_FILE` wins over the tag and takes the runs whatever they are. A write that fails prints
 one warning for the life of the process and never fails the run that produced it, and a
 whole record goes out in a single append, so a server and a `generate` recording at the
 same moment interleave records rather than fragments.
@@ -498,11 +500,18 @@ naming the checkpoint the run replies as, and is unchanged.
 (default `day`), `--since 24h|7d|4w|YYYY-MM-DD` (a date means local midnight), `--model`
 and `--surface` filter exactly, `--client` and `--session` by substring, `--json` prints
 the rows instead of the table, and `--file` reads another history without ever recording
-to it. The report covers real use alone: a run recorded under a tag is left out, `--tag
-<name>` reads one harness on its own, `--all-tags` reads the whole file, and the stderr
-footer always says how many tagged runs the default left out. The scripts that drive the
+to it. The report covers real use because it reads `metrics.jsonl` and nothing else;
+`--tag <name>` reads that harness's own file, and `--all-tags` reads `metrics.jsonl`
+plus every `metrics-<name>.jsonl` in the directory as one history, its footer naming
+the directory and how many files it found. Any file of that shape counts, so an
+archived copy called `metrics-old.jsonl` is read back in as a harness called `old`;
+name archives something that does not start with `metrics-`. An unreadable directory
+is an error rather than an empty report. Tagged runs recorded before 2026-09-07 are
+still inside `metrics.jsonl`, where `--all-tags` and `--file` reach them: the tag
+filter still runs over whatever was read, so such a file reports real use and says in
+the stderr footer how many tagged runs it left out. The scripts that drive the
 binary set the tag themselves — `bench` for `bench.ts`, `retune-draft.ts`,
-`spec-equivalence.ts` and `flashnext-replay.ts`, `parity` for `parity-gate.ts`, `demo`
+`spec-equivalence.ts`, `flashnext-replay.ts` and `longctx.ts`, `parity` for `parity-gate.ts`, `demo`
 for the server `classify-demo.ts` spawns — so a sweep does not read as a day of
 inference nobody did. A script that drives an ALREADY-RUNNING server cannot tag anything:
 the record is written by the server process, so that server's own environment decides. A bad `--since` is an error before the file is opened, so a typo says so rather
@@ -591,9 +600,11 @@ when there is one, otherwise reads past the last `session_` marker in the client
 and labels whatever is left `-`. The `x-claude-code-agent-id` header is read the same
 way and recorded as its own field: it rides subagent requests only, so `--by agent`
 names the subagents that did the work and labels every other run `-`, while `--by
-session` keeps one session one row whatever ran inside it. All three ids are cut to 128
-characters. Whether the header's id is the same one `claude --resume` shows is not
-confirmed.
+session` keeps one session one row whatever ran inside it. All three ids are cut to 256
+characters, which is above the ~190 Claude Code's body id runs to; at 128 the cut landed
+inside that blob's session id. The header's id does name the transcript `claude --resume`
+lists: a row of `--by session` is a conversation on disk, under
+`~/.claude/projects/<project>/<id>.jsonl`.
 
 ## Verifying a change
 

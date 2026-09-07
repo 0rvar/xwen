@@ -58,10 +58,14 @@ pub struct ClientId {
     pub agent: Option<String>,
 }
 
-/// The longest client-supplied identifier that is stored. Nothing legitimate
-/// comes close — a session uuid is 36 characters — and the history is a file a
-/// hostile client would otherwise get to grow a request at a time.
-pub const CLIENT_ID_MAX_CHARS: usize = 128;
+/// The longest client-supplied identifier that is stored. The history is a file
+/// a hostile client would otherwise get to grow a request at a time, so the
+/// bound exists; it is set above what the real ids need rather than at them.
+/// Claude Code's body id is a JSON blob carrying a 64-character device id, an
+/// account uuid and a session uuid, which runs to about 190 characters — a
+/// tighter bound cuts it inside the session id, and that id is what
+/// `session_key` reads when a request carries no session header.
+pub const CLIENT_ID_MAX_CHARS: usize = 256;
 
 impl ClientId {
     /// Every value as the client sent it, each cut to
