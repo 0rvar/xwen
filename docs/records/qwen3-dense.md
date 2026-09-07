@@ -558,7 +558,7 @@ edited into the test.
 
 One caveat on that run: its `sdpa` rows were taken with the hollow arm and read 0.0
 against flash, which is the same measurement the withdrawn Stage 1 ablation made. They
-say nothing and are not reproduced above.
+say nothing and are not reproduced above; Arc 4 below has the real ones.
 
 ### Review rounds
 
@@ -566,8 +566,11 @@ Two outside models, each on a different cut of the branch. **Codex** reviewed ev
 commit as it landed, loader, tokenizer and chat, registry, stack and serve, each round
 followed by fixes. **Qwen**, which is Flash-Next through the local review wrapper,
 reviewed the branch in four slices: model and loader, registry and serving, the chat
-renderer, and the generate loop, the last of which is running as this is written and its
-verdict is _pending_.
+renderer, and the generate loop. The fourth never produced a verdict: two attempts died
+on a refused connection to the local server and the third hit the wrapper's session limit,
+and on 2026-09-07 the owner decided to skip Qwen reviews for the rest of the arc. Codex
+reviewed that slice with the stack commit, so the generate loop has one outside review,
+not two.
 
 Both verdicts on the three finished slices were to ship, and the value was in what they
 checked and found correct as much as in the findings: the projection orientation and the
@@ -615,6 +618,89 @@ when a corruption of another shape is seen in the wild.
 
 The architecture is feature-complete against the plan: every surface runs, both gates
 have been executed, and the encoder is ready for the diffusion pipelines to call
-`XwenModel::encode` in process. What is open is the Stage 1 bar decision, which is a
-ledger item and not an arc, and the two "not taken now" entries above. The next thing
-that needs this checkpoint is a diffusion model, not another Qwen3 arc.
+`XwenModel::encode` in process. What was open after this arc was the Stage 1 bar
+decision, closed in Arc 4 below, and the two "not taken now" entries above. The next
+thing that needs this checkpoint is a diffusion model, not another Qwen3 arc.
+
+## Arc 4, 2026-09-07: the bars are decided, and the ablation that was pending runs
+
+The closing arc. No surface changed; two tests changed what they assert, one ablation
+ran, and the ledger's one `[blocked]` item closed. Everything below was measured with
+`pmset -g` reading `lowpowermode 0` and no other model process; none of it is a
+throughput number.
+
+### The Stage 1 ablation against the real f32 arm
+
+Arc 1 withdrew its `XWEN_QWEN3_ATTN=sdpa` ablation as vacuous and 30995b9 made the arm
+a real f32 chain, Q·Kᵀ, softmax and ·V over the f32 cache with no f16 anywhere. Against
+the Metal oracle over all 20 prompts, 6307 positions:
+
+| arm | pooled max-abs | argmax | near-tie flips | pooled top-5 |
+| --- | --- | --- | --- | --- |
+| fused (flash kernel, f16 cache, f16 vector sdpa at t=1) | 0.222 | 6304/6307 | 3 | 99.9239% |
+| `sdpa` (f32 chain) | 0.309 | 6303/6307 | 4 | 99.9556% |
+
+Per prompt the f32 arm is lower on most of the short ones (parity-code-short 0.020 against
+0.025, corpus-middle 0.052 against 0.073, edge-mixed-script-code 0.028 against 0.042) and
+higher on both long ones (bench-decode-630 0.229 against 0.121, bench-prefill-4k 0.309
+against 0.222). That shape is the oracle's: `llama-logits-all` ran with `type_k` and
+`type_v` f16 and flash attention on, so the fused arm shares the oracle's cache precision
+and its kernel lineage, and the f32 arm diverges from it in proportion to how much cache
+there is. The f32 arm's higher top-5 says the same thing from the other side: it is the
+more exact computation, and the oracle is not. Neither arm dominates, both sit inside the
+oracle's own backend spread of 0.358, and every flip on both is a near tie, so the
+attention kernel is ruled out as a systematic error source and the fused arm stays
+shipped.
+
+### Consistency, tabulated on both arms
+
+The rerun that Arc 3 could not do (its `sdpa` rows were the hollow arm). Three prompts,
+862 positions per arm, every row's argmax agreeing at every position:
+
+| arm | gemv chunkings 1/7/8, worst | gemm chunkings 9/16, worst | one prefill vs flash |
+| --- | --- | --- | --- |
+| fused | 0.149 at corpus-middle position 76 | 0.021 | — |
+| `sdpa` | 0.187 at corpus-middle position 76 | 0.051 | 0.028 |
+
+The picture Arc 3 drew holds on the real arm and is a little wider there: the whole
+spread is `matmul_bf16`'s f32-activation gemv against its half-staged tensor gemm, the
+same position leads on both arms, and the two attention arms agree with each other to
+0.028 at their worst, which is under the gemm-vs-gemm chunking spread on the f32 arm.
+
+### The decision
+
+Two gates and a report, taken 2026-09-07 with the counter-argument on the record.
+Pooled top-5 at 99.9%; argmax as "no flip outside the near-tie band", a near-tie flip
+counted and printed and passing; max-abs reported beside the oracle's own CPU-versus-Metal
+spread and not gated. The consistency bar is 0.2 with an identical argmax, and 0.2 rather
+than the 0.149 first proposed because the f32 arm reads 0.187 on the same seam, and a bar
+at a measured peak fails on its first re-measurement. What the bar does not certify: a
+systematic error under 0.358 that leaves the top-5 set and every decided argmax alone
+would pass it, and the only way to a tighter max-abs bar is an oracle whose two backends
+agree to better than the number proposed. Argued in
+[docs/decisions/ground-truth-and-parity.md](../decisions/ground-truth-and-parity.md),
+stated for the reader in [docs/qwen3-dense.md](../qwen3-dense.md), runbook in
+[docs/parity.md](../parity.md).
+
+### Verified this arc
+
+- Stage 1 under the decided bars, both oracle arms: Metal PASS (0 hard flips, 3 near
+  ties, 99.9239%, max-abs 0.222 inside the spread), CPU PASS (0 hard flips, 7 near ties,
+  99.9176%, max-abs 0.379 printed as above the spread).
+- Consistency at the 0.2 bar, both arms, as tabulated: PASS.
+- The parity binary's metrics unit tests, rewritten for the new predicate: a near-tie
+  flip passes the pool, a decided flip fails it with top-5 still perfect, and max-abs
+  above the spread is reported without failing. 13 pass.
+- `bun scripts/docs-check.ts` clean.
+
+### Not taken now, added this arc
+
+- **The Qwen outside review of the generate loop.** Three attempts, none produced a
+  verdict, and the owner skipped it for the rest of the arc. Codex reviewed the slice.
+  Reopen when the wrapper is reliable again, or when `SectionState`/`ThinkBudget` change.
+
+### Next
+
+Nothing in this track. The branch merges to master with every stage passing under stated
+bars. The next thing that needs this checkpoint is a diffusion model calling
+`XwenModel::encode` in process.

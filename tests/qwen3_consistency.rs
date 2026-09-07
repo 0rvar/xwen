@@ -5,16 +5,23 @@
 //! (multi-token) against the f16 vector sdpa (one token), `matmul_bf16`'s gemv
 //! (t <= 8) against its tensor gemm (t > 8), and the shipped attention arm
 //! against the f32 sdpa bisect arm (`XWEN_QWEN3_ATTN=sdpa`). Bar: max-abs
-//! logit difference <= 2e-2 (`XWEN_QWEN3_CONSISTENCY_MAX_ABS` overrides it)
+//! logit difference <= 0.2 (`XWEN_QWEN3_CONSISTENCY_MAX_ABS` overrides it)
 //! and an identical argmax at every position (docs/parity.md, the qwen3
-//! section).
+//! section, decided 2026-09-07).
+//!
+//! The bar is where it is because the whole internal spread is one seam:
+//! `matmul_bf16` keeps f32 activations on its gemv path (t <= 8) and stages
+//! them to half on its tensor-gemm path (t > 8), so chunk 1/7/8 against a
+//! single-pass prefill is that staging, measured 0.149 at one position of the
+//! corpus-middle prompt with argmax agreeing everywhere, while gemm-vs-gemm
+//! chunkings read <= 0.021. A prefill and a decode legitimately differ by that
+//! much here, and the oracle's own bf16 gemm stages the same way.
 //!
 //! Every comparison runs before anything is asserted: the whole table is
 //! printed (prompt, arm, chunk size, positions, the worst |Δ| and where, argmax
 //! agreements, positions over the bar), and the test then fails listing every
 //! row that missed. A first failure that stopped the run would leave the other
-//! chunkings and the flash-vs-sdpa arm unmeasured, which is exactly the number
-//! the bar's owner needs to decide where it belongs.
+//! chunkings and the flash-vs-sdpa arm unmeasured.
 //!
 //! Ignored by default (needs the 8 GB checkpoint and a Metal device). ONE test
 //! body, deliberately: the second half switches the attention arm through the
@@ -39,8 +46,10 @@ use xwen::model::XwenModel;
 use xwen::ops::ExpertRunner;
 use xwen::qwen3::stack::{ATTN_ENV, AttnImpl};
 
-/// The bar unless `XWEN_QWEN3_CONSISTENCY_MAX_ABS` moves it.
-const DEFAULT_MAX_ABS: f32 = 2e-2;
+/// The bar unless `XWEN_QWEN3_CONSISTENCY_MAX_ABS` moves it: the gemv-vs-gemm
+/// staging spread (0.149 measured) with headroom, so a re-measurement that lands
+/// a hair over the measured peak is not a failure.
+const DEFAULT_MAX_ABS: f32 = 0.2;
 const CHUNKS: [usize; 5] = [1, 7, 8, 9, 16];
 
 fn max_abs_bar() -> Result<f32> {

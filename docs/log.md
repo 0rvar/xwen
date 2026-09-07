@@ -4,6 +4,24 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — Dense Qwen3 parity bars decided: Stage 1 passes on both oracle arms, consistency at 0.2, the sdpa ablation rules the attention kernel out
+
+Arc 4, the last of the dense Qwen3-4B arcs and the one that turns two measurements into
+gates. Stage 1 gates pooled top-5 at 99.9% and argmax as "no flip outside the 2e-2
+near-tie band"; max-abs is reported beside the oracle's own CPU-versus-Metal spread of
+0.358 and not gated, because a fixed 2e-2 was a number llama.cpp misses against itself.
+Under those bars both arms pass: Metal 0 hard flips, 99.9239%, max-abs 0.222 inside the
+spread; CPU 0 hard flips, 99.9176%, 0.379 printed as above it. The consistency bar is 0.2
+with an identical argmax and passes on both attention arms (0.149 fused, 0.187 f32 sdpa,
+862/862 argmax on every row). The Stage 1 ablation against the real f32 sdpa arm, pending
+since the hollow one was withdrawn, ran over all 20 prompts: 0.309, 4 near-tie flips and
+top-5 99.9556% against the fused arm's 0.222, 3 and 99.9239%, lower on short prompts and
+higher on long ones because the oracle ran an f16 cache with flash attention. Neither
+arm dominates, so the kernel is not a systematic error source. The ledger's one
+`[blocked]` item closes into the archive. The Qwen outside review of the generate loop
+was skipped by decision; Codex reviewed that slice. [Record](records/qwen3-dense.md),
+[bars](qwen3-dense.md), [runbook](parity.md), [decision](decisions/ground-truth-and-parity.md).
+
 ## 2026-09-07 — Qwen3-4B on serve and batch: one server, two vocabularies, and decode at 95% of its byte ceiling
 
 Arc 3, the same day as the stack arc above and the arc that makes the entries reachable.

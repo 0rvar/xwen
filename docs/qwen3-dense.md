@@ -30,8 +30,8 @@ there succeeds and would produce fluent garbage out of the zero-filled layer 35.
 
 **Still deliberately off:** `auto_fetch()` on all three, so nothing downloads 8 GB inside
 a request or a zero-flag run; `xwen fetch` is what fills the cache. There is no drafter
-for this architecture and none is planned. What remains open is not a surface but a
-question: what the Stage 1 parity bars should be (Verification, below).
+for this architecture and none is planned. Nothing is open on the surface; the parity
+bars were decided 2026-09-07 (Verification, below).
 
 ## Config
 
@@ -173,29 +173,30 @@ they stand on 2026-09-07:
 | tokenizer round trip | `llama-tokenize --ids --no-bos` on the BF16 GGUF | ids equal, `decode(ids) == text` | 20 prompts, 2026-09-06 (self-skips without the cached tokenizer) |
 | chat template | `llama-server --jinja /apply-template` | byte-equal rendering | 16/16 cases, 2026-09-06 |
 | encode index semantics | the engine's own taps | exact | max abs diff 0 at both indices, 2026-09-07 |
-| Stage 1, full-vocab logits | `llama-logits-all` per-position dump | OPEN, see below | top-5 99.9239% vs Metal and 99.9176% vs CPU (pass), max-abs 0.222 and 0.379, argmax 6304 and 6300 of 6307 with every flip inside the near-tie band |
-| decode consistency | the engine against itself | OPEN, same question | max abs logit difference 2.59e-2 at chunk 1 |
+| Stage 1, full-vocab logits | `llama-logits-all` per-position dump | pooled top-5 >= 99.9%, no argmax flip outside the 2e-2 near-tie band; max-abs reported against the oracle's own CPU-vs-Metal spread (0.358), not gated | PASS on both arms: top-5 99.9239% vs Metal and 99.9176% vs CPU, 0 flips outside the band (3 and 7 inside it), max-abs 0.222 inside the spread and 0.379 above it |
+| decode consistency | the engine against itself | max abs logit difference <= 0.2, identical argmax | PASS: 0.149 on the fused arm, 0.187 on the f32 sdpa arm, argmax 862/862 on every row |
 | Stage 2, encoder hidden states | torch fp32 dump | cosine >= 0.9999, relative error <= 1e-2 | PASS: min cosine 0.99999449, max relative error 0.00388 |
 | GGUF parity gate and Flash-Next replay | upstream llama.cpp | the existing floors | PASS on the 35B, the 27B and the Flash-Next replay, 2026-09-07 |
 
-**The Stage 1 bars are an open decision and this file does not state one.** The 2e-2
-max-abs and 100% argmax the plan proposed are not attainable: llama.cpp's own CPU and
-Metal backends differ by pooled max-abs 0.358 with 4 argmax flips over the same 20
-prompts, so the reference does not meet that bar against itself, and xwen sits closer to
-the Metal oracle (0.222, 3 flips) than the two oracle backends sit to each other. The
-recommendation on the table is to gate pooled top-5 at 99.9%, gate argmax as "no flip
-outside the near-tie band", and report max-abs against the oracle's own backend spread
-rather than a fixed number. The counter-argument is that such a bar certifies only "as
-close as llama.cpp is to itself" and would not catch a systematic error under 0.358.
-The consistency bar is part of the SAME decision and is ledgered with it: the whole
-internal spread is the gemv path (chunks 1, 7 and 8, f32 activations) against the tensor
-gemm (chunk 9 and up, activations staged to half), it peaks at 1.49e-1 on one position,
-argmax agrees everywhere, and the worst position is the same one the Stage 1 comparison
-calls an outlier against an oracle whose own bf16 gemm stages activations the same way.
-Decode and prefill legitimately differ by up to ~0.15 logits at a few positions here, so
-a bar is a statement about which of them is the reference. The evidence, the ablation that
-rules out the classic matmul, the one that was withdrawn as vacuous, and the ledger item
-are in [records/qwen3-dense.md](records/qwen3-dense.md).
+**The Stage 1 bars, decided 2026-09-07.** Two gates and one report. Pooled top-5 must
+reach 99.9%. Argmax must not flip at any position the reference decided by 2e-2 or more;
+a flip inside that near-tie band is counted and printed and passes. Max-abs is reported
+beside the oracle's own CPU-versus-Metal spread, 0.358 over these prompts, and is not a
+gate. The 2e-2 max-abs with 100% argmax the plan proposed was dropped because llama.cpp's
+two backends miss it against each other (4 flips, 0.358), so a fixed number under that
+spread graded the reference's backend choice, not xwen; the price is stated with it: this
+bar certifies "as close as llama.cpp is to itself" and would not catch a systematic error
+under 0.358 that leaves the top-5 set and every decided argmax alone. The consistency bar
+is 0.2 with identical argmax, the same decision: the whole internal spread is the gemv
+path (chunks 1, 7 and 8, f32 activations) against the tensor gemm (chunk 9 and up,
+activations staged to half), it peaks at 0.149 on the fused arm and 0.187 on the f32
+sdpa arm at one position, argmax agrees everywhere, and that position is the Stage 1
+outlier too, against an oracle whose own bf16 gemm stages activations the same way. The
+attention kernel is not where the spread comes from: the f32 sdpa arm against the Metal
+oracle reads max-abs 0.309, 4 near-tie flips and top-5 99.9556% where the fused arm reads
+0.222, 3 and 99.9239%, so neither arm dominates and both sit inside the oracle's own
+spread. The full tables and the withdrawn earlier ablation are in
+[records/qwen3-dense.md](records/qwen3-dense.md).
 
 Pooled top-5 is pooled on purpose: per-position overlap of five items moves in 20%
 steps, so 99.9% only means something summed over positions, as

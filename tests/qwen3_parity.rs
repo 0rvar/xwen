@@ -43,10 +43,15 @@
 //! - `XWEN_QWEN3_PARITY_LIST` — how many failing positions the panic message
 //!   spells out before summarising the rest. Default 50.
 //!
-//! The bars (`metrics::MAX_ABS_BAR`, argmax 100%, `metrics::TOP5_BAR`) and the
-//! near-tie band come from docs/parity.md. Near ties are REPORTED, never
-//! excused: an argmax flip the reference itself decided by less than the band is
-//! counted and printed, and it still fails the gate.
+//! The bars come from docs/parity.md ("The Qwen3 dense track") and were decided
+//! 2026-09-07. Two are gates: pooled top-5 agreement at `metrics::TOP5_BAR`, and
+//! argmax "no flip outside the near-tie band" — a flip the reference itself
+//! decided by less than `metrics::NEAR_TIE_MARGIN` is counted and printed but
+//! does not fail. Max-abs is REPORTED, not gated: it is printed beside
+//! `metrics::ORACLE_BACKEND_SPREAD`, the pooled max-abs between llama.cpp's own
+//! CPU and Metal backends over these same prompts, because that spread is the
+//! resolution the oracle has, and a fixed bar under it graded the reference's
+//! backend choice rather than xwen.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -65,19 +70,22 @@ use serde_json::Value;
 /// Nothing here knows about models, files or devices, which is why it can be
 /// tested on ten-wide synthetic rows.
 mod metrics {
-    /// The largest per-position, per-vocabulary-entry absolute logit difference
-    /// the gate allows. docs/parity.md owns the number; it is tighter than the
-    /// repo's older cosine bar and was committed to only after the oracle's
-    /// arithmetic was pinned.
-    pub const MAX_ABS_BAR: f32 = 2e-2;
+    /// The pooled max-abs logit difference between llama.cpp's own CPU and
+    /// Metal backends over the 20 fixture prompts (6307 positions, 2026-09-07,
+    /// docs/parity.md). Max-abs is not gated; it is printed against this so a
+    /// run reads as "inside the oracle's own spread" or "above it". Re-measure
+    /// it (`scripts/qwen3-ref-logits.ts` on both backends) when the fixtures or
+    /// the pinned llama.cpp change.
+    pub const ORACLE_BACKEND_SPREAD: f32 = 0.358;
 
-    /// Pooled top-5 agreement floor. Per position the overlap can only move in
-    /// 20% steps, so a fraction like 99.9% is meaningful only over the pool.
+    /// Pooled top-5 agreement floor, and a gate. Per position the overlap can
+    /// only move in 20% steps, so a fraction like 99.9% is meaningful only over
+    /// the pool.
     pub const TOP5_BAR: f64 = 0.999;
 
     /// An argmax flip is called a near tie when the REFERENCE's own top-1
-    /// beat its top-2 by less than this. It describes the flip; it does not
-    /// forgive it.
+    /// beat its top-2 by less than this. A near-tie flip is counted and printed
+    /// and passes; a flip outside the band fails the gate.
     pub const NEAR_TIE_MARGIN: f32 = 2e-2;
 
     /// The k of the pooled top-k agreement.
@@ -266,14 +274,25 @@ mod metrics {
             self.argmax_agree as f64 / self.positions as f64
         }
 
+        /// Argmax flips the reference decided by at least the near-tie band.
+        /// These are the ones the gate fails on.
+        pub fn hard_flips(&self) -> usize {
+            self.positions - self.argmax_agree - self.near_tie_flips
+        }
+
+        /// Whether the pooled max-abs sits inside the oracle's own backend
+        /// spread. Reported, never a gate.
+        pub fn inside_oracle_spread(&self) -> bool {
+            self.max_abs <= ORACLE_BACKEND_SPREAD
+        }
+
         /// The whole bar in one place: every position scored, none non-finite,
-        /// max-abs under the band, every argmax agreeing, pooled top-5 at the
-        /// floor.
+        /// no argmax flip outside the near-tie band, pooled top-5 at the floor.
+        /// Max-abs is deliberately absent.
         pub fn passes(&self) -> bool {
             self.positions > 0
                 && self.nonfinite == 0
-                && self.max_abs <= MAX_ABS_BAR
-                && self.argmax_agree == self.positions
+                && self.hard_flips() == 0
                 && self.top5_agreement() >= TOP5_BAR
         }
     }
@@ -342,8 +361,10 @@ mod metrics_tests {
         pool.observe(&m);
         assert_eq!(pool.near_tie_flips, 1);
         assert_eq!(pool.argmax_agree, 0);
-        // A near tie is described, not excused.
-        assert!(!pool.passes());
+        assert_eq!(pool.hard_flips(), 0);
+        // A near-tie flip is counted and printed, and it passes: the
+        // reference did not decide that position either.
+        assert!(pool.passes());
     }
 
     #[test]
@@ -359,6 +380,11 @@ mod metrics_tests {
         let mut pool = Pool::default();
         pool.observe(&m);
         assert_eq!(pool.near_tie_flips, 0);
+        assert_eq!(pool.hard_flips(), 1);
+        // The set is unchanged by the swap, so top-5 is blind to it: the
+        // argmax gate is what catches a decided position going the other way.
+        assert_eq!(pool.top5_agreement(), 1.0);
+        assert!(!pool.passes());
     }
 
     #[test]
@@ -395,10 +421,14 @@ mod metrics_tests {
 
         let mut pool = Pool::default();
         pool.observe(&small);
-        assert!(pool.passes(), "0.003 is inside the {MAX_ABS_BAR} band");
+        assert!(pool.inside_oracle_spread());
         pool.observe(&large);
         assert!((pool.max_abs - 0.5).abs() < 1e-6);
-        assert!(!pool.passes());
+        // Max-abs is reported against the oracle's own backend spread and is
+        // not a gate: the argmax and top-5 rows are perfect here, so this
+        // still passes, and the report says "above" the spread.
+        assert!(!pool.inside_oracle_spread());
+        assert!(pool.passes());
     }
 
     #[test]
@@ -923,13 +953,14 @@ fn qwen3_4b_logits_match_the_llamacpp_oracle() -> Result<()> {
     let mut report = String::new();
     report.push_str(&format!(
         "QWEN3-4B STAGE 1 LOGITS PARITY\n  oracle:     {}\n  checkpoint: {} ({entry})\n  \
-         vocab: {vocab}   max_ctx: {max_ctx}   prefill chunk: {chunk}\n  bars: max-abs <= {:.1e}, \
-         argmax 100%, pooled top-5 >= {:.4}   near-tie band: {:.1e}\n\n",
+         vocab: {vocab}   max_ctx: {max_ctx}   prefill chunk: {chunk}\n  gates: no argmax flip \
+         outside the near-tie band ({:.1e}), pooled top-5 >= {:.4}\n  reported: max-abs against \
+         the oracle's own CPU-vs-Metal spread ({:.3})\n\n",
         dir.display(),
         checkpoint.display(),
-        metrics::MAX_ABS_BAR,
-        metrics::TOP5_BAR,
         metrics::NEAR_TIE_MARGIN,
+        metrics::TOP5_BAR,
+        metrics::ORACLE_BACKEND_SPREAD,
     ));
     report.push_str(&format!(
         "  {:>3}  {:<26} {:>7} {:>11} {:>13} {:>9} {:>9}\n",
@@ -1001,10 +1032,10 @@ fn qwen3_4b_logits_match_the_llamacpp_oracle() -> Result<()> {
                 let reference = rows.next_row()?;
                 let m = metrics::row_metrics(candidate, reference);
                 prompt_pool.observe(&m);
-                let bad = m.max_abs > metrics::MAX_ABS_BAR
-                    || !m.argmax_agrees()
-                    || m.nonfinite > 0
-                    || m.top5_overlap < metrics::TOP_K;
+                // A position fails on its own only for a decided argmax going
+                // the other way or a non-finite entry. Top-5 is pooled, and
+                // max-abs is reported, so neither lists positions here.
+                let bad = (!m.argmax_agrees() && !m.near_tie()) || m.nonfinite > 0;
                 if bad {
                     failures.push(Failure {
                         prompt: e.idx,
@@ -1040,22 +1071,26 @@ fn qwen3_4b_logits_match_the_llamacpp_oracle() -> Result<()> {
     }
 
     report.push_str(&format!(
-        "\n  POOLED over {} prompts, {} positions\n    max-abs error:     {:.4e}  [{}]\n    \
-         argmax agreement:  {}/{} ({:.4}%)  [{}]\n    top-5 agreement:   {:.6}%  [{}]\n    \
+        "\n  POOLED over {} prompts, {} positions\n    max-abs error:     {:.4e}  [{} the oracle's \
+         own backend spread of {:.3}; reported, not gated]\n    \
+         argmax agreement:  {}/{} ({:.4}%), {} flips outside the near-tie band  [{}]\n    \
+         top-5 agreement:   {:.6}%  [{}]\n    \
          argmax flips inside the near-tie band: {} of {}\n    non-finite logit entries \
          (either side): {}\n",
         run.len(),
         pooled.positions,
         pooled.max_abs,
-        if pooled.max_abs <= metrics::MAX_ABS_BAR {
-            "PASS"
+        if pooled.inside_oracle_spread() {
+            "inside"
         } else {
-            "FAIL"
+            "ABOVE"
         },
+        metrics::ORACLE_BACKEND_SPREAD,
         pooled.argmax_agree,
         pooled.positions,
         100.0 * pooled.argmax_agreement(),
-        if pooled.argmax_agree == pooled.positions {
+        pooled.hard_flips(),
+        if pooled.hard_flips() == 0 && pooled.positions > 0 {
             "PASS"
         } else {
             "FAIL"

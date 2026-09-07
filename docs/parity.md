@@ -838,8 +838,8 @@ the fixture and the frozen bound — recalibrate.
 Everything above grades a GGUF checkpoint against llama.cpp on the identical file. Dense
 Qwen3-4B is neither GGUF nor hybrid, so it gets its own track rather than an arm of the
 existing one. Architecture and bars: [qwen3-dense.md](qwen3-dense.md). As of 2026-09-07
-every stage has run at least once; Stage 2 passes and the Stage 1 bars are an open
-decision, argued at the end of this section.
+every stage has run at least once and every stage passes under bars decided the same
+day, stated at the end of this section.
 
 **Tokenizer round trip.** `tests/fixtures/qwen3-prompts.json` holds 20 prompts (longest
 3890 tokens) with ids from `llama-tokenize --ids --no-bos` on
@@ -929,8 +929,7 @@ refuses the Z-Image zero-filled planes.
 Decode consistency, which needs no oracle at all:
 
 ```
-XWEN_QWEN3_CONSISTENCY_MAX_ABS=<bar> \
-  cargo test --release --test qwen3_consistency -- --ignored --nocapture
+cargo test --release --test qwen3_consistency -- --ignored --nocapture
 ```
 
 It teacher-forces the same ids at chunks 1, 7, 8, 9 and 16 against one single-pass
@@ -939,10 +938,10 @@ the two attention arms directly. All-position prefill never exercises the one-to
 path or the gemv below 8 rows, so this is where the gemv-versus-gemm split shows, and it
 does: the whole spread is chunks 1/7/8, the gemv path with f32 activations, against 9/16
 and the single pass, which are the tensor gemm with activations staged to half. Numbers
-in [records/qwen3-dense.md](records/qwen3-dense.md). The bar is the environment override
-above because what it should be is part of the same open decision as Stage 1's;
-`XWEN_QWEN3_DIR` overrides the checkpoint. It tabulates every comparison before
-asserting, so one run reports all of them rather than stopping at the first failure.
+in [records/qwen3-dense.md](records/qwen3-dense.md). The bar is 0.2 max-abs with an
+identical argmax at every position (`XWEN_QWEN3_CONSISTENCY_MAX_ABS` overrides it,
+`XWEN_QWEN3_DIR` the checkpoint). It tabulates every comparison before asserting, so one
+run reports all of them rather than stopping at the first failure.
 
 **Running the suite honestly on this machine.** A great many tests read the real
 checkpoints and self-skip when the HF cache lacks them, which means a green run can mean
@@ -988,25 +987,43 @@ position: per prompt the max-abs runs 1.8e-5 at 1 token, 6.3e-3 at 8, 9.6e-3 at 
 prompt the failing fraction is about 7% in every position bucket with a median of 2.3e-2,
 the outliers at positions 853 and 1084 being isolated. One ablation against the Metal oracle
 on six prompts holds: `XWEN_ATTN_MM_CLASSIC=1` is worse (pooled 0.337 against 0.222), so
-the tensor gemm is the more accurate path here. **The `XWEN_QWEN3_ATTN=sdpa` ablation is
-WITHDRAWN**: it read bit-identical to the flash arm, which was taken as ruling the flash
-kernel out, but candle's Metal sdpa above one token dispatches the steel kernel that
-`flash.metal` is a copy of, so both arms were the same code. The arm is a real f32 chain
-since 30995b9 and the ablation against it is _pending_.
+the tensor gemm is the more accurate path here. The earlier `XWEN_QWEN3_ATTN=sdpa`
+ablation was withdrawn as vacuous (both arms were candle's steel kernel, which
+`flash.metal` is a copy of); the arm is a real f32 chain since 30995b9 and the ablation
+against it ran 2026-09-07 over all 20 prompts against the Metal oracle:
 
-Decode consistency reaches max absolute logit difference 2.59e-2 at one position of the
-53-token prompt at chunk 1, over the proposed 2e-2. The other chunkings are untabulated
-because the test stops at the first failure.
+| arm vs the Metal oracle | pooled max-abs | argmax | near-tie flips | pooled top-5 |
+| --- | --- | --- | --- | --- |
+| fused (shipped: flash kernel, f16 cache, f16 vector sdpa) | 0.222 | 6304/6307 | 3 | 99.9239% |
+| `sdpa` (f32 Q·Kᵀ, softmax and ·V over the f32 cache) | 0.309 | 6303/6307 | 4 | 99.9556% |
 
-**The Stage 1 bars are therefore an open decision, and this runbook does not state one.**
-The third row above is why: llama.cpp's own two backends disagree by more than xwen
-disagrees with either, so a fixed 2e-2 max-abs with 100% argmax agreement is not a
-standard the reference meets against itself. The recommendation on the table is to gate
-pooled top-5 at 99.9%, gate argmax as "no flip outside the near-tie band", and report
-max-abs against the oracle's own backend spread rather than a fixed number; the
-counter-argument is that such a bar certifies only "as close as llama.cpp is to itself"
-and would miss a systematic error under 0.358. It is an owner decision, ledgered in
-TODO.md and argued in [records/qwen3-dense.md](records/qwen3-dense.md).
+Neither dominates. The f32 arm reads lower on most short prompts (corpus-middle 0.052
+against 0.073, code-short 0.020 against 0.025) and higher on the two long ones
+(bench-decode-630 0.229 against 0.121, bench-prefill-4k 0.309 against 0.222), which is
+the oracle's own arithmetic showing: `llama-logits-all` ran with `type_k`/`type_v` f16
+and flash attention, so the fused arm shares its cache precision and its kernel lineage,
+and the difference grows where the cache is long. The attention kernel is not a source of
+systematic error; both arms sit inside the oracle's backend spread and every flip on
+both is a near tie.
+
+Decode consistency, tabulated on both arms 2026-09-07 (three prompts, 862 positions per
+arm): every chunking agrees on the argmax at every position; the gemv chunkings 1/7/8
+peak at 0.149 (fused) and 0.187 (`sdpa`) at position 76 of corpus-middle, the gemm
+chunkings 9/16 at 0.021 and 0.051, and the two arms against each other at 0.028.
+
+**The bars, decided 2026-09-07.** Stage 1 gates two things: pooled top-5 at 99.9%, and
+argmax as "no flip outside the near-tie band", a flip the reference itself decided by
+less than 2e-2 being counted and printed but not failed. Max-abs is reported against the
+oracle's own CPU-versus-Metal spread, 0.358 (`metrics::ORACLE_BACKEND_SPREAD` in the
+test, re-measured when the fixtures or the llama.cpp pin change), and is not gated. The
+consistency bar is 0.2 max-abs with an identical argmax. Under them both Stage 1 arms
+pass (Metal: 0 hard flips, 99.9239%, max-abs inside the spread; CPU: 0 hard flips,
+99.9176%, max-abs 0.379 above the spread and printed as such) and consistency passes.
+What the bar does not certify is stated once, in [qwen3-dense.md](qwen3-dense.md): a
+systematic error under 0.358 that leaves the top-5 set and every decided argmax alone
+would pass it. Decision paragraph in
+[decisions/ground-truth-and-parity.md](decisions/ground-truth-and-parity.md), the
+argument in [records/qwen3-dense.md](records/qwen3-dense.md).
 
 ## Limitations
 

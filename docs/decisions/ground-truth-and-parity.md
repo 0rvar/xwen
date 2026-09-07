@@ -91,3 +91,27 @@ five items moves in 20% steps and a per-position 99.9% is not a quantity; and th
 encoder's relative error is per token, `max_i |x_i − r_i| / max(max_i |r_i|, 1e-6)`, the
 denominator being that token's own largest reference magnitude rather than a global one
 (2026-09-06).
+
+**The dense Qwen3 Stage 1 bars are two gates and one report, and the consistency bar is
+0.2.** Gates: pooled top-5 agreement at 99.9%, and argmax as "no flip outside the near-tie
+band", where a flip the reference itself decided by less than 2e-2 is counted and printed
+and does not fail. Report: max-abs, printed beside the oracle's own CPU-versus-Metal
+pooled spread (0.358 over the 20 fixture prompts; `metrics::ORACLE_BACKEND_SPREAD` in
+`tests/qwen3_parity.rs`, re-measured when the fixtures or the llama.cpp pin change) and
+never gated. The 2e-2 max-abs with 100% argmax the plan proposed is REFUTED as a bar, by
+the reference: llama.cpp's own two backends over the same prompts read pooled max-abs
+0.358 with 4 argmax flips, so a fixed number under that spread graded which backend the
+oracle ran on, not xwen, which sits closer to the Metal arm (0.222, 3 flips) than the two
+arms sit to each other. The attention arm was ruled out as the source the same day: the
+f32 sdpa chain against the Metal oracle reads 0.309, 4 near-tie flips and top-5 99.9556%
+where the shipped fused arm reads 0.222, 3 and 99.9239%, lower on short prompts and higher
+on long ones because the oracle ran an f16 cache with flash attention, so neither arm
+dominates and both sit inside the oracle's spread. The consistency bar follows from the
+same measurement: the only internal spread is `matmul_bf16`'s f32-activation gemv (t <= 8)
+against its half-staged tensor gemm, 0.149 on the fused arm and 0.187 on the f32 arm at
+one position with the argmax agreeing everywhere, and the oracle's own bf16 gemm stages the
+same way, so 0.2 with an identical argmax is the statement "decode and prefill may differ
+by the staging and nothing else". What the bar does not certify is stated with it: a
+systematic error under 0.358 that leaves the top-5 set and every decided argmax alone
+passes. Reopen the max-abs gate only with an oracle whose two backends agree to better
+than the number proposed (2026-09-07).
