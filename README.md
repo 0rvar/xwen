@@ -17,6 +17,12 @@ the open ledger and `docs/log.md` for the timeline. A fifth architecture, dense 
 in HF safetensors, runs on every surface too (Models, below); its encoder path passes
 its own reference gate at cosine 0.99999449.
 
+**And since 2026-09-07 one thing here is not a language model.** `xwen image` renders a
+prompt to a PNG through the Z-Image-Turbo diffusion pipeline, conditioned on that same
+4B encoder in process. It produces coherent, prompt-faithful 1024x1024 images in about
+52 s and its arithmetic is not yet graded against a reference dump, so treat it as
+working rather than verified (Models, below).
+
 ## Docs
 
 - `docs/perf-state.md`: the current figures, one row per checkpoint and surface
@@ -28,7 +34,8 @@ its own reference gate at cosine 0.99999449.
   into under `docs/records/`
 - `docs/parity.md`: the verification runbook (vs upstream llama.cpp)
 - `docs/qwen3-dense.md`: the dense Qwen3-4B architecture, its config and its verification
-  bars; `docs/zimage.md` is the Z-Image text-encoder role that came with it
+  bars; `docs/zimage.md` is the whole Z-Image-Turbo pipeline, the text-encoder role it
+  came in for and the diffusion transformer, VAE and scheduler beside it
 - `AGENTS.md`: agent context, meaning ground truth, architecture cheat sheet, hazards,
   and the map of these files
 - `TODO.md`: the open ledger; items close by moving verbatim to `docs/ledger-archive.md`
@@ -162,9 +169,39 @@ writes `hidden [T, 2560]` bf16 and `input_ids`, rendering the prompt through the
 checkpoint's own chat template and truncating at the entry's 512 tokens. `--layer`
 defaults to the recorded hidden-state index, 35 for Z-Image, and is refused above the
 corrupt plane. The library entry point is `XwenModel::encode`, which is what the
-diffusion pipelines will call in process. `docs/qwen3-dense.md` has the architecture and
+diffusion pipelines call in process. `docs/qwen3-dense.md` has the architecture and
 the measured verification numbers, `docs/zimage.md` has the encoder role and the
 corruption.
+
+**One entry is not a language model at all** (2026-09-07): the Z-Image-Turbo diffusion
+pipeline, which is what `xwen image` runs.
+
+| Full name | Repo | `--model-size` | Role |
+| --- | --- | --- | --- |
+| `Z-Image-Turbo` | `Tongyi-MAI/Z-Image-Turbo`, whole repo | `zimage-turbo` / `z-image-turbo` | text-to-image, `xwen image` only |
+
+Fifteen files, **32.9 GB** in total: the transformer is 24.6 GB of fp32 safetensors in
+three shards, cast to bf16 at load so it is 12.3 GB resident; the VAE is 168 MB; the text
+encoder is the 8.06 GB set above, listed on this entry too so one fetch leaves nothing to
+download. It is not auto-fetched and not servable, so `generate`, `chat`, `serve` and
+`batch` refuse it with one sentence saying it is a text-to-image pipeline, and it is
+never listed by `/v1/models`.
+
+```
+xwen fetch --model-size zimage-turbo
+xwen image --prompt "a red bicycle against a white brick wall, golden hour" -o out.png
+```
+
+`--width` and `--height` default to 1024, `--steps` to 8, `--seed` is drawn and printed
+when omitted, and `--latents <file.safetensors>` injects a fixed latent for reference
+comparisons. Sizes must be multiples of 16 with an image token count `(w/16) * (h/16)`
+that is a multiple of 32, which 1024x1024, 1024x768, 512x512 and 1536x1024 all satisfy;
+anything else is refused with the reason, because the padded-image path is not
+implemented. One image at 1024x1024 takes about 52 s warm, roughly 42 s of it in the
+eight transformer steps, and no performance work has been done on it. The arithmetic is
+not yet graded against a reference dump. `docs/zimage.md` is the architecture and the
+traps, `docs/records/zimage-pipeline.md` the arc, `docs/perf-state.md` the timings and
+their conditions.
 
 **`--model <path>` takes a safetensors directory** on every one-shot subcommand, not
 only `serve`: a directory, a `config.json` inside one or a `*.safetensors` inside one all

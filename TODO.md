@@ -46,18 +46,28 @@ Flash-Next one was measured (bytes per token summed from the tensor table, the s
 rate, then the residual) is an open item. The ~7 ms non-byte residual on both MoE
 checkpoints is no longer "launches x 4 us": that price holds only for launches under
 ~2 MB on the dependent chain; the rest is occupancy losses (the router class, found by
-reading after the probe priced its projection at zero; the audit in the Front's second
-entry is what would find the rest) and the syncs plus the serial scan.]
+reading after the probe priced its projection at zero; the threadgroup-count audit on
+the Front is what would find the rest) and the syncs plus the serial scan.]
+
+[Amended 2026-09-07, after the Z-Image-Turbo pipeline arc (log.md "`xwen image` renders
+through Z-Image-Turbo"): three image entries join the Front and three decode entries are
+demoted to make room, each of them the smallest measured gain in its class (+1.4%, +1.4%
+and ~+4%). The image work is ranked the way the scope amendment says it should be
+(decisions.md "Diffusion image transformers are in scope, held to correctness bars
+first"): the parity gate and the waiting-user route rank high because they are
+correctness and a person, while the image step time ranks BELOW every decode lever on the
+three design-target checkpoints, because it is not a target and nothing found there
+transfers to them.]
 
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
-2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
-3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
-4. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
-5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
-6. **Above the 2048 indexer budget: +165 dispatches** (Decode performance, measured): 0.66 ms of dispatch cost plus 0.24 ms of QSA score tail, at every context past 2048 tokens; that 0.90 ms works out to ~+4% of a 18.9 ms token, a figure derived here and not stated in the item
-7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
-8. **The token-id readback sync (`stack.rs:511`): the host uploaded those ids one line earlier** (Decode performance, measured): +0.3 ms/token, +1.4%, no math change and no new kernel
-9. **GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger** (Decode performance, measured): the three-projection merge is -72 dispatches, about +1.4%
+2. **Stage 3 and Stage 4 parity for the Z-Image transformer** (Image generation, unpriced): nothing downstream of `encode` is numerically graded, so "it makes coherent images" is the only claim the pipeline has; the instrument prices the step-0 velocity gap, which is what decides whether bf16 activations are enough or F32 is needed, and no perf work on that graph is honest before it exists
+3. **Serve the images route and ship a ComfyUI node** (Image generation, unpriced): the user is waiting to drive this from ComfyUI, which is the whole reason the pipeline is in the repo on a wire and not only on the CLI
+4. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
+5. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
+6. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
+7. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
+8. **Z-Image step time: 5.0-5.5 s per step against a ~3.1 s compute ceiling** (Image generation, measured): a step is ~62 TFLOP and the reported large-matmul rate on this chip puts it at ~3.1 s, so there is ~1.6x on the reading we have and up to 6x on the theoretical peak; ranked below every decode entry above it on purpose, because images are not a tok/s target
+9. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
 10. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
 
 ## Decode performance
@@ -133,11 +143,15 @@ entry is what would find the rest) and the syncs plus the serial scan.]
    earlier.** One drain per token for data that never left the CPU; pass the ids down
    instead. ≈ +0.3 ms, +1.4%, no math change; run the Flash-Next replay check anyway.
    NEW item, unstarted.
+   DEMOTED from the Front 2026-09-07 to make room for the Z-Image arc. Kept: +1.4% for a
+   change with no new kernel is still the cheapest thing on this ledger per hour spent.
   From: Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4).
 
 - [ ] [measured] **GDN: 252 dispatches (13%), the three fusion candidates in the P3 ledger.** At 4 µs
    each −36 is ≈ 0.15 ms (+0.7%), not the +1-2% the 8.41 µs arithmetic gave; the
    three-projection merge (−72) ≈ +1.4% and needs its A/B. Re-priced DOWN.
+   DEMOTED from the Front 2026-09-07 to make room for the Z-Image arc. Kept: the +1.4%
+   merge is real but it needs an A/B before it is worth an arc's slot.
    The three, none started: conv+silu+state into the scan (−36); gnorm+zgate into
    `out_proj`'s prologue (−36); the three Q8_0 projections (`attn_qkv`, `attn_gate`,
    `ssm_out`) as one launch (−72), bandwidth-saturating, so A/B it (`XWEN_MOE_DUAL`).
@@ -151,6 +165,9 @@ entry is what would find the rest) and the syncs plus the serial scan.]
    and a cooperative 256-thread threshold walk in `kernel_qsa_select` (serial on thread 0
    today; at most ~1 ms/step in the whole above-budget path, so bench the kernel's share
    first).
+   DEMOTED from the Front 2026-09-07 to make room for the Z-Image arc. Kept, not
+   retired: ~+4% at every context past 2048 tokens is still the largest of the three
+   demoted gains, and it is the one to promote back first.
   From: Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4).
 
 - [ ] [small] **PLE decode tail on device** (P3 (5)(b)): 0.13 ms of host work against one more
@@ -724,6 +741,71 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   From: Deferred from the prefill-chunk pass (2026-08-30).
 
 ## Tokenizer, chat and sampling
+
+## Image generation
+
+- [ ] [unpriced] **Stage 3 and Stage 4 parity for the Z-Image transformer.** Arc B, and the
+  prerequisite for everything else on this graph: nothing downstream of `encode` is
+  numerically graded today. Stage 3 dumps a fixed `[1,16,128,128]` fp32 latent and the
+  step-0 velocity field from the torch reference, grades xwen's against it on cosine and
+  relative error, and is the GATE; Stage 4 compares the final image by PSNR on the same
+  latent and is reported, not gated. What it prices: whether bf16 activations clear the
+  bar or F32 activations are needed, which is the one open precision question
+  (decisions.md "Verification is a torch dump with an injected latent"). Next step is to
+  extend `scripts/zimage-ref-dump.py` with the latent-injection stage; the official
+  `Tongyi-MAI/Z-Image` repo has an MPS branch so the oracle runs here, and diffusers'
+  `latents` argument is the injection point because the official `generate()` does not
+  expose one. xwen's side is `xwen image --latents <file.safetensors>`, which already
+  exists. Bars get decided from the dump's own spread, and the requirement is that the
+  oracle be fast enough to re-run (2026-09-07).
+  [Record](docs/records/zimage-pipeline.md), [architecture](docs/zimage.md).
+  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
+
+- [ ] [unpriced] **Serve the images route and ship a ComfyUI node.** The user is waiting to
+  drive this from ComfyUI. `POST /v1/images/generations` in the OpenAI shape, with
+  `negative_prompt`, `num_inference_steps`, `guidance_scale` and `seed`/`rng_seed` as
+  top-level extension fields and `quality`/`style`/`n` and the rest accepted and ignored,
+  plus a ComfyUI node of our own rather than hoping an existing one fits
+  (decisions.md "CLI first, then serve as OpenAI"). Two requirements that are easy to
+  miss: the image models must participate in the existing unload-on-idle behaviour, since
+  12.3 GB resident on a server answering language requests is not acceptable; and the
+  serve path is the second consumer that would justify the diffusion `CheckpointSource`
+  arm this arc deferred (2026-09-07).
+  [Record](docs/records/zimage-pipeline.md).
+  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
+
+- [ ] [measured] **Z-Image step time: 5.0-5.5 s per step against a ~3.1 s compute ceiling.**
+  A 1024x1024 step is ~62 TFLOP (roughly 57 of linears at ~4200 tokens, ~10 of attention)
+  against 12.3 GB of weight traffic, so it is compute-bound by 45-160x and weight
+  quantization cannot move it (decisions.md "The transformer runs bf16 end to end"). At
+  the ~19.9 TFLOP/s a large fp16 matmul is reported to reach on this chip the step would
+  be ~3.1 s and at the theoretical ~70 TFLOP/s ~0.9 s, so the headroom is between 1.6x and
+  6x, on inputs that are secondary reports rather than measurements taken here. First step
+  is therefore to measure what this graph's matmuls actually achieve, not to fuse
+  anything. Do not start before Stage 3 exists: there would be nothing to regress against
+  (2026-09-07).
+  [Figures](docs/perf-state.md).
+  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
+
+- [ ] [unpriced] **The image pad-token path: sizes whose token count is not a multiple of 32.**
+  `check_size` accepts a width and height only when both are positive multiples of 16 and
+  `(w/16) * (h/16)` is a multiple of 32, so 1024x1024, 1024x768, 512x512 and 1536x1024
+  pass while 528x528 is refused at 1089 image tokens. The transformer's real rule is
+  looser: `x_pad_token` exists so a ragged image grid can pad up to a multiple of 32,
+  with the pad rows at rope position (0,0,0), participating in attention as ordinary keys
+  and queries and NOT masked. Implementing it is a piece of math with no oracle behind it
+  yet, so it waits on Stage 3 rather than shipping untested. The batched attention-mask
+  path beside it is in the same state (2026-09-07).
+  [Record](docs/records/zimage-pipeline.md).
+  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
+
+- [ ] [small] **Measure the image pipeline's footprint from a user shell.** `footprint`, `ps`
+  and `vmmap` were all refused with "operation not permitted" from the agent sandbox, so
+  the arc that shipped `xwen image` has no memory number at all. Expected from the loads:
+  7.6 GB encoder, 12.3 GB bf16 transformer, 0.34 GB f32 VAE, so ~20 GB plus activations,
+  with the fp32-to-bf16 cast transiently holding one f32 tensor. Five minutes with the GPU
+  free, and the serve route has to plan around whatever it says (2026-09-07).
+  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
 
 ## Research candidates
 

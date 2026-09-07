@@ -34,3 +34,17 @@ on its behalf. The weight format follows from the role rather than from taste - 
 encoder that a pipeline hands to a diffusion model is the HF BF16 safetensors set the
 pipeline itself loads, so this is the first architecture here that is not GGUF
 (2026-09-06).
+
+**Diffusion image transformers are in scope, held to correctness bars first, and their
+wall clock is a secondary figure that ranks nothing.** The design-target line in
+AGENTS.md still names the Qwen 3.6 and 3.8 GGUF checkpoints and Flash-Next, and
+Z-Image-Turbo joins the repo the way the dense 4B did: a scope amendment, not a target
+amendment. The 4B rule extends unchanged, one architecture further out. An image arc is
+graded against the reference pipeline, its time per image lands in
+[docs/perf-state.md](../perf-state.md) so that it can be known, and no image arc is
+allowed to argue for a change to the language models' hot path on its behalf. The reason
+it is in scope at all is that the pipeline already needs this repo's encoder in process,
+called for one hidden state; the reason it is not a tok/s target is that a denoising step
+is prefill-shaped compute where none of the shipped checkpoints' decode levers apply, so
+a lever found here would not transfer and a lever found there is not owed to it. The
+pipeline's own decisions are in [zimage.md](zimage.md) (2026-09-07).

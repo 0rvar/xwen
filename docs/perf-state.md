@@ -235,11 +235,54 @@ runs at the gemm's own rate**, with a ceiling of 3300-4300 depending where in th
 this hardware's peak sits. There is no cheap lever on either, which is the answer this
 section exists to give rather than a problem it poses.
 
+## Z-Image-Turbo, a time per image and not a tok/s target
+
+Kept apart from everything above for the same reason the 4B is: image transformers are in
+scope as a correctness target, and this figure exists so that it can be known
+(decisions.md "Diffusion image transformers are in scope, held to correctness bars
+first"). Nothing here ranks a lever, and nothing here justifies a change to the language
+models' hot path.
+
+Measured 2026-09-07 on a dev-tree release build of 493ae2e, which is **not a pinned
+binary**, at 1024x1024, batch 1, 8 steps, no CFG. `pmset -g` read `lowpowermode 0`; no
+high-power claim. First readings on code that has had no performance work at all, so read
+them as an order of magnitude rather than as a baseline for an A/B.
+
+| Figure | Value |
+| --- | --- |
+| transformer step, each of 8 | 5.0-5.5 s |
+| VAE decode | 4.86-5.11 s |
+| encode, 23-39 tokens | 6 ms warm, 166 ms cold |
+| total wall, one image | 51.7-52.5 s warm, 82.3 s cold |
+| transformer + VAE load | 3.3 s warm, 31.9 s cold (fp32 to bf16 cast) |
+| text encoder load | 0.8 s warm, 3.3 s cold |
+
+Steps creep from 5.0 to 5.5 s across a run, which is most likely thermal and was not
+isolated. Footprint was **not measured**: `footprint`, `ps` and `vmmap` were all refused
+from the agent sandbox. The load figures predict about 20 GB resident (7.6 GB encoder,
+12.3 GB bf16 transformer, 0.34 GB f32 VAE) plus activations, and measuring it from a user
+shell is a ledger item.
+
+**The ceiling to read a step against is compute, not bandwidth, and that inverts every
+intuition the rest of this file has built up.** A 1024x1024 step is about 62 TFLOP (roughly
+57 of linear layers at ~4200 tokens and ~10 of attention) against 12.3 GB of weight
+traffic, an arithmetic intensity near 5100 FLOP/byte where this machine's ridge point is
+24 to 114. Reading the weights is about 20 ms of a multi-second step. At the ~19.9 TFLOP/s
+a large fp16 matmul is reported to reach on this chip a step would be about 3.1 s, so
+today's 5.0-5.5 s is roughly 60% of that; at the theoretical ~70 TFLOP/s with the neural
+accelerators engaged it would be 0.9 s. Both of those inputs are secondary reports rather
+than measurements taken here, so the honest statement is that there is between 1.6x and
+6x of headroom and that the first job of any perf arc on this graph is to measure the
+matmul rate it actually achieves. Quantization is not on that list: it is a footprint
+lever here and cannot move a step (decisions.md "The transformer runs bf16 end to end").
+
 ## History
 
 Narrative, protocol and the tables that produced these figures live in the log and its
 records, not here:
 
+- [records/zimage-pipeline.md](records/zimage-pipeline.md), the 2026-09-07 first image and
+  the conditions its timings were taken under.
 - [records/router-gemv.md](records/router-gemv.md), the 2026-09-06 occupancy lever.
 - [records/fused-moe-shared-expert.md](records/fused-moe-shared-expert.md) and
   [records/hc-gate-ragged-and-probe-decode.md](records/hc-gate-ragged-and-probe-decode.md),

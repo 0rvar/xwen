@@ -4,6 +4,27 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — `xwen image` renders through Z-Image-Turbo: a coherent 1024x1024 in 52 s warm, and no bars on it yet
+
+Arc A, and the first thing in this repo that is not a language model. `xwen image
+--prompt <text>` runs the Z-Image-Turbo pipeline end to end: the repo's own verified
+Qwen3-4B encoder at hidden index 35, the S3-DiT transformer, eight flow-match Euler
+steps, the Flux VAE decoder, a PNG. The transformer, VAE, scheduler and sampler are
+candle's `z_image` at rev 21cca0b vendored into `src/zimage/` and corrected in four
+places against the reference, none of them an optimization. Two prompts came out
+photorealistic and prompt-faithful with legible sign text, and a seed reproduces
+byte-identically across processes. **Timings: 5.0-5.5 s per transformer step, eight
+steps, VAE decode ~5 s, ~52 s wall warm**, with transformer and VAE load 3.3 s warm and
+31.9 s cold on the fp32-to-bf16 cast; `pmset -g` read `lowpowermode 0` and no
+performance work was done. The registry entry is `Model::ZImageTurbo` under a new
+`Format::Diffusion`, not servable and not auto-fetched, and the encoder alias moved to
+`zimage-turbo-encoder`. What is NOT verified is the arithmetic: there is no reference
+dump of the transformer yet, so the block math is graded by reading and by the images
+looking right, and that is Arc B. Image transformers are in scope as a correctness
+target with a secondary time-per-image figure, on the same terms as the dense 4B.
+[Record](records/zimage-pipeline.md), [architecture](zimage.md),
+[decisions](decisions/zimage.md), [figures](perf-state.md).
+
 ## 2026-09-07 — Dense Qwen3 parity bars decided: Stage 1 passes on both oracle arms, consistency at 0.2, the sdpa ablation rules the attention kernel out
 
 Arc 4, the last of the dense Qwen3-4B arcs and the one that turns two measurements into
