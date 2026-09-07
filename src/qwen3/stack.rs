@@ -624,14 +624,18 @@ mod tests {
 
     /// A tiny config at the real head size (128 is what the flash kernel and
     /// the loader both pin) with every projection inside the kernels' shape
-    /// rules: hidden 64, q 256, kv 128, intermediate 96, vocab 32.
+    /// rules: hidden 64, q 512, kv 256, intermediate 96, vocab 32. Four query
+    /// heads over two KV heads, so the GQA head mapping (query head h reads KV
+    /// head h / 2) is exercised rather than collapsed onto one KV head, and
+    /// hidden differs from every projection width so a transposed plane
+    /// cannot pass the shape check by coincidence.
     fn tiny_config(n_layer: usize) -> Qwen3Config {
         Qwen3Config {
             hidden_size: 64,
             intermediate_size: 96,
             n_layer,
-            n_head: 2,
-            n_kv_head: 1,
+            n_head: 4,
+            n_kv_head: 2,
             rms_norm_eps: 1e-6,
             vocab_size: 32,
             max_position_embeddings: 4096,
@@ -756,15 +760,23 @@ mod tests {
         t.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap()
     }
 
+    /// Largest |a - b| over two equal-shape row sets. Every value is required
+    /// to be finite FIRST: `f32::max` returns its non-NaN operand, so a fold
+    /// over a NaN-filled output would read as a perfect match.
     fn max_abs_diff(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
         assert_eq!(a.len(), b.len());
-        a.iter()
-            .zip(b)
-            .flat_map(|(x, y)| {
-                assert_eq!(x.len(), y.len());
-                x.iter().zip(y).map(|(p, q)| (p - q).abs())
-            })
-            .fold(0.0, f32::max)
+        let mut worst = 0f32;
+        for (r, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(x.len(), y.len());
+            for (c, (p, q)) in x.iter().zip(y).enumerate() {
+                assert!(
+                    p.is_finite() && q.is_finite(),
+                    "non-finite value at row {r} column {c}: {p} vs {q}"
+                );
+                worst = worst.max((p - q).abs());
+            }
+        }
+        worst
     }
 
     /// The shapes every entry point returns at the tiny geometry: all-position
@@ -858,11 +870,7 @@ mod tests {
             let pos = 19 + (i - 10);
             let x = fused.forward(&t, pos).unwrap().to_vec1::<f32>().unwrap();
             let y = sdpa.forward(&t, pos).unwrap().to_vec1::<f32>().unwrap();
-            let d = x
-                .iter()
-                .zip(&y)
-                .map(|(p, q)| (p - q).abs())
-                .fold(0.0, f32::max);
+            let d = max_abs_diff(&[x.clone()], &[y.clone()]);
             assert!(d <= 2e-2, "decode step {i}: max abs diff {d}");
             assert_eq!(argmax(&x), argmax(&y), "decode step {i}: argmax");
         }
@@ -912,7 +920,7 @@ mod tests {
         let (h2, _) = model.encode(&ids, 2).unwrap();
         assert_eq!(max_abs_diff(&rows(&h2), &rows(&normed)), 0.0);
         // And the pre-o_proj tap exists at the attention width.
-        assert_eq!(tap("kqv_out-1").dims(), &[12, 256]);
+        assert_eq!(tap("kqv_out-1").dims(), &[12, 512]);
     }
 
     fn argmax(v: &[f32]) -> usize {

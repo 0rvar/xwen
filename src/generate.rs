@@ -1847,10 +1847,15 @@ impl Generator {
             }
         };
 
-        // ---- Decode: sample, stream, feed back, one token at a time. The
-        // rendered prompt's `</think>` is part of the text stream this path
-        // hands out (the REPL splits on the literal), so the loop runs entirely
-        // in the answer section and forwards every chunk verbatim.
+        // ---- Decode: sample, stream, feed back, one token at a time.
+        //
+        // This path hands the caller raw text, and its callers find the
+        // reasoning/answer boundary by splitting on the literal `</think>` (the
+        // REPL, and `xwen generate`'s own printing). So the markers stay in the
+        // stream and every chunk is forwarded verbatim, whichever section the
+        // state machine assigns it to — the events are still tagged, which is
+        // what arms the think budget on a model-written opener, but the tag
+        // changes no bytes.
         let mut forward_text = |event: GenEvent| {
             if !event.text().is_empty() {
                 on_text(event.text());
@@ -1860,6 +1865,7 @@ impl Generator {
             logits,
             pos,
             entry,
+            MarkerText::Keep,
             max_tokens,
             &mut forward_text,
             should_stop,
@@ -2207,7 +2213,15 @@ impl Generator {
             .take()
             .ok_or_else(|| anyhow!("decode_loop: no prefill logits; call prefill_tokens first"))?;
         self.think.reset();
-        self.decode_tokens(logits, start_pos, entry, max_new, on_event, should_stop)
+        self.decode_tokens(
+            logits,
+            start_pos,
+            entry,
+            MarkerText::Strip,
+            max_new,
+            on_event,
+            should_stop,
+        )
     }
 
     /// Speculative counterpart to [`decode_loop`](Self::decode_loop): same
@@ -2269,7 +2283,14 @@ impl Generator {
         // of both shapes. Dispatched here, before `self` is split into field
         // borrows, because the other loop needs all of `self` back.
         if matches!(self.drafter, Some(AttachedDrafter::Mtp(_))) {
-            return self.decode_loop_mtp(start_pos, entry, max_new, on_event, should_stop);
+            return self.decode_loop_mtp(
+                start_pos,
+                entry,
+                MarkerText::Strip,
+                max_new,
+                on_event,
+                should_stop,
+            );
         }
         let ban_floor = self.ban_ids(true);
         let ban_plain = self.ban_ids(false);
@@ -2321,7 +2342,12 @@ impl Generator {
         // The reasoning/answer cursor: which section each committed token lands
         // in, and whether an opener the prompt left to the model is still
         // owed. Built before the decode stream borrows the tokenizer.
-        let mut section = SectionState::new(entry, tokenizer.specials());
+        //
+        // This loop is reached only from `decode_loop_spec`, whose callers all
+        // consume `GenEvent`s and read the section off the variant — the
+        // raw-text `generate_spec` runs its own rounds and never comes through
+        // here — so the markers are stripped rather than made a parameter.
+        let mut section = SectionState::new(entry, tokenizer.specials(), MarkerText::Strip);
         if matches!(entry, ThinkingEntry::ModelOpens) {
             think.hold_for_opener();
         }
@@ -2768,6 +2794,7 @@ impl Generator {
         &mut self,
         start_pos: usize,
         entry: ThinkingEntry,
+        markers: MarkerText,
         max_new: usize,
         on_event: &mut dyn FnMut(GenEvent),
         should_stop: &mut dyn FnMut() -> bool,
@@ -2827,7 +2854,7 @@ impl Generator {
         // The reasoning/answer cursor: which section each committed token lands
         // in, and whether an opener the prompt left to the model is still
         // owed. Built before the decode stream borrows the tokenizer.
-        let mut section = SectionState::new(entry, tokenizer.specials());
+        let mut section = SectionState::new(entry, tokenizer.specials(), markers);
         if matches!(entry, ThinkingEntry::ModelOpens) {
             think.hold_for_opener();
         }
@@ -3186,6 +3213,7 @@ impl Generator {
         mut logits: Tensor,
         start_pos: usize,
         entry: ThinkingEntry,
+        markers: MarkerText,
         max_new: usize,
         on_event: &mut dyn FnMut(GenEvent),
         should_stop: &mut dyn FnMut() -> bool,
@@ -3207,7 +3235,7 @@ impl Generator {
         let mut decoded = 0usize;
         // The reasoning/answer cursor: which section each committed token lands
         // in, and whether an opener the prompt left to the model is still owed.
-        let mut section = SectionState::new(entry, self.tokenizer.specials());
+        let mut section = SectionState::new(entry, self.tokenizer.specials(), markers);
         if matches!(entry, ThinkingEntry::ModelOpens) {
             self.think.hold_for_opener();
         }
@@ -3852,9 +3880,9 @@ impl Generator {
             });
         }
 
-        // The rendered prompt's `</think>` is part of the text stream this path
-        // hands out (the REPL splits on the literal), so every chunk is
-        // forwarded verbatim whichever section the round assigns it to.
+        // Raw text, like the plain path above: the markers stay in the stream
+        // so the caller can still split on the literal `</think>`, and every
+        // chunk is forwarded verbatim whichever section the round assigns it to.
         let mut forward_text = |event: GenEvent| {
             if !event.text().is_empty() {
                 on_text(event.text());
@@ -3863,6 +3891,7 @@ impl Generator {
         let outcome = self.decode_loop_mtp(
             tokens.len(),
             entry,
+            MarkerText::Keep,
             max_tokens,
             &mut forward_text,
             should_stop,
@@ -4265,6 +4294,25 @@ fn retained_commits(committed: usize, emitted: usize, hit_eog: bool) -> usize {
 /// ([`ThinkingEntry::ModelOpens`] — the Qwen3 base template with thinking on).
 /// It is left on `</think>`. Under [`ThinkingEntry::Answer`] neither marker
 /// means anything and every token is answer text.
+/// Whether the events a decode loop hands out keep the `<think>` and
+/// `</think>` markers in their text.
+///
+/// Two consumers with opposite needs, which is why this is a per-call decision
+/// and not a property of the state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerText {
+    /// Strip them. The event's own variant already says which section the token
+    /// belongs to, so the marker is redundant there and would otherwise be
+    /// delivered as reasoning prose. What serve's reasoning channel and the
+    /// batch runner consume.
+    Strip,
+    /// Keep them, byte for byte as the model wrote them. The raw-text surfaces
+    /// hand their stream to callers that find the reasoning/answer boundary by
+    /// splitting on the literal `</think>` — the REPL and `xwen generate` — so
+    /// removing it would leave them unable to find the boundary at all.
+    Keep,
+}
+
 struct SectionState {
     /// The decoder is inside a reasoning block.
     in_thinking: bool,
@@ -4282,10 +4330,12 @@ struct SectionState {
     /// paces a block, and until one exists there is nothing to pace. Never true
     /// on a seeded prompt, whose budget was armed before the first draw.
     opened_now: bool,
+    /// Whether the markers survive into the text this hands out.
+    markers: MarkerText,
 }
 
 impl SectionState {
-    fn new(entry: ThinkingEntry, specials: &Specials) -> Self {
+    fn new(entry: ThinkingEntry, specials: &Specials, markers: MarkerText) -> Self {
         Self {
             in_thinking: entry.starts_in_thinking(),
             awaiting_opener: matches!(entry, ThinkingEntry::ModelOpens),
@@ -4293,6 +4343,27 @@ impl SectionState {
             think_close: specials.think_close,
             thinking_tokens: 0,
             opened_now: false,
+            markers,
+        }
+    }
+
+    /// The text of a marker token, per this call's [`MarkerText`] policy.
+    ///
+    /// Under `Strip`, what survives is the reasoning side of the marker: what
+    /// FOLLOWS an opener and what PRECEDES a closer. A decode step finalizes
+    /// text only through the token just fed, so an opener is its chunk's head
+    /// and a closer its chunk's tail, and the reasoning lies between them.
+    fn marker_text(&self, text: String, opening: bool) -> String {
+        if self.markers == MarkerText::Keep {
+            return text;
+        }
+        let marker = if opening { "<think>" } else { "</think>" };
+        match text.split_once(marker) {
+            Some((before, after)) => {
+                let kept = if opening { after } else { before };
+                kept.to_string()
+            }
+            None => text,
         }
     }
 
@@ -4300,11 +4371,12 @@ impl SectionState {
     /// reasoning bookkeeping. `text` is what the streaming decoder finalized
     /// for this token (empty when it withheld it).
     ///
-    /// Both markers are stripped from the text they arrive in and neither is
-    /// reported as reasoning prose, so a seeded block and a model-opened one
-    /// deliver the same event stream: a decode step finalizes text only through
-    /// the token just fed, so `</think>` is its chunk's tail and `<think>` is
-    /// its chunk's head. Each still counts toward `thinking_tokens`.
+    /// A seeded block and a model-opened one hand out the same event stream:
+    /// each marker is tagged as reasoning, counts toward `thinking_tokens`, and
+    /// carries whatever [`SectionState::marker_text`] leaves of its chunk. The
+    /// stream's BYTES therefore depend only on the [`MarkerText`] policy and not
+    /// on which dialect the prompt rendered under, which is what lets a raw-text
+    /// caller keep splitting on the literal markers whatever it is talking to.
     fn tag(&mut self, token: u32, text: String) -> GenEvent {
         self.opened_now = false;
         if self.awaiting_opener {
@@ -4313,12 +4385,9 @@ impl SectionState {
                 self.in_thinking = true;
                 self.opened_now = true;
                 self.thinking_tokens += 1;
-                let opened = text
-                    .split_once("<think>")
-                    .map_or(text.as_str(), |(_, after)| after);
                 return GenEvent::ThinkingTok {
                     id: token,
-                    text: opened.to_string(),
+                    text: self.marker_text(text, true),
                 };
             }
         }
@@ -4330,12 +4399,9 @@ impl SectionState {
             return GenEvent::ThinkingTok { id: token, text };
         }
         self.in_thinking = false;
-        let reasoning = text
-            .split_once("</think>")
-            .map_or(text.as_str(), |(before, _)| before);
         GenEvent::ThinkingTok {
             id: token,
-            text: reasoning.to_string(),
+            text: self.marker_text(text, false),
         }
     }
 }
@@ -4765,7 +4831,11 @@ mod tests {
     // answer text that does not.
     #[test]
     fn a_seeded_block_ends_its_reasoning_at_the_marker() {
-        let mut section = SectionState::new(ThinkingEntry::Seeded, &section_specials());
+        let mut section = SectionState::new(
+            ThinkingEntry::Seeded,
+            &section_specials(),
+            MarkerText::Strip,
+        );
 
         let event = section.tag(7, "step one".into());
         assert!(matches!(event, GenEvent::ThinkingTok { id: 7, .. }));
@@ -4792,7 +4862,11 @@ mod tests {
     // text, `</think>` included — there is no block for it to close.
     #[test]
     fn an_answer_entry_counts_nothing_as_reasoning() {
-        let mut section = SectionState::new(ThinkingEntry::Answer, &section_specials());
+        let mut section = SectionState::new(
+            ThinkingEntry::Answer,
+            &section_specials(),
+            MarkerText::Strip,
+        );
         let event = section.tag(LagunaTokenizer::THINK_CLOSE, "</think>".into());
         assert!(matches!(event, GenEvent::TextTok { .. }));
         assert_eq!(event.text(), "</think>");
@@ -4805,11 +4879,136 @@ mod tests {
         assert!(!section.opened_now);
     }
 
+    /// What the raw-text surfaces actually hand their caller: the concatenation
+    /// of every non-empty chunk, exactly as `generate`'s and `generate_mtp`'s
+    /// `forward_text` closures build it.
+    fn streamed(entry: ThinkingEntry, markers: MarkerText, script: &[(u32, &str)]) -> String {
+        let mut section = SectionState::new(entry, &section_specials(), markers);
+        let mut out = String::new();
+        for &(token, text) in script {
+            let event = section.tag(token, text.to_string());
+            if !event.text().is_empty() {
+                out.push_str(event.text());
+            }
+        }
+        out
+    }
+
+    /// One reply as the streaming decoder would finalize it on a 3.6/3.8
+    /// checkpoint with thinking on: the header already opened the block, so the
+    /// model writes reasoning, closes it, and answers.
+    const SEEDED_REPLY: [(u32, &str); 4] = [
+        (7, "two plus two"),
+        (8, " is four"),
+        (LagunaTokenizer::THINK_CLOSE, ".</think>"),
+        (9, "\n\n4"),
+    ];
+
+    // The raw-text loops hand their caller the model's bytes, markers included.
+    //
+    // This is the shipped checkpoints' contract and it predates the thinking
+    // entry: `generate` used to pass a hardcoded "not thinking" and forward
+    // every chunk verbatim. Its callers find the reasoning/answer boundary by
+    // splitting the STREAM on the literal `</think>` — the REPL dims what
+    // precedes it — so a marker removed here does not move a boundary, it
+    // deletes one.
+    #[test]
+    fn the_raw_text_stream_keeps_the_closing_marker_on_a_seeded_reply() {
+        assert_eq!(
+            streamed(ThinkingEntry::Seeded, MarkerText::Keep, &SEEDED_REPLY),
+            "two plus two is four.</think>\n\n4"
+        );
+    }
+
+    // The same reply under a prompt that left the opener to the model: both
+    // markers reach the caller, so the stream has the same shape as the seeded
+    // one and the same split finds the same boundary.
+    #[test]
+    fn the_raw_text_stream_keeps_both_markers_on_a_model_opened_reply() {
+        let script = [
+            (LagunaTokenizer::THINK_OPEN, "<think>"),
+            (7, "two plus two"),
+            (8, " is four"),
+            (LagunaTokenizer::THINK_CLOSE, ".</think>"),
+            (9, "\n\n4"),
+        ];
+        assert_eq!(
+            streamed(ThinkingEntry::ModelOpens, MarkerText::Keep, &script),
+            "<think>two plus two is four.</think>\n\n4"
+        );
+
+        // Keeping the markers changes the bytes only. The state machine still
+        // tags the sections, which is what arms the think budget on the opener
+        // and what the grammar rides — those key on ids, never on text.
+        let mut section = SectionState::new(
+            ThinkingEntry::ModelOpens,
+            &section_specials(),
+            MarkerText::Keep,
+        );
+        let event = section.tag(LagunaTokenizer::THINK_OPEN, "<think>".into());
+        assert!(matches!(event, GenEvent::ThinkingTok { .. }));
+        assert_eq!(event.text(), "<think>", "the marker reaches the caller");
+        assert!(section.in_thinking);
+        assert!(section.opened_now, "the budget is still armed here");
+        assert_eq!(section.thinking_tokens, 1);
+    }
+
+    // The event-consuming surfaces get the other policy, and it is the one that
+    // was already shipping: serve reads the section off the event variant and
+    // forwards the text to its reasoning channel, where a marker would be prose
+    // the model never wrote. Both entries strip the same way, so the reasoning
+    // and the answer come out identical whichever dialect rendered the prompt.
+    #[test]
+    fn the_event_stream_strips_the_markers_under_either_entry() {
+        assert_eq!(
+            streamed(ThinkingEntry::Seeded, MarkerText::Strip, &SEEDED_REPLY),
+            "two plus two is four.\n\n4"
+        );
+        let opened = [
+            (LagunaTokenizer::THINK_OPEN, "<think>"),
+            (7, "two plus two"),
+            (8, " is four"),
+            (LagunaTokenizer::THINK_CLOSE, ".</think>"),
+            (9, "\n\n4"),
+        ];
+        assert_eq!(
+            streamed(ThinkingEntry::ModelOpens, MarkerText::Strip, &opened),
+            "two plus two is four.\n\n4"
+        );
+    }
+
+    // A reply with no reasoning at all is untouched by either policy: with
+    // nothing to strip, the two agree byte for byte.
+    #[test]
+    fn a_marker_free_reply_streams_the_same_under_both_policies() {
+        let script = [(1u32, "The answer"), (2, " is 4."), (3, "")];
+        for entry in [
+            ThinkingEntry::Answer,
+            ThinkingEntry::Seeded,
+            ThinkingEntry::ModelOpens,
+        ] {
+            assert_eq!(
+                streamed(entry, MarkerText::Keep, &script),
+                "The answer is 4.",
+                "keep, {entry:?}"
+            );
+            assert_eq!(
+                streamed(entry, MarkerText::Strip, &script),
+                "The answer is 4.",
+                "strip, {entry:?}"
+            );
+        }
+    }
+
     // A token the streaming decoder withheld (mid-UTF-8, or a partial tag prefix)
     // still counts and still carries its real id — only its text is empty.
     #[test]
     fn a_withheld_token_still_counts_as_reasoning() {
-        let mut section = SectionState::new(ThinkingEntry::Seeded, &section_specials());
+        let mut section = SectionState::new(
+            ThinkingEntry::Seeded,
+            &section_specials(),
+            MarkerText::Strip,
+        );
         let event = section.tag(42, String::new());
         assert_eq!(event.id(), 42);
         assert!(event.text().is_empty());
@@ -4823,7 +5022,11 @@ mod tests {
     // block and this one hand out the same event stream.
     #[test]
     fn a_model_written_opener_enters_the_block() {
-        let mut section = SectionState::new(ThinkingEntry::ModelOpens, &section_specials());
+        let mut section = SectionState::new(
+            ThinkingEntry::ModelOpens,
+            &section_specials(),
+            MarkerText::Strip,
+        );
         assert!(!section.in_thinking, "the header opened nothing");
 
         let event = section.tag(LagunaTokenizer::THINK_OPEN, "<think>".into());
@@ -4852,7 +5055,11 @@ mod tests {
     // and nothing ever arms the budget.
     #[test]
     fn a_reply_with_no_opener_is_all_answer_text() {
-        let mut section = SectionState::new(ThinkingEntry::ModelOpens, &section_specials());
+        let mut section = SectionState::new(
+            ThinkingEntry::ModelOpens,
+            &section_specials(),
+            MarkerText::Strip,
+        );
         for (token, text) in [(1u32, "The"), (2, " answer"), (3, " is 4.")] {
             let event = section.tag(token, text.into());
             assert!(matches!(event, GenEvent::TextTok { .. }), "{text:?}");
@@ -4867,7 +5074,11 @@ mod tests {
     // the reply is the model writing about one — text, not a section change.
     #[test]
     fn an_opener_that_is_not_first_is_ordinary_text() {
-        let mut section = SectionState::new(ThinkingEntry::ModelOpens, &section_specials());
+        let mut section = SectionState::new(
+            ThinkingEntry::ModelOpens,
+            &section_specials(),
+            MarkerText::Strip,
+        );
         let event = section.tag(1, "Let me ".into());
         assert!(matches!(event, GenEvent::TextTok { .. }));
 
@@ -4891,7 +5102,7 @@ mod tests {
         .thinking_entry;
         assert_eq!(entry, ThinkingEntry::Answer);
 
-        let mut section = SectionState::new(entry, &section_specials());
+        let mut section = SectionState::new(entry, &section_specials(), MarkerText::Strip);
         let event = section.tag(LagunaTokenizer::THINK_OPEN, "<think>".into());
         assert!(matches!(event, GenEvent::TextTok { .. }));
         assert!(!section.in_thinking);

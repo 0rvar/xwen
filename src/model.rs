@@ -336,6 +336,22 @@ impl XwenModel {
              (flash_attn) and activation (silu_mul) are vendored Metal kernels"
         );
         let attn = crate::qwen3::AttnImpl::from_env()?;
+        // An infinity or a NaN in a weight is not a precision question: on the
+        // gemv it reaches the output as itself, on the tensor gemm as inf, and
+        // neither kernel reports it. The subnormal tail is different in kind —
+        // it flushes on one path and survives on the other, a documented
+        // asymmetry the loader logs as a count — so it stays a warning.
+        let nonfinite = set.nonfinite_planes();
+        ensure!(
+            nonfinite.is_empty(),
+            "{} carries non-finite BF16 weights and cannot run: {}",
+            set.dir().display(),
+            nonfinite
+                .iter()
+                .map(|(name, count)| format!("{name} ({count} inf/NaN)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         let load_start = std::time::Instant::now();
         let crate::qwen3::Qwen3Weights {

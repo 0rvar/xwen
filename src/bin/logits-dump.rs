@@ -421,7 +421,7 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
         // bit-identical to the chain it replaces, so parity-gate.ts pins
         // "classic" for reference and strict dumps and the bounded tiers grade
         // "fused" against it.
-        "delta": observed_delta_path()?,
+        "delta": observed_delta_path(model.config())?,
         // Dense-checkpoint SwiGLU FFN prefill gemm: "fused" (the vendored
         // cooperative-tensor kernel, the Metal default) or "classic" (candle's
         // QMatMul chain, under XWEN_DENSE_MM_CLASSIC). Env-derived for every
@@ -546,7 +546,13 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
 /// records what ran, and refuses to be written at all when that contradicts the
 /// environment or splits across both paths (one dump carries one label; a mixed
 /// run has no honest one).
-fn observed_delta_path() -> Result<&'static str> {
+fn observed_delta_path(cfg: &xwen::XwenConfig) -> Result<&'static str> {
+    // An all-attention checkpoint (the Qwen3 dense stack) has no DeltaNet
+    // layer to observe: the field says so rather than claiming a path, and
+    // the counters below stay zero by construction.
+    if !(0..cfg.n_layer).any(|il| !cfg.is_full_attn(il)) {
+        return Ok("n/a");
+    }
     let (fused, classic) = xwen::linear_attn::delta_path_counts();
     let expected = if xwen::ops::delta_classic() {
         "classic"
@@ -588,6 +594,12 @@ fn main() -> Result<()> {
     };
     let source = CheckpointSource::open(&path, &device, cli.model_size)?;
     let cfg = source.config()?;
+    // The same cross-check every surface applies: a --model-size that
+    // contradicts what the file says it is fails here, before the load.
+    source.identify(&cfg, cli.model_size, "--model-size")?;
+    // The checkpoint's own tokenizer, when it ships one (a safetensors set);
+    // captured before the load consumes the source.
+    let checkpoint_tokenizer = source.tokenizer_path().map(std::path::Path::to_path_buf);
     let vocab = cfg.vocab;
     // The greedy/replay decode dumps record each step's top1/top2 from
     // `step_top5`, which indexes `top5[0]`/`top5[1]`; a degenerate vocab would
@@ -613,7 +625,14 @@ fn main() -> Result<()> {
             cli.greedy.is_none() && cli.replay.is_none(),
             "--ppl is mutually exclusive with --greedy/--replay"
         );
-        return run_ppl(&cli, model, &device, vocab, &corpus);
+        return run_ppl(
+            &cli,
+            model,
+            &device,
+            vocab,
+            &corpus,
+            checkpoint_tokenizer.as_deref(),
+        );
     }
 
     match (cli.greedy, &cli.replay) {
@@ -656,11 +675,15 @@ fn run_ppl(
     device: &Device,
     vocab: usize,
     corpus: &std::path::Path,
+    checkpoint_tokenizer: Option<&std::path::Path>,
 ) -> Result<()> {
-    let tokenizer = match &cli.tokenizer {
-        Some(path) => LagunaTokenizer::from_file(path)
+    // The flag, else the checkpoint's own tokenizer.json (a safetensors set
+    // ships one and it is a different vocabulary from the embedded Qwen 3.6
+    // one), else the embedded tokenizer — the rule `Generator::load` applies.
+    let tokenizer = match (cli.tokenizer.as_deref(), checkpoint_tokenizer) {
+        (Some(path), _) | (None, Some(path)) => LagunaTokenizer::from_file(path)
             .with_context(|| format!("loading tokenizer {}", path.display()))?,
-        None => LagunaTokenizer::embedded()?,
+        (None, None) => LagunaTokenizer::embedded()?,
     };
     let text = std::fs::read_to_string(corpus)
         .with_context(|| format!("reading corpus {}", corpus.display()))?;

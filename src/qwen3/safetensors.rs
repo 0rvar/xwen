@@ -248,6 +248,11 @@ pub struct Qwen3Set {
     has_lm_head: bool,
     zero_runs: Vec<(String, ZeroRun)>,
     range: RangeScan,
+    /// Every BF16 projection plane holding an infinity or a NaN, with its
+    /// count. Empty on every shipped checkpoint; a stack refuses to load a set
+    /// where it is not, because such a weight poisons every activation it
+    /// touches and no kernel reports it.
+    nonfinite: Vec<(String, u64)>,
     checkpoint: CheckpointId,
 }
 
@@ -488,6 +493,7 @@ impl Qwen3Set {
         let scans = scan_planes(&planes);
 
         let mut zero_runs = Vec::new();
+        let mut nonfinite = Vec::new();
         let mut range = RangeScan::default();
         let mut worst_below: Option<(&str, u64)> = None;
         let mut worst_above: Option<(&str, u64)> = None;
@@ -495,6 +501,9 @@ impl Qwen3Set {
             range.below_f16_subnormal += scan.below;
             range.above_f16_max += scan.above;
             range.elements += scan.elements;
+            if scan.nonfinite > 0 {
+                nonfinite.push(((*name).to_string(), scan.nonfinite));
+            }
             if scan.below > worst_below.map_or(0, |(_, n)| n) {
                 worst_below = Some((name, scan.below));
             }
@@ -555,6 +564,7 @@ impl Qwen3Set {
             has_lm_head,
             zero_runs,
             range,
+            nonfinite,
             checkpoint,
         })
     }
@@ -600,6 +610,12 @@ impl Qwen3Set {
     /// How much of the weight sits outside f16's range. See [`RangeScan`].
     pub fn range_scan(&self) -> RangeScan {
         self.range
+    }
+
+    /// The BF16 projection planes that hold an infinity or a NaN, each with
+    /// its count, in tensor order. Empty on an intact checkpoint.
+    pub fn nonfinite_planes(&self) -> &[(String, u64)] {
+        &self.nonfinite
     }
 
     /// Identity of this checkpoint: the same [`CheckpointId`] a GGUF open
@@ -893,6 +909,8 @@ fn checkpoint_id(config: &Path, index: &Path, shards: &[Shard]) -> Result<Checkp
 struct PlaneScan {
     below: u64,
     above: u64,
+    /// Infinities and NaNs (counted in `above` as well).
+    nonfinite: u64,
     /// Elements in the plane.
     elements: u64,
     /// The longest run of exact zeros, if there is one at all.
@@ -904,6 +922,7 @@ struct PlaneScan {
 struct ChunkScan {
     below: u64,
     above: u64,
+    nonfinite: u64,
     /// Elements in this chunk.
     len: usize,
     /// Length of the zero run this chunk opens with.
@@ -972,6 +991,10 @@ fn scan_chunk(bytes: &[u8]) -> ChunkScan {
             out.below += 1;
         } else if mag >= F16_OVERFLOW {
             out.above += 1;
+            // BF16 exponent all ones: an infinity (mantissa 0) or a NaN.
+            if mag >= 0x7F80 {
+                out.nonfinite += 1;
+            }
         }
     }
     if leading {
@@ -1005,6 +1028,7 @@ fn stitch(chunks: &[ChunkScan]) -> PlaneScan {
     for c in chunks {
         out.below += c.below;
         out.above += c.above;
+        out.nonfinite += c.nonfinite;
         out.elements += c.len as u64;
         if c.all_zero {
             if carry == 0 {
@@ -1035,7 +1059,9 @@ fn stitch(chunks: &[ChunkScan]) -> PlaneScan {
 }
 
 /// Scan one plane sequentially at a chosen chunk size. The scan's answer does
-/// not depend on that size, which is the whole point of testing it at several.
+/// not depend on that size, which is the whole point of testing it at several;
+/// production goes through the pooled `scan_planes`, so this is test-only.
+#[cfg(test)]
 fn scan_one(bytes: &[u8], chunk_bytes: usize) -> PlaneScan {
     let chunks: Vec<ChunkScan> = bytes.chunks(chunk_bytes.max(2)).map(scan_chunk).collect();
     stitch(&chunks)
@@ -1977,6 +2003,20 @@ mod tests {
         let scan = set.range_scan();
         assert_eq!(scan.below_f16_subnormal, 1);
         assert_eq!(scan.above_f16_max, 1);
+        // A finite value over f16's ceiling is not a nonfinite one.
+        assert!(set.nonfinite_planes().is_empty());
+
+        // Now an infinity and a NaN in the same plane: both count as above
+        // the ceiling and both are reported, by plane, as nonfinite.
+        let mut bytes = std::fs::read(&shard).unwrap();
+        let inf = half::bf16::INFINITY.to_bits();
+        let nan = half::bf16::NAN.to_bits();
+        bytes[start + 6..start + 8].copy_from_slice(&inf.to_le_bytes());
+        bytes[start + 8..start + 10].copy_from_slice(&(nan | 0x8000).to_le_bytes());
+        std::fs::write(&shard, bytes).unwrap();
+        let set = Qwen3Set::open(&dir, None, &[]).unwrap();
+        assert_eq!(set.range_scan().above_f16_max, 3);
+        assert_eq!(set.nonfinite_planes(), &[(name.to_string(), 2u64)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

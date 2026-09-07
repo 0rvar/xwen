@@ -8,7 +8,10 @@
 //! logit difference <= 2e-2 and an identical argmax at every position
 //! (docs/parity.md, the qwen3 section).
 //!
-//! Ignored by default (needs the 8 GB checkpoint and a Metal device):
+//! Ignored by default (needs the 8 GB checkpoint and a Metal device). ONE test
+//! body, deliberately: the second half switches the attention arm through the
+//! process environment before a load, and two tests in this binary would run
+//! in parallel under the default harness and race on it.
 //!
 //!   cargo test --release --test qwen3_consistency -- --ignored --nocapture
 //!
@@ -113,7 +116,9 @@ fn logits_in_chunks(
 }
 
 /// Compare two all-position logit sets under the bar; returns the measured
-/// max-abs difference and panics with the first offending position.
+/// max-abs difference and panics with the first offending position. Every
+/// value must be finite before anything is folded: `f32::max` returns its
+/// non-NaN operand, so a NaN-filled output would otherwise read as a match.
 fn assert_same(label: &str, a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
     assert_eq!(a.len(), b.len(), "{label}: position counts differ");
     let mut worst = 0f32;
@@ -123,11 +128,14 @@ fn assert_same(label: &str, a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
             y.len(),
             "{label}: vocab widths differ at position {p}"
         );
-        let d = x
-            .iter()
-            .zip(y)
-            .map(|(u, v)| (u - v).abs())
-            .fold(0f32, f32::max);
+        let mut d = 0f32;
+        for (i, (u, v)) in x.iter().zip(y).enumerate() {
+            assert!(
+                u.is_finite() && v.is_finite(),
+                "{label}: non-finite logit at position {p} index {i}: {u} vs {v}"
+            );
+            d = d.max((u - v).abs());
+        }
         worst = worst.max(d);
         assert!(
             d <= MAX_ABS,
@@ -144,7 +152,7 @@ fn assert_same(label: &str, a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 
 #[test]
 #[ignore]
-fn chunked_teacher_forcing_matches_one_prefill_at_every_position() -> Result<()> {
+fn the_qwen3_stack_is_consistent_across_chunkings_arms_and_encode_indices() -> Result<()> {
     let Some(dir) = checkpoint_dir() else {
         eprintln!(
             "skipping: Qwen3-4B is not in the Hugging Face cache and XWEN_QWEN3_DIR is unset"
@@ -152,6 +160,20 @@ fn chunked_teacher_forcing_matches_one_prefill_at_every_position() -> Result<()>
         return Ok(());
     };
     let device = xwen::gguf::metal_device()?;
+    // The encode-index half first: it loads under the default arm and must
+    // not observe the environment switch the second half sets.
+    encode_indices_match_the_forward_taps(&dir, &device)?;
+    chunked_teacher_forcing_matches_one_prefill_at_every_position(&dir, &device)
+}
+
+/// The same ids as one prefill, one token at a time and in uneven chunks, on
+/// the fused arm; then the sdpa arm against the fused arm and its own chunkings.
+fn chunked_teacher_forcing_matches_one_prefill_at_every_position(
+    dir: &PathBuf,
+    device: &Device,
+) -> Result<()> {
+    let device = device.clone();
+    let dir = dir.clone();
     let prompts = fixture_ids()?;
 
     // The shipped arm first: one prefill against every chunking.
@@ -179,7 +201,9 @@ fn chunked_teacher_forcing_matches_one_prefill_at_every_position() -> Result<()>
     // The bisect arm, loaded in-process with the switch set before the load
     // (the arm is resolved per load, not per process), against the fused
     // arm's one-prefill logits and its own chunkings.
-    // SAFETY: single-threaded test binary; nothing else reads the environment.
+    // SAFETY: this binary has exactly one test and it runs both halves
+    // sequentially on this thread; nothing else in the process reads or writes
+    // the environment while the variable is set.
     unsafe { std::env::set_var(ATTN_ENV, "sdpa") };
     let mut sdpa = load(&dir, &device)?;
     assert_eq!(
@@ -209,17 +233,9 @@ fn chunked_teacher_forcing_matches_one_prefill_at_every_position() -> Result<()>
 /// checkpoint: index 0 is the embedding rows, index 36 is the normed residual
 /// after layer 35 (the full forward's `l_out-35` tap through `output_norm`),
 /// and index 35 is that residual raw (the `l_out-34` tap).
-#[test]
-#[ignore]
-fn encode_indices_match_the_forward_taps() -> Result<()> {
-    let Some(dir) = checkpoint_dir() else {
-        eprintln!(
-            "skipping: Qwen3-4B is not in the Hugging Face cache and XWEN_QWEN3_DIR is unset"
-        );
-        return Ok(());
-    };
-    let device = xwen::gguf::metal_device()?;
-    let mut model = load(&dir, &device)?;
+fn encode_indices_match_the_forward_taps(dir: &PathBuf, device: &Device) -> Result<()> {
+    let mut model = load(dir, device)?;
+    let device = device.clone();
     let n_layer = model.config().n_layer;
     assert_eq!(n_layer, 36);
     let (_, ids) = fixture_ids()?.swap_remove(1); // corpus-middle, 199 tokens
