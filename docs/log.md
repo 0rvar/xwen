@@ -4,6 +4,31 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — The dense Qwen3-4B stack runs: Stage 2 passes at cosine 0.99999449, and Stage 1 finds the 2e-2 bar is one llama.cpp cannot meet against itself
+
+Arc 1. `src/qwen3/stack.rs` runs the dense graph through `XwenModel`, and `generate`,
+`chat` and `encode-text` work on the three entries; `serve` and `batch` are still
+refused. `LmHead` became an enum to carry the tied bf16 embedding and `run_stack` gained a
+dispatch, both under every shipped checkpoint, so the GGUF parity gate was a precondition
+rather than a formality: the 35B and the 27B pass every tier (the 27B decodes 64/64 with
+nothing excused) and the Flash-Next replay passes all three fixtures with zero hard
+mismatches. Thinking on
+the Qwen3 dialect became model-opened rather than prompt-seeded, closing the gap Arc 0
+recorded. **Stage 2 passes**: minimum cosine 0.99999449 and maximum relative error
+0.00388 against the fp32 torch reference, where the pipeline's own bf16 execution reads
+0.99960 and 0.03236, so xwen sits about ten times closer to fp32 than diffusers does; the
+bf16 output cast alone accounts for 0.003784 of that. **Stage 1 is the finding.** Against
+the Metal oracle: pooled max-abs 0.222, argmax 6304/6307 with every flip inside the
+near-tie band, pooled top-5 99.9239% (pass). Against the CPU oracle: 0.379, 6300/6307,
+99.9176%. And llama.cpp's own CPU and Metal arms differ by 0.358 with 4 flips on the same
+prompts, so **xwen is closer to the Metal oracle than the two oracle backends are to each
+other** and the planned 2e-2 max-abs with 100% argmax is not a bar the reference meets
+against itself. Ablations rule out the two obvious suspects: the sdpa arm reproduces the
+flash arm exactly, and the classic matmul is worse than the tensor gemm. What the bars
+should be is now an owner decision, ledgered rather than improvised.
+[Record](records/qwen3-dense.md), [architecture](qwen3-dense.md), [Z-Image](zimage.md),
+[parity](parity.md).
+
 ## 2026-09-06 — Dense Qwen3-4B registered: BF16 safetensors loader, per-instance tokenizer specials, two chat dialects, a per-position logits oracle
 
 Arc 0 of a new architecture, and the only GPU-free one: `model_type: qwen3` joins the repo as

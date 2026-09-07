@@ -260,7 +260,7 @@ edited ref costs a full re-download.
   omits ssm_beta and the shexp set). The shipped tensor tables are the spec; never
   read constants.py as one.
 
-## Qwen3-4B dense (`qwen3`, HF BF16 safetensors; REGISTERED, NOT RUNNABLE as of 2026-09-06)
+## Qwen3-4B dense (`qwen3`, HF BF16 safetensors)
 
 A second weight format and a second vocabulary, not a variant of the graphs above. It is
 in the repo for two roles at once: a full LM checkpoint, and the text-conditioning
@@ -280,10 +280,12 @@ converter here, so no tiled V-order and no pre-baked norm. Specials 151643
 `</think>` (`special: false`, same by-id trap). No BOS. Stops on 151645 AND 151643, and
 unlike 3.6 both are in the upstream `generation_config.json`.
 
-Arc 0 landed config, loader, specials, dialects, registry and the Stage 1 oracle. There
-is NO layer stack: `XwenModel::load`'s safetensors arm returns "stack not implemented",
-and `servable()`/`auto_fetch()` are false on all three entries until the arc whose
-surface makes each true. Do not describe any of it as running.
+State as of 2026-09-07, and check it before you describe anything as working: `generate`,
+`chat` and `encode-text` run on the three entries (the encoder is `encode-text` only).
+`serve` and `batch` are REFUSED, Arc 3 being the arc that makes them work, and
+`auto_fetch()` is still false everywhere, so a run only ever uses what `xwen fetch` put
+in the cache. `Model::not_servable_reason()` is the single source of `servable()` and of
+the sentence the CLI and the HTTP 400 both print.
 
 Traps, each of which has already cost someone time:
 
@@ -305,17 +307,36 @@ Traps, each of which has already cost someone time:
   `config.rs`'s GGUF-only EOG fold and `ConstraintFactory::embedded`. A new call site
   that reaches for a constant will be a wrong number on this vocabulary, not a missing
   one. `TOKENIZATION_RULES_VERSION` stays at 3 on purpose.
-- **Identity for a safetensors directory** is provenance first (the entry's own cached
-  snapshot, comparing canonicalized DIRECTORIES and never a file, hub cache files being
-  symlinks into shared blobs), then `rope_theta` (5e6 Instruct-2507, else base, which
-  wins the tie with the byte-identical Z-Image config). There is no name inside the set,
-  so the `general.name` passes are unreachable here. `--model-size` stays a cross-check
-  and a disagreement is a startup error.
+- **Identity for a safetensors directory** is provenance first, and the rule is about the
+  REPO, not the snapshot (tightened 2026-09-07): a directory is `Official` when it sits
+  under the entry's repo directory in the hub cache, at the entry's subdirectory, with
+  every registry file present, under ANY snapshot commit. The repo directory is what
+  separates Z-Image from base, their configs being byte-identical. Canonicalize the
+  DIRECTORY and never a file, hub cache files being symlinks into shared blobs. Failing
+  that it is `Assumed`, with `rope_theta` picking the release (5e6 Instruct-2507, else
+  base, which wins the tie with Z-Image). There is no name inside the set, so the
+  `general.name` passes are unreachable here. `--model-size` stays a cross-check and a
+  disagreement is a startup error.
+- **Thinking on the Qwen3 dialect is MODEL-opened, not prompt-seeded.** A prompt's
+  reasoning state is `chat::ThinkingEntry` (Answer / Seeded / ModelOpens), and
+  `ChatDialect::model_opens_thinking()` is true for Qwen3 alone: the template writes no
+  `<think>` after the assistant header, so the model writes its own. The decode loop
+  enters thinking on a think opener only when it is the reply's FIRST tagged token, so a
+  later `<think>` is text. Two things follow that a change here will break silently: the
+  think budget must hold until the opener rather than arm at position 0, and `--min-think`
+  is gated on being inside a block, or under ModelOpens it bans the stop tokens as a
+  minimum answer length. Marker retention is an explicit `MarkerText` policy per call
+  (Strip for the event consumers, Keep for callers that split on the literal marker), not
+  a dialect property; a review round caught the raw-text loops having silently changed for
+  the shipped checkpoints.
 - **`CheckpointSource` is the one open seam.** Every consumer that used to call
   `gguf::open` itself now routes through it, so a new checkpoint consumer goes there and
-  not beside it. Note that `Qwen3Set::open` scans all 8 GB on every open (~1.4 s in dev),
-  which every routed metadata-only caller now pays; fine while nothing serves these
-  entries, and the first thing to fix when `servable()` flips.
+  not beside it. It carries the caller's `Device` on the safetensors arm on purpose: a
+  fresh `Device::new_metal(0)` inside the loader is a DIFFERENT candle device from the
+  Generator's, and every op between them a DeviceMismatch. Note that `Qwen3Set::open`
+  scans all 8 GB on every open (~1.4 s in dev), which every routed caller now pays,
+  `encode-text` and `logits-dump` included; it is the first thing to fix when
+  `servable()` flips.
 - **The Python exception.** `scripts/zimage-ref-dump.py` is the only Python in the repo,
   run by hand under `uv` in a throwaway venv, never in CI. It exists because the encoder
   has no ONNX export and there is no bun path to torch. It is not a precedent.

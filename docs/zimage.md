@@ -204,10 +204,13 @@ Two findings from that run matter beyond bookkeeping.
 minimum cosine 0.99960 and maximum relative error 0.03236 across the twelve prompts,
 against a plan that grades xwen at cosine 0.9999 and relative error 1e-2 versus fp32. So
 the bar is tighter than the distance between the real pipeline and its own fp32
-idealization. That is not by itself a reason to loosen it: xwen keeps F32 activations
-against BF16 weights, which is a different and probably closer arithmetic than torch's
-all-bf16 path, and it may clear 0.9999 outright. The decision is only needed if it lands
-between the two, and these numbers are the context for it.
+idealization. That is not by itself a reason to loosen it, and as of 2026-09-07 it is
+settled by measurement rather than by argument: xwen keeps F32 activations against BF16
+weights, which is a different and closer arithmetic than torch's all-bf16 path, and it
+clears the bar outright at minimum cosine 0.99999449 and maximum relative error 0.00388
+over positions 1 and up, with position 0 at 0.99999955 and 0.00089. It is about ten times
+closer to the fp32 reference than the pipeline's own bf16 execution. The question the
+numbers above would have posed therefore does not arise.
 
 **Position 0 is a massive activation and it dominates the relative-error metric.** Token
 0 is `<|im_start|>` in every prompt and, under causal attention, its hidden state depends
@@ -219,3 +222,13 @@ why it is the same token every time. Any relative-error metric with a per-token
 denominator will be led by this row, so `tests/qwen3_encoder.rs` reports position 0
 separately; a per-prompt denominator is the other option. If xwen ever lands between the
 bars, this row is the first term to look at, because one fix there moves eleven prompts.
+
+
+**One more term to hold on to, for whoever reads a future Stage 2 number.** Rounding the
+fp32 reference itself to bf16 and back, with no graph involved at all, scores 0.003784
+relative error and 0.999996 cosine. `encode` returns bf16, so a perfect graph already
+spends 38% of the 1e-2 relative budget on the output cast alone. The bar has 2.6x
+headroom over pure output quantization, not 100x. Today's 0.00388 is barely above that
+floor, which is the strongest available statement that the graph itself contributes
+almost nothing; a future result between 0.004 and 0.01 should be read as the cast plus
+something, and comparing against an f32 encode output is how to tell the two apart.

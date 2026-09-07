@@ -582,6 +582,22 @@ entry is what would find the rest) and the syncs plus the serial scan.]
 
 ## Parity, provenance and tooling
 
+- [ ] [blocked] **Decide the Stage 1 bars for the dense Qwen3 track.** The proposed
+  2e-2 max-abs with 100% argmax agreement is not attainable, and the reason is the
+  reference: llama.cpp's own CPU and Metal backends differ by pooled max-abs 0.358 with 4
+  argmax flips over the 20 fixture prompts, while xwen reads 0.222 with 3 flips against
+  the Metal arm and 0.379 with 7 against the CPU arm, every flip on every arm inside the
+  near-tie band, pooled top-5 99.9239% and 99.9176% (2026-09-07). xwen is closer to the
+  Metal oracle than the two oracle backends are to each other. Recommendation: gate
+  pooled top-5 at 99.9%, gate argmax as "no flip outside the near-tie band", and report
+  max-abs against the oracle's own backend spread instead of a fixed number. Counter:
+  such a bar certifies only "as close as llama.cpp is to itself" and would not catch a
+  systematic error under 0.358. The same decision settles whether the decode-consistency
+  test's 2.59e-2 at chunk 1 is a failure or the resolution of the metric. Until it is
+  made, neither gate can be called a gate. [Record](docs/records/qwen3-dense.md),
+  [runbook](docs/parity.md).
+  From: Deferred from the dense Qwen3-4B arcs (2026-09-07).
+
 - [ ] [small] **The 27B's interactive generate/chat smoke run was never done, and its
     numbers carry a ±10% spread.** Bring-up itself finished 2026-07-28 via P7: the parity
     gate ran the 27B end to end, first forward correct, all gated tiers passing (strict is

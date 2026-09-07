@@ -2952,3 +2952,7 @@ blocks use of the feature; item (a) is the one with a known trigger.
   walk) are folded into «Above the 2048 indexer budget: +165 dispatches» in "Decode
   performance"; the retired per-chunk readback item's reopen condition is this number.
   From: Deferred from the long-context envelope arc (2026-09-06).
+
+## Deferred from the dense Qwen3-4B arcs (2026-09-07)
+
+[Nothing closed here yet; the heading exists because TODO.md items name it in their From: line.]

@@ -10,20 +10,22 @@ Qwen 3.6 graph. It arrives for two reasons at once: full inference on a small de
 checkpoint, and the text-conditioning encoder that the diffusion image transformers
 will call in-process. It is not a tok/s target.
 
-## Status, 2026-09-06
+## Status
 
-**Registered, not runnable.** Arc 0 landed the CPU-only foundation: the config, the
-BF16 safetensors loader with its integrity scan, per-instance tokenizer specials, two
-chat dialects, three registry entries and one resolved checkpoint source. No layer
-stack exists yet, so `XwenModel::load` refuses the safetensors arm with a "stack not
-implemented" error, and `servable()` and `auto_fetch()` are false on all three entries.
-What works today is `xwen fetch` and `xwen inspect` on each entry, plus everything CPU
-side: identity, config parsing, the loader's validation and scans, the tokenizer and
-the two dialects.
+Restated per arc; as of **2026-09-07** (Arc 1).
 
-The arcs that follow flip the gates as each surface starts working: the layer stack,
-`encode` and `generate`/`chat` in Arc 1, the torch reference and the Instruct-2507
-smoke in Arc 2, `serve` and `batch` in Arc 3.
+**Runs on the one-shot surfaces.** `generate`, `chat` and `encode-text` work on the two
+LM entries, and `encode-text` alone on the encoder entry, whose zero-filled planes
+`XwenModel::load` refuses and `load_encoder` accepts. `xwen fetch` and `xwen inspect`
+work on all three. Both verification stages have been run: Stage 2 passes, and Stage 1
+passes on top-5 while its max-abs bar is an open decision rather than a failure of the
+engine (Verification, below).
+
+**Not yet.** `serve` and `batch` are refused, with one sentence from
+`Model::not_servable_reason()` that the CLI and the HTTP 400 both print; Arc 3 is the
+arc that makes them work, and it needs the per-target tokenizer and grammar factory
+first. `auto_fetch()` is false on all three entries, so nothing downloads without
+`xwen fetch`. There is no drafter for this architecture and none is planned.
 
 ## Config
 
@@ -156,33 +158,46 @@ see the record for the reopen condition.
 
 ## Verification
 
-The runbook lives in [parity.md](parity.md) under "The Qwen3 dense track". The bars and
-the measurements as they land:
+The runbook, with the exact commands and their environment variables, lives in
+[parity.md](parity.md) under "The Qwen3 dense track". The bars and the measurements as
+they stand on 2026-09-07:
 
 | stage | reference | bar | measured |
 | --- | --- | --- | --- |
 | tokenizer round trip | `llama-tokenize --ids --no-bos` on the BF16 GGUF | ids equal, `decode(ids) == text` | 20 prompts, 2026-09-06 (self-skips without the cached tokenizer) |
 | chat template | `llama-server --jinja /apply-template` | byte-equal rendering | 16/16 cases, 2026-09-06 |
-| Stage 1, full-vocab logits | `llama-logits-all` per-position dump | max-abs <= 2e-2, argmax 100%, pooled top-5 >= 99.9% | pending |
-| decode consistency | the engine against itself | same 2e-2 bar across chunk sizes | pending |
-| Stage 2, encoder hidden states | torch fp32 dump | cosine >= 0.9999, relative error <= 1e-2 | reference dumped 2026-09-06, xwen side pending |
+| encode index semantics | the engine's own taps | exact | max abs diff 0 at both indices, 2026-09-07 |
+| Stage 1, full-vocab logits | `llama-logits-all` per-position dump | OPEN, see below | top-5 99.9239% vs Metal and 99.9176% vs CPU (pass), max-abs 0.222 and 0.379, argmax 6304 and 6300 of 6307 with every flip inside the near-tie band |
+| decode consistency | the engine against itself | OPEN, same question | max abs logit difference 2.59e-2 at chunk 1 |
+| Stage 2, encoder hidden states | torch fp32 dump | cosine >= 0.9999, relative error <= 1e-2 | PASS: min cosine 0.99999449, max relative error 0.00388 |
+| GGUF parity gate and Flash-Next replay | upstream llama.cpp | the existing floors | PASS on the 35B, the 27B and the Flash-Next replay, 2026-09-07 |
 
-Two things about those bars are not yet settled and should not be quoted as if they
-were. The Stage 1 bar of 2e-2 is provisional: llama.cpp's CPU path rounds F32
-activations to BF16 before every BF16 matmul, so a CPU reference is not the arithmetic
-xwen performs, and the bar is committed to only after the same oracle is run with
-`--n-gpu-layers` on Metal. And pooled top-5 is pooled on purpose: per-position overlap
-of five items moves in 20% steps, so 99.9% only means something summed over positions,
-as `sum |top5_xwen ∩ top5_ref| / (5 × positions)`.
+**The Stage 1 bars are an open decision and this file does not state one.** The 2e-2
+max-abs and 100% argmax the plan proposed are not attainable: llama.cpp's own CPU and
+Metal backends differ by pooled max-abs 0.358 with 4 argmax flips over the same 20
+prompts, so the reference does not meet that bar against itself, and xwen sits closer to
+the Metal oracle (0.222, 3 flips) than the two oracle backends sit to each other. The
+recommendation on the table is to gate pooled top-5 at 99.9%, gate argmax as "no flip
+outside the near-tie band", and report max-abs against the oracle's own backend spread
+rather than a fixed number. The counter-argument is that such a bar certifies only "as
+close as llama.cpp is to itself" and would not catch a systematic error under 0.358.
+The evidence, the ablations that rule out the flash kernel and the classic matmul, and
+the ledger item are in [records/qwen3-dense.md](records/qwen3-dense.md).
+
+Pooled top-5 is pooled on purpose: per-position overlap of five items moves in 20%
+steps, so 99.9% only means something summed over positions, as
+`sum |top5_xwen ∩ top5_ref| / (5 × positions)`. Ties break to the lower id on both
+sides, so a tie is never itself a disagreement.
 
 The Stage 2 relative error is defined per token as
 `max_i |x_i − r_i| / max(max_i |r_i|, 1e-6)`, the denominator being that token's own
-largest magnitude in the reference. The reference is dumped at fp32 and graded there;
-the same script also dumps bf16, which is what the real pipeline executes, and that
-distance is reported alongside rather than gated. Two things about the Stage 2 bar are
-known before xwen has been measured against it. The bf16 arm does not meet it against
-its own fp32 reference, reading minimum cosine 0.99960 and maximum relative error
-0.03236, so the bar is tighter than the arithmetic diffusers ships. And position 0 is a
-massive activation, magnitude 13,753.5 against 150 to 380 elsewhere and the same row in
-every prompt, which leads any per-token relative-error metric; the test reports it
-separately for that reason. Both are in [zimage.md](zimage.md).
+largest magnitude in the reference. Position 0 is scored and reported separately: it is
+a massive activation, magnitude 13,753.5 against 150 to 380 elsewhere and the same row
+in every prompt, so it leads any per-token relative-error metric. Read the passing
+figure against two others. The pipeline's own bf16 execution scores 0.99960 and 0.03236
+against the same fp32 reference, so xwen is about ten times closer to fp32 than
+diffusers is. And rounding the fp32 reference itself to bf16 and back scores 0.003784,
+so `encode`'s bf16 return type alone spends 38% of the relative-error budget: the bar
+has 2.6x headroom over pure output quantization, not 100x, and a future result between
+0.004 and 0.01 should account for the cast before anything else. Both are in
+[zimage.md](zimage.md).

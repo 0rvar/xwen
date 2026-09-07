@@ -229,3 +229,172 @@ replay run before it ships, not after. The unpriced risks it carries are
 `ops::flash_attn`'s first production use, f16 KV against an fp32 reference on long
 prompts, and the gemv-versus-gemm asymmetry the f16-range scan measured but did not
 price.
+
+## Arc 1, 2026-09-07: the stack runs, and the Stage 1 bar turns out to be the open question
+
+Five commits (1761dab, 5bbe15a, 70bdb58, feba8c9, 5589f3c). The graph runs on the GPU:
+`generate` and `chat` work on the two LM entries, `encode-text` on all three, `serve` and
+`batch` still refuse. Both parity stages have been executed, and Stage 2 passes outright. Stage 1 passes on top-5 and fails a max-abs
+bar that, as it turns out, llama.cpp cannot meet against itself. That last measurement is
+the substance of this arc and it ends in a decision the owner has to make.
+
+Machine state for every figure below: `pmset -g` reads `lowpowermode 2`. No high-power
+claim is made.
+
+**The stack.** `src/qwen3/stack.rs` runs the dense graph through `XwenModel` the way the
+Flash-Next stack does, with `run_stack` short-circuiting into it. Per layer: rms_norm,
+`matmul_bf16` on the BF16 projections as stored, per-head QK-norm then rope (full 128,
+NEoX, K stored f16), `LayerCache::Full` append, `flash_attn` above one token and the f16
+vector sdpa at one, o_proj, then gate/up, `silu_mul`, down. `XWEN_QWEN3_ATTN=sdpa` is a
+bit-exact materialized-mask fallback for bisecting, resolved at load so one process can
+hold both arms. Kernel contracts are asserted once at load rather than per call. This is
+`ops::flash_attn`'s first production caller.
+
+`LmHead` became an enum, `Quant(QLinear)` for the GGUF checkpoints and `Bf16(Tensor)` for
+the tied embedding here, with a bf16 gemv arm in `lm_head_row`. That is the change with
+blast radius on every shipped checkpoint, which is why the GGUF parity gate is a
+precondition for this arc and not a formality.
+
+**`encode` and `encode-text`.** `XwenModel::encode(ids, n_layers)` returns `[T, hidden]`
+bf16 under the HF `hidden_states` index semantics and runs only the layers it needs. The
+index semantics are not merely tested, they are exact: on the real checkpoint,
+`encode(35)` against the `l_out-34` tap reads max absolute difference **0**, and
+`encode(36)` against `final_norm(l_out-35)` also **0**. `xwen encode-text` renders with
+the checkpoint's own dialect and tokenizer, truncates to the entry's 512, caps `--layer`
+at the corrupt plane, and writes `hidden` plus `input_ids`.
+
+**Thinking became model-opened.** The Arc 0 record left the gap open: a thinking-on Qwen3
+prompt opens no `<think>`, so the model writes its own and the old scanner, which knew
+only the closing marker, would have filed the whole reply as answer text. A prompt's
+reasoning state is now `chat::ThinkingEntry` rather than a bool, the decode loop enters
+thinking on a think opener that is the reply's first tagged token, the think budget holds
+until that opener, and `--min-think` is gated on being inside a block. A review round
+found the first version had quietly changed the raw-text loops for the shipped
+checkpoints; marker retention is now an explicit per-call policy with two tests pinning
+both halves, and the 16/16 llama-server renders still hold.
+
+### Stage 2 passes, comfortably
+
+`tests/qwen3_encoder.rs` against the fp32 torch reference, 12 prompts, rendered templates
+and ids byte-equal on all twelve before any number is compared:
+
+| | xwen | bar | the pipeline's own bf16 |
+| --- | --- | --- | --- |
+| min cosine, positions >= 1 | 0.99999449 | >= 0.9999 | 0.99960 |
+| max relative error, positions >= 1 | 0.00388 | <= 1e-2 | 0.03236 |
+| position 0 cosine | 0.99999955 | >= 0.9999 | |
+| position 0 relative error | 0.00089 | <= 1e-2 | |
+
+So xwen sits about an order of magnitude closer to the fp32 reference than the arithmetic
+diffusers actually ships. Read the relative-error column against one more measurement:
+rounding the fp32 reference itself to bf16 and back scores 0.003784, so the bf16 return
+type alone spends 38% of that budget and the bar has 2.6x headroom over pure output
+quantization, not 100x. A future result between 0.004 and 0.01 should account for the
+output cast first, and comparing against an f32 encode output is how to separate the graph
+from the cast.
+
+### Stage 1 passes on top-5 and fails max-abs, and the failure is not xwen's
+
+The gate ran against both oracle arms over all 20 prompts, 6307 positions:
+
+| oracle arm | pooled max-abs | argmax | pooled top-5 |
+| --- | --- | --- | --- |
+| llama.cpp CPU | 0.379 | 6300/6307 | 99.9176% |
+| llama.cpp Metal | 0.222 | 6304/6307 | 99.9239% |
+| llama.cpp CPU vs its own Metal | 0.358 | 6303/6307 | 99.9239% |
+
+Every argmax flip on every arm falls inside the 2e-2 near-tie band. The third row is the
+decisive one: **xwen is closer to the Metal oracle than the two oracle backends are to
+each other.** A 2e-2 max-abs bar with 100% argmax agreement is therefore not a bar
+llama.cpp meets against itself on these prompts, and holding xwen to it would be holding
+it to a standard the reference does not have.
+
+Two ablations say the error is not where one would first look. `XWEN_QWEN3_ATTN=sdpa`
+produces numbers identical to the flash arm on six prompts, so the flash kernel, this
+being its first production use, is not the source. And `XWEN_ATTN_MM_CLASSIC=1` is
+**worse**, pooled 0.337 against 0.222 and 0.217 against 0.073 on the corpus-middle
+prompt, so the tensor gemm is more accurate here than the classic chain it replaces,
+which is the same direction the dense-FFN gemm went and the opposite of the `dense_mm`
+case.
+
+Error does not grow with position, which is the shape a cache or rope bug would have. Per
+prompt the max-abs runs 1.8e-5 at 1 token, 6.3e-3 at 8, 9.6e-3 at 16, 2.5e-2 at 53,
+7.3e-2 at 199, 5.3e-2 at 610 and 0.222 at 3890; within the 3890-token prompt the failing
+fraction is about 7% in every position bucket with a median of 2.3e-2, and the outliers
+(0.22 at position 853, 0.21 at 1084) are isolated positions rather than a tail.
+
+**The decode-consistency test is in the same position.** `tests/qwen3_consistency.rs`
+compares chunk-1 decode against a single-pass prefill and reaches max absolute logit
+difference 2.59e-2 at one position of the 53-token prompt, over the same 2e-2. The other
+chunkings are not tabulated because the test stops at the first failure. This one has no
+oracle in it at all, so it is a statement about xwen's own partition-dependence, and the
+repo already has a decision on that shape of fact: persistent state is partition-dependent
+in its low bits and that is accepted rather than denied (decisions.md "Persistent state is
+partition-dependent"). Whether 2e-2 is the right number for a full-vocabulary logit row is
+part of the same open question.
+
+### The open decision, stated as open
+
+**Nobody has decided what the Stage 1 bars should be, and this record does not decide it.**
+What is measured is above. The recommendation to react to, not a settled policy:
+
+- gate on pooled top-5 >= 99.9%, which both arms clear;
+- gate argmax as "no flip outside the near-tie band" rather than 100% agreement, since
+  every flip observed on every arm, llama.cpp's own two backends included, is inside it;
+- report max-abs against the oracle's own CPU-versus-Metal spread rather than a fixed
+  2e-2, because that spread is the resolution the reference itself has.
+
+The counter-argument deserves stating too: a bar derived from the reference's internal
+disagreement can only ever certify "as close as llama.cpp is to itself", which is weaker
+than the fixed bar the plan wanted and would not catch a systematic error smaller than
+0.358. Ledgered as an owner decision under Parity, provenance and tooling.
+
+### Verified this arc
+
+- Stack unit tests on a tiny 4-Q-head / 2-KV-head model, release: shapes, the attention
+  switch, chunked-versus-single-pass, the sdpa arm against the fused arm, and the encode
+  index semantics. All pass.
+- Stage 1 against both oracle arms and Stage 2 against the torch reference, as tabulated.
+- `encode-text` on the encoder entry: 23 tokens in, `hidden [23, 2560]` bf16 out, 3.7 s
+  including load (0.5 s load, 7.5 GB of weights on the device, 8.6 GB resident at
+  `max_ctx` 40960).
+- `generate` on both LMs: qwen3-4b with thinking on opens its own `<think>` and reasons
+  through a haiku prompt; Instruct-2507 answers cleanly. Load 0.4 s and 0.8 s to first
+  token.
+- Track A's tap table is implemented and source-verified rather than predicted:
+  `scripts/parity.ts --arch qwen3` maps our taps onto `qwen3.cpp`'s as the identity plus
+  `kqv_out-{il}`, and skips `attn_o_proj`. The deciding fact is that llama.cpp's
+  `cb(cur, "kqv_out", il)` fires on the output of `build_attn_mha`, BEFORE `wo`, and the
+  only cb after `wo` is commented out, so there is no post-o_proj node to compare against.
+- **The GGUF parity gate and the Flash-Next replay both PASS**, from a pinned checkout of
+  5589f3c under /tmp. This was the precondition, not a formality: `LmHead` became an enum
+  and `run_stack` gained a dispatch, both on the path of every shipped checkpoint, so a
+  regression here would have been in the 35B and the 27B rather than in anything qwen3.
+
+| gate | strict | mm | decode | perplexity |
+| --- | --- | --- | --- | --- |
+| 35B-A3B, 6 tiers graded | cos 1.000000, top-5 5/5 | cos 0.999618 | 63/64, 62/64, 61/64 agree, 1/2/3 excused, 0 mismatch | Δnll 0.001179 |
+| 27B | cos 1.000000 | cos 1.000000 | 64/64 on all three fixtures, 0 excused | Δnll 0.000243 |
+
+  Flash-Next has no harness, so it takes the forced replay instead
+  (`--control XWEN_PLE_TAIL_CLASSIC=1`, oracle reused at pin `6fe7498`): code-short 62/64
+  with 2 excused, text-mixed 64/64, long-mixed 59/64 with 5 excused, **zero hard
+  mismatches** on all three, all passed. The 27B's 64/64 with nothing excused is the
+  cleanest of the set and the most direct statement that the dense path is untouched.
+
+### Not taken now, added this arc
+
+- **An f32 encode output alongside the bf16 one.** The bf16 cast spends 38% of the Stage 2
+  relative-error budget. Reopen if a Stage 2 result ever lands between 0.004 and 0.01, at
+  which point separating the graph from the cast is the first diagnostic.
+- **Tabulating every chunking in the consistency test.** It stops at the first failure, so
+  chunk 1 is the only arm measured. Reopen when the bar is decided, since the bar is what
+  decides whether the other chunkings are failures at all.
+
+### Next
+
+Arc 2 is the Instruct-2507 smoke recorded properly and whatever the bar decision implies
+for the two gates. Arc 3 is `serve` and `batch`: the per-target tokenizer and grammar
+factory (D6c), the Target mapping, the disk tier on a safetensors `checkpoint_id`, and the
+`servable()` flip. The 8 GB scan on every `Qwen3Set::open` becomes a real cost there and
+is the first thing to fix in that arc; `encode-text` and `logits-dump` already pay it.

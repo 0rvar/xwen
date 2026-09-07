@@ -14,7 +14,8 @@ Qwen3.8-27B runs that same dense graph. Flash-Next has no harness of its own yet
 verified by forced replay against llama.cpp (`docs/qwen4exp-port.md`). Decode rates are
 in Speculative decoding below and, in full, in `docs/perf-state.md`. See `TODO.md` for
 the open ledger and `docs/log.md` for the timeline. A fifth architecture, dense Qwen3-4B
-in HF safetensors, is registered but does not run yet (Models, below).
+in HF safetensors, generates and encodes but is not servable yet (Models, below); its
+encoder path passes its own reference gate at cosine 0.99999449.
 
 ## Docs
 
@@ -123,10 +124,8 @@ of its own. It ships no DFlash sidecar, but it does ship a first-party MTP head,
 a different drafter shape and became a second drafter implementation (2026-08-15); all
 three qwen35 checkpoints speculate. Flash-Next does not (below).
 
-Three more are **registered but not runnable yet** (2026-09-06). They are dense Qwen3-4B
-in HF BF16 safetensors, not GGUF, and there is no layer stack for that architecture yet,
-so loading one is an error rather than a slow path. They are listed here because
-`xwen fetch` and `xwen inspect` already work on them and because the registry names them:
+Three more run on the one-shot surfaces only (2026-09-07). They are dense Qwen3-4B
+in HF BF16 safetensors rather than GGUF, a second architecture and a second vocabulary:
 
 | Full name | Repo | `--model-size` | Role |
 | --- | --- | --- | --- |
@@ -134,14 +133,27 @@ so loading one is an error rather than a slow path. They are listed here because
 | `Qwen3-4B-Instruct-2507` | `Qwen/Qwen3-4B-Instruct-2507` | `qwen3-4b-instruct-2507` / `4b-instruct` | full LM, no thinking mode |
 | `Z-Image-Turbo-text-encoder` | `Tongyi-MAI/Z-Image-Turbo`, `text_encoder/` | `zimage-turbo` / `z-image-turbo` | encode-only, never an LM |
 
-8.06 GB each, three shards plus config, index and tokenizer. None is auto-fetched and
-none is servable or selectable over HTTP; each gate flips in the arc whose surface makes
-it work. The encoder entry never becomes an LM: its copy of the weights has a corrupted
-last-layer MLP, which the hidden state Z-Image reads never touches and anything else
-does. `docs/qwen3-dense.md` has the architecture and the verification bars,
-`docs/zimage.md` has the encoder role and the corruption.
+8.06 GB each, three shards plus config, index and tokenizer. `generate`, `chat` and
+`encode-text` work on the two LMs and `encode-text` alone on the encoder; `serve` and
+`batch` refuse them with one sentence saying why, and none of the three is auto-fetched,
+so `xwen fetch` is what puts one in the cache. There is no drafter for this architecture.
+The encoder entry never becomes an LM: its copy of the weights has a corrupted last-layer
+MLP, which the hidden state Z-Image reads never touches and anything else does.
 
-**`--model <path>` now takes a safetensors directory** on every one-shot subcommand, not
+```
+xwen encode-text --model-size zimage-turbo --prompt "a cat on a windowsill" \
+  --output /tmp/enc.safetensors --verbose
+```
+
+writes `hidden [T, 2560]` bf16 and `input_ids`, rendering the prompt through the
+checkpoint's own chat template and truncating at the entry's 512 tokens. `--layer`
+defaults to the recorded hidden-state index, 35 for Z-Image, and is refused above the
+corrupt plane. The library entry point is `XwenModel::encode`, which is what the
+diffusion pipelines will call in process. `docs/qwen3-dense.md` has the architecture and
+the measured verification numbers, `docs/zimage.md` has the encoder role and the
+corruption.
+
+**`--model <path>` takes a safetensors directory** on every one-shot subcommand, not
 only `serve`: a directory, a `config.json` inside one or a `*.safetensors` inside one all
 resolve to the same set. The file decides which checkpoint it is, and `--model-size`
 stays a cross-check that errors on disagreement rather than an override.
