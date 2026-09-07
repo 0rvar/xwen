@@ -12,20 +12,23 @@ will call in-process. It is not a tok/s target.
 
 ## Status
 
-Restated per arc; as of **2026-09-07** (Arc 1).
+Restated per arc; as of **2026-09-07** (Arc 3).
 
-**Runs on the one-shot surfaces.** `generate`, `chat` and `encode-text` work on the two
-LM entries, and `encode-text` alone on the encoder entry, whose zero-filled planes
-`XwenModel::load` refuses and `load_encoder` accepts. `xwen fetch` and `xwen inspect`
-work on all three. Both verification stages have been run: Stage 2 passes, and Stage 1
-passes on top-5 while its max-abs bar is an open decision rather than a failure of the
-engine (Verification, below).
+**Every surface runs the two language models.** `generate`, `chat`, `serve`, `batch` and
+`encode-text` all work on `Qwen3-4B` and `Qwen3-4B-Instruct-2507`, and both are listed by
+`/v1/models` and selectable by full name while cached. Serve carries a second vocabulary
+for them, resolved per request target rather than per process (decisions.md "The tokenizer
+and the grammar trie follow the request's target").
 
-**Not yet.** `serve` and `batch` are refused, with one sentence from
-`Model::not_servable_reason()` that the CLI and the HTTP 400 both print; Arc 3 is the
-arc that makes them work, and it needs the per-target tokenizer and grammar factory
-first. `auto_fetch()` is false on all three entries, so nothing downloads without
-`xwen fetch`. There is no drafter for this architecture and none is planned.
+**The encoder entry runs `encode-text` and nothing else.** Its weights are not a faithful
+language model, so every generating surface refuses it with one sentence saying why. That
+gate runs before the fetch and on `generate` and `chat` too, because loading the encoder
+there succeeds and would produce fluent garbage out of the zero-filled layer 35.
+
+**Still deliberately off:** `auto_fetch()` on all three, so nothing downloads 8 GB inside
+a request or a zero-flag run; `xwen fetch` is what fills the cache. There is no drafter
+for this architecture and none is planned. What remains open is not a surface but a
+question: what the Stage 1 parity bars should be (Verification, below).
 
 ## Config
 

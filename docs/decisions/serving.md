@@ -405,3 +405,45 @@ entry, so a 400 can name a checkpoint that a request cannot then select. That wa
 already true of an uncached Flash-Next and the unservable entries make it
 unconditional; it is a message bug with a one-line fix, recorded rather than
 improvised into an unrelated arc (2026-09-06).
+
+**The tokenizer and the grammar trie follow the request's target, and a family without
+one is an error rather than a fallback (2026-09-06 decided, 2026-09-07 shipped).** Serve
+used to encode every request with the one tokenizer it loaded at startup and build every
+grammar from a process-wide factory over the embedded bytes, which was correct exactly
+while every checkpoint shared a vocabulary. Qwen3 is a second one, 151936 against 248320,
+so the two are now per `VocabFamily`: `src/serve/vocab.rs` holds one `Vocabulary` per
+family, tokenizer and trie built together, cached lazily behind a mutex that is never held
+across a build, and every reader in serve resolves from the target. Three things about the
+shape are deliberate. It is keyed by FAMILY and not by checkpoint, a family being exactly
+the set of checkpoints for which those two objects are the same object. The trie is built
+from the file the tokenizer was parsed from, `LagunaTokenizer` having gained a source path
+and `constrain::for_tokenizer` asking it, rather than from a path the caller carries
+alongside: a trie and a tokenizer from different files agree about nothing and the symptom
+is wrong output, never an error, so the question is asked of the object that knows. And a
+family with no tokenizer anywhere on the machine is a 400 naming the fetch, with NO
+fallback to the embedded copy, which is the one outcome worse than refusing: it would
+build, run and answer fluently in another vocabulary's tokens. The lookup order is the
+embedded copy for Qwen 3.6 with no search (it IS that family's vocabulary), then the
+served file's own, then any cached registry checkpoint of the family, then the error. The
+mask width is a registry constant rather than a property of an open file, for the same
+reason `CacheGeometry` is: it is asked before anything is open (2026-09-07).
+
+**The two Qwen3 language models are servable; `auto_fetch` stays false, and the encoder
+is refused on every surface including `generate` and `chat`.** `not_servable_reason()` is
+the single source of `servable()` and of the sentence the CLI and the HTTP 400 both print,
+so nothing can be refused without saying why. The two questions the gates answer are kept
+apart on purpose: "can this checkpoint run at all" is now yes for the language models,
+while "may a request download 8 GB" is still no, so an uncached checkpoint is a 400 naming
+`xwen fetch` rather than a download inside a request, exactly as Flash-Next has been since
+2026-08-30. The encoder answers no to the first question forever, and the arc that shipped
+this found the gate missing from `generate` and `chat`, where loading it SUCCEEDS: its
+weights parse and its config is a language model's, so those two surfaces would have
+generated fluent-looking garbage out of the zero-filled layer 35 rather than failing. The
+gate runs on all four surfaces now, before the fetch, and the shared sentence says "cannot
+be run" because that is what it now means. One known asymmetry, recorded rather than
+fixed: `AppState.max_ctx` is the SERVED checkpoint's, so the handler's prompt-fits check
+uses it even for a request naming another checkpoint, which clamps Instruct-2507's trained
+262144 to the base model's 40960 on a base-default server, with a warning. It is
+pre-existing across the GGUF checkpoints and merely visible now that one family holds two
+windows six times apart; the engine re-derives its own at load and that stays
+authoritative (2026-09-07).

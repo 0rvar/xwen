@@ -4,6 +4,28 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — Qwen3-4B on serve and batch: one server, two vocabularies, and decode at 95% of its byte ceiling
+
+Arc 3, the same day as the stack arc above and the arc that makes the entries reachable.
+The tokenizer and the grammar trie now follow the request's target rather than the
+process: `src/serve/vocab.rs` holds one pair per `VocabFamily`, built together so they
+cannot disagree, and `constrain::shared()` is off every serve request path. A family with
+no tokenizer on the machine is an error naming the fetch and never a fallback to the
+embedded copy, which would answer fluently in the wrong vocabulary. Both language models
+are servable; the encoder is refused on all four surfaces plus the wire, and that gate was
+missing from `generate` and `chat`, where loading it SUCCEEDS and would have generated
+from a zero-filled layer 35. Smoked on the GPU: a thinking completion returned 314
+reasoning tokens separated from a 56-token answer, a json_schema reply validated against
+its schema (the request that proves the trie is the 151936-wide one), a two-turn
+conversation reused 14 of 63 tokens, and one server answered Qwen3-4B then
+Qwen3.6-35B-A3B then Qwen3-4B. **Performance, recorded and not pursued**: plain decode
+63.1 tok/s short-context and 55.9 at 3890, which is 95% and 90% of the bytes-only
+ceiling, and prefill 3416-3433 tok/s at 3890, about 29 TFLOP/s end to end and inside what
+the tensor gemm reaches in isolation. No cheap lever on either, which is the right
+outcome for a correctness target. `lowpowermode 2`, and CPU-only debug builds were
+running alongside. [Record](records/qwen3-dense.md), [figures](perf-state.md),
+[decision](decisions/serving.md).
+
 ## 2026-09-07 — The dense Qwen3-4B stack runs: Stage 2 passes at cosine 0.99999449, and Stage 1 finds the 2e-2 bar is one llama.cpp cannot meet against itself
 
 Arc 1. `src/qwen3/stack.rs` runs the dense graph through `XwenModel`, and `generate`,

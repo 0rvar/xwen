@@ -14,8 +14,8 @@ Qwen3.8-27B runs that same dense graph. Flash-Next has no harness of its own yet
 verified by forced replay against llama.cpp (`docs/qwen4exp-port.md`). Decode rates are
 in Speculative decoding below and, in full, in `docs/perf-state.md`. See `TODO.md` for
 the open ledger and `docs/log.md` for the timeline. A fifth architecture, dense Qwen3-4B
-in HF safetensors, generates and encodes but is not servable yet (Models, below); its
-encoder path passes its own reference gate at cosine 0.99999449.
+in HF safetensors, runs on every surface too (Models, below); its encoder path passes
+its own reference gate at cosine 0.99999449.
 
 ## Docs
 
@@ -124,8 +124,8 @@ of its own. It ships no DFlash sidecar, but it does ship a first-party MTP head,
 a different drafter shape and became a second drafter implementation (2026-08-15); all
 three qwen35 checkpoints speculate. Flash-Next does not (below).
 
-Three more run on the one-shot surfaces only (2026-09-07). They are dense Qwen3-4B
-in HF BF16 safetensors rather than GGUF, a second architecture and a second vocabulary:
+Three more are dense Qwen3-4B in HF BF16 safetensors rather than GGUF, a second
+architecture and a second vocabulary (2026-09-07):
 
 | Full name | Repo | `--model-size` | Role |
 | --- | --- | --- | --- |
@@ -133,12 +133,25 @@ in HF BF16 safetensors rather than GGUF, a second architecture and a second voca
 | `Qwen3-4B-Instruct-2507` | `Qwen/Qwen3-4B-Instruct-2507` | `qwen3-4b-instruct-2507` / `4b-instruct` | full LM, no thinking mode |
 | `Z-Image-Turbo-text-encoder` | `Tongyi-MAI/Z-Image-Turbo`, `text_encoder/` | `zimage-turbo` / `z-image-turbo` | encode-only, never an LM |
 
-8.06 GB each, three shards plus config, index and tokenizer. `generate`, `chat` and
-`encode-text` work on the two LMs and `encode-text` alone on the encoder; `serve` and
-`batch` refuse them with one sentence saying why, and none of the three is auto-fetched,
-so `xwen fetch` is what puts one in the cache. There is no drafter for this architecture.
-The encoder entry never becomes an LM: its copy of the weights has a corrupted last-layer
-MLP, which the hidden state Z-Image reads never touches and anything else does.
+8.06 GB each, three shards plus config, index and tokenizer. **Every surface runs the two
+language models** - `generate`, `chat`, `serve`, `batch` and `encode-text` - and both are
+listed by `/v1/models` and selectable by full name. One server holds both vocabularies at
+once (248320 and 151936) and resolves the tokenizer and the grammar trie per request,
+so a Qwen3-4B request and a Qwen3.6-35B-A3B request can follow each other on the same
+process. The wire batch route is `POST /xwen/v1/batch`, as for every other checkpoint.
+
+**The encoder entry runs `encode-text` and nothing else**, and every other surface
+refuses it with one sentence saying why: its copy of the weights has a corrupted
+last-layer MLP, which the hidden state Z-Image reads never touches and generation would
+run straight through. Point `--model-size qwen3-4b` at the faithful copy if you want the
+4B as a language model.
+
+None of the three is auto-fetched, so `xwen fetch` is what puts one in the cache and an
+uncached one is a 400 rather than an 8 GB download inside a request. There is no drafter
+for this architecture. Plain decode measures 63.1 tok/s short-context and 55.9 at a
+3890-token context, prefill 3416-3433 tok/s at 3890, both near their ceilings; it is a
+correctness target rather than a throughput one, and the figures and their conditions are
+in `docs/perf-state.md`.
 
 ```
 xwen encode-text --model-size zimage-turbo --prompt "a cat on a windowsill" \
@@ -435,16 +448,19 @@ HISTORY pane has a `model` column, so a row's rate can be read against the check
 that produced it.
 
 **On the wire a checkpoint has exactly one name: its full name** (`Qwen3.6-27B`,
-`Qwen3.6-35B-A3B`, `Qwen3.8-27B`, `Qwen3.8-Flash-Next`) — 2026-08-14. The CLI's short
+`Qwen3.6-35B-A3B`, `Qwen3.8-27B`, `Qwen3.8-Flash-Next`, and since 2026-09-07 `Qwen3-4B`
+and `Qwen3-4B-Instruct-2507`) — 2026-08-14. The CLI's short
 aliases are a CLI spelling and are refused by every API. Selection by surface:
 
 - `GET /v1/models` lists each checkpoint once, the served one first, under exactly the
   string a `model` field selects it by — every listed id is selectable, which is the
   point of a listing. Flash-Next is listed only while its shards are in the HF cache,
   for the same reason: it is the one checkpoint a request may not download, so listing
-  it uncached would list an id that is a 400. A served GGUF that is none of the
-  official checkpoints (a custom `--model` path) leads the list under its file name,
-  which is then its only id.
+  it uncached would list an id that is a 400, and the two Qwen3-4B language models are
+  listed on the same rule. The Z-Image encoder is never listed at all: it is not a
+  language model and every generating surface refuses it. A served GGUF that is none of
+  the official checkpoints (a custom `--model` path) leads the list under its file name,
+  which is then its only id, and a served safetensors directory does the same.
 - The compat dialects, `/v1/messages/count_tokens` and `/xwen/v1/batch` all resolve
   `model` the same way: absent or empty means the served file, this server's own id
   means the served file, another checkpoint's full name selects that checkpoint out of

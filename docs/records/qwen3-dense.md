@@ -398,3 +398,109 @@ for the two gates. Arc 3 is `serve` and `batch`: the per-target tokenizer and gr
 factory (D6c), the Target mapping, the disk tier on a safetensors `checkpoint_id`, and the
 `servable()` flip. The 8 GB scan on every `Qwen3Set::open` becomes a real cost there and
 is the first thing to fix in that arc; `encode-text` and `logits-dump` already pay it.
+
+## Arc 3, 2026-09-07: serve and batch, one server two vocabularies
+
+One commit (c05d631), plus the consistency test's tabulation fix (e15d6da). The two
+language models are servable and batchable, the encoder is refused on every surface, and
+the last structural thing the plan deferred, a second vocabulary inside one process, is
+shipped. This is the arc that makes the entries real: nothing before it could be reached
+over the wire.
+
+**The vocabulary follows the request's target.** `src/serve/vocab.rs` holds one
+`Vocabulary` per `VocabFamily`, the tokenizer and the grammar trie built together so they
+cannot disagree, cached lazily behind a short mutex that is never held across a build. A
+pair costs about 150 ms, dominated by the trie, so a server whose clients never ask for
+the other family never pays for it; two racing first requests may both build one and the
+loser is dropped, which is the trade that keeps one family's request off the other's
+build. Every tokenizer reader and every grammar-factory site in serve now resolves from
+the target, and `constrain::shared()` is off the request path entirely.
+
+Two smaller decisions inside that carry the weight. The trie is built from the file the
+tokenizer was parsed from, not from a path the caller carries alongside: `LagunaTokenizer`
+remembers its source and `constrain::for_tokenizer` asks it, because a trie and a
+tokenizer from different files agree about nothing and the symptom is wrong output rather
+than an error. And a family with no tokenizer on the machine is an error naming the fetch,
+never a fallback to the embedded copy, for the same reason: falling back would build, run
+and answer fluently in the wrong vocabulary. The mask width is a registry constant,
+`VocabFamily::logit_width()`, 248320 against 151936, because it is asked before any file
+is open.
+
+The lookup order for a family's `tokenizer.json` is worth knowing when a server surprises
+someone: the embedded copy for Qwen 3.6 with no search at all, since it IS that family's
+vocabulary; then the served file's own, which may be a directory the hub cache has never
+held; then any cached registry checkpoint of the family, the three qwen3 entries shipping
+a byte-identical tokenizer; then the error.
+
+**A gate that was missing on two surfaces.** `generate` and `chat` had no servable check,
+so `--model-size zimage-turbo` would have loaded the encoder and generated from its
+zero-filled layer 35. That load SUCCEEDS, the weights parsing and the config being a
+language model's, so the output would have been fluent-looking garbage rather than a
+failure. `ensure_servable` now runs on all four surfaces before the fetch, and the shared
+sentence says "cannot be run" rather than "cannot be served or batched" because it is now
+true of running at all.
+
+### Measured on the GPU, 2026-09-07
+
+`pmset -g` read `lowpowermode 2`, no high-power claim, everything on the release binary
+of c05d631 with the server started as `xwen serve --model-size qwen3-4b`.
+
+- `/v1/models` lists `Qwen3-4B` and `Qwen3-4B-Instruct-2507` once each beside the four
+  GGUF entries, and the encoder is absent.
+- A thinking completion on Qwen3-4B returned 314 reasoning tokens in `reasoning_content`
+  and a clean 56-token answer, the model having written its own `<think>`. That is the
+  model-opened path working end to end through the wire's channel separation.
+- Instruct-2507 answered, and `chat_template_kwargs.enable_thinking` on it was a 400
+  giving the reason.
+- A `json_schema` response format produced valid JSON matching the schema, which is the
+  request that proves the trie is the Qwen3 one: a mask built at 248320 over 151936
+  logits produces garbage or fails outright.
+- A two-turn conversation reported `cached_tokens` 14 of 63 on the second turn. Prefix
+  reuse quantizes to snapshots, so a partial figure is the documented behaviour rather
+  than a miss (decisions.md "Prefix reuse is quantized to snapshots").
+- Switching families on one server, Qwen3-4B to Qwen3.6-35B-A3B and back, answered on
+  every request. This is D6c end to end and the thing that was impossible before the arc.
+- The wire batch route, `POST /xwen/v1/batch`, ran three items: prefill 84 tokens in
+  8.7 ms, decode 9 tokens, 1053 ms of load. The CLI batch answered both its items.
+- The encoder is refused with the same sentence on `generate`, `chat`, `serve`, `batch`
+  and the wire, the last as a 400.
+
+### Performance, recorded and not pursued
+
+Plain decode 63.1 tok/s short-context and 55.9 at a 3890-token context; prefill 3416 to
+3433 tok/s at 3890 over three runs. Both sit near their ceilings: decode is 95% and 90%
+of the bytes-only figure (8.04 GB of BF16 weights per token, the tied head read in full
+for the logits, plus 0.57 GB of KV at 3890, at the ~535 GB/s this repo measures), and
+prefill's ~29 TFLOP/s end to end is inside the 28-36 TFLOP/s the Metal-4 tensor gemm
+reaches in isolation, so prefill runs at the gemm's own rate. There is no cheap lever on
+either, which is the right outcome for a checkpoint that is a correctness target and not
+a throughput one. Conditions, including the one caveat that CPU-only debug builds were
+running in the background, are in [perf-state.md](../perf-state.md).
+
+### Not taken now, added this arc
+
+- **`auto_fetch()` on the three entries.** Still false, so an uncached checkpoint is a
+  400 or a CLI error naming `xwen fetch` rather than an 8 GB download inside a request.
+  Reopen when someone wants a zero-flag run of the 4B and is willing to have the first
+  one download 8 GB.
+- **`AppState.max_ctx` is the SERVED checkpoint's, not the request target's.** The
+  handler-side "does this prompt fit" check therefore uses the served checkpoint's
+  window even for a request naming another, so Instruct-2507's trained 262144 is clamped
+  to the base model's 40960 on a base-default server, with a warning printed. This is
+  pre-existing across the GGUF checkpoints and merely more visible now that two
+  checkpoints of one family have windows six times apart. The engine re-derives its own
+  at load and that stays authoritative. Reopen when someone serves Instruct-2507 past
+  40960 alongside the base model.
+- **A unit-tested snapshot round trip on a safetensors checkpoint.** What is tested at
+  this level is the seam that changed, the disk tier deriving a stable distinct id from a
+  safetensors set; the binding logic below it is id-agnostic and already covered with
+  synthetic ids, and the real round trip was smoked on the GPU rather than pinned by a
+  test, because it needs a device. Reopen at the first serve regression there.
+
+### Next
+
+The architecture is feature-complete against the plan: every surface runs, both gates
+have been executed, and the encoder is ready for the diffusion pipelines to call
+`XwenModel::encode` in process. What is open is the Stage 1 bar decision, which is a
+ledger item and not an arc, and the two "not taken now" entries above. The next thing
+that needs this checkpoint is a diffusion model, not another Qwen3 arc.

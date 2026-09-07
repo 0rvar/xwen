@@ -280,12 +280,16 @@ converter here, so no tiled V-order and no pre-baked norm. Specials 151643
 `</think>` (`special: false`, same by-id trap). No BOS. Stops on 151645 AND 151643, and
 unlike 3.6 both are in the upstream `generation_config.json`.
 
-State as of 2026-09-07, and check it before you describe anything as working: `generate`,
-`chat` and `encode-text` run on the three entries (the encoder is `encode-text` only).
-`serve` and `batch` are REFUSED, Arc 3 being the arc that makes them work, and
-`auto_fetch()` is still false everywhere, so a run only ever uses what `xwen fetch` put
-in the cache. `Model::not_servable_reason()` is the single source of `servable()` and of
-the sentence the CLI and the HTTP 400 both print.
+State as of 2026-09-07, after Arc 3: **every surface runs the two language models** -
+`generate`, `chat`, `serve`, `batch` and `encode-text` - and the ENCODER runs
+`encode-text` alone. `auto_fetch()` is still false on all three, so an uncached checkpoint
+is a 400 or a CLI error naming `xwen fetch` and never an 8 GB download inside a request.
+`Model::not_servable_reason()` is the single source of `servable()` and of the one
+sentence the CLI and the HTTP 400 both print, and that gate runs on `generate` and `chat`
+too: loading the encoder there SUCCEEDS, its weights parsing and its config being a
+language model's, so without the gate those surfaces generate fluent garbage out of the
+zero-filled layer 35 instead of failing. There is no drafter for this architecture and
+none is planned.
 
 Traps, each of which has already cost someone time:
 
@@ -342,6 +346,23 @@ Traps, each of which has already cost someone time:
   has no ONNX export and there is no bun path to torch. It is not a precedent.
 - **A GGUF whose arch string is `qwen3` is refused**, pointing at the safetensors
   directory. Safetensors is the form this architecture ships in here.
+- **Serve carries TWO vocabularies and they follow the request's target**, not the
+  process (Arc 3). `src/serve/vocab.rs` holds one tokenizer plus grammar trie per
+  `VocabFamily`, built together so they cannot disagree, and `constrain::shared()` is off
+  every serve request path. Build a trie from the file its tokenizer was parsed from
+  (`constrain::for_tokenizer` asks the tokenizer, which remembers its source); a trie and
+  a tokenizer from different files agree about nothing and the symptom is wrong output,
+  never an error. Lookup order for a family: the embedded copy for Qwen 3.6 with no search
+  at all, then the served file's own, then any cached registry checkpoint of the family,
+  then an ERROR naming the fetch. Never add a fallback to the embedded tokenizer: it would
+  answer fluently in the wrong vocabulary. Mask width is `VocabFamily::logit_width()`,
+  248320 against 151936, a registry constant because it is asked before any file is open.
+- **`AppState.max_ctx` is the SERVED checkpoint's, not the request target's.** The
+  handler's prompt-fits check therefore uses the served window even for a request naming
+  another checkpoint, so on a base-default server Instruct-2507's trained 262144 is
+  clamped to 40960 with a warning. Pre-existing across the GGUF checkpoints, visible now
+  that one family holds two windows six times apart. The engine re-derives its own at load
+  and that is authoritative; do not "fix" one without the other.
 
 ## The candle situation
 
@@ -515,7 +536,8 @@ accept-and-drop while `presence_penalty` is consumed on every dialect that has a
 for it (2026-09-06).
 
 API model names are FULL names only (`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B`,
-`Qwen3.8-Flash-Next` — `Model::full_name`, matching `general.name` and the repo), plus
+`Qwen3.8-Flash-Next`, and since 2026-09-07 `Qwen3-4B` and `Qwen3-4B-Instruct-2507` —
+`Model::full_name`, matching `general.name` and the repo), plus
 the served file's own id when that file is none of them. Flash-Next is listed and
 selectable only while its shards are in the HF cache (`auto_fetch` false — an uncached
 one is a 400 naming `xwen fetch`, not an in-request 111 GB download). The CLI's
@@ -530,3 +552,16 @@ DIFFERENT file, so an official name resolves the hub file while the file's own i
 resolves the local one. Speculation is per checkpoint (`DraftMode::{Off,Official,
 Custom}`), resolved at load, so a sidecar-less default checkpoint no longer disables
 drafting for the others.
+
+The two dense Qwen3-4B language models joined serve and batch on 2026-09-07, which is
+what forced the vocabulary to become per target (`src/serve/vocab.rs`, the trap list in
+the Qwen3-4B section above, decisions.md "The tokenizer and the grammar trie follow the
+request's target"). They are listed and selectable only while cached, `auto_fetch` being
+false the way it is for Flash-Next. The Z-Image encoder is never listed and is refused on
+every surface. Their 400s: `enable_thinking` on Instruct-2507 (its template has no
+reasoning mode), a request-level `reasoning_effort` on either (the 3.6 rule, unchanged,
+`supports_reasoning_effort()` being Qwen38-only), and tools on either dialect (the call
+format is JSON and the serve parser reads `<function=`). A server-wide thinking default
+stays INERT rather than refusing every request, which is the same rule
+`reasoning_effort` already followed: the dialect drops the resolved value in chat.rs, so
+an operator default can be silently ignored while an explicit request is an error.
