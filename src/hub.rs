@@ -217,22 +217,23 @@ pub enum Format {
         encoder: Option<EncoderSpec>,
     },
     /// A diffusion pipeline repo at its snapshot root: a text encoder that is
-    /// its own registry entry, plus a transformer and a VAE that
-    /// [`crate::zimage`] opens straight from their diffusers-format
-    /// `config.json` and safetensors, and a scheduler config. Not a language
-    /// model; no surface but `xwen image` opens it.
+    /// its own registry entry, plus a transformer, a VAE and a scheduler
+    /// config that [`crate::zimage`] opens straight from their
+    /// diffusers-format `config.json` and safetensors. Not a language model;
+    /// no surface but `xwen image` opens it.
+    ///
+    /// The internal layout — `transformer/`, `vae/`,
+    /// `scheduler/scheduler_config.json` — is stated once, in
+    /// `ZImagePipeline::load`, and not repeated here. It is a property of the
+    /// diffusers format rather than of this registry, `load` has to work
+    /// against an operator's own `--model <root>` that no entry describes, and
+    /// two copies of a path list is how they come to disagree. What this entry
+    /// owns is which files a FETCH pulls, which is [`Checkpoint::files`].
     Diffusion {
         /// The registry entry for the `text_encoder/` set inside this repo —
         /// what supplies its tokenizer path, its zero-run allowlist and its
         /// [`EncoderSpec`]. Opened with that entry, never with this one.
         text_encoder: Model,
-        /// `transformer/config.json`, relative to the repo root; the shards
-        /// sit beside it and its index names them.
-        transformer_config: &'static str,
-        /// `vae/config.json`, with its single weight file beside it.
-        vae_config: &'static str,
-        /// `scheduler/scheduler_config.json`.
-        scheduler_config: &'static str,
     },
 }
 
@@ -615,9 +616,6 @@ const Z_IMAGE_TURBO: Checkpoint = Checkpoint {
     geometry: QWEN3_4B_GEOMETRY,
     format: Format::Diffusion {
         text_encoder: Model::ZImageTurboEncoder,
-        transformer_config: "transformer/config.json",
-        vae_config: "vae/config.json",
-        scheduler_config: "scheduler/scheduler_config.json",
     },
 };
 
@@ -660,21 +658,6 @@ impl Model {
     pub const fn text_encoder(self) -> Option<Model> {
         match &self.checkpoint().format {
             Format::Diffusion { text_encoder, .. } => Some(*text_encoder),
-            Format::SafeTensors { .. } | Format::Gguf => None,
-        }
-    }
-
-    /// The repo-relative paths of this pipeline's transformer, VAE and
-    /// scheduler configs, in that order, or `None` for a checkpoint that is
-    /// not a diffusion pipeline.
-    pub const fn diffusion_configs(self) -> Option<(&'static str, &'static str, &'static str)> {
-        match &self.checkpoint().format {
-            Format::Diffusion {
-                transformer_config,
-                vae_config,
-                scheduler_config,
-                ..
-            } => Some((transformer_config, vae_config, scheduler_config)),
             Format::SafeTensors { .. } | Format::Gguf => None,
         }
     }
@@ -2201,11 +2184,26 @@ mod tests {
             "the encoder's refusal must not read as one a later build lifts: {encoder}"
         );
 
-        // The wire says the same thing the CLI does, for the same checkpoint.
-        assert_eq!(
-            crate::serve::unselectable_model_message(Model::ZImageTurboEncoder),
-            Model::ZImageTurboEncoder.not_servable_message()
+        // The pipeline is refused for a different reason and points at a
+        // different command, which is the whole argument for two entries
+        // rather than one.
+        let pipeline = Model::ZImageTurbo.not_servable_message();
+        assert!(pipeline.contains("text-to-image"), "{pipeline}");
+        assert!(pipeline.contains("xwen image"), "{pipeline}");
+        assert!(
+            !pipeline.contains("encode-text"),
+            "the pipeline's refusal must not send someone to the encoder's command: {pipeline}"
         );
+        assert_ne!(pipeline, encoder);
+
+        // The wire says the same thing the CLI does, for both of them.
+        for model in [Model::ZImageTurboEncoder, Model::ZImageTurbo] {
+            assert_eq!(
+                crate::serve::unselectable_model_message(model),
+                model.not_servable_message(),
+                "{model:?}"
+            );
+        }
     }
 
     /// The qwen3 cache figures. All three checkpoints share one geometry — the
@@ -2403,6 +2401,30 @@ mod tests {
         // checkpoint is `text_encoder/` inside it, and the root holds a
         // tokenizer and nothing else this build can run.
         assert_eq!(identify(encoder.parent().unwrap()), None);
+
+        // A whole PIPELINE snapshot — all fifteen files, the encoder's six
+        // among them — which is the state `xwen fetch --model-size
+        // zimage-turbo` leaves behind and the one an operator actually has.
+        //
+        // Its root identifies as NOTHING, and that is load-bearing twice
+        // over: `identify_cached_dir` iterates the safetensors entries and
+        // `Format::Diffusion` is not one, and the encoder's own rule wants
+        // the `text_encoder` subdirectory rather than the root. Make
+        // `is_safetensors()` true for the pipeline — the obvious "but it IS
+        // safetensors" edit — and the root starts identifying as a language
+        // model that every generating surface then refuses.
+        let pipeline = install_set(&root, Model::ZImageTurbo, "eee555");
+        assert_eq!(identify(&pipeline), None);
+        assert!(pipeline.join("model_index.json").is_file());
+        // The encoder inside it does resolve, so one pipeline fetch supplies
+        // `encode-text`, `xwen image` and serve's Qwen3 vocabulary. A `Some`
+        // here is what `XwenConfig::identify` turns into
+        // `Identity::Official`, that being its whole rule for a directory
+        // whose files name no release (config.rs).
+        assert_eq!(
+            identify(&pipeline.join("text_encoder")),
+            Some(Model::ZImageTurboEncoder)
+        );
 
         // A half-downloaded snapshot is not the official weights, however
         // official its provenance: the config and the index arrive first and

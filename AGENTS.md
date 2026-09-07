@@ -413,10 +413,15 @@ The seams, so a change lands in one place:
   (tested). `is_safetensors()` means specifically "a Qwen3 set the Qwen3 loader opens",
   which is why the pipeline could not be one: `identify_cached_dir` iterates those and
   would have made the snapshot root identify as a language model.
-- **`check_size`** owns the accepted resolutions: both sides positive multiples of 16 AND
-  `(w/16) * (h/16)` a multiple of 32. The `x_pad_token` path that would lift the second
-  half is unimplemented, so a size needing it is refused with the token count in the
-  message rather than silently padded.
+- **`check_size`** owns the accepted resolutions, and there are three rules: both sides
+  positive multiples of 16, `(w/16) * (h/16)` a multiple of 32, and each side at most
+  8192 px, which is the 512 positions its RoPE table holds. The `x_pad_token` path that
+  would lift the second rule is unimplemented, so a size needing it is refused with the
+  token count in the message rather than silently padded. The third rule exists because
+  candle's Metal `index_select` clamps an out-of-range position instead of failing, so
+  past it the run returns a wrong image rather than an error; the same bound is re-checked
+  inside `forward` against the loaded `axes_lens`, which also catches a caption long
+  enough to push the image past axis 0's 1536.
 - Aliases: `zimage-turbo` is the PIPELINE and `zimage-turbo-encoder` is the encode-only
   entry. Neither is auto-fetched, neither is servable, and neither appears in
   `/v1/models`.

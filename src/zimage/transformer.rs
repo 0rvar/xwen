@@ -25,6 +25,21 @@ pub const FREQUENCY_EMBEDDING_SIZE: usize = 256;
 /// Max period for sinusoidal encoding
 pub const MAX_PERIOD: f64 = 10000.0;
 
+/// The shipped `axes_lens`: how many positions each of the three RoPE tables
+/// holds, and therefore the highest position any coordinate grid may name.
+///
+/// A position past the end of a table is NOT an error on Metal — candle's
+/// `index_select` kernel clamps out-of-range ids to the last row rather than
+/// failing (`candle-metal-kernels/src/metal_src/indexing.metal`, "Force
+/// prevent out of bounds indexing") while the CPU backend errors. So an
+/// oversized request would come back as a plausible image built from the
+/// wrong rotations, on the shipped device only. The explicit checks in
+/// [`ZImageTransformer2DModel::forward`] and
+/// [`crate::zimage::pipeline::ZImagePipeline::check_size`] are the whole
+/// defence; these are the numbers they check against when the caller has no
+/// config in hand.
+pub const AXES_LENS: [usize; 3] = [1536, 512, 512];
+
 // ==================== Config ====================
 
 /// Z-Image Transformer configuration
@@ -60,9 +75,11 @@ pub struct Config {
     pub axes_dims: Vec<usize>,
     #[serde(default = "default_axes_lens")]
     pub axes_lens: Vec<usize>,
-    /// Whether attention runs through candle's fused Metal SDPA kernel (true,
-    /// the default; not a key in the shipped config.json) or through the plain
-    /// matmul-softmax-matmul chain, which is the reference arm for an A/B.
+    /// Whether attention runs through candle's fused Metal SDPA kernel (the
+    /// default) or through the plain matmul-softmax-matmul chain, which is the
+    /// reference arm for an A/B. Not a key in the shipped config.json, so the
+    /// `serde` default is what decides it, and that default reads
+    /// [`ATTN_ENV`] — `XWEN_ZIMAGE_ATTN=basic` selects the reference arm.
     #[serde(default = "default_use_accelerated_attn")]
     pub use_accelerated_attn: bool,
 }
@@ -74,8 +91,75 @@ pub fn compute_padding_len(ori_len: usize) -> usize {
     (SEQ_MULTI_OF - (ori_len % SEQ_MULTI_OF)) % SEQ_MULTI_OF
 }
 
+/// The environment switch that picks the attention implementation, read when
+/// a [`Config`] is built — by `serde` from `transformer/config.json`, which
+/// carries no such key, or by [`Config::z_image_turbo`]. Same shape as
+/// `XWEN_QWEN3_ATTN` on the language stack and for the same purpose: a
+/// bisect arm that shares no attention kernel with the shipped one.
+pub const ATTN_ENV: &str = "XWEN_ZIMAGE_ATTN";
+
+/// Which attention chain a built [`Config`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnImpl {
+    /// The shipped path on Metal: candle's fused SDPA kernel.
+    Fused,
+    /// The explicit chain — Q·Kᵀ, additive mask, softmax, P·V — through
+    /// candle's plain matmul and softmax. It is the reference arm: it shares
+    /// no attention kernel with the fused one, so an A/B between them is a
+    /// comparison of two computations rather than of one kernel with itself.
+    Basic,
+}
+
+impl AttnImpl {
+    /// Resolve from [`ATTN_ENV`]: unset means the shipped path, anything else
+    /// must name an arm.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(ATTN_ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(Self::Fused),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                candle_core::bail!("{ATTN_ENV} is not valid UTF-8")
+            }
+            Ok(value) => Self::parse(&value),
+        }
+    }
+
+    /// [`Self::from_env`] with a bad value read as the shipped path, for the
+    /// `serde` default, which cannot fail. Nothing runs on that reading:
+    /// `ZImagePipeline::load` calls [`Self::from_env`] with a `?` before it
+    /// opens anything, so a typo in a bisect run is a load error rather than
+    /// a silent measurement of the wrong arm.
+    pub fn from_env_or_default() -> Self {
+        Self::from_env().unwrap_or(Self::Fused)
+    }
+
+    /// `fused` / `flash` (or empty) select the shipped path, `basic` the
+    /// reference chain; anything else is refused rather than defaulted.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "fused" | "flash" | "sdpa" => Ok(Self::Fused),
+            "basic" => Ok(Self::Basic),
+            other => candle_core::bail!(
+                "{ATTN_ENV}={other:?}: expected `fused` (the default) or `basic`"
+            ),
+        }
+    }
+
+    /// Whether this arm is the fused kernel, which is how [`Config`] stores it.
+    pub fn is_accelerated(self) -> bool {
+        matches!(self, Self::Fused)
+    }
+
+    /// The name a dump or a log records for provenance.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fused => "fused",
+            Self::Basic => "basic",
+        }
+    }
+}
+
 fn default_use_accelerated_attn() -> bool {
-    true
+    AttnImpl::from_env_or_default().is_accelerated()
 }
 
 fn default_patch_size() -> Vec<usize> {
@@ -84,8 +168,14 @@ fn default_patch_size() -> Vec<usize> {
 fn default_f_patch_size() -> Vec<usize> {
     vec![1]
 }
+/// The latent channel count, `in_channels` in the shipped
+/// `transformer/config.json` and the VAE's `latent_channels`. A constant
+/// because the shape of an injected latent has to be checkable before any
+/// config is open; the loaded config stays authoritative for what runs.
+pub const LATENT_CHANNELS: usize = 16;
+
 fn default_in_channels() -> usize {
-    16
+    LATENT_CHANNELS
 }
 fn default_dim() -> usize {
     3840
@@ -121,7 +211,7 @@ fn default_axes_dims() -> Vec<usize> {
     vec![32, 48, 48]
 }
 fn default_axes_lens() -> Vec<usize> {
-    vec![1536, 512, 512]
+    AXES_LENS.to_vec()
 }
 
 impl Config {
@@ -130,7 +220,7 @@ impl Config {
         Self {
             all_patch_size: vec![2],
             all_f_patch_size: vec![1],
-            in_channels: 16,
+            in_channels: LATENT_CHANNELS,
             dim: 3840,
             n_layers: 30,
             n_refiner_layers: 2,
@@ -142,14 +232,25 @@ impl Config {
             rope_theta: 256.0,
             t_scale: 1000.0,
             axes_dims: vec![32, 48, 48],
-            axes_lens: vec![1536, 512, 512],
-            use_accelerated_attn: true,
+            axes_lens: AXES_LENS.to_vec(),
+            use_accelerated_attn: AttnImpl::from_env_or_default().is_accelerated(),
         }
     }
 
-    /// Set whether to use accelerated attention (for debugging)
-    pub fn set_use_accelerated_attn(&mut self, enabled: bool) {
-        self.use_accelerated_attn = enabled;
+    /// Which attention chain this config runs.
+    pub fn attn_impl(&self) -> AttnImpl {
+        if self.use_accelerated_attn {
+            AttnImpl::Fused
+        } else {
+            AttnImpl::Basic
+        }
+    }
+
+    /// Pick the attention chain explicitly, overriding what [`ATTN_ENV`] said
+    /// when this config was built. What a test uses to run both arms in one
+    /// process without touching the environment its siblings share.
+    pub fn set_attn_impl(&mut self, attn: AttnImpl) {
+        self.use_accelerated_attn = attn.is_accelerated();
     }
 
     /// Get head dimension
@@ -315,6 +416,14 @@ impl RopeEmbedder {
 
     /// Get RoPE cos/sin from position IDs
     /// ids: (seq_len, 3) - [frame_id, height_id, width_id]
+    ///
+    /// Every id must already be inside its axis's `axes_lens`: the
+    /// `index_select` below CLAMPS an out-of-range id to the table's last row
+    /// on Metal instead of failing, so a caller that skips the check gets
+    /// wrong rotations rather than an error. The one caller,
+    /// [`ZImageTransformer2DModel::forward`], checks the grid extents before
+    /// building the ids, which costs nothing per step; reading the ids back
+    /// here to check them would cost a device sync per call.
     pub fn forward(&self, ids: &Tensor) -> Result<(Tensor, Tensor)> {
         let mut cos_parts = Vec::with_capacity(self.axes_dims.len());
         let mut sin_parts = Vec::with_capacity(self.axes_dims.len());
@@ -505,8 +614,25 @@ impl ZImageAttention {
         attn_probs.matmul(v)
     }
 
-    /// The additive `(B, n_heads, seq_len, seq_len)` mask SDPA takes, from a
-    /// `(B, seq_len)` keep-mask.
+    /// The additive `(B, n_heads, seq_len, seq_len)` mask candle's Metal SDPA
+    /// takes, from a `(B, seq_len)` keep-mask.
+    ///
+    /// The four-axis shape is not a waste and it is not optional. It is not a
+    /// waste because `broadcast_as` sets a stride of 0 on the two expanded
+    /// axes and copies nothing (`candle-core/src/layout.rs`
+    /// `Layout::broadcast_as`), and candle hands those strides to the kernel
+    /// rather than making the mask contiguous first. It is not optional
+    /// because that kernel refuses anything else: `candle-nn/src/ops.rs`
+    /// bails with "Mask shape must be (bs, qheads, qseq, kseq)" unless the
+    /// dims equal `[b, q_heads, q_seq, k_seq]` exactly, so the
+    /// `(B, 1, 1, seq_len)` form the reference's torch SDPA broadcasts
+    /// internally is an error here. [`Self::attention_basic`] takes that
+    /// broadcastable form instead, `broadcast_add` being happy with it.
+    ///
+    /// Neither mask branch is reachable from `xwen image`: every call site
+    /// passes `None`, batch 1 having no ragged sequence to mask. The tests
+    /// cover them so that whoever enables the batched or image-padded path
+    /// starts from something that has run.
     fn prepare_sdpa_mask(&self, mask: Option<&Tensor>, q: &Tensor) -> Result<Option<Tensor>> {
         match mask {
             Some(m) => {
@@ -991,6 +1117,37 @@ impl ZImageTransformer2DModel {
         let f_tokens = f / f_patch_size;
         let h_tokens = h / patch_size;
         let w_tokens = w / patch_size;
+        // Every position named below indexes a RoPE table, and an index past
+        // the end of one is silently clamped to its last row by candle's Metal
+        // `index_select` kernel — wrong rotations, a plausible image and no
+        // error, on the device this actually runs on. The caption occupies
+        // axis 0 up to `cap_len` and the image sits above it at
+        // `cap_len + 1 ..= cap_len + f_tokens`, so `cap_len + f_tokens` is the
+        // highest index axis 0 ever sees.
+        let axes_lens = self.cfg.axes_lens.as_slice();
+        if axes_lens.len() != 3 {
+            candle_core::bail!(
+                "axes_lens has {} entries; the coordinate grid is 3-axis",
+                axes_lens.len()
+            );
+        }
+        let top = cap_len + f_tokens;
+        if top >= axes_lens[0] {
+            candle_core::bail!(
+                "the caption needs position {top} on rope axis 0 ({cap_len} caption tokens \
+                 then the image above them), and its table holds {}; a shorter prompt is \
+                 the only fix, the table being the checkpoint's",
+                axes_lens[0]
+            );
+        }
+        if h_tokens > axes_lens[1] || w_tokens > axes_lens[2] {
+            candle_core::bail!(
+                "the image token grid is {h_tokens}x{w_tokens} (rows x columns) and the rope \
+                 tables hold {}x{}; that size is past what this checkpoint can position",
+                axes_lens[1],
+                axes_lens[2]
+            );
+        }
         let x_pos_ids =
             create_coordinate_grid((f_tokens, h_tokens, w_tokens), (cap_len + 1, 0, 0), device)?;
         let (x_cos, x_sin) = self.rope_embedder.forward(&x_pos_ids)?;
@@ -1183,5 +1340,241 @@ mod tests {
         assert_eq!(compute_padding_len(1), 31);
         assert_eq!(compute_padding_len(33), 31);
         assert_eq!(compute_padding_len(63), 1);
+    }
+
+    #[test]
+    fn the_attention_env_switch_names_its_arms_and_refuses_a_typo() {
+        assert_eq!(AttnImpl::parse("").unwrap(), AttnImpl::Fused);
+        assert_eq!(AttnImpl::parse("fused").unwrap(), AttnImpl::Fused);
+        assert_eq!(AttnImpl::parse(" Flash ").unwrap(), AttnImpl::Fused);
+        assert_eq!(AttnImpl::parse("basic").unwrap(), AttnImpl::Basic);
+        assert_eq!(AttnImpl::parse("BASIC").unwrap(), AttnImpl::Basic);
+        assert!(AttnImpl::parse("reference").is_err());
+        assert_eq!(AttnImpl::Fused.label(), "fused");
+        assert_eq!(AttnImpl::Basic.label(), "basic");
+        assert!(AttnImpl::Fused.is_accelerated());
+        assert!(!AttnImpl::Basic.is_accelerated());
+
+        // What a Config built from the shipped `config.json` gets, that file
+        // carrying no key for it, and what an explicit override does.
+        let mut cfg = Config::z_image_turbo();
+        cfg.set_attn_impl(AttnImpl::Basic);
+        assert_eq!(cfg.attn_impl(), AttnImpl::Basic);
+        assert!(!cfg.use_accelerated_attn);
+        cfg.set_attn_impl(AttnImpl::Fused);
+        assert_eq!(cfg.attn_impl(), AttnImpl::Fused);
+    }
+
+    /// Deterministic pseudo-random weights for any name and shape, so a whole
+    /// tiny transformer can be built with no checkpoint at all.
+    ///
+    /// Seeded from the tensor's NAME, so two builders hand the same tensor the
+    /// same numbers: an A/B between two models built this way differs only in
+    /// the code under test.
+    struct RandomWeights;
+
+    impl candle_nn::var_builder::SimpleBackend for RandomWeights {
+        fn get(
+            &self,
+            s: candle_core::Shape,
+            name: &str,
+            _init: candle_nn::Init,
+            dtype: DType,
+            dev: &Device,
+        ) -> Result<Tensor> {
+            let mut state = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+            }) | 1;
+            let values: Vec<f32> = (0..s.elem_count())
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let u = (state >> 11) as f64 / (1u64 << 53) as f64;
+                    (u as f32 - 0.5) * 0.2
+                })
+                .collect();
+            Tensor::from_vec(values, s, &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_device(dev)
+        }
+
+        fn get_unchecked(&self, name: &str, _dtype: DType, _dev: &Device) -> Result<Tensor> {
+            candle_core::bail!("{name} was asked for without a shape to make up")
+        }
+
+        fn contains_tensor(&self, _name: &str) -> bool {
+            true
+        }
+    }
+
+    fn random_vb(dev: &Device) -> VarBuilder<'static> {
+        VarBuilder::from_backend(Box::new(RandomWeights), DType::F32, dev.clone())
+    }
+
+    /// The real head dim (128) and the real axis split, at one head pair and
+    /// one layer of each kind, with the rope tables cut down to 40 positions
+    /// on axis 0 and 8 on each spatial axis so a test can reach past them.
+    fn tiny_config() -> Config {
+        Config {
+            all_patch_size: vec![2],
+            all_f_patch_size: vec![1],
+            in_channels: 4,
+            dim: 256,
+            n_layers: 1,
+            n_refiner_layers: 1,
+            n_heads: 2,
+            n_kv_heads: 2,
+            norm_eps: 1e-5,
+            qk_norm: true,
+            cap_feat_dim: 16,
+            rope_theta: 256.0,
+            t_scale: 1000.0,
+            axes_dims: vec![32, 48, 48],
+            axes_lens: vec![40, 8, 8],
+            use_accelerated_attn: true,
+        }
+    }
+
+    fn metal_or_skip(what: &str) -> Option<Device> {
+        match crate::gguf::metal_device() {
+            Ok(dev) => Some(dev),
+            Err(e) => {
+                eprintln!("skipping {what}: no Metal device ({e})");
+                None
+            }
+        }
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        let b = b.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        let a = a.to_vec1::<f32>().unwrap();
+        let b = b.to_vec1::<f32>().unwrap();
+        assert_eq!(a.len(), b.len());
+        let mut worst = 0f32;
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            // Checked first: `f32::max` returns its non-NaN operand, so a fold
+            // over a NaN-filled output would read as a perfect match.
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "non-finite value at {i}: {x} vs {y}"
+            );
+            worst = worst.max((x - y).abs());
+        }
+        worst
+    }
+
+    /// A position past the end of a rope table is refused, not clamped.
+    ///
+    /// Clamped is what it would otherwise be: candle's Metal `index_select`
+    /// returns the table's last row for an out-of-range id rather than
+    /// failing, so an over-long caption or an over-large image would come back
+    /// as a plausible picture built from the wrong rotations. Runs on the CPU,
+    /// where the same ids would have errored inside `index_select` — the point
+    /// is that the refusal happens up front, with a sentence about the size,
+    /// on every device.
+    #[test]
+    fn a_position_past_a_rope_table_is_refused_rather_than_clamped() {
+        let dev = cpu();
+        let cfg = tiny_config();
+        let model = ZImageTransformer2DModel::new(&cfg, random_vb(&dev)).unwrap();
+        let t = Tensor::new(&[0.5f32], &dev).unwrap();
+        let legal_latent = Tensor::zeros((1, 4, 1, 16, 8), DType::F32, &dev).unwrap();
+        let legal_cap = Tensor::zeros((1, 16, 16), DType::F32, &dev).unwrap();
+
+        // The control. 16 caption tokens pad to 32, so the image sits at axis-0
+        // position 33 of 40, and its 8x4 cell grid fits the 8x8 spatial tables.
+        let out = model.forward(&legal_latent, &t, &legal_cap).unwrap();
+        assert_eq!(out.dims(), &[1, 4, 1, 16, 8]);
+
+        // 48 caption tokens pad to 64, putting the image at position 65 of a
+        // 40-row table.
+        let long_cap = Tensor::zeros((1, 48, 16), DType::F32, &dev).unwrap();
+        let err = model
+            .forward(&legal_latent, &t, &long_cap)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("position 65"), "{err}");
+        assert!(err.contains("rope axis 0"), "{err}");
+
+        // A 16x2 cell grid is still 32 image tokens, so this is the table
+        // bound firing and not the multiple-of-32 rule.
+        let tall_latent = Tensor::zeros((1, 4, 1, 32, 4), DType::F32, &dev).unwrap();
+        let err = model
+            .forward(&tall_latent, &t, &legal_cap)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("16x2"), "{err}");
+        assert!(err.contains("8x8"), "{err}");
+    }
+
+    /// The basic attention arm agrees with the fused Metal kernel, within a
+    /// bar and NOT to the bit.
+    ///
+    /// The nonzero half is the point. The two arms are different computations
+    /// — an explicit matmul, additive mask, softmax and second matmul against
+    /// candle's fused SDPA — and a bit-identical result would mean the switch
+    /// selected one kernel twice and `XWEN_ZIMAGE_ATTN=basic` bisects nothing.
+    /// That is exactly how the dense Qwen3 sdpa ablation was vacuous for an
+    /// arc (AGENTS.md, "Verification workflow").
+    ///
+    /// It also runs the two mask branches, which `xwen image` never reaches:
+    /// the fused arm's mask has to be the four-axis shape candle's kernel
+    /// demands and the basic arm's the broadcastable one, and only running
+    /// both says whether either is right.
+    #[test]
+    fn the_basic_attention_arm_matches_the_fused_kernel() {
+        let Some(dev) = metal_or_skip("the_basic_attention_arm_matches_the_fused_kernel") else {
+            return;
+        };
+        let mut fused_cfg = tiny_config();
+        fused_cfg.set_attn_impl(AttnImpl::Fused);
+        let mut basic_cfg = tiny_config();
+        basic_cfg.set_attn_impl(AttnImpl::Basic);
+        let fused = ZImageAttention::new(&fused_cfg, random_vb(&dev)).unwrap();
+        let basic = ZImageAttention::new(&basic_cfg, random_vb(&dev)).unwrap();
+
+        let seq = 64;
+        let hidden = random_vb(&dev)
+            .get((1, seq, fused_cfg.dim), "hidden_states")
+            .unwrap();
+        let ids = create_coordinate_grid((1, 8, 8), (1, 0, 0), &dev).unwrap();
+        let rope = RopeEmbedder::new(
+            fused_cfg.rope_theta,
+            fused_cfg.axes_dims.clone(),
+            fused_cfg.axes_lens.clone(),
+            &dev,
+        )
+        .unwrap();
+        let (cos, sin) = rope.forward(&ids).unwrap();
+
+        let a = fused.forward(&hidden, None, &cos, &sin).unwrap();
+        let b = basic.forward(&hidden, None, &cos, &sin).unwrap();
+        assert_eq!(a.dims(), &[1, seq, fused_cfg.dim]);
+        let diff = max_abs_diff(&a, &b);
+        eprintln!("z-image attention, fused vs basic: max |delta| {diff:.3e}");
+        assert!(diff <= 2e-3, "max abs diff {diff}");
+        assert!(
+            diff > 0.0,
+            "the two arms produced bit-identical output, so they ran the same kernel"
+        );
+
+        // The mask branches, on a keep-mask that drops the second half of the
+        // sequence. The masked arms agree with each other and differ from the
+        // unmasked run, which is what says the mask was applied at all.
+        let keep: Vec<f32> = (0..seq)
+            .map(|i| if i < seq / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let mask = Tensor::from_vec(keep, (1, seq), &dev).unwrap();
+        let a_masked = fused.forward(&hidden, Some(&mask), &cos, &sin).unwrap();
+        let b_masked = basic.forward(&hidden, Some(&mask), &cos, &sin).unwrap();
+        let diff = max_abs_diff(&a_masked, &b_masked);
+        eprintln!("z-image attention with a mask, fused vs basic: max |delta| {diff:.3e}");
+        assert!(diff <= 2e-3, "masked: max abs diff {diff}");
+        assert!(
+            max_abs_diff(&a, &a_masked) > 0.0,
+            "the mask changed nothing, so it was not applied"
+        );
     }
 }

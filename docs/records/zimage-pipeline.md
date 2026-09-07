@@ -55,10 +55,15 @@ invariants the registry already holds: `is_safetensors()` means "a Qwen3 set the
 loader opens", `identify_cached_dir` iterates exactly those entries and would have
 identified the snapshot ROOT as the pipeline where an existing test pins the root as
 identifying as nothing, and the safetensors tests assert `config == files[0]` over a
-six-file set. So the entry got its own `Format::Diffusion { text_encoder,
-transformer_config, vae_config, scheduler_config }`, with `is_gguf()`, `is_diffusion()`,
-`text_encoder()` and `diffusion_configs()` beside it and a test that exactly one of the
-three format predicates holds per entry. Five tests that meant "GGUF" and filtered on
+six-file set. So the entry got its own `Format::Diffusion { text_encoder }`, with
+`is_gguf()`, `is_diffusion()` and `text_encoder()` beside it and a test that exactly one
+of the three format predicates holds per entry. It carried the transformer, VAE and
+scheduler config paths too until the review round after this arc, which found nothing
+read them: `ZImagePipeline::load` states the diffusers layout itself, and it has to,
+being called against an operator's own `--model <root>` that no entry describes. The
+paths came out and `load` is the one source of that layout.
+
+Five tests that meant "GGUF" and filtered on
 `!is_safetensors()` now say `is_gguf()`. The argument is in
 [docs/decisions/zimage.md](../decisions/zimage.md).
 
@@ -81,10 +86,16 @@ xwen image --prompt <text> [--width 1024] [--height 1024] [--steps 8] [--seed N]
   [--latents file.safetensors]
 ```
 
-The size rule is `check_size`: both sides positive multiples of 16, and the image token
-count `(w/16) * (h/16)` a multiple of 32. 1024x1024, 1024x768, 768x1024, 512x512 and
-1536x1024 pass. 1000x1000 is refused for the multiple of 16 and 528x528 for "1089 image
-tokens ... not a multiple of 32". An omitted seed draws a random u64 and prints it; seeds
+The size rule is `check_size`: both sides positive multiples of 16, the image token
+count `(w/16) * (h/16)` a multiple of 32, and neither side past 8192 px, which is the
+512 positions each spatial RoPE table holds. 1024x1024, 1024x768, 768x1024, 512x512 and
+1536x1024 pass. 1000x1000 is refused for the multiple of 16, 528x528 for "1089 image
+tokens ... not a multiple of 32", and 8208x1024 for the table bound. The 8192 px rule and
+`forward`'s matching check against the loaded `axes_lens` (which also covers a caption
+long enough to push the image past axis 0's 1536) came from the review round after the
+arc: candle's Metal `index_select` clamps an out-of-range position instead of failing, so
+without them the answer to an oversized request is a wrong image and not an error.
+An omitted seed draws a random u64 and prints it; seeds
 are xwen's own draw and mean nothing to torch. Per-phase timings go to stderr and one
 summary line to stdout. `--latents` injects a latent from a safetensors file, which is
 the hook Stage 3 and Stage 4 will use.
@@ -98,7 +109,10 @@ behaviour is unchanged. Encoder and transformer both stay resident for the run.
 
 - `cargo test --release`, full suite: lib 1302 passed, 0 failed, 34 ignored; bin 14;
   cli_gates 4; parity 69 with 3 ignored; qwen3_encoder 17 with 1 ignored; qwen3_parity 13
-  with 1 ignored. Exit 0.
+  with 1 ignored. Exit 0. **After the review round** that followed the arc, the same run
+  is lib 1308 (six new tests), cli_gates 6 (two new), everything else unchanged, 0 failed
+  and no SKIPPED lines; and the ignored image test reproduces the figures below to the
+  digit, which is the evidence the fixes touched no math.
 - New unit tests, all passing: the 8-step sigma table and the dynamic-shift refusal; the
   five rope reference values at position (5,3,7) and the rope dtype; patchify ordering and
   the unpatchify roundtrip; caption padding length; seeded-noise reproducibility and
@@ -142,7 +156,23 @@ number or a waiting user are ledger items in [TODO.md](../../TODO.md) instead.
   the evidence is that the step is compute-bound by 45x to 160x
   (decisions.md "The transformer runs bf16 end to end"). Reopen on a W8A8 kernel reaching
   the neural accelerators, or on footprint pressure.
-- **The HTTP encode route.** `encode-text` exposes the encoder on the CLI and the serve
+- **Ties-to-even rounding in `postprocess_image`.** candle's `.round()` is
+  ties-away-from-zero and numpy's `.round()`, which `VaeImageProcessor.numpy_to_pil`
+  uses, is ties-to-even. They differ only for a value landing exactly on `.5` after the
+  x255, which f32 VAE output effectively never produces, and the existing test's own case
+  (127.5 to 128) agrees by luck because 128 is even. Reopen at the Stage 4 bit-exact
+  comparison, if one is ever attempted: if the PSNR is being read against a byte-for-byte
+  bar rather than a decibel one, this is a source of single-count differences and has to
+  go first.
+- **Threading `n_kv_heads` through the attention reshape.** `ZImageAttention::new` sizes
+  `to_k` and `to_v` with `cfg.n_kv_heads` and `forward` reshapes k and v with
+  `self.n_heads`; the shipped config has both at 30, so it is a conflation and not a bug,
+  and if they ever differed the reshape would fail loudly rather than compute something
+  wrong. diffusers has the same conflation (it uses `attn.heads` for all three) and the
+  official repo threads the two separately. Reopen if a Z-Image release ships a config
+  where the two differ, which would be a GQA variant of this transformer.
+- **The HTTP encode route.**
+ `encode-text` exposes the encoder on the CLI and the serve
   route for images will need the encoder in process; an HTTP endpoint that returns raw
   hidden states for an external pipeline is a different feature and nobody asked for it.
   Reopen if something outside this process wants the conditioning.

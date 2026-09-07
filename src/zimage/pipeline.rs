@@ -16,7 +16,9 @@ use candle_nn::VarBuilder;
 
 use super::sampling::{postprocess_image, seeded_noise};
 use super::scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};
-use super::transformer::{Config, SEQ_MULTI_OF, ZImageTransformer2DModel};
+use super::transformer::{
+    AXES_LENS, AttnImpl, Config, LATENT_CHANNELS, SEQ_MULTI_OF, ZImageTransformer2DModel,
+};
 use super::vae::{AutoEncoderKL, VaeConfig};
 
 /// The pipeline's own divisibility rule: the VAE compresses 8x and the
@@ -68,8 +70,15 @@ impl ZImagePipeline {
     /// The transformer's fp32 shards are cast to bf16 as they load; the VAE's
     /// bf16 weights are widened to f32, which is the dtype it decodes in.
     pub fn load(root: &Path, device: &Device) -> Result<Self> {
+        // Before anything opens: a typo in the bisect switch is a load error,
+        // not a run that quietly measures the shipped arm twice.
+        let attn = AttnImpl::from_env()?;
         let transformer_dir = root.join("transformer");
-        let transformer_cfg: Config = read_json(&transformer_dir.join("config.json"))?;
+        let mut transformer_cfg: Config = read_json(&transformer_dir.join("config.json"))?;
+        transformer_cfg.set_attn_impl(attn);
+        if attn != AttnImpl::Fused {
+            eprintln!("xwen: z-image attention arm: {}", attn.label());
+        }
         let shards = shard_paths(&transformer_dir)?;
         let dtype = DType::BF16;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, device)? };
@@ -101,25 +110,45 @@ impl ZImagePipeline {
 
     /// Whether a `width x height` is one this pipeline runs, and why not.
     ///
-    /// Both sides are whole 16-pixel cells, and the cell count is a multiple
-    /// of 32 so the image sequence needs no pad rows (see
-    /// `ZImageTransformer2DModel::forward`).
+    /// Three rules. Both sides are whole 16-pixel cells; the cell count is a
+    /// multiple of 32 so the image sequence needs no pad rows (see
+    /// `ZImageTransformer2DModel::forward`); and each side's cell count fits
+    /// inside its RoPE table, [`AXES_LENS`] rows on axis 1 for the image's
+    /// rows and axis 2 for its columns, which caps a side at 8192 px. That
+    /// third rule is not a formality: candle's Metal `index_select` clamps an
+    /// out-of-range position to the table's last row instead of failing, so
+    /// past the cap the run would return a plausible image built from the
+    /// wrong rotations. [`AXES_LENS`] is the shipped `transformer/config.json`
+    /// and this is a static check with no config in hand; the same bound is
+    /// re-checked against the loaded `axes_lens` inside the transformer.
     pub fn check_size(width: usize, height: usize) -> Result<()> {
         ensure!(
             width > 0
                 && height > 0
-                && width % PIXELS_PER_TOKEN == 0
-                && height % PIXELS_PER_TOKEN == 0,
+                && width.is_multiple_of(PIXELS_PER_TOKEN)
+                && height.is_multiple_of(PIXELS_PER_TOKEN),
             "{width}x{height}: both sides must be positive multiples of {PIXELS_PER_TOKEN}"
         );
-        let tokens = (width / PIXELS_PER_TOKEN) * (height / PIXELS_PER_TOKEN);
+        let cols = width / PIXELS_PER_TOKEN;
+        let rows = height / PIXELS_PER_TOKEN;
+        // Checked, because the caller's width and height are unvalidated
+        // `usize`s and the product of two of them is not obviously one.
+        let tokens = rows.checked_mul(cols).with_context(|| {
+            format!("{width}x{height} is more image tokens than a usize can count")
+        })?;
         ensure!(
-            tokens % SEQ_MULTI_OF == 0,
-            "{width}x{height} is {tokens} image tokens ({}x{} cells of {PIXELS_PER_TOKEN} px), \
-             not a multiple of {SEQ_MULTI_OF}; sizes whose cell count needs padding are not \
-             supported yet (1024x1024, 1024x768, 768x1024, 512x512 all are)",
-            width / PIXELS_PER_TOKEN,
-            height / PIXELS_PER_TOKEN
+            tokens.is_multiple_of(SEQ_MULTI_OF),
+            "{width}x{height} is {tokens} image tokens ({cols}x{rows} cells of \
+             {PIXELS_PER_TOKEN} px), not a multiple of {SEQ_MULTI_OF}; sizes whose cell count \
+             needs padding are not supported yet (1024x1024, 1024x768, 768x1024, 512x512 all \
+             are)"
+        );
+        let (max_rows, max_cols) = (AXES_LENS[1], AXES_LENS[2]);
+        ensure!(
+            rows <= max_rows && cols <= max_cols,
+            "{width}x{height} is a {rows}x{cols} cell grid (rows x columns) and the rope \
+             tables position only {max_rows}x{max_cols}, so a side is capped at {} px",
+            max_cols * PIXELS_PER_TOKEN
         );
         Ok(())
     }
@@ -130,6 +159,51 @@ impl ZImagePipeline {
             2 * (height / PIXELS_PER_TOKEN),
             2 * (width / PIXELS_PER_TOKEN),
         )
+    }
+
+    /// Read an injected latent from a safetensors file and check it fits a
+    /// `width x height` run, as f32 on the CPU.
+    ///
+    /// Separate from [`Self::generate`]'s own check, and called BEFORE
+    /// anything loads: a typo in the path or a latent from another resolution
+    /// otherwise costs the encoder and the transformer — about 33 GB and a
+    /// minute — before it is noticed. `generate` re-checks against the loaded
+    /// `in_channels` and that stays the authority for what runs.
+    pub fn read_latents(path: &Path, width: usize, height: usize) -> Result<Tensor> {
+        Self::check_size(width, height)?;
+        let tensors = candle_core::safetensors::load(path, &Device::Cpu)
+            .with_context(|| format!("reading the latents file {}", path.display()))?;
+        let latents = tensors.get("latents").with_context(|| {
+            format!(
+                "{} has no `latents` tensor; it holds {}",
+                path.display(),
+                if tensors.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    tensors.keys().cloned().collect::<Vec<_>>().join(", ")
+                }
+            )
+        })?;
+        let latents = if latents.rank() == 3 {
+            latents.unsqueeze(0)?
+        } else {
+            latents.clone()
+        };
+        let (lat_h, lat_w) = Self::latent_size(width, height);
+        let want = (1, LATENT_CHANNELS, lat_h, lat_w);
+        let got = latents
+            .dims4()
+            .with_context(|| format!("the latents in {} are not 3- or 4-axis", path.display()))?;
+        ensure!(
+            got == want,
+            "the latents in {} are {:?}, and {width}x{height} needs {:?}",
+            path.display(),
+            latents.dims(),
+            want
+        );
+        latents
+            .to_dtype(DType::F32)
+            .with_context(|| format!("casting the latents in {} to f32", path.display()))
     }
 
     /// Generate one image from `cap_feats`, the text encoder's `[T, 2560]`
@@ -215,6 +289,11 @@ impl ZImagePipeline {
 }
 
 /// Encode a `[3, H, W]` u8 tensor as an RGB8 PNG at `path`.
+///
+/// Written to a sibling temporary file and renamed into place, so a failure
+/// anywhere in the encode leaves whatever was at `path` untouched. Creating
+/// the destination first truncates it, which on a re-run over the previous
+/// image destroys the one comparable artefact the run had.
 pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
     let (c, h, w) = image.dims3().context("the image is [3, H, W]")?;
     ensure!(c == 3, "the image has {c} channels, PNG RGB needs 3");
@@ -224,15 +303,38 @@ pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
         .contiguous()?
         .flatten_all()?
         .to_vec1::<u8>()?;
-    let file =
-        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header()?;
-    writer.write_image_data(&pixels)?;
-    writer.finish()?;
-    Ok(())
+    // A sibling, so the rename is within one filesystem and therefore atomic;
+    // the pid keeps two concurrent runs to the same output from colliding.
+    let temp = match path.file_name() {
+        Some(name) => path.with_file_name(format!(
+            ".{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id()
+        )),
+        None => bail!("{} is not a file path to write a PNG to", path.display()),
+    };
+    let write = || -> Result<()> {
+        let file =
+            std::fs::File::create(&temp).with_context(|| format!("creating {}", temp.display()))?;
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&pixels)?;
+        writer.finish()?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    std::fs::rename(&temp, path).with_context(|| {
+        format!(
+            "renaming {} into place as {}",
+            temp.display(),
+            path.display()
+        )
+    })
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -301,5 +403,132 @@ mod tests {
             .to_string();
         assert!(err.contains("1089 image tokens"), "{err}");
         assert!(ZImagePipeline::check_size(0, 1024).is_err());
+    }
+
+    /// The rope tables hold 512 positions per spatial axis, so 8192 px is the
+    /// largest side, and one cell past it is refused rather than clamped.
+    ///
+    /// Clamped is what it would otherwise be: candle's Metal `index_select`
+    /// returns the table's last row for an out-of-range position, so the run
+    /// would produce an image rather than an error, and the image would be
+    /// built from the wrong rotations everywhere past row or column 511.
+    #[test]
+    fn a_size_past_the_rope_tables_is_refused_rather_than_clamped() {
+        // The boundary itself is a 512x512 cell grid and 262144 tokens.
+        ZImagePipeline::check_size(8192, 8192).unwrap();
+
+        // One cell wider: 513 columns, still a multiple-of-32 token count, so
+        // this is the new rule firing and not the old one.
+        let tokens = (8208 / PIXELS_PER_TOKEN) * (1024 / PIXELS_PER_TOKEN);
+        assert!(tokens.is_multiple_of(SEQ_MULTI_OF), "{tokens}");
+        let err = ZImagePipeline::check_size(8208, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("8192 px"), "{err}");
+        let err = ZImagePipeline::check_size(1024, 8208)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("8192 px"), "{err}");
+
+        // And the token count is counted, not wrapped: two sides that are each
+        // legal multiples of 16 can still multiply past a usize.
+        let huge = 1usize << 40;
+        let err = ZImagePipeline::check_size(huge, huge)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("than a usize can count"), "{err}");
+    }
+
+    /// An injected latent is read and checked before anything loads, so a
+    /// typo in the path costs a millisecond rather than the encoder and the
+    /// transformer.
+    ///
+    /// Every rejection names the file, because the caller passed a path and
+    /// that is what they can go and look at.
+    #[test]
+    fn an_injected_latent_is_validated_from_the_file() {
+        let dir = std::env::temp_dir().join(format!("xwen-latents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A missing file, which is the typo case.
+        let err = ZImagePipeline::read_latents(&dir.join("nope.safetensors"), 1024, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope.safetensors"), "{err}");
+
+        // The right shape under the wrong name.
+        let good = Tensor::zeros((1, LATENT_CHANNELS, 128, 128), DType::F32, &Device::Cpu).unwrap();
+        let named_wrong = dir.join("named-wrong.safetensors");
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([("latent".to_string(), good.clone())]),
+            &named_wrong,
+        )
+        .unwrap();
+        let err = ZImagePipeline::read_latents(&named_wrong, 1024, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no `latents` tensor"), "{err}");
+        assert!(err.contains("latent"), "{err}");
+
+        // The right name at another resolution's shape, which is the mistake a
+        // reference comparison actually makes.
+        let path = dir.join("latents.safetensors");
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([("latents".to_string(), good.clone())]),
+            &path,
+        )
+        .unwrap();
+        let err = ZImagePipeline::read_latents(&path, 512, 512)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("512x512 needs"), "{err}");
+        assert!(err.contains("[1, 16, 128, 128]"), "{err}");
+
+        // And the matching one, cast to f32 whatever it was stored as. Rank 3
+        // is accepted too: a torch dump of one latent often has no batch axis.
+        let read = ZImagePipeline::read_latents(&path, 1024, 1024).unwrap();
+        assert_eq!(read.dims(), &[1, LATENT_CHANNELS, 128, 128]);
+        assert_eq!(read.dtype(), DType::F32);
+
+        let unbatched = dir.join("unbatched.safetensors");
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([(
+                "latents".to_string(),
+                good.squeeze(0).unwrap().to_dtype(DType::BF16).unwrap(),
+            )]),
+            &unbatched,
+        )
+        .unwrap();
+        let read = ZImagePipeline::read_latents(&unbatched, 1024, 1024).unwrap();
+        assert_eq!(read.dims(), &[1, LATENT_CHANNELS, 128, 128]);
+        assert_eq!(read.dtype(), DType::F32);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A failed PNG write leaves the previous image at that path alone.
+    ///
+    /// The failure is staged by putting a directory where the temporary file
+    /// wants to be, which is the one way to make the encode fail without a
+    /// broken tensor. What it pins is the ordering: nothing truncates the
+    /// destination, so a re-run that dies mid-encode still has yesterday's
+    /// image to compare against.
+    #[test]
+    fn a_failed_png_write_does_not_destroy_the_previous_image() {
+        let dir = std::env::temp_dir().join(format!("xwen-png-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.png");
+
+        let image = Tensor::zeros((3, 16, 16), DType::U8, &Device::Cpu).unwrap();
+        write_png(&image, &out).unwrap();
+        let good = std::fs::read(&out).unwrap();
+        assert!(good.starts_with(b"\x89PNG"), "not a PNG: {:?}", &good[..4]);
+
+        let blocked = dir.join(format!(".out.png.{}.tmp", std::process::id()));
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(write_png(&image, &out).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), good);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

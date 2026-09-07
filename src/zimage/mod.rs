@@ -27,7 +27,13 @@
 //!
 //! Ground truth for every form here is the official `src/zimage/*.py` and
 //! diffusers' `transformer_z_image.py` / `pipeline_z_image.py`; the shapes
-//! and the traps are written up in docs/zimage.md.
+//! and the traps are written up in docs/zimage.md. Where the two references
+//! disagree, which is the sigma grid alone, this follows DIFFUSERS
+//! ([`scheduler`] says by how much and why).
+//!
+//! One environment switch: [`ATTN_ENV`] (`XWEN_ZIMAGE_ATTN=basic`) swaps
+//! candle's fused Metal SDPA for an explicit matmul-softmax-matmul chain that
+//! shares no kernel with it. For bisecting, not for speed.
 
 pub mod pipeline;
 pub mod sampling;
@@ -38,5 +44,5 @@ pub mod vae;
 pub use pipeline::{ImageOptions, ZImagePipeline};
 pub use sampling::{postprocess_image, seeded_noise};
 pub use scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};
-pub use transformer::{Config, ZImageTransformer2DModel};
+pub use transformer::{ATTN_ENV, AttnImpl, Config, ZImageTransformer2DModel};
 pub use vae::{AutoEncoderKL, VaeConfig};

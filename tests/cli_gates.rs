@@ -8,10 +8,15 @@
 //! was where the question got asked, so the test has to run the thing that asks
 //! it.
 //!
-//! One entry is refused today, the Z-Image text encoder: it is an encode-only
-//! checkpoint over weights with a zero-filled layer. The two Qwen3-4B language
-//! models were refused here until their layer stack landed, and are covered
-//! below by the case that says they are NOT.
+//! Two entries are refused today and for different reasons: the Z-Image text
+//! encoder, an encode-only checkpoint over weights with a zero-filled layer,
+//! and the Z-Image-Turbo pipeline, which is a text-to-image model and not a
+//! language model at all. Each refusal names the command that does work, and
+//! the cases below assert which one, because sending someone from the pipeline
+//! to `xwen encode-text` would be a wrong answer that still passes a test for
+//! "was refused". The two Qwen3-4B language models were refused here until
+//! their layer stack landed, and are covered below by the case that says they
+//! are NOT.
 //!
 //! Cheap by construction: every case here fails before any hub access, so
 //! nothing is fetched, no port is bound and no model is loaded. If one of them
@@ -51,9 +56,9 @@ fn xwen() -> Command {
 #[test]
 fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
     let config = empty_config("serve_refuses");
-    for (alias, expected) in [
-        ("zimage-turbo-encoder", "encode-only"),
-        ("zimage-turbo", "text-to-image"),
+    for (alias, expected, command) in [
+        ("zimage-turbo-encoder", "encode-only", "xwen encode-text"),
+        ("zimage-turbo", "text-to-image", "xwen image"),
     ] {
         let out = xwen()
             .args(["serve", "--config"])
@@ -68,6 +73,9 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
         );
         assert!(stderr.contains("cannot be run"), "{alias}: {stderr}");
         assert!(stderr.contains(expected), "{alias}: {stderr}");
+        // Which command to reach for instead, since that is the whole reason
+        // these two entries have separate sentences.
+        assert!(stderr.contains(command), "{alias}: {stderr}");
         // The refusal has to happen before the download, and a message about
         // fetching would mean it did not.
         assert!(
@@ -78,6 +86,45 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
     std::fs::remove_file(&config).unwrap();
 }
 
+/// The same two refusals on the one-shot CLI surfaces, which apply the gate at
+/// a different call site from serve's and could stop applying it on their own.
+///
+/// `generate` and `chat` do not move cache state the way serve and batch do,
+/// but they run the graph, and the pipeline entry has no graph to run: without
+/// the gate `generate --model-size zimage-turbo` would try to open a
+/// `model_index.json` as a checkpoint after a 32.9 GB download.
+#[test]
+fn the_one_shot_surfaces_refuse_both_z_image_entries() {
+    for (alias, expected, command) in [
+        ("zimage-turbo-encoder", "encode-only", "xwen encode-text"),
+        ("zimage-turbo", "text-to-image", "xwen image"),
+    ] {
+        // `chat` takes no `--prompt`; it reads a REPL it never gets to.
+        for (subcommand, extra) in [("generate", vec!["--prompt", "hi"]), ("chat", Vec::new())] {
+            let out = xwen()
+                .args([subcommand, "--model-size", alias])
+                .args(&extra)
+                .output()
+                .unwrap_or_else(|e| panic!("running xwen {subcommand}: {e}"));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success(),
+                "{subcommand} --model-size {alias} ran; it must refuse\n{stderr}"
+            );
+            assert!(
+                stderr.contains("cannot be run"),
+                "{subcommand} {alias}: {stderr}"
+            );
+            assert!(stderr.contains(expected), "{subcommand} {alias}: {stderr}");
+            assert!(stderr.contains(command), "{subcommand} {alias}: {stderr}");
+            assert!(
+                !stderr.contains("downloading"),
+                "{subcommand} {alias} fetched before refusing: {stderr}"
+            );
+        }
+    }
+}
+
 /// The same gate on `xwen batch`, which names its checkpoint in the payload
 /// rather than in a flag and moves cache state for the same reason serve does.
 ///
@@ -85,7 +132,14 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
 /// 1, so that is where the message is.
 #[test]
 fn batch_refuses_an_unrunnable_checkpoint_named_in_its_payload() {
-    for (name, expected) in [("Z-Image-Turbo-text-encoder", "encode-only")] {
+    for (name, expected, command) in [
+        (
+            "Z-Image-Turbo-text-encoder",
+            "encode-only",
+            "xwen encode-text",
+        ),
+        ("Z-Image-Turbo", "text-to-image", "xwen image"),
+    ] {
         let mut child = xwen()
             .arg("batch")
             .stdin(Stdio::piped())
@@ -107,6 +161,7 @@ fn batch_refuses_an_unrunnable_checkpoint_named_in_its_payload() {
         assert!(!out.status.success(), "batch on {name} succeeded\n{stdout}");
         assert!(stdout.contains("cannot be run"), "{name}: {stdout}");
         assert!(stdout.contains(expected), "{name}: {stdout}");
+        assert!(stdout.contains(command), "{name}: {stdout}");
         assert!(
             !String::from_utf8_lossy(&out.stderr).contains("downloading"),
             "{name} fetched before refusing"
@@ -227,6 +282,50 @@ fn a_runnable_checkpoint_gets_past_the_gate() {
         ok,
     );
     std::fs::remove_file(&config).unwrap();
+}
+
+/// `encode-text` accepts BOTH Z-Image aliases and encodes with the same
+/// weights either way.
+///
+/// The pipeline alias used to mean the encoder and is what the README, the
+/// docs and any operator script had been spelling; when it moved to the
+/// pipeline entry, the same command line started failing on a sentence about
+/// GGUF checkpoints, which a diffusion pipeline is not. Both spellings must
+/// reach the encoder's own repo, and the way to see that they did is the
+/// download notice naming it.
+#[test]
+fn encode_text_takes_either_z_image_alias() {
+    for alias in ["zimage-turbo-encoder", "zimage-turbo"] {
+        let out = std::env::temp_dir().join(format!("xwen-encode-{alias}.safetensors"));
+        let (stdout, stderr, ok) = past_the_gate(
+            &[
+                "encode-text",
+                "--model-size",
+                alias,
+                "--prompt",
+                "hi",
+                "-o",
+                out.to_str().unwrap(),
+            ],
+            None,
+        );
+        let both = format!("{stderr}{stdout}");
+        assert!(
+            !both.contains("GGUF checkpoint"),
+            "{alias} was refused as a GGUF: {both}"
+        );
+        assert!(
+            !both.contains("text-to-image pipeline rather than"),
+            "{alias} was refused as a pipeline: {both}"
+        );
+        assert_reached_the_fetch(
+            &format!("encode-text --model-size {alias}"),
+            "Tongyi-MAI/Z-Image-Turbo",
+            &stdout,
+            &stderr,
+            ok,
+        );
+    }
 }
 
 /// The two Qwen3-4B language models are NOT refused: their layer stack landed,

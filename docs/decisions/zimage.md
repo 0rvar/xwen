@@ -142,6 +142,24 @@ the start: an image model must participate in the existing idle-unload behaviour
 12.3 GB resident on a server that is answering language requests is not acceptable
 (2026-09-07).
 
+Amended the same day, after the user refused to install a community node pack: the node
+of our own is no longer part of the decision, it is conditional. ComfyUI's stock OpenAI
+image nodes POST to the relative path `/proxy/openai/images/generations` against the
+`--comfy-api-base` flag, with no auth header when there is no comfy.org token, so the
+route must ALSO answer at that path, speak the OpenAI error envelope, and never return
+401, 402, 409 or 429 (the node rewrites those into comfy.org login and credit prompts).
+That is the zero-install path and it is the deliverable. Its limits are the stock node's:
+seed never reaches the wire, size is a dropdown of 1024x1024, 1024x1536, 1536x1024 and
+auto, no steps or negative prompt, and the flag redirects every partner node at once. The
+mechanism is confirmed in ComfyUI's source and unattested in the wild, so the route ships
+with a curl against the proxy path and is proven from the laptop before anything else is
+built. A node pack of our own (three nodes with real CONDITIONING and LATENT sockets, so
+an xwen latent can feed local nodes and a local latent can come back for img2img) is
+built only when the user names a composition that needs it: img2img, inpainting, LoRA or
+an upscale chain. Making xwen a ComfyUI backend that speaks the frontend's own protocol
+is refuted as an approach: a large arc reimplementing a moving, loosely documented API for
+a fixed node set (2026-09-07).
+
 **The encoder and the transformer are both resident for the whole run.** diffusers offers
 the other arrangement, `model_cpu_offload_seq = "text_encoder->transformer->vae"`, and it
 exists because 8 GB plus 12.3 GB is a real problem on a 16 GB card. It is not one here:
@@ -150,3 +168,55 @@ dropping the encoder between them would buy footprint we are not short of at the
 a reload on the next prompt. The serve route will want the opposite of offloading anyway,
 since sharing one loaded Qwen3-4B between the language surfaces and the image surface is
 one of the two reasons this endpoint is worth having at all (2026-09-07).
+
+**The sigma grid follows diffusers, not the official repo.** The two really do differ.
+The vendored scheduler computes `linspace(1.0, 1/n, n)`, applies the static
+shift `3σ / (1 + 2σ)` once and appends a terminal 0, which is exactly what diffusers'
+`ZImagePipeline` does: it passes `get_default_z_image_sigmas` as an explicit `sigmas`
+argument and `FlowMatchEulerDiscreteScheduler.set_timesteps` shifts what it was handed.
+`Tongyi-MAI/Z-Image` does something else. It passes `sigmas=None`, shifts the full
+1..1000 training grid in the scheduler's constructor (so its `sigma_min` is
+`3 * 0.001 / (1 + 2 * 0.001)` = 0.0029940 rather than 0.001), interpolates `n + 1` points
+between those already-shifted extremes and shifts a SECOND time. At 8 steps the grids
+agree to a maximum |Δσ| of 5.0e-3, worst at the last step (0.3050089 against 0.3), and
+the final Euler step's `dt` is −0.305009 there against −0.300000 here — a 1.7% difference
+on the largest single step of the run. Small enough to be invisible by eye, large enough
+to fail a parity gate at every step past the first. diffusers wins because it is the
+ORACLE: Stage 3 and Stage 4 are graded against `scripts/zimage-ref-dump.py`, which drives
+the diffusers pipeline and already does for the encoder, and diffusers is what
+HuggingFace publishes for these weights. Moving to the official grid would mean moving
+the oracle with it, and there is no reason to prefer it. Worth recording because it was
+first written down backwards: the code claimed both references hand the scheduler an
+explicit linspace, which is false about the official one, and candle upstream's grid —
+the one this file calls wrong — was a faithful reproduction of it rather than a bug of
+candle's invention. The `set_timesteps` unit test pins all nine diffusers sigmas and
+asserts the last one is NOT the official repo's, so a move back is a red test rather than
+a quiet drift (2026-09-07).
+
+**An out-of-range RoPE position is refused, not clamped, and `check_size` grew a third
+rule for it.** candle's Metal `index_select` kernel clamps an out-of-range id to the
+table's last row — `indexing.metal`, with the comment "Force prevent out of bounds
+indexing since there doesn't seem to be a good way to force crash" — while the CPU
+backend errors. So a caption past 1534 tokens, or an image past 8192 px on a side, would
+return a plausible picture built from the wrong rotations on the device this actually runs
+on, and a CPU unit test would have caught what the shipped path would not. Two checks
+close it, deliberately duplicated because they answer to different callers.
+`ZImagePipeline::check_size` refuses a side past 8192 px against the shipped `AXES_LENS`
+constant before a byte loads, which is what a CLI user gets and the only form available
+with no config open, and it counts the token grid with checked arithmetic while it is
+there. `ZImageTransformer2DModel::forward` re-checks `cap_len + f_tokens` against the
+LOADED `axes_lens[0]` and the token grid against axes 1 and 2, which is the authority for
+what runs and is also the only one of the two that a library caller with its own
+`cap_feats` cannot skip. Neither is reachable through `xwen image` today — the encoder
+truncates at 512 tokens and no admitted size exceeds the grid — and both are there
+because `generate` and `forward` are `pub` and Stage 3's oracle will call them directly
+(2026-09-07).
+
+**A PNG is written to a temporary sibling and renamed.** `File::create` on the
+destination truncates it before the encode runs, so a run that failed anywhere in the
+encode destroyed the previous image at that path — which for a reference comparison is
+the one artefact worth keeping, and the failure mode is "the run I wanted to compare
+against is gone". The temp name carries the pid so two concurrent runs to one output do
+not collide, and it is a sibling so the rename is within one filesystem and therefore
+atomic. Pinned by a test that blocks the temporary path with a directory, the only
+deterministic way to fail the encode without a broken tensor (2026-09-07).

@@ -365,6 +365,18 @@ So axis 0 is a text-position axis on which the whole image occupies one slot pas
 caption, and axes 1 and 2 are the image's height and width. `axes_lens` bound the tables
 at 1536 on axis 0 and 512 tokens on axes 1 and 2, which is 8192 px per side.
 
+**Those bounds are checked, and the check is not a formality.** candle's Metal
+`index_select` CLAMPS an out-of-range id to the table's last row rather than failing
+(`indexing.metal`, "Force prevent out of bounds indexing"), while the CPU backend errors
+— so an over-long caption or an over-large image would come back on this machine as a
+plausible picture built from the wrong rotations, and a CPU unit test would catch what the
+shipped path would not. `check_size` refuses a side past 8192 px before anything loads,
+and `ZImageTransformer2DModel::forward` re-checks `cap_len + f_tokens` against
+`axes_lens[0]` and the token grid against axes 1 and 2 from the LOADED config, which is
+the authority for what runs. Neither is reachable through `xwen image` today (the encoder
+truncates to 512 tokens and no admitted size exceeds the grid), but `generate` and
+`forward` are both `pub` and take arbitrary `cap_feats`.
+
 Sequence construction, and the order is load-bearing:
 
 ```
@@ -547,5 +559,12 @@ first. The VAE and the Euler loop run f32 with the model output negated before t
 which the reference does and candle's library did not (its example did). The postprocess
 rounds to nearest byte where upstream truncated. And the CUDA flash-attn arm, the CFG
 helpers, `calculate_shift` and `preprocess.rs` are removed; what is kept is a
-`use_accelerated_attn` switch selecting candle's Metal SDPA against a plain matmul chain,
-which is a reference arm for a real A/B and was not exercised in the first arc.
+`use_accelerated_attn` switch selecting candle's Metal SDPA against a plain matmul chain.
+That switch is reachable as **`XWEN_ZIMAGE_ATTN=basic`** (unset or `fused` is the shipped
+path; a value that names neither is a load error rather than a silent default), read when
+the `Config` is built, which is where the shipped `transformer/config.json` — carrying no
+such key — takes its `serde` default. The arm is a real A/B: the two share no attention
+kernel, and the unit test asserts their outputs differ by a NONZERO amount under the bar,
+because a bit-identical result would mean the switch selected one kernel twice. It was
+unreachable and untested in the first arc, which is the shape the `XWEN_QWEN3_ATTN=sdpa`
+ablation was vacuous in for a whole arc (AGENTS.md "Verification workflow").

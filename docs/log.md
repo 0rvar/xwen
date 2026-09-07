@@ -22,6 +22,15 @@ performance work was done. The registry entry is `Model::ZImageTurbo` under a ne
 dump of the transformer yet, so the block math is graded by reading and by the images
 looking right, and that is Arc B. Image transformers are in scope as a correctness
 target with a secondary time-per-image figure, on the same terms as the dense 4B.
+A three-reviewer round on the same day found and fixed six things, none of them in the
+block math: the RoPE tables were unbounded where candle's Metal `index_select` clamps
+rather than errors (so `check_size` gained an 8192 px rule and `forward` a check against
+the loaded `axes_lens`), a PNG write truncated the previous image before encoding,
+`encode-text --model-size zimage-turbo` refused the pipeline alias as a GGUF, `--latents`
+was read after 33 GB had loaded and its run printed an unused seed, the documented
+attention reference arm was unreachable (now `XWEN_ZIMAGE_ATTN=basic`, with a nonzero-diff
+A/B test), and the scheduler's comments credited the official repo with diffusers' sigma
+grid when the two differ by up to 5.0e-3.
 [Record](records/zimage-pipeline.md), [architecture](zimage.md),
 [decisions](decisions/zimage.md), [figures](perf-state.md).
 

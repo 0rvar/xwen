@@ -192,12 +192,16 @@ xwen fetch --model-size zimage-turbo
 xwen image --prompt "a red bicycle against a white brick wall, golden hour" -o out.png
 ```
 
-`--width` and `--height` default to 1024, `--steps` to 8, `--seed` is drawn and printed
-when omitted, and `--latents <file.safetensors>` injects a fixed latent for reference
-comparisons. Sizes must be multiples of 16 with an image token count `(w/16) * (h/16)`
-that is a multiple of 32, which 1024x1024, 1024x768, 512x512 and 1536x1024 all satisfy;
-anything else is refused with the reason, because the padded-image path is not
-implemented. One image at 1024x1024 takes about 52 s warm, roughly 42 s of it in the
+`--width` and `--height` default to 1024, `--steps` to 8, and `--seed` is drawn and
+printed when omitted. `--latents <file.safetensors>` injects a fixed latent for reference
+comparisons: the file is read and its shape checked before anything loads, and the result
+line then reports the latent instead of a seed, there being no seed to report. Sizes must
+be multiples of 16, with an image token count `(w/16) * (h/16)` that is a multiple of 32
+and neither side past 8192 px; 1024x1024, 1024x768, 512x512 and 1536x1024 all satisfy all
+three. Anything else is refused with the reason, because the padded-image path is not
+implemented and 8192 px is as far as the model's position tables reach.
+
+One image at 1024x1024 takes about 52 s warm, roughly 42 s of it in the
 eight transformer steps, and no performance work has been done on it. The arithmetic is
 not yet graded against a reference dump. `docs/zimage.md` is the architecture and the
 traps, `docs/records/zimage-pipeline.md` the arc, `docs/perf-state.md` the timings and

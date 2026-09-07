@@ -546,11 +546,12 @@ enum Cmd {
         model: Option<PathBuf>,
         /// Which Qwen3 checkpoint to encode with: zimage-turbo-encoder (the Z-Image
         /// text encoder; the default here, unlike every other command),
-        /// qwen3-4b or qwen3-4b-instruct-2507. A GGUF checkpoint has no
-        /// hidden-state encoder.
+        /// qwen3-4b or qwen3-4b-instruct-2507. `zimage-turbo`, the whole
+        /// diffusion pipeline, is accepted and encodes with its text encoder.
+        /// A GGUF checkpoint has no hidden-state encoder.
         #[arg(
             long,
-            value_name = "zimage-turbo-encoder|qwen3-4b|qwen3-4b-instruct-2507"
+            value_name = "zimage-turbo-encoder|zimage-turbo|qwen3-4b|qwen3-4b-instruct-2507"
         )]
         model_size: Option<Model>,
         /// The HF `hidden_states` index to return: 0 is the embedding output,
@@ -2145,6 +2146,27 @@ fn run_encode_text(
         }
         (Some(_), Some(_)) => bail!("--prompt and --prompt-file are mutually exclusive"),
     };
+    // `--model-size zimage-turbo` names the whole diffusion pipeline, and the
+    // part of it that encodes is its text encoder entry — the same weights,
+    // the same repo, one subdirectory down. Both aliases therefore encode, and
+    // the remap happens here rather than being a second name for the encoder
+    // entry, because `xwen image` wants the pipeline under that alias.
+    let (model_size, model) = match model_size {
+        Some(pipeline) if pipeline.is_diffusion() => {
+            let encoder = pipeline
+                .text_encoder()
+                .with_context(|| format!("{} names no text encoder", pipeline.full_name()))?;
+            let subdir = Path::new(encoder.file()).parent().unwrap_or(Path::new(""));
+            // A snapshot root the operator named holds the encoder inside it;
+            // anything else is passed through as given.
+            let model = match model {
+                Some(path) if path.join("model_index.json").is_file() => Some(path.join(subdir)),
+                other => other,
+            };
+            (Some(encoder), model)
+        }
+        other => (other, model),
+    };
     // Unlike every other command, the zero-flag default is the encoder entry:
     // encoding is what that checkpoint is for, and the global default
     // (Flash-Next, a GGUF) has no hidden-state encoder at all.
@@ -2155,6 +2177,16 @@ fn run_encode_text(
         Model::ZImageTurboEncoder,
     )?;
     let size = checkpoint.model;
+    // Kept even though the remap above makes it unreachable from the flag: it
+    // is the sentence a future route into here would need, and it must not be
+    // the GGUF one, a diffusion pipeline being neither.
+    ensure!(
+        !size.is_diffusion(),
+        "{} is a text-to-image pipeline rather than a language model; its text encoder is \
+         --model-size {}, and `xwen image` runs the pipeline itself",
+        size.full_name(),
+        Model::ZImageTurboEncoder
+    );
     ensure!(
         size.is_safetensors(),
         "{} is a GGUF checkpoint; the hidden-state encoder runs the Qwen3 dense safetensors \
@@ -2306,9 +2338,19 @@ fn run_image(args: ImageArgs) -> Result<()> {
     let spec = encoder_entry
         .encoder_spec()
         .context("the pipeline's text encoder entry carries no encoder spec")?;
-    // The size rule and the step count are checked before a byte loads.
+    // Every input the run can be wrong about is checked before a byte loads:
+    // the size rule, the step count, the bisect switch, and the injected
+    // latent, which is a file and therefore the one of the four that can be
+    // missing or misshapen. `ZImagePipeline::load` re-reads the switch for its
+    // library callers, but by then the 7.6 GB encoder is already resident, and
+    // a typo in a bisect run should cost nothing.
+    xwen::zimage::AttnImpl::from_env()?;
     ZImagePipeline::check_size(args.width, args.height)?;
     ensure!(args.steps >= 1, "--steps must be at least 1");
+    let latents = match &args.latents {
+        Some(path) => Some(ZImagePipeline::read_latents(path, args.width, args.height)?),
+        None => None,
+    };
 
     let root = match args.model {
         Some(root) => root,
@@ -2366,27 +2408,16 @@ fn run_image(args: ImageArgs) -> Result<()> {
         load_start.elapsed().as_secs_f64()
     );
 
-    let latents = match &args.latents {
-        Some(path) => {
-            let tensors = candle_core::safetensors::load(path, &candle_core::Device::Cpu)
-                .with_context(|| format!("reading {}", path.display()))?;
-            Some(
-                tensors
-                    .get("latents")
-                    .with_context(|| format!("{} has no `latents` tensor", path.display()))?
-                    .clone(),
-            )
-        }
-        None => None,
-    };
+    // Drawn even when a latent was injected, `ImageOptions` wanting a value,
+    // but then it decides nothing and is reported as deciding nothing: a run
+    // that printed a seed it did not use would be a reference comparison
+    // nobody could reproduce from its own log line.
     let seed = args.seed.unwrap_or_else(rand::random::<u64>);
-    match &latents {
-        Some(_) => eprintln!(
-            "xwen: latents from {}",
-            args.latents.as_ref().unwrap().display()
-        ),
-        None => eprintln!("xwen: seed {seed}"),
-    }
+    let noise_source = match &args.latents {
+        Some(path) => format!("latents from {}", path.display()),
+        None => format!("seed {seed}"),
+    };
+    eprintln!("xwen: {noise_source}");
 
     let opts = ImageOptions {
         width: args.width,
@@ -2402,7 +2433,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
     eprintln!("xwen: VAE decode {:.2}s", timings.vae_decode);
     write_png(&image, &args.out)?;
     println!(
-        "{}x{}, {} steps, seed {seed}, written to {} ({:.1}s total)",
+        "{}x{}, {} steps, {noise_source}, written to {} ({:.1}s total)",
         args.width,
         args.height,
         args.steps,
@@ -2636,9 +2667,11 @@ mod tests {
         for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
             assert!(ensure_servable(model).is_ok(), "{model:?}");
         }
-        // The encoder is the one entry still refused, and its reason does not
-        // lift when a build lands: the operator's next move is a different
-        // command, not a different version.
+        // Two entries are still refused, and neither reason lifts when a build
+        // lands: the operator's next move is a different command, not a
+        // different version. Which command is the part worth asserting —
+        // sending someone from the pipeline to `encode-text` would still pass
+        // a test for "was refused".
         let err = ensure_servable(Model::ZImageTurboEncoder)
             .unwrap_err()
             .to_string();
@@ -2646,6 +2679,12 @@ mod tests {
         assert!(err.contains("encode-only"), "{err}");
         assert!(err.contains("zero-filled"), "{err}");
         assert!(err.contains("encode-text"), "{err}");
+
+        let err = ensure_servable(Model::ZImageTurbo).unwrap_err().to_string();
+        assert!(err.contains(Model::ZImageTurbo.full_name()), "{err}");
+        assert!(err.contains("text-to-image"), "{err}");
+        assert!(err.contains("xwen image"), "{err}");
+        assert!(!err.contains("encode-text"), "{err}");
 
         for model in xwen::hub::MODELS {
             assert_eq!(
