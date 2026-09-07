@@ -112,7 +112,9 @@ behaviour is unchanged. Encoder and transformer both stay resident for the run.
   with 1 ignored. Exit 0. **After the review round** that followed the arc, the same run
   is lib 1308 (six new tests), cli_gates 6 (two new), everything else unchanged, 0 failed
   and no SKIPPED lines; and the ignored image test reproduces the figures below to the
-  digit, which is the evidence the fixes touched no math.
+  digit, which is the evidence the fixes touched no math. **After the second round**
+  (below) it is lib 1311 and cli_gates 9, still nothing else moved, and the image test
+  still reproduces those figures.
 - New unit tests, all passing: the 8-step sigma table and the dynamic-shift refusal; the
   five rope reference values at position (5,3,7) and the rope dtype; patchify ordering and
   the unpatchify roundtrip; caption padding length; seeded-noise reproducibility and
@@ -127,6 +129,50 @@ behaviour is unchanged. Encoder and transformer both stay resident for the run.
 yet, so the block math, the VAE and the rope beyond its five pinned values are graded by
 reading and by the images looking right. That is the whole content of Arc B, and until it
 runs, "coherent image" is the only claim this arc makes.
+
+### The second review round, 2026-09-07
+
+Four findings, and the interesting thing about them is that two were corrections of the
+first round rather than of the arc.
+
+**The scheduler attribution was wrong in the fix, not just in the original.** The first
+round said the comments credited the official repo with diffusers' grid; the correction it
+wrote said the two references genuinely differ by up to 5.0e-3. They do not. The official
+pipeline assigns `scheduler.sigma_min = 0.0` on the line before `retrieve_timesteps`, and
+with `use_dynamic_shifting: false` and shift 3.0 its interpolation branch then produces
+`1.0, 0.9545455, 0.9, 0.8333333, 0.75, 0.6428571, 0.5, 0.3, 0` — diffusers' grid exactly.
+The 5.0e-3 belongs to the scheduler's constructor default, which is what candle upstream
+reproduces and what nothing ships. Recomputed both grids from the fetched sources before
+touching a word; the decision paragraph now says so and the unit test's last assertion
+reads "not the constructor-default grid".
+
+**The pipeline entry fell through to the GGUF reader**, which is the arc's own bug and the
+expensive one. `Model::ZImageTurbo`'s first file is `model_index.json`, so
+`resolve_model` returned it and `CheckpointSource::open`, seeing neither a `config.json`
+nor a `.safetensors`, tried it as a GGUF: `xwen inspect --model-size zimage-turbo`
+downloaded 32.9 GB and then failed on a magic number. Fixed at the seam rather than at the
+call site — `checkpoint::diffusion_snapshot_root` is now the one rule for what a snapshot
+path is, `safetensors_dir` refuses it naming `xwen image`, and `inspect` gates on the
+format ahead of the fetch. The gate there is deliberately the FORMAT and not
+`servable()`: the text encoder is unservable and inspecting it is exactly what someone
+wants. `encode-text`'s remap onto `text_encoder/` accepts both spellings of the snapshot
+now, the directory and its `model_index.json`, which is the path `xwen fetch` prints.
+
+**The PNG temporary name was per process, not per writer**, so two writers to one
+destination inside one process would have shared it. Exclusively created with a counter
+now, and removed on a failed rename as well as a failed encode.
+
+**The attention A/B bar was 2e-3 against a signal of 1.2e-8.** The whole gap was
+unmeasured, and the outside reviewer's claim that a broken arm passes it is correct: on
+that fixture an arm with the `1 / sqrt(head_dim)` scale dropped differs by 9.1e-4 and one
+with uniform probabilities by 8.9e-5. The reason is the fixture, not the bar. Driven
+through `forward` with the test's random weights, the qk-norm weights are uniform on ±0.1,
+the logits span ±1.3e-2 and the probabilities sit within 2e-4 of a flat 1/64 — a softmax
+that is already uniform cannot report that its softmax broke. So the new test drives the
+two arms directly with q and k at unit RMS, where the same two mutations move the output
+by 2.0 and 0.96 against a real fused-versus-basic difference of 9.5e-7, and the bar is set
+at 2e-5: bracketed from both sides, more than twenty times above every real difference and
+more than four times below every wrong one.
 
 ### Not taken now
 

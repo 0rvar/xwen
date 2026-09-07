@@ -246,6 +246,43 @@ pub fn tokenizer_beside(path: &Path) -> Option<PathBuf> {
     sibling.is_file().then_some(sibling)
 }
 
+/// The diffusion snapshot root `path` names, if it names one.
+///
+/// Two spellings resolve, and both are spellings an operator really produces:
+/// the snapshot directory itself, and its `model_index.json` — which is the
+/// path `hub::ensure_model` hands back for a `Format::Diffusion` entry and so
+/// the one `xwen fetch` prints and a script copies.
+///
+/// One rule, one function, because two call sites need the same answer for
+/// opposite reasons: [`safetensors_dir`] refuses it, and `encode-text` remaps
+/// it onto the text encoder one directory down. Written separately they drift,
+/// and the drift is silent — the CLI accepting a shape the loader then refuses,
+/// or the reverse.
+///
+/// The parent of a bare relative `model_index.json` is `Some("")`, not `None`,
+/// which as a path is the empty directory rather than the current one; the same
+/// trap [`safetensors_dir`] documents, handled the same way.
+pub fn diffusion_snapshot_root(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        return path
+            .join("model_index.json")
+            .is_file()
+            .then(|| path.to_path_buf());
+    }
+    if !path.is_file()
+        || path
+            .file_name()
+            .is_none_or(|name| name != "model_index.json")
+    {
+        return None;
+    }
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(PathBuf::from(".")),
+        Some(parent) => Some(parent.to_path_buf()),
+        None => None,
+    }
+}
+
 /// The safetensors checkpoint directory `path` names, `None` when `path` is a
 /// GGUF (or anything else a GGUF open should be tried on), and an error when it
 /// is neither.
@@ -269,12 +306,30 @@ pub fn tokenizer_beside(path: &Path) -> Option<PathBuf> {
 /// symlink into a shared `blobs/` store, so resolving `config.json` yields a
 /// content-hashed name in `blobs/`, which is neither called `config.json` nor
 /// sitting anywhere near the checkpoint.
+///
+/// A diffusion snapshot is a fourth shape and it is refused here rather than
+/// anywhere further in. It is not a GGUF and not a Qwen3 set, but nothing about
+/// `model_index.json` says so to the code below: it is neither a `config.json`
+/// nor a `.safetensors`, so it used to fall through to the GGUF parser and fail
+/// on a magic number, one whole download later. `hub::ensure_model` returns
+/// that exact path for a [`crate::hub::Format::Diffusion`] entry, so it is what
+/// a mis-routed pipeline arrives as.
 fn safetensors_dir(path: &Path) -> Result<Option<PathBuf>> {
     anyhow::ensure!(
         path.exists(),
         "{} does not exist: a checkpoint is a GGUF file or a safetensors directory",
         path.display()
     );
+    if let Some(root) = diffusion_snapshot_root(path) {
+        anyhow::bail!(
+            "{} is a text-to-image diffusion snapshot, not a language model checkpoint: \
+             `model_index.json` indexes a pipeline of several models and there is no one \
+             graph here to run. Use `xwen image` for the pipeline, or point at \
+             {}/text_encoder to load its text encoder.",
+            root.display(),
+            root.display()
+        );
+    }
     if path.is_dir() {
         return Ok(Some(path.to_path_buf()));
     }
@@ -456,6 +511,59 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&stray).unwrap();
+    }
+
+    /// A diffusion snapshot is refused at the seam, by either spelling, and the
+    /// refusal names the command that runs it.
+    ///
+    /// `model_index.json` is neither a `config.json` nor a `.safetensors`, so
+    /// it used to fall straight through to the GGUF parser and fail on a magic
+    /// number — after the 32.9 GB `resolve_model` fetches to produce it.
+    /// [`crate::hub::ensure_model`] returns exactly that path for a
+    /// `Format::Diffusion` entry, which is how it reached here.
+    #[test]
+    fn a_diffusion_snapshot_is_refused_rather_than_read_as_a_gguf() {
+        let dir = scratch("diffusion");
+        std::fs::write(dir.join("model_index.json"), b"{}").unwrap();
+
+        for path in [dir.clone(), dir.join("model_index.json")] {
+            assert_eq!(
+                diffusion_snapshot_root(&path).as_deref(),
+                Some(dir.as_path()),
+                "{}",
+                path.display()
+            );
+            let err = safetensors_dir(&path).unwrap_err().to_string();
+            assert!(
+                err.contains("diffusion snapshot"),
+                "{}: {err}",
+                path.display()
+            );
+            assert!(err.contains("xwen image"), "{}: {err}", path.display());
+            // Through the seam every consumer goes through, not just the
+            // predicate underneath it.
+            let err = CheckpointSource::open(&path, &Device::Cpu, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("xwen image"), "{}: {err}", path.display());
+        }
+
+        // The text encoder lives one directory down and is a real safetensors
+        // set, so the rule must not swallow it.
+        let encoder = dir.join("text_encoder");
+        std::fs::create_dir(&encoder).unwrap();
+        std::fs::write(encoder.join("config.json"), b"{}").unwrap();
+        assert_eq!(diffusion_snapshot_root(&encoder), None);
+        assert_eq!(safetensors_dir(&encoder).unwrap(), Some(encoder.clone()));
+
+        // And a `model_index.json` that is not there is not a snapshot; the
+        // predicate answers before the existence check does.
+        assert_eq!(
+            diffusion_snapshot_root(&dir.join("missing/model_index.json")),
+            None
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A file resolves to its RESOLVED directory, never to the parent of the

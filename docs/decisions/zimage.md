@@ -169,29 +169,37 @@ a reload on the next prompt. The serve route will want the opposite of offloadin
 since sharing one loaded Qwen3-4B between the language surfaces and the image surface is
 one of the two reasons this endpoint is worth having at all (2026-09-07).
 
-**The sigma grid follows diffusers, not the official repo.** The two really do differ.
-The vendored scheduler computes `linspace(1.0, 1/n, n)`, applies the static
-shift `3σ / (1 + 2σ)` once and appends a terminal 0, which is exactly what diffusers'
+**The sigma grid is diffusers', and the official pipeline computes the same one.** The
+vendored scheduler computes `linspace(1.0, 1/n, n)`, applies the static shift
+`3σ / (1 + 2σ)` once and appends a terminal 0, which is exactly what diffusers'
 `ZImagePipeline` does: it passes `get_default_z_image_sigmas` as an explicit `sigmas`
 argument and `FlowMatchEulerDiscreteScheduler.set_timesteps` shifts what it was handed.
-`Tongyi-MAI/Z-Image` does something else. It passes `sigmas=None`, shifts the full
-1..1000 training grid in the scheduler's constructor (so its `sigma_min` is
-`3 * 0.001 / (1 + 2 * 0.001)` = 0.0029940 rather than 0.001), interpolates `n + 1` points
-between those already-shifted extremes and shifts a SECOND time. At 8 steps the grids
-agree to a maximum |Δσ| of 5.0e-3, worst at the last step (0.3050089 against 0.3), and
-the final Euler step's `dt` is −0.305009 there against −0.300000 here — a 1.7% difference
-on the largest single step of the run. Small enough to be invisible by eye, large enough
-to fail a parity gate at every step past the first. diffusers wins because it is the
-ORACLE: Stage 3 and Stage 4 are graded against `scripts/zimage-ref-dump.py`, which drives
-the diffusers pipeline and already does for the encoder, and diffusers is what
-HuggingFace publishes for these weights. Moving to the official grid would mean moving
-the oracle with it, and there is no reason to prefer it. Worth recording because it was
-first written down backwards: the code claimed both references hand the scheduler an
-explicit linspace, which is false about the official one, and candle upstream's grid —
-the one this file calls wrong — was a faithful reproduction of it rather than a bug of
-candle's invention. The `set_timesteps` unit test pins all nine diffusers sigmas and
-asserts the last one is NOT the official repo's, so a move back is a red test rather than
-a quiet drift (2026-09-07).
+`Tongyi-MAI/Z-Image` gets there by a different route and lands in the same place. Its
+pipeline passes `sigmas=None`, which sends its scheduler down an interpolation branch —
+but the line before `retrieve_timesteps` assigns `scheduler.sigma_min = 0.0`
+(`src/zimage/pipeline.py`), and with that override the branch computes
+`linspace(1000, 0, n + 1)[:-1] / 1000`, which is `1 - k/n` exactly, then applies the same
+single shift. At 8 steps and shift 3.0 both give
+`1.0, 0.9545455, 0.9, 0.8333333, 0.75, 0.6428571, 0.5, 0.3, 0`, equal at every step.
+
+What the override prevents is the scheduler's own CONSTRUCTOR default, and that is the
+grid to recognize: left alone the constructor shifts the full 1..1000 training grid, so
+its `sigma_min` is `3 * 0.001 / (1 + 2 * 0.001)` = 0.0029940 rather than 0, and
+interpolating between those already-shifted extremes and shifting a SECOND time gives
+`1.0, 0.9546939, …, 0.3050089` — up to 5.0e-3 off, worst at the last step, with a final
+`dt` of −0.305009 against −0.300000. Nothing ships it, and candle upstream computes it
+faithfully because it reproduces the scheduler without the pipeline that drives it.
+
+diffusers is named the reference anyway because it is the ORACLE: Stage 3 and Stage 4 are
+graded against `scripts/zimage-ref-dump.py`, which drives the diffusers pipeline and
+already does for the encoder, and diffusers is what HuggingFace publishes for these
+weights. Agreeing with the official pipeline is what makes that choice free. Worth
+recording because it was written down wrong twice on the way here: first claiming both
+references hand the scheduler an explicit linspace, which is false about the official one,
+and then claiming the two grids differ by up to 5.0e-3, which is true of the constructor
+default and false of the pipeline. The `set_timesteps` unit test pins all nine sigmas and
+asserts the last one is NOT 0.3050089, so a revert to the constructor-default grid is a
+red test rather than a quiet drift (2026-09-07).
 
 **An out-of-range RoPE position is refused, not clamped, and `check_size` grew a third
 rule for it.** candle's Metal `index_select` kernel clamps an out-of-range id to the
@@ -216,7 +224,45 @@ because `generate` and `forward` are `pub` and Stage 3's oracle will call them d
 destination truncates it before the encode runs, so a run that failed anywhere in the
 encode destroyed the previous image at that path — which for a reference comparison is
 the one artefact worth keeping, and the failure mode is "the run I wanted to compare
-against is gone". The temp name carries the pid so two concurrent runs to one output do
-not collide, and it is a sibling so the rename is within one filesystem and therefore
-atomic. Pinned by a test that blocks the temporary path with a directory, the only
-deterministic way to fail the encode without a broken tensor (2026-09-07).
+against is gone". It is a sibling so the rename is within one filesystem and therefore
+atomic. **Amended the same day:** the name is unique per WRITER and claimed by exclusive
+creation, not chosen. A pid separates two `xwen image` processes and separates nothing
+inside one, which the image serve route will be: two callers writing one destination would
+share the name, interleave their pixels and each rename a half-written file over the
+other's output. `create_new` in a bounded counter loop is what makes that impossible —
+the counter proposes, the filesystem decides — and a failed rename now removes the
+temporary too, since nothing will ever pick it up. Two tests: the destination survives a
+write whose directory is unwritable, and a held candidate name is stepped over rather than
+opened (2026-09-07).
+
+**A path that names a diffusion snapshot is refused at the `CheckpointSource` seam, and
+`inspect` gates on the FORMAT rather than on `servable()`.** `Model::ZImageTurbo`'s first
+file is `model_index.json`, which is what `hub::ensure_model` returns for a
+`Format::Diffusion` entry — and to `safetensors_dir` it is neither a `config.json` nor a
+`.safetensors`, so it fell through to the GGUF parser. The cost was not the confusing
+message: `xwen inspect --model-size zimage-turbo` resolved the entry first and downloaded
+32.9 GB before failing on a magic number. Fixing it at the seam rather than at each call
+site is the whole point — every checkpoint consumer already routes through
+`CheckpointSource::open` (AGENTS.md, "`CheckpointSource` is the one open seam"), so one
+refusal covers `generate`, `chat`, `batch`, `encode-text`, `inspect` and whatever comes
+next, and `checkpoint::diffusion_snapshot_root` is the single rule for what a snapshot
+path is, shared with `encode-text`'s remap onto `text_encoder/` so the two cannot drift
+into the CLI accepting a shape the loader refuses. On top of that, `inspect` refuses a
+diffusion ENTRY before `resolve_model`, and the predicate there is `is_diffusion()` and
+not `servable()` on purpose: the Z-Image text encoder is unservable, and inspecting it is
+exactly what someone reaching for `inspect` wants (2026-09-07).
+
+**An agreement bar is bracketed from both sides or it is not a bar.** The
+fused-versus-basic attention A/B shipped at 2e-3 against a real difference of 1.2e-8, and
+an outside review pointed out that an arm with the `1 / sqrt(head_dim)` scale dropped
+(9.1e-4) or its probabilities replaced by a uniform distribution (8.9e-5) would also have
+passed. The nonzero-difference assertion that was already there catches the failure mode
+AGENTS.md warns about — one kernel compared with itself — but says nothing about how
+wrong the arm is allowed to be. So the rule for this repo: a tolerance is chosen by
+measuring the real difference AND at least one deliberately broken variant, and the test
+asserts the bar separates them. The second thing that came out of it is that the fixture
+can defeat the test on its own: driven through `forward` with random weights the qk-norm
+weights are uniform on ±0.1, so the logits span ±1.3e-2 and the softmax is uniform to
+2e-4, and a mutation of a softmax that is already uniform is invisible. The mutation check
+therefore drives the arms directly with q and k at unit RMS, which is what QK-RMSNorm
+produces on trained weights (2026-09-07).

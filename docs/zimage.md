@@ -445,9 +445,14 @@ VAE's 8, because the transformer's patch size is 2 on top of it.
 ```
 
 The raw grid is `sigma_k = 1 - k/n` for `k = 0..n-1`; the official repo spells it
-`linspace(1000, 0, n+1)[:-1] / 1000`, which is algebraically the same for every n. Each
-sigma then takes the static shift `sigma' = 3*sigma / (1 + 2*sigma)`, and a terminal 0 is
-appended to the sigma array. At the shipped defaults, n = 8 and shift 3.0:
+`linspace(1000, 0, n+1)[:-1] / 1000`, which is algebraically the same for every n. The
+lower endpoint is 0 there only because the pipeline assigns `scheduler.sigma_min = 0.0`
+on the line before it asks for the timesteps; left at the constructor's own 0.0029940 the
+same interpolation gives a grid up to 5.0e-3 away, which is candle upstream's and which
+nothing ships (decisions.md "The sigma grid is diffusers', and the official pipeline
+computes the same one"). Each sigma then takes the static shift
+`sigma' = 3*sigma / (1 + 2*sigma)`, and a terminal 0 is appended to the sigma array. At
+the shipped defaults, n = 8 and shift 3.0:
 
 | k | raw σ | shifted σ | t = 1 − σ | dt = σ<sub>k+1</sub> − σ<sub>k</sub> |
 | --- | --- | --- | --- | --- |

@@ -1720,6 +1720,19 @@ fn main() -> Result<()> {
             // that every run named a checkpoint, and a `--model` pointing at
             // something else would then be a contradiction that never fired.
             let selected = select.model_size;
+            // Ahead of `resolve_model`, which fetches. A diffusion entry's
+            // first file is `model_index.json`, so without this the run
+            // downloaded 32.9 GB and then handed a JSON index to the GGUF
+            // parser. `servable()` is the wrong question for inspect — the
+            // Z-Image text encoder is unservable and inspecting it is exactly
+            // what someone wants — so the gate is the format, and the sentence
+            // is the entry's own.
+            let requested = select.size();
+            ensure!(
+                !requested.is_diffusion(),
+                "{}",
+                requested.not_servable_message()
+            );
             let path = resolve_model(model, select.size())?;
             let device = candle_core::Device::Cpu;
             let source = CheckpointSource::open(&path, &device, selected)?;
@@ -2157,11 +2170,19 @@ fn run_encode_text(
                 .text_encoder()
                 .with_context(|| format!("{} names no text encoder", pipeline.full_name()))?;
             let subdir = Path::new(encoder.file()).parent().unwrap_or(Path::new(""));
-            // A snapshot root the operator named holds the encoder inside it;
-            // anything else is passed through as given.
-            let model = match model {
-                Some(path) if path.join("model_index.json").is_file() => Some(path.join(subdir)),
-                other => other,
+            // A snapshot the operator named holds the encoder inside it;
+            // anything else is passed through as given. Either spelling of the
+            // snapshot counts — the directory or its `model_index.json`, which
+            // is what `xwen fetch` prints — and the rule is
+            // `checkpoint::diffusion_snapshot_root`'s, the same one the loader
+            // refuses that path by. Written twice they drift, and the drift is
+            // this command accepting a shape the loader then refuses.
+            let model = match model
+                .as_deref()
+                .and_then(xwen::checkpoint::diffusion_snapshot_root)
+            {
+                Some(root) => Some(root.join(subdir)),
+                None => model,
             };
             (Some(encoder), model)
         }

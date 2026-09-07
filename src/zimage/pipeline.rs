@@ -294,6 +294,14 @@ impl ZImagePipeline {
 /// anywhere in the encode leaves whatever was at `path` untouched. Creating
 /// the destination first truncates it, which on a re-run over the previous
 /// image destroys the one comparable artefact the run had.
+///
+/// The temporary name is unique per WRITER, not per process, and it is claimed
+/// by exclusive creation rather than chosen. A pid is enough to separate two
+/// `xwen image` runs and not enough to separate two callers inside one process,
+/// which the image serve route will be: they would share the name, interleave
+/// their pixels into it, and each rename a half-written file over the other's
+/// output. The counter only supplies the next candidate; the filesystem decides
+/// who got it.
 pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
     let (c, h, w) = image.dims3().context("the image is [3, H, W]")?;
     ensure!(c == 3, "the image has {c} channels, PNG RGB needs 3");
@@ -303,19 +311,41 @@ pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
         .contiguous()?
         .flatten_all()?
         .to_vec1::<u8>()?;
-    // A sibling, so the rename is within one filesystem and therefore atomic;
-    // the pid keeps two concurrent runs to the same output from colliding.
-    let temp = match path.file_name() {
-        Some(name) => path.with_file_name(format!(
-            ".{}.{}.tmp",
-            name.to_string_lossy(),
-            std::process::id()
-        )),
-        None => bail!("{} is not a file path to write a PNG to", path.display()),
+    // A sibling, so the rename is within one filesystem and therefore atomic.
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        bail!("{} is not a file path to write a PNG to", path.display());
+    };
+    let pid = std::process::id();
+    let (temp, file) = {
+        let mut attempt = 0u32;
+        loop {
+            let candidate = path.with_file_name(format!(".{name}.{pid}.{attempt}.tmp"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    attempt += 1;
+                    // Bounded, because a thousand taken names beside one output
+                    // is a directory this cannot win in — leftovers from killed
+                    // runs, most likely — and a spin there is worse than saying
+                    // so.
+                    ensure!(
+                        attempt < 1024,
+                        "no free temporary name beside {} after {attempt} tries; \
+                         stale `.{name}.*.tmp` files may need clearing",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("creating {}", candidate.display()));
+                }
+            }
+        }
     };
     let write = || -> Result<()> {
-        let file =
-            std::fs::File::create(&temp).with_context(|| format!("creating {}", temp.display()))?;
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
@@ -328,13 +358,20 @@ pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&temp);
         return Err(e);
     }
-    std::fs::rename(&temp, path).with_context(|| {
-        format!(
-            "renaming {} into place as {}",
-            temp.display(),
-            path.display()
-        )
-    })
+    // The temp is this writer's alone, so a rename that failed leaves a file
+    // nothing will ever pick up. Removed on the way out, or it accumulates one
+    // whole image per failure beside the output.
+    if let Err(e) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e).with_context(|| {
+            format!(
+                "renaming {} into place as {}",
+                temp.display(),
+                path.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -506,17 +543,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A directory of its own per test: these run in parallel in one process,
+    /// and the temporary names below are derived from the process id, so a
+    /// shared directory is one test staging a failure for another.
+    fn png_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xwen-png-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// A failed PNG write leaves the previous image at that path alone.
     ///
-    /// The failure is staged by putting a directory where the temporary file
-    /// wants to be, which is the one way to make the encode fail without a
-    /// broken tensor. What it pins is the ordering: nothing truncates the
-    /// destination, so a re-run that dies mid-encode still has yesterday's
-    /// image to compare against.
+    /// The failure is staged by making the output's DIRECTORY unwritable, so
+    /// the temporary file cannot be created at all. What it pins is the
+    /// ordering: nothing truncates the destination, so a re-run that dies
+    /// before the rename still has yesterday's image to compare against.
     #[test]
     fn a_failed_png_write_does_not_destroy_the_previous_image() {
-        let dir = std::env::temp_dir().join(format!("xwen-png-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = png_dir("failure");
         let out = dir.join("out.png");
 
         let image = Tensor::zeros((3, 16, 16), DType::U8, &Device::Cpu).unwrap();
@@ -524,10 +570,44 @@ mod tests {
         let good = std::fs::read(&out).unwrap();
         assert!(good.starts_with(b"\x89PNG"), "not a PNG: {:?}", &good[..4]);
 
-        let blocked = dir.join(format!(".out.png.{}.tmp", std::process::id()));
-        std::fs::create_dir(&blocked).unwrap();
-        assert!(write_png(&image, &out).is_err());
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = write_png(&image, &out).unwrap_err();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(format!("{err:#}").contains("creating"), "{err:#}");
         assert_eq!(std::fs::read(&out).unwrap(), good);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A taken temporary name is stepped over rather than reused, and nothing
+    /// is left behind on the way through.
+    ///
+    /// The name used to be `.{output}.{pid}.tmp` and nothing else, so two
+    /// writers to one destination inside one process shared a file: each would
+    /// encode into it and each would rename it, and one of the two images was
+    /// whatever the interleaving produced. Exclusive creation is what makes
+    /// that impossible, and the observable consequence is this — a candidate
+    /// somebody else holds is skipped, not opened.
+    #[test]
+    fn a_taken_temporary_name_is_skipped_and_no_temporary_survives() {
+        let dir = png_dir("collision");
+        let out = dir.join("out.png");
+        let pid = std::process::id();
+
+        // Candidate 0 held by something the writer cannot open: exactly the
+        // situation a second writer in this process creates.
+        let taken = dir.join(format!(".out.png.{pid}.0.tmp"));
+        std::fs::create_dir(&taken).unwrap();
+
+        let image = Tensor::zeros((3, 16, 16), DType::U8, &Device::Cpu).unwrap();
+        write_png(&image, &out).unwrap();
+        assert!(std::fs::read(&out).unwrap().starts_with(b"\x89PNG"));
+        assert!(taken.is_dir(), "the held candidate was consumed");
+        assert!(
+            !dir.join(format!(".out.png.{pid}.1.tmp")).exists(),
+            "the temporary the write used is still there"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

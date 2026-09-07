@@ -369,3 +369,149 @@ fn the_qwen3_language_models_are_no_longer_refused_at_startup() {
     }
     std::fs::remove_file(&config).unwrap();
 }
+
+/// A directory that looks like a diffusion snapshot to every predicate that
+/// reads one, and holds no weights at all.
+///
+/// An empty `model_index.json` is enough: the shapes under test are decided
+/// from the file's NAME and its presence, and nothing downstream of the
+/// refusals below ever parses it. Nothing here downloads.
+fn fake_snapshot(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "xwen_cli_gates_snapshot_{}_{label}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("text_encoder")).unwrap();
+    std::fs::write(dir.join("model_index.json"), b"").unwrap();
+    dir
+}
+
+/// `xwen inspect` refuses the diffusion entry before it fetches, and refuses a
+/// snapshot path before it parses.
+///
+/// Two failures met here, and they were the same bug at two distances from it.
+/// `inspect --model-size zimage-turbo` resolved the entry first, which for a
+/// `Format::Diffusion` entry means downloading 32.9 GB and being handed
+/// `model_index.json` — whereupon the loader, seeing neither a `config.json`
+/// nor a `.safetensors`, tried it as a GGUF and died on the magic number. So
+/// the entry is gated ahead of the fetch and the path is refused at the loader
+/// seam, and both messages name `xwen image`.
+///
+/// The gate is the FORMAT and not `servable()`, deliberately: the Z-Image text
+/// encoder is unservable and inspecting it is exactly what someone wants.
+#[test]
+fn inspect_refuses_the_diffusion_entry_before_fetching_and_its_snapshot_before_parsing() {
+    let (stdout, stderr, ok) = past_the_gate(&["inspect", "--model-size", "zimage-turbo"], None);
+    let both = format!("{stderr}{stdout}");
+    assert!(!ok, "inspect on the pipeline entry succeeded: {both}");
+    assert!(both.contains("cannot be run"), "{both}");
+    assert!(both.contains("text-to-image"), "{both}");
+    assert!(both.contains("xwen image"), "{both}");
+    assert!(
+        !both.contains("is not in the Hugging Face cache"),
+        "inspect fetched before refusing: {both}"
+    );
+
+    // The path an operator who already has the snapshot would type, in both
+    // spellings, with no `--model-size` to gate on.
+    let dir = fake_snapshot("inspect");
+    for path in [dir.clone(), dir.join("model_index.json")] {
+        let (stdout, stderr, ok) =
+            past_the_gate(&["inspect", "--model", path.to_str().unwrap()], None);
+        let both = format!("{stderr}{stdout}");
+        assert!(!ok, "inspect on {} succeeded: {both}", path.display());
+        assert!(
+            both.contains("diffusion snapshot"),
+            "{}: {both}",
+            path.display()
+        );
+        assert!(both.contains("xwen image"), "{}: {both}", path.display());
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The three language surfaces refuse a diffusion snapshot handed to `--model`,
+/// and say what it is rather than what a GGUF parser makes of it.
+///
+/// `--model-size zimage-turbo` was already refused on these
+/// (`the_one_shot_surfaces_refuse_both_z_image_entries`); this is the other
+/// route in, which reaches `one_shot_checkpoint` BEFORE any servable gate
+/// because with `--model` the file is what decides the checkpoint.
+#[test]
+fn the_language_surfaces_refuse_a_diffusion_snapshot_path() {
+    let dir = fake_snapshot("surfaces");
+    for path in [dir.clone(), dir.join("model_index.json")] {
+        for (subcommand, extra) in [
+            ("generate", vec!["--prompt", "hi"]),
+            ("chat", Vec::new()),
+            ("encode-text", vec!["--prompt", "hi"]),
+        ] {
+            let mut args = vec![subcommand, "--model", path.to_str().unwrap()];
+            args.extend(&extra);
+            let out = std::env::temp_dir().join(format!("xwen-gates-{subcommand}.safetensors"));
+            if subcommand == "encode-text" {
+                args.extend(["-o", out.to_str().unwrap()]);
+            }
+            let (stdout, stderr, ok) = past_the_gate(&args, None);
+            let both = format!("{stderr}{stdout}");
+            assert!(!ok, "{subcommand} on {} succeeded: {both}", path.display());
+            assert!(
+                both.contains("diffusion snapshot"),
+                "{subcommand} on {} did not say what the path is: {both}",
+                path.display()
+            );
+            assert!(
+                both.contains("xwen image"),
+                "{subcommand} on {} did not name the command that runs it: {both}",
+                path.display()
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `encode-text --model <snapshot>` finds the text encoder inside it, by either
+/// spelling of the snapshot.
+///
+/// The remap only recognized the snapshot DIRECTORY, so a path to its
+/// `model_index.json` — which is what `xwen fetch` prints and therefore what a
+/// script copies — went through untouched and into the GGUF parser. Both
+/// spellings must land on `text_encoder/`, and what says they did is the error:
+/// this fake snapshot's `text_encoder/` is empty, so the run gets far enough to
+/// complain about the checkpoint rather than about the index.
+#[test]
+fn encode_text_finds_the_encoder_by_either_spelling_of_a_snapshot() {
+    let dir = fake_snapshot("encode");
+    for path in [dir.clone(), dir.join("model_index.json")] {
+        let spelling = path.file_name().unwrap().to_string_lossy().into_owned();
+        let out = std::env::temp_dir().join(format!("xwen-gates-encode-{spelling}.safetensors"));
+        let (stdout, stderr, ok) = past_the_gate(
+            &[
+                "encode-text",
+                "--model-size",
+                "zimage-turbo",
+                "--model",
+                path.to_str().unwrap(),
+                "--prompt",
+                "hi",
+                "-o",
+                out.to_str().unwrap(),
+            ],
+            None,
+        );
+        let both = format!("{stderr}{stdout}");
+        assert!(!ok, "an empty text_encoder cannot encode: {both}");
+        assert!(
+            both.contains("text_encoder"),
+            "{} did not resolve to the text encoder: {both}",
+            path.display()
+        );
+        assert!(
+            !both.contains("diffusion snapshot"),
+            "{} was refused as a snapshot instead of remapped: {both}",
+            path.display()
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

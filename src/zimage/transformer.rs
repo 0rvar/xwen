@@ -1509,6 +1509,24 @@ mod tests {
         assert!(err.contains("8x8"), "{err}");
     }
 
+    /// The bar the two attention arms are held to.
+    ///
+    /// Bracketed by measurement from both sides rather than chosen as the
+    /// loosest number that passed. On the fixture
+    /// [`the_attention_bar_is_tighter_than_a_broken_arm`] builds, the real
+    /// fused-versus-basic difference is 9.5e-7 and the two wrong arms it
+    /// measures are 2.0 and 0.96; on the `forward`-level fixture below the real
+    /// difference is 1.2e-8 and the smallest wrong arm is 8.9e-5. Every real
+    /// difference therefore clears this by more than twenty times and every
+    /// wrong one exceeds it by more than four.
+    ///
+    /// It replaced 2e-3, which was not a bar at all. On the `forward` fixture
+    /// an arm with the `1 / sqrt(head_dim)` scale dropped differs by 9.1e-4 and
+    /// would have passed it, and so would one that replaced its probabilities
+    /// with a uniform distribution, at 8.9e-5. The whole gap between 1.2e-8 and
+    /// 2e-3 was unmeasured.
+    const ATTN_AB_BAR: f32 = 2e-5;
+
     /// The basic attention arm agrees with the fused Metal kernel, within a
     /// bar and NOT to the bit.
     ///
@@ -1554,7 +1572,7 @@ mod tests {
         assert_eq!(a.dims(), &[1, seq, fused_cfg.dim]);
         let diff = max_abs_diff(&a, &b);
         eprintln!("z-image attention, fused vs basic: max |delta| {diff:.3e}");
-        assert!(diff <= 2e-3, "max abs diff {diff}");
+        assert!(diff <= ATTN_AB_BAR, "max abs diff {diff}");
         assert!(
             diff > 0.0,
             "the two arms produced bit-identical output, so they ran the same kernel"
@@ -1571,10 +1589,100 @@ mod tests {
         let b_masked = basic.forward(&hidden, Some(&mask), &cos, &sin).unwrap();
         let diff = max_abs_diff(&a_masked, &b_masked);
         eprintln!("z-image attention with a mask, fused vs basic: max |delta| {diff:.3e}");
-        assert!(diff <= 2e-3, "masked: max abs diff {diff}");
+        assert!(diff <= ATTN_AB_BAR, "masked: max abs diff {diff}");
         assert!(
             max_abs_diff(&a, &a_masked) > 0.0,
             "the mask changed nothing, so it was not applied"
+        );
+    }
+
+    /// [`ATTN_AB_BAR`] is tight enough that a wrong attention arm fails it, and
+    /// loose enough that the real one passes with room.
+    ///
+    /// An agreement bar means nothing on its own: a bar of 1.0 would also have
+    /// "passed", and so would a bar of 2e-3 against an arm that had lost the
+    /// `1 / sqrt(head_dim)` scale entirely. So this measures three numbers on
+    /// one set of inputs and asserts the bar separates them — the real
+    /// fused-versus-basic difference on one side, two mutations of the basic
+    /// arm on the other.
+    ///
+    /// The mutations are the two things the arm is FOR. The scale is what turns
+    /// a dot product over 128 dims into a logit, and dropping it multiplies
+    /// every logit by 11.3; the softmax is what makes attention attention, and
+    /// replacing it with a uniform distribution turns the arm into a mean over
+    /// keys. Either would be a plausible transcription error.
+    ///
+    /// q and k arrive at unit RMS per element, which is what QK-RMSNorm
+    /// produces once its weights are trained and what puts `q·k / sqrt(128)` at
+    /// unit variance. That matters more than it looks, and it is why this test
+    /// drives the two arms directly instead of going through
+    /// [`ZImageAttention::forward`]: on that fixture the qk-norm weights are
+    /// `RandomWeights`' uniform ±0.1, the logits span only ±1.3e-2, and the
+    /// probabilities sit within 2e-4 of a flat 1/64. A softmax that is already
+    /// uniform cannot tell you that you broke its softmax — the uniform
+    /// mutation moves the layer output by 8.9e-5 there, against 0.96 here.
+    /// A bar justified from that fixture alone would be justified by a
+    /// coincidence of the fixture.
+    #[test]
+    fn the_attention_bar_is_tighter_than_a_broken_arm() {
+        let Some(dev) = metal_or_skip("the_attention_bar_is_tighter_than_a_broken_arm") else {
+            return;
+        };
+        let mut cfg = tiny_config();
+        cfg.set_attn_impl(AttnImpl::Basic);
+        let basic = ZImageAttention::new(&cfg, random_vb(&dev)).unwrap();
+        let mut fused_cfg = tiny_config();
+        fused_cfg.set_attn_impl(AttnImpl::Fused);
+        let fused = ZImageAttention::new(&fused_cfg, random_vb(&dev)).unwrap();
+
+        // `RandomWeights` is uniform on ±0.1, so its RMS is 0.1/sqrt(3) and
+        // this is the factor that takes it to 1.
+        let unit = 3f64.sqrt() * 10.0;
+        let (heads, seq, head_dim) = (cfg.n_heads, 64, cfg.head_dim());
+        let qkv = |name: &str| {
+            (random_vb(&dev)
+                .get((1, heads, seq, head_dim), name)
+                .unwrap()
+                * unit)
+                .unwrap()
+        };
+        let (q, k, v) = (qkv("probe_q"), qkv("probe_k"), qkv("probe_v"));
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        let reference = basic.attention_basic(&q, &k, &v, None, scale).unwrap();
+        let real = max_abs_diff(
+            &fused.attention_metal(&q, &k, &v, None, scale).unwrap(),
+            &reference,
+        );
+
+        // Mutation 1: the softmax temperature gone, every logit 11.3x too big.
+        let unscaled = basic.attention_basic(&q, &k, &v, None, 1.0).unwrap();
+        let unscaled = max_abs_diff(&unscaled, &reference);
+
+        // Mutation 2: the probabilities replaced by a uniform distribution,
+        // which is `ones(seq, seq) / seq` times v and so a mean over keys.
+        let uniform = v.mean_keepdim(2).unwrap().broadcast_as(v.shape()).unwrap();
+        let uniform = max_abs_diff(&uniform, &reference);
+
+        eprintln!(
+            "z-image attention bar {ATTN_AB_BAR:.1e}: real {real:.3e}, \
+             unscaled scores {unscaled:.3e}, uniform probabilities {uniform:.3e}"
+        );
+        // A tenfold margin on the passing side, so the bar is not one machine's
+        // rounding away from red.
+        assert!(
+            real * 10.0 <= ATTN_AB_BAR,
+            "the real difference {real:.3e} has no margin under the bar {ATTN_AB_BAR:.1e}"
+        );
+        assert!(
+            unscaled > ATTN_AB_BAR,
+            "an arm with no 1/sqrt(head_dim) scale differs by {unscaled:.3e} \
+             and passes the bar {ATTN_AB_BAR:.1e}"
+        );
+        assert!(
+            uniform > ATTN_AB_BAR,
+            "an arm with uniform probabilities differs by {uniform:.3e} \
+             and passes the bar {ATTN_AB_BAR:.1e}"
         );
     }
 }

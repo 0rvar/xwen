@@ -1,12 +1,11 @@
 // Vendored from candle rev 21cca0b (candle-transformers/src/models/z_image/scheduler.rs,
-// PR #3261, SpenserCai), MIT / Apache-2.0. The sigma grid is rewritten to follow
-// diffusers; upstream followed the official repo, which is a different grid. Which one
-// is which, and why this one, is below.
+// PR #3261, SpenserCai), MIT / Apache-2.0. The sigma grid is rewritten: upstream
+// reproduces the official scheduler's CONSTRUCTOR default, which no pipeline actually
+// runs. Which grid is which, and why this one, is below.
 //! The flow-matching Euler scheduler as Z-Image runs it.
 //!
-//! **The grid is diffusers', and the official repo's differs.** The two
-//! references really do disagree, by a little, and this file follows the one
-//! the parity oracle will come from:
+//! **Both references produce the grid below.** They reach it by different
+//! routes, which is the only reason it needs writing down:
 //!
 //! - diffusers' `ZImagePipeline` hands the scheduler an EXPLICIT sigma grid,
 //!   `get_default_z_image_sigmas` = `linspace(1.0, 1/n, n)` — the same as
@@ -15,18 +14,28 @@
 //!   `s * σ / (1 + (s - 1) * σ)` with `s = 3.0` from `scheduler_config.json`
 //!   ONCE, then appends a terminal 0. That is what [`Self::set_timesteps`]
 //!   below computes.
-//! - `Tongyi-MAI/Z-Image`'s own scheduler passes `sigmas=None`, shifts the
-//!   full 1..1000 training grid in its constructor, interpolates `n + 1` points
-//!   between those ALREADY-SHIFTED extremes and shifts a second time. At 8
-//!   steps the two grids agree to a maximum |Δσ| of 5.0e-3, and the largest
-//!   single Euler step of the run has `dt` −0.305009 there against −0.300000
-//!   here: visibly the same image, not the same numbers.
+//! - `Tongyi-MAI/Z-Image`'s own pipeline passes `sigmas=None` and lets its
+//!   scheduler interpolate — but it assigns `scheduler.sigma_min = 0.0` first,
+//!   on the line before `retrieve_timesteps` (`src/zimage/pipeline.py`). With
+//!   that override the interpolation is `linspace(1000, 0, n + 1)[:-1] / 1000`,
+//!   which is `1 - k/n` exactly, and the single static shift it then applies is
+//!   the same one. The two grids are equal at every step, to the bit in exact
+//!   arithmetic.
 //!
-//! diffusers is the reference here because it is the oracle Stage 3 and
-//! Stage 4 will be graded against — it is what `scripts/zimage-ref-dump.py`
-//! drives, and it is the pipeline HuggingFace publishes for these weights
-//! (decisions.md "The sigma grid follows diffusers, not the official repo").
-//! Moving to the official grid means moving the oracle with it.
+//! The grid nothing ships is the scheduler's own constructor default, and it is
+//! the one to recognize. Left to itself that constructor shifts the whole
+//! 1..1000 training grid, so its `sigma_min` is `3 * 0.001 / (1 + 2 * 0.001)` =
+//! 0.0029940 rather than 0; interpolating between those already-shifted
+//! extremes and shifting a SECOND time gives 1.0, 0.9546939, …, 0.3050089, up
+//! to 5.0e-3 away from this grid and worst at the last step, where `dt` is
+//! −0.305009 against −0.300000. That is what candle upstream computes,
+//! faithfully, and what the official pipeline's one assignment prevents.
+//!
+//! diffusers is still the ORACLE, because it is what
+//! `scripts/zimage-ref-dump.py` drives and what HuggingFace publishes for these
+//! weights (decisions.md "The sigma grid is diffusers', and the official
+//! pipeline computes the same one"). Agreeing with the official pipeline is
+//! what makes that choice free.
 //!
 //! `use_dynamic_shifting` is false in every shipped Z-Image config, so the
 //! resolution-dependent `mu` both pipelines still compute is dead code there
@@ -175,15 +184,16 @@ impl FlowMatchEulerDiscreteScheduler {
 mod tests {
     use super::*;
 
-    /// The shipped defaults: 8 steps at shift 3.0, pinned to all nine of
-    /// DIFFUSERS' sigmas — the shifted grid `3σ / (1 + 2σ)` over
-    /// `σ = 1 - k/8`, plus the terminal 0.
+    /// The shipped defaults: 8 steps at shift 3.0, pinned to all nine sigmas —
+    /// the shifted grid `3σ / (1 + 2σ)` over `σ = 1 - k/8`, plus the terminal 0.
+    /// Both references compute this grid; the module header is where the two
+    /// routes to it are written down.
     ///
-    /// The tolerance is deliberately tighter than the gap to the official
-    /// repo's double-shifted grid, so this test is the thing that would go red
-    /// if anyone moved the schedule back to it, and the last comparison below
-    /// says so in the one place it matters most: the final step, where the two
-    /// references are 5.0e-3 apart.
+    /// The tolerance is deliberately tighter than the gap to the grid the
+    /// scheduler's CONSTRUCTOR default gives — the double-shifted one candle
+    /// upstream computes and this file replaced — so this test is the thing
+    /// that would go red if anyone reverted to it. The last comparison below
+    /// says so at the step where the gap is widest: 0.3 against 0.3050089.
     #[test]
     fn eight_steps_at_shift_three_match_the_diffusers_schedule() {
         let mut s = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo()).unwrap();
@@ -193,11 +203,11 @@ mod tests {
         for (got, want) in s.sigmas.iter().zip(expected_sigmas) {
             assert!((got - want).abs() < 1e-6, "sigma {got} != {want}");
         }
-        // The official repo's grid at the same step is 0.3050089, and that is
+        // The constructor-default grid puts this step at 0.3050089, and that is
         // the value this must NOT be.
         assert!(
             (s.sigmas[7] - 0.3050089).abs() > 1e-4,
-            "sigma {} is the official repo's grid, not diffusers'",
+            "sigma {} is the constructor-default grid, not the one both pipelines run",
             s.sigmas[7]
         );
         assert_eq!(s.timesteps.len(), 8);

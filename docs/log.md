@@ -29,8 +29,16 @@ the loaded `axes_lens`), a PNG write truncated the previous image before encodin
 `encode-text --model-size zimage-turbo` refused the pipeline alias as a GGUF, `--latents`
 was read after 33 GB had loaded and its run printed an unused seed, the documented
 attention reference arm was unreachable (now `XWEN_ZIMAGE_ATTN=basic`, with a nonzero-diff
-A/B test), and the scheduler's comments credited the official repo with diffusers' sigma
-grid when the two differ by up to 5.0e-3.
+A/B test), and the scheduler's comments described the official repo's sigma grid wrongly.
+A second outside round the same day found four more, one of them that correction: the
+official PIPELINE sets `scheduler.sigma_min = 0` and lands on the shipped grid exactly, so
+the two references agree and the 5.0e-3 gap belongs to the scheduler's constructor
+default, which only candle upstream computes. The other three were the pipeline entry
+falling through to the GGUF reader (`inspect --model-size zimage-turbo` fetched 32.9 GB
+and then parsed `model_index.json` as a GGUF; refused at the `CheckpointSource` seam and
+ahead of the fetch now), a PNG temp name that two in-process writers to one destination
+would share, and an attention A/B bar loose enough that dropping the 1/√128 scale passed
+it — now pinned by a mutation check that measures the broken arms.
 [Record](records/zimage-pipeline.md), [architecture](zimage.md),
 [decisions](decisions/zimage.md), [figures](perf-state.md).
 
