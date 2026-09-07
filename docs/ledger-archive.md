@@ -2993,4 +2993,21 @@ blocks use of the feature; item (a) is the one with a known trigger.
 
 ## Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A)
 
-[Nothing closed here yet; the heading exists because TODO.md items name it in their From: line.]
+[Shipped 2026-09-07, later the same day, by Arc B: the dump exists (`scripts/zimage-ref-dump.py --stage transformer`), the fixture is committed under tests/fixtures/zimage-transformer/, `tests/zimage_parity.rs` gates the step-0 velocity at cosine 0.998 / mean rel 0.04 and the VAE alone at 60 dB and reports the final latent and the PSNR; the bars are in docs/decisions/zimage.md "Verification is a torch dump with an injected latent" and the arc in docs/records/zimage-pipeline.md "Arc B, 2026-09-07". Nothing of it stays open; the F32-activations question it was to price is answered (bf16 clears the bar) and its remainder is a record line, not an item.]
+
+- [x] [unpriced] **Stage 3 and Stage 4 parity for the Z-Image transformer.** Arc B, and the
+  prerequisite for everything else on this graph: nothing downstream of `encode` is
+  numerically graded today. Stage 3 dumps a fixed `[1,16,128,128]` fp32 latent and the
+  step-0 velocity field from the torch reference, grades xwen's against it on cosine and
+  relative error, and is the GATE; Stage 4 compares the final image by PSNR on the same
+  latent and is reported, not gated. What it prices: whether bf16 activations clear the
+  bar or F32 activations are needed, which is the one open precision question
+  (decisions.md "Verification is a torch dump with an injected latent"). Next step is to
+  extend `scripts/zimage-ref-dump.py` with the latent-injection stage; the official
+  `Tongyi-MAI/Z-Image` repo has an MPS branch so the oracle runs here, and diffusers'
+  `latents` argument is the injection point because the official `generate()` does not
+  expose one. xwen's side is `xwen image --latents <file.safetensors>`, which already
+  exists. Bars get decided from the dump's own spread, and the requirement is that the
+  oracle be fast enough to re-run (2026-09-07).
+  [Record](records/zimage-pipeline.md), [architecture](zimage.md).
+  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).

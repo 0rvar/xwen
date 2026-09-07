@@ -263,6 +263,24 @@ from the agent sandbox. The load figures predict about 20 GB resident (7.6 GB en
 12.3 GB bf16 transformer, 0.34 GB f32 VAE) plus activations, and measuring it from a user
 shell is a ledger item.
 
+**The first cross-implementation datum, 2026-09-07, 512x512.** The Stage 3 dump ran the
+same weights through diffusers 0.40 on torch 2.14 mps, so the two sides were timed on one
+machine within minutes of each other, on the same 512x512 case. Power mode was NOT read
+in that session, so these are ordered, not calibrated; dev-tree build, not a pinned
+binary.
+
+| 512x512, per transformer step | xwen bf16 | torch mps bf16 | torch mps fp32 |
+| --- | --- | --- | --- |
+| transformer step | 1.23 s | 0.35 s | 1.10 s |
+| VAE decode, f32 | 1.06 s | 0.7 s | |
+
+torch's bf16 arm is about 3.5x faster per step than xwen at this size, and torch's fp32
+arm runs level with xwen's bf16. That is the ceiling evidence the step-time ledger item
+lacked: the reported large-matmul rate said 1.6x of headroom at 1024x1024, a working
+implementation on the same GPU says at least 3.5x at 512x512. Which of the two holds at
+1024x1024, where attention is a larger share, is the first measurement of any perf arc
+here ([records/zimage-pipeline.md](records/zimage-pipeline.md)).
+
 **The ceiling to read a step against is compute, not bandwidth, and that inverts every
 intuition the rest of this file has built up.** A 1024x1024 step is about 62 TFLOP (roughly
 57 of linear layers at ~4200 tokens and ~10 of attention) against 12.3 GB of weight

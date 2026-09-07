@@ -435,13 +435,20 @@ learned, applied after the embedder, and NOT masked; 8 steps, not the 9 the mode
 says; the static shift is 3.0 and `calculate_shift` is dead code; fp16 is disqualified,
 not merely slower, because activations exceed 65504 and the image comes out black.
 
-Two things not to expect. There is no reference dump of the transformer yet, so nothing
-downstream of `encode` is numerically graded: Stage 3 (step-0 velocity, gated) and
-Stage 4 (final-image PSNR, reported) are the next arc, both driven by an injected latent
-through `xwen image --latents`. And there is no `CheckpointSource` arm for diffusion
-weights; `ZImagePipeline::load` goes through candle's `VarBuilder` directly, casting
-fp32 to bf16 one tensor at a time, which is a deliberate deferral until a second consumer
-exists.
+The transformer IS graded, as of 2026-09-07: `tests/zimage_parity.rs` (run with
+`--ignored`, 19 s) gates the step-0 velocity against diffusers' fp32 run of the same
+weights at cosine 0.998 and mean relative error 0.04, with two wrong-graph brackets run
+every time, gates the VAE alone at 60 dB PSNR, and reports the final latent and the image
+PSNR after eight steps. The fixture under `tests/fixtures/zimage-transformer/` holds BOTH
+inputs, the noise and the caption features, so the gate grades the transformer and not the
+encoder; `scripts/zimage-ref-dump.py --stage transformer` regenerates it in under two
+minutes, and `xwen image --latents <file> --cap-feats <file> --dump <dir>` runs the same
+comparison by hand (`--cap-feats` skips the encoder entirely and the prompt is ignored).
+xwen's bf16 arithmetic is about 1.6x noisier than torch's bf16 on the same inputs; that is
+a record line, not a bug (docs/records/zimage-pipeline.md). One thing not to expect: there
+is no `CheckpointSource` arm for diffusion weights; `ZImagePipeline::load` goes through
+candle's `VarBuilder` directly, casting fp32 to bf16 one tensor at a time, which is a
+deliberate deferral until a second consumer exists.
 
 ## The candle situation
 

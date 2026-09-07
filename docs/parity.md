@@ -930,6 +930,26 @@ then ids after the 512 truncation, then `encode(ids, 35)` against the fp32 refer
 loads through `load_encoder`, the entry that accepts an encode-only set, since the LM load
 refuses the Z-Image zero-filled planes.
 
+Stages 3 and 4, the Z-Image transformer and the decoded image, need no environment
+variable and no dump directory: the fixture is committed.
+
+```
+cargo test --release --test zimage_parity -- --ignored --nocapture
+```
+
+One pipeline load and about 19 s. It grades every case directory under
+`tests/fixtures/zimage-transformer/`, gates the step-0 velocity (cosine >= 0.998, mean
+relative error <= 0.04, two wrong-graph brackets asserted outside the bar every run) and
+the VAE alone (the reference latent through xwen's decoder, PSNR >= 60 dB), and reports the
+final latent and the image PSNR after eight steps. `XWEN_ZIMAGE_DIR` here points at the
+snapshot ROOT, not `text_encoder/`, because the encoder is not loaded: both inputs come
+from the fixture. Regenerating the fixture, or adding a case at another size, is
+`scripts/zimage-ref-dump.py --stage transformer --dtype fp32` then `--dtype bf16` in the
+Stage 2 venv plus `diffusers accelerate` (its header has the lines), about two minutes.
+The same comparison by hand is `xwen image --latents <case>/latents0.safetensors
+--cap-feats <case>/cap_feats.safetensors --dump <dir>` (docs/zimage.md "The transformer
+reference dump, Stages 3 and 4").
+
 Decode consistency, which needs no oracle at all:
 
 ```

@@ -239,6 +239,54 @@ floor, which is the strongest available statement that the graph itself contribu
 almost nothing; a future result between 0.004 and 0.01 should be read as the cast plus
 something, and comparing against an f32 encode output is how to tell the two apart.
 
+## The transformer reference dump, Stages 3 and 4
+
+Live since 2026-09-07. `scripts/zimage-ref-dump.py --stage transformer --dtype fp32`
+then `--dtype bf16` (flags `--width`, `--height`, `--prompt-idx`, `--seed`) reproduces
+diffusers' `ZImagePipeline.__call__` from `prepare_latents` onwards on mps, with the two
+inputs fixed by files so xwen can start from the same tensors: `latents0`, a CPU
+`torch.randn` draw labelled by its seed, and `cap_feats`, the encoder's `hidden_states[-2]`
+for one prompt of `prompts.json` computed fp32 on cpu as Stage 2 does and rounded once to
+bf16. Both sides read those two files, so the encoder is out of the picture here and
+Stage 2 stays its only gate. The fp32 arm is the reference and writes the inputs; the
+bf16 arm reads them back, so the two arms differ in arithmetic alone, and it copies the
+fixture set into `tests/fixtures/zimage-transformer/<WxH>-p<idx>-s<seed>/` with a
+`meta.json` holding its own gap to fp32 and every file's sha256. diffusers 0.40's
+`get_default_z_image_sigmas` is `linspace(1, 1/N, N)`, then the static shift, then a
+terminal zero, which is the grid in "The scheduler and the Euler loop" exactly, and the
+script asserts it. The whole dump, encoder included, ran in under two minutes.
+
+`tests/zimage_parity.rs` grades xwen against it (`cargo test --release --test
+zimage_parity -- --ignored --nocapture`, 18.9 s). xwen's side is `ZImagePipeline::
+velocity` for the single forward and `generate` for the full run, and on the CLI the same
+two inputs go in through `xwen image --latents <file> --cap-feats <file>`, with `--dump
+<dir>` writing the step-0 velocity and the final latent for grading by hand.
+
+| 512x512, prompt 1 (73 caption tokens), seed 0 | cosine | mean rel | max rel |
+| --- | --- | --- | --- |
+| step-0 velocity, xwen bf16 vs fp32 reference | 0.999302 | 0.0205 | 0.1006 |
+| step-0 velocity, reference bf16 vs fp32 (its own spread) | 0.999560 | 0.0175 | 0.0890 |
+| bracket: timestep one grid point off | 0.6045 | 0.6288 | 0.9541 |
+| bracket: caption tokens reversed | 0.8633 | 0.3259 | 0.6536 |
+| final latent after 8 steps, xwen vs fp32 | 0.990845 | 0.0631 | |
+| final latent after 8 steps, reference bf16 vs fp32 | 0.994750 | 0.0492 | |
+
+Image PSNR against the reference PNG: xwen 29.71 dB, the reference's own bf16 arm
+32.40 dB. The reference's final latent decoded through xwen's VAE against the reference
+PNG: 92.62 dB. xwen against the reference's bf16 arm directly: cosine 0.99971, closer than
+to fp32, which is the shared bf16 rounding showing.
+
+**Stage 3 is the gate**, at cosine >= 0.998 and mean relative error <= 0.04 on the step-0
+velocity; **Stage 4 is reported**, the final latent and the PSNR, because eight Euler steps
+compound the bf16 differences on both sides; and **the VAE alone is gated** at 60 dB,
+because it decodes in f32 on both sides and 92.6 dB is a handful of pixels one level off.
+The bars and their bracketing are decisions.md "Verification is a torch dump with an
+injected latent". One reading matters for the future: xwen's bf16 loss (1 - cosine,
+7.0e-4) is about 1.6x the reference's own bf16 loss (4.4e-4), so the graph is right and
+its arithmetic is a little noisier than torch's; the candidates are candle's Metal sdpa
+accumulation and the bf16 elementwise chains inside the block, and the record says when
+that is worth chasing.
+
 ## The transformer
 
 An S3-DiT, single stream, 6,154,908,736 parameters. `transformer/config.json`, read off

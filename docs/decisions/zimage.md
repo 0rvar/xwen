@@ -102,6 +102,30 @@ second Python entry point, and the official repo's MPS branch is what makes it r
 on this machine. The requirement on it is that it be fast: an oracle that takes hours
 does not get re-run, and an oracle that does not get re-run stops being one (2026-09-07).
 
+Set the same day, once the dump existed (2026-09-07, later). The dump went through
+diffusers on mps rather than the official repo, `latents` being the injection point, and
+it injects the CAPTION as well as the latent: `cap_feats` is the encoder's fp32 hidden
+state rounded once to bf16, read by both sides, so the transformer gate grades the
+transformer and Stage 2 stays the encoder's only gate; grading through two encoders would
+have folded a graded gap into an ungraded one. The bars are **cosine >= 0.998 and mean
+relative error <= 0.04 on the step-0 velocity**, from these figures on the 512x512 case:
+the reference's own bf16 arm against its fp32 arm is 0.99956 / 0.0175, xwen is
+0.99930 / 0.0205, and the two brackets, the timestep one grid point off and the caption
+tokens reversed, are 0.6045 / 0.6288 and 0.8633 / 0.3259. So the bar sits at about three
+times the bf16 arithmetic's own loss and a hundred times under the nearest bracket, which
+separates a wrong graph from a rounding difference without flapping on the latter; the
+brackets run inside the test every time, per "An agreement bar is bracketed from both
+sides or it is not a bar" below. Max relative error is reported and not gated, being a
+single-element statistic. Stage 4 stays reported (final latent 0.9908 against the
+reference bf16 arm's 0.9947; PSNR 29.71 dB against 32.40 dB). One gate was ADDED to the
+plan: the reference's final latent decoded through xwen's VAE against the reference PNG,
+at **PSNR >= 60 dB**, measured 92.62. It is cheap, it is deterministic because both sides
+decode in f32, and it isolates the decoder from the trajectory, which nothing else in the
+plan did. The fixture is 512x512 rather than the planned 1024x1024 because the whole gate
+then runs in 19 s and the dump in under two minutes, which is the fast-oracle requirement
+above made concrete; the script takes `--width`/`--height` for the day a size-dependent
+question arises.
+
 **First image before first bar.** The order was deliberate and it is worth recording as
 a choice rather than as an accident: get a coherent 1024x1024 PNG out of the vendored
 module end to end, then build the reference dump, then do performance work. The argument

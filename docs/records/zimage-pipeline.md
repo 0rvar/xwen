@@ -125,10 +125,11 @@ behaviour is unchanged. Encoder and transformer both stay resident for the run.
   63.8, mean neighbour absolute difference 6.10 on the middle row), and its PNG is
   byte-identical to the CLI's.
 
-**What is NOT verified is the arithmetic.** No reference dump of the transformer exists
-yet, so the block math, the VAE and the rope beyond its five pinned values are graded by
-reading and by the images looking right. That is the whole content of Arc B, and until it
-runs, "coherent image" is the only claim this arc makes.
+**What was NOT verified at this point was the arithmetic.** No reference dump of the
+transformer existed when Arc A shipped, so the block math, the VAE and the rope beyond its
+five pinned values were graded by reading and by the images looking right, and "coherent
+image" was the only claim the arc made. Arc B, the same day, closed that: see "Arc B,
+2026-09-07: Stage 3 and Stage 4, the transformer against its reference" below.
 
 ### The second review round, 2026-09-07
 
@@ -173,6 +174,84 @@ two arms directly with q and k at unit RMS, where the same two mutations move th
 by 2.0 and 0.96 against a real fused-versus-basic difference of 9.5e-7, and the bar is set
 at 2e-5: bracketed from both sides, more than twenty times above every real difference and
 more than four times below every wrong one.
+
+## Arc B, 2026-09-07: Stage 3 and Stage 4, the transformer against its reference
+
+The reference is diffusers 0.40.0 on torch 2.14.0, mps, running the shipped
+`transformer/`, `vae/` and `scheduler/` from `prepare_latents` onwards, driven by
+`scripts/zimage-ref-dump.py --stage transformer`. Two inputs are files both sides read:
+`latents0`, a CPU `torch.randn` draw at seed 0, and `cap_feats`, the encoder's
+`hidden_states[-2]` for prompt 1 of `prompts.json` ("portrait-golden-hour", 73 tokens),
+computed fp32 on cpu and rounded once to bf16. Injecting the caption as well as the latent
+is what makes this a transformer gate and not a pipeline gate: the encoder has its own
+(Stage 2) and folding it in would have graded two things at once. Two arms: fp32 is the
+reference and writes the inputs, bf16 rereads them so it differs in arithmetic alone and
+its gap to fp32 is the bar's yardstick. The VAE decodes in f32 in both arms, as xwen does.
+The dump, encoder load included, ran in under two minutes; the fp32 transformer arm was
+1.10 s per step at 512x512 and the bf16 arm 0.35 s.
+
+The fixture is `tests/fixtures/zimage-transformer/512x512-p1-s0/` (1.5 MB: the two
+inputs, the fp32 velocity, latent and PNG, and `meta.json` with the bf16-vs-fp32 spread
+and every sha256), and the gate is `tests/zimage_parity.rs`:
+
+```
+cargo test --release --test zimage_parity -- --ignored --nocapture
+```
+
+18.9 s, one pipeline load, and it prints this table before asserting. Rerunning the dump is
+the two `--stage transformer` lines in the script's header; `--width`, `--height`,
+`--prompt-idx` and `--seed` make another case, and the test grades every case directory
+it finds.
+
+| step-0 velocity, 512x512 | cosine | mean rel | max rel | bar |
+| --- | --- | --- | --- | --- |
+| xwen bf16 vs fp32 reference | 0.999302 | 0.0205 | 0.1006 | inside |
+| reference bf16 vs fp32 (its own spread) | 0.999560 | 0.0175 | 0.0890 | inside |
+| bracket: timestep one grid point off | 0.6045 | 0.6288 | 0.9541 | outside |
+| bracket: caption tokens reversed | 0.8633 | 0.3259 | 0.6536 | outside |
+
+| after 8 steps | xwen bf16 | reference bf16 arm |
+| --- | --- | --- |
+| final latent vs fp32, cosine / mean rel | 0.990845 / 0.0631 | 0.994750 / 0.0492 |
+| image PSNR vs the fp32 PNG | 29.71 dB | 32.40 dB |
+| reference latent through xwen's VAE vs the fp32 PNG | 92.62 dB | |
+
+Gated: the step-0 velocity at cosine >= 0.998 and mean relative error <= 0.04, and the VAE
+alone at PSNR >= 60 dB. Reported: the final latent and the image PSNR. The brackets run
+inside the test on every execution, so the bar is re-proven to separate a wrong graph from
+a rounding difference each time it passes (decisions.md "Verification is a torch dump with
+an injected latent"). xwen against the reference's bf16 arm directly is cosine 0.99971,
+closer than either is to fp32, which is what a shared bf16 rounding component looks like.
+
+The code that made it possible: `ZImagePipeline::generate` returns `Rendered { image,
+timings, velocity0, final_latents }`; `velocity(latents, cap_feats, t)` is one forward,
+public so the test can run it with a wrong `t`; `decode(latents)` is the VAE tail alone;
+`read_cap_feats(path)` mirrors `read_latents`; `encode_png(image) -> Vec<u8>` is the PNG
+encoder split out of `write_png` for the serve route to come. On the CLI, `xwen image
+--cap-feats <file>` skips the encoder entirely (the prompt is ignored and said so) and
+`--dump <dir>` writes `velocity0.safetensors` (`velocity`) and `latents-final.safetensors`
+(`latents`). The CLI run on the fixture inputs reproduces the test's numbers.
+
+Timings from the same session, 512x512, power mode NOT read this session: xwen 1.23 s per
+transformer step and 1.06 s VAE decode; torch mps fp32 1.10 s per step, bf16 0.35 s per
+step, f32 VAE 0.7 s. torch's bf16 arm is about 3.5x faster per step than xwen at this size,
+which is the first cross-implementation datum the step-time ledger item has.
+
+### Not taken now, Arc B
+
+- **xwen's bf16 arithmetic is a little noisier than torch's.** 1 - cosine at step 0 is
+  7.0e-4 against the reference bf16 arm's 4.4e-4, about 1.6x, and it compounds to 29.7 dB
+  against 32.4 dB after eight steps. The graph is right; the candidates are candle's Metal
+  sdpa accumulation and the bf16 elementwise chains inside the block (norms, modulation,
+  the residual adds). Reopen if the Stage 4 PSNR gap to the reference bf16 arm is judged
+  visible on a real image, or if a perf change wants to spend precision and needs to know
+  where the budget already goes.
+- **A 1024x1024 fixture.** Not committed, at about 6 MB for the set; the script produces
+  one in a minute with `--width 1024 --height 1024`. Reopen if a size-dependent bug is
+  suspected (the rope tables past 32 positions per axis, the 4096-token attention).
+- **F32 activations against bf16 weights.** The reopen condition in Arc A's list was "when
+  the step-0 parity gap exists"; it exists now and it is small, so there is nothing to buy
+  at the bar. It stays not taken, with the first item above as its new reopen condition.
 
 ### Not taken now
 
@@ -225,13 +304,17 @@ number or a waiting user are ledger items in [TODO.md](../../TODO.md) instead.
 
 ### Next
 
-Arc B is the reference dump, and it is the prerequisite for everything else: no
-performance work should touch this graph while its arithmetic is ungraded, because there
-would be nothing to regress against. The step is to extend
-`scripts/zimage-ref-dump.py` with a latent-injection stage that writes a fixed
-`[1, 16, 128, 128]` fp32 latent plus the step-0 velocity field and the final image from
-the official pipeline, then read xwen's own through `xwen image --latents`. Prerequisites:
-the official `Tongyi-MAI/Z-Image` repo has an MPS branch in `inference.py`, so the oracle
-runs on this machine; diffusers' `latents` argument bypasses the noise draw and the
-official `generate()` does not expose it, so either patch it or run the reference through
-diffusers. The bars get decided from the dump's own spread, after it exists.
+Arc B shipped the same day (above), so the graph now has something to regress against and
+the ordering constraint on performance work is lifted. The next arc is the serve route,
+TODO.md Front "Serve the images route and ship a ComfyUI node": `POST
+/v1/images/generations` in the OpenAI shape, the same handler at
+`/proxy/openai/images/generations` for ComfyUI's stock node under `--comfy-api-base`,
+never a 401/402/409/429, proven from the laptop with the stock node. Entry points: the
+router in `src/serve/mod.rs` (register the route ABOVE the body-limit layer), a third
+`Job` variant in `src/serve/types.rs`, the lazy load and the idle-unload timer in
+`src/serve/engine.rs`, and `zimage::pipeline::encode_png` for the bytes. Prerequisites the
+route needs and this record already priced: about 20 GB resident for encoder plus
+transformer plus VAE, so the image models must join the unload-on-idle path; and the
+route is the second consumer that reopens the diffusion `CheckpointSource` arm below.
+Verification is the parity gate above (unchanged by a route) plus a request from the
+stock ComfyUI node returning the same PNG the CLI writes for the same seed.

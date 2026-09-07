@@ -4,6 +4,25 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — The Z-Image transformer is graded: step-0 velocity at cosine 0.99930 against fp32, the reference's own bf16 at 0.99956
+
+Arc B, the bars the morning's entry said were missing. `scripts/zimage-ref-dump.py
+--stage transformer` runs diffusers 0.40 on mps from `prepare_latents` onwards with BOTH
+inputs fixed by files, the noise and the caption features (the encoder's fp32 hidden state
+rounded once to bf16), so the gate grades the transformer and Stage 2 stays the encoder's
+only gate; an fp32 arm is the reference and a bf16 arm on the same inputs is the yardstick.
+`tests/zimage_parity.rs` grades xwen against the committed 512x512 fixture in 19 s.
+**Step-0 velocity: xwen bf16 cosine 0.999302 and mean relative error 0.0205 against fp32,
+the reference's own bf16 arm 0.999560 / 0.0175; bars at 0.998 / 0.04, gated**, with two
+brackets run every time (timestep one grid point off 0.60, caption reversed 0.86). After
+eight steps, reported: final latent 0.9908 (reference bf16 0.9947), image PSNR 29.71 dB
+(reference bf16 32.40). The reference latent through xwen's VAE is 92.62 dB from the
+reference PNG, gated at 60. The dump ran in under two minutes. One datum for the step-time
+item: torch bf16 on mps is 0.35 s per 512x512 step against xwen's 1.23, about 3.5x, power
+mode not read. `xwen image` gained `--cap-feats` and `--dump`.
+[Record](records/zimage-pipeline.md), [architecture](zimage.md),
+[decision](decisions/zimage.md).
+
 ## 2026-09-07 — `xwen image` renders through Z-Image-Turbo: a coherent 1024x1024 in 52 s warm, and no bars on it yet
 
 Arc A, and the first thing in this repo that is not a language model. `xwen image

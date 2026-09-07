@@ -195,7 +195,11 @@ xwen image --prompt "a red bicycle against a white brick wall, golden hour" -o o
 `--width` and `--height` default to 1024, `--steps` to 8, and `--seed` is drawn and
 printed when omitted. `--latents <file.safetensors>` injects a fixed latent for reference
 comparisons: the file is read and its shape checked before anything loads, and the result
-line then reports the latent instead of a seed, there being no seed to report. Sizes must
+line then reports the latent instead of a seed, there being no seed to report.
+`--cap-feats <file.safetensors>` injects the caption features too, and then the text
+encoder is not loaded and the prompt is ignored; `--dump <dir>` writes the step-0 velocity
+and the final latent beside the PNG, which is how a run is graded against the reference
+dump by hand (docs/parity.md). Sizes must
 be multiples of 16, with an image token count `(w/16) * (h/16)` that is a multiple of 32
 and neither side past 8192 px; 1024x1024, 1024x768, 512x512 and 1536x1024 all satisfy all
 three. Anything else is refused with the reason, because the padded-image path is not
