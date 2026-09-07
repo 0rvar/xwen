@@ -37,7 +37,7 @@ pub enum LinearImpl {
     /// the candle chain, the kernel being Metal-only.
     Xwen,
     /// candle's own gemm over the bf16 weight, with the activation rounded to
-    /// bf16 first and the product widened back — the pre-kernel path.
+    /// bf16 first and the product widened back, the pre-kernel path.
     Candle,
 }
 

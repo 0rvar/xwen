@@ -8,6 +8,7 @@
 //! from [`crate::XwenModel::encode`] and is not produced here.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -15,6 +16,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
 use super::linear::LinearImpl;
+use super::profile::{self, Profiler};
 use super::sampling::{postprocess_image, seeded_noise};
 use super::scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};
 use super::transformer::{
@@ -79,6 +81,9 @@ pub struct ZImagePipeline {
     /// The transformer's activation dtype: f32 between every layer. The
     /// projection weights are bf16 on the device whatever this says.
     dtype: DType,
+    /// Present only when [`profile::PROFILE_ENV`] asked for a profile, which
+    /// is what keeps the marks off an ordinary run.
+    profiler: Option<Arc<Profiler>>,
 }
 
 impl ZImagePipeline {
@@ -93,6 +98,7 @@ impl ZImagePipeline {
         // not a run that quietly measures the shipped arm twice.
         let attn = AttnImpl::from_env()?;
         let linear = LinearImpl::from_env()?;
+        let profiling = profile::from_env()?;
         let transformer_dir = root.join("transformer");
         let mut transformer_cfg: Config = read_json(&transformer_dir.join("config.json"))?;
         transformer_cfg.set_attn_impl(attn);
@@ -106,9 +112,17 @@ impl ZImagePipeline {
         let shards = shard_paths(&transformer_dir)?;
         let dtype = DType::F32;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, device)? };
-        let transformer = ZImageTransformer2DModel::new(&transformer_cfg, vb)
+        let mut transformer = ZImageTransformer2DModel::new(&transformer_cfg, vb)
             .context("building the Z-Image transformer")?;
         eprintln!("xwen: {}", transformer.weight_range().summary());
+        let profiler = if profiling {
+            let profiler = Arc::new(Profiler::new(device));
+            transformer.set_profiler(profiler.clone());
+            eprintln!("xwen: z-image per-stage profile on");
+            Some(profiler)
+        } else {
+            None
+        };
 
         let vae_dir = root.join("vae");
         let vae_cfg: VaeConfig = read_json(&vae_dir.join("config.json"))?;
@@ -130,6 +144,7 @@ impl ZImagePipeline {
             scheduler_cfg,
             device: device.clone(),
             dtype,
+            profiler,
         })
     }
 
@@ -308,7 +323,10 @@ impl ZImagePipeline {
         let mut timings = Timings::default();
         let mut velocity0 = None;
 
-        for _ in 0..opts.steps {
+        if let Some(prof) = &self.profiler {
+            prof.reset();
+        }
+        for step in 0..opts.steps {
             let started = Instant::now();
             let t = scheduler.current_timestep_normalized();
             let velocity = self.velocity_batched(&latents, &cap_feats, t as f32)?;
@@ -319,13 +337,42 @@ impl ZImagePipeline {
             // The step's arithmetic is asynchronous on Metal; reading one
             // element back is what makes the timing mean anything.
             let _ = latents.flatten_all()?.get(0)?.to_scalar::<f32>()?;
+            profile::mark(&self.profiler, "euler");
             timings.steps.push(started.elapsed().as_secs_f64());
+            // The first step pays for the lazily created buffers and the
+            // kernel compiles of the whole graph, so the profile covers the
+            // steps after it whenever there is more than one.
+            if step == 0
+                && opts.steps > 1
+                && let Some(prof) = &self.profiler
+            {
+                prof.reset();
+            }
         }
         let velocity0 = velocity0.expect("at least one step ran");
+        if let Some(prof) = &self.profiler {
+            eprintln!(
+                "xwen: profiled run: every mark synchronizes the device, so the \
+                 stages below sum to more than an unprofiled step takes"
+            );
+            let (title, counted) = if opts.steps > 1 {
+                (
+                    format!("transformer, mean per step over steps 2..{}", opts.steps),
+                    opts.steps - 1,
+                )
+            } else {
+                ("transformer, the one step, warm-up included".to_string(), 1)
+            };
+            profile::print_table(&title, &prof.report(), counted);
+            prof.reset();
+        }
 
         let started = Instant::now();
         let image = self.decode(&latents)?;
         timings.vae_decode = started.elapsed().as_secs_f64();
+        if let Some(prof) = &self.profiler {
+            profile::print_table("VAE, one decode", &prof.report(), 1);
+        }
         Ok(Rendered {
             image,
             timings,
@@ -368,10 +415,16 @@ impl ZImagePipeline {
     /// reference latent can be decoded through this VAE alone.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
         let latents = latents.to_device(&self.device)?.to_dtype(DType::F32)?;
-        let image = self.vae.decode(&latents)?; // (1, 3, H, W) f32
-        Ok(postprocess_image(&image)?
+        // (1, 3, H, W) f32, from the same arithmetic either way.
+        let image = match &self.profiler {
+            Some(prof) => self.vae.decode_profiled(&latents, prof)?,
+            None => self.vae.decode(&latents)?,
+        };
+        let image = postprocess_image(&image)?
             .squeeze(0)?
-            .to_device(&Device::Cpu)?)
+            .to_device(&Device::Cpu)?;
+        profile::mark(&self.profiler, "to_cpu");
+        Ok(image)
     }
 
     pub fn transformer_config(&self) -> &Config {

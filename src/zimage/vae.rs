@@ -13,6 +13,19 @@
 use candle_core::{D, Module, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, GroupNorm, VarBuilder, conv2d, group_norm};
 
+use super::profile::Profiler;
+
+/// The profile labels of the decoder's up blocks, resnet stack and upsample
+/// convolution apart. One pair per block of the shipped four; a config with
+/// more blocks than this reports the rest under a shared row rather than
+/// failing a profiled run.
+const UP_LABELS: [(&str, &str); 4] = [
+    ("up0.resnets", "up0.upsample"),
+    ("up1.resnets", "up1.upsample"),
+    ("up2.resnets", "up2.upsample"),
+    ("up3.resnets", "up3.upsample"),
+];
+
 // ==================== Config ====================
 
 /// VAE configuration
@@ -377,6 +390,28 @@ impl UpDecoderBlock2D {
     }
 }
 
+impl UpDecoderBlock2D {
+    /// [`Module::forward`] with the resnet stack and the upsample
+    /// convolution timed under `labels` (see [`Profiler`]).
+    fn forward_profiled(
+        &self,
+        xs: &Tensor,
+        prof: &Profiler,
+        labels: (&'static str, &'static str),
+    ) -> Result<Tensor> {
+        let mut h = xs.clone();
+        for resnet in &self.resnets {
+            h = h.apply(resnet)?;
+        }
+        prof.mark(labels.0);
+        if let Some(us) = &self.upsampler {
+            h = h.apply(us)?;
+            prof.mark(labels.1);
+        }
+        Ok(h)
+    }
+}
+
 impl Module for UpDecoderBlock2D {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut h = xs.clone();
@@ -411,6 +446,20 @@ impl UNetMidBlock2D {
             attention,
             resnet_1,
         })
+    }
+}
+
+impl UNetMidBlock2D {
+    /// [`Module::forward`] with the two resnets summed into one row and the
+    /// attention in its own.
+    fn forward_profiled(&self, xs: &Tensor, prof: &Profiler) -> Result<Tensor> {
+        let h = xs.apply(&self.resnet_0)?;
+        prof.mark("mid.resnet");
+        let h = h.apply(&self.attention)?;
+        prof.mark("mid.attn");
+        let h = h.apply(&self.resnet_1)?;
+        prof.mark("mid.resnet");
+        Ok(h)
     }
 }
 
@@ -584,6 +633,30 @@ impl Decoder {
     }
 }
 
+impl Decoder {
+    /// [`Module::forward`] with one row per stage. Same arithmetic; the
+    /// marks synchronize the device, so a profiled decode is slower than the
+    /// decode it describes.
+    fn forward_profiled(&self, xs: &Tensor, prof: &Profiler) -> Result<Tensor> {
+        let mut h = xs.apply(&self.conv_in)?;
+        prof.mark("conv_in");
+        h = self.mid_block.forward_profiled(&h, prof)?;
+        for (i, block) in self.up_blocks.iter().enumerate() {
+            let labels = UP_LABELS
+                .get(i)
+                .copied()
+                .unwrap_or(("up*.resnets", "up*.upsample"));
+            h = block.forward_profiled(&h, prof, labels)?;
+        }
+        let out = h
+            .apply(&self.conv_norm_out)?
+            .apply(&candle_nn::Activation::Swish)?
+            .apply(&self.conv_out)?;
+        prof.mark("norm_out+conv_out");
+        Ok(out)
+    }
+}
+
 impl Module for Decoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut h = xs.apply(&self.conv_in)?.apply(&self.mid_block)?;
@@ -666,6 +739,12 @@ impl AutoEncoderKL {
     pub fn decode(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = ((xs / self.scale_factor)? + self.shift_factor)?;
         xs.apply(&self.decoder)
+    }
+
+    /// [`Self::decode`] with one profile row per decoder stage.
+    pub fn decode_profiled(&self, xs: &Tensor, prof: &Profiler) -> Result<Tensor> {
+        let xs = ((xs / self.scale_factor)? + self.shift_factor)?;
+        self.decoder.forward_profiled(&xs, prof)
     }
 
     /// Get scaling factor

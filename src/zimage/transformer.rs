@@ -10,11 +10,14 @@
 //! sequence is its own length and no attention mask exists in either
 //! reference implementation.
 
+use std::sync::Arc;
+
 use candle_core::{D, DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::with_tracing::RmsNorm;
 
 use super::linear::{LinearImpl, Projection, WeightRange, ensure_weights_fit_f16};
+use super::profile::{self, Profiler};
 
 // ==================== Constants ====================
 
@@ -348,6 +351,7 @@ pub struct FeedForward {
     w1: Projection,
     w2: Projection,
     w3: Projection,
+    profiler: Option<Arc<Profiler>>,
 }
 
 impl FeedForward {
@@ -355,11 +359,21 @@ impl FeedForward {
         let w1 = Projection::new(dim, hidden_dim, false, vb.pp("w1"), arm)?;
         let w2 = Projection::new(hidden_dim, dim, false, vb.pp("w2"), arm)?;
         let w3 = Projection::new(dim, hidden_dim, false, vb.pp("w3"), arm)?;
-        Ok(Self { w1, w2, w3 })
+        Ok(Self {
+            w1,
+            w2,
+            w3,
+            profiler: None,
+        })
     }
 
     fn projections(&self) -> [&Projection; 3] {
         [&self.w1, &self.w2, &self.w3]
+    }
+
+    /// Time this FFN's stages into `profiler`.
+    pub fn set_profiler(&mut self, profiler: Arc<Profiler>) {
+        self.profiler = Some(profiler);
     }
 }
 
@@ -367,6 +381,7 @@ impl Module for FeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = x.apply(&self.w1)?;
         let up = x.apply(&self.w3)?;
+        profile::mark(&self.profiler, "ffn.w1w3");
         // `silu(gate) * up` in one pass on Metal (bit-identical to the candle
         // chain, which is what runs everywhere else).
         let act = if gate.device().is_metal() && gate.dtype() == DType::F32 {
@@ -374,7 +389,10 @@ impl Module for FeedForward {
         } else {
             (gate.silu()? * up)?
         };
-        act.apply(&self.w2)
+        profile::mark(&self.profiler, "ffn.silu_mul");
+        let out = act.apply(&self.w2)?;
+        profile::mark(&self.profiler, "ffn.w2");
+        Ok(out)
     }
 }
 
@@ -538,6 +556,7 @@ pub struct ZImageAttention {
     n_heads: usize,
     head_dim: usize,
     use_accelerated_attn: bool,
+    profiler: Option<Arc<Profiler>>,
 }
 
 impl ZImageAttention {
@@ -567,11 +586,17 @@ impl ZImageAttention {
             n_heads,
             head_dim,
             use_accelerated_attn: cfg.use_accelerated_attn,
+            profiler: None,
         })
     }
 
     fn projections(&self) -> [&Projection; 4] {
         [&self.to_q, &self.to_k, &self.to_v, &self.to_out]
+    }
+
+    /// Time this attention's stages into `profiler`.
+    pub fn set_profiler(&mut self, profiler: Arc<Profiler>) {
+        self.profiler = Some(profiler);
     }
 
     /// Bidirectional attention over the whole sequence. `attention_mask` is
@@ -596,6 +621,7 @@ impl ZImageAttention {
         let q = q.reshape((b, seq_len, self.n_heads, self.head_dim))?;
         let k = k.reshape((b, seq_len, self.n_heads, self.head_dim))?;
         let v = v.reshape((b, seq_len, self.n_heads, self.head_dim))?;
+        profile::mark(&self.profiler, "attn.qkv");
 
         // Apply QK norm
         let (q, k) = if let Some(ref norm) = self.qk_norm {
@@ -603,15 +629,18 @@ impl ZImageAttention {
         } else {
             (q, k)
         };
+        profile::mark(&self.profiler, "attn.qknorm");
 
         // Apply RoPE
         let q = apply_rotary_emb(&q, cos, sin)?;
         let k = apply_rotary_emb(&k, cos, sin)?;
+        profile::mark(&self.profiler, "attn.rope");
 
         // Transpose for attention: (B, n_heads, seq_len, head_dim)
         let q = q.transpose(1, 2)?.contiguous()?;
         let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
+        profile::mark(&self.profiler, "attn.transpose");
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
 
@@ -620,11 +649,15 @@ impl ZImageAttention {
         } else {
             self.attention_basic(&q, &k, &v, attention_mask, scale)?
         };
+        profile::mark(&self.profiler, "attn.sdpa");
 
         // Reshape back: (B, n_heads, seq_len, head_dim) -> (B, seq_len, dim)
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
+        profile::mark(&self.profiler, "attn.untranspose");
 
-        context.apply(&self.to_out)
+        let out = context.apply(&self.to_out)?;
+        profile::mark(&self.profiler, "attn.out");
+        Ok(out)
     }
 
     /// Metal: candle's fused SDPA kernel (bf16/f16/f32, head_dim 128).
@@ -715,6 +748,7 @@ pub struct ZImageTransformerBlock {
     ffn_norm1: RmsNorm,
     ffn_norm2: RmsNorm,
     adaln_modulation: Option<Projection>,
+    profiler: Option<Arc<Profiler>>,
 }
 
 impl ZImageTransformerBlock {
@@ -752,7 +786,16 @@ impl ZImageTransformerBlock {
             ffn_norm1,
             ffn_norm2,
             adaln_modulation,
+            profiler: None,
         })
+    }
+
+    /// Time this block's stages into `profiler`, which its attention and its
+    /// FFN share so that one table covers the whole block.
+    pub fn set_profiler(&mut self, profiler: Arc<Profiler>) {
+        self.attention.set_profiler(profiler.clone());
+        self.feed_forward.set_profiler(profiler.clone());
+        self.profiler = Some(profiler);
     }
 
     fn projections(&self) -> Vec<&Projection> {
@@ -783,31 +826,42 @@ impl ZImageTransformerBlock {
             let gate_mlp = gate_mlp.tanh()?;
             let scale_msa = (scale_msa + 1.0)?;
             let scale_mlp = (scale_mlp + 1.0)?;
+            profile::mark(&self.profiler, "adaln");
 
             // Attention block
             let normed = self.attention_norm1.forward(x)?;
             let scaled = normed.broadcast_mul(&scale_msa)?;
+            profile::mark(&self.profiler, "attn.norm+scale");
             let attn_out = self.attention.forward(&scaled, attn_mask, cos, sin)?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
             let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
+            profile::mark(&self.profiler, "attn.gate+residual");
 
             // FFN block
             let normed = self.ffn_norm1.forward(&x)?;
             let scaled = normed.broadcast_mul(&scale_mlp)?;
+            profile::mark(&self.profiler, "ffn.norm+scale");
             let ffn_out = self.feed_forward.forward(&scaled)?;
             let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
-            x + gate_mlp.broadcast_mul(&ffn_out)?
+            let out = (x + gate_mlp.broadcast_mul(&ffn_out)?)?;
+            profile::mark(&self.profiler, "ffn.gate+residual");
+            Ok(out)
         } else {
             // Without modulation
             let normed = self.attention_norm1.forward(x)?;
+            profile::mark(&self.profiler, "attn.norm+scale");
             let attn_out = self.attention.forward(&normed, attn_mask, cos, sin)?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
             let x = (x + attn_out)?;
+            profile::mark(&self.profiler, "attn.gate+residual");
 
             let normed = self.ffn_norm1.forward(&x)?;
+            profile::mark(&self.profiler, "ffn.norm+scale");
             let ffn_out = self.feed_forward.forward(&normed)?;
             let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
-            x + ffn_out
+            let out = (x + ffn_out)?;
+            profile::mark(&self.profiler, "ffn.gate+residual");
+            Ok(out)
         }
     }
 }
@@ -1046,6 +1100,7 @@ pub struct ZImageTransformer2DModel {
     cfg: Config,
     /// What the load-time f16 range check over every projection found.
     weight_range: WeightRange,
+    profiler: Option<Arc<Profiler>>,
 }
 
 impl ZImageTransformer2DModel {
@@ -1160,6 +1215,7 @@ impl ZImageTransformer2DModel {
                 max_abs_tensor: String::new(),
                 total: 0,
             },
+            profiler: None,
         };
         model.weight_range = ensure_weights_fit_f16(model.projections(), device)?;
         Ok(model)
@@ -1188,6 +1244,21 @@ impl ZImageTransformer2DModel {
     /// What the load-time f16 range check found over every projection.
     pub fn weight_range(&self) -> &WeightRange {
         &self.weight_range
+    }
+
+    /// Time every stage of a forward into `profiler`, blocks included. Set
+    /// after construction rather than carried on `Config`, which is what the
+    /// checkpoint deserializes into and holds no run-time state.
+    pub fn set_profiler(&mut self, profiler: Arc<Profiler>) {
+        for block in self
+            .noise_refiner
+            .iter_mut()
+            .chain(&mut self.context_refiner)
+            .chain(&mut self.layers)
+        {
+            block.set_profiler(profiler.clone());
+        }
+        self.profiler = Some(profiler);
     }
 
     /// One denoising forward at batch 1.
@@ -1245,6 +1316,8 @@ impl ZImageTransformer2DModel {
             cap = Tensor::cat(&[&cap, &pad], 1)?;
         }
         let cap_len = text_len + cap_pad;
+        profile::set_phase(&self.profiler, "");
+        profile::mark(&self.profiler, "embed");
 
         // 4. Position ids: caption 1..=cap_len on axis 0; image at cap_len + 1
         let f_tokens = f / f_patch_size;
@@ -1286,21 +1359,30 @@ impl ZImageTransformer2DModel {
         let (x_cos, x_sin) = self.rope_embedder.forward(&x_pos_ids)?;
         let cap_pos_ids = create_coordinate_grid((cap_len, 1, 1), (1, 0, 0), device)?;
         let (cap_cos, cap_sin) = self.rope_embedder.forward(&cap_pos_ids)?;
+        profile::mark(&self.profiler, "rope.tables");
 
         // 5. Noise refiner (image, modulated)
+        // The refiner loops run the same block code as the main layers, so
+        // their stages are told apart by a phase prefix rather than by
+        // labels of their own.
+        profile::set_phase(&self.profiler, "noise_refiner.");
         for layer in &self.noise_refiner {
             x = layer.forward(&x, None, &x_cos, &x_sin, Some(&adaln_input))?;
         }
 
         // 6. Context refiner (caption, unmodulated)
+        profile::set_phase(&self.profiler, "context_refiner.");
         for layer in &self.context_refiner {
             cap = layer.forward(&cap, None, &cap_cos, &cap_sin, None)?;
         }
+        profile::set_phase(&self.profiler, "");
 
         // 7. Joint sequence: [image, caption]
         let mut unified = Tensor::cat(&[&x, &cap], 1)?; // (B, img_seq + cap_len, dim)
         let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
         let (unified_cos, unified_sin) = self.rope_embedder.forward(&unified_pos_ids)?;
+        // The joint concatenation is counted with the table lookups it feeds.
+        profile::mark(&self.profiler, "rope.tables");
 
         // 8. Main transformer layers
         for layer in &self.layers {
@@ -1316,13 +1398,15 @@ impl ZImageTransformer2DModel {
         // 9. Final layer on the image rows, then unpatchify
         let x_out = unified.narrow(1, 0, img_seq_len)?;
         let x_out = self.final_layer.forward(&x_out, &adaln_input)?;
-        unpatchify(
+        let out = unpatchify(
             &x_out,
             orig_size,
             patch_size,
             f_patch_size,
             self.cfg.in_channels,
-        )
+        )?;
+        profile::mark(&self.profiler, "final");
+        Ok(out)
     }
 
     /// The learned image pad row, for a caller building padded sequences.
