@@ -395,6 +395,36 @@ fn listed_models_with(served: &str, selectable: &dyn Fn(crate::hub::Model) -> bo
     ids
 }
 
+/// The context a prompt for `target` is admitted against.
+///
+/// NOT the server's own `max_ctx`, which is the SERVED checkpoint's trained
+/// context clamped by the configured `context_length` and is measured once at
+/// startup. A request naming another checkpoint runs on that one's cache, and
+/// the two disagree: `Qwen/Qwen3-4B` trains to 40960 where every other entry
+/// here trains to 262144. Judging every request by the served checkpoint's
+/// number is wrong in both directions, and both are live on a mixed server:
+///
+/// - too SMALL, and a 50k prompt to a cached Instruct-2507 on a Qwen3-4B server
+///   is a 400 for a conversation that checkpoint would have answered.
+/// - too LARGE, and an oversized base-model prompt on an Instruct server is
+///   admitted, streams a 200, and fails in the engine — after the client has
+///   already been told the request was accepted.
+///
+/// The served target keeps the startup measurement, which is authoritative for
+/// it: its file's own config was read, and for a custom checkpoint that is a
+/// fact about the file rather than about the checkpoint it runs as. Every other
+/// target is the registry's [`crate::hub::Model::trained_context`] under the
+/// same configured cap, which is exactly what `EngineState::load` will resolve
+/// when it loads that checkpoint.
+pub(crate) fn admission_context(state: &AppState, target: types::Target) -> usize {
+    if target == state.default_target {
+        return state.max_ctx;
+    }
+    state
+        .settings
+        .context_length
+        .min(target.model.trained_context())
+}
 /// The target a request runs on, with the name its response echoes — or the
 /// message for the 400 it gets instead.
 ///
@@ -1189,12 +1219,16 @@ pub(crate) fn submit(
         request.continuation.as_ref(),
     )
     .map_err(|e| SubmitError::Invalid(format!("rendering the prompt failed: {e:#}")))?;
-    if prompt.tokens.len() >= state.max_ctx {
+    // Against the CHECKPOINT THAT WILL ANSWER, not against the one this server
+    // was started on: see `admission_context`.
+    let max_ctx = admission_context(state, model);
+    if prompt.tokens.len() >= max_ctx {
         return Err(SubmitError::Invalid(format!(
-            "the prompt is {} tokens, which leaves no room to reply inside the server's \
-             {}-token context: shorten the conversation or raise context_length",
+            "the prompt is {} tokens, which leaves no room to reply inside {}'s \
+             {max_ctx}-token context: shorten the conversation, raise context_length, \
+             or send it to a checkpoint with a longer one",
             prompt.tokens.len(),
-            state.max_ctx
+            model.model.full_name(),
         )));
     }
 
@@ -2581,10 +2615,23 @@ mod tests {
         let (state, queue) = probe_state(4096);
         let qwen36 = types::Target::official(crate::hub::Model::Qwen35BA3B);
         let qwen3 = types::Target::official(crate::hub::Model::Qwen34B);
-        if state.vocab.for_target(qwen3).is_err() {
+        // Skips itself only when the checkpoint is not on this machine. Any OTHER
+        // failure to build that vocabulary — an unreadable file, a trie that will
+        // not size — is what this test is for, and skipping on it would hide
+        // exactly the breakage it exists to catch.
+        if crate::hub::cached_file(
+            crate::hub::Model::Qwen34B.repo(),
+            crate::hub::Model::Qwen34B.safetensors_tokenizer().unwrap(),
+        )
+        .is_none()
+        {
             eprintln!("skipping: no Qwen3 tokenizer in the Hugging Face cache");
             return;
         }
+        state
+            .vocab
+            .for_target(qwen3)
+            .expect("a cached Qwen3 tokenizer must build");
 
         // The submission handles are kept alive across the whole test: dropping
         // a `CancelGuard` cancels its job, and a cancelled job is gone from the
@@ -2707,10 +2754,23 @@ mod tests {
     fn a_qwen3_job_leaves_the_thinking_opener_to_the_model() {
         let (state, queue) = probe_state(4096);
         let qwen3 = types::Target::official(crate::hub::Model::Qwen34B);
-        if state.vocab.for_target(qwen3).is_err() {
+        // Skips itself only when the checkpoint is not on this machine. Any OTHER
+        // failure to build that vocabulary — an unreadable file, a trie that will
+        // not size — is what this test is for, and skipping on it would hide
+        // exactly the breakage it exists to catch.
+        if crate::hub::cached_file(
+            crate::hub::Model::Qwen34B.repo(),
+            crate::hub::Model::Qwen34B.safetensors_tokenizer().unwrap(),
+        )
+        .is_none()
+        {
             eprintln!("skipping: no Qwen3 tokenizer in the Hugging Face cache");
             return;
         }
+        state
+            .vocab
+            .for_target(qwen3)
+            .expect("a cached Qwen3 tokenizer must build");
 
         let submitted = |target: types::Target| {
             let handle = submit(
@@ -2751,6 +2811,95 @@ mod tests {
         let seeded = submitted(state.default_target);
         assert!(seeded.thinking_entry.starts_in_thinking());
         assert_ne!(seeded.thinking_entry, chat::ThinkingEntry::ModelOpens);
+    }
+    /// A prompt is admitted against the context of the CHECKPOINT THAT WILL
+    /// ANSWER, not against the one the server was started on.
+    ///
+    /// Both directions are live on a mixed server and both are bad in their own
+    /// way. Judging a long-context target by a short-context server is a 400 for
+    /// a conversation that checkpoint would have answered. Judging a
+    /// short-context target by a long-context server is worse: the request is
+    /// admitted, the client is told 200, the stream opens, and the engine's own
+    /// re-check fails it — after the point where a 400 was still possible.
+    #[test]
+    fn a_prompt_is_admitted_against_its_own_targets_context() {
+        let short = types::Target::official(crate::hub::Model::Qwen34B);
+        let long = types::Target::official(crate::hub::Model::Qwen34BInstruct2507);
+        assert_eq!(short.model.trained_context(), 40_960);
+        assert_eq!(long.model.trained_context(), 262_144);
+
+        // A server started on the SHORT checkpoint, configured for more context
+        // than that checkpoint has: its own bound is the clamp, and the long
+        // target's is its own trained context.
+        let (mut state, _queue) = probe_state(40_960);
+        {
+            let settings = Arc::make_mut(&mut state.settings);
+            settings.context_length = 262_144;
+        }
+        state.default_target = short;
+        assert_eq!(admission_context(&state, short), 40_960);
+        assert_eq!(
+            admission_context(&state, long),
+            262_144,
+            "a long-context target must not inherit the served checkpoint's clamp"
+        );
+
+        // The other way round: a server on the LONG checkpoint must not admit a
+        // prompt the short one cannot hold.
+        let (mut state, _queue) = probe_state(262_144);
+        {
+            let settings = Arc::make_mut(&mut state.settings);
+            settings.context_length = 262_144;
+        }
+        state.default_target = long;
+        assert_eq!(admission_context(&state, long), 262_144);
+        assert_eq!(
+            admission_context(&state, short),
+            40_960,
+            "a short-context target must not inherit the served checkpoint's reach"
+        );
+
+        // The configured cap still wins when it is the smaller number: it is an
+        // operator's ceiling on the cache, not a suggestion.
+        {
+            let settings = Arc::make_mut(&mut state.settings);
+            settings.context_length = 8_192;
+        }
+        assert_eq!(admission_context(&state, short), 8_192);
+        assert_eq!(
+            admission_context(&state, long),
+            262_144,
+            "the served target keeps its startup measurement"
+        );
+    }
+
+    /// And the refusal itself goes through `submit`, naming the checkpoint whose
+    /// context was too small rather than "the server's".
+    #[test]
+    fn an_oversized_prompt_names_the_checkpoint_that_refused_it() {
+        let (mut state, _queue) = probe_state(262_144);
+        state.default_target = types::Target::official(crate::hub::Model::Qwen3827B);
+        // Twelve tokens of prompt against a two-token context: the served
+        // target's own bound, which `probe_state` measured.
+        {
+            let settings = Arc::make_mut(&mut state.settings);
+            settings.context_length = 2;
+        }
+        state.max_ctx = 2;
+        match submit(
+            &state,
+            probe_request(16),
+            Dialect::Native,
+            false,
+            state.default_target,
+            ClientId::default(),
+        ) {
+            Err(SubmitError::Invalid(message)) => {
+                assert!(message.contains("Qwen3.8-27B"), "{message}");
+                assert!(message.contains("2-token context"), "{message}");
+            }
+            _ => panic!("a prompt past the context must not be admitted"),
+        }
     }
     /// The checks a request alone can fail are judged at submit, as a 400 in the
     /// handler's dialect; the engine never sees the job.

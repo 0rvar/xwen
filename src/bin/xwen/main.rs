@@ -57,9 +57,11 @@ struct ModelArgs {
     /// Which official checkpoint to run: Qwen3.8-Flash-Next (`flash-next`,
     /// the default on every surface, still EXPERIMENTAL and without a
     /// drafter), the dense Qwen3.6-27B, the Qwen3.6-35B-A3B MoE, or the dense
-    /// Qwen3.8-27B. The dense Qwen3-4B checkpoints — `qwen3-4b`,
-    /// `qwen3-4b-instruct-2507` and the encode-only `zimage-turbo` — are
-    /// registered but not runnable yet: their layer stack is not implemented.
+    /// Qwen3.8-27B, or the dense Qwen3-4B pair — `qwen3-4b` (hybrid thinking)
+    /// and `qwen3-4b-instruct-2507` (no thinking) — which run on every surface.
+    /// `zimage-turbo` is the Z-Image text encoder: `xwen encode-text` only, and
+    /// refused by generate, chat, serve and batch, because its weights are not a
+    /// working language model.
     /// Each checkpoint's full name works here too. A `--model` path (a GGUF, or
     /// a safetensors directory) overrides the target outright, and then the
     /// CHECKPOINT says which one it is: this flag is the cross-check (it must

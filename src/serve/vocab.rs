@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -82,18 +82,35 @@ impl std::fmt::Debug for Vocabulary {
 /// Every vocabulary this server may need, built on first use and kept.
 ///
 /// Cheap to clone into `AppState` (it is held behind an `Arc` there) and safe
-/// to share: the map is behind a mutex held only across a lookup or an insert,
-/// never across the ~150 ms build. Two requests for an unbuilt family can
-/// therefore both build one; the first to finish wins and the other's is
-/// dropped, which costs one wasted build in a race and buys never blocking a
-/// request for one family on a build for the other.
+/// to share, and each family is built EXACTLY ONCE however many requests want
+/// it at once.
+///
+/// Two locks doing two jobs. The outer mutex guards the map and is held only
+/// long enough to hand back a family's cell — never across a build, so a
+/// request for one family never waits on a build for the other. The cell is a
+/// `OnceLock`, so the first caller into an empty one builds and the rest block
+/// on it and take its result: no duplicated ~150 ms trie, and no window in
+/// which two `Arc<Vocabulary>` exist for one family.
+///
+/// The build is synchronous on whatever thread asks, which on the HTTP path is
+/// a Tokio worker. That is deliberate rather than `spawn_blocking`: every
+/// family this server can reach is built at startup by [`Vocabularies::warm`],
+/// so a request reaching a cold cell means a `tokenizer.json` appeared on disk
+/// after the server started. Making the request path async to move a build
+/// that should never happen off the worker would put an await point in
+/// `submit`, which is sync all the way down.
 pub struct Vocabularies {
     /// The tokenizer to prefer for the SERVED file's own family, when that file
     /// carries one. A server started on a safetensors directory is running that
     /// directory's tokenizer, not whatever copy of the same family happens to
     /// be in the hub cache — and possibly when no copy is.
     served: Option<(VocabFamily, PathBuf)>,
-    built: Mutex<HashMap<VocabFamily, Arc<Vocabulary>>>,
+    /// One cell per family, created empty on first ask and filled once. The
+    /// `String` is a rendered error: a `OnceLock` has to hold a `Clone`-able
+    /// value, and a failed build is worth caching too — a family with no
+    /// tokenizer on disk will not grow one mid-request, and rebuilding to fail
+    /// again on every request would be the cost without the information.
+    built: Mutex<HashMap<VocabFamily, Arc<OnceLock<Result<Arc<Vocabulary>, String>>>>>,
 }
 
 impl Vocabularies {
@@ -127,40 +144,63 @@ impl Vocabularies {
         self.for_family(target.model.vocab_family())
     }
 
-    /// The vocabulary for one family, built on first use.
+    /// The vocabulary for one family, built on first use and once.
     pub fn for_family(&self, family: VocabFamily) -> Result<Arc<Vocabulary>> {
-        if let Some(built) = self.cached(family) {
-            return Ok(built);
+        // The map lock is released before the build: it only hands back the
+        // cell. Two callers for two families never meet; two for one family
+        // meet inside the cell, where exactly one of them builds.
+        let cell = Arc::clone(self.lock().entry(family).or_default());
+        match cell.get_or_init(|| {
+            self.build(family)
+                .map(Arc::new)
+                .map_err(|error| format!("{error:#}"))
+        }) {
+            Ok(vocabulary) => Ok(Arc::clone(vocabulary)),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
         }
-        let built = Arc::new(self.build(family)?);
-        let mut map = self.lock();
-        // Whoever got here first wins, so every caller sees one object per
-        // family even when two of them built one.
-        Ok(Arc::clone(map.entry(family).or_insert(built)))
     }
 
     /// Build every family this server can reach, now rather than on the request
     /// that needs it.
     ///
-    /// Startup preflight: a missing or unreadable `tokenizer.json` for the
-    /// SERVED checkpoint is a configuration mistake, and the first request is
-    /// far too late to learn it — it would fail that request, and every retry
-    /// after it, forever. Only the served family is required; the other is
-    /// warmed if it can be and left alone if it cannot, because it depends on
-    /// what the hub cache holds and a server is allowed to run without it.
+    /// The SERVED checkpoint's is required: a missing or unreadable
+    /// `tokenizer.json` there is a configuration mistake, and the first request
+    /// is far too late to learn it — it would fail that request, and every retry
+    /// after it, forever.
+    ///
+    /// Every OTHER family is best-effort, and warming them is what keeps the
+    /// ~150 ms build off the request path entirely. A family whose tokenizer is
+    /// not on this machine simply has none to build, which is not a reason to
+    /// refuse to start: nothing on that family is selectable either
+    /// (`checkpoint_selectable` wants the weights cached too), so the operator
+    /// has lost nothing they had.
     pub fn warm(&self, served: Target) -> Result<()> {
         let family = served.model.vocab_family();
         self.for_family(family).with_context(|| {
             format!("loading the vocabulary {} speaks", served.model.full_name())
         })?;
+        for other in [VocabFamily::Qwen36, VocabFamily::Qwen3] {
+            if other != family {
+                let _ = self.for_family(other);
+            }
+        }
         Ok(())
     }
 
-    fn cached(&self, family: VocabFamily) -> Option<Arc<Vocabulary>> {
-        self.lock().get(&family).map(Arc::clone)
+    /// Whether this family has already been built — for the tests, and for a
+    /// caller that wants to know whether asking would be free.
+    pub fn is_built(&self, family: VocabFamily) -> bool {
+        self.lock()
+            .get(&family)
+            .is_some_and(|cell| cell.get().is_some_and(Result::is_ok))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<VocabFamily, Arc<Vocabulary>>> {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        HashMap<VocabFamily, Arc<OnceLock<Result<Arc<Vocabulary>, String>>>>,
+    > {
         // A poisoned mutex here means a previous caller panicked while holding
         // a map of `Arc`s, which cannot leave a torn value: take it back rather
         // than making every later request fail for something already survived.
@@ -235,7 +275,10 @@ impl std::fmt::Debug for Vocabularies {
             .field("served", &self.served)
             .field(
                 "built",
-                &self.lock().keys().copied().collect::<Vec<VocabFamily>>(),
+                &[VocabFamily::Qwen36, VocabFamily::Qwen3]
+                    .into_iter()
+                    .filter(|family| self.is_built(*family))
+                    .collect::<Vec<VocabFamily>>(),
             )
             .finish()
     }
@@ -269,6 +312,10 @@ mod tests {
     /// The Qwen3 family needs a `tokenizer.json` on this machine; the tests that
     /// exercise two families skip themselves without one, because what they are
     /// about is the SWITCH and a machine with one checkpoint cannot show it.
+    ///
+    /// Absence is the ONLY thing this reports. A file that is present and does
+    /// not build is the breakage these tests exist to catch, and it has to fail
+    /// them rather than skip them.
     fn qwen3_available() -> bool {
         Vocabularies::hub_only()
             .tokenizer_source(VocabFamily::Qwen3)

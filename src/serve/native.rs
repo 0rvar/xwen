@@ -290,8 +290,15 @@ pub(crate) fn prepare(
         )));
     }
     // Absent fields follow the operator's server policy, like the compat
-    // dialects; explicit fields override it.
-    let enable_thinking = request.thinking.unwrap_or(settings.thinking_force);
+    // dialects; explicit fields override it — and then the DIALECT has the last
+    // word, because a template with no reasoning mode renders none whatever the
+    // resolved value says. `chat.rs` applies the same `&& supports_thinking()`
+    // when it renders, so anything downstream that reasons about the thinking
+    // span has to use the effective mode or it will describe a block that will
+    // not exist: `resolve_continuation` below refuses a response prefix as
+    // "inside an open reasoning block" on a checkpoint that never opens one.
+    let enable_thinking = request.thinking.unwrap_or(settings.thinking_force)
+        && target.model.chat_dialect().supports_thinking();
     // The field is the raw template parameter, and only the 3.8 template takes
     // one: this API refuses fields it would ignore, the same rule the OpenAI
     // dialect's effort kwarg and the CLI's --reasoning-effort follow. The
@@ -620,6 +627,47 @@ mod tests {
     /// The default test target: the checkpoint whose template takes every
     /// field this API exposes, so a test is about the field it names rather
     /// than about the dialect refusal. The refusal test passes a 3.6 target.
+    /// A response prefix is renderable on a checkpoint whose template has no
+    /// reasoning mode.
+    ///
+    /// The resolved thinking mode is not the effective one: a server-wide
+    /// `thinking_force` (which `settings()` sets) survives the request's silence,
+    /// and `resolve_continuation` used to read it and refuse the prefix as
+    /// "inside an open reasoning block" — a block Instruct-2507 never opens. The
+    /// mode has to be ANDed with the dialect before anything reasons about the
+    /// thinking span, which is what `chat.rs` does when it renders.
+    #[test]
+    fn a_response_prefix_is_renderable_on_a_template_without_thinking() {
+        let instruct =
+            crate::serve::types::Target::official(crate::hub::Model::Qwen34BInstruct2507);
+        let body = r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}],
+                      "continue":{"prefix":"{\"city\":"}}"#;
+        let prepared = prepare(
+            parse(body),
+            &settings(),
+            instruct,
+            &crate::serve::testutil::vocab(),
+        )
+        .unwrap_or_else(|e| panic!("a prefix needs no open thinking span here: {}", message(&e)));
+        assert!(
+            !prepared.job.enable_thinking,
+            "the dialect has no thinking mode"
+        );
+        assert_eq!(continuation(&prepared).2, Some("{\"city\":"));
+
+        // The 3.6 family is unchanged: there the span really is open, and a
+        // prefix without `close_thinking` is still refused.
+        let error = prepare(
+            parse(body),
+            &settings(),
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .err()
+        .expect("a prefix inside an open thinking span is unrenderable");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
     /// See the OpenAI dialect's copy. This API's spelling is a bare `thinking`
     /// bool, and `false` is not asking.
     #[test]

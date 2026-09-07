@@ -621,6 +621,37 @@ impl Model {
             .find(|model| model.safetensors_rope_theta() == Some(theta))
     }
 
+    /// The context length this checkpoint was converted with — its
+    /// `<arch>.context_length` in a GGUF, its `max_position_embeddings` in a
+    /// safetensors `config.json`.
+    ///
+    /// A registry constant for the same reason [`CacheGeometry`] is: it is
+    /// asked BEFORE the checkpoint is open, and on the request path. A server
+    /// admits a prompt against the context of the checkpoint that will answer
+    /// it, which is not always the one it was started on — and re-reading a
+    /// config per request is a metadata read for a GGUF and an eight-gigabyte
+    /// scan for a safetensors set.
+    ///
+    /// 262144 on every checkpoint here but two: `Qwen/Qwen3-4B` trains to 40960
+    /// and the Z-Image encoder is its byte-identical config. That gap is the
+    /// whole reason this exists — a 50k prompt is servable by one Qwen3 release
+    /// and not by the other.
+    ///
+    /// Authoritative only for the OFFICIAL file. A served checkpoint's own
+    /// config is read at startup and that measurement wins for it, because a
+    /// custom file's context is a fact about the file rather than about the
+    /// checkpoint it runs as.
+    pub const fn trained_context(self) -> usize {
+        match self {
+            Model::Qwen27B
+            | Model::Qwen35BA3B
+            | Model::Qwen3827B
+            | Model::Qwen38FlashNext
+            | Model::Qwen34BInstruct2507 => 262_144,
+            Model::Qwen34B | Model::ZImageTurboEncoder => 40_960,
+        }
+    }
+
     /// Which tokenizer vocabulary this checkpoint speaks.
     ///
     /// A checkpoint's ids only mean anything inside its own family: the Qwen 3.6

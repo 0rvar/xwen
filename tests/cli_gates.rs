@@ -111,33 +111,117 @@ fn batch_refuses_an_unrunnable_checkpoint_named_in_its_payload() {
     }
 }
 
-/// A checkpoint this build CAN run gets past the gate — so the tests above are
-/// measuring the gate and not some earlier failure common to every invocation.
+/// Run a command against an EMPTY hub cache and an endpoint that refuses
+/// connections, and return its output.
 ///
-/// Stops at the first thing after the gate that needs the machine, which is the
-/// checkpoint file itself: the message names the cache or the file, never the
-/// refusal.
-#[test]
-fn a_runnable_checkpoint_gets_past_the_gate() {
-    let config = empty_config("runnable");
-    let out = xwen()
-        .args(["serve", "--config"])
-        .arg(&config)
-        .args(["--model-size", "35b", "--port", "0"])
-        // A directory with no cache in it, so the run cannot find a checkpoint
-        // and cannot download one either: it gets past the gate and stops at
-        // the fetch, which is the ordering this asserts.
+/// Everything past the servable gate then stops at the same place: the run
+/// resolves its checkpoint, finds nothing cached, announces the download and
+/// fails to reach the hub. That announcement is the positive evidence the gate
+/// was passed — an assertion that the refusal is merely ABSENT would be
+/// satisfied by a run that died of a typo in its arguments.
+fn past_the_gate(args: &[&str], stdin: Option<&str>) -> (String, String, bool) {
+    let mut cmd = xwen();
+    cmd.args(args)
         .env(
             "HF_HUB_CACHE",
             std::env::temp_dir().join("xwen-gates-empty-cache"),
         )
-        .env("HF_ENDPOINT", "http://127.0.0.1:1")
-        .output()
-        .expect("running xwen serve");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+        .env("HF_ENDPOINT", "http://127.0.0.1:1");
+    let out = match stdin {
+        None => cmd.output().expect("running xwen"),
+        Some(payload) => {
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("running xwen");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            child.wait_with_output().expect("waiting for xwen")
+        }
+    };
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// What a run that got past the gate and stopped at the empty cache looks like.
+fn assert_reached_the_fetch(what: &str, repo: &str, stdout: &str, stderr: &str, ok: bool) {
+    let both = format!("{stderr}{stdout}");
     assert!(
-        !stderr.contains("cannot be run"),
-        "a servable checkpoint must not be refused by the gate: {stderr}"
+        !ok,
+        "{what}: an empty cache cannot produce a successful run"
+    );
+    assert!(
+        !both.contains("cannot be run"),
+        "{what} must not be refused by the gate: {both}"
+    );
+    assert!(
+        both.contains("is not in the Hugging Face cache"),
+        "{what} must reach the download notice: {both}"
+    );
+    assert!(
+        both.contains(repo),
+        "{what} must name the repo it tried to fetch: {both}"
+    );
+    assert!(
+        both.contains("fetching"),
+        "{what} must fail at the fetch, which is the next thing after the gate: {both}"
+    );
+}
+/// A checkpoint this build CAN run gets past the gate — so the tests above are
+/// measuring the gate and not some earlier failure common to every invocation.
+///
+/// Stops at the first thing after the gate that needs the machine — the
+/// checkpoint file itself — and SAYS so: the download notice naming the repo
+/// is what proves the gate was reached and passed rather than that the run
+/// fell over somewhere earlier for a reason of its own.
+///
+/// Both cache-moving surfaces, because both apply the gate and the two resolve
+/// their checkpoint by different routes: serve from `--model-size`, batch from
+/// the payload.
+#[test]
+fn a_runnable_checkpoint_gets_past_the_gate() {
+    let config = empty_config("runnable");
+    let (stdout, stderr, ok) = past_the_gate(
+        &[
+            "serve",
+            "--config",
+            config.to_str().unwrap(),
+            "--model-size",
+            "35b",
+            "--port",
+            "0",
+        ],
+        None,
+    );
+    assert_reached_the_fetch(
+        "serve --model-size 35b",
+        "ggml-org/Qwen3.6-35B-A3B-GGUF",
+        &stdout,
+        &stderr,
+        ok,
+    );
+
+    let (stdout, stderr, ok) = past_the_gate(
+        &["batch"],
+        Some(
+            r#"{"model":"Qwen3.6-35B-A3B","items":[{"id":"a","messages":[{"role":"user","content":"hi"}]}]}"#,
+        ),
+    );
+    assert_reached_the_fetch(
+        "batch on Qwen3.6-35B-A3B",
+        "ggml-org/Qwen3.6-35B-A3B-GGUF",
+        &stdout,
+        &stderr,
+        ok,
     );
     std::fs::remove_file(&config).unwrap();
 }
@@ -153,23 +237,33 @@ fn a_runnable_checkpoint_gets_past_the_gate() {
 #[test]
 fn the_qwen3_language_models_are_no_longer_refused_at_startup() {
     let config = empty_config("qwen3_runs");
-    for alias in ["qwen3-4b", "qwen3-4b-instruct-2507"] {
-        let out = xwen()
-            .args(["serve", "--config"])
-            .arg(&config)
-            .args(["--model-size", alias, "--port", "0"])
-            .env(
-                "HF_HUB_CACHE",
-                std::env::temp_dir().join("xwen-gates-empty-cache"),
-            )
-            .env("HF_ENDPOINT", "http://127.0.0.1:1")
-            .output()
-            .expect("running xwen serve");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !stderr.contains("cannot be run"),
-            "{alias} must not be refused by the gate: {stderr}"
+    for (alias, repo, name) in [
+        ("qwen3-4b", "Qwen/Qwen3-4B", "Qwen3-4B"),
+        (
+            "qwen3-4b-instruct-2507",
+            "Qwen/Qwen3-4B-Instruct-2507",
+            "Qwen3-4B-Instruct-2507",
+        ),
+    ] {
+        let (stdout, stderr, ok) = past_the_gate(
+            &[
+                "serve",
+                "--config",
+                config.to_str().unwrap(),
+                "--model-size",
+                alias,
+                "--port",
+                "0",
+            ],
+            None,
         );
+        assert_reached_the_fetch(alias, repo, &stdout, &stderr, ok);
+
+        let payload = format!(
+            r#"{{"model":"{name}","items":[{{"id":"a","messages":[{{"role":"user","content":"hi"}}]}}]}}"#
+        );
+        let (stdout, stderr, ok) = past_the_gate(&["batch"], Some(&payload));
+        assert_reached_the_fetch(name, repo, &stdout, &stderr, ok);
     }
     std::fs::remove_file(&config).unwrap();
 }

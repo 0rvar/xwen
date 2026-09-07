@@ -543,6 +543,30 @@ pub(crate) fn normalize(
 
 /// Resolve the thinking mode. A request that states one wins; a request that
 /// says nothing gets the server's configured default.
+/// See `super::thinking_unsupported_message`: an explicit thinking block asking
+/// a template with no reasoning mode to reason is refused rather than dropped.
+/// A `disabled` block is not asking, so it passes.
+///
+/// Shared by `prepare` and `counted_tokens` so the two cannot drift: an
+/// endpoint that counts a prompt the generation endpoint would refuse is
+/// answering a question about a request the client cannot make.
+fn check_thinking_supported(
+    request: &MessagesRequest,
+    target: crate::serve::types::Target,
+) -> Result<(), ApiError> {
+    if !target.model.chat_dialect().supports_thinking()
+        && request
+            .thinking
+            .as_ref()
+            .is_some_and(|param| param.kind != "disabled")
+    {
+        return Err(bad_request(super::thinking_unsupported_message(
+            target, "thinking",
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_thinking(
     param: Option<&ThinkingParam>,
     settings: &ServeSettings,
@@ -776,19 +800,7 @@ pub(crate) fn prepare(
         return Err(bad_request("max_tokens must be at least 1"));
     }
 
-    // See thinking_unsupported_message: an explicit thinking block asking a
-    // template with no reasoning mode to reason is refused rather than dropped.
-    // A "disabled" block is not asking, so it passes.
-    if !target.model.chat_dialect().supports_thinking()
-        && request
-            .thinking
-            .as_ref()
-            .is_some_and(|param| param.kind != "disabled")
-    {
-        return Err(bad_request(super::thinking_unsupported_message(
-            target, "thinking",
-        )));
-    }
+    check_thinking_supported(&request, target)?;
     let messages = normalize(&request, settings.tools_mode)?;
     let (enable_thinking, max_think) =
         resolve_thinking(request.thinking.as_ref(), settings, Some(max_tokens))?;
@@ -1245,6 +1257,10 @@ pub(crate) async fn messages(
 /// — a tool list is often the larger half of a harness's prompt, and a count
 /// that omitted it would be wrong by exactly the part the caller is asking
 /// about.
+///
+/// The same REFUSALS, too. A request this endpoint accepted and `/v1/messages`
+/// would 400 is worse than useless: it answers a count for a prompt the client
+/// can never send, and the client learns that only when it sends it.
 fn counted_tokens(
     request: &MessagesRequest,
     settings: &ServeSettings,
@@ -1255,6 +1271,7 @@ fn counted_tokens(
     if request.messages.is_empty() {
         return Err(bad_request(EMPTY_MESSAGES));
     }
+    check_thinking_supported(request, target)?;
     let messages = normalize(request, settings.tools_mode)?;
     // `max_tokens` is not required here, so the budget is left unclamped: it
     // caps the thinking span, which does not change the prompt being counted.
@@ -1319,6 +1336,44 @@ mod tests {
 
     fn parse(body: &str) -> MessagesRequest {
         serde_json::from_str(body).expect("request parses")
+    }
+
+    /// `count_tokens` refuses exactly what `/v1/messages` refuses.
+    ///
+    /// An endpoint that counted a prompt the generation endpoint would reject is
+    /// worse than useless: it answers a number for a request the client can
+    /// never send, and the client finds out only when it sends it.
+    #[test]
+    fn counting_refuses_what_generating_refuses() {
+        let instruct =
+            crate::serve::types::Target::official(crate::hub::Model::Qwen34BInstruct2507);
+        let body = r#"{"thinking":{"type":"enabled","budget_tokens":64},
+                      "messages":[{"role":"user","content":"Hi"}]}"#;
+        let tokenizer = crate::serve::testutil::vocab();
+        let error = counted_tokens(&parse(body), &settings(), tokenizer.tokenizer(), instruct)
+            .err()
+            .expect("counting must refuse a thinking block the template has no mode for");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            message(&error).contains("no reasoning mode"),
+            "{}",
+            message(&error)
+        );
+
+        // `max_tokens` stays optional for counting — it caps the thinking span,
+        // which does not change the prompt being counted — so a request with no
+        // cap and no thinking block still counts.
+        let counted = counted_tokens(
+            &parse(r#"{"messages":[{"role":"user","content":"Hi"}]}"#),
+            &settings(),
+            tokenizer.tokenizer(),
+            instruct,
+        )
+        .expect("counting needs no max_tokens");
+        assert!(counted > 0);
+
+        // And a checkpoint that DOES reason counts a thinking request as before.
+        assert!(counted_tokens(&parse(body), &settings(), tokenizer.tokenizer(), target()).is_ok());
     }
 
     /// See the OpenAI dialect's copy: a template with no reasoning mode refuses
