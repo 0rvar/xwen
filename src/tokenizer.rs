@@ -23,7 +23,7 @@
 //! instead.
 
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow, bail};
@@ -189,6 +189,15 @@ pub struct LagunaTokenizer {
     /// canonical opener of any non-ASCII option value. Built once per
     /// tokenizer on first use.
     decoded: OnceLock<Vec<Vec<u8>>>,
+    /// The `tokenizer.json` this was parsed from, or `None` for the copy
+    /// compiled into the binary.
+    ///
+    /// Kept because a token trie has to be built over the SAME file — a trie
+    /// is a second view of one vocabulary, and two views that came from
+    /// different files agree about nothing. Anything that needs one asks
+    /// [`crate::constrain::for_tokenizer`] rather than being handed a path
+    /// separately and hoping it matches.
+    source: Option<PathBuf>,
 }
 
 impl LagunaTokenizer {
@@ -254,11 +263,15 @@ impl LagunaTokenizer {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(path.as_ref())
             .map_err(|e| anyhow!("failed to load tokenizer from {:?}: {e}", path.as_ref()))?;
-        Self::from_inner(inner)
+        Self::from_inner_at(inner, Some(path.as_ref().to_path_buf()))
             .map_err(|e| e.context(format!("tokenizer {:?}", path.as_ref().display())))
     }
 
     fn from_inner(inner: tokenizers::Tokenizer) -> Result<Self> {
+        Self::from_inner_at(inner, None)
+    }
+
+    fn from_inner_at(inner: tokenizers::Tokenizer, source: Option<PathBuf>) -> Result<Self> {
         let vocab = inner.get_added_vocabulary().get_vocab();
         let specials = Specials::resolve(|text| vocab.get(text).copied())?;
         let mut markers: Vec<(String, u32)> =
@@ -279,7 +292,14 @@ impl LagunaTokenizer {
             marker_first_bytes,
             plain: OnceLock::new(),
             decoded: OnceLock::new(),
+            source,
         })
+    }
+
+    /// The `tokenizer.json` this vocabulary was read from, or `None` for the
+    /// embedded one. See the field.
+    pub fn source(&self) -> Option<&Path> {
+        self.source.as_deref()
     }
 
     /// This vocabulary's structural marker ids. Anything that recognizes a

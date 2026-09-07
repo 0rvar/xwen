@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use candle_core::Device;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -34,7 +34,7 @@ use crate::kv_cache::{HostFullKv, HostSnapshot};
 use crate::mtp::{MtpConfig, MtpDrafter};
 use crate::ops::ExpertRunner;
 use crate::sampler::SamplerOptions;
-use crate::tokenizer::{LagunaTokenizer, Specials};
+use crate::tokenizer::Specials;
 
 /// How much prefill a mid-prefill snapshot has to save before it is worth taking.
 ///
@@ -216,17 +216,25 @@ pub fn read_startup_config(settings: &ServeSettings) -> Result<XwenConfig> {
 }
 
 /// Cheap startup validation: judges the already-parsed metadata (no tensor data, no
-/// Metal allocation) and loads the tokenizer. Fails fast so a bad model path or config
-/// is caught at startup rather than on the first request. Returns the tokenizer the
-/// HTTP layer renders prompts with — the same vocabulary the engine decodes with (every
-/// checkpoint shares it) — and the resolved context length its "does the prompt fit"
-/// check applies.
+/// Metal allocation) and loads the served checkpoint's vocabulary. Fails fast so a
+/// bad model path, an unreadable tokenizer or a config mistake is caught at startup
+/// rather than on the first request.
+///
+/// Returns the vocabularies the HTTP layer renders and masks with — one per
+/// family, resolved per request from its target, because the registry now holds
+/// two vocabularies and a served request may name either — and the resolved
+/// context length its "does the prompt fit" check applies.
+///
+/// Only the SERVED checkpoint's vocabulary is built here. The other family's is
+/// built on the first request that names it: it depends on what the hub cache
+/// holds, and a server whose clients only ever use the served checkpoint should
+/// neither pay for it nor refuse to start without it.
 pub fn validate_model(
     settings: &ServeSettings,
     cfg: &XwenConfig,
     served: Target,
     logger: &ServeLogger,
-) -> Result<(Arc<LagunaTokenizer>, usize)> {
+) -> Result<(Arc<super::vocab::Vocabularies>, usize)> {
     let (max_ctx, warning) = resolve_context_length(settings.context_length, cfg.n_ctx_train)?;
     if let Some(warning) = warning {
         logger.log(warning);
@@ -242,11 +250,22 @@ pub fn validate_model(
     // sidecar, and if the file's geometry differs at all, every request fails at
     // attach. Any OTHER checkpoint's sidecar cannot be judged here — it may not even
     // be downloaded yet — and is checked when that checkpoint attaches it.
+    // Asked for by name, against a target whose graph has no verify seam: the
+    // answer is the same one `xwen generate --draft` gives, and it is worth more
+    // than the sidecar's own "does this fit" complaint, which would describe a
+    // mismatch rather than the reason there can never be a match.
+    if matches!(settings.draft, DraftMode::Custom(_) | DraftMode::Official)
+        && !served.model.supports_drafting()
+    {
+        bail!("{}", served.model.no_drafting_message());
+    }
     if let Some(path) = startup_drafter(settings, served) {
         read_draft_config(&path, cfg)
             .with_context(|| format!("validating the drafter {}", path.display()))?;
     }
-    Ok((Arc::new(load_tokenizer()?), max_ctx))
+    let vocabularies = Arc::new(super::vocab::Vocabularies::new(&settings.model, served));
+    vocabularies.warm(served)?;
+    Ok((vocabularies, max_ctx))
 }
 
 /// Which drafter startup can judge, or `None` when none can be.
@@ -349,10 +368,6 @@ fn read_draft_config(path: &Path, target: &XwenConfig) -> Result<DrafterKind> {
     Ok(kind)
 }
 
-fn load_tokenizer() -> Result<LagunaTokenizer> {
-    LagunaTokenizer::embedded().context("loading the tokenizer embedded in the binary")
-}
-
 /// The context length to allocate the KV cache for: what the config asks for, capped at
 /// what the checkpoint was converted with. Going past the trained context needs a rope
 /// override at load, which this server does not do, so a larger request is trimmed rather
@@ -441,7 +456,15 @@ fn checkpoint_paths(
     };
     let draft = match &settings.draft {
         DraftMode::Off => None,
-        DraftMode::Custom(path) if local => Some(path.clone()),
+        DraftMode::Custom(path) if local => {
+            // A sidecar cannot be attached to a graph with no speculative verify
+            // seam, whoever's sidecar it is. Refused where the operator wrote it
+            // rather than fetched, opened, classified and rejected inside the
+            // first request, where the error would read as a geometry mismatch
+            // instead of as the fact that this target cannot be drafted for.
+            ensure!(size.supports_drafting(), "{}", size.no_drafting_message());
+            Some(path.clone())
+        }
         // Nothing in the config asked, and this checkpoint ships a sidecar it
         // does not attach unasked (the 35B-A3B since 2026-09-06). Said out
         // loud, because a drafter that is present and unused otherwise reads as
@@ -4492,6 +4515,7 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::LagunaTokenizer;
 
     fn cache(capacity: usize) -> PrefixCache<usize> {
         PrefixCache::new(capacity)

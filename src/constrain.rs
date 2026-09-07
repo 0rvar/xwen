@@ -48,7 +48,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use llguidance::api::TopLevelGrammar;
 use llguidance::{Matcher, ParserFactory};
 use toktrie::{SimpleVob, TokEnv};
@@ -63,24 +63,65 @@ pub struct ConstraintFactory {
     factory: Arc<ParserFactory>,
 }
 
-/// The process-wide factory over the embedded vocabulary, built on first use
-/// (~150 ms) and kept for the life of the process. The server always runs the
-/// embedded tokenizer (`serve/engine.rs::load_tokenizer`), so this is always
-/// the right trie for a served request.
+/// The process-wide factory over the EMBEDDED vocabulary, built on first use
+/// (~150 ms) and kept for the life of the process.
 ///
-/// A trie is tied to one vocabulary: its token bytes, its stop ids and its
-/// mask width all come from the file it was built over. A checkpoint on a
-/// different vocabulary needs its own factory, built through
-/// [`ConstraintFactory::new`] over that checkpoint's `tokenizer.json` and its
-/// own logit width, and cannot borrow this one.
-pub fn shared() -> Result<&'static ConstraintFactory> {
-    static SHARED: OnceLock<std::result::Result<ConstraintFactory, String>> = OnceLock::new();
-    match SHARED.get_or_init(|| ConstraintFactory::embedded().map_err(|e| format!("{e:#}"))) {
-        Ok(factory) => Ok(factory),
+/// A trie is tied to one vocabulary: its token bytes, its stop ids and its mask
+/// width all come from the file it was built over. This one is therefore right
+/// for the Qwen 3.6 family and for nothing else, which is why nothing calls it
+/// directly any more — [`for_tokenizer`] is the seam, and it reaches this only
+/// when the tokenizer in hand really is the embedded one. A server holding two
+/// vocabularies resolves through [`crate::serve::vocab::Vocabularies`], which
+/// is keyed by family for the same reason.
+pub fn shared() -> Result<Arc<ConstraintFactory>> {
+    static SHARED: OnceLock<std::result::Result<Arc<ConstraintFactory>, String>> = OnceLock::new();
+    match SHARED.get_or_init(|| {
+        ConstraintFactory::embedded()
+            .map(Arc::new)
+            .map_err(|e| format!("{e:#}"))
+    }) {
+        Ok(factory) => Ok(Arc::clone(factory)),
         Err(e) => Err(anyhow!(
             "constrain: the shared factory failed to build: {e}"
         )),
     }
+}
+
+/// The trie a run using `tokenizer` compiles its schemas against, sized to
+/// `logit_width`.
+///
+/// THE constructor for anything holding a tokenizer, because it cannot pick the
+/// wrong file: the trie is built over the very `tokenizer.json` that tokenizer
+/// was parsed from ([`LagunaTokenizer::source`]), and the stop ids come from
+/// that same vocabulary's own specials rather than from a constant. A trie and
+/// a tokenizer that came from different files agree about nothing — a mask
+/// index would mean one token to one and another to the other — and there is no
+/// symptom short of wrong output.
+///
+/// The embedded vocabulary answers from the process-shared factory, so a server
+/// or a batch run on a Qwen 3.6 checkpoint pays the ~150 ms build once, as it
+/// always did. Every other vocabulary is built here, and there is no fallback
+/// to the embedded one: a tokenizer with no source that is not the embedded
+/// vocabulary is a case this cannot serve, and it says so rather than returning
+/// a trie for someone else's ids.
+pub fn for_tokenizer(
+    tokenizer: &LagunaTokenizer,
+    logit_width: usize,
+) -> Result<Arc<ConstraintFactory>> {
+    let Some(path) = tokenizer.source() else {
+        ensure!(
+            logit_width == LagunaTokenizer::PADDED_VOCAB,
+            "constrain: this tokenizer is the embedded {}-wide vocabulary, but a \
+             {logit_width}-wide mask was asked for",
+            LagunaTokenizer::PADDED_VOCAB
+        );
+        return shared();
+    };
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading {} to build a grammar trie", path.display()))?;
+    let factory = ConstraintFactory::new(&bytes, &tokenizer.specials().eog(), logit_width)
+        .with_context(|| format!("building the grammar trie over {}", path.display()))?;
+    Ok(Arc::new(factory))
 }
 
 impl ConstraintFactory {

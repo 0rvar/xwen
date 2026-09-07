@@ -88,12 +88,37 @@ pub enum Model {
 /// Which tokenizer vocabulary a checkpoint speaks — see
 /// [`Model::vocab_family`]. Two families ship here, and nothing about one
 /// transfers to the other: not the ids, not the width, not the specials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VocabFamily {
     /// Qwen 3.6/3.8 — 248320 ids padded, real tokens to 248076.
     Qwen36,
     /// Qwen3 — 151936 ids padded, real tokens to 151668.
     Qwen3,
+}
+
+impl VocabFamily {
+    /// The LOGIT width of every checkpoint in this family — the number of
+    /// columns its output layer produces, which is what a constrained-decoding
+    /// mask has to be exactly as wide as.
+    ///
+    /// Not the tokenizer's id count, which is smaller on both families
+    /// (248320 against 248076, 151936 against 151669): the tail is padding, and
+    /// the mask is indexed by logit. A mask sized to the tokenizer would
+    /// silently ban every id past its end, which the sampler refuses.
+    ///
+    /// A registry constant rather than a value read from a checkpoint, for the
+    /// same reason [`CacheGeometry`] is: this is asked before any file is open —
+    /// the grammar trie for a family is built once, off the family's own
+    /// `tokenizer.json`, and no checkpoint need be resident to answer a
+    /// request that names one.
+    pub const fn logit_width(self) -> usize {
+        match self {
+            VocabFamily::Qwen36 => crate::tokenizer::LagunaTokenizer::PADDED_VOCAB,
+            // `vocab_size` in every Qwen3-4B `config.json`, and the first
+            // dimension of `model.embed_tokens.weight` in every shard set.
+            VocabFamily::Qwen3 => 151_936,
+        }
+    }
 }
 
 /// Every checkpoint this build knows, in the order surfaces that enumerate them
@@ -780,8 +805,8 @@ impl Model {
         self.not_servable_reason().is_none()
     }
 
-    /// WHY this checkpoint cannot be served or batched, in a clause that
-    /// completes "…cannot be served or batched: ", or `None` for one that can.
+    /// WHY this checkpoint cannot be RUN, in a clause that completes
+    /// "…cannot be run: ", or `None` for one that can.
     ///
     /// [`Model::servable`] is derived from this rather than the other way
     /// round, so a checkpoint cannot be refused without saying why. The reasons
@@ -791,10 +816,13 @@ impl Model {
     pub const fn not_servable_reason(self) -> Option<&'static str> {
         match self {
             Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => None,
-            Model::Qwen34B | Model::Qwen34BInstruct2507 => Some(
-                "the qwen3 layer stack is not implemented in this build, so nothing can run \
-                 this checkpoint yet",
-            ),
+            // Servable since the qwen3 layer stack landed: every layer is full
+            // attention, so a conversation's whole state is its KV rows and the
+            // snapshot, rewind, page-out and disk-tier paths carry it with the
+            // machinery they already had. What still gates them is
+            // [`Model::auto_fetch`], which is about the download and not the
+            // graph.
+            Model::Qwen34B | Model::Qwen34BInstruct2507 => None,
             Model::ZImageTurboEncoder => Some(
                 "it is an encode-only conditioning encoder, and its weights are not a \
                  faithful language model — layer 35's MLP arrives zero-filled in the \
@@ -804,16 +832,19 @@ impl Model {
         }
     }
 
-    /// The one sentence every surface that moves cache state says when it is
-    /// asked for a checkpoint it cannot run — the CLI at startup, before a byte
-    /// is downloaded, and the HTTP APIs as the body of a 400.
+    /// The one sentence every surface says when it is asked for a checkpoint it
+    /// cannot run — `generate`, `chat`, `serve` and `batch` at startup, before a
+    /// byte is downloaded, and the HTTP APIs as the body of a 400.
     ///
-    /// Phrased for both, because they are refusing the same thing for the same
-    /// reason and two wordings would be two things to keep true.
+    /// Phrased for all of them, because they are refusing the same thing for the
+    /// same reason and five wordings would be five things to keep true. It says
+    /// "run" rather than "serve": the encoder is not a language model on any
+    /// surface, and a message that only mentioned serving would read as though
+    /// `xwen generate` were the way around it.
     pub fn not_servable_message(self) -> String {
         match self.not_servable_reason() {
-            Some(reason) => format!("{} cannot be served or batched: {reason}", self.full_name()),
-            None => format!("{} can be served", self.full_name()),
+            Some(reason) => format!("{} cannot be run: {reason}", self.full_name()),
+            None => format!("{} can be run", self.full_name()),
         }
     }
 
@@ -1875,15 +1906,19 @@ mod tests {
         }
     }
 
-    /// The three qwen3 entries are registered so that names, sizes and cache
-    /// figures exist for them — and gated off every surface that would try to
-    /// run one, because the layer stack that would run them does not exist.
+    /// What the three qwen3 entries answer now that their layer stack exists:
+    /// the two language models are served and batched like any other
+    /// checkpoint, and the encoder is not.
     ///
-    /// Two of the three gates lift when it does. The encoder's `servable` does
-    /// not: it is an encode-only entry over weights with a corrupt layer, and
-    /// generating from it would evaluate exactly that layer.
+    /// The encoder's refusal is the permanent one. It is an encode-only entry
+    /// over weights with a zero-filled layer, and generating from it would
+    /// evaluate exactly that layer — nothing a later build changes.
+    ///
+    /// `auto_fetch` stays false on all three, which is a different question
+    /// with a different answer: they can be RUN, and they are still not
+    /// downloaded as a side effect of a request that named one.
     #[test]
-    fn the_qwen3_checkpoints_are_registered_but_not_runnable_yet() {
+    fn the_qwen3_language_models_are_served_and_the_encoder_is_not() {
         for model in [
             Model::Qwen34B,
             Model::Qwen34BInstruct2507,
@@ -1891,16 +1926,30 @@ mod tests {
         ] {
             assert!(model.is_safetensors(), "{model:?}");
             assert_eq!(model.arch(), Arch::Qwen3, "{model:?}");
-            assert!(!model.servable(), "{model:?}");
             assert!(!model.auto_fetch(), "{model:?}");
+            // No drafter exists for this graph and no release ships one, so
+            // every speculation question answers the same way.
             assert!(!model.supports_drafting(), "{model:?}");
             assert!(!model.draft_default_on(), "{model:?}");
             assert_eq!(model.drafter_kind(), None, "{model:?}");
             assert_eq!(model.vocab_family(), VocabFamily::Qwen3, "{model:?}");
-            // Not selectable on the wire while they cannot run, whatever the
-            // cache holds.
-            assert!(!crate::serve::checkpoint_selectable(model), "{model:?}");
         }
+        for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
+            assert!(model.servable(), "{model:?}");
+            // Selectable exactly when the weights are really here: with
+            // `auto_fetch` false the cache is the whole gate.
+            assert_eq!(
+                crate::serve::checkpoint_selectable(model),
+                cached_model(model).is_some(),
+                "{model:?}"
+            );
+        }
+        // The encoder is never servable and therefore never selectable, cached
+        // or not.
+        assert!(!Model::ZImageTurboEncoder.servable());
+        assert!(!crate::serve::checkpoint_selectable(
+            Model::ZImageTurboEncoder
+        ));
         // Nothing else moved family: the four GGUF checkpoints still speak the
         // 3.6 vocabulary, which is what makes this a checkpoint property worth
         // keying a tokenizer on rather than a constant.
@@ -1954,14 +2003,11 @@ mod tests {
             );
         }
 
+        // The two language models are servable, so they have no refusal at
+        // all — which is the half of this rule that changed when their stack
+        // landed, and the half a stale reason would have silently kept.
         for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
-            let message = model.not_servable_message();
-            assert!(message.starts_with(model.full_name()), "{message}");
-            assert!(message.contains("cannot be served or batched"), "{message}");
-            assert!(
-                message.contains("layer stack is not implemented"),
-                "{message}"
-            );
+            assert_eq!(model.not_servable_reason(), None, "{model:?}");
         }
 
         let encoder = Model::ZImageTurboEncoder.not_servable_message();
@@ -1971,14 +2017,14 @@ mod tests {
         assert!(encoder.contains("zero-filled"), "{encoder}");
         assert!(encoder.contains("encode-text"), "{encoder}");
         assert!(
-            !encoder.contains("layer stack is not implemented"),
+            !encoder.contains("layer stack"),
             "the encoder's refusal must not read as one a later build lifts: {encoder}"
         );
 
         // The wire says the same thing the CLI does, for the same checkpoint.
         assert_eq!(
-            crate::serve::unselectable_model_message(Model::Qwen34B),
-            Model::Qwen34B.not_servable_message()
+            crate::serve::unselectable_model_message(Model::ZImageTurboEncoder),
+            Model::ZImageTurboEncoder.not_servable_message()
         );
     }
 

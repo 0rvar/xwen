@@ -1,11 +1,17 @@
 //! Startup refusals, exercised through the real binary.
 //!
 //! These are ORDERING tests, and ordering is the one thing a unit test on a
-//! predicate cannot see. `xwen serve --model-size qwen3-4b` used to identify the
-//! checkpoint, download eight gigabytes, start the server, list the model on
-//! `/v1/models` and only then die on the first request — with every individual
-//! predicate answering correctly the whole way down. What was wrong was where
-//! the question got asked, so the test has to run the thing that asks it.
+//! predicate cannot see. `xwen serve --model-size <an unrunnable checkpoint>`
+//! used to identify it, download eight gigabytes, start the server, list the
+//! model on `/v1/models` and only then die on the first request — with every
+//! individual predicate answering correctly the whole way down. What was wrong
+//! was where the question got asked, so the test has to run the thing that asks
+//! it.
+//!
+//! One entry is refused today, the Z-Image text encoder: it is an encode-only
+//! checkpoint over weights with a zero-filled layer. The two Qwen3-4B language
+//! models were refused here until their layer stack landed, and are covered
+//! below by the case that says they are NOT.
 //!
 //! Cheap by construction: every case here fails before any hub access, so
 //! nothing is fetched, no port is bound and no model is loaded. If one of them
@@ -45,11 +51,7 @@ fn xwen() -> Command {
 #[test]
 fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
     let config = empty_config("serve_refuses");
-    for (alias, expected) in [
-        ("qwen3-4b", "layer stack is not implemented"),
-        ("qwen3-4b-instruct-2507", "layer stack is not implemented"),
-        ("zimage-turbo", "encode-only"),
-    ] {
+    for (alias, expected) in [("zimage-turbo", "encode-only")] {
         let out = xwen()
             .args(["serve", "--config"])
             .arg(&config)
@@ -61,10 +63,7 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
             !out.status.success(),
             "serve --model-size {alias} started; it must refuse\n{stderr}"
         );
-        assert!(
-            stderr.contains("cannot be served or batched"),
-            "{alias}: {stderr}"
-        );
+        assert!(stderr.contains("cannot be run"), "{alias}: {stderr}");
         assert!(stderr.contains(expected), "{alias}: {stderr}");
         // The refusal has to happen before the download, and a message about
         // fetching would mean it did not.
@@ -83,10 +82,7 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
 /// 1, so that is where the message is.
 #[test]
 fn batch_refuses_an_unrunnable_checkpoint_named_in_its_payload() {
-    for (name, expected) in [
-        ("Qwen3-4B", "layer stack is not implemented"),
-        ("Z-Image-Turbo-text-encoder", "encode-only"),
-    ] {
+    for (name, expected) in [("Z-Image-Turbo-text-encoder", "encode-only")] {
         let mut child = xwen()
             .arg("batch")
             .stdin(Stdio::piped())
@@ -106,10 +102,7 @@ fn batch_refuses_an_unrunnable_checkpoint_named_in_its_payload() {
         let out = child.wait_with_output().expect("waiting for xwen batch");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!out.status.success(), "batch on {name} succeeded\n{stdout}");
-        assert!(
-            stdout.contains("cannot be served or batched"),
-            "{name}: {stdout}"
-        );
+        assert!(stdout.contains("cannot be run"), "{name}: {stdout}");
         assert!(stdout.contains(expected), "{name}: {stdout}");
         assert!(
             !String::from_utf8_lossy(&out.stderr).contains("downloading"),
@@ -143,8 +136,40 @@ fn a_runnable_checkpoint_gets_past_the_gate() {
         .expect("running xwen serve");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("cannot be served or batched"),
+        !stderr.contains("cannot be run"),
         "a servable checkpoint must not be refused by the gate: {stderr}"
     );
+    std::fs::remove_file(&config).unwrap();
+}
+
+/// The two Qwen3-4B language models are NOT refused: their layer stack landed,
+/// so serve and batch run them like any other checkpoint.
+///
+/// Here rather than only as a predicate test because the refusal was a startup
+/// ordering decision, and the thing that has to stop happening is the startup
+/// bail. Both runs go on to fail at the checkpoint itself, against a cache
+/// directory with nothing in it and an endpoint that refuses connections, which
+/// is the next thing after the gate and proves the gate is what was passed.
+#[test]
+fn the_qwen3_language_models_are_no_longer_refused_at_startup() {
+    let config = empty_config("qwen3_runs");
+    for alias in ["qwen3-4b", "qwen3-4b-instruct-2507"] {
+        let out = xwen()
+            .args(["serve", "--config"])
+            .arg(&config)
+            .args(["--model-size", alias, "--port", "0"])
+            .env(
+                "HF_HUB_CACHE",
+                std::env::temp_dir().join("xwen-gates-empty-cache"),
+            )
+            .env("HF_ENDPOINT", "http://127.0.0.1:1")
+            .output()
+            .expect("running xwen serve");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("cannot be run"),
+            "{alias} must not be refused by the gate: {stderr}"
+        );
+    }
     std::fs::remove_file(&config).unwrap();
 }

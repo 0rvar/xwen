@@ -21,6 +21,7 @@ pub mod openai;
 pub mod queue;
 pub mod tui;
 pub mod types;
+pub mod vocab;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -138,7 +139,11 @@ fn shutdown_grace(pending: u64) -> Duration {
 #[derive(Clone)]
 pub struct AppState {
     pub jobs: Arc<JobQueue>,
-    pub tokenizer: Arc<LagunaTokenizer>,
+    /// Every vocabulary this server can speak, keyed by family and built on
+    /// first use. Not one tokenizer: two checkpoints on this registry disagree
+    /// about what an id means, so the tokenizer and the grammar trie a request
+    /// gets follow its [`types::Target`] rather than the process.
+    pub vocab: Arc<vocab::Vocabularies>,
     pub settings: Arc<ServeSettings>,
     /// Which checkpoint the engine is holding, stamped by the engine at load
     /// and cleared on every unload. `/health` reads it, and so does the
@@ -227,7 +232,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
     if let Some(warning) = unidentified {
         logger.log(warning);
     }
-    let (tokenizer, max_ctx) = engine::validate_model(&settings, &cfg, default_target, &logger)?;
+    let (vocabularies, max_ctx) = engine::validate_model(&settings, &cfg, default_target, &logger)?;
 
     // The queue timeout is DERIVED from the context length unless it was named,
     // so it is not a number anyone can read off the config file. Said once here,
@@ -269,7 +274,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
     let address = format!("{}:{}", settings.host, settings.port);
     let state = AppState {
         jobs: Arc::clone(&jobs),
-        tokenizer,
+        vocab: vocabularies,
         settings: Arc::new(settings),
         resident,
         shutdown: Arc::clone(&shutdown),
@@ -442,6 +447,30 @@ fn resolve_requested_model_with(
     ))
 }
 
+/// The 400 for asking a checkpoint whose chat template has no reasoning mode
+/// to reason.
+///
+/// Explicit REQUESTS only. A server-wide thinking_force is an operator default
+/// that every dialect already lets a request override, and refusing every
+/// request on this checkpoint because the config named a default would make the
+/// checkpoint unusable for a reason the client cannot see. The same rule the
+/// reasoning_effort gate follows.
+///
+/// The alternative is to drop the field, which is the silent prompt change the
+/// strict-kwargs policy exists to prevent: a client that asked for reasoning and
+/// got a bare answer has no way to tell that from a model that chose not to
+/// reason.
+pub(crate) fn thinking_unsupported_message(
+    target: crate::serve::types::Target,
+    field: &str,
+) -> String {
+    format!(
+        "{field}: {} renders a chat template with no reasoning mode at all: it has no \
+         thinking block to open, and nothing this server can do makes one appear. Drop \
+         the field, or send this request to a checkpoint that reasons",
+        target.model.full_name()
+    )
+}
 /// The 400 for a checkpoint that IS one of ours and spelled correctly, but that
 /// this server will not run.
 ///
@@ -1141,8 +1170,16 @@ pub(crate) fn submit(
             "max_tokens must be at least 1".to_string(),
         ));
     }
+    // The vocabulary follows the TARGET, never the process: a request naming
+    // the other family is encoded with that family's ids, and one naming a
+    // family this machine holds no tokenizer for is refused here rather than
+    // silently encoded with the wrong one.
+    let vocab = state
+        .vocab
+        .for_target(model)
+        .map_err(|e| SubmitError::Invalid(format!("{e:#}")))?;
     let prompt = encode_conversation(
-        &state.tokenizer,
+        vocab.tokenizer(),
         &request.messages,
         model.model.chat_dialect(),
         request.enable_thinking,
@@ -1167,7 +1204,7 @@ pub(crate) fn submit(
     // continues that document instead of starting a second one.
     // The marker ids the grammar watches for come from the tokenizer the
     // request was encoded with, so the arming edge is that vocabulary's own.
-    let specials = *state.tokenizer.specials();
+    let specials = *vocab.tokenizer().specials();
     let grammar = match request.grammar {
         None => None,
         Some(grammar) => {
@@ -1467,6 +1504,47 @@ pub(crate) mod testutil {
     use super::*;
     use std::path::PathBuf;
 
+    /// The embedded vocabulary, built once for the whole suite.
+    ///
+    /// Every dialect's `prepare` needs one, because the trie a schema compiles
+    /// against is the target's. Shared through a `OnceLock` because building it
+    /// costs ~150 ms and the tests that ask for it are the ones that do not care
+    /// which vocabulary it is: the Qwen 3.6 family's is what a `laguna-s-2.1`
+    /// fixture target speaks.
+    pub(crate) fn vocab() -> Arc<vocab::Vocabulary> {
+        static VOCAB: std::sync::OnceLock<Arc<vocab::Vocabulary>> = std::sync::OnceLock::new();
+        Arc::clone(VOCAB.get_or_init(|| {
+            vocab::Vocabularies::hub_only()
+                .for_family(crate::hub::VocabFamily::Qwen36)
+                .expect("the embedded vocabulary builds")
+        }))
+    }
+
+    /// A minimal job request: one user turn, no thinking, no schema, no tools.
+    /// The dialect tests that go through `submit` build on this rather than on
+    /// their own literal, so a new `JobRequest` field lands in one place.
+    pub(crate) fn plain_request(max_tokens: usize) -> JobRequest {
+        JobRequest {
+            messages: vec![chat::Message::User("Hi".into())],
+            enable_thinking: false,
+            preserve_thinking: None,
+            reasoning_effort: None,
+            max_think: None,
+            max_tokens,
+            sampling: crate::sampler::SamplerOptions::default(),
+            stop_sequences: Vec::new(),
+            tools: Vec::new(),
+            grammar: None,
+            continuation: None,
+        }
+    }
+
+    /// Every vocabulary a test server can reach, with no served file to prefer:
+    /// the embedded one, plus whatever the hub cache holds for the other family.
+    pub(crate) fn vocabularies() -> Arc<vocab::Vocabularies> {
+        Arc::new(vocab::Vocabularies::hub_only())
+    }
+
     /// Settings with the documented defaults, for the request-preparation
     /// tests: they exercise the "request said nothing, fall back to the server"
     /// half of every mapping. One deliberate exception: `draft` is pinned to
@@ -1564,12 +1642,9 @@ pub(crate) mod testutil {
             },
             ServeLogger::discarding(),
         ));
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/reference/tokenizer.json");
         let state = AppState {
             jobs: Arc::clone(&jobs),
-            tokenizer: Arc::new(
-                LagunaTokenizer::from_file(path).expect("load reference tokenizer"),
-            ),
+            vocab: testutil::vocabularies(),
             settings: Arc::new(testutil::settings()),
             resident: Arc::new(types::ResidentModel::new()),
             shutdown: Arc::new(Cancel::default()),
@@ -1631,6 +1706,14 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
+    /// The vocabulary a `probe_state` server encodes with — its default
+    /// target's, resolved the way a request resolves it.
+    fn probe_vocab(state: &AppState) -> Arc<vocab::Vocabulary> {
+        state
+            .vocab
+            .for_target(state.default_target)
+            .expect("the served vocabulary builds")
+    }
     use super::*;
     use axum::body::Bytes;
 
@@ -1840,20 +1923,30 @@ mod tests {
         let served = types::Target::official(Model::Qwen3827B);
         let served_id = "Qwen3.8-27B";
 
-        // The engine half still refuses the qwen3 checkpoints, whose layer
-        // stack does not exist — but it refuses nothing among the GGUF ones,
+        // The engine half refuses one entry and one only: the Z-Image encoder,
+        // which is not a language model. Every checkpoint that IS one passes it,
         // which is what leaves the download rule as Flash-Next's only gate.
-        for model in crate::hub::MODELS
-            .into_iter()
-            .filter(|m| !m.is_safetensors())
-        {
-            assert!(model.servable(), "{model}");
+        for model in crate::hub::MODELS {
+            assert_eq!(
+                model.servable(),
+                model != Model::ZImageTurboEncoder,
+                "{model}"
+            );
         }
-        for model in crate::hub::MODELS
-            .into_iter()
-            .filter(|m| m.is_safetensors())
-        {
-            assert!(!checkpoint_selectable(model), "{model} cannot run yet");
+        assert!(
+            !checkpoint_selectable(Model::ZImageTurboEncoder),
+            "an encode-only entry is never selectable"
+        );
+        // The qwen3 language models are gated by their cache alone now, exactly
+        // as Flash-Next is: `auto_fetch` is false on all three, so a request
+        // naming one is answered when the weights are here and refused when
+        // they are not.
+        for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
+            assert_eq!(
+                checkpoint_selectable(model),
+                crate::hub::cached_model(model).is_some(),
+                "{model}"
+            );
         }
         assert_eq!(
             checkpoint_selectable(Model::Qwen38FlashNext),
@@ -2170,6 +2263,60 @@ mod tests {
         serde_json::from_slice(&bytes).expect("handlers answer JSON")
     }
 
+    /// What `/v1/models` shows and what a request may name, now that the Qwen3
+    /// language models run: both of them, each once, by full name — and never
+    /// the encoder.
+    ///
+    /// The CACHE half of the predicate is injected, as it is everywhere else
+    /// here: whether these weights happen to be on this machine is not what the
+    /// rule says. The ENGINE half is not injected, because it is the half under
+    /// test — the encoder has to stay hidden on a machine holding every
+    /// checkpoint, which is the only state in which hiding it is interesting.
+    #[test]
+    fn the_qwen3_language_models_are_listed_and_the_encoder_never_is() {
+        let cached = |model: crate::hub::Model| model.servable();
+        let ids = listed_models_with("Qwen3.8-27B", &cached);
+        for name in ["Qwen3-4B", "Qwen3-4B-Instruct-2507"] {
+            assert_eq!(
+                ids.iter().filter(|id| id.as_str() == name).count(),
+                1,
+                "{name} must be listed exactly once: {ids:?}"
+            );
+        }
+        assert!(
+            !ids.iter().any(|id| id == "Z-Image-Turbo-text-encoder"),
+            "an encode-only checkpoint is never listed: {ids:?}"
+        );
+
+        // Every listed id is one a request can select by — including the two
+        // that just became listable.
+        let served = types::Target::official(crate::hub::Model::Qwen3827B);
+        for id in &ids {
+            assert!(
+                resolve_requested_model_with(Some(id), served, "Qwen3.8-27B", &cached).is_ok(),
+                "a listed id must be selectable: {id}"
+            );
+        }
+        assert_eq!(
+            resolve_requested_model_with(Some("Qwen3-4B"), served, "Qwen3.8-27B", &cached),
+            Ok((
+                types::Target::official(crate::hub::Model::Qwen34B),
+                "Qwen3-4B".to_string()
+            ))
+        );
+
+        // The encoder is refused wherever it is named, with the reason rather
+        // than with a fetch hint: no cache state makes it selectable.
+        let error = resolve_requested_model_with(
+            Some("Z-Image-Turbo-text-encoder"),
+            served,
+            "Qwen3.8-27B",
+            &cached,
+        )
+        .expect_err("an encode-only checkpoint is never selectable");
+        assert!(error.contains("encode-only"), "{error}");
+        assert!(error.contains("encode-text"), "{error}");
+    }
     /// The 400 an unknown model gets names every model that would have
     /// worked — and only those.
     ///
@@ -2418,6 +2565,193 @@ mod tests {
         })
     }
 
+    /// One server, two consecutive requests, two vocabularies.
+    ///
+    /// This is the property the whole per-family cache exists for, and the one
+    /// nothing else would catch: both requests succeed either way, and a server
+    /// that encoded the second with the first's tokenizer would answer it with
+    /// fluent nonsense. So the assertion is on the ids that reached the queue,
+    /// on the stop id the job will decode against, and on the width of the mask
+    /// its grammar produces — the three things the vocabulary decides.
+    ///
+    /// Skips itself without a Qwen3 tokenizer on this machine: what it is about
+    /// is the SWITCH, and one vocabulary cannot show it.
+    #[test]
+    fn consecutive_requests_use_their_own_targets_vocabulary() {
+        let (state, queue) = probe_state(4096);
+        let qwen36 = types::Target::official(crate::hub::Model::Qwen35BA3B);
+        let qwen3 = types::Target::official(crate::hub::Model::Qwen34B);
+        if state.vocab.for_target(qwen3).is_err() {
+            eprintln!("skipping: no Qwen3 tokenizer in the Hugging Face cache");
+            return;
+        }
+
+        // The submission handles are kept alive across the whole test: dropping
+        // a `CancelGuard` cancels its job, and a cancelled job is gone from the
+        // queue before it can be read.
+        let mut live = Vec::new();
+        let mut submitted = |target: types::Target| {
+            let factory = state
+                .vocab
+                .for_target(target)
+                .expect("the target's vocabulary builds");
+            let request = JobRequest {
+                grammar: Some(
+                    factory
+                        .grammars()
+                        .compile(&probe_schema())
+                        .expect("the schema compiles"),
+                ),
+                // Past the reasoning block, so the grammar is armed and its
+                // mask is computable without decoding anything.
+                continuation: Some(chat::Continuation {
+                    thinking: None,
+                    close_thinking: true,
+                    prefix: None,
+                }),
+                ..probe_request(64)
+            };
+            live.push(
+                submit(
+                    &state,
+                    request,
+                    Dialect::Native,
+                    false,
+                    target,
+                    ClientId::default(),
+                )
+                .expect("the request submits"),
+            );
+            generation(try_take(&queue).expect("the job reached the queue").job)
+        };
+
+        // Deliberately in this order and on one state: the second request is
+        // the one that would inherit the first's vocabulary from a process
+        // global, which is exactly what this used to have.
+        let first = submitted(qwen36);
+        let second = submitted(qwen3);
+
+        // The ids. Same conversation, two renderings, and neither is the
+        // other's — a server that reused the first tokenizer would produce two
+        // identical prompts for two different models.
+        assert_ne!(
+            first.prompt, second.prompt,
+            "two vocabularies cannot encode one conversation identically"
+        );
+        // Each prompt is made of ids its own vocabulary can decode, which is
+        // what rules out one of them being the wrong file's numbers.
+        for (job, target) in [(&first, qwen36), (&second, qwen3)] {
+            let vocab = state.vocab.for_target(target).unwrap();
+            let ids = vocab.tokenizer().vocab_size() as u32;
+            assert!(
+                job.prompt.iter().all(|&id| id < ids),
+                "{target:?}: a prompt id is outside its own vocabulary"
+            );
+        }
+
+        // The smoking gun, stated directly: the Qwen3 job's ids are ids in the
+        // OTHER vocabulary too — every one of them is below 248320 — so a server
+        // that decoded them with the embedded tokenizer would get text rather
+        // than an error, and different text. That is the whole failure mode, and
+        // it is why nothing downstream can catch this.
+        let mine = state
+            .vocab
+            .for_target(qwen3)
+            .unwrap()
+            .tokenizer()
+            .decode(&second.prompt)
+            .expect("its own vocabulary decodes it");
+        let theirs = state
+            .vocab
+            .for_target(qwen36)
+            .unwrap()
+            .tokenizer()
+            .decode(&second.prompt)
+            .expect("the other vocabulary also decodes it, into something else");
+        assert!(mine.contains("<|im_start|>user"), "{mine:?}");
+        assert_ne!(mine, theirs, "the wrong vocabulary must not agree by luck");
+
+        // The mask width. A grammar compiled against the wrong trie is the
+        // failure with no symptom: it masks logits that mean other tokens.
+        // Consumed by value: a `GrammarState` holds a matcher and cannot be
+        // cloned, which is why each job is measured once and then dropped.
+        let width = |job: GenerationJob| {
+            let mut grammar = job.grammar.expect("an armed grammar");
+            grammar
+                .mask_words()
+                .expect("the mask computes")
+                .expect("a closed thinking block arms the grammar")
+                .len()
+                * 32
+        };
+        let (wide, narrow) = (width(first), width(second));
+        assert!(wide >= crate::hub::VocabFamily::Qwen36.logit_width());
+        assert!(narrow >= crate::hub::VocabFamily::Qwen3.logit_width());
+        assert!(
+            narrow < crate::hub::VocabFamily::Qwen36.logit_width(),
+            "the Qwen3 job's mask must not be the other family's"
+        );
+    }
+    /// A thinking request on a Qwen3 target leaves the `<think>` opener to the
+    /// MODEL, and the job says so.
+    ///
+    /// This is the one structural difference between the two families that the
+    /// serve layer has to carry rather than render: a 3.6 generation prompt ends
+    /// INSIDE an open block, so the first decoded token is reasoning by
+    /// construction, while a Qwen3 one ends at the bare assistant header and the
+    /// reply's first token is what decides. `ThinkingEntry::ModelOpens` is what
+    /// tells the decode loop to watch for it — and the grammar to mask that one
+    /// draw with `<think>` allowed — so a job that lost it would stream a whole
+    /// reasoning block into the answer channel.
+    #[test]
+    fn a_qwen3_job_leaves_the_thinking_opener_to_the_model() {
+        let (state, queue) = probe_state(4096);
+        let qwen3 = types::Target::official(crate::hub::Model::Qwen34B);
+        if state.vocab.for_target(qwen3).is_err() {
+            eprintln!("skipping: no Qwen3 tokenizer in the Hugging Face cache");
+            return;
+        }
+
+        let submitted = |target: types::Target| {
+            let handle = submit(
+                &state,
+                probe_request(64),
+                Dialect::Native,
+                false,
+                target,
+                ClientId::default(),
+            )
+            .expect("a thinking request submits");
+            let job = generation(try_take(&queue).expect("the job reached the queue").job);
+            drop(handle);
+            job
+        };
+
+        let job = submitted(qwen3);
+        assert_eq!(job.thinking_entry, chat::ThinkingEntry::ModelOpens);
+        assert!(!job.thinking_entry.starts_in_thinking());
+        assert!(job.thinking_entry.may_think());
+        // And the prompt really does stop at the header: the opener is absent
+        // from the text, which is what makes the first token load-bearing.
+        let rendered = state
+            .vocab
+            .for_target(qwen3)
+            .unwrap()
+            .tokenizer()
+            .decode(&job.prompt)
+            .expect("the prompt decodes");
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains("<think>"), "{rendered:?}");
+
+        // The 3.6 family is the other shape, and it has not moved: the prompt
+        // ends inside the block the model is already writing.
+        let seeded = submitted(state.default_target);
+        assert!(seeded.thinking_entry.starts_in_thinking());
+        assert_ne!(seeded.thinking_entry, chat::ThinkingEntry::ModelOpens);
+    }
     /// The checks a request alone can fail are judged at submit, as a 400 in the
     /// handler's dialect; the engine never sees the job.
     #[test]
@@ -2461,7 +2795,10 @@ mod tests {
             },
         )
         .expect("the prompt renders");
-        let expected = state.tokenizer.encode(&whole).expect("the prompt encodes");
+        let expected = probe_vocab(&state)
+            .tokenizer()
+            .encode(&whole)
+            .expect("the prompt encodes");
 
         let (_events, _guard) = submit_default(&state, probe_request(64), Dialect::Anthropic, true)
             .expect("the job submits");
@@ -2726,7 +3063,10 @@ mod tests {
         // closing brace — where a grammar that had started over would be
         // offering the opening one.
         let bit = |text: &str| {
-            let ids = state.tokenizer.encode(text).expect("encodes");
+            let ids = probe_vocab(&state)
+                .tokenizer()
+                .encode(text)
+                .expect("encodes");
             assert_eq!(ids.len(), 1, "{text:?} is one token");
             words
                 .get((ids[0] / 32) as usize)

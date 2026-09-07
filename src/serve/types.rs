@@ -132,8 +132,9 @@ pub struct Target {
     /// assumption reported at startup.
     pub model: Model,
     /// Whether this means the server's own `--model` file rather than the
-    /// official hub file for `model`. Only ever true when the served GGUF
-    /// identified as none of the official checkpoints.
+    /// official hub file for `model`. Only ever true when the served checkpoint
+    /// identified as none of the official ones — a GGUF whose name says nothing,
+    /// or a safetensors directory that is not one of their cached snapshots.
     pub served_file: bool,
 }
 
@@ -146,7 +147,8 @@ impl Target {
         }
     }
 
-    /// The file this server was started with, running as `model`.
+    /// The checkpoint this server was started with, running as `model`. A GGUF
+    /// file, or a safetensors directory.
     pub fn served(model: Model) -> Self {
         Self {
             model,

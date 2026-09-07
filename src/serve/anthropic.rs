@@ -27,7 +27,7 @@ use super::{
     collect_completion, random_id, sse_response, submit,
 };
 use crate::chat::{Message, ToolCall};
-use crate::constrain::{self, Grammar};
+use crate::constrain::Grammar;
 use crate::generate::feasible_think_budget;
 use crate::sampler::SamplerOptions;
 
@@ -722,6 +722,7 @@ fn resolve_tools(request: &MessagesRequest, mode: ToolsMode) -> Result<Vec<Value
 fn resolve_output_format(
     config: Option<&OutputConfig>,
     tools: &[Value],
+    vocab: &crate::serve::vocab::Vocabulary,
 ) -> Result<Option<Grammar>, ApiError> {
     let Some(format) = config.and_then(|c| c.format.as_ref()) else {
         return Ok(None);
@@ -732,13 +733,9 @@ fn resolve_output_format(
             if !tools.is_empty() {
                 return Err(bad_request(SCHEMA_WITH_TOOLS));
             }
-            let factory = constrain::shared().map_err(|e| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    format!("{e:#}"),
-                )
-            })?;
+            // The target's trie, not the process's — see the OpenAI dialect's
+            // copy of this comment for why a borrowed one is unusable.
+            let factory = vocab.grammars();
             let schema = format
                 .schema
                 .as_ref()
@@ -759,6 +756,7 @@ pub(crate) fn prepare(
     settings: &ServeSettings,
     default_model: &str,
     target: crate::serve::types::Target,
+    vocab: &crate::serve::vocab::Vocabulary,
 ) -> Result<Prepared, ApiError> {
     let tools = resolve_tools(&request, settings.tools_mode)?;
     if request.output_format.is_some() {
@@ -767,7 +765,7 @@ pub(crate) fn prepare(
              in output_config.format ({\"type\": \"json_schema\", \"schema\": ...})",
         ));
     }
-    let grammar = resolve_output_format(request.output_config.as_ref(), &tools)?;
+    let grammar = resolve_output_format(request.output_config.as_ref(), &tools, vocab)?;
     if request.messages.is_empty() {
         return Err(bad_request(EMPTY_MESSAGES));
     }
@@ -778,6 +776,19 @@ pub(crate) fn prepare(
         return Err(bad_request("max_tokens must be at least 1"));
     }
 
+    // See thinking_unsupported_message: an explicit thinking block asking a
+    // template with no reasoning mode to reason is refused rather than dropped.
+    // A "disabled" block is not asking, so it passes.
+    if !target.model.chat_dialect().supports_thinking()
+        && request
+            .thinking
+            .as_ref()
+            .is_some_and(|param| param.kind != "disabled")
+    {
+        return Err(bad_request(super::thinking_unsupported_message(
+            target, "thinking",
+        )));
+    }
     let messages = normalize(&request, settings.tools_mode)?;
     let (enable_thinking, max_think) =
         resolve_thinking(request.thinking.as_ref(), settings, Some(max_tokens))?;
@@ -1181,7 +1192,14 @@ pub(crate) async fn messages(
     // the client's spelling of it.
     request.model = Some(model_name);
     let who = client_id(&request, &headers);
-    let prepared = match prepare(request, &state.settings, &state.model_id, size) {
+    // The vocabulary this request is rendered and masked with, resolved from
+    // the checkpoint that will answer it. A family this machine holds no
+    // tokenizer for is a 400 naming the fetch, not a wrong-vocabulary reply.
+    let vocab = match state.vocab.for_target(size) {
+        Ok(vocab) => vocab,
+        Err(e) => return bad_request(format!("{e:#}")).into_response(),
+    };
+    let prepared = match prepare(request, &state.settings, &state.model_id, size, &vocab) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
     };
@@ -1280,7 +1298,11 @@ pub(crate) async fn count_tokens(State(state): State<AppState>, body: Bytes) -> 
         Ok(resolved) => resolved,
         Err(message) => return bad_request(message).into_response(),
     };
-    match counted_tokens(&request, &state.settings, &state.tokenizer, target) {
+    let vocab = match state.vocab.for_target(target) {
+        Ok(vocab) => vocab,
+        Err(e) => return bad_request(format!("{e:#}")).into_response(),
+    };
+    match counted_tokens(&request, &state.settings, vocab.tokenizer(), target) {
         Ok(count) => axum::Json(json!({"input_tokens": count})).into_response(),
         Err(e) => e.into_response(),
     }
@@ -1299,29 +1321,97 @@ mod tests {
         serde_json::from_str(body).expect("request parses")
     }
 
+    /// See the OpenAI dialect's copy: a template with no reasoning mode refuses
+    /// an explicit request to reason rather than dropping it. This API's
+    /// spelling is the `thinking` block, and `disabled` is not asking.
+    #[test]
+    fn a_thinking_block_is_refused_on_a_template_without_one() {
+        let instruct =
+            crate::serve::types::Target::official(crate::hub::Model::Qwen34BInstruct2507);
+        let go = |body: &str| {
+            prepare(
+                parse(body),
+                &settings(),
+                "m",
+                instruct,
+                &crate::serve::testutil::vocab(),
+            )
+        };
+        for kind in ["enabled", "adaptive"] {
+            let error = go(&format!(
+                r#"{{"max_tokens":16,"thinking":{{"type":"{kind}"}},
+                   "messages":[{{"role":"user","content":"Hi"}}]}}"#
+            ))
+            .err()
+            .expect("a template with no thinking must refuse");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{kind}");
+            assert!(
+                message(&error).contains("no reasoning mode"),
+                "{}",
+                message(&error)
+            );
+        }
+        // Explicitly disabled, and absent, both go through. Silence resolves
+        // to the server-wide `thinking_force`, which stays live on the job:
+        // the DIALECT drops it in `chat.rs`, which is why an operator default
+        // is inert here while a request is a 400.
+        for body in [
+            r#"{"max_tokens":16,"thinking":{"type":"disabled"},
+               "messages":[{"role":"user","content":"Hi"}]}"#,
+            r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#,
+        ] {
+            go(body).unwrap_or_else(|e| panic!("not asking to reason is fine: {}", message(&e)));
+        }
+    }
+
     fn target() -> crate::serve::types::Target {
         crate::serve::types::Target::official(crate::hub::Model::Qwen3827B)
     }
 
     fn prepared(body: &str) -> Prepared {
-        prepare(parse(body), &settings(), "laguna-s-2.1", target()).expect("request prepares")
+        prepare(
+            parse(body),
+            &settings(),
+            "laguna-s-2.1",
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .expect("request prepares")
     }
 
     fn rejected(body: &str) -> ApiError {
-        prepare(parse(body), &settings(), "laguna-s-2.1", target())
-            .err()
-            .expect("request is rejected")
+        prepare(
+            parse(body),
+            &settings(),
+            "laguna-s-2.1",
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .err()
+        .expect("request is rejected")
     }
 
     fn prepared_in(body: &str, mode: ToolsMode) -> Prepared {
-        prepare(parse(body), &tools(mode), "laguna-s-2.1", target())
-            .unwrap_or_else(|e| panic!("request prepares under {mode}: {}", message(&e)))
+        prepare(
+            parse(body),
+            &tools(mode),
+            "laguna-s-2.1",
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .unwrap_or_else(|e| panic!("request prepares under {mode}: {}", message(&e)))
     }
 
     fn rejected_in(body: &str, mode: ToolsMode) -> ApiError {
-        prepare(parse(body), &tools(mode), "laguna-s-2.1", target())
-            .err()
-            .unwrap_or_else(|| panic!("request is rejected under {mode}"))
+        prepare(
+            parse(body),
+            &tools(mode),
+            "laguna-s-2.1",
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("request is rejected under {mode}"))
     }
 
     /// A conversation's tool calls, one line per assistant turn that made any:
@@ -1576,8 +1666,14 @@ mod tests {
             "explore-metrics".parse().expect("a header value"),
         );
         let who = client_id(&request, &headers);
-        let prepared =
-            prepare(request, &settings(), "laguna-s-2.1", target()).expect("request prepares");
+        let prepared = prepare(
+            request,
+            &settings(),
+            "laguna-s-2.1",
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .expect("request prepares");
         let (_events, _guard) = crate::serve::submit(
             &state,
             prepared.job,
@@ -1636,7 +1732,13 @@ mod tests {
                     "messages":[{{"role":"user","content":"Hi"}}]}}"#
             );
             let request = parse(&body);
-            let prepared = prepare(request, &settings(), "laguna-s-2.1", target());
+            let prepared = prepare(
+                request,
+                &settings(),
+                "laguna-s-2.1",
+                target(),
+                &crate::serve::testutil::vocab(),
+            );
             assert!(
                 prepared.is_ok(),
                 "metadata {shape} must not fail the request"
@@ -1733,6 +1835,7 @@ mod tests {
             &tools(ToolsMode::Reject),
             "laguna-s-2.1",
             target(),
+            &crate::serve::testutil::vocab(),
         )
         .err()
         .expect("a tools request is rejected in reject mode");
@@ -1764,6 +1867,7 @@ mod tests {
             &tools(ToolsMode::Strip),
             "laguna-s-2.1",
             target(),
+            &crate::serve::testutil::vocab(),
         )
         .expect("strip mode accepts tool definitions");
         let toolless = prepare(
@@ -1771,6 +1875,7 @@ mod tests {
             &tools(ToolsMode::Strip),
             "laguna-s-2.1",
             target(),
+            &crate::serve::testutil::vocab(),
         )
         .expect("a request with no tools prepares");
         assert_eq!(shape(&stripped.job.messages), vec!["user:Hi"]);
@@ -1880,6 +1985,7 @@ mod tests {
                 &tools(ToolsMode::Native),
                 "laguna-s-2.1",
                 target(),
+            &crate::serve::testutil::vocab(),
             )
             .expect("a call with no arguments prepares");
             assert_eq!(calls(&request.job.messages), vec!["f()"]);
@@ -2430,6 +2536,7 @@ mod tests {
             &pinned,
             "m",
             target(),
+            &crate::serve::testutil::vocab(),
         )
         .unwrap();
         assert_eq!(configured.job.sampling.temperature, 0.5);
@@ -2457,7 +2564,14 @@ mod tests {
         // Thinking on, and the 3.8 card asks for no penalty there.
         assert_eq!(prepared(body).job.sampling.presence_penalty, 0.0);
         let a3b = crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B);
-        let on_a3b = prepare(parse(body), &settings(), "m", a3b).unwrap();
+        let on_a3b = prepare(
+            parse(body),
+            &settings(),
+            "m",
+            a3b,
+            &crate::serve::testutil::vocab(),
+        )
+        .unwrap();
         assert_eq!(on_a3b.job.sampling.presence_penalty, 1.5);
 
         // Thinking off: every card asks for 1.5.
@@ -2469,7 +2583,14 @@ mod tests {
 
         let mut pinned = settings();
         pinned.presence_penalty = Some(0.25);
-        let configured = prepare(parse(body), &pinned, "m", a3b).unwrap();
+        let configured = prepare(
+            parse(body),
+            &pinned,
+            "m",
+            a3b,
+            &crate::serve::testutil::vocab(),
+        )
+        .unwrap();
         assert_eq!(configured.job.sampling.presence_penalty, 0.25);
     }
 
@@ -2695,6 +2816,60 @@ mod tests {
         assert_eq!(payload(&frames[3])["index"], 0);
     }
 
+    /// The Anthropic mirror of the OpenAI dialect's model-opened test: a reply
+    /// that reasons opens a `thinking` block, and one that does not opens only a
+    /// `text` block — no empty thinking block for a client to render.
+    #[test]
+    fn a_model_opened_reply_separates_its_blocks_and_may_have_neither() {
+        let stream = |events: Vec<EngineEvent>| {
+            let mut encoder = MessageStream::new("msg_9".into(), "Qwen3-4B".into());
+            encode_all(&mut encoder, events)
+        };
+        let start = EngineEvent::Start {
+            input_tokens: 10,
+            cached_tokens: 0,
+        };
+        let done = EngineEvent::Done {
+            stop: StopKind::EndTurn,
+            output_tokens: 4,
+            thinking_tokens: 2,
+        };
+
+        let reasoned = stream(vec![
+            start.clone(),
+            EngineEvent::Thinking("weighing it".into()),
+            EngineEvent::Text("yes".into()),
+            done.clone(),
+        ]);
+        let kinds: Vec<String> = reasoned
+            .iter()
+            .filter(|frame| frame.name == Some("content_block_start"))
+            .map(|frame| {
+                payload(frame)["content_block"]["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(kinds, vec!["thinking", "text"]);
+
+        let direct = stream(vec![start, EngineEvent::Text("yes".into()), done]);
+        let kinds: Vec<String> = direct
+            .iter()
+            .filter(|frame| frame.name == Some("content_block_start"))
+            .map(|frame| {
+                payload(frame)["content_block"]["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["text"],
+            "a reply that never reasoned must open no thinking block"
+        );
+    }
     #[test]
     fn empty_thinking_deltas_never_open_a_thinking_block() {
         let mut stream = MessageStream::new("msg_1".into(), "m".into());

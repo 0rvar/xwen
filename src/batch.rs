@@ -565,11 +565,17 @@ pub fn run_batch(
     // Built once for the whole batch: the token trie costs ~150 ms, while
     // compiling one item's schema against it costs well under a millisecond.
     // Only paid when some item actually asks for a schema.
+    // Over the run's OWN tokenizer, not a process-shared one: a batch on a
+    // Qwen3 checkpoint speaks 151936 ids where the embedded vocabulary speaks
+    // 248320, and a mask built over the wrong one indexes nothing.
     let factory = if prepared
         .iter()
         .any(|p| p.as_ref().is_ok_and(|p| p.schema.is_some()))
     {
-        Some(constrain::shared()?)
+        Some(constrain::for_tokenizer(
+            generator.tokenizer(),
+            model.vocab_family().logit_width(),
+        )?)
     } else {
         None
     };
@@ -599,7 +605,13 @@ pub fn run_batch(
         };
         let cached = snapshot.as_ref().map(|snapshot| (snapshot, shared_len));
         let item_started = Instant::now();
-        match run_item(generator, factory, prepared, cached, hooks.cancelled) {
+        match run_item(
+            generator,
+            factory.as_deref(),
+            prepared,
+            cached,
+            hooks.cancelled,
+        ) {
             Ok(outcome) => {
                 (hooks.progress)(BatchProgress::Item {
                     id: spec.id.clone(),

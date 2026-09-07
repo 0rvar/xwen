@@ -222,6 +222,30 @@ pub fn label_for(opened: &Path) -> String {
         .unwrap_or_else(|| "xwen".to_string())
 }
 
+/// The `tokenizer.json` a safetensors checkpoint at `path` uses, WITHOUT
+/// opening the checkpoint.
+///
+/// [`CheckpointSource::tokenizer_path`] answers the same question and costs a
+/// full open: validating a set reads and scans every shard, eight gigabytes of
+/// it. The server needs the answer to build a grammar trie for a vocabulary
+/// family, which it does before any checkpoint is resident and possibly for a
+/// checkpoint no request has yet asked to load, so it cannot pay that.
+///
+/// Same two layouts the loader's own search knows, in the same order: the
+/// checkpoint directory's own `tokenizer.json`, then a sibling
+/// `tokenizer/tokenizer.json`, which is how the Z-Image repo splits its text
+/// encoder from its tokenizer. `None` when `path` is not a safetensors
+/// checkpoint at all, or when neither file is there.
+pub fn tokenizer_beside(path: &Path) -> Option<PathBuf> {
+    let dir = safetensors_dir(path).ok().flatten()?;
+    let own = dir.join("tokenizer.json");
+    if own.is_file() {
+        return Some(own);
+    }
+    let sibling = dir.parent()?.join("tokenizer/tokenizer.json");
+    sibling.is_file().then_some(sibling)
+}
+
 /// The safetensors checkpoint directory `path` names, `None` when `path` is a
 /// GGUF (or anything else a GGUF open should be tried on), and an error when it
 /// is neither.

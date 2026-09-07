@@ -1048,10 +1048,16 @@ fn describe_safetensors_set(set: &xwen::qwen3::Qwen3Set) {
     }
 }
 
-/// The gate `xwen serve` and `xwen batch` apply before they commit to a
-/// checkpoint — both of them move cache state, and both would otherwise learn
-/// that this build cannot run one only at the lazy load, behind a download and
-/// a started server.
+/// The gate every surface that GENERATES applies before it commits to a
+/// checkpoint: `generate`, `chat`, `serve` and `batch`.
+///
+/// All four would otherwise learn that this build cannot run one only at the
+/// lazy load, behind a download and — on the server — a started process. And on
+/// the Z-Image encoder the load would SUCCEED: its weights parse, its config is
+/// a language model's, and layer 35 is zero-filled, so a run would produce
+/// fluent-looking output from a corrupt layer rather than fail. `xwen
+/// encode-text` is the surface that entry exists for and the only one that never
+/// evaluates that layer.
 ///
 /// The message is [`Model::not_servable_message`], the same sentence the HTTP
 /// APIs answer a request for an unrunnable checkpoint with, so the CLI and the
@@ -1735,6 +1741,9 @@ fn main() -> Result<()> {
                 Model::default(),
             )?;
             let size = checkpoint.model;
+            // Before `resolve_model` fetches, and before a load that on the
+            // encoder would SUCCEED and generate from a corrupt layer.
+            ensure_servable(size)?;
             let chat_opts = think.chat_options(size)?;
             let mut generator = build_generator(
                 &resolve_model(model, size)?,
@@ -1952,6 +1961,9 @@ fn main() -> Result<()> {
                 Model::default(),
             )?;
             let size = checkpoint.model;
+            // Before `resolve_model` fetches, and before a load that on the
+            // encoder would SUCCEED and generate from a corrupt layer.
+            ensure_servable(size)?;
             let chat_opts = think.chat_options(size)?;
             let mut generator = build_generator(
                 &resolve_model(model, size)?,
@@ -2366,17 +2378,20 @@ mod tests {
     /// each.
     #[test]
     fn the_cache_moving_surfaces_refuse_a_checkpoint_they_cannot_run() {
+        // The two Qwen3-4B language models are runnable now, so the gate has
+        // nothing to say about them. Asserted rather than dropped: a gate that
+        // silently kept refusing a checkpoint whose stack had landed would look
+        // exactly like a checkpoint that had not landed.
         for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
-            let err = ensure_servable(model).unwrap_err().to_string();
-            assert!(err.contains(model.full_name()), "{err}");
-            assert!(err.contains("layer stack is not implemented"), "{err}");
+            assert!(ensure_servable(model).is_ok(), "{model:?}");
         }
-        // The encoder is refused for a different reason, and says so: this one
-        // does not lift when the stack lands, and the operator's next move is a
-        // different command rather than a different build.
+        // The encoder is the one entry still refused, and its reason does not
+        // lift when a build lands: the operator's next move is a different
+        // command, not a different version.
         let err = ensure_servable(Model::ZImageTurboEncoder)
             .unwrap_err()
             .to_string();
+        assert!(err.contains(Model::ZImageTurboEncoder.full_name()), "{err}");
         assert!(err.contains("encode-only"), "{err}");
         assert!(err.contains("zero-filled"), "{err}");
         assert!(err.contains("encode-text"), "{err}");
