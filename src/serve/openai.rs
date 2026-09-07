@@ -88,7 +88,7 @@ pub(crate) fn error(
     }
 }
 
-fn bad_request(message: impl Into<String>) -> ApiError {
+pub(crate) fn bad_request(message: impl Into<String>) -> ApiError {
     error(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",

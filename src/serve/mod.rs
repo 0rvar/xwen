@@ -15,6 +15,7 @@ pub mod config;
 pub mod disk_cache;
 mod disk_tier;
 pub mod engine;
+pub mod images;
 pub mod log;
 pub(crate) mod native;
 pub mod openai;
@@ -170,6 +171,9 @@ pub struct AppState {
     /// events one request produces — they are never sent to a client and never
     /// appear in a log line — so a plain counter is all they have to be.
     pub next_request_id: Arc<AtomicU64>,
+    /// The image engine: its queue and its residency flag. Always present;
+    /// the thread loads nothing until the first images request.
+    pub images: Arc<images::Handle>,
 }
 
 /// A request for a graceful shutdown from something that is not a signal.
@@ -270,6 +274,8 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
         Arc::clone(&disk_pending),
         logger.clone(),
     );
+    let (image_handle, image_engine) =
+        images::spawn(&settings, Arc::clone(&shutdown), logger.clone());
 
     let address = format!("{}:{}", settings.host, settings.port);
     let state = AppState {
@@ -282,6 +288,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
         default_target,
         max_ctx,
         next_request_id: Arc::new(AtomicU64::new(1)),
+        images: Arc::new(image_handle),
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -325,9 +332,15 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
     jobs.close();
     logger.log(ServeLog::ShuttingDown);
     let engine_panicked = engine.join().is_err();
+    // The image engine exits once the router, and with it the last handle to
+    // its queue, is gone; a render in flight finishes first.
+    let image_engine_panicked = image_engine.join().is_err();
     served?;
     if engine_panicked {
         anyhow::bail!("the inference thread panicked");
+    }
+    if image_engine_panicked {
+        anyhow::bail!("the image engine thread panicked");
     }
     Ok(())
 }
@@ -588,7 +601,15 @@ fn router(state: AppState) -> Router {
             .route("/v1/messages/count_tokens", post(anthropic::count_tokens));
     }
     if state.settings.openai {
-        api = api.route("/v1/chat/completions", post(openai::chat_completions));
+        api = api
+            .route("/v1/chat/completions", post(openai::chat_completions))
+            // One handler on three paths; see `images` for why each exists.
+            .route("/v1/images/generations", post(images::generations))
+            .route("/images/generations", post(images::generations))
+            .route(
+                "/proxy/openai/images/generations",
+                post(images::generations),
+            );
     }
     // The native surface is not a compatibility dialect and has no opt-out: it
     // is the only way to reach the engine capabilities the other two cannot
@@ -798,6 +819,7 @@ async fn health(State(state): State<AppState>) -> Response {
         "status": "ok",
         "model_loaded": resident.is_some(),
         "model": resident.map(|target| model_id(&state.settings, &target)),
+        "image_model_loaded": state.images.is_loaded(),
     }))
     .into_response()
 }
@@ -905,6 +927,16 @@ async fn require_api_key(State(state): State<AppState>, request: Request, next: 
         anthropic::error(StatusCode::UNAUTHORIZED, "authentication_error", message).into_response()
     } else if is_native_path(path) {
         native::error(StatusCode::UNAUTHORIZED, "authentication_error", message).into_response()
+    } else if images::is_images_path(path) {
+        // 403, not 401: ComfyUI's client turns a 401 into "please log in to
+        // comfy.org" before it reads the body, and the body is the whole point.
+        openai::error(
+            StatusCode::FORBIDDEN,
+            "invalid_request_error",
+            Some("invalid_api_key"),
+            message,
+        )
+        .into_response()
     } else {
         openai::error(
             StatusCode::UNAUTHORIZED,
@@ -1690,6 +1722,7 @@ pub(crate) mod testutil {
             default_target: types::Target::served(crate::hub::Model::Qwen35BA3B),
             max_ctx,
             next_request_id: Arc::new(AtomicU64::new(1)),
+            images: Arc::new(images::Handle::detached()),
         };
         (state, jobs)
     }

@@ -2303,40 +2303,24 @@ fn run_encode_text(
     Ok(())
 }
 
-/// The prompt as a diffusion pipeline's text encoder sees it: rendered as one
-/// user turn with the generation prompt appended and thinking on (which on the
-/// Qwen3 dialect opens no `<think>` block) through the same renderer the chat
-/// surfaces use, tokenized with the checkpoint's OWN `tokenizer.json`, and
-/// truncated to the encoder entry's `max_tokens` with a warning — exactly
-/// diffusers' `ZImagePipeline._encode_prompt`. Both `encode-text` and `image`
-/// go through here so the two cannot drift.
+/// [`xwen::zimage::conditioning::prompt_ids`] with the truncation said out loud:
+/// the pipeline cuts a long prompt silently, and a CLI user should hear that
+/// the text past the limit was not encoded.
 fn encoder_prompt_ids(
     size: Model,
     tokenizer_path: &Path,
     prompt: String,
 ) -> Result<(String, Vec<u32>)> {
-    let chat_opts = ChatOptions::for_dialect(size.chat_dialect());
-    // The third element is the thinking state the generation prompt leaves
-    // the model in; an encoder generates nothing, so it has no reader here.
-    let (text, content_ranges, _thinking) =
-        build_prompt_with_spans(&[Message::User(prompt)], &chat_opts)?;
-    let tokenizer = xwen::tokenizer::LagunaTokenizer::from_file(tokenizer_path)
-        .with_context(|| format!("loading {}", tokenizer_path.display()))?;
-    let mut ids = tokenizer.encode_prompt(&text, &content_ranges)?;
-    if let Some(spec) = size.encoder_spec() {
-        if ids.len() > spec.max_tokens {
-            eprintln!(
-                "xwen: prompt is {} tokens, truncated to {}'s pipeline limit of {} (the text \
-                 past that is not encoded)",
-                ids.len(),
-                size.full_name(),
-                spec.max_tokens
-            );
-            ids.truncate(spec.max_tokens);
-        }
+    let rendered = xwen::zimage::conditioning::prompt_ids(size, tokenizer_path, &prompt)?;
+    if let Some(from) = rendered.truncated_from {
+        eprintln!(
+            "xwen: prompt is {from} tokens, truncated to {}'s pipeline limit of {} (the text \
+             past that is not encoded)",
+            size.full_name(),
+            rendered.ids.len()
+        );
     }
-    ensure!(!ids.is_empty(), "the rendered prompt tokenized to nothing");
-    Ok((text, ids))
+    Ok((rendered.text, rendered.ids))
 }
 
 /// `xwen image`'s flags, gathered so the run function has a name per field.

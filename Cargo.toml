@@ -75,6 +75,8 @@ toml = "1"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "layout-cache"] }
 # `xwen image`: the PNG writer for the Z-Image pipeline (src/zimage/pipeline.rs).
 png = "0.18.1"
+# `xwen serve`: the images route returns the PNG as `b64_json`.
+base64 = "0.22"
 
 [profile.release]
 debug = true

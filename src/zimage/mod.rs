@@ -35,6 +35,7 @@
 //! candle's fused Metal SDPA for an explicit matmul-softmax-matmul chain that
 //! shares no kernel with it. For bisecting, not for speed.
 
+pub mod conditioning;
 pub mod pipeline;
 pub mod sampling;
 pub mod scheduler;
