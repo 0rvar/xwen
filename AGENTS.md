@@ -423,8 +423,24 @@ The seams, so a change lands in one place:
   inside `forward` against the loaded `axes_lens`, which also catches a caption long
   enough to push the image past axis 0's 1536.
 - Aliases: `zimage-turbo` is the PIPELINE and `zimage-turbo-encoder` is the encode-only
-  entry. Neither is auto-fetched, neither is servable, and neither appears in
-  `/v1/models`.
+  entry. Neither is auto-fetched and neither appears in `/v1/models`. The pipeline is
+  served by the images route below and by nothing else; `servable()` is still false for
+  both, so the chat routes, `generate`, `chat` and `batch` refuse them with the one
+  sentence `not_servable_reason` owns.
+- **`src/serve/images.rs`** is the whole serve surface for images (2026-09-07): `POST
+  /v1/images/generations`, `/images/generations` and `/proxy/openai/images/generations`
+  on one handler, and the `image-engine` thread beside the language engine with its own
+  lazy load and its own idle unload on `--idle-unload`. The two engines do not coordinate
+  residency, so both can be resident inside one idle window (fine at 20 GB plus 20 GB,
+  thrashes with Flash-Next); not taken now, with the reopen condition in the record. The
+  prompt rendering both `xwen image` and the route use is
+  `zimage::conditioning::prompt_ids`, so a change to how the caption is rendered lands in
+  one place. The `model` rule is split by path (full name or nothing on the first two,
+  anything on the proxy path, logged), `negative_prompt` and `guidance_scale` are 400s
+  because Turbo would ignore them silently, and the route never returns 401, 402, 409 or
+  429: a missing key is a 403 and a full queue a 503, because the ComfyUI client rewrites
+  those four into comfy.org prompts (decisions/zimage.md "CLI first, then serve as
+  OpenAI", the Arc C paragraph).
 
 Traps that are silent, the short list (all of them, with evidence, in docs/zimage.md):
 rope is INTERLEAVED-pair, not the NEoX every Qwen graph here uses; the joint sequence is
@@ -668,3 +684,12 @@ format is JSON and the serve parser reads `<function=`). A server-wide thinking 
 stays INERT rather than refusing every request, which is the same rule
 `reasoning_effort` already followed: the dialect drops the resolved value in chat.rs, so
 an operator default can be silently ignored while an explicit request is an error.
+
+The images route joined the same evening (`src/serve/images.rs`, the Z-Image section
+above). Two things it changed on the shared surface: `/health` gained
+`image_model_loaded`, a second flag from a second engine, beside the `model_loaded` and
+`model` pair that still describe the language engine alone; and `require_api_key` answers
+403 rather than 401 on the three images paths (`images::is_images_path`), because the
+ComfyUI client turns a 401 into a comfy.org login prompt before reading the body. The
+routes are registered inside the OpenAI-dialect block and ABOVE the body-limit layer, like
+every other body-taking route.

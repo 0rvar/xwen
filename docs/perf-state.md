@@ -263,6 +263,20 @@ from the agent sandbox. The load figures predict about 20 GB resident (7.6 GB en
 12.3 GB bf16 transformer, 0.34 GB f32 VAE) plus activations, and measuring it from a user
 shell is a ledger item.
 
+**Under the serve route, 2026-09-07.** The same pipeline behind `POST
+/v1/images/generations` (Arc C), on a dev-tree release build, the language model never
+loaded, power mode NOT read; ordered against the CLI figures above, not calibrated.
+
+| Figure, images route | Value |
+| --- | --- |
+| 1024x1024, 8 steps, cold: load plus render | 80.4 s (load 33.6: encoder 2.3, transformer and VAE 31.4; render 46.7) |
+| 1024x1024, 8 steps, warm, the stock ComfyUI payload on the proxy path | 48.6 s |
+| 512x512, 8 steps, `n: 2`, warm | 23.3 s, 11.6 s per image |
+
+The warm 1024x1024 time per image under the route is the figure to quote for "how long
+does ComfyUI wait"; it is the CLI's 52 s less the process start, and it will move only
+when the step time does ([records/zimage-pipeline.md](records/zimage-pipeline.md) "Arc C").
+
 **The first cross-implementation datum, 2026-09-07, 512x512.** The Stage 3 dump ran the
 same weights through diffusers 0.40 on torch 2.14 mps, so the two sides were timed on one
 machine within minutes of each other, on the same 512x512 case. Power mode was NOT read

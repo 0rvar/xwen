@@ -64,15 +64,20 @@ transfers to them.]
 and nothing was promoted into the gap. The step-time item below now carries a measured
 ceiling datum from that arc.]
 
+[Amended 2026-09-07, evening: the images route shipped (log.md "`xwen serve` renders
+images") and its item moved to the archive whole, the node-pack half having been made
+conditional by the same-day amendment rather than a piece of the item; the Front is
+eight and nothing was promoted into the gap. What the route still owes is a proof from
+the laptop with the stock node, which is a record line, not an item.]
+
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
-2. **Serve the images route and ship a ComfyUI node** (Image generation, unpriced): the user is waiting to drive this from ComfyUI, which is the whole reason the pipeline is in the repo on a wire and not only on the CLI
-3. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
-4. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
-5. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
-6. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
-7. **Z-Image step time: 5.0-5.5 s per step against a ~3.1 s compute ceiling** (Image generation, measured): a step is ~62 TFLOP and the reported large-matmul rate on this chip puts it at ~3.1 s, so there is ~1.6x on the reading we have and up to 6x on the theoretical peak; ranked below every decode entry above it on purpose, because images are not a tok/s target
-8. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
-9. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
+2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
+3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
+4. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
+5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
+6. **Z-Image step time: 5.0-5.5 s per step against a ~3.1 s compute ceiling** (Image generation, measured): a step is ~62 TFLOP and the reported large-matmul rate on this chip puts it at ~3.1 s, so there is ~1.6x on the reading we have and up to 6x on the theoretical peak; ranked below every decode entry above it on purpose, because images are not a tok/s target
+7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
+8. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
 
 ## Decode performance
 
@@ -747,23 +752,6 @@ ceiling datum from that arc.]
 ## Tokenizer, chat and sampling
 
 ## Image generation
-
-- [ ] [unpriced] **Serve the images route and ship a ComfyUI node.** The user is waiting to
-  drive this from ComfyUI. `POST /v1/images/generations` in the OpenAI shape, with
-  `negative_prompt`, `num_inference_steps`, `guidance_scale` and `seed`/`rng_seed` as
-  top-level extension fields and `quality`/`style`/`n` and the rest accepted and ignored
-  (decisions.md "CLI first, then serve as OpenAI"). Two requirements that are easy to
-  miss: the image models must participate in the existing unload-on-idle behaviour, since
-  12.3 GB resident on a server answering language requests is not acceptable; and the
-  serve path is the second consumer that would justify the diffusion `CheckpointSource`
-  arm this arc deferred (2026-09-07).
-  Amended 2026-09-07: the zero-install client is ComfyUI's stock OpenAI image node under
-  `--comfy-api-base`, so the same handler answers at `/proxy/openai/images/generations`,
-  never returns 401/402/409/429, and is proven from the laptop with the stock node before
-  anything else; a node pack of our own is conditional on a named composition
-  (img2img, inpainting, LoRA, upscale chain), not part of this item.
-  [Record](docs/records/zimage-pipeline.md).
-  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
 
 - [ ] [measured] **Z-Image step time: 5.0-5.5 s per step against a ~3.1 s compute ceiling.**
   A 1024x1024 step is ~62 TFLOP (roughly 57 of linears at ~4200 tokens, ~10 of attention)

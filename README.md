@@ -178,14 +178,15 @@ pipeline, which is what `xwen image` runs.
 
 | Full name | Repo | `--model-size` | Role |
 | --- | --- | --- | --- |
-| `Z-Image-Turbo` | `Tongyi-MAI/Z-Image-Turbo`, whole repo | `zimage-turbo` / `z-image-turbo` | text-to-image, `xwen image` only |
+| `Z-Image-Turbo` | `Tongyi-MAI/Z-Image-Turbo`, whole repo | `zimage-turbo` / `z-image-turbo` | text-to-image, `xwen image` and the images route |
 
 Fifteen files, **32.9 GB** in total: the transformer is 24.6 GB of fp32 safetensors in
 three shards, cast to bf16 at load so it is 12.3 GB resident; the VAE is 168 MB; the text
 encoder is the 8.06 GB set above, listed on this entry too so one fetch leaves nothing to
-download. It is not auto-fetched and not servable, so `generate`, `chat`, `serve` and
-`batch` refuse it with one sentence saying it is a text-to-image pipeline, and it is
-never listed by `/v1/models`.
+download. It is not auto-fetched, and it is not a language model: `generate`, `chat`,
+`batch` and the chat routes of `serve` refuse it with one sentence saying it is a
+text-to-image pipeline, and it is never listed by `/v1/models`. What serves it is `POST
+/v1/images/generations` (below, under Serve).
 
 ```
 xwen fetch --model-size zimage-turbo
@@ -206,10 +207,10 @@ three. Anything else is refused with the reason, because the padded-image path i
 implemented and 8192 px is as far as the model's position tables reach.
 
 One image at 1024x1024 takes about 52 s warm, roughly 42 s of it in the
-eight transformer steps, and no performance work has been done on it. The arithmetic is
-not yet graded against a reference dump. `docs/zimage.md` is the architecture and the
-traps, `docs/records/zimage-pipeline.md` the arc, `docs/perf-state.md` the timings and
-their conditions.
+eight transformer steps, and no performance work has been done on it. The transformer is
+graded against a diffusers fp32 dump (`tests/zimage_parity.rs`, docs/parity.md).
+`docs/zimage.md` is the architecture and the traps, `docs/records/zimage-pipeline.md` the
+arcs, `docs/perf-state.md` the timings and their conditions.
 
 **`--model <path>` takes a safetensors directory** on every one-shot subcommand, not
 only `serve`: a directory, a `config.json` inside one or a `*.safetensors` inside one all
@@ -474,10 +475,33 @@ through one server is a deliberate exercise of the checkpoint swap.
 ## Serve
 
 `xwen serve` runs an HTTP server over the engine. Routes: `POST /v1/messages` (+
-`/v1/messages/count_tokens`) in the Anthropic dialect, `POST /v1/chat/completions` in
-the OpenAI dialect, `POST /xwen/v1/generate` and `POST /xwen/v1/batch` (the native
-surface), `GET /v1/models`, `GET /health`. `xwen serve --init` writes a commented
-config template; every setting is also a flag.
+`/v1/messages/count_tokens`) in the Anthropic dialect, `POST /v1/chat/completions` and
+`POST /v1/images/generations` in the OpenAI dialect, `POST /xwen/v1/generate` and
+`POST /xwen/v1/batch` (the native surface), `GET /v1/models`, `GET /health`. `xwen serve
+--init` writes a commented config template; every setting is also a flag.
+
+**Images (2026-09-07).** `POST /v1/images/generations` renders through Z-Image-Turbo in
+the OpenAI images shape, when the checkpoint is in the cache (`xwen fetch --model-size
+zimage-turbo`; an uncached one is a 400 naming that command). The same handler answers
+`/images/generations` and `/proxy/openai/images/generations`. It runs on its own thread
+beside the language engine, loads on the first request and unloads after `idle_unload`
+like a language model, one render at a time with four queued at most; `/health` reports
+it as `image_model_loaded`. Fields: `prompt`, `size` (`WxH` or `auto`, default 1024x1024),
+`n` (1 to 4), `seed`, `steps` (default 8), `response_format` (`b64_json` only); `model` is
+`Z-Image-Turbo` or absent, and anything the ComfyUI dropdown says on the proxy path. A
+negative prompt or a guidance scale is a 400, since Turbo runs without guidance and would
+ignore them silently. 1024x1024 takes about 49 s warm and 80 s cold, load included.
+
+```
+curl -sS http://127.0.0.1:8080/v1/images/generations \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"a red bicycle against a white brick wall, golden hour","size":"1024x1024","seed":7}' \
+  | jq -r '.data[0].b64_json' | base64 -d > out.png
+```
+
+ComfyUI on another machine needs nothing installed: start it with `--comfy-api-base
+http://<this mac>:8080` and its stock OpenAI image node renders here (`docs/zimage.md`
+"Serving"). Run without an `api_key` for that: the node sends none and would get a 403.
 
 **One server serves every checkpoint (2026-08-11).** `--model`/`--model-size` picks the
 DEFAULT checkpoint; any request may name another one and the engine lazy-loads it,

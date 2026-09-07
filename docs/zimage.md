@@ -103,6 +103,25 @@ runs one text-encoder pass per prompt and no second one.
 activations, with HF's `Qwen3RMSNorm` upcasting to fp32 internally and casting back
 before the weight multiply.
 
+## Serving
+
+Since 2026-09-07 the pipeline is also behind `xwen serve`, as `POST
+/v1/images/generations` in the OpenAI images shape, with the same handler on
+`/images/generations` and `/proxy/openai/images/generations`. The route is present
+whenever the OpenAI dialect is on; the encoder, the transformer and the VAE load on the
+first request and leave after `--idle-unload`, on an `image-engine` thread of their own
+beside the language engine. `src/serve/images.rs` is the whole route, and
+[records/zimage-pipeline.md](records/zimage-pipeline.md) "Arc C" has the field-by-field
+contract, the statuses and the measured times; the choices behind it are in
+[decisions/zimage.md](decisions/zimage.md) "CLI first, then serve as OpenAI".
+
+ComfyUI needs nothing installed: start ComfyUI with `--comfy-api-base
+http://<this mac>:<port>` and its stock OpenAI image node POSTs to the proxy path here.
+Run the server without an API key for that node, which sends none and would get a 403.
+The node's `model` dropdown is accepted whatever it says, its `size` dropdown offers
+1024x1024, 1024x1536, 1536x1024 and auto, and it carries no seed or step count on the
+wire; the `seed` and `steps` extension fields exist for clients that do.
+
 ## `hidden_states[-2]` is index 35, and why
 
 Current transformers collects hidden states through forward hooks, not an in-loop

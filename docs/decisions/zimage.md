@@ -184,6 +184,44 @@ an upscale chain. Making xwen a ComfyUI backend that speaks the frontend's own p
 is refuted as an approach: a large arc reimplementing a moving, loosely documented API for
 a fixed node set (2026-09-07).
 
+Shipped the same evening (Arc C, `src/serve/images.rs`), with six choices made on the way
+that the paragraphs above did not settle. **The images route is its own engine thread,
+not a third `Job` variant.** `image-engine` sits beside the language engine with its own
+bounded queue of four, its own lazy load from the cached snapshot and its own idle unload
+on the same `--idle-unload` setting, so the 20 GB resident for encoder, transformer and
+VAE leaves after the configured window exactly as a language model does. A third `Job`
+arm would have threaded an image request through `impl Job`'s seven accessors, the
+scheduler's prefill-cost closure and the KV-slot machinery, none of which has a meaning for
+a render. The price is that the two engines do NOT coordinate residency: a language model
+and the image pipeline can both be resident inside one idle window. That is fine for the
+27B and the 35B, about 20 GB each, and it thrashes with Flash-Next, whose 111 GB is
+mmap-backed and so degrades under the pressure rather than dying. Cross-engine eviction
+is not taken now; the reopen condition is someone serving Flash-Next and images from one
+process and measuring the stall. **The `model` rule is split by path.** `/v1/images/
+generations` and `/images/generations` take the full name `Z-Image-Turbo` or nothing, the
+rule every LM route follows, and a CLI alias is refused; `/proxy/openai/images/generations`
+takes whatever ComfyUI's dropdown says (`gpt-image-1`, `dall-e-3`) and logs the
+substitution, because that path exists for a node that cannot name the real model and
+there is one image model to serve. **A missing API key on the images paths is a 403, not a
+401, and a full queue is a 503 with `retry-after: 5`, not a 429**, for the reason the
+amendment gives: the ComfyUI client rewrites 401, 402, 409 and 429 into comfy.org login and
+credit messages before it reads the body. **`negative_prompt` and `guidance_scale` are
+400s, not accept-and-drop**, reversing the "accepted and ignored" line above for those
+two: Turbo is distilled to run without guidance, so a client that sent a negative prompt
+would get an image that silently ignored it and no way to learn that. `quality`, `style`,
+`background`, `moderation`, `user` and the rest are still dropped, since dropping them
+changes nothing the client could observe. **Z-Image-Turbo stays out of `/v1/models`**,
+unchanged: that list is what chat clients pick a chat model from, and the chat routes
+still refuse it with the one sentence `not_servable_reason` owns. **A queued render whose
+client hung up still renders.** There is no cancellation on this path; a render is
+seconds to a minute and the queue holds four, so the most a hang-up can waste is a few
+minutes of GPU. Not taken now; reopen if queues form in practice. A drawn seed is
+`rand::random::<u64>() >> 11` so it fits in 53 bits: the seed goes back in the JSON and a
+JavaScript client rounds anything wider, which would make the echoed seed not reproduce
+the image it came with; a client-given seed is used as given. The route is registered
+whenever the OpenAI dialect is on, and an uncached checkpoint is a 400 naming `xwen fetch
+--model-size zimage-turbo`, never an in-request download (2026-09-07).
+
 **The encoder and the transformer are both resident for the whole run.** diffusers offers
 the other arrangement, `model_cpu_offload_seq = "text_encoder->transformer->vae"`, and it
 exists because 8 GB plus 12.3 GB is a real problem on a 16 GB card. It is not one here:

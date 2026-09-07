@@ -4,6 +4,23 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — `xwen serve` renders images: `POST /v1/images/generations` in the OpenAI shape, 1024x1024 in 48.6 s warm and 80.4 s cold
+
+Arc C, the route the user was waiting for. One handler answers on three paths,
+`/v1/images/generations`, `/images/generations` and `/proxy/openai/images/generations`,
+the last being where ComfyUI's stock OpenAI image node POSTs under `--comfy-api-base`, so
+the node works against this server with nothing installed on the ComfyUI side. The work
+runs on an `image-engine` thread beside the language engine: its own lazy load from the
+cached snapshot, its own idle unload on `--idle-unload`, one render at a time, four queued
+at most, `image_model_loaded` on `/health`. Smoke on a dev-tree build, power mode not
+read: **1024x1024 cold 80.4 s (33.6 s load, 46.7 s render), warm 48.6 s through the stock
+node's exact payload; 512x512 at `n: 2` in 23.3 s**. Never 401, 402, 409 or 429 (the
+ComfyUI client rewrites those); a missing key is a 403 and a full queue a 503. The two
+engines do not coordinate residency, which is fine at 20 GB plus 20 GB and thrashes with
+Flash-Next; cross-engine eviction is not taken now. Still owed: the run from the laptop
+itself. [Record](records/zimage-pipeline.md), [decisions](decisions/zimage.md),
+[architecture](zimage.md).
+
 ## 2026-09-07 — The Z-Image transformer is graded: step-0 velocity at cosine 0.99930 against fp32, the reference's own bf16 at 0.99956
 
 Arc B, the bars the morning's entry said were missing. `scripts/zimage-ref-dump.py

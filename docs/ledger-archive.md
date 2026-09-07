@@ -3011,3 +3011,22 @@ blocks use of the feature; item (a) is the one with a known trigger.
   oracle be fast enough to re-run (2026-09-07).
   [Record](records/zimage-pipeline.md), [architecture](zimage.md).
   From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
+
+[Shipped 2026-09-07, the same evening, by Arc C (`src/serve/images.rs`, log.md "`xwen serve` renders images"): `POST /v1/images/generations` in the OpenAI shape, the same handler at `/images/generations` and `/proxy/openai/images/generations`, never a 401/402/409/429, on its own idle-unloading engine thread; the extension fields ride as named, except that `negative_prompt` and `guidance_scale` are 400s rather than ignored, a same-day decision. Archived whole: the node pack was made conditional by the 2026-09-07 amendment and is a decision line in docs/decisions/zimage.md, not a remainder of this item, and the proof from the laptop with the stock node is owed as a record line in docs/records/zimage-pipeline.md "Arc C", not as an item. The diffusion `CheckpointSource` arm it names now has its second consumer and stays a record line too.]
+
+- [x] [unpriced] **Serve the images route and ship a ComfyUI node.** The user is waiting to
+  drive this from ComfyUI. `POST /v1/images/generations` in the OpenAI shape, with
+  `negative_prompt`, `num_inference_steps`, `guidance_scale` and `seed`/`rng_seed` as
+  top-level extension fields and `quality`/`style`/`n` and the rest accepted and ignored
+  (decisions.md "CLI first, then serve as OpenAI"). Two requirements that are easy to
+  miss: the image models must participate in the existing unload-on-idle behaviour, since
+  12.3 GB resident on a server answering language requests is not acceptable; and the
+  serve path is the second consumer that would justify the diffusion `CheckpointSource`
+  arm this arc deferred (2026-09-07).
+  Amended 2026-09-07: the zero-install client is ComfyUI's stock OpenAI image node under
+  `--comfy-api-base`, so the same handler answers at `/proxy/openai/images/generations`,
+  never returns 401/402/409/429, and is proven from the laptop with the stock node before
+  anything else; a node pack of our own is conditional on a named composition
+  (img2img, inpainting, LoRA, upscale chain), not part of this item.
+  [Record](records/zimage-pipeline.md).
+  From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).

@@ -302,19 +302,103 @@ number or a waiting user are ledger items in [TODO.md](../../TODO.md) instead.
   hidden states for an external pipeline is a different feature and nobody asked for it.
   Reopen if something outside this process wants the conditioning.
 
+## Arc C, 2026-09-07: the images route in `xwen serve`
+
+The third arc of the day, and the one the user was waiting for: Z-Image-Turbo behind the
+OpenAI images shape so ComfyUI on another machine can render through this one. What
+shipped is `src/serve/images.rs`, one handler on three paths, and an `image-engine` thread
+beside the language engine (decisions.md "CLI first, then serve as OpenAI", the Arc C
+paragraph, for the six choices). The prompt rendering that `encode-text` and `image`
+shared moved from the CLI into the library as `zimage::conditioning::prompt_ids`, so the
+route renders the caption the way diffusers does without a copy of the code.
+
+The engine is one OS thread over a bounded crossbeam queue of four. It opens everything
+`xwen image` opens, from the cached snapshot, on the first request: the encoder through
+`CheckpointSource` and `XwenModel::load_encoder`, then `ZImagePipeline::load`. It holds
+both until `--idle-unload` elapses with nothing queued, then drops them and clears the
+flag `/health` reports as `image_model_loaded`. `n` images render one after another with
+seeds `seed, seed + 1, ...`; a drawn seed stays under 2^53 so a JavaScript client can echo
+it back exactly. Every event is a `ServeLog::HostLine`: the load with its encoder and
+transformer split, each render with its size, steps, seconds and seed, a proxy-path model
+substitution, a truncated prompt, the idle unload with the measured and configured spans.
+The two engines do not know about each other's residency (decisions.md, above).
+
+The contract, as implemented. Paths `POST /v1/images/generations`, `POST
+/images/generations` (where a client that `urljoin`s a base URL without its trailing
+slash lands) and `POST /proxy/openai/images/generations` (ComfyUI's stock OpenAI image
+node under `--comfy-api-base`). Unknown fields are dropped.
+
+| Field | Rule |
+| --- | --- |
+| `prompt` | required, non-empty after trim; else 400, `param: "prompt"` |
+| `model` | on `/v1` and `/images`: absent, `""` or `Z-Image-Turbo`, anything else 400 (the CLI alias included); on the proxy path: anything, logged |
+| `size` | `WxH`, `auto` or absent (both 1024x1024); malformed is 400 `Invalid size format: '...'. Expected WIDTHxHEIGHT.`, then `check_size`'s own sentence as a 400, both `param: "size"` |
+| `width`, `height` | both present override `size`; one alone is a 400 |
+| `n` | 1 to 4, default 1 |
+| `response_format` | absent or `b64_json`; `url` is a 400 saying the server hosts no URLs |
+| `output_format` | absent or `png` |
+| `stream` | `true` is a 400 |
+| `negative_prompt` (non-empty), `guidance_scale` (non-zero) | 400: Turbo runs without guidance and would ignore them silently |
+| `seed` / `rng_seed`, `steps` / `num_inference_steps` | either spelling; both present must agree; steps 1 to 50, default 8 |
+
+Statuses: 400 for a request fault, including an uncached checkpoint (the message names
+`xwen fetch --model-size zimage-turbo`); 503 with `retry-after: 5` when four requests are
+already queued; 500 when a render fails or the engine is gone; 403 rather than 401 for a
+missing API key on these paths. Never 401, 402, 409 or 429. The 200 body is `{"created",
+"model": "Z-Image-Turbo", "size": "WxH", "steps", "output_format": "png", "data":
+[{"b64_json", "seed"}]}`.
+
+Smoke, `xwen serve --port 5252 --idle-unload 30s` on a dev-tree release build, the
+language model never loaded, power mode not read:
+
+| Request | Status | Wall |
+| --- | --- | --- |
+| `/v1/images/generations`, 1024x1024, seed 7, cold | 200 | 80.4 s: load 33.6 s (encoder 2.3, transformer and VAE 31.4) plus render 46.7 s; the PNG decodes as 1024x1024 RGB8 and shows the prompt |
+| `/proxy/openai/images/generations`, the stock node's exact payload with `model: gpt-image-1`, warm | 200 | 48.6 s, substitution logged |
+| `/images/generations`, 512x512, `n: 2`, seed 100 | 200 | 23.3 s, seeds 100 and 101, 11.6 s per render |
+| `size: "1024x"` | 400 | the size message, `param: "size"` |
+| `response_format: "url"` | 400 | the b64_json-only message |
+| `model: gpt-image-1` on `/v1` | 400 | the unknown-model message naming Z-Image-Turbo |
+| malformed JSON | 400 | the parse message |
+| `/health` after the renders, then 40 s later | 200 | `image_model_loaded` true, then false; the log shows the unload after 30 s idle |
+
+Ten unit tests cover the validation table and the three-path predicate without a
+checkpoint, including that the stock node's exact payload parses. The full suite stayed
+green (1321 library tests) and clippy reports nothing new in the touched files.
+
+### Not taken now, Arc C
+
+- **Cross-engine eviction.** The language engine and the image engine each unload on
+  their own idle timer and neither asks the other to leave. Fine at 20 GB plus 20 GB;
+  Flash-Next plus images thrashes, mmap-backed, until one of them idles out. Reopen when
+  someone serves Flash-Next and images from one process and measures the stall; the
+  mechanism would be a control message into `JobQueue` that the engine loop treats as an
+  immediate idle unload.
+- **Cancellation of a queued render.** A client that hangs up leaves its job in the queue
+  and the engine renders it anyway; the reply goes nowhere. Bounded by four queued jobs of
+  seconds to a minute each. Reopen if queues form in practice; the fix is a cancel flag
+  on `ImageJob` checked before the render starts, as the language jobs already carry.
+- **Listing Z-Image-Turbo in `/v1/models`.** Kept out, since the chat routes refuse it and
+  the list is what chat clients pick from. Reopen if an OpenAI images client turns out to
+  read `/v1/models` to populate its own dropdown.
+- **The proof from the laptop.** The route is proven with the stock node's payload from
+  curl, not yet from ComfyUI itself on another machine. That is the verification still
+  owed, below.
+
 ### Next
 
-Arc B shipped the same day (above), so the graph now has something to regress against and
-the ordering constraint on performance work is lifted. The next arc is the serve route,
-TODO.md Front "Serve the images route and ship a ComfyUI node": `POST
-/v1/images/generations` in the OpenAI shape, the same handler at
-`/proxy/openai/images/generations` for ComfyUI's stock node under `--comfy-api-base`,
-never a 401/402/409/429, proven from the laptop with the stock node. Entry points: the
-router in `src/serve/mod.rs` (register the route ABOVE the body-limit layer), a third
-`Job` variant in `src/serve/types.rs`, the lazy load and the idle-unload timer in
-`src/serve/engine.rs`, and `zimage::pipeline::encode_png` for the bytes. Prerequisites the
-route needs and this record already priced: about 20 GB resident for encoder plus
-transformer plus VAE, so the image models must join the unload-on-idle path; and the
-route is the second consumer that reopens the diffusion `CheckpointSource` arm below.
-Verification is the parity gate above (unchanged by a route) plus a request from the
-stock ComfyUI node returning the same PNG the CLI writes for the same seed.
+Three arcs landed today and the graph is graded, so what remains on this ledger is a
+proof, a candidate and a perf item. The proof is the one Arc C left owed: ComfyUI on the
+laptop with `--comfy-api-base http://<this mac>:<port>` and the stock OpenAI image node,
+no API key (the node sends none and would get a 403), rendering through this server; the
+mechanism is confirmed in ComfyUI's source and unattested in the wild, and the first run
+settles it. The candidate is LoRA support, which the user asked about and which is
+server-side by design (merge at load, a `<lora:name:scale>` tag or an extension field, a
+listing route); it enters the ledger as an area item behind the proof once it carries a
+number or a named LoRA. The perf item is TODO.md "Z-Image step time", now with a measured
+ceiling: torch bf16 on mps runs a 512x512 step in 0.35 s against xwen's 1.23, and the
+first job there is to measure the matmul rate xwen achieves at 1024x1024, where the
+parity gate above (unchanged by any of it) is what says a faster step is still the right
+one. The diffusion `CheckpointSource` arm below now has its second consumer,
+`images::Loaded::open`, which duplicates `run_image`'s open sequence; that is the reopen
+condition met, and it is a chore for whichever arc touches the loader next.
