@@ -16,7 +16,8 @@
 # pre-Metal-4 and every tensor kernel fails at runtime. BLAS is off: Metal does
 # the real work.
 set -euo pipefail
-REPO="$(cd "$(dirname "$0")/.." && pwd)/reference/llama.cpp"
+SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+REPO="$SCRIPTS/../reference/llama.cpp"
 cd "$REPO"
 
 SDK="$(xcrun --show-sdk-path)"
@@ -33,7 +34,7 @@ nix shell nixpkgs#cmake --command bash -c "
 # It links the libraries cmake just produced and lands beside them in build/bin, so
 # @loader_path is all the rpath it needs. Keep the compile line here — it is the
 # only record of how the binary was produced.
-SRC="$(cd "$(dirname "$0")" && pwd)/llama-logits-all.cpp"
+SRC="$SCRIPTS/llama-logits-all.cpp"
 clang++ -std=c++17 -O2 -o "$REPO/build/bin/llama-logits-all" "$SRC" \
   -I "$REPO/include" -I "$REPO/ggml/include" \
   -L "$REPO/build/bin" -lllama -lggml -lggml-base \
