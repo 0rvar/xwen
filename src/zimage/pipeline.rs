@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail, ensure};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
+use super::linear::LinearImpl;
 use super::sampling::{postprocess_image, seeded_noise};
 use super::scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};
 use super::transformer::{
@@ -75,7 +76,8 @@ pub struct ZImagePipeline {
     vae: AutoEncoderKL,
     scheduler_cfg: SchedulerConfig,
     device: Device,
-    /// The transformer's compute dtype. bf16, as the reference runs it.
+    /// The transformer's activation dtype: f32 between every layer. The
+    /// projection weights are bf16 on the device whatever this says.
     dtype: DType,
 }
 
@@ -83,23 +85,30 @@ impl ZImagePipeline {
     /// Open the pipeline at a repo snapshot root — the directory holding
     /// `model_index.json`, `transformer/`, `vae/` and `scheduler/`.
     ///
-    /// The transformer's fp32 shards are cast to bf16 as they load; the VAE's
-    /// bf16 weights are widened to f32, which is the dtype it decodes in.
+    /// The transformer's fp32 projection weights are cast to bf16 as they
+    /// load and everything else (norms, pad tokens, biases) stays f32; the
+    /// VAE's bf16 weights are widened to f32, which is the dtype it decodes in.
     pub fn load(root: &Path, device: &Device) -> Result<Self> {
-        // Before anything opens: a typo in the bisect switch is a load error,
+        // Before anything opens: a typo in a bisect switch is a load error,
         // not a run that quietly measures the shipped arm twice.
         let attn = AttnImpl::from_env()?;
+        let linear = LinearImpl::from_env()?;
         let transformer_dir = root.join("transformer");
         let mut transformer_cfg: Config = read_json(&transformer_dir.join("config.json"))?;
         transformer_cfg.set_attn_impl(attn);
+        transformer_cfg.set_linear_impl(linear);
         if attn != AttnImpl::Fused {
             eprintln!("xwen: z-image attention arm: {}", attn.label());
         }
+        if linear != LinearImpl::Xwen {
+            eprintln!("xwen: z-image linear arm: {}", linear.label());
+        }
         let shards = shard_paths(&transformer_dir)?;
-        let dtype = DType::BF16;
+        let dtype = DType::F32;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, device)? };
         let transformer = ZImageTransformer2DModel::new(&transformer_cfg, vb)
             .context("building the Z-Image transformer")?;
+        eprintln!("xwen: {}", transformer.weight_range().summary());
 
         let vae_dir = root.join("vae");
         let vae_cfg: VaeConfig = read_json(&vae_dir.join("config.json"))?;

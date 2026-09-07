@@ -36,12 +36,14 @@
 //! shares no kernel with it. For bisecting, not for speed.
 
 pub mod conditioning;
+pub mod linear;
 pub mod pipeline;
 pub mod sampling;
 pub mod scheduler;
 pub mod transformer;
 pub mod vae;
 
+pub use linear::{LINEAR_ENV, LinearImpl};
 pub use pipeline::{ImageOptions, Rendered, Timings, ZImagePipeline, encode_png, write_png};
 pub use sampling::{postprocess_image, seeded_noise};
 pub use scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};

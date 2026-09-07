@@ -11,8 +11,10 @@
 //! reference implementation.
 
 use candle_core::{D, DType, Device, IndexOp, Module, Result, Tensor};
-use candle_nn::{VarBuilder, linear, linear_no_bias};
+use candle_nn::VarBuilder;
 use candle_transformers::models::with_tracing::RmsNorm;
+
+use super::linear::{LinearImpl, Projection, WeightRange, ensure_weights_fit_f16};
 
 // ==================== Constants ====================
 
@@ -82,6 +84,12 @@ pub struct Config {
     /// [`ATTN_ENV`] — `XWEN_ZIMAGE_ATTN=basic` selects the reference arm.
     #[serde(default = "default_use_accelerated_attn")]
     pub use_accelerated_attn: bool,
+    /// Whether the linear layers run through xwen's Metal-4 tensor gemm (the
+    /// default) or through candle's bf16 gemm, the pre-kernel path and the
+    /// bisect arm. Not a key in the shipped config.json either; the `serde`
+    /// default reads [`super::linear::LINEAR_ENV`].
+    #[serde(default = "default_use_xwen_linear")]
+    pub use_xwen_linear: bool,
 }
 
 /// Padding length that takes `ori_len` up to the next multiple of
@@ -162,6 +170,10 @@ fn default_use_accelerated_attn() -> bool {
     AttnImpl::from_env_or_default().is_accelerated()
 }
 
+fn default_use_xwen_linear() -> bool {
+    LinearImpl::from_env_or_default().is_xwen()
+}
+
 fn default_patch_size() -> Vec<usize> {
     vec![2]
 }
@@ -234,7 +246,23 @@ impl Config {
             axes_dims: vec![32, 48, 48],
             axes_lens: AXES_LENS.to_vec(),
             use_accelerated_attn: AttnImpl::from_env_or_default().is_accelerated(),
+            use_xwen_linear: LinearImpl::from_env_or_default().is_xwen(),
         }
+    }
+
+    /// Which linear-layer kernel this config runs.
+    pub fn linear_impl(&self) -> LinearImpl {
+        if self.use_xwen_linear {
+            LinearImpl::Xwen
+        } else {
+            LinearImpl::Candle
+        }
+    }
+
+    /// Pick the linear-layer kernel explicitly, overriding what
+    /// [`super::linear::LINEAR_ENV`] said when this config was built.
+    pub fn set_linear_impl(&mut self, arm: LinearImpl) {
+        self.use_xwen_linear = arm.is_xwen();
     }
 
     /// Which attention chain this config runs.
@@ -270,15 +298,21 @@ impl Config {
 /// Timestep embedding using sinusoidal encoding + MLP
 #[derive(Debug, Clone)]
 pub struct TimestepEmbedder {
-    linear1: candle_nn::Linear,
-    linear2: candle_nn::Linear,
+    linear1: Projection,
+    linear2: Projection,
     frequency_embedding_size: usize,
 }
 
 impl TimestepEmbedder {
-    pub fn new(out_size: usize, mid_size: usize, vb: VarBuilder) -> Result<Self> {
-        let linear1 = linear(FREQUENCY_EMBEDDING_SIZE, mid_size, vb.pp("mlp").pp("0"))?;
-        let linear2 = linear(mid_size, out_size, vb.pp("mlp").pp("2"))?;
+    pub fn new(out_size: usize, mid_size: usize, vb: VarBuilder, arm: LinearImpl) -> Result<Self> {
+        let linear1 = Projection::new(
+            FREQUENCY_EMBEDDING_SIZE,
+            mid_size,
+            true,
+            vb.pp("mlp").pp("0"),
+            arm,
+        )?;
+        let linear2 = Projection::new(mid_size, out_size, true, vb.pp("mlp").pp("2"), arm)?;
         Ok(Self {
             linear1,
             linear2,
@@ -300,8 +334,8 @@ impl TimestepEmbedder {
 
     pub fn forward(&self, t: &Tensor) -> Result<Tensor> {
         let device = t.device();
-        let dtype = self.linear1.weight().dtype();
-        let t_freq = self.timestep_embedding(t, device, dtype)?;
+        // The activation stream is f32 throughout the transformer.
+        let t_freq = self.timestep_embedding(t, device, DType::F32)?;
         t_freq.apply(&self.linear1)?.silu()?.apply(&self.linear2)
     }
 }
@@ -311,25 +345,36 @@ impl TimestepEmbedder {
 /// SwiGLU feedforward network
 #[derive(Debug, Clone)]
 pub struct FeedForward {
-    w1: candle_nn::Linear,
-    w2: candle_nn::Linear,
-    w3: candle_nn::Linear,
+    w1: Projection,
+    w2: Projection,
+    w3: Projection,
 }
 
 impl FeedForward {
-    pub fn new(dim: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let w1 = linear_no_bias(dim, hidden_dim, vb.pp("w1"))?;
-        let w2 = linear_no_bias(hidden_dim, dim, vb.pp("w2"))?;
-        let w3 = linear_no_bias(dim, hidden_dim, vb.pp("w3"))?;
+    pub fn new(dim: usize, hidden_dim: usize, vb: VarBuilder, arm: LinearImpl) -> Result<Self> {
+        let w1 = Projection::new(dim, hidden_dim, false, vb.pp("w1"), arm)?;
+        let w2 = Projection::new(hidden_dim, dim, false, vb.pp("w2"), arm)?;
+        let w3 = Projection::new(dim, hidden_dim, false, vb.pp("w3"), arm)?;
         Ok(Self { w1, w2, w3 })
+    }
+
+    fn projections(&self) -> [&Projection; 3] {
+        [&self.w1, &self.w2, &self.w3]
     }
 }
 
 impl Module for FeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x1 = x.apply(&self.w1)?.silu()?;
-        let x3 = x.apply(&self.w3)?;
-        (x1 * x3)?.apply(&self.w2)
+        let gate = x.apply(&self.w1)?;
+        let up = x.apply(&self.w3)?;
+        // `silu(gate) * up` in one pass on Metal (bit-identical to the candle
+        // chain, which is what runs everywhere else).
+        let act = if gate.device().is_metal() && gate.dtype() == DType::F32 {
+            crate::ops::silu_mul(&gate, &up).map_err(|e| candle_core::Error::Msg(e.to_string()))?
+        } else {
+            (gate.silu()? * up)?
+        };
+        act.apply(&self.w2)
     }
 }
 
@@ -485,10 +530,10 @@ pub fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor
 /// Z-Image attention with QK normalization and 3D RoPE
 #[derive(Debug, Clone)]
 pub struct ZImageAttention {
-    to_q: candle_nn::Linear,
-    to_k: candle_nn::Linear,
-    to_v: candle_nn::Linear,
-    to_out: candle_nn::Linear,
+    to_q: Projection,
+    to_k: Projection,
+    to_v: Projection,
+    to_out: Projection,
     qk_norm: Option<QkNorm>,
     n_heads: usize,
     head_dim: usize,
@@ -500,11 +545,12 @@ impl ZImageAttention {
         let dim = cfg.dim;
         let n_heads = cfg.n_heads;
         let head_dim = cfg.head_dim();
+        let arm = cfg.linear_impl();
 
-        let to_q = linear_no_bias(dim, n_heads * head_dim, vb.pp("to_q"))?;
-        let to_k = linear_no_bias(dim, cfg.n_kv_heads * head_dim, vb.pp("to_k"))?;
-        let to_v = linear_no_bias(dim, cfg.n_kv_heads * head_dim, vb.pp("to_v"))?;
-        let to_out = linear_no_bias(n_heads * head_dim, dim, vb.pp("to_out").pp("0"))?;
+        let to_q = Projection::new(dim, n_heads * head_dim, false, vb.pp("to_q"), arm)?;
+        let to_k = Projection::new(dim, cfg.n_kv_heads * head_dim, false, vb.pp("to_k"), arm)?;
+        let to_v = Projection::new(dim, cfg.n_kv_heads * head_dim, false, vb.pp("to_v"), arm)?;
+        let to_out = Projection::new(n_heads * head_dim, dim, false, vb.pp("to_out").pp("0"), arm)?;
 
         let qk_norm = if cfg.qk_norm {
             Some(QkNorm::new(head_dim, cfg.norm_eps, vb.clone())?)
@@ -522,6 +568,10 @@ impl ZImageAttention {
             head_dim,
             use_accelerated_attn: cfg.use_accelerated_attn,
         })
+    }
+
+    fn projections(&self) -> [&Projection; 4] {
+        [&self.to_q, &self.to_k, &self.to_v, &self.to_out]
     }
 
     /// Bidirectional attention over the whole sequence. `attention_mask` is
@@ -587,6 +637,10 @@ impl ZImageAttention {
         scale: f64,
     ) -> Result<Tensor> {
         let sdpa_mask = self.prepare_sdpa_mask(mask, q)?;
+        // q, k, v arrive f32 and the kernel takes them as they are: casting
+        // the three to bf16 first was measured at 1024x1024 and saved nothing
+        // (3.0-3.6 s per step either way), so the f32 path keeps the precision
+        // for free.
         candle_nn::ops::sdpa(q, k, v, sdpa_mask.as_ref(), false, scale as f32, 1.0)
     }
 
@@ -660,16 +714,17 @@ pub struct ZImageTransformerBlock {
     attention_norm2: RmsNorm,
     ffn_norm1: RmsNorm,
     ffn_norm2: RmsNorm,
-    adaln_modulation: Option<candle_nn::Linear>,
+    adaln_modulation: Option<Projection>,
 }
 
 impl ZImageTransformerBlock {
     pub fn new(cfg: &Config, modulation: bool, vb: VarBuilder) -> Result<Self> {
         let dim = cfg.dim;
         let hidden_dim = cfg.hidden_dim();
+        let arm = cfg.linear_impl();
 
         let attention = ZImageAttention::new(cfg, vb.pp("attention"))?;
-        let feed_forward = FeedForward::new(dim, hidden_dim, vb.pp("feed_forward"))?;
+        let feed_forward = FeedForward::new(dim, hidden_dim, vb.pp("feed_forward"), arm)?;
 
         let attention_norm1 = RmsNorm::new(dim, cfg.norm_eps, vb.pp("attention_norm1"))?;
         let attention_norm2 = RmsNorm::new(dim, cfg.norm_eps, vb.pp("attention_norm2"))?;
@@ -678,10 +733,12 @@ impl ZImageTransformerBlock {
 
         let adaln_modulation = if modulation {
             let adaln_dim = dim.min(ADALN_EMBED_DIM);
-            Some(linear(
+            Some(Projection::new(
                 adaln_dim,
                 4 * dim,
+                true,
                 vb.pp("adaLN_modulation").pp("0"),
+                arm,
             )?)
         } else {
             None
@@ -696,6 +753,13 @@ impl ZImageTransformerBlock {
             ffn_norm2,
             adaln_modulation,
         })
+    }
+
+    fn projections(&self) -> Vec<&Projection> {
+        let mut all: Vec<&Projection> = self.attention.projections().to_vec();
+        all.extend(self.feed_forward.projections());
+        all.extend(self.adaln_modulation.iter());
+        all
     }
 
     pub fn forward(
@@ -785,23 +849,37 @@ impl Module for LayerNormNoParams {
 #[derive(Debug, Clone)]
 pub struct FinalLayer {
     norm_final: LayerNormNoParams,
-    linear: candle_nn::Linear,
-    adaln_silu: candle_nn::Linear,
+    linear: Projection,
+    adaln_silu: Projection,
 }
 
 impl FinalLayer {
-    pub fn new(hidden_size: usize, out_channels: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        hidden_size: usize,
+        out_channels: usize,
+        vb: VarBuilder,
+        arm: LinearImpl,
+    ) -> Result<Self> {
         let norm_final = LayerNormNoParams::new(1e-6);
-        let linear = candle_nn::linear(hidden_size, out_channels, vb.pp("linear"))?;
+        let linear = Projection::new(hidden_size, out_channels, true, vb.pp("linear"), arm)?;
         let adaln_dim = hidden_size.min(ADALN_EMBED_DIM);
-        let adaln_silu =
-            candle_nn::linear(adaln_dim, hidden_size, vb.pp("adaLN_modulation").pp("1"))?;
+        let adaln_silu = Projection::new(
+            adaln_dim,
+            hidden_size,
+            true,
+            vb.pp("adaLN_modulation").pp("1"),
+            arm,
+        )?;
 
         Ok(Self {
             norm_final,
             linear,
             adaln_silu,
         })
+    }
+
+    fn projections(&self) -> [&Projection; 2] {
+        [&self.linear, &self.adaln_silu]
     }
 
     pub fn forward(&self, x: &Tensor, c: &Tensor) -> Result<Tensor> {
@@ -953,8 +1031,8 @@ pub fn create_coordinate_grid(
 pub struct ZImageTransformer2DModel {
     t_embedder: TimestepEmbedder,
     cap_embedder_norm: RmsNorm,
-    cap_embedder_linear: candle_nn::Linear,
-    x_embedder: candle_nn::Linear,
+    cap_embedder_linear: Projection,
+    x_embedder: Projection,
     final_layer: FinalLayer,
     /// Learned embedding for the image rows that pad the token count up to a
     /// multiple of [`SEQ_MULTI_OF`]. They attend and are attended to, unmasked.
@@ -966,15 +1044,22 @@ pub struct ZImageTransformer2DModel {
     layers: Vec<ZImageTransformerBlock>,
     rope_embedder: RopeEmbedder,
     cfg: Config,
+    /// What the load-time f16 range check over every projection found.
+    weight_range: WeightRange,
 }
 
 impl ZImageTransformer2DModel {
+    /// Build from `vb`, whose dtype is the ACTIVATION dtype (f32: norm
+    /// weights, pad tokens and biases are fetched in it); every projection
+    /// weight is fetched as bf16 regardless. Refuses a checkpoint whose
+    /// projections would not survive the tensor gemm's f16 staging.
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let device = vb.device();
+        let arm = cfg.linear_impl();
 
         // TimestepEmbedder
         let adaln_dim = cfg.dim.min(ADALN_EMBED_DIM);
-        let t_embedder = TimestepEmbedder::new(adaln_dim, 1024, vb.pp("t_embedder"))?;
+        let t_embedder = TimestepEmbedder::new(adaln_dim, 1024, vb.pp("t_embedder"), arm)?;
 
         // Caption embedder
         let cap_embedder_norm = RmsNorm::new(
@@ -982,22 +1067,38 @@ impl ZImageTransformer2DModel {
             cfg.norm_eps,
             vb.pp("cap_embedder").pp("0"),
         )?;
-        let cap_embedder_linear = linear(cfg.cap_feat_dim, cfg.dim, vb.pp("cap_embedder").pp("1"))?;
+        let cap_embedder_linear = Projection::new(
+            cfg.cap_feat_dim,
+            cfg.dim,
+            true,
+            vb.pp("cap_embedder").pp("1"),
+            arm,
+        )?;
 
         // Patch embedder (assuming patch_size=2, f_patch_size=1)
         let patch_dim = cfg.all_f_patch_size[0]
             * cfg.all_patch_size[0]
             * cfg.all_patch_size[0]
             * cfg.in_channels;
-        let x_embedder = linear(patch_dim, cfg.dim, vb.pp("all_x_embedder").pp("2-1"))?;
+        let x_embedder = Projection::new(
+            patch_dim,
+            cfg.dim,
+            true,
+            vb.pp("all_x_embedder").pp("2-1"),
+            arm,
+        )?;
 
         // Final layer
         let out_channels = cfg.all_patch_size[0]
             * cfg.all_patch_size[0]
             * cfg.all_f_patch_size[0]
             * cfg.in_channels;
-        let final_layer =
-            FinalLayer::new(cfg.dim, out_channels, vb.pp("all_final_layer").pp("2-1"))?;
+        let final_layer = FinalLayer::new(
+            cfg.dim,
+            out_channels,
+            vb.pp("all_final_layer").pp("2-1"),
+            arm,
+        )?;
 
         // Pad tokens
         let x_pad_token = vb.get((1, cfg.dim), "x_pad_token")?;
@@ -1041,7 +1142,7 @@ impl ZImageTransformer2DModel {
             device,
         )?;
 
-        Ok(Self {
+        let mut model = Self {
             t_embedder,
             cap_embedder_norm,
             cap_embedder_linear,
@@ -1054,7 +1155,39 @@ impl ZImageTransformer2DModel {
             layers,
             rope_embedder,
             cfg: cfg.clone(),
-        })
+            weight_range: WeightRange {
+                max_abs: 0.0,
+                max_abs_tensor: String::new(),
+                total: 0,
+            },
+        };
+        model.weight_range = ensure_weights_fit_f16(model.projections(), device)?;
+        Ok(model)
+    }
+
+    /// Every linear layer of the model, in checkpoint order.
+    fn projections(&self) -> Vec<&Projection> {
+        let mut all = vec![
+            &self.t_embedder.linear1,
+            &self.t_embedder.linear2,
+            &self.cap_embedder_linear,
+            &self.x_embedder,
+        ];
+        all.extend(self.final_layer.projections());
+        for block in self
+            .noise_refiner
+            .iter()
+            .chain(&self.context_refiner)
+            .chain(&self.layers)
+        {
+            all.extend(block.projections());
+        }
+        all
+    }
+
+    /// What the load-time f16 range check found over every projection.
+    pub fn weight_range(&self) -> &WeightRange {
+        &self.weight_range
     }
 
     /// One denoising forward at batch 1.
@@ -1433,6 +1566,7 @@ mod tests {
             axes_dims: vec![32, 48, 48],
             axes_lens: vec![40, 8, 8],
             use_accelerated_attn: true,
+            use_xwen_linear: true,
         }
     }
 
