@@ -2964,3 +2964,29 @@ blocks use of the feature; item (a) is the one with a known trigger.
   walk) are folded into «Above the 2048 indexer budget: +165 dispatches» in "Decode
   performance"; the retired per-chunk readback item's reopen condition is this number.
   From: Deferred from the long-context envelope arc (2026-09-06).
+
+## Deferred from the dense Qwen3-4B arcs (2026-09-07)
+
+[Shipped 2026-09-07: the bars were decided and both gates pass under them; the decision is in docs/decisions/ground-truth-and-parity.md and the arc in docs/records/qwen3-dense.md (Arc 4). No open remainder.]
+
+- [x] [blocked] **Decide the Stage 1 bars for the dense Qwen3 track.** The proposed
+  2e-2 max-abs with 100% argmax agreement is not attainable, and the reason is the
+  reference: llama.cpp's own CPU and Metal backends differ by pooled max-abs 0.358 with 4
+  argmax flips over the 20 fixture prompts, while xwen reads 0.222 with 3 flips against
+  the Metal arm and 0.379 with 7 against the CPU arm, every flip on every arm inside the
+  near-tie band, pooled top-5 99.9239% and 99.9176% (2026-09-07). xwen is closer to the
+  Metal oracle than the two oracle backends are to each other. Recommendation: gate
+  pooled top-5 at 99.9%, gate argmax as "no flip outside the near-tie band", and report
+  max-abs against the oracle's own backend spread instead of a fixed number. Counter:
+  such a bar certifies only "as close as llama.cpp is to itself" and would not catch a
+  systematic error under 0.358. **The consistency bar is the same decision** (2026-09-07,
+  tabulated): the whole internal spread is the gemv path at chunks 1/7/8 against the
+  tensor gemm at 9/16, peaking at 1.49e-1 on one position with argmax agreeing everywhere,
+  and that position is the Stage 1 outlier too, against an oracle whose bf16 gemm stages
+  activations to half exactly as ours does. Decode and prefill legitimately differ by up
+  to ~0.15 logits at a few positions, so a bar is a statement about which is the
+  reference; `XWEN_QWEN3_CONSISTENCY_MAX_ABS` is the override to set once it is decided.
+  Until then neither gate can be called a gate.
+  [Record](records/qwen3-dense.md), [runbook](parity.md).
+  From: Deferred from the dense Qwen3-4B arcs (2026-09-07).
+

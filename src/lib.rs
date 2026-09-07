@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod batch;
 pub mod chat;
+pub mod checkpoint;
 pub mod config;
 pub mod constrain;
 pub mod dflash;
@@ -18,13 +19,18 @@ pub mod moe;
 pub mod mtp;
 pub mod ops;
 pub mod parity_schema;
+pub mod qwen3;
 pub mod qwen4exp;
 pub mod rope;
 pub mod sampler;
 pub mod serve;
 pub mod stack_profile;
+/// Shared test helpers. Compiled only for tests: nothing here ships.
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tokenizer;
 
+pub use checkpoint::CheckpointSource;
 pub use config::XwenConfig;
 pub use generate::Generator;
 pub use model::XwenModel;

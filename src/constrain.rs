@@ -38,16 +38,24 @@
 //! arms itself when it sees `</think>` commit — the same activation edge
 //! `ThinkBudget` uses, and correct under DFlash because activation rides
 //! `on_committed`, which the verify walk calls per row in commit order.
+//!
+//! On a template that leaves the `<think>` opener to the model
+//! (`chat::ThinkingEntry::ModelOpens`) there is one more state: the reply's
+//! first token is what says whether a block is being opened at all, so that
+//! single draw is masked by the grammar WITH `<think>` added and the token
+//! itself resolves the state — dormant if it opened the block, live and
+//! consumed if it did not.
 
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use llguidance::api::TopLevelGrammar;
 use llguidance::{Matcher, ParserFactory};
 use toktrie::{SimpleVob, TokEnv};
 use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 
-use crate::tokenizer::{EMBEDDED_TOKENIZER_JSON, LagunaTokenizer};
+use crate::chat::ThinkingEntry;
+use crate::tokenizer::{EMBEDDED_TOKENIZER_JSON, LagunaTokenizer, Specials};
 
 /// Token trie + parser factory over the embedded vocabulary. Build once and
 /// share (`Arc`-clone is cheap; the factory itself is `Send + Sync`).
@@ -55,18 +63,65 @@ pub struct ConstraintFactory {
     factory: Arc<ParserFactory>,
 }
 
-/// The process-wide factory over the embedded vocabulary, built on first use
-/// (~150 ms) and kept for the life of the process. The server always runs the
-/// embedded tokenizer (`serve/engine.rs::load_tokenizer`), so this is always
-/// the right trie for a served request.
-pub fn shared() -> Result<&'static ConstraintFactory> {
-    static SHARED: OnceLock<std::result::Result<ConstraintFactory, String>> = OnceLock::new();
-    match SHARED.get_or_init(|| ConstraintFactory::embedded().map_err(|e| format!("{e:#}"))) {
-        Ok(factory) => Ok(factory),
+/// The process-wide factory over the EMBEDDED vocabulary, built on first use
+/// (~150 ms) and kept for the life of the process.
+///
+/// A trie is tied to one vocabulary: its token bytes, its stop ids and its mask
+/// width all come from the file it was built over. This one is therefore right
+/// for the Qwen 3.6 family and for nothing else, which is why nothing calls it
+/// directly any more — [`for_tokenizer`] is the seam, and it reaches this only
+/// when the tokenizer in hand really is the embedded one. A server holding two
+/// vocabularies resolves through [`crate::serve::vocab::Vocabularies`], which
+/// is keyed by family for the same reason.
+pub fn shared() -> Result<Arc<ConstraintFactory>> {
+    static SHARED: OnceLock<std::result::Result<Arc<ConstraintFactory>, String>> = OnceLock::new();
+    match SHARED.get_or_init(|| {
+        ConstraintFactory::embedded()
+            .map(Arc::new)
+            .map_err(|e| format!("{e:#}"))
+    }) {
+        Ok(factory) => Ok(Arc::clone(factory)),
         Err(e) => Err(anyhow!(
             "constrain: the shared factory failed to build: {e}"
         )),
     }
+}
+
+/// The trie a run using `tokenizer` compiles its schemas against, sized to
+/// `logit_width`.
+///
+/// THE constructor for anything holding a tokenizer, because it cannot pick the
+/// wrong file: the trie is built over the very `tokenizer.json` that tokenizer
+/// was parsed from ([`LagunaTokenizer::source`]), and the stop ids come from
+/// that same vocabulary's own specials rather than from a constant. A trie and
+/// a tokenizer that came from different files agree about nothing — a mask
+/// index would mean one token to one and another to the other — and there is no
+/// symptom short of wrong output.
+///
+/// The embedded vocabulary answers from the process-shared factory, so a server
+/// or a batch run on a Qwen 3.6 checkpoint pays the ~150 ms build once, as it
+/// always did. Every other vocabulary is built here, and there is no fallback
+/// to the embedded one: a tokenizer with no source that is not the embedded
+/// vocabulary is a case this cannot serve, and it says so rather than returning
+/// a trie for someone else's ids.
+pub fn for_tokenizer(
+    tokenizer: &LagunaTokenizer,
+    logit_width: usize,
+) -> Result<Arc<ConstraintFactory>> {
+    let Some(path) = tokenizer.source() else {
+        ensure!(
+            logit_width == LagunaTokenizer::PADDED_VOCAB,
+            "constrain: this tokenizer is the embedded {}-wide vocabulary, but a \
+             {logit_width}-wide mask was asked for",
+            LagunaTokenizer::PADDED_VOCAB
+        );
+        return shared();
+    };
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading {} to build a grammar trie", path.display()))?;
+    let factory = ConstraintFactory::new(&bytes, &tokenizer.specials().eog(), logit_width)
+        .with_context(|| format!("building the grammar trie over {}", path.display()))?;
+    Ok(Arc::new(factory))
 }
 
 impl ConstraintFactory {
@@ -80,34 +135,33 @@ impl ConstraintFactory {
     /// so the padded ids are unreachable by construction, which is what they
     /// should be.
     pub fn embedded() -> Result<Self> {
-        Self::new(LagunaTokenizer::PADDED_VOCAB)
+        Self::new(
+            EMBEDDED_TOKENIZER_JSON,
+            &LagunaTokenizer::EOG,
+            LagunaTokenizer::PADDED_VOCAB,
+        )
     }
 
-    /// Builds the trie from the same embedded `tokenizer.json` bytes the real
-    /// tokenizer parses, so the two views cannot drift. `expected_vocab` is the
-    /// model's logit width; the mask must cover exactly that many ids.
-    pub fn new(expected_vocab: usize) -> Result<Self> {
-        Self::new_from(Some(expected_vocab))
-    }
-
-    fn new_from(expected_vocab: Option<usize>) -> Result<Self> {
-        let mut bt = ByteTokenizer::from_json_bytes(EMBEDDED_TOKENIZER_JSON)
+    /// Builds the trie over one vocabulary. `tokenizer_json` are the same bytes
+    /// the real tokenizer parses, so the two views cannot drift; `eos` are that
+    /// vocabulary's end-of-generation ids (`Specials::eog`); `expected_vocab`
+    /// is the model's logit width, which the mask must cover exactly.
+    pub fn new(tokenizer_json: &[u8], eos: &[u32], expected_vocab: usize) -> Result<Self> {
+        let mut bt = ByteTokenizer::from_json_bytes(tokenizer_json)
             .map_err(|e| anyhow!("constrain: building the grammar token trie failed: {e}"))?;
         // Chat ends on either EOG id, and llguidance's auto-detection settles
         // on one stop token. Naming both keeps the grammar offering a stop the
         // decode loop will actually act on; leaving it to the scan lets a
         // constrained run reach max_tokens with the value long since complete.
-        bt.set_eos_tokens(&LagunaTokenizer::EOG);
-        let env: TokEnv = ByteTokenizerEnv::new(bt, expected_vocab)
+        bt.set_eos_tokens(eos);
+        let env: TokEnv = ByteTokenizerEnv::new(bt, Some(expected_vocab))
             .map_err(|e| anyhow!("constrain: sizing the token trie failed: {e}"))?
             .to_env();
-        if let Some(expected) = expected_vocab {
-            ensure!(
-                env.tok_trie().vocab_size() == expected,
-                "constrain: trie holds {} tokens but the model's vocabulary is {expected}",
-                env.tok_trie().vocab_size(),
-            );
-        }
+        ensure!(
+            env.tok_trie().vocab_size() == expected_vocab,
+            "constrain: trie holds {} tokens but the model's vocabulary is {expected_vocab}",
+            env.tok_trie().vocab_size(),
+        );
         let mut factory = ParserFactory::new_simple(&env)
             .map_err(|e| anyhow!("constrain: building the parser factory failed: {e}"))?;
         // llguidance logs straight to stderr by default. Under `serve` stderr
@@ -153,13 +207,19 @@ impl Grammar {
         &self.warnings
     }
 
-    /// Turns the compiled grammar into decode-loop state. `in_thinking` says
-    /// whether generation starts inside a `<think>` block; if so the state
-    /// stays dormant until `</think>` commits.
-    pub fn into_state(self, in_thinking: bool) -> GrammarState {
+    /// Turns the compiled grammar into decode-loop state. `entry` says where
+    /// the prompt left the model: inside a `<think>` block (dormant until
+    /// `</think>` commits), in the answer (live from the first draw), or
+    /// waiting on the model's own opener (see [`GrammarState::awaiting_opener`]).
+    /// `specials` are the running vocabulary's marker ids, which is what the
+    /// state watches the committed stream for — the ids differ between
+    /// checkpoint families.
+    pub fn into_state(self, entry: ThinkingEntry, specials: Specials) -> GrammarState {
         GrammarState {
             matcher: self.matcher,
-            active: !in_thinking,
+            specials,
+            active: matches!(entry, ThinkingEntry::Answer),
+            awaiting_opener: matches!(entry, ThinkingEntry::ModelOpens),
             done: false,
             mask: None,
         }
@@ -176,9 +236,24 @@ impl Grammar {
 /// [`is_done`]: GrammarState::is_done
 pub struct GrammarState {
     matcher: Matcher,
+    /// The running vocabulary's marker ids: which committed token arms the
+    /// state, and which ones are stops the matcher must never be fed.
+    specials: Specials,
     /// False while the model is still thinking; nothing is masked or consumed
     /// until `</think>` commits.
     active: bool,
+    /// The reply's first token has not landed yet and it is the token that
+    /// decides whether this is a reasoning block or the answer
+    /// ([`ThinkingEntry::ModelOpens`]).
+    ///
+    /// That one draw is masked by the grammar WITH `<think>` added, which is
+    /// what keeps the choice open without ever handing out an unconstrained
+    /// draw: the model either opens the block, and the state goes dormant until
+    /// `</think>`, or it writes a token the schema already allowed, and the
+    /// state arms and consumes it. Letting that draw go unmasked instead would
+    /// risk a first answer token the matcher then has to reject, which poisons
+    /// it for the rest of the request.
+    awaiting_opener: bool,
     /// The grammar reached a state it cannot extend: the value is complete.
     done: bool,
     /// The most recent mask, held so the sampler can borrow its words.
@@ -190,13 +265,20 @@ impl GrammarState {
     /// `None` while dormant. Packed 32-bit words, index `t / 32`, LSB-first —
     /// the layout `SampleControl::allowed` applies.
     pub fn mask_words(&mut self) -> Result<Option<&[u32]>> {
-        if !self.active || self.done {
+        if (!self.active && !self.awaiting_opener) || self.done {
             return Ok(None);
         }
-        let vob = self
+        let mut vob = self
             .matcher
             .compute_mask()
             .map_err(|e| anyhow!("constrain: grammar mask failed: {e}"))?;
+        if self.awaiting_opener {
+            // The one draw where opening a reasoning block is as legal as
+            // starting the value. Adding the single marker id is all it takes:
+            // the trie holds it as a control token, so the grammar itself never
+            // offers it and no other draw ever can.
+            vob.allow_token(self.specials.think_open);
+        }
         self.mask = Some(vob);
         Ok(self.mask.as_ref().map(|m| m.as_slice()))
     }
@@ -234,17 +316,30 @@ impl GrammarState {
         Ok(())
     }
 
-    /// Observe a committed token, in commit order. Dormant: watches for
-    /// `</think>` and arms itself. Active: advances the grammar; when the
-    /// grammar can no longer be extended the state flips to done. EOG ids are
-    /// never fed to the matcher — the loops break on them, and the mask only
-    /// offers them when stopping is already legal.
+    /// Observe a committed token, in commit order. Waiting on the opener: the
+    /// token decides, and either sends the state dormant or arms it and is then
+    /// consumed as the value's first token. Dormant: watches for `</think>` and
+    /// arms itself. Active: advances the grammar; when the grammar can no
+    /// longer be extended the state flips to done. EOG ids are never fed to the
+    /// matcher — the loops break on them, and the mask only offers them when
+    /// stopping is already legal.
     pub fn on_committed(&mut self, token: u32) -> Result<()> {
-        if self.done || LagunaTokenizer::EOG.contains(&token) {
+        if self.done || self.specials.eog().contains(&token) {
             return Ok(());
         }
+        if self.awaiting_opener {
+            // Only the reply's first token can open the block, so the wait ends
+            // here whichever way it went.
+            self.awaiting_opener = false;
+            if token == self.specials.think_open {
+                return Ok(());
+            }
+            // No block: the value starts here, and this token was drawn under
+            // the grammar's own mask, so the matcher can take it.
+            self.active = true;
+        }
         if !self.active {
-            if token == LagunaTokenizer::THINK_CLOSE {
+            if token == self.specials.think_close {
                 self.active = true;
             }
             return Ok(());
@@ -291,6 +386,15 @@ mod tests {
         })
     }
 
+    /// The embedded vocabulary's marker ids, which every state under test runs
+    /// against. Pinned to the constants by
+    /// `tokenizer::tests::the_embedded_vocabulary_resolves_to_the_named_constants`,
+    /// so the assertions below may keep naming the constants.
+    fn embedded_specials() -> Specials {
+        static SPECIALS: OnceLock<Specials> = OnceLock::new();
+        *SPECIALS.get_or_init(|| *LagunaTokenizer::embedded().unwrap().specials())
+    }
+
     fn bit(words: &[u32], id: u32) -> bool {
         words
             .get((id / 32) as usize)
@@ -304,7 +408,10 @@ mod tests {
     fn walks_a_valid_document_and_completes() {
         let tok = LagunaTokenizer::embedded().unwrap();
         let ids = tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         for (i, &id) in ids.iter().enumerate() {
             let words = state
                 .mask_words()
@@ -344,7 +451,10 @@ mod tests {
     fn the_mask_spans_the_models_logit_width() {
         let tok = LagunaTokenizer::embedded().unwrap();
         assert!(LagunaTokenizer::PADDED_VOCAB > tok.vocab_size());
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let words = state
             .mask_words()
             .unwrap()
@@ -367,7 +477,10 @@ mod tests {
     #[test]
     fn no_control_token_is_ever_offered() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let ids = tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap();
         let mut widest = 0;
         for (step, &id) in ids.iter().enumerate() {
@@ -403,7 +516,10 @@ mod tests {
         let close_bracket = tok.encode("]").unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(close_bracket.len(), 1);
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let words = state.mask_words().unwrap().unwrap();
         assert!(bit(words, open[0]), "opening brace must be legal");
         assert!(!bit(words, close_bracket[0]), "']' cannot open an object");
@@ -414,7 +530,10 @@ mod tests {
     #[test]
     fn stays_dormant_until_think_close() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(true);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Seeded, embedded_specials());
         assert!(state.mask_words().unwrap().is_none());
         // Arbitrary thinking-text tokens pass through without touching the
         // grammar.
@@ -427,6 +546,97 @@ mod tests {
         assert!(bit(words, tok.encode("{").unwrap()[0]));
     }
 
+    // A prompt that leaves the `<think>` opener to the model puts the grammar in
+    // a third state. The first draw is masked by the grammar WITH `<think>`
+    // allowed, so the model can still open a block — and the token it draws is
+    // grammar-legal either way, which is what keeps an unconstrained first token
+    // from ever reaching (and poisoning) the matcher.
+    #[test]
+    fn a_model_opened_block_is_offered_alongside_the_values_first_token() {
+        let tok = LagunaTokenizer::embedded().unwrap();
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::ModelOpens, embedded_specials());
+
+        let words = state
+            .mask_words()
+            .unwrap()
+            .expect("the deciding draw is masked, not skipped");
+        assert!(
+            bit(words, LagunaTokenizer::THINK_OPEN),
+            "<think> has to stay reachable on this one draw"
+        );
+        assert!(
+            bit(words, tok.encode("{").unwrap()[0]),
+            "so does the value's own opening brace"
+        );
+        assert!(
+            !bit(words, tok.encode("]").unwrap()[0]),
+            "everything else is still the schema's business"
+        );
+        for eog in LagunaTokenizer::EOG {
+            assert!(
+                !bit(words, eog),
+                "EOG {eog} offered before the value started"
+            );
+        }
+    }
+
+    // The model opens the block: the state goes dormant and arms on `</think>`,
+    // exactly as a seeded prompt's would, and the reasoning never touches the
+    // matcher.
+    #[test]
+    fn opening_the_block_sends_the_grammar_dormant_until_think_close() {
+        let tok = LagunaTokenizer::embedded().unwrap();
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::ModelOpens, embedded_specials());
+        state.mask_words().unwrap().expect("the deciding draw");
+        state.on_committed(LagunaTokenizer::THINK_OPEN).unwrap();
+
+        assert!(
+            state.mask_words().unwrap().is_none(),
+            "reasoning decodes unconstrained"
+        );
+        for id in tok.encode("let me reason about ] this } first").unwrap() {
+            state.on_committed(id).unwrap();
+        }
+        assert!(state.mask_words().unwrap().is_none());
+        state.on_committed(LagunaTokenizer::THINK_CLOSE).unwrap();
+        let words = state.mask_words().unwrap().expect("armed after </think>");
+        assert!(bit(words, tok.encode("{").unwrap()[0]));
+    }
+
+    // The model answers without opening a block: the first token is the value's
+    // own, so the state arms on it and consumes it — the document walks to
+    // completion from there, with no token lost and none drawn unconstrained.
+    #[test]
+    fn answering_without_a_block_arms_the_grammar_on_the_first_token() {
+        let tok = LagunaTokenizer::embedded().unwrap();
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::ModelOpens, embedded_specials());
+        let ids = tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap();
+        for (i, &id) in ids.iter().enumerate() {
+            let words = state
+                .mask_words()
+                .unwrap()
+                .expect("live grammar yields a mask");
+            assert!(bit(words, id), "token {id} (step {i}) missing from mask");
+            // `<think>` is offered on the deciding draw and never again.
+            assert_eq!(
+                bit(words, LagunaTokenizer::THINK_OPEN),
+                i == 0,
+                "<think> reachability at step {i}"
+            );
+            state.on_committed(id).unwrap();
+        }
+        assert!(state.is_done(), "grammar not complete after the full value");
+    }
+
     // A prefix the caller already put in the prompt is consumed before the first
     // draw, and the grammar carries on from there: the mask continues the
     // document mid-string rather than offering a fresh one, and the rest of the
@@ -434,7 +644,10 @@ mod tests {
     #[test]
     fn consume_prefix_continues_the_document() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         state
             .consume_prefix(&tok.encode("{\"name\": \"laguna\",").unwrap())
             .unwrap();
@@ -460,7 +673,10 @@ mod tests {
     #[test]
     fn an_invalid_prefix_names_where_it_diverged() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{\"name\": [1").unwrap())
             .expect_err("an array is not a string");
@@ -473,7 +689,10 @@ mod tests {
     #[test]
     fn a_prefix_that_completes_the_document_is_refused() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(false);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{\"name\": \"laguna\", \"count\": 3}").unwrap())
             .expect_err("a complete value leaves nothing to generate");
@@ -485,7 +704,10 @@ mod tests {
     #[test]
     fn consume_prefix_on_a_dormant_state_errors() {
         let tok = LagunaTokenizer::embedded().unwrap();
-        let mut state = factory().compile(&schema()).unwrap().into_state(true);
+        let mut state = factory()
+            .compile(&schema())
+            .unwrap()
+            .into_state(ThinkingEntry::Seeded, embedded_specials());
         let error = state
             .consume_prefix(&tok.encode("{").unwrap())
             .expect_err("a dormant grammar has nothing to consume with");
@@ -514,7 +736,10 @@ mod tests {
         let ids = tok
             .encode("{\"anything\": [1, {\"nested\": null}]}")
             .unwrap();
-        let mut state = factory().compile_any_object().unwrap().into_state(false);
+        let mut state = factory()
+            .compile_any_object()
+            .unwrap()
+            .into_state(ThinkingEntry::Answer, embedded_specials());
         for &id in &ids {
             let words = state.mask_words().unwrap().unwrap();
             assert!(bit(words, id), "token {id} missing from json_object mask");

@@ -76,13 +76,15 @@ use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::chat::{self, ChatDialect, ChatOptions, Continuation, Message, ReasoningEffort};
+use crate::chat::{
+    self, ChatDialect, ChatOptions, Continuation, Message, ReasoningEffort, ThinkingEntry,
+};
 use crate::constrain::{self, ConstraintFactory, GrammarState};
 use crate::generate::{GenEvent, Generator};
 use crate::hub::Model;
 use crate::kv_cache::CacheSnapshot;
 use crate::sampler::SamplerOptions;
-use crate::tokenizer::LagunaTokenizer;
+use crate::tokenizer::{LagunaTokenizer, Specials};
 
 /// Shortest shared prefix worth a snapshot. Below this the snapshot/restore
 /// bookkeeping costs more than re-prefilling the tokens it would save.
@@ -358,7 +360,9 @@ struct Prepared {
     /// none. Decoding continues it without re-emitting it, so it is the missing
     /// head of any constrained value the item produces.
     prefix_text: String,
-    starts_in_thinking: bool,
+    /// Where the rendered prompt leaves the model with respect to its
+    /// reasoning block; see `chat::ThinkingEntry`.
+    thinking_entry: ThinkingEntry,
     max_tokens: usize,
     sampling: SamplerOptions,
     /// The schema the grammar path compiles, `None` for an unconstrained item
@@ -561,11 +565,17 @@ pub fn run_batch(
     // Built once for the whole batch: the token trie costs ~150 ms, while
     // compiling one item's schema against it costs well under a millisecond.
     // Only paid when some item actually asks for a schema.
+    // Over the run's OWN tokenizer, not a process-shared one: a batch on a
+    // Qwen3 checkpoint speaks 151936 ids where the embedded vocabulary speaks
+    // 248320, and a mask built over the wrong one indexes nothing.
     let factory = if prepared
         .iter()
         .any(|p| p.as_ref().is_ok_and(|p| p.schema.is_some()))
     {
-        Some(constrain::shared()?)
+        Some(constrain::for_tokenizer(
+            generator.tokenizer(),
+            model.vocab_family().logit_width(),
+        )?)
     } else {
         None
     };
@@ -595,7 +605,13 @@ pub fn run_batch(
         };
         let cached = snapshot.as_ref().map(|snapshot| (snapshot, shared_len));
         let item_started = Instant::now();
-        match run_item(generator, factory, prepared, cached, hooks.cancelled) {
+        match run_item(
+            generator,
+            factory.as_deref(),
+            prepared,
+            cached,
+            hooks.cancelled,
+        ) {
             Ok(outcome) => {
                 (hooks.progress)(BatchProgress::Item {
                     id: spec.id.clone(),
@@ -725,7 +741,11 @@ fn run_item(
         return assemble_scored(generator, item, plan);
     }
     // Set unconditionally: `None` is what clears the previous item's grammar.
-    generator.set_grammar(item_grammar(factory, item)?);
+    generator.set_grammar(item_grammar(
+        factory,
+        item,
+        *generator.tokenizer().specials(),
+    )?);
 
     let prompt_len = item.tokens.len();
     let mut content = String::new();
@@ -751,7 +771,7 @@ fn run_item(
     let outcome = if generator.spec_ready_at(prompt_len) {
         generator.decode_loop_spec(
             prompt_len,
-            item.starts_in_thinking,
+            item.thinking_entry,
             item.max_tokens,
             &mut on_event,
             &mut should_stop,
@@ -759,7 +779,7 @@ fn run_item(
     } else {
         generator.decode_loop(
             prompt_len,
-            item.starts_in_thinking,
+            item.thinking_entry,
             item.max_tokens,
             &mut on_event,
             &mut should_stop,
@@ -809,13 +829,16 @@ fn run_item(
 fn item_grammar(
     factory: Option<&ConstraintFactory>,
     item: &Prepared,
+    specials: Specials,
 ) -> Result<Option<GrammarState>> {
     let Some(schema) = &item.schema else {
         return Ok(None);
     };
     let factory =
         factory.ok_or_else(|| anyhow!("batch: an item wants a schema but no factory was built"))?;
-    let mut state = factory.compile(schema)?.into_state(item.starts_in_thinking);
+    let mut state = factory
+        .compile(schema)?
+        .into_state(item.thinking_entry, specials);
     if item.prefix_len > 0 {
         // A response prefix is already part of the answer document; feeding it
         // in is what makes the first mask continue it. A prefix can only be
@@ -1323,7 +1346,7 @@ fn assemble_scored(
     // Refused before any forward runs, and against the LONGEST option of each
     // field: which option wins is not known until it has been scored, and an
     // item that could only fit by picking short answers does not fit.
-    let reasoning_floor = usize::from(item.starts_in_thinking);
+    let reasoning_floor = usize::from(item.thinking_entry.may_think());
     if plan.worst_case_tokens + reasoning_floor > item.max_tokens {
         return Ok(budget_refusal(item, plan, reasoning_floor));
     }
@@ -1333,10 +1356,11 @@ fn assemble_scored(
     let mut written = Vec::new();
     let mut decode_tokens = 0;
     let mut decode_secs = 0.0;
-    if item.starts_in_thinking {
+    if item.thinking_entry.may_think() {
         let run = decode_reasoning(
             generator,
             prompt_len,
+            item.thinking_entry,
             item.max_tokens - plan.worst_case_tokens,
         )?;
         ensure!(
@@ -1457,26 +1481,28 @@ struct Reasoning {
 fn decode_reasoning(
     generator: &mut Generator,
     prompt_len: usize,
+    entry: ThinkingEntry,
     budget: usize,
 ) -> Result<Reasoning> {
     let closed = Cell::new(false);
     let mut text = String::new();
     let mut ids = Vec::new();
     let outcome;
+    let think_close = generator.tokenizer().specials().think_close;
     {
         let mut on_event = |event: GenEvent| {
             ids.push(event.id());
             text.push_str(event.text());
-            if event.id() == LagunaTokenizer::THINK_CLOSE {
+            if event.id() == think_close {
                 closed.set(true);
             }
         };
         let mut stop = || closed.get();
         generator.note_draft_horizon_at(prompt_len);
         outcome = if generator.spec_ready_at(prompt_len) {
-            generator.decode_loop_spec(prompt_len, true, budget, &mut on_event, &mut stop)?
+            generator.decode_loop_spec(prompt_len, entry, budget, &mut on_event, &mut stop)?
         } else {
-            generator.decode_loop(prompt_len, true, budget, &mut on_event, &mut stop)?
+            generator.decode_loop(prompt_len, entry, budget, &mut on_event, &mut stop)?
         };
     }
     Ok(Reasoning {
@@ -1791,7 +1817,7 @@ fn prepare_item(
         .map(|(at, message)| chat_message(message, if at == 0 { shared_prefix } else { None }))
         .collect::<Result<Vec<_>>>()?;
     let (opts, continuation) = resolve_render(item, defaults, label, dialect)?;
-    let (tokens, prefix_len, starts_in_thinking) =
+    let (tokens, prefix_len, thinking_entry) =
         encode_item(tokenizer, &messages, &opts, continuation.as_ref())?;
     // The renderer writes the prefix verbatim, so what it was asked to render
     // is what the answer continues from.
@@ -1834,7 +1860,7 @@ fn prepare_item(
         tokens,
         prefix_len,
         prefix_text,
-        starts_in_thinking,
+        thinking_entry,
         max_tokens,
         // The item's own thinking state is what its penalty default is keyed
         // to, and `resolve_render` has just settled it.
@@ -1902,10 +1928,10 @@ fn resolve_render(
     dialect: ChatDialect,
 ) -> Result<(ChatOptions, Option<Continuation>)> {
     let effort = item.reasoning_effort.or(defaults.reasoning_effort);
-    if effort.is_some() && dialect == ChatDialect::Qwen36 {
+    if effort.is_some() && !dialect.supports_reasoning_effort() {
         bail!(
-            "reasoning_effort: {label} renders the Qwen 3.6 chat template, which has no \
-             reasoning_effort parameter (it is a Qwen 3.8 template feature)"
+            "reasoning_effort: {label} renders a chat template with no reasoning_effort \
+             parameter (it is a Qwen 3.8 template feature)"
         );
     }
     let thinking = item
@@ -2015,14 +2041,14 @@ fn encode_item(
     messages: &[Message],
     opts: &ChatOptions,
     continuation: Option<&Continuation>,
-) -> Result<(Vec<u32>, usize, bool)> {
+) -> Result<(Vec<u32>, usize, ThinkingEntry)> {
     let chat::PromptParts {
         context,
         header,
         content_ranges,
         header_content_ranges,
         header_prefix_start,
-        starts_in_thinking,
+        thinking_entry,
         ..
     } = chat::build_prompt_parts_with_spans_continued(messages, opts, continuation)?;
 
@@ -2042,7 +2068,7 @@ fn encode_item(
         }
     };
     ensure!(!tokens.is_empty(), "the prompt encoded to zero tokens");
-    Ok((tokens, prefix_len, starts_in_thinking))
+    Ok((tokens, prefix_len, thinking_entry))
 }
 
 /// Divide client-content byte ranges at `at` into the ranges before it and the
@@ -2708,7 +2734,7 @@ mod tests {
             tokens: vec![1, 2, 3],
             prefix_len: 0,
             prefix_text: prefix_text.to_string(),
-            starts_in_thinking: false,
+            thinking_entry: ThinkingEntry::Answer,
             max_tokens: 32,
             sampling: BATCH_SAMPLING,
             schema,

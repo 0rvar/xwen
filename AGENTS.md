@@ -17,6 +17,9 @@ one that owns it:
   write-ups, meaning protocol, tables and reviews, live in **`docs/records/<slug>.md`**
   behind a stub in the log.
 - **`docs/parity.md`** is the verification runbook.
+- **`docs/qwen3-dense.md`** and **`docs/zimage.md`** are the dense Qwen3-4B architecture
+  and its Z-Image encoder role, the way `docs/qwen4exp-port.md` is Flash-Next's port:
+  per-architecture reference, not a rule and not a timeline.
 - **`docs/perf-state.md`** is the current figures, and it is their single source.
 - **`docs/benching.md`** is how to measure anything on this machine.
 - **`TODO.md`** is the backlog and the open ledger: a ranked **Front** of at most ten
@@ -73,7 +76,12 @@ Rules for keeping it that way:
 
 - Design target: maximum tok/s for Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B GGUF on
   this one machine (M5 Max, Metal). Batch 1. No portability hedging. (3.8-27B runs the
-  3.6-27B graph unchanged — it is a registry entry, not a port.)
+  3.6-27B graph unchanged — it is a registry entry, not a port.) **Amended 2026-09-06:**
+  dense Qwen3-4B (`model_type: qwen3`, HF BF16 safetensors) is in scope as a full
+  checkpoint AND as the text-conditioning encoder for the diffusion image transformers
+  to come, and it is NOT a tok/s target. It is held to correctness bars and to costing
+  the checkpoints above nothing; no arc of it argues for a hot-path change on its behalf
+  (decisions.md "Dense Qwen3-4B is a full checkpoint AND the conditioning encoder").
 - TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, it
   becomes a ledger item with context, or it is retired with a dated reason and a reopen
   condition (retired means not planned, not forbidden). Ledger text is never deleted:
@@ -99,6 +107,16 @@ Rules for keeping it that way:
    layout: the GGUF has conversion-baked deltas (next section).
 4. HF `config.json` of Qwen/Qwen3.6-* — last resort; its text params nest under
    `text_config` and its single `eos_token_id` is wrong for chat.
+
+That order is for the GGUF archs. **For dense `qwen3` the order is different and HF is
+not demoted**: llama.cpp `src/models/qwen3.cpp` and HF `modeling_qwen3.py` are joint
+authority and they agree on every form that could have gone the other way, because there
+is no converter between us and these weights: we read the HF safetensors directly, so
+none of the conversion deltas below apply. The `config.json` of the checkpoint itself is
+authoritative for its own parameters here (it does not nest, and both its stop ids are in
+`generation_config.json`), and diffusers' `pipeline_z_image.py` is authority for the
+encoder role. Details: [docs/qwen3-dense.md](docs/qwen3-dense.md),
+[docs/zimage.md](docs/zimage.md).
 
 ## Architecture cheat sheet (Qwen 3.6, ggml-org GGUF)
 
@@ -242,6 +260,112 @@ edited ref costs a full re-download.
   omits ssm_beta and the shexp set). The shipped tensor tables are the spec; never
   read constants.py as one.
 
+## Qwen3-4B dense (`qwen3`, HF BF16 safetensors)
+
+A second weight format and a second vocabulary, not a variant of the graphs above. It is
+in the repo for two roles at once: a full LM checkpoint, and the text-conditioning
+encoder that the diffusion image transformers will call in-process (Z-Image-Turbo
+first). [docs/qwen3-dense.md](docs/qwen3-dense.md) is the architecture and the
+verification bars, [docs/zimage.md](docs/zimage.md) is the encoder role,
+[docs/records/qwen3-dense.md](docs/records/qwen3-dense.md) is the arc.
+
+Shape: 36 layers, ALL full attention, hidden 2560, 32 Q / 8 KV heads, head_dim 128,
+dense SwiGLU 9728, vocab 151936, rms_norm_eps 1e-6, tied embeddings, no biases, no
+sliding window, no output gate. Rope is FULL NEoX over all 128 head dims (theta 1e6, or
+5e6 on Instruct-2507), not the partial 64-of-256 of 3.6. QK-RMSNorm over [128] on every
+layer, before rope, v untouched. GQA broadcast is repeat_interleave (KV head j serves Q
+heads 4j..4j+3), which is the form the 3.6 GGUF path calls wrong for ITSELF; there is no
+converter here, so no tiled V-order and no pre-baked norm. Specials 151643
+`<|endoftext|>`, 151644 `<|im_start|>`, 151645 `<|im_end|>`, 151667 `<think>` / 151668
+`</think>` (`special: false`, same by-id trap). No BOS. Stops on 151645 AND 151643, and
+unlike 3.6 both are in the upstream `generation_config.json`.
+
+State as of 2026-09-07, after Arc 3: **every surface runs the two language models** -
+`generate`, `chat`, `serve`, `batch` and `encode-text` - and the ENCODER runs
+`encode-text` alone. `auto_fetch()` is still false on all three, so an uncached checkpoint
+is a 400 or a CLI error naming `xwen fetch` and never an 8 GB download inside a request.
+`Model::not_servable_reason()` is the single source of `servable()` and of the one
+sentence the CLI and the HTTP 400 both print, and that gate runs on `generate` and `chat`
+too: loading the encoder there SUCCEEDS, its weights parsing and its config being a
+language model's, so without the gate those surfaces generate fluent garbage out of the
+zero-filled layer 35 instead of failing. There is no drafter for this architecture and
+none is planned.
+
+Traps, each of which has already cost someone time:
+
+- **Z-Image ships a corrupt copy of Qwen3-4B.** `text_encoder/` shard 3 has
+  `model.layers.35.mlp.up_proj.weight` zero-filled for 14,772,816 contiguous elements
+  from element 27,003 and `down_proj` for 3,938,425 from element 20,930,265; base
+  Qwen3-4B has none. Harmless for the encoder (index 35 never evaluates layer 35) and
+  disqualifying for anything else, which is why that entry is encode-only. The loader
+  refuses any zero run past 4096 elements unless the REGISTRY ENTRY allowlists that
+  tensor by name, so a bare directory is refused and only the documented entry passes.
+  Never widen the allowlist to make a load succeed, and never point an LM surface at
+  that copy: `Qwen/Qwen3-4B` is the faithful one.
+- **NFC.** Every Qwen tokenizer.json declares an NFC normalizer that the HF runtime
+  applies and llama.cpp does not. `encode` is not injective over decomposed spellings
+  and `decode(encode(x))` returns the NFC form. Pre-existing, affects 3.6 identically. A
+  fixture whose ids come from `llama-tokenize` is a valid oracle only for NFC input.
+- **Specials are per tokenizer instance now**, resolved by token text at load
+  (`LagunaTokenizer::specials()`), not the 248k constants. The constants survive only in
+  `config.rs`'s GGUF-only EOG fold and `ConstraintFactory::embedded`. A new call site
+  that reaches for a constant will be a wrong number on this vocabulary, not a missing
+  one. `TOKENIZATION_RULES_VERSION` stays at 3 on purpose.
+- **Identity for a safetensors directory** is provenance first, and the rule is about the
+  REPO, not the snapshot (tightened 2026-09-07): a directory is `Official` when it sits
+  under the entry's repo directory in the hub cache, at the entry's subdirectory, with
+  every registry file present, under ANY snapshot commit. The repo directory is what
+  separates Z-Image from base, their configs being byte-identical. Canonicalize the
+  DIRECTORY and never a file, hub cache files being symlinks into shared blobs. Failing
+  that it is `Assumed`, with `rope_theta` picking the release (5e6 Instruct-2507, else
+  base, which wins the tie with Z-Image). There is no name inside the set, so the
+  `general.name` passes are unreachable here. `--model-size` stays a cross-check and a
+  disagreement is a startup error.
+- **Thinking on the Qwen3 dialect is MODEL-opened, not prompt-seeded.** A prompt's
+  reasoning state is `chat::ThinkingEntry` (Answer / Seeded / ModelOpens), and
+  `ChatDialect::model_opens_thinking()` is true for Qwen3 alone: the template writes no
+  `<think>` after the assistant header, so the model writes its own. The decode loop
+  enters thinking on a think opener only when it is the reply's FIRST tagged token, so a
+  later `<think>` is text. Two things follow that a change here will break silently: the
+  think budget must hold until the opener rather than arm at position 0, and `--min-think`
+  is gated on being inside a block, or under ModelOpens it bans the stop tokens as a
+  minimum answer length. Marker retention is an explicit `MarkerText` policy per call
+  (Strip for the event consumers, Keep for callers that split on the literal marker), not
+  a dialect property; a review round caught the raw-text loops having silently changed for
+  the shipped checkpoints.
+- **`CheckpointSource` is the one open seam.** Every consumer that used to call
+  `gguf::open` itself now routes through it, so a new checkpoint consumer goes there and
+  not beside it. It carries the caller's `Device` on the safetensors arm on purpose: a
+  fresh `Device::new_metal(0)` inside the loader is a DIFFERENT candle device from the
+  Generator's, and every op between them a DeviceMismatch. Note that `Qwen3Set::open`
+  scans all 8 GB on every open (~1.4 s in dev), which every routed caller now pays,
+  `encode-text` and `logits-dump` included; it is the first thing to fix when
+  `servable()` flips.
+- **The Python exception.** `scripts/zimage-ref-dump.py` is the only Python in the repo,
+  run by hand under `uv` in a throwaway venv, never in CI. It exists because the encoder
+  has no ONNX export and there is no bun path to torch. It is not a precedent.
+- **A GGUF whose arch string is `qwen3` is refused**, pointing at the safetensors
+  directory. Safetensors is the form this architecture ships in here.
+- **Serve carries TWO vocabularies and they follow the request's target**, not the
+  process (Arc 3). `src/serve/vocab.rs` holds one tokenizer plus grammar trie per
+  `VocabFamily`, built together so they cannot disagree, and `constrain::shared()` is off
+  every serve request path. Build a trie from the file its tokenizer was parsed from
+  (`constrain::for_tokenizer` asks the tokenizer, which remembers its source); a trie and
+  a tokenizer from different files agree about nothing and the symptom is wrong output,
+  never an error. Lookup order for a family: the embedded copy for Qwen 3.6 with no search
+  at all, then the served file's own, then any cached registry checkpoint of the family,
+  then an ERROR naming the fetch. Never add a fallback to the embedded tokenizer: it would
+  answer fluently in the wrong vocabulary. Mask width is `VocabFamily::logit_width()`,
+  248320 against 151936, a registry constant because it is asked before any file is open.
+- **Prompt admission uses the REQUEST TARGET's trained context, not the served
+  checkpoint's** (fixed 2026-09-07, d48a3f4). `Model::trained_context()` is the registry
+  constant, read off the cached files: 262144 everywhere except `Qwen/Qwen3-4B` and the
+  Z-Image encoder at 40960. The handler caps it by `--context-length` and names the
+  checkpoint in the refusal. Before the fix the check used `AppState.max_ctx`, the served
+  checkpoint's, which on a base-default server clamped Instruct-2507's 262144 to 40960;
+  do not reintroduce that by reaching for the served window in a handler. The engine
+  re-derives its own limit at load and that stays authoritative for what actually runs.
+
 ## The candle situation
 
 Identical to laguna, unchanged and not relitigated: candle git rev 21cca0b (ships
@@ -262,6 +386,22 @@ harness**; its check is `bun scripts/flashnext-replay.ts --control <kill switch>
 (forced replay against llama-server over the committed fixtures, oracle cached under
 /tmp; a mismatch is excused when the oracle OR the control arm held the decision by
 less than the band, ≤8 excuses, everything else hard; docs/parity.md "Limitations").
+
+**A green `cargo test` does not mean the cache-backed tests ran.** A great many read the
+real checkpoints and self-skip when the HF cache lacks them. Every one of those skips goes
+through `crate::test_support` (2026-09-07), which prints a SKIPPED line naming the file
+and the fetch that would supply it, and `XWEN_REQUIRE_HF_CACHE=1` turns every skip into a
+failure. Run `XWEN_REQUIRE_HF_CACHE=1 cargo test --release` when green has to mean those
+paths really executed, and route any NEW self-skip through `test_support` rather than an
+`eprintln!` and a `return`: an outside review found the two tests proving the Qwen3
+vocabulary never crosses over were silently vacuous on a clean checkout.
+
+**A bit-identical A/B is a result only when the two sides are known to be different
+code.** `XWEN_QWEN3_ATTN=sdpa` was read as ruling out the flash kernel because it matched
+to the bit; candle's Metal sdpa above one token dispatches the steel kernel that
+`flash.metal` is a copy of, so it was one kernel compared with itself. The arm is a real
+f32 chain since 30995b9 and its tiny-model test asserts a NONZERO difference under the
+bar, which is the shape a reference arm's test should have.
 
 ## Operational hazards (each has already bitten laguna once; the machine is the same)
 
@@ -415,7 +555,8 @@ accept-and-drop while `presence_penalty` is consumed on every dialect that has a
 for it (2026-09-06).
 
 API model names are FULL names only (`Qwen3.6-27B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B`,
-`Qwen3.8-Flash-Next` — `Model::full_name`, matching `general.name` and the repo), plus
+`Qwen3.8-Flash-Next`, and since 2026-09-07 `Qwen3-4B` and `Qwen3-4B-Instruct-2507` —
+`Model::full_name`, matching `general.name` and the repo), plus
 the served file's own id when that file is none of them. Flash-Next is listed and
 selectable only while its shards are in the HF cache (`auto_fetch` false — an uncached
 one is a 400 naming `xwen fetch`, not an in-request 111 GB download). The CLI's
@@ -430,3 +571,16 @@ DIFFERENT file, so an official name resolves the hub file while the file's own i
 resolves the local one. Speculation is per checkpoint (`DraftMode::{Off,Official,
 Custom}`), resolved at load, so a sidecar-less default checkpoint no longer disables
 drafting for the others.
+
+The two dense Qwen3-4B language models joined serve and batch on 2026-09-07, which is
+what forced the vocabulary to become per target (`src/serve/vocab.rs`, the trap list in
+the Qwen3-4B section above, decisions.md "The tokenizer and the grammar trie follow the
+request's target"). They are listed and selectable only while cached, `auto_fetch` being
+false the way it is for Flash-Next. The Z-Image encoder is never listed and is refused on
+every surface. Their 400s: `enable_thinking` on Instruct-2507 (its template has no
+reasoning mode), a request-level `reasoning_effort` on either (the 3.6 rule, unchanged,
+`supports_reasoning_effort()` being Qwen38-only), and tools on either dialect (the call
+format is JSON and the serve parser reads `<function=`). A server-wide thinking default
+stays INERT rather than refusing every request, which is the same rule
+`reasoning_effort` already followed: the dialect drops the resolved value in chat.rs, so
+an operator default can be silently ignored while an explicit request is an error.

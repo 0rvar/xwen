@@ -46,6 +46,58 @@ export const CHECKPOINTS = {
     ],
     drafter: null,
   },
+  // The three SAFETENSORS checkpoints. `model` is `config.json` rather than a
+  // weight file, because that is what the Rust registry lists first and what
+  // `CheckpointSource` resolves the checkpoint DIRECTORY from — a safetensors
+  // checkpoint is opened as a directory, not as a file. `files` is every file
+  // that has to be cached for it to load, tokenizer included.
+  //
+  // Not runnable yet: the qwen3 layer stack is not implemented, so these are
+  // here so that a script can find and fetch them, not so that one can bench
+  // them. None ships a drafter and none ever will — no drafter exists for this
+  // graph.
+  "qwen3-4b": {
+    repo: "Qwen/Qwen3-4B",
+    model: "config.json",
+    files: [
+      "config.json",
+      "model.safetensors.index.json",
+      "model-00001-of-00003.safetensors",
+      "model-00002-of-00003.safetensors",
+      "model-00003-of-00003.safetensors",
+      "tokenizer.json",
+    ],
+    drafter: null,
+  },
+  "qwen3-4b-instruct-2507": {
+    repo: "Qwen/Qwen3-4B-Instruct-2507",
+    model: "config.json",
+    files: [
+      "config.json",
+      "model.safetensors.index.json",
+      "model-00001-of-00003.safetensors",
+      "model-00002-of-00003.safetensors",
+      "model-00003-of-00003.safetensors",
+      "tokenizer.json",
+    ],
+    drafter: null,
+  },
+  // The encoder lives in a subdirectory of a diffusion repo, with its tokenizer
+  // in a sibling one — which is why every path here is relative to the REPO and
+  // not to the checkpoint directory.
+  "zimage-turbo": {
+    repo: "Tongyi-MAI/Z-Image-Turbo",
+    model: "text_encoder/config.json",
+    files: [
+      "text_encoder/config.json",
+      "text_encoder/model.safetensors.index.json",
+      "text_encoder/model-00001-of-00003.safetensors",
+      "text_encoder/model-00002-of-00003.safetensors",
+      "text_encoder/model-00003-of-00003.safetensors",
+      "tokenizer/tokenizer.json",
+    ],
+    drafter: null,
+  },
 } as const;
 
 export type ModelSize = keyof typeof CHECKPOINTS;
@@ -94,11 +146,13 @@ export function cachedFile(repo: string, file: string): string | null {
   return existsSync(path) ? path : null;
 }
 
-/** Every file that has to be cached for `size` to load: the shard set on a
- *  split checkpoint, the single file on the others. */
+/** Every file that has to be cached for `size` to load: every file of a
+ *  safetensors set, the shard set on a split GGUF, the single file otherwise. */
 export function modelFiles(size: ModelSize): readonly string[] {
   const ck = CHECKPOINTS[size];
-  return "shards" in ck ? ck.shards : [ck.model];
+  if ("files" in ck) return ck.files;
+  if ("shards" in ck) return ck.shards;
+  return [ck.model];
 }
 
 /** The official model for `size`, or throw with the fix.

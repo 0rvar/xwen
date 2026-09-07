@@ -23,7 +23,16 @@
  *
  * Usage:
  *   bun scripts/parity.ts --ours ours.json --ref eval-callback.txt \
- *       [--report parity-report.json] [--threshold 0.01] [--ref-top1 <id>]
+ *       [--arch qwen35|qwen3] [--report parity-report.json] \
+ *       [--threshold 0.01] [--ref-top1 <id>]
+ *
+ * --arch selects the tap-name table (see `TAP_TABLES` and docs/parity.md "Tap
+ * names"). It defaults to `qwen35`, the hybrid attention/DeltaNet graph of the
+ * 3.6 and 3.8 checkpoints, which is what this script has always compared.
+ * `qwen3` is llama.cpp's plain dense `src/models/qwen3.cpp` graph — the
+ * Qwen3-4B family — where almost every name already matches and the one real
+ * difference is that the mixer output has no post-o_proj node to compare
+ * against at all.
  */
 
 type Args = Record<string, string | boolean>;
@@ -154,17 +163,51 @@ const relErr = (a: number, b: number) => Math.abs(a - b) / (Math.abs(b) + 1e-6);
  * cbs the norm's MUL). Mapping them would compare two different tensors. The
  * post-norm value is compared as `result_norm` instead.
  */
-function refTapNames(ourName: string): string[] {
+const ARCHES = ["qwen35", "qwen3"] as const;
+type Arch = (typeof ARCHES)[number];
+
+// Per-arch translation from OUR tap name to the llama.cpp graph node name(s) it
+// should be compared against. An empty array means "we tap this, llama.cpp does
+// not name anything equivalent" -- the tap is skipped, never matched against a
+// same-named node that means something else. docs/parity.md "Tap names" is the
+// prose version, with the evidence.
+const TAP_TABLES: Record<Arch, (base: string, il: string) => string[]> = {
+  // Hybrid qwen35 / qwen35moe. `attn_o_proj` resolves BY LAYER KIND: the full-
+  // attention layers are indices where (il+1) % 4 == 0, everything else is
+  // gated DeltaNet, and `attn_output-{il}` exists on a DeltaNet layer too where
+  // it names a different tensor of a different shape.
+  qwen35: (base, il) => {
+    switch (base) {
+      case "attn_o_proj":
+        return [(Number(il) + 1) % 4 === 0 ? `attn_output-${il}` : `linear_attn_out-${il}`];
+      case "ffn_inp": return [`attn_residual-${il}`];
+      case "ffn_norm": return [`attn_post_norm-${il}`];
+      default: return [`${base}-${il}`];
+    }
+  },
+  // Dense qwen3 (Qwen3-4B and the rest of that family). Verified against
+  // llama.cpp's src/models/qwen3.cpp: it cbs attn_norm, ffn_inp, ffn_norm,
+  // ffn_out and l_out under exactly our names, so the table is the identity
+  // apart from the mixer output.
+  //
+  // `attn_o_proj` HAS NO COUNTERPART. build_attn cbs `kqv_out` on the attention
+  // result and then applies wo with no further cb -- the would-be `kqv_wo` call
+  // is commented out in llama-graph.cpp. So llama.cpp names the value BEFORE
+  // o_proj and never names the value after it, and our post-o_proj tap has
+  // nothing to be compared to. `kqv_out` is the pair for the pre-o_proj tap of
+  // the same name.
+  qwen3: (base, il) => (base === "attn_o_proj" ? [] : [`${base}-${il}`]),
+};
+
+function refTapNames(arch: Arch, ourName: string): string[] {
   const m = ourName.match(/^(.*)-(\d+)$/);
+  // `h_nextn` is ours only: our value is the PRE-final-norm residual stream and
+  // llama.cpp's same-named node is the post-norm hidden, which we compare as
+  // `result_norm` instead. Everything else unlayered (`result_norm`,
+  // `result_output`) is named identically by both.
   if (!m) return ourName === "h_nextn" ? [] : [ourName];
   const [, base, il] = m;
-  switch (base) {
-    case "attn_o_proj":
-      return [(Number(il) + 1) % 4 === 0 ? `attn_output-${il}` : `linear_attn_out-${il}`];
-    case "ffn_inp": return [`attn_residual-${il}`];
-    case "ffn_norm": return [`attn_post_norm-${il}`];
-    default: return [ourName];
-  }
+  return TAP_TABLES[arch](base, il);
 }
 
 // rel-L2 of paired samples: align the ref's truncated first-3/last-3 samples to
@@ -199,8 +242,14 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const oursPath = args.ours as string;
   const refPath = args.ref as string;
-  if (!oursPath || !refPath) {
-    console.error("usage: bun scripts/parity.ts --ours ours.json --ref eval-callback.txt [--report out.json] [--threshold 0.01] [--ref-top1 ID]");
+  if (!oursPath || !refPath || args.help === true) {
+    console.error(`usage: bun scripts/parity.ts --ours ours.json --ref eval-callback.txt [--arch ${ARCHES.join("|")}] [--report out.json] [--threshold 0.01] [--ref-top1 ID]`);
+    console.error(`  --arch  which llama.cpp graph the reference trace came from; picks the tap-name table (default: ${ARCHES[0]})`);
+    process.exit(2);
+  }
+  const arch = (args.arch ?? ARCHES[0]) as Arch;
+  if (!ARCHES.includes(arch)) {
+    console.error(`--arch must be one of ${ARCHES.join(", ")}; got ${JSON.stringify(args.arch)}`);
     process.exit(2);
   }
   const threshold = args.threshold ? Number(args.threshold) : 1e-2;
@@ -210,13 +259,12 @@ async function main() {
   const refText = await Bun.file(refPath).text();
   const refNodes = parseEvalCallback(refText);
   const refByName = new Map(refNodes.map((n) => [n.name, n]));
-  // Our tap names are the engine's own; llama.cpp's qwen35/qwen35moe graphs use
-  // different cb() names for three of them, and the mixer output has two names
-  // depending on the layer kind. Key our taps by the REF name so the walk below
-  // matches. The full table lives in docs/parity.md "Tap names".
+  // Our tap names are the engine's own; llama.cpp names its nodes per arch.
+  // Key our taps by the REF name so the walk below matches. The full table
+  // lives in `TAP_TABLES` above and in docs/parity.md "Tap names".
   const tapByName = new Map<string, Tap>();
   for (const t of ours.taps) {
-    for (const name of refTapNames(t.name)) {
+    for (const name of refTapNames(arch, t.name)) {
       if (refByName.has(name) && !tapByName.has(name)) tapByName.set(name, t);
     }
   }
@@ -227,7 +275,7 @@ async function main() {
   p(`XWEN PARITY`);
   p(`  ours: ${oursPath}`);
   p(`  ref:  ${refPath}`);
-  p(`  ref nodes parsed: ${refNodes.length}   our taps: ${ours.taps.length}   threshold: ${threshold}`);
+  p(`  arch: ${arch}   ref nodes parsed: ${refNodes.length}   our taps: ${ours.taps.length}   threshold: ${threshold}`);
   p(`  tokens: ${ours.n_tokens}  vocab: ${ours.vocab}`);
   p();
 
@@ -314,7 +362,7 @@ async function main() {
 
   if (args.report) {
     const report = {
-      ours: oursPath, ref: refPath, threshold, cosThreshold,
+      ours: oursPath, ref: refPath, arch, threshold, cosThreshold,
       nTokens: ours.n_tokens, vocab: ours.vocab,
       comparedTaps: cmps.length,
       firstDivergence: firstDiv,

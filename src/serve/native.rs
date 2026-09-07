@@ -25,7 +25,7 @@ use super::{
     collect_completion, random_id, sse_response, submit,
 };
 use crate::chat::{Continuation, Message};
-use crate::constrain::{self, Grammar};
+use crate::constrain::Grammar;
 use crate::generate::feasible_think_budget;
 use crate::sampler::SamplerOptions;
 
@@ -196,7 +196,10 @@ fn resolve_continuation(
 /// Resolve `format` into the grammar the job will decode under. Compiled here,
 /// on the HTTP thread, so a schema the compiler rejects is a 400 carrying the
 /// compiler's own message; only the shared factory failing is a 500.
-fn resolve_format(format: Option<&OutputFormat>) -> Result<Option<Grammar>, ApiError> {
+fn resolve_format(
+    format: Option<&OutputFormat>,
+    vocab: &crate::serve::vocab::Vocabulary,
+) -> Result<Option<Grammar>, ApiError> {
     let Some(format) = format else {
         return Ok(None);
     };
@@ -223,13 +226,10 @@ fn resolve_format(format: Option<&OutputFormat>) -> Result<Option<Grammar>, ApiE
                 )));
             }
         };
-    let factory = constrain::shared().map_err(|e| {
-        error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            format!("{e:#}"),
-        )
-    })?;
+    // The target's trie, not the process's. This endpoint always runs on the
+    // served checkpoint, so the family is the served one — but it is resolved
+    // rather than assumed, so it stays right if that ever stops being true.
+    let factory = vocab.grammars();
     match schema {
         Some(schema) => factory.compile(schema),
         None => factory.compile_any_object(),
@@ -274,6 +274,7 @@ pub(crate) fn prepare(
     request: GenerateRequest,
     settings: &ServeSettings,
     target: crate::serve::types::Target,
+    vocab: &crate::serve::vocab::Vocabulary,
 ) -> Result<Prepared, ApiError> {
     if request.messages.is_empty() {
         return Err(bad_request(EMPTY_MESSAGES));
@@ -281,20 +282,34 @@ pub(crate) fn prepare(
     if request.max_tokens == 0 {
         return Err(bad_request("max_tokens must be at least 1"));
     }
+    // See thinking_unsupported_message: asking a template with no reasoning
+    // mode to reason is refused rather than dropped. `false` is not asking.
+    if request.thinking == Some(true) && !target.model.chat_dialect().supports_thinking() {
+        return Err(bad_request(super::thinking_unsupported_message(
+            target, "thinking",
+        )));
+    }
     // Absent fields follow the operator's server policy, like the compat
-    // dialects; explicit fields override it.
-    let enable_thinking = request.thinking.unwrap_or(settings.thinking_force);
-    // The field is the raw template parameter, and the target's 3.6 template
-    // has no such parameter: this API refuses fields it would ignore, the same
-    // rule the OpenAI dialect's effort kwarg and the CLI's --reasoning-effort
-    // follow. The server-wide configured effort is an operator default, not a
-    // request, and stays inert-but-legal below.
+    // dialects; explicit fields override it — and then the DIALECT has the last
+    // word, because a template with no reasoning mode renders none whatever the
+    // resolved value says. `chat.rs` applies the same `&& supports_thinking()`
+    // when it renders, so anything downstream that reasons about the thinking
+    // span has to use the effective mode or it will describe a block that will
+    // not exist: `resolve_continuation` below refuses a response prefix as
+    // "inside an open reasoning block" on a checkpoint that never opens one.
+    let enable_thinking = request.thinking.unwrap_or(settings.thinking_force)
+        && target.model.chat_dialect().supports_thinking();
+    // The field is the raw template parameter, and only the 3.8 template takes
+    // one: this API refuses fields it would ignore, the same rule the OpenAI
+    // dialect's effort kwarg and the CLI's --reasoning-effort follow. The
+    // server-wide configured effort is an operator default, not a request, and
+    // stays inert-but-legal below.
     if request.reasoning_effort.is_some()
-        && target.model.chat_dialect() == crate::chat::ChatDialect::Qwen36
+        && !target.model.chat_dialect().supports_reasoning_effort()
     {
         return Err(bad_request(format!(
-            "reasoning_effort: {} renders the Qwen 3.6 chat template, which has no \
-             reasoning_effort parameter (it is a Qwen 3.8 template feature)",
+            "reasoning_effort: {} renders a chat template with no reasoning_effort \
+             parameter (it is a Qwen 3.8 template feature)",
             target.model.full_name(),
         )));
     }
@@ -308,7 +323,7 @@ pub(crate) fn prepare(
         .transpose()?
         .or(settings.reasoning_effort);
     let continuation = resolve_continuation(request.continuation.as_ref(), enable_thinking)?;
-    let grammar = resolve_format(request.format.as_ref())?;
+    let grammar = resolve_format(request.format.as_ref(), vocab)?;
     let messages = normalize(&request)?;
     // The ceiling has to leave the reply room to conclude in: it is lowered to
     // the largest one that fits, or dropped when none does — the same clamp both
@@ -539,7 +554,14 @@ pub(crate) async fn generate(State(state): State<AppState>, body: Bytes) -> Resp
             return bad_request(format!("could not parse the request body: {e}")).into_response();
         }
     };
-    let prepared = match prepare(request, &state.settings, state.default_target) {
+    // The vocabulary this request is rendered and masked with, resolved from
+    // the checkpoint that will answer it. A family this machine holds no
+    // tokenizer for is a 400 naming the fetch, not a wrong-vocabulary reply.
+    let vocab = match state.vocab.for_target(state.default_target) {
+        Ok(vocab) => vocab,
+        Err(e) => return bad_request(format!("{e:#}")).into_response(),
+    };
+    let prepared = match prepare(request, &state.settings, state.default_target, &vocab) {
         Ok(prepared) => prepared,
         Err(e) => return e.into_response(),
     };
@@ -605,18 +627,105 @@ mod tests {
     /// The default test target: the checkpoint whose template takes every
     /// field this API exposes, so a test is about the field it names rather
     /// than about the dialect refusal. The refusal test passes a 3.6 target.
+    /// A response prefix is renderable on a checkpoint whose template has no
+    /// reasoning mode.
+    ///
+    /// The resolved thinking mode is not the effective one: a server-wide
+    /// `thinking_force` (which `settings()` sets) survives the request's silence,
+    /// and `resolve_continuation` used to read it and refuse the prefix as
+    /// "inside an open reasoning block" — a block Instruct-2507 never opens. The
+    /// mode has to be ANDed with the dialect before anything reasons about the
+    /// thinking span, which is what `chat.rs` does when it renders.
+    #[test]
+    fn a_response_prefix_is_renderable_on_a_template_without_thinking() {
+        let instruct =
+            crate::serve::types::Target::official(crate::hub::Model::Qwen34BInstruct2507);
+        let body = r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}],
+                      "continue":{"prefix":"{\"city\":"}}"#;
+        let prepared = prepare(
+            parse(body),
+            &settings(),
+            instruct,
+            &crate::serve::testutil::vocab(),
+        )
+        .unwrap_or_else(|e| panic!("a prefix needs no open thinking span here: {}", message(&e)));
+        assert!(
+            !prepared.job.enable_thinking,
+            "the dialect has no thinking mode"
+        );
+        assert_eq!(continuation(&prepared).2, Some("{\"city\":"));
+
+        // The 3.6 family is unchanged: there the span really is open, and a
+        // prefix without `close_thinking` is still refused.
+        let error = prepare(
+            parse(body),
+            &settings(),
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .err()
+        .expect("a prefix inside an open thinking span is unrenderable");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// See the OpenAI dialect's copy. This API's spelling is a bare `thinking`
+    /// bool, and `false` is not asking.
+    #[test]
+    fn thinking_true_is_refused_on_a_template_without_one() {
+        let instruct =
+            crate::serve::types::Target::official(crate::hub::Model::Qwen34BInstruct2507);
+        let go = |body: &str| {
+            prepare(
+                parse(body),
+                &settings(),
+                instruct,
+                &crate::serve::testutil::vocab(),
+            )
+        };
+        let error =
+            go(r#"{"max_tokens":16,"thinking":true,"messages":[{"role":"user","content":"Hi"}]}"#)
+                .err()
+                .expect("a template with no thinking must refuse");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(
+            message(&error).contains("no reasoning mode"),
+            "{}",
+            message(&error)
+        );
+        for body in [
+            r#"{"max_tokens":16,"thinking":false,"messages":[{"role":"user","content":"Hi"}]}"#,
+            r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#,
+        ] {
+            // Silence resolves to the server-wide `thinking_force`, which stays
+            // live on the job: the DIALECT drops it in `chat.rs`, which is why
+            // an operator default is inert here while a request is a 400.
+            go(body).unwrap_or_else(|e| panic!("not asking to reason is fine: {}", message(&e)));
+        }
+    }
+
     fn target() -> crate::serve::types::Target {
         crate::serve::types::Target::official(crate::hub::Model::Qwen3827B)
     }
 
     fn prepared(body: &str) -> Prepared {
-        prepare(parse(body), &settings(), target()).expect("request prepares")
+        prepare(
+            parse(body),
+            &settings(),
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .expect("request prepares")
     }
 
     fn rejected(body: &str) -> ApiError {
-        prepare(parse(body), &settings(), target())
-            .err()
-            .expect("request is rejected")
+        prepare(
+            parse(body),
+            &settings(),
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .err()
+        .expect("request is rejected")
     }
 
     fn message(error: &ApiError) -> String {
@@ -694,7 +803,13 @@ mod tests {
         assert_eq!(prepared(body).job.sampling.presence_penalty, 0.0);
         // The 35B-A3B card is the one that does.
         let a3b = crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B);
-        let on_a3b = prepare(parse(body), &settings(), a3b).expect("request prepares");
+        let on_a3b = prepare(
+            parse(body),
+            &settings(),
+            a3b,
+            &crate::serve::testutil::vocab(),
+        )
+        .expect("request prepares");
         assert_eq!(on_a3b.job.sampling.presence_penalty, 1.5);
         // Thinking off: every card asks for 1.5.
         let instruct = prepared(
@@ -704,7 +819,13 @@ mod tests {
 
         let mut pinned = settings();
         pinned.presence_penalty = Some(0.25);
-        let configured = prepare(parse(body), &pinned, target()).expect("request prepares");
+        let configured = prepare(
+            parse(body),
+            &pinned,
+            target(),
+            &crate::serve::testutil::vocab(),
+        )
+        .expect("request prepares");
         assert_eq!(configured.job.sampling.presence_penalty, 0.25);
 
         let asked = prepare(
@@ -714,6 +835,7 @@ mod tests {
             ),
             &pinned,
             target(),
+            &crate::serve::testutil::vocab(),
         )
         .expect("request prepares");
         assert_eq!(asked.job.sampling.presence_penalty, 0.75);
@@ -739,6 +861,7 @@ mod tests {
             ),
             &pinned,
             target(),
+            &crate::serve::testutil::vocab(),
         )
         .unwrap();
         assert_eq!(configured.job.sampling.top_p, 0.9);
@@ -784,6 +907,7 @@ mod tests {
             parse(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#),
             &configured,
             target(),
+            &crate::serve::testutil::vocab(),
         )
         .unwrap();
         assert_eq!(
@@ -806,6 +930,7 @@ mod tests {
             ),
             &settings(),
             q36,
+            &crate::serve::testutil::vocab(),
         )
         .err()
         .expect("a 3.6 target refuses the field");
@@ -822,6 +947,7 @@ mod tests {
             parse(r#"{"max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#),
             &configured,
             q36,
+            &crate::serve::testutil::vocab(),
         )
         .expect("a configured default prepares on 3.6");
         assert_eq!(
@@ -867,6 +993,7 @@ mod tests {
                 serde_json::from_str::<GenerateRequest>(body).expect("parse"),
                 &policy,
                 target(),
+                &crate::serve::testutil::vocab(),
             )
             .expect("prepare")
         };

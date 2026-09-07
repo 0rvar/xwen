@@ -201,6 +201,40 @@ never per-kernel bandwidth.** Three refinements to that budget, all measured:
    instruments. The audit that would find the rest, threadgroup count against bytes for
    every decode dispatch, is ledgered and unbuilt.
 
+## Dense Qwen3-4B, which is not a design target
+
+Kept apart from the table above on purpose. The design target names the Qwen 3.6 and 3.8
+GGUF checkpoints; Qwen3-4B is in the repo as a correctness target and as the
+conditioning encoder (decisions.md "Dense Qwen3-4B is a full checkpoint AND the
+conditioning encoder"), so these figures exist to be known, not to be improved. Nothing
+here ranks a lever.
+
+Measured 2026-09-07 on the release binary of c05d631, plain decode with `--no-draft`
+(there is no drafter for this architecture), batch 1. `pmset -g` read `lowpowermode 2`;
+no high-power claim. **One caveat that would disqualify these as A/B numbers**: CPU-only
+debug builds were running in the background, which the benching rules forbid beside a
+bench. They are single-configuration levels with nothing to compare against inside their
+own session, so the contention costs accuracy and cannot flip a comparison.
+
+| Figure | Value |
+| --- | --- |
+| plain decode, 7-token prompt, 256 tokens | 63.1 tok/s |
+| plain decode at a 3890-token context, 128 tokens | 55.9 tok/s |
+| prefill @3890 | 3416, 3432, 3433 tok/s over three runs |
+
+**Both are close to their ceilings, and that is the finding.** Decode reads all 4.022 G
+BF16 parameters per token, 8.04 GB (7.27 GB of layers plus the 0.78 GB tied head, read in
+full because the logits need every row), plus 147 KB of KV per context token, 0.57 GB at
+3890. At the ~535 GB/s this repo measures for byte-bound kernels that is a bytes-only
+ceiling of 66.5 tok/s short-context and 62 at 3890, so the measured figures are **95% and
+90% of them**. The residual is the 36-layer dependent dispatch chain, which is a far
+smaller population than the MoE checkpoints carry. Prefill at 3890 costs ~8.4
+GFLOP/token (7.27 of layers, ~1.15 of causal attention), so 3433 tok/s is ~29 TFLOP/s end
+to end, inside the 28-36 TFLOP/s the Metal-4 tensor gemm measures in isolation: **prefill
+runs at the gemm's own rate**, with a ceiling of 3300-4300 depending where in that range
+this hardware's peak sits. There is no cheap lever on either, which is the answer this
+section exists to give rather than a problem it poses.
+
 ## History
 
 Narrative, protocol and the tables that produced these figures live in the log and its

@@ -118,7 +118,11 @@ fn main() -> Result<()> {
     let device = gguf::metal_device()?;
     let file = gguf::open(&args.model, &device)?;
     let _cfg = XwenConfig::from_gguf(&file.content)?;
-    let mut model = XwenModel::load(file, ExpertRunner::Fused, 4096)?;
+    let mut model = XwenModel::load(
+        xwen::CheckpointSource::Gguf(file),
+        ExpertRunner::Fused,
+        4096,
+    )?;
     // Under XWEN_STACK_PROFILE the verify forwards decompose into the stack
     // profiler's buckets. They are decode-shaped — a verify span is tokens the
     // generation already committed to, not prompt — so the phase is declared

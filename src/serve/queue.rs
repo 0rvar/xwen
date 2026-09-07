@@ -357,7 +357,7 @@ mod tests {
                 prompt,
                 boundary: 0,
                 anchor: None,
-                starts_in_thinking: false,
+                thinking_entry: crate::chat::ThinkingEntry::Answer,
                 max_think: None,
                 max_tokens: 16,
                 sampling: SamplerOptions::default(),

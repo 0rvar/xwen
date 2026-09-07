@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use candle_core::Device;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -34,7 +34,7 @@ use crate::kv_cache::{HostFullKv, HostSnapshot};
 use crate::mtp::{MtpConfig, MtpDrafter};
 use crate::ops::ExpertRunner;
 use crate::sampler::SamplerOptions;
-use crate::tokenizer::LagunaTokenizer;
+use crate::tokenizer::Specials;
 
 /// How much prefill a mid-prefill snapshot has to save before it is worth taking.
 ///
@@ -131,12 +131,12 @@ fn job_deadline(
 /// below are not in the vocabulary — so the span is entered and left by token
 /// id and parsed as text in between.
 ///
-/// The ids come from [`LagunaTokenizer`], which owns every token id in this
-/// crate. Spelling them out here once cost a parser that opened a span on every
-/// `:` in ordinary prose; a span marker is a vocabulary fact, and the
+/// The ids come from the running tokenizer's [`Specials`], which owns every
+/// token id in this crate — checkpoint families number the same markers
+/// differently, so the parser reads them off the vocabulary it is decoding
+/// against. Spelling them out here once cost a parser that opened a span on
+/// every `:` in ordinary prose; a span marker is a vocabulary fact, and the
 /// vocabulary has exactly one owner.
-const TOOL_CALL_OPEN: u32 = LagunaTokenizer::TOOL_CALL_OPEN;
-const TOOL_CALL_CLOSE: u32 = LagunaTokenizer::TOOL_CALL_CLOSE;
 const TOOL_CALL_OPEN_TEXT: &str = "<tool_call>";
 const TOOL_CALL_CLOSE_TEXT: &str = "</tool_call>";
 
@@ -216,17 +216,25 @@ pub fn read_startup_config(settings: &ServeSettings) -> Result<XwenConfig> {
 }
 
 /// Cheap startup validation: judges the already-parsed metadata (no tensor data, no
-/// Metal allocation) and loads the tokenizer. Fails fast so a bad model path or config
-/// is caught at startup rather than on the first request. Returns the tokenizer the
-/// HTTP layer renders prompts with — the same vocabulary the engine decodes with (every
-/// checkpoint shares it) — and the resolved context length its "does the prompt fit"
-/// check applies.
+/// Metal allocation) and loads the served checkpoint's vocabulary. Fails fast so a
+/// bad model path, an unreadable tokenizer or a config mistake is caught at startup
+/// rather than on the first request.
+///
+/// Returns the vocabularies the HTTP layer renders and masks with — one per
+/// family, resolved per request from its target, because the registry now holds
+/// two vocabularies and a served request may name either — and the resolved
+/// context length its "does the prompt fit" check applies.
+///
+/// Only the SERVED checkpoint's vocabulary is built here. The other family's is
+/// built on the first request that names it: it depends on what the hub cache
+/// holds, and a server whose clients only ever use the served checkpoint should
+/// neither pay for it nor refuse to start without it.
 pub fn validate_model(
     settings: &ServeSettings,
     cfg: &XwenConfig,
     served: Target,
     logger: &ServeLogger,
-) -> Result<(Arc<LagunaTokenizer>, usize)> {
+) -> Result<(Arc<super::vocab::Vocabularies>, usize)> {
     let (max_ctx, warning) = resolve_context_length(settings.context_length, cfg.n_ctx_train)?;
     if let Some(warning) = warning {
         logger.log(warning);
@@ -242,11 +250,22 @@ pub fn validate_model(
     // sidecar, and if the file's geometry differs at all, every request fails at
     // attach. Any OTHER checkpoint's sidecar cannot be judged here — it may not even
     // be downloaded yet — and is checked when that checkpoint attaches it.
+    // Asked for by name, against a target whose graph has no verify seam: the
+    // answer is the same one `xwen generate --draft` gives, and it is worth more
+    // than the sidecar's own "does this fit" complaint, which would describe a
+    // mismatch rather than the reason there can never be a match.
+    if matches!(settings.draft, DraftMode::Custom(_) | DraftMode::Official)
+        && !served.model.supports_drafting()
+    {
+        bail!("{}", served.model.no_drafting_message());
+    }
     if let Some(path) = startup_drafter(settings, served) {
         read_draft_config(&path, cfg)
             .with_context(|| format!("validating the drafter {}", path.display()))?;
     }
-    Ok((Arc::new(load_tokenizer()?), max_ctx))
+    let vocabularies = Arc::new(super::vocab::Vocabularies::new(&settings.model, served));
+    vocabularies.warm(served)?;
+    Ok((vocabularies, max_ctx))
 }
 
 /// Which drafter startup can judge, or `None` when none can be.
@@ -312,8 +331,11 @@ pub(super) const ENGINE_THREAD: &str = "engine";
 /// Metadata-only read of the checkpoint. The CPU device skips the mmap aliasing the
 /// Metal load path sets up, so this touches the header and tensor index alone.
 fn read_config(path: &Path) -> Result<XwenConfig> {
-    let gguf = gguf::open(path, &Device::Cpu)?;
-    XwenConfig::from_gguf(&gguf.content)
+    // No registry entry: this is a metadata read of a file the server was
+    // pointed at, and the identity it feeds is what decides which entry it is.
+    // The only thing the entry would buy here is a safetensors set's zero-run
+    // allowlist, and a set that fails that check is one no request could run.
+    crate::checkpoint::CheckpointSource::open(path, &Device::Cpu, None)?.config()
 }
 
 /// Metadata-only read of a drafter sidecar, on the CPU device for the same
@@ -344,10 +366,6 @@ fn read_draft_config(path: &Path, target: &XwenConfig) -> Result<DrafterKind> {
         }
     }
     Ok(kind)
-}
-
-fn load_tokenizer() -> Result<LagunaTokenizer> {
-    LagunaTokenizer::embedded().context("loading the tokenizer embedded in the binary")
 }
 
 /// The context length to allocate the KV cache for: what the config asks for, capped at
@@ -438,7 +456,15 @@ fn checkpoint_paths(
     };
     let draft = match &settings.draft {
         DraftMode::Off => None,
-        DraftMode::Custom(path) if local => Some(path.clone()),
+        DraftMode::Custom(path) if local => {
+            // A sidecar cannot be attached to a graph with no speculative verify
+            // seam, whoever's sidecar it is. Refused where the operator wrote it
+            // rather than fetched, opened, classified and rejected inside the
+            // first request, where the error would read as a geometry mismatch
+            // instead of as the fact that this target cannot be drafted for.
+            ensure!(size.supports_drafting(), "{}", size.no_drafting_message());
+            Some(path.clone())
+        }
         // Nothing in the config asked, and this checkpoint ships a sidecar it
         // does not attach unasked (the 35B-A3B since 2026-09-06). Said out
         // loud, because a drafter that is present and unused otherwise reads as
@@ -517,6 +543,7 @@ impl EngineState {
         let mut generator = Generator::load(
             &device,
             &model_path,
+            Some(size.model),
             None,
             ExpertRunner::Fused,
             max_ctx,
@@ -1580,7 +1607,7 @@ fn run_job(
         prompt,
         boundary,
         anchor,
-        starts_in_thinking,
+        thinking_entry,
         max_think,
         max_tokens,
         sampling,
@@ -1951,6 +1978,7 @@ fn run_job(
         &abandon,
         stop_sequences,
         &tools,
+        *engine.generator.tokenizer().specials(),
         &stopped,
         &disconnected,
         first_sent,
@@ -1964,7 +1992,7 @@ fn run_job(
     let outcome = if engine.generator.spec_ready_at(prompt_len) {
         engine.generator.decode_loop_spec(
             prompt_len,
-            starts_in_thinking,
+            thinking_entry,
             max_new,
             &mut |event| emitter.accept(event),
             &mut || stopped.get() || disconnected.get() || abandon.reason().is_some(),
@@ -1972,7 +2000,7 @@ fn run_job(
     } else {
         engine.generator.decode_loop(
             prompt_len,
-            starts_in_thinking,
+            thinking_entry,
             max_new,
             &mut |event| emitter.accept(event),
             &mut || stopped.get() || disconnected.get() || abandon.reason().is_some(),
@@ -2775,6 +2803,9 @@ struct Emitter<'a> {
     /// The declared argument types, and the switch that turns tool parsing on:
     /// with no tools in the request, `<tool_call>` is text like any other.
     schemas: ToolSchemas,
+    /// The running vocabulary's marker ids, which is how a `<tool_call>` token
+    /// is told from a token that merely decodes to that text.
+    specials: Specials,
     /// The call currently being parsed, when the model is inside one. While it is
     /// open, answer text and stop sequences are both suspended: a stop firing
     /// mid-call would deliver a call that cannot be parsed.
@@ -2809,6 +2840,7 @@ impl<'a> Emitter<'a> {
         abandon: &'a Abandon<'a>,
         stop_sequences: Vec<String>,
         tools: &[serde_json::Value],
+        specials: Specials,
         stopped: &'a Cell<bool>,
         disconnected: &'a Cell<bool>,
         first_sent: &'a Cell<Option<Instant>>,
@@ -2829,6 +2861,7 @@ impl<'a> Emitter<'a> {
             matched: None,
             internal_stop,
             schemas,
+            specials,
             span: None,
             called_tools: false,
             healed: 0,
@@ -2877,23 +2910,21 @@ impl<'a> Emitter<'a> {
     /// framing a call, and reading it as quoted text instead would let one
     /// malformed value swallow the rest of the reply.
     fn accept_tool_text(&mut self, id: u32, text: &str) {
-        match id {
-            TOOL_CALL_OPEN => {
-                let before = before_marker(text, TOOL_CALL_OPEN_TEXT);
-                self.feed_span(before, true);
-                // A call left unterminated by the one that follows it is closed
-                // here, so the two never merge into one.
-                self.close_span(false);
-                self.span = Some(ToolSpan::default());
-            }
-            TOOL_CALL_CLOSE if self.span.is_some() => {
-                let before = before_marker(text, TOOL_CALL_CLOSE_TEXT);
-                self.feed_span(before, true);
-                self.close_span(true);
-            }
+        if id == self.specials.tool_call_open {
+            let before = before_marker(text, TOOL_CALL_OPEN_TEXT);
+            self.feed_span(before, true);
+            // A call left unterminated by the one that follows it is closed
+            // here, so the two never merge into one.
+            self.close_span(false);
+            self.span = Some(ToolSpan::default());
+        } else if id == self.specials.tool_call_close && self.span.is_some() {
+            let before = before_marker(text, TOOL_CALL_CLOSE_TEXT);
+            self.feed_span(before, true);
+            self.close_span(true);
+        } else {
             // A close marker with no call open closes nothing; it falls through
             // to the answer as the text the model wrote.
-            _ => self.feed_span(text, false),
+            self.feed_span(text, false);
         }
     }
 
@@ -4484,6 +4515,7 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenizer::LagunaTokenizer;
 
     fn cache(capacity: usize) -> PrefixCache<usize> {
         PrefixCache::new(capacity)
@@ -7459,6 +7491,24 @@ mod tests {
         }
     }
 
+    /// The embedded vocabulary's marker ids, which the scripted streams below
+    /// spell in terms of. Resolved from the tokenizer rather than written out,
+    /// so a script and the emitter under test always name the same tokens.
+    fn embedded_specials() -> Specials {
+        static SPECIALS: std::sync::OnceLock<Specials> = std::sync::OnceLock::new();
+        *SPECIALS.get_or_init(|| *LagunaTokenizer::embedded().unwrap().specials())
+    }
+
+    /// `<tool_call>` and `</tool_call>` in the embedded vocabulary, the two ids
+    /// every tool-parser script brackets a call with.
+    fn tool_call_open() -> u32 {
+        embedded_specials().tool_call_open
+    }
+
+    fn tool_call_close() -> u32 {
+        embedded_specials().tool_call_close
+    }
+
     /// Drive the emitter over a scripted `(token id, finalized text)` stream,
     /// then end the generation the way `run_job` does. `hit_eog` tells an
     /// end-of-generation token from the output cap.
@@ -7480,6 +7530,7 @@ mod tests {
             &abandon,
             sequences,
             &tools,
+            embedded_specials(),
             &stopped,
             &disconnected,
             &first_sent,
@@ -7532,14 +7583,14 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=get_weather>\n"),
                 (0, "<parameter=city>\nSan Francisco\n</parameter>\n"),
                 (0, "<parameter=days>\n3\n</parameter>\n"),
                 (0, "<parameter=filters>\n{\"wind\":true}\n</parameter>\n"),
                 (0, "<parameter=tags>\n[\"a\",\"b\"]\n</parameter>\n"),
                 (0, "</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7566,7 +7617,7 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nif (a < b) {",
@@ -7574,7 +7625,7 @@ mod tests {
                 (0, "}</para"),
                 (0, "meterX\n</parameter"),
                 (0, ">\n</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7595,11 +7646,11 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=get_weather>\n<parameter=city>\nsay \"caf"),
                 (0, "é\"\n\tor \\else"),
                 (0, "\n</parameter>\n</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7620,11 +7671,11 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function= get_weather >\n"),
                 (0, "<parameter= city >\nOslo\n</parameter>\n"),
                 (0, "</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7642,9 +7693,9 @@ mod tests {
             vec![tool("get_time", serde_json::json!({}))],
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=get_time>\n</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7660,19 +7711,19 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
                 (0, "\n"),
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=days>\n2\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7697,7 +7748,7 @@ mod tests {
             vec![tool("run", serde_json::json!({}))],
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=run>\n<parameter=payload>\n{\"a\":1}\n</parameter>\n",
@@ -7706,7 +7757,7 @@ mod tests {
                     0,
                     "<parameter=note>\nhello world\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7725,7 +7776,10 @@ mod tests {
         let truncated = drive(
             weather(),
             &[],
-            &[(TOOL_CALL_OPEN, "<tool_call>"), (0, "\n<function=get_wea")],
+            &[
+                (tool_call_open(), "<tool_call>"),
+                (0, "\n<function=get_wea"),
+            ],
             true,
         );
         assert!(truncated.calls().is_empty());
@@ -7739,7 +7793,7 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=get_weather"),
             ],
             true,
@@ -7754,9 +7808,9 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=>\n</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7779,9 +7833,9 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<parameter=city>\nOslo\n</parameter>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7799,15 +7853,15 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<parameter=city>\nOslo\n</parameter>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_close(), "</tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=days>\n2\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7823,7 +7877,7 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<parameter=city>\nOs"),
             ],
             true,
@@ -7845,7 +7899,7 @@ mod tests {
                 weather(),
                 &[],
                 &[
-                    (TOOL_CALL_OPEN, "<tool_call>"),
+                    (tool_call_open(), "<tool_call>"),
                     (0, "\n<function=get_weather>\n"),
                     (0, tail),
                 ],
@@ -7865,12 +7919,12 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\n\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7886,7 +7940,7 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=get_weather>\n<parameter=city>\nSan Fran"),
             ],
             false,
@@ -7900,7 +7954,7 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</param",
@@ -7917,7 +7971,7 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n\
@@ -7938,13 +7992,13 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=filters>\nwindy\n</parameter>\n\
                      </function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7960,12 +8014,12 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<func"),
                 (0, "tion=get_wea"),
                 (0, "ther>\n<param"),
                 (0, "eter=city>\nOslo\n</parameter>\n</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -7984,17 +8038,17 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=days>\n2\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8021,9 +8075,9 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=get_weather>\n<parameter=city>\nsay "),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
                 (0, " loudly"),
             ],
             true,
@@ -8051,14 +8105,14 @@ mod tests {
             tools,
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=note>\n<parameter=label>\n123\n</parameter>\n",
                 ),
                 (0, "<parameter=count>\n123\n</parameter>\n"),
                 (0, "<parameter=mode>\nfast\n</parameter>\n</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8076,12 +8130,12 @@ mod tests {
             )],
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=note>\n<parameter=label>\nnull\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8116,13 +8170,13 @@ mod tests {
             weather(),
             &["STOP"],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nSTOP HERE\n</parameter>\n\
                      </function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
                 (0, "now STOP tail"),
             ],
             true,
@@ -8154,12 +8208,12 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
                 (0, "</assistant>"),
             ],
             false,
@@ -8188,9 +8242,9 @@ mod tests {
             Vec::new(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=get_weather>\n</function>\n"),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
                 (0, "</assistant>"),
             ],
             true,
@@ -8206,7 +8260,7 @@ mod tests {
         let stray = drive(
             weather(),
             &[],
-            &[(0, "done"), (TOOL_CALL_CLOSE, "</tool_call>")],
+            &[(0, "done"), (tool_call_close(), "</tool_call>")],
             true,
         );
         assert!(stray.calls().is_empty());
@@ -8222,12 +8276,12 @@ mod tests {
             &["STOP"],
             &[
                 (0, "Let me check. ST"),
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8244,20 +8298,20 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n\
                      <parameter=days>\n2\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_close(), "</tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=filters>\n{\"wind\":true}\n\
                      </parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8274,7 +8328,7 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (0, "\n<function=get_weather>\n<parameter=city>\nOs"),
             ],
             false,
@@ -8289,7 +8343,7 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=filters>\n{\"wind\":tr",
@@ -8312,17 +8366,17 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=days>\n2\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8342,12 +8396,12 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8364,13 +8418,13 @@ mod tests {
             weather(),
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=get_weather>\n<parameter=days>\nsoon\n</parameter>\n\
                      </function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8390,12 +8444,12 @@ mod tests {
             )],
             &[],
             &[
-                (TOOL_CALL_OPEN, "<tool_call>"),
+                (tool_call_open(), "<tool_call>"),
                 (
                     0,
                     "\n<function=note>\n<parameter=label>\n123\n</parameter>\n</function>\n",
                 ),
-                (TOOL_CALL_CLOSE, "</tool_call>"),
+                (tool_call_close(), "</tool_call>"),
             ],
             true,
         );
@@ -8568,7 +8622,7 @@ mod tests {
             "no `:` or `;` in {ids:?}"
         );
         assert!(
-            !ids.contains(&TOOL_CALL_OPEN) && !ids.contains(&TOOL_CALL_CLOSE),
+            !ids.contains(&tool_call_open()) && !ids.contains(&tool_call_close()),
             "prose must not carry the span tokens"
         );
         let script: Vec<(u32, String)> = ids

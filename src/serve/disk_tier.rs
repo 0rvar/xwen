@@ -38,7 +38,7 @@ use candle_core::Device;
 
 use crate::chat::TOKENIZATION_RULES_VERSION;
 use crate::dflash::DrafterImage;
-use crate::gguf::{self, CheckpointId};
+use crate::gguf::CheckpointId;
 use crate::kv_cache::{HostFullKv, HostSnapshot, MAX_STORED_SNAPSHOTS};
 
 use super::config::ServeSettings;
@@ -1215,7 +1215,7 @@ impl DiskCache {
 /// device: this runs before the model is loaded, and the hash covers the header,
 /// the metadata and the tensor index — never the tens of gigabytes behind them.
 fn checkpoint_id(model: &Path) -> anyhow::Result<CheckpointId> {
-    Ok(gguf::open(model, &Device::Cpu)?.checkpoint_id())
+    Ok(crate::checkpoint::CheckpointSource::open(model, &Device::Cpu, None)?.checkpoint_id())
 }
 
 /// One segment as a chain walk reaches it.
@@ -2411,6 +2411,44 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// The disk tier binds every stored segment to the checkpoint it was
+    /// produced by, and it has to be able to name a safetensors checkpoint as
+    /// well as a GGUF — the two are hashed by different code and both arrive
+    /// here through the same call.
+    ///
+    /// A stable id and a DISTINCT one are the two properties: unstable means a
+    /// restart abandons the store, and colliding means one checkpoint's cache
+    /// rows are handed to another, which is silent corruption of the only kind
+    /// this binding exists to prevent.
+    ///
+    /// Skips itself without the checkpoints in the local cache. The id is
+    /// metadata-only on both arms, so this reads headers rather than weights.
+    #[test]
+    fn a_safetensors_checkpoint_has_its_own_stable_disk_tier_id() {
+        let Some(qwen3) = crate::test_support::checkpoint_or_skip(crate::hub::Model::Qwen34B)
+        else {
+            return;
+        };
+        let id = checkpoint_id(&qwen3).expect("a safetensors set has an id");
+        assert_eq!(id, checkpoint_id(&qwen3).unwrap(), "the id must be stable");
+        // The directory and the config.json inside it are the same checkpoint,
+        // and both spellings reach this function: `ensure_model` returns the
+        // file and `--model` may name either.
+        assert_eq!(id, checkpoint_id(qwen3.parent().unwrap()).unwrap());
+        // A non-empty subdirectory name for the store, as every id produces.
+        assert!(!id.dir_name().is_empty());
+
+        if let Some(instruct) = crate::hub::cached_model(crate::hub::Model::Qwen34BInstruct2507) {
+            assert_ne!(
+                id,
+                checkpoint_id(&instruct).unwrap(),
+                "two releases sharing a graph must not share a cache"
+            );
+        }
+        if let Some(gguf) = crate::hub::cached_model(crate::hub::Model::Qwen35BA3B) {
+            assert_ne!(id, checkpoint_id(&gguf).unwrap());
+        }
+    }
     use super::*;
     use crate::kv_cache::HostLayerSnapshot;
 

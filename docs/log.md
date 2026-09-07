@@ -4,6 +4,71 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — Dense Qwen3 parity bars decided: Stage 1 passes on both oracle arms, consistency at 0.2, the sdpa ablation rules the attention kernel out
+
+Arc 4, the last of the dense Qwen3-4B arcs and the one that turns two measurements into
+gates. Stage 1 gates pooled top-5 at 99.9% and argmax as "no flip outside the 2e-2
+near-tie band"; max-abs is reported beside the oracle's own CPU-versus-Metal spread of
+0.358 and not gated, because a fixed 2e-2 was a number llama.cpp misses against itself.
+Under those bars both arms pass: Metal 0 hard flips, 99.9239%, max-abs 0.222 inside the
+spread; CPU 0 hard flips, 99.9176%, 0.379 printed as above it. The consistency bar is 0.2
+with an identical argmax and passes on both attention arms (0.149 fused, 0.187 f32 sdpa,
+862/862 argmax on every row). The Stage 1 ablation against the real f32 sdpa arm, pending
+since the hollow one was withdrawn, ran over all 20 prompts: 0.309, 4 near-tie flips and
+top-5 99.9556% against the fused arm's 0.222, 3 and 99.9239%, lower on short prompts and
+higher on long ones because the oracle ran an f16 cache with flash attention. Neither
+arm dominates, so the kernel is not a systematic error source. The ledger's one
+`[blocked]` item closes into the archive. The Qwen outside review of the generate loop
+was skipped by decision; Codex reviewed that slice. [Record](records/qwen3-dense.md),
+[bars](qwen3-dense.md), [runbook](parity.md), [decision](decisions/ground-truth-and-parity.md).
+
+## 2026-09-07 — Qwen3-4B on serve and batch: one server, two vocabularies, and decode at 95% of its byte ceiling
+
+Arc 3, the same day as the stack arc above and the arc that makes the entries reachable.
+The tokenizer and the grammar trie now follow the request's target rather than the
+process: `src/serve/vocab.rs` holds one pair per `VocabFamily`, built together so they
+cannot disagree, and `constrain::shared()` is off every serve request path. A family with
+no tokenizer on the machine is an error naming the fetch and never a fallback to the
+embedded copy, which would answer fluently in the wrong vocabulary. Both language models
+are servable; the encoder is refused on all four surfaces plus the wire, and that gate was
+missing from `generate` and `chat`, where loading it SUCCEEDS and would have generated
+from a zero-filled layer 35. Smoked on the GPU: a thinking completion returned 314
+reasoning tokens separated from a 56-token answer, a json_schema reply validated against
+its schema (the request that proves the trie is the 151936-wide one), a two-turn
+conversation reused 14 of 63 tokens, and one server answered Qwen3-4B then
+Qwen3.6-35B-A3B then Qwen3-4B. **Performance, recorded and not pursued**: plain decode
+63.1 tok/s short-context and 55.9 at 3890, which is 95% and 90% of the bytes-only
+ceiling, and prefill 3416-3433 tok/s at 3890, about 29 TFLOP/s end to end and inside what
+the tensor gemm reaches in isolation. No cheap lever on either, which is the right
+outcome for a correctness target. `lowpowermode 2`, and CPU-only debug builds were
+running alongside. [Record](records/qwen3-dense.md), [figures](perf-state.md),
+[decision](decisions/serving.md).
+
+## 2026-09-07 — The dense Qwen3-4B stack runs: Stage 2 passes at cosine 0.99999449, and Stage 1 finds the 2e-2 bar is one llama.cpp cannot meet against itself
+
+Arc 1. `src/qwen3/stack.rs` runs the dense graph through `XwenModel`, and `generate`,
+`chat` and `encode-text` work on the three entries; `serve` and `batch` are still
+refused. `LmHead` became an enum to carry the tied bf16 embedding and `run_stack` gained a
+dispatch, both under every shipped checkpoint, so the GGUF parity gate was a precondition
+rather than a formality: the 35B and the 27B pass every tier (the 27B decodes 64/64 with
+nothing excused) and the Flash-Next replay passes all three fixtures with zero hard
+mismatches. Thinking on
+the Qwen3 dialect became model-opened rather than prompt-seeded, closing the gap Arc 0
+recorded. **Stage 2 passes**: minimum cosine 0.99999449 and maximum relative error
+0.00388 against the fp32 torch reference, where the pipeline's own bf16 execution reads
+0.99960 and 0.03236, so xwen sits about ten times closer to fp32 than diffusers does; the
+bf16 output cast alone accounts for 0.003784 of that. **Stage 1 is the finding.** Against
+the Metal oracle: pooled max-abs 0.222, argmax 6304/6307 with every flip inside the
+near-tie band, pooled top-5 99.9239% (pass). Against the CPU oracle: 0.379, 6300/6307,
+99.9176%. And llama.cpp's own CPU and Metal arms differ by 0.358 with 4 flips on the same
+prompts, so **xwen is closer to the Metal oracle than the two oracle backends are to each
+other** and the planned 2e-2 max-abs with 100% argmax is not a bar the reference meets
+against itself. Ablations rule out the two obvious suspects: the sdpa arm reproduces the
+flash arm exactly, and the classic matmul is worse than the tensor gemm. What the bars
+should be is now an owner decision, ledgered rather than improvised.
+[Record](records/qwen3-dense.md), [architecture](qwen3-dense.md), [Z-Image](zimage.md),
+[parity](parity.md).
+
 ## 2026-09-07 — Metrics: harness runs record to their own files, and the client id keeps its session id
 
 `XWEN_METRICS_TAG=bench` now resolves `metrics-bench.jsonl` beside `metrics.jsonl`
@@ -26,6 +91,33 @@ live file also settled the item the metrics arc left open: the recorded
 binary, and a fixture smoke over a scratch `HOME` covering the default read, `--tag`,
 `--all-tags`, `--json`, a mixed `--file`, and the three ways there is nothing to read.
 
+## 2026-09-06 — Dense Qwen3-4B registered: BF16 safetensors loader, per-instance tokenizer specials, two chat dialects, a per-position logits oracle
+
+Arc 0 of a new architecture, and the only GPU-free one: `model_type: qwen3` joins the repo as
+both a full LM checkpoint and the text-conditioning encoder the diffusion image models
+will call in-process, which is a scope amendment and not a throughput one
+(decisions.md "Dense Qwen3-4B is a full checkpoint AND the conditioning encoder"). Four
+commits, nothing runnable on purpose: three registry entries with `servable()` and
+`auto_fetch()` false until the arc whose surface makes each true. What landed is the CPU
+side. A BF16 safetensors loader that validates before it allocates and copies rather
+than aliases, shards 1 and 2 of every set starting at `% 16 == 8`. An integrity scan that
+refuses a projection with a zero run past 4096 elements unless the entry allowlists it,
+written against a real defect: Z-Image ships Qwen3-4B's last-layer MLP with 14,772,816
+and 3,938,425 contiguous zeros, harmless for the hidden state it reads and
+disqualifying for anything else. Tokenizer specials became per-instance data resolved by
+text, over eleven call sites, with `TOKENIZATION_RULES_VERSION` deliberately unbumped. Two
+chat dialects, 16/16 renders byte-equal to `llama-server --jinja`, tools refused because
+the call format is JSON and the serve parser reads only `<function=`. And
+`llama-logits-all`, a per-position logits oracle neither existing tool provides, whose
+CPU arm turns out not to be xwen's arithmetic: llama.cpp narrows F32 activations to BF16
+before every BF16 matmul there, so the 2e-2 Stage 1 bar waits for the Metal arm. The
+Stage 2 encoder reference landed early, needing neither GPU nor stack: it proves the
+`hidden_states` index convention with forward hooks (the naive assertion for it is false
+by 12.15), shows padded and unpadded batch-1 bitwise equal, and reports the pipeline's
+own bf16 arm at minimum cosine 0.99960 against an acceptance bar of 0.9999.
+[Record](records/qwen3-dense.md), [architecture](qwen3-dense.md), [Z-Image](zimage.md),
+[parity](parity.md).
+
 ## 2026-09-06 — QSA layers attend sparsely at prefill: 128k prefill 282-296 → 428-456 tok/s
 
 The probe the device-mask record asked for, and the route it justified, the same evening.
@@ -43,6 +135,8 @@ tokens. below 64k it does not pay (-10% at 16k, -2.5% at 32k, +13-17% at 64k), s
 below that.
 `XWEN_QSA_ATTN_CLASSIC=1` is the dense route back, a parity row rather than a bitwise
 switch. [Record](records/qsa-sparse-prefill.md), [decision](decisions/flash-next.md).
+||||||| f384522
+
 
 ## 2026-09-06 — QSA prefill selection and mask on the device: 128k prefill 231 → 284-296 tok/s, peak 59 → 28 GB
 

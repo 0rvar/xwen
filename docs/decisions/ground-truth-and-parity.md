@@ -49,3 +49,69 @@ are Gemma-style zero-centered `(1+w)`) for every norm EXCEPT the DeltaNet `ssm_n
 and GGUF V-head ordering is tiled (llama.cpp permutes V-side weights at conversion to
 suit `ggml_repeat`) where HF safetensors are grouped (`repeat_interleave`). We read
 GGUF, so we use the pre-baked/tiled forms directly and never "fix" them (2026-07-28).
+
+**For the dense `qwen3` graph the authority is llama.cpp `src/models/qwen3.cpp` and HF
+`modeling_qwen3.py`, and here the two agree.** The Qwen 3.6 entry above warns that HF is
+hazardous to diff against because of conversion-baked deltas; that warning is about
+GGUF, and it does not transfer. We read the HF safetensors directly, so there is no
+converter between us and the weights, no pre-baked `w+1` norm and no tiled V-head
+permutation: GQA broadcast here is `repeat_interleave` semantics, KV head `j` serving Q
+heads `4j..4j+3`, which is the form the 3.6 GGUF path calls WRONG for itself. Both
+references were read rather than assumed and they agree on every point that could have
+gone the other way: q_proj then per-head RMSNorm over [128] then rope, the same for k,
+with v untouched by either; full NEoX rope over all 128 head dims (llama.cpp asserts
+`n_embd_head == n_rot`), against 3.6's partial 64 of 256; scale `1/sqrt(128)`; plain
+RMSNorm with no `+1`; SwiGLU; no biases; and with `use_sliding_window` false every layer
+is full attention. The pinned oracle checkout already carries a `qwen3.cpp` byte-identical
+to master, so no re-pin was needed. Two runtime facts are NOT in `config.json` and are
+supplied by the architecture definition rather than defaulted: `NormVariant::Standard`
+and `RopeSpec { head_dim, rotary_dim, theta }`, neither with a `Default` impl. That is
+the same discipline as the removed `ssm_ba` fallback, inverted: a form that could have
+gone the other way is stated once where it can be read, and a future variant has to be
+implemented rather than assumed into existence (2026-09-06).
+
+**The Stage 1 oracle for `qwen3` is per-position logits, and its CPU arm is not the
+arithmetic being graded.** Neither existing oracle produces what a dense-4B gate needs:
+`llama-eval-callback` dumps per-node sums with first-3/last-3 samples and computes
+logits for the last position only, and `llama-perplexity --kl-divergence-base` stores
+uint16-compressed log-probs with a 16-logit floor. `scripts/llama-logits-all.cpp` links
+libllama, sets `batch.logits[i]` on every token, and streams raw f32 `[n_tokens,
+n_vocab]` to disk with a sidecar recording backend, GPU layers, KV types, batch
+geometry, flash-attn, threads, the GGUF sha256 and the llama.cpp commit; chunked decode
+is ubatch-invariant, checked bitwise. The caveat is the load-bearing part. llama.cpp's
+CPU path narrows F32 activations to BF16 before every BF16 matmul - the type traits set
+`vec_dot_type = GGML_TYPE_BF16` and the llamafile fast path has no ARM branch, so the
+conversion always runs - while its Metal path keeps F32 activations against BF16
+weights, which is what xwen does. A CPU reference is therefore a different computation,
+not a slower one, and the planned 2e-2 max-abs bar is provisional until the same binary
+has produced the Metal arm under `--n-gpu-layers`. Two measurement definitions are fixed
+now so that a later number cannot quietly mean something else: top-5 agreement is POOLED,
+`sum |top5_candidate ∩ top5_ref| / (5 × positions)`, because per-position overlap of
+five items moves in 20% steps and a per-position 99.9% is not a quantity; and the
+encoder's relative error is per token, `max_i |x_i − r_i| / max(max_i |r_i|, 1e-6)`, the
+denominator being that token's own largest reference magnitude rather than a global one
+(2026-09-06).
+
+**The dense Qwen3 Stage 1 bars are two gates and one report, and the consistency bar is
+0.2.** Gates: pooled top-5 agreement at 99.9%, and argmax as "no flip outside the near-tie
+band", where a flip the reference itself decided by less than 2e-2 is counted and printed
+and does not fail. Report: max-abs, printed beside the oracle's own CPU-versus-Metal
+pooled spread (0.358 over the 20 fixture prompts; `metrics::ORACLE_BACKEND_SPREAD` in
+`tests/qwen3_parity.rs`, re-measured when the fixtures or the llama.cpp pin change) and
+never gated. The 2e-2 max-abs with 100% argmax the plan proposed is REFUTED as a bar, by
+the reference: llama.cpp's own two backends over the same prompts read pooled max-abs
+0.358 with 4 argmax flips, so a fixed number under that spread graded which backend the
+oracle ran on, not xwen, which sits closer to the Metal arm (0.222, 3 flips) than the two
+arms sit to each other. The attention arm was ruled out as the source the same day: the
+f32 sdpa chain against the Metal oracle reads 0.309, 4 near-tie flips and top-5 99.9556%
+where the shipped fused arm reads 0.222, 3 and 99.9239%, lower on short prompts and higher
+on long ones because the oracle ran an f16 cache with flash attention, so neither arm
+dominates and both sit inside the oracle's spread. The consistency bar follows from the
+same measurement: the only internal spread is `matmul_bf16`'s f32-activation gemv (t <= 8)
+against its half-staged tensor gemm, 0.149 on the fused arm and 0.187 on the f32 arm at
+one position with the argmax agreeing everywhere, and the oracle's own bf16 gemm stages the
+same way, so 0.2 with an identical argmax is the statement "decode and prefill may differ
+by the staging and nothing else". What the bar does not certify is stated with it: a
+systematic error under 0.358 that leaves the top-5 set and every decided argmax alone
+passes. Reopen the max-abs gate only with an oracle whose two backends agree to better
+than the number proposed (2026-09-07).

@@ -278,6 +278,33 @@ impl CheckpointId {
         Ok((hash, file_len))
     }
 
+    /// An id over a checkpoint that is a SET of files rather than one GGUF:
+    /// each `(path, metadata_len)` is folded in the order given, and the total
+    /// length is the sum of the whole files.
+    ///
+    /// Same guarantee as the split-GGUF chain `fold` was written for, generalised
+    /// to a caller that knows where each of its files stops being metadata. A
+    /// safetensors checkpoint uses it for its config, its shard index and each
+    /// shard's JSON header; the tensor payload is not read, exactly as a GGUF's
+    /// is not.
+    pub fn chain(files: &[(&Path, u64)]) -> Result<Self> {
+        ensure!(!files.is_empty(), "checkpoint id: no files to fold");
+        let mut hash = Self::OFFSET_BASIS;
+        let mut total = 0u64;
+        for (path, metadata_len) in files {
+            let mut file = File::open(path)
+                .with_context(|| format!("opening {} for the checkpoint id", path.display()))?;
+            let (next, file_len) = Self::fold(&mut file, *metadata_len, hash)
+                .with_context(|| format!("hashing {}", path.display()))?;
+            hash = next;
+            total = total.saturating_add(file_len);
+        }
+        Ok(Self {
+            hash,
+            file_len: total,
+        })
+    }
+
     /// A specific id, for tests that have to bind and mis-bind a persisted
     /// artifact without a checkpoint on disk to derive one from.
     #[cfg(test)]
@@ -424,6 +451,15 @@ impl GgufFile {
     /// empty off Metal or under `XWEN_LOAD_CLASSIC`). Keep-alive and view
     /// registration must cover all of them: a tensor aliases whichever shard's
     /// mapping holds it.
+    /// The path this checkpoint was OPENED from — shard 0's for a split set.
+    ///
+    /// Unlike the [`GgufFile::path`] field this never panics on a split GGUF,
+    /// because it promises less: it is the name the checkpoint is identified
+    /// and labelled by, not a file whole-file reads would be correct against.
+    pub fn checkpoint_path(&self) -> &Path {
+        &self.path.path
+    }
+
     pub fn mmap_sources(&self) -> Vec<Arc<MmapSource>> {
         self.shards.iter().filter_map(|s| s.mmap.clone()).collect()
     }

@@ -19,7 +19,15 @@
 //! - it no longer splits inline `<think>` blocks out of assistant content
 //!   (3.6 lines 93-97 have no 3.8 counterpart): a turn that carries no
 //!   reasoning field renders its content verbatim, where 3.6 cuts it at the
-//!   block ([`split_reasoning`] runs only under the 3.6 dialect).
+//!   block ([`ChatDialect::splits_inline_reasoning`]).
+//!
+//! The dense Qwen3-4B checkpoints ship a template from a different lineage
+//! (reference/chat_template-qwen3.jinja and its Instruct-2507 revision), which
+//! diverges further: it strips no message body, writes no `<think>` opener into
+//! a thinking-on generation prompt, has neither `preserve_thinking` nor
+//! `reasoning_effort`, renders conversations the 3.6 one refuses, and writes
+//! tool calls as JSON — a format this renderer does not produce, so tools on
+//! those dialects are [`ChatError::ToolsUnsupported`]. See [`ChatDialect`].
 use std::fmt;
 use std::ops::Range;
 
@@ -116,6 +124,10 @@ pub enum ChatError {
     MalformedToolArguments { name: String, detail: String },
     /// A [`Continuation`] whose fields describe a turn that cannot be written.
     UnrenderableContinuation { reason: &'static str },
+    /// Tools were requested, or replayed in an assistant turn, on a dialect
+    /// whose tool-call format this renderer does not write
+    /// ([`ChatDialect::supports_tools`]).
+    ToolsUnsupported { dialect: ChatDialect },
 }
 
 impl fmt::Display for ChatError {
@@ -146,6 +158,11 @@ impl fmt::Display for ChatError {
             Self::UnrenderableContinuation { reason } => {
                 write!(f, "the continuation has no rendering: {reason}")
             }
+            Self::ToolsUnsupported { dialect } => write!(
+                f,
+                "this checkpoint's chat template writes tool calls in a format \
+                 xwen does not render or parse ({dialect:?}); run the request without tools"
+            ),
         }
     }
 }
@@ -178,11 +195,15 @@ pub enum Message {
     ToolResponse(String),
 }
 
-/// Which release's chat template a conversation renders under. The two differ
-/// only around the system block (the 3.8 `reasoning_effort` preamble and its
-/// empty-system handling) and in their `preserve_thinking` default
-/// ([`ChatOptions::for_dialect`]); every turn and the generation prompt render
-/// identically.
+/// Which release's chat template a conversation renders under.
+///
+/// The 3.6 and 3.8 templates are one lineage, differing only around the system
+/// block (the 3.8 `reasoning_effort` preamble and its empty-system handling),
+/// in their `preserve_thinking` default ([`ChatOptions::for_dialect`]) and in
+/// whether an assistant turn's inline `<think>` block is split out of its
+/// content ([`ChatDialect::splits_inline_reasoning`]); every turn body and the
+/// generation prompt render identically. The two Qwen3 templates are a second
+/// lineage and diverge much further — see [`ChatDialect::Qwen3`].
 ///
 /// A checkpoint's dialect is [`crate::hub::Model::chat_dialect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -192,6 +213,119 @@ pub enum ChatDialect {
     Qwen36,
     /// reference/chat_template-qwen38.jinja — Qwen3.8-27B.
     Qwen38,
+    /// reference/chat_template-qwen3.jinja — the dense Qwen3-4B base
+    /// checkpoint, whose template is the hybrid-thinking one. Against 3.6:
+    ///
+    /// - the generation prompt with thinking ON ends at
+    ///   `<|im_start|>assistant\n` and opens no `<think>` block; the model
+    ///   writes its own opener. With thinking off it closes an empty block, as
+    ///   3.6 does.
+    /// - no message body is stripped: the template interpolates `content`
+    ///   raw where 3.6 pipes every body through `|trim`.
+    /// - there is no `preserve_thinking` parameter and no reasoning-effort
+    ///   preamble. A superseded assistant turn always drops its reasoning, and
+    ///   a turn past the current query keeps it only when it is the last
+    ///   message or actually carries reasoning.
+    /// - a system message past the first position renders as an ordinary turn
+    ///   rather than being refused, and a conversation with no user query
+    ///   renders (the last message opens the query) rather than raising.
+    /// - tool calls are written as JSON inside `<tool_call>` rather than in
+    ///   3.6's `<function=…>` form, which this renderer does not implement:
+    ///   tools on this dialect are [`ChatError::ToolsUnsupported`].
+    Qwen3,
+    /// reference/chat_template-qwen3-instruct-2507.jinja — Qwen3-4B-Instruct-2507.
+    ///
+    /// [`ChatDialect::Qwen3`] with every trace of thinking removed: the
+    /// generation prompt is always the bare `<|im_start|>assistant\n`, an
+    /// assistant turn renders its content verbatim with no `<think>` block and
+    /// no inline parsing, and `enable_thinking` has nothing to act on.
+    Qwen3Instruct,
+}
+
+/// Which family of templates a dialect belongs to. Most of what separates the
+/// dense Qwen3 templates from the 3.6/3.8 ones is shared by both members of
+/// each family, so those divergences key on this rather than on the dialect:
+/// whether bodies are stripped, whether tools are renderable, whether a late
+/// system message and a query-less conversation are refused, and how a
+/// superseded assistant turn is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lineage {
+    /// reference/chat_template.jinja and its 3.8 revision.
+    Qwen36,
+    /// reference/chat_template-qwen3.jinja and its Instruct-2507 revision.
+    Qwen3,
+}
+
+impl ChatDialect {
+    fn lineage(self) -> Lineage {
+        match self {
+            Self::Qwen36 | Self::Qwen38 => Lineage::Qwen36,
+            Self::Qwen3 | Self::Qwen3Instruct => Lineage::Qwen3,
+        }
+    }
+
+    /// Whether the template strips both ends of every message body (`|trim`).
+    /// The 3.6 family does; the Qwen3 one interpolates bodies raw.
+    fn trims_bodies(self) -> bool {
+        self.lineage() == Lineage::Qwen36
+    }
+
+    /// Whether an assistant turn with no reasoning field has its content cut at
+    /// an inline `<think>` block ([`split_reasoning`]). Both hybrid-thinking
+    /// templates do it; 3.8 dropped the parsing and Instruct-2507 never had it.
+    fn splits_inline_reasoning(self) -> bool {
+        matches!(self, Self::Qwen36 | Self::Qwen3)
+    }
+
+    /// Whether the template has a thinking mode at all. Instruct-2507 does not:
+    /// its generation prompt is fixed and it renders no `<think>` block.
+    pub fn supports_thinking(self) -> bool {
+        !matches!(self, Self::Qwen3Instruct)
+    }
+
+    /// Whether a thinking-on generation prompt leaves the `<think>` opener to
+    /// the MODEL instead of seeding it.
+    ///
+    /// The 3.6 lineage ends its header inside an open block, so the first
+    /// decoded token is reasoning by construction. The Qwen3 base template ends
+    /// at `<|im_start|>assistant\n` and the model writes its own `<think>` — or
+    /// does not, and answers directly. That makes the reply's opening token the
+    /// thing that decides, which is what [`ThinkingEntry::ModelOpens`] carries
+    /// into the decode loop.
+    pub fn model_opens_thinking(self) -> bool {
+        matches!(self, Self::Qwen3)
+    }
+
+    /// Whether the template takes a `reasoning_effort` parameter. Only 3.8's
+    /// does; everywhere else a request-level effort is a level the template
+    /// would silently ignore, which every surface refuses rather than drops
+    /// (the CLI flag, serve's two dialect fields, the batch item).
+    pub fn supports_reasoning_effort(self) -> bool {
+        matches!(self, Self::Qwen38)
+    }
+
+    /// Whether this renderer can write the template's tool-call format. The
+    /// Qwen3 family writes calls as JSON and its `# Tools` preamble is its own
+    /// prose; neither is implemented, and the serve-side parser reads the 3.6
+    /// `<function=…>` form only, so a half-rendered tool round trip would come
+    /// back unparseable.
+    pub fn supports_tools(self) -> bool {
+        self.lineage() == Lineage::Qwen36
+    }
+
+    /// The vendored template this dialect renders, for the tests that check the
+    /// fixed prose and the structural branches against their source.
+    #[cfg(test)]
+    fn template_source(self) -> &'static str {
+        match self {
+            Self::Qwen36 => include_str!("../reference/chat_template.jinja"),
+            Self::Qwen38 => include_str!("../reference/chat_template-qwen38.jinja"),
+            Self::Qwen3 => include_str!("../reference/chat_template-qwen3.jinja"),
+            Self::Qwen3Instruct => {
+                include_str!("../reference/chat_template-qwen3-instruct-2507.jinja")
+            }
+        }
+    }
 }
 
 /// The 3.8 template's `reasoning_effort` levels. With thinking on, `xhigh` and
@@ -260,8 +394,10 @@ pub struct ChatOptions {
     pub enable_thinking: bool,
     /// Keep the reasoning of assistant turns that precede the current query.
     /// Off, a replayed turn shows only its answer once a later user message has
-    /// superseded it. The templates default this opposite ways — 3.6 off, 3.8
-    /// on ([`ChatOptions::for_dialect`]).
+    /// superseded it. The 3.6 and 3.8 templates default this opposite ways —
+    /// 3.6 off, 3.8 on ([`ChatOptions::for_dialect`]). The Qwen3 templates take
+    /// no such parameter, so the field is inert under those dialects and a
+    /// superseded turn always drops its reasoning there.
     pub preserve_thinking: bool,
     /// OpenAI-shape tool objects (`{"type":"function","function":{…}}`), already
     /// normalized by the HTTP layer. Empty means the request carries no tools.
@@ -287,13 +423,18 @@ impl Default for ChatOptions {
 
 impl ChatOptions {
     /// The default options for one dialect: like [`Default`], but rendering
-    /// under `dialect` with that template's own `preserve_thinking` default —
-    /// 3.6 drops superseded reasoning, 3.8 keeps it (`preserve_thinking is
-    /// undefined or is true`, template line 116).
+    /// under `dialect` with that template's own defaults.
+    ///
+    /// `preserve_thinking` is 3.8's alone — it drops superseded reasoning
+    /// nowhere (`preserve_thinking is undefined or is true`, its template line
+    /// 116), where 3.6 drops it by default and the Qwen3 templates have no such
+    /// parameter at all (there the field is inert). `enable_thinking` is on
+    /// everywhere except Instruct-2507, whose template has no thinking mode.
     pub fn for_dialect(dialect: ChatDialect) -> Self {
         Self {
             dialect,
             preserve_thinking: matches!(dialect, ChatDialect::Qwen38),
+            enable_thinking: dialect.supports_thinking(),
             ..Self::default()
         }
     }
@@ -429,6 +570,50 @@ fn format_double_as_ostream(value: f64) -> String {
     }
 }
 
+/// How a rendered generation prompt leaves the model with respect to its
+/// reasoning block: what the first decoded token already is, and what could
+/// still change it.
+///
+/// The distinction exists because the two template lineages hand the reasoning
+/// block over differently. The 3.6 lineage always seeds the opener, so the
+/// answer is settled before the first draw. The Qwen3 base template ends at the
+/// assistant role line with thinking on and leaves the opener to the model,
+/// which makes the reply's FIRST token the thing that decides — and everything
+/// keyed on being inside the block (the reasoning/answer split, the think
+/// budget, a schema grammar's activation) has to wait for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingEntry {
+    /// The reply begins in the answer and stays there: thinking is off, the
+    /// template has no thinking mode, or the header already closed the span.
+    /// A `<think>` the model writes anyway is ordinary text.
+    #[default]
+    Answer,
+    /// The header ends inside an open `<think>` block, so the first decoded
+    /// token is already reasoning and `</think>` ends it.
+    Seeded,
+    /// Thinking is on and the template left the opener to the model
+    /// ([`ChatDialect::model_opens_thinking`]). The reply is reasoning if and
+    /// only if its FIRST token is `<think>`; anything else settles it as answer
+    /// text, and a `<think>` further in is text like any other token.
+    ModelOpens,
+}
+
+impl ThinkingEntry {
+    /// Whether the first decoded token is reasoning already. False under
+    /// [`ThinkingEntry::ModelOpens`], where that token is what decides.
+    pub fn starts_in_thinking(self) -> bool {
+        matches!(self, Self::Seeded)
+    }
+
+    /// Whether this reply can hold a reasoning block at all — the question a
+    /// think budget or a reasoning channel asks, since under
+    /// [`ThinkingEntry::ModelOpens`] the answer is not known until the first
+    /// token lands.
+    pub fn may_think(self) -> bool {
+        !matches!(self, Self::Answer)
+    }
+}
+
 /// A rendered conversation split at the generation prompt, with the byte
 /// ranges of client-supplied content marked for the tokenizer.
 ///
@@ -459,9 +644,9 @@ pub struct PromptParts {
     /// is refused (it would join that run instead of starting after it)
     /// (`tests::a_rendered_prefix_starts_on_a_token_boundary`).
     pub header_prefix_start: Option<usize>,
-    /// Whether the header leaves the model inside an open thinking span, so the
-    /// first decoded token is reasoning rather than answer text.
-    pub starts_in_thinking: bool,
+    /// Where in the reply the first decoded token sits, and what could still
+    /// move it. See [`ThinkingEntry`].
+    pub thinking_entry: ThinkingEntry,
     /// Byte offset in `context` just past the leading system block — its closing
     /// `<|im_end|>` and the newline after it — or `None` when the conversation
     /// renders no such block (no system message and no tools).
@@ -487,22 +672,29 @@ pub fn build_prompt(messages: &[Message], opts: &ChatOptions) -> Result<String> 
     Ok(prompt)
 }
 
-/// `build_prompt` plus the client-content byte ranges, for callers that encode
-/// the whole prompt in one go (`LagunaTokenizer::encode_prompt`). The ranges
-/// index into the returned string; the appended generation header holds no
-/// client content, so they are the context ranges unchanged.
+/// `build_prompt` plus the client-content byte ranges and the reply's thinking
+/// entry, for callers that encode the whole prompt in one go
+/// (`LagunaTokenizer::encode_prompt`). The ranges index into the returned
+/// string; the appended generation header holds no client content, so they are
+/// the context ranges unchanged.
+///
+/// The [`ThinkingEntry`] comes back with them because a caller that splits
+/// reasoning from answer, or sets a think budget, cannot derive it from the
+/// options alone — the dialect and the header's own shape both decide, and
+/// re-deriving it beside the renderer is how the two drift.
 pub fn build_prompt_with_spans(
     messages: &[Message],
     opts: &ChatOptions,
-) -> Result<(String, Vec<Range<usize>>)> {
+) -> Result<(String, Vec<Range<usize>>, ThinkingEntry)> {
     let PromptParts {
         mut context,
         header,
         content_ranges,
+        thinking_entry,
         ..
     } = build_prompt_parts_with_spans(messages, opts)?;
     context.push_str(&header);
-    Ok((context, content_ranges))
+    Ok((context, content_ranges, thinking_entry))
 }
 
 /// The same rendering as `build_prompt`, split into `(context, gen_header)` with
@@ -538,21 +730,36 @@ pub fn build_prompt_parts_with_spans(
 /// message already wrapped in `<tool_response>…</tool_response>`. The wrapped
 /// form is not a question, so it does not start a new query — which is what
 /// decides whether the assistant turns before it keep their reasoning.
-fn last_query_index(messages: &[Message]) -> Result<usize, ChatError> {
-    messages
+///
+/// The two lineages disagree about a conversation with no query at all: the 3.6
+/// template raises, while the Qwen3 one leaves its scan's initial value in
+/// place — the last message index — and renders. They also disagree about
+/// whether the body is stripped before the wrapper is looked for.
+fn last_query_index(messages: &[Message], dialect: ChatDialect) -> Result<usize, ChatError> {
+    let found = messages
         .iter()
         .enumerate()
         .rev()
         .find_map(|(index, message)| match message {
             Message::User(text) => {
-                let text = trim(text);
+                let text = if dialect.trims_bodies() {
+                    trim(text)
+                } else {
+                    text
+                };
                 let wrapped =
                     text.starts_with("<tool_response>") && text.ends_with("</tool_response>");
                 (!wrapped).then_some(index)
             }
             _ => None,
-        })
-        .ok_or(ChatError::NoUserQuery)
+        });
+    match found {
+        Some(index) => Ok(index),
+        // The Qwen3 template leaves its scan at the initial value, the last
+        // message index, and renders.
+        None if dialect.lineage() == Lineage::Qwen3 => Ok(messages.len() - 1),
+        None => Err(ChatError::NoUserQuery),
+    }
 }
 
 /// Strip both ends of a message body the way the template's `|trim` does.
@@ -567,11 +774,12 @@ fn trim(text: &str) -> &str {
 }
 
 /// Split an assistant turn's content into `(reasoning, answer)` for a turn that
-/// carries its reasoning inline rather than in a separate field. A 3.6-dialect
-/// behavior only: the 3.8 template dropped this parsing, so its renderer never
-/// calls this.
+/// carries its reasoning inline rather than in a separate field. Called only
+/// under the dialects whose template does this parsing — 3.6 and the Qwen3 base
+/// one ([`ChatDialect::splits_inline_reasoning`]); 3.8 dropped it and
+/// Instruct-2507 never had it, and those two render the content verbatim.
 ///
-/// The two halves are cut at different places, as the 3.6 template cuts them: the
+/// The two halves are cut at different places, as both templates cut them: the
 /// reasoning is what precedes the FIRST `</think>` (after its last `<think>`
 /// opener, if it has one), while the answer is what follows the LAST one. A
 /// turn with a single well-formed block — the shape a decode produces — sees no
@@ -614,20 +822,32 @@ pub fn build_prompt_parts_with_spans_continued(
     // that is wrong in more than one way is refused for the same reason the
     // reference renderer would give: the missing query is found while scanning
     // for it (jinja lines 78-80), before any message is rendered.
-    let last_query = last_query_index(messages)?;
-    // The template renders the system block ahead of the conversation and
+    let dialect = opts.dialect;
+    let last_query = last_query_index(messages, dialect)?;
+    // The 3.6 lineage renders the system block ahead of the conversation and
     // raises on any later one (jinja lines 83-86) — including a second one that
-    // follows a leading system message.
-    if let Some((index, _)) = messages
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find(|(_, message)| matches!(message, Message::System(_)))
+    // follows a leading system message. The Qwen3 templates render a later one
+    // as an ordinary turn instead.
+    if dialect.lineage() == Lineage::Qwen36
+        && let Some((index, _)) = messages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, message)| matches!(message, Message::System(_)))
     {
         return Err(ChatError::SystemNotFirst { index }.into());
     }
-
-    let thinking = opts.enable_thinking;
+    // A template with no thinking mode reads `enable_thinking` as false however
+    // it was set: there is no branch for it to take.
+    let thinking = opts.enable_thinking && dialect.supports_thinking();
+    // Bodies are stripped or interpolated raw, per lineage.
+    fn body_of(text: &str, dialect: ChatDialect) -> &str {
+        if dialect.trims_bodies() {
+            trim(text)
+        } else {
+            text
+        }
+    }
     let mut out = String::new();
     let mut ranges: Vec<Range<usize>> = Vec::new();
     let mut system_end = None;
@@ -653,13 +873,27 @@ pub fn build_prompt_parts_with_spans_continued(
         _ => None,
     };
 
-    // Header (3.6 jinja lines 45-66; 3.8 lines 57-87). Every message body, the
-    // system message included, is rendered with both ends stripped.
+    // Header (3.6 jinja lines 45-66; 3.8 lines 57-87; qwen3 lines 1-16). The
+    // 3.6 lineage strips the system body like every other; the Qwen3 one does
+    // not.
     let leading_system = match messages.first() {
-        Some(Message::System(text)) => Some(trim(text)),
+        Some(Message::System(text)) => Some(body_of(text, dialect)),
         _ => None,
     };
-    if !opts.tools.is_empty() {
+    if !opts.tools.is_empty() && !dialect.supports_tools() {
+        return Err(ChatError::ToolsUnsupported { dialect }.into());
+    }
+    if dialect.lineage() == Lineage::Qwen3 {
+        // The Qwen3 family writes the block whenever the conversation opens
+        // with a system message, empty content included (its jinja lines
+        // 13-15), and has no preamble to synthesize one for.
+        if let Some(system) = leading_system {
+            out.push_str("<|im_start|>system\n");
+            content(&mut out, &mut ranges, system);
+            out.push_str("<|im_end|>\n");
+            system_end = Some(out.len());
+        }
+    } else if !opts.tools.is_empty() {
         // Tools replace the system block with the `# Tools` preamble; the
         // client's own system message, when it has one, is appended after it.
         // The reasoning-effort sentence, when there is one, comes first of all.
@@ -717,11 +951,18 @@ pub fn build_prompt_parts_with_spans_continued(
     for (index, message) in messages.iter().enumerate() {
         match message {
             // The leading system message was rendered above; the loop passes
-            // over it. Any later one was refused before rendering started.
-            Message::System(_) => {}
+            // over it. A later one is refused before rendering starts under the
+            // 3.6 family and renders as an ordinary turn under the Qwen3 one
+            // (its jinja line 29, which admits `system` past `loop.first`).
+            Message::System(_) if index == 0 => {}
+            Message::System(text) => {
+                out.push_str("<|im_start|>system\n");
+                content(&mut out, &mut ranges, body_of(text, dialect));
+                out.push_str("<|im_end|>\n");
+            }
             Message::User(text) => {
                 out.push_str("<|im_start|>user\n");
-                content(&mut out, &mut ranges, trim(text));
+                content(&mut out, &mut ranges, body_of(text, dialect));
                 out.push_str("<|im_end|>\n");
             }
             Message::Assistant {
@@ -729,26 +970,58 @@ pub fn build_prompt_parts_with_spans_continued(
                 reasoning,
                 tool_calls,
             } => {
-                let text = trim(text);
+                if !tool_calls.is_empty() && !dialect.supports_tools() {
+                    return Err(ChatError::ToolsUnsupported { dialect }.into());
+                }
+                let text = body_of(text, dialect);
                 // An explicit reasoning field wins and leaves the content
-                // alone. Without one the dialects diverge: 3.6 splits the
-                // content at its own inline `<think>` block (its jinja lines
-                // 90-99), while the 3.8 template dropped that parsing and
-                // renders the content verbatim.
+                // alone. Without one the dialects diverge: both hybrid-thinking
+                // templates split the content at its own inline `<think>` block
+                // (3.6 jinja lines 90-99, qwen3 lines 36-39), while the 3.8 and
+                // Instruct-2507 templates render the content verbatim.
                 let (reasoning, body) = match reasoning {
                     Some(reasoning) => (reasoning.as_str(), text),
-                    None if opts.dialect == ChatDialect::Qwen36 => split_reasoning(text),
+                    None if dialect.splits_inline_reasoning() => split_reasoning(text),
                     None => ("", text),
                 };
                 out.push_str("<|im_start|>assistant\n");
                 // A turn keeps its reasoning only while it is still the current
                 // one: once a later user message has asked something new, the
-                // replayed turn shows its answer alone. `preserve_thinking`
-                // overrides that and keeps every turn's reasoning.
-                if opts.preserve_thinking || index > last_query {
+                // replayed turn shows its answer alone.
+                //
+                // What the families add to that rule differs. 3.6/3.8 offer
+                // `preserve_thinking`, which keeps every turn's reasoning. The
+                // Qwen3 template has no such parameter and instead narrows the
+                // rule: a turn past the current query writes the block only when
+                // it is the LAST message or actually carries reasoning (its
+                // jinja lines 41-42), so an intermediate turn with none is
+                // written bare. It also strips newlines rather than all
+                // whitespace, and drops the answer's leading newlines only
+                // inside the block.
+                //
+                // A template with no thinking mode writes no block at all, so
+                // an explicit reasoning field on an Instruct-2507 conversation
+                // is dropped rather than wrapped.
+                let current = index > last_query;
+                let writes_block = dialect.supports_thinking()
+                    && match dialect.lineage() {
+                        Lineage::Qwen36 => opts.preserve_thinking || current,
+                        Lineage::Qwen3 => {
+                            current && (index + 1 == messages.len() || !reasoning.is_empty())
+                        }
+                    };
+                let mut body = body;
+                if writes_block {
                     out.push_str("<think>\n");
-                    content(&mut out, &mut ranges, trim(reasoning));
+                    let reasoning = match dialect.lineage() {
+                        Lineage::Qwen36 => trim(reasoning),
+                        Lineage::Qwen3 => reasoning.trim_matches('\n'),
+                    };
+                    content(&mut out, &mut ranges, reasoning);
                     out.push_str("\n</think>\n\n");
+                    if dialect.lineage() == Lineage::Qwen3 {
+                        body = body.trim_start_matches('\n');
+                    }
                 }
                 content(&mut out, &mut ranges, body);
                 // Calls follow the answer inside the same turn. The first is
@@ -793,16 +1066,24 @@ pub fn build_prompt_parts_with_spans_continued(
             Message::ToolResponse(text) => {
                 // A run of results collapses into one user turn: the header is
                 // written once at the start of the run and the turn is closed
-                // once at its end. The run therefore needs a turn before it to
-                // continue from.
-                let previous = index
-                    .checked_sub(1)
-                    .ok_or(ChatError::ToolResultOpensConversation)?;
-                if !matches!(messages[previous], Message::ToolResponse(_)) {
+                // once at its end.
+                //
+                // The families disagree about a run that OPENS the conversation.
+                // 3.6 tests `loop.previtem`, which is undefined at the first
+                // message, so it writes the result's `<|im_end|>` without ever
+                // having opened the turn — malformed ChatML, refused here. The
+                // Qwen3 template tests `loop.first or …` and does open the turn,
+                // so there the leading run renders.
+                let opens_turn = match index.checked_sub(1) {
+                    Some(previous) => !matches!(messages[previous], Message::ToolResponse(_)),
+                    None if dialect.lineage() == Lineage::Qwen3 => true,
+                    None => return Err(ChatError::ToolResultOpensConversation.into()),
+                };
+                if opens_turn {
                     out.push_str("<|im_start|>user");
                 }
                 out.push_str("\n<tool_response>\n");
-                content(&mut out, &mut ranges, trim(text));
+                content(&mut out, &mut ranges, body_of(text, dialect));
                 out.push_str("\n</tool_response>");
                 let run_continues =
                     matches!(messages.get(index + 1), Some(Message::ToolResponse(_)));
@@ -842,16 +1123,31 @@ pub fn build_prompt_parts_with_spans_continued(
         .into());
     }
 
-    // Thinking on or off, the turn opens the same way; what differs is whether
-    // the block is left open for the model to write into or closed empty ahead
-    // of it.
-    let mut gen_header = String::from("<|im_start|>assistant\n<think>\n");
+    // Whether the header writes a `<think>` opener at all.
+    //
+    // The 3.6 family always does: thinking on it leaves the block open for the
+    // model, thinking off it closes an empty one ahead of the answer. The Qwen3
+    // template writes NOTHING after `<|im_start|>assistant\n` with thinking on
+    // — the model opens its own block — and the same closed empty block with
+    // thinking off. So under that dialect the opener appears only when the
+    // header has to close a block or carry injected reasoning, both of which are
+    // this builder's own extension rather than anything the template renders.
+    // Instruct-2507 has no block in any case.
+    let opens_think_block = match dialect {
+        ChatDialect::Qwen36 | ChatDialect::Qwen38 => true,
+        ChatDialect::Qwen3 => closes_thinking || !injected.is_empty(),
+        ChatDialect::Qwen3Instruct => false,
+    };
+    let mut gen_header = String::from("<|im_start|>assistant\n");
     let mut header_ranges: Vec<Range<usize>> = Vec::new();
-    if thinking {
-        content(&mut gen_header, &mut header_ranges, injected);
-    }
-    if closes_thinking {
-        gen_header.push_str("\n</think>\n\n");
+    if opens_think_block {
+        gen_header.push_str("<think>\n");
+        if thinking {
+            content(&mut gen_header, &mut header_ranges, injected);
+        }
+        if closes_thinking {
+            gen_header.push_str("\n</think>\n\n");
+        }
     }
     let header_prefix_start = (!prefix.is_empty()).then(|| {
         let start = gen_header.len();
@@ -865,7 +1161,22 @@ pub fn build_prompt_parts_with_spans_continued(
         content_ranges: ranges,
         header_content_ranges: header_ranges,
         header_prefix_start,
-        starts_in_thinking: thinking && !closes_thinking,
+        // Only a header that actually wrote an unclosed `<think>` leaves the
+        // model inside one. Under the Qwen3 dialect a plain thinking-on prompt
+        // writes no opener, so the reply's own first token decides — unless a
+        // continuation already opened or closed the span, in which case the
+        // header settled it after all.
+        thinking_entry: if opens_think_block {
+            if closes_thinking {
+                ThinkingEntry::Answer
+            } else {
+                ThinkingEntry::Seeded
+            }
+        } else if thinking && dialect.model_opens_thinking() {
+            ThinkingEntry::ModelOpens
+        } else {
+            ThinkingEntry::Answer
+        },
         system_end,
     })
 }
@@ -885,6 +1196,19 @@ mod tests {
         include_str!("../reference/chat_template.jinja"),
         include_str!("../reference/chat_template-qwen38.jinja"),
     ];
+
+    /// Options for the dense Qwen3 base template.
+    fn qwen3(on: bool) -> ChatOptions {
+        ChatOptions {
+            enable_thinking: on,
+            ..ChatOptions::for_dialect(ChatDialect::Qwen3)
+        }
+    }
+
+    /// Options for Instruct-2507, whose template has no thinking mode.
+    fn qwen3_instruct() -> ChatOptions {
+        ChatOptions::for_dialect(ChatDialect::Qwen3Instruct)
+    }
 
     fn thinking(on: bool) -> ChatOptions {
         ChatOptions {
@@ -1257,7 +1581,18 @@ mod tests {
         let q38 = ChatOptions::for_dialect(ChatDialect::Qwen38);
         assert_eq!(q38.dialect, ChatDialect::Qwen38);
         assert!(q38.preserve_thinking);
-        for opts in [q36, q38] {
+        // The Qwen3 templates have no `preserve_thinking` parameter, so the
+        // field stays off there; Instruct-2507 additionally has no thinking
+        // mode, and its default says so.
+        let q3 = ChatOptions::for_dialect(ChatDialect::Qwen3);
+        assert_eq!(q3.dialect, ChatDialect::Qwen3);
+        assert!(!q3.preserve_thinking);
+        assert!(q3.enable_thinking);
+        let q3i = ChatOptions::for_dialect(ChatDialect::Qwen3Instruct);
+        assert_eq!(q3i.dialect, ChatDialect::Qwen3Instruct);
+        assert!(!q3i.preserve_thinking);
+        assert!(!q3i.enable_thinking);
+        for opts in [q36, q38, q3] {
             assert!(opts.enable_thinking);
             assert_eq!(opts.reasoning_effort, ReasoningEffort::Xhigh);
             assert!(opts.tools.is_empty());
@@ -2035,7 +2370,8 @@ mod tests {
                 .unwrap();
             split.extend(tok.encode(&parts.header).unwrap());
 
-            let (whole, ranges) = build_prompt_with_spans(&msgs, &thinking(on)).unwrap();
+            let (whole, ranges, entry) = build_prompt_with_spans(&msgs, &thinking(on)).unwrap();
+            assert_eq!(entry, parts.thinking_entry);
             assert_eq!(whole, format!("{}{}", parts.context, parts.header));
             assert_eq!(ranges, parts.content_ranges);
             assert_eq!(split, tok.encode_prompt(&whole, &ranges).unwrap());
@@ -2178,14 +2514,15 @@ mod tests {
         for (on, continuation, expected) in cases {
             let parts = rendered(on, continuation.as_ref());
             assert_eq!(
-                parts.starts_in_thinking, expected,
+                parts.thinking_entry.starts_in_thinking(),
+                expected,
                 "thinking={on} {continuation:?}"
             );
         }
         // The header sniff this flag replaces, and where it parts company: a
         // turn whose reasoning was handed to it still starts inside the span.
         let parts = rendered(true, Some(&cont(Some("plan"), false, None)));
-        assert!(parts.starts_in_thinking && !parts.header.ends_with("<think>\n"));
+        assert!(parts.thinking_entry.starts_in_thinking() && !parts.header.ends_with("<think>\n"));
     }
 
     // The continuations with no rendering at all. Callers validate them first
@@ -2305,5 +2642,461 @@ mod tests {
                 assert_eq!(tok.decode(&prefix_ids).unwrap(), prefix);
             }
         }
+    }
+    // ---- The dense Qwen3 dialects.
+    //
+    // Every literal below was checked byte-for-byte against llama.cpp's own
+    // jinja renderer through `llama-server --jinja`'s /apply-template
+    // (`scripts/verify_chat_template_qwen3.ts`, which carries the same cases).
+    // Two branches that endpoint cannot reach — a conversation ending in an
+    // assistant turn, which llama-server renders as a prefill, and the inline
+    // `<think>` split, which its own reasoning parser intercepts — are checked
+    // against the vendored jinja source instead, and named where they appear.
+
+    /// The Qwen3 base template's fixed structure, read off its own source. What
+    /// this module reproduces has to be what the template says, not what the
+    /// last render happened to produce.
+    #[test]
+    fn the_qwen3_template_says_what_this_renderer_implements() {
+        let base = ChatDialect::Qwen3.template_source();
+        let instruct = ChatDialect::Qwen3Instruct.template_source();
+
+        // The generation prompt: an empty closed block when thinking is off,
+        // and NOTHING when it is on — where the 3.6 lineage writes `<think>\n`.
+        let tail = |source: &'static str| {
+            let at = source
+                .find("{%- if add_generation_prompt %}")
+                .expect("every template writes a generation prompt");
+            &source[at..]
+        };
+        assert!(tail(base).contains("'<think>\\n\\n</think>\\n\\n'"));
+        assert!(
+            !tail(base).contains("'<think>\\n'"),
+            "the Qwen3 template opens no thinking block with thinking on"
+        );
+        assert!(
+            !tail(instruct).contains("<think>"),
+            "Instruct-2507 writes no thinking block at all"
+        );
+        assert!(
+            !instruct.contains("enable_thinking") && !instruct.contains("reasoning_content"),
+            "Instruct-2507 has no thinking parameters"
+        );
+
+        // No `preserve_thinking` and no reasoning-effort prose in either.
+        for source in [base, instruct] {
+            assert!(!source.contains("preserve_thinking"));
+            assert!(!source.contains("reasoning effort"));
+            assert!(!source.contains(REASONING_EFFORT_XHIGH));
+        }
+
+        // The inline `<think>` split, which `split_reasoning` implements: the
+        // base template has it and Instruct-2507 does not.
+        const SPLIT: &str = "content.split('</think>')[0].rstrip('\\n').split('<think>')[-1]";
+        assert!(
+            base.contains(SPLIT),
+            "the Qwen3 template splits inline reasoning"
+        );
+        assert!(!instruct.contains(SPLIT));
+
+        // Bodies are interpolated raw: neither template pipes a message body
+        // through `|trim`, where the 3.6 pair does it on every one.
+        for source in [base, instruct] {
+            assert!(!source.contains("message.content|trim"));
+            assert!(!source.contains("|trim %}"));
+        }
+        assert!(TEMPLATE_SOURCES[0].contains("|trim"));
+
+        // Tool calls are JSON here, not the `<function=…>` form this renderer
+        // writes — which is why `supports_tools` is false for both.
+        for source in [base, instruct] {
+            assert!(source.contains("'<tool_call>\\n{\"name\": \"'"));
+            assert!(!source.contains("<function="));
+        }
+        assert!(!ChatDialect::Qwen3.supports_tools());
+        assert!(!ChatDialect::Qwen3Instruct.supports_tools());
+        assert!(ChatDialect::Qwen3.supports_thinking());
+        assert!(!ChatDialect::Qwen3Instruct.supports_thinking());
+    }
+
+    // (a) The prompt the Z-Image diffusion pipeline conditions on: one user
+    // turn, add_generation_prompt, thinking ON. The template writes no `<think>`
+    // opener there, so the header ends at the assistant role line — and the
+    // model, not the header, is what would open a reasoning block.
+    #[test]
+    fn the_qwen3_generation_prompt_opens_no_thinking_block() {
+        let msgs = [Message::User("a red fox in the snow".into())];
+        let expected = "<|im_start|>user\na red fox in the snow<|im_end|>\n<|im_start|>assistant\n";
+        assert_eq!(build_prompt(&msgs, &qwen3(true)).unwrap(), expected);
+
+        let parts = build_prompt_parts_with_spans(&msgs, &qwen3(true)).unwrap();
+        assert!(
+            !parts.thinking_entry.starts_in_thinking(),
+            "nothing in the header leaves the model inside a block"
+        );
+        assert_eq!(parts.header, "<|im_start|>assistant\n");
+    }
+
+    // (b) Thinking off closes an empty block ahead of the answer, exactly as the
+    // 3.6 lineage does.
+    #[test]
+    fn the_qwen3_generation_prompt_closes_an_empty_block_with_thinking_off() {
+        let msgs = [Message::User("Hi".into())];
+        let expected =
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        assert_eq!(build_prompt(&msgs, &qwen3(false)).unwrap(), expected);
+        let parts = build_prompt_parts_with_spans(&msgs, &qwen3(false)).unwrap();
+        assert!(!parts.thinking_entry.starts_in_thinking());
+    }
+
+    // (c) and (d) The system block: written whenever the conversation opens with
+    // a system message, empty content included, and never carrying a preamble.
+    #[test]
+    fn the_qwen3_dialect_writes_the_system_block_including_an_empty_one() {
+        let msgs = [
+            Message::System("You are a pirate.".into()),
+            Message::User("Hi".into()),
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>system\nYou are a pirate.<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+
+        let msgs = [Message::System(String::new()), Message::User("Hi".into())];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>system\n<|im_end|>\n\
+             <|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let parts = build_prompt_parts_with_spans(&msgs, &qwen3(true)).unwrap();
+        assert_eq!(
+            parts.system_end,
+            Some("<|im_start|>system\n<|im_end|>\n".len())
+        );
+    }
+
+    // (e), (f) and (g) Which replayed turns keep their reasoning. The 3.6 rule
+    // is "the turn is still the current one"; Qwen3 narrows it with a second
+    // condition, so a turn past the last query that carries no reasoning writes
+    // no block at all — where 3.6 would write an empty one.
+    #[test]
+    fn the_qwen3_dialect_keeps_reasoning_only_where_there_is_some_to_keep() {
+        // Superseded by a new query: the answer alone.
+        let msgs = [
+            Message::User("Q1".into()),
+            assistant("A1", "reasoning one"),
+            Message::User("Q2".into()),
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\nA1<|im_end|>\n\
+             <|im_start|>user\nQ2<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+
+        // A wrapped tool result is not a new query, so the turn is still the
+        // current one and keeps its reasoning.
+        let msgs = [
+            Message::User("Q1".into()),
+            assistant("A1", "reasoning one"),
+            Message::User("<tool_response>\nsunny\n</tool_response>".into()),
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\n<think>\nreasoning one\n</think>\n\nA1<|im_end|>\n\
+             <|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+
+        // The same conversation with nothing to keep: no block at all.
+        let msgs = [
+            Message::User("Q1".into()),
+            Message::Assistant {
+                content: "A1".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            Message::User("<tool_response>\nsunny\n</tool_response>".into()),
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\nA1<|im_end|>\n\
+             <|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    // (h) The other half of that condition: the LAST message writes the block
+    // even with nothing in it. llama-server renders this conversation as an
+    // assistant prefill, so the cross-check compares only the context; the
+    // literal here is the whole prompt.
+    #[test]
+    fn the_qwen3_dialect_writes_an_empty_block_on_the_last_message() {
+        let msgs = [
+            Message::User("Q1".into()),
+            Message::Assistant {
+                content: "A1".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    // (i) Bodies are interpolated raw. This is the divergence with the widest
+    // blast radius, because it changes the token stream of every conversation
+    // whose messages carry stray whitespace.
+    #[test]
+    fn the_qwen3_dialects_do_not_strip_message_bodies() {
+        let msgs = [Message::User("  padded  \n".into())];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>user\n  padded  \n<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(
+            build_prompt(&msgs, &qwen3_instruct()).unwrap(),
+            "<|im_start|>user\n  padded  \n<|im_end|>\n<|im_start|>assistant\n"
+        );
+        // The 3.6 lineage strips the same body.
+        assert_eq!(
+            build_prompt(&msgs, &thinking(true)).unwrap(),
+            "<|im_start|>user\npadded<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    // (j) and (k) Two conversations the 3.6 lineage refuses and the Qwen3 one
+    // renders: a system message past the first position, and a tool result that
+    // opens the conversation.
+    #[test]
+    fn the_qwen3_dialect_renders_what_the_36_lineage_refuses() {
+        let msgs = [
+            Message::User("Q1".into()),
+            Message::System("be terse".into()),
+            Message::User("Q2".into()),
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>system\nbe terse<|im_end|>\n\
+             <|im_start|>user\nQ2<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+        assert!(matches!(
+            error(build_prompt(&msgs, &thinking(true))),
+            ChatError::SystemNotFirst { index: 1 }
+        ));
+
+        let msgs = [
+            Message::ToolResponse("sunny".into()),
+            Message::User("Q".into()),
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n\
+             <|im_start|>user\nQ<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+        assert_eq!(
+            error(build_prompt(&msgs, &thinking(true))),
+            ChatError::ToolResultOpensConversation
+        );
+    }
+
+    // A conversation with no user query at all: the 3.6 template raises, the
+    // Qwen3 one leaves its scan at the last message and renders.
+    #[test]
+    fn a_query_less_conversation_renders_under_the_qwen3_dialect() {
+        let msgs = [Message::System("be terse".into())];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>system\nbe terse<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(
+            error(build_prompt(&msgs, &thinking(true))),
+            ChatError::NoUserQuery
+        );
+    }
+
+    // The inline `<think>` split, which llama-server's own reasoning parser
+    // hides from /apply-template: the base template cuts the content at the
+    // block (its jinja lines 36-39) and Instruct-2507 renders it verbatim.
+    #[test]
+    fn inline_think_content_splits_under_qwen3_and_not_under_instruct() {
+        let msgs = [
+            Message::User("Q1".into()),
+            Message::Assistant {
+                content: "<think>\nsome reasoning\n</think>\n\nA1".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            Message::User("<tool_response>\nsunny\n</tool_response>".into()),
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\n<think>\nsome reasoning\n</think>\n\nA1<|im_end|>\n\
+             <|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+        assert_eq!(
+            build_prompt(&msgs, &qwen3_instruct()).unwrap(),
+            "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\n<think>\nsome reasoning\n</think>\n\nA1<|im_end|>\n\
+             <|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    // Instruct-2507 has no thinking mode: the tail is bare however
+    // `enable_thinking` is set, a reasoning field is dropped, and no assistant
+    // turn is ever wrapped.
+    #[test]
+    fn the_instruct_dialect_renders_no_thinking_at_all() {
+        let msgs = [Message::User("Hi".into())];
+        let bare = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        assert_eq!(build_prompt(&msgs, &qwen3_instruct()).unwrap(), bare);
+        // An explicitly enabled thinking flag has nothing to act on.
+        let forced = ChatOptions {
+            enable_thinking: true,
+            ..ChatOptions::for_dialect(ChatDialect::Qwen3Instruct)
+        };
+        assert_eq!(build_prompt(&msgs, &forced).unwrap(), bare);
+        let parts = build_prompt_parts_with_spans(&msgs, &forced).unwrap();
+        assert!(!parts.thinking_entry.starts_in_thinking());
+
+        let msgs = [
+            Message::System("You are a pirate.".into()),
+            Message::User("Q1".into()),
+            assistant("A1", "reasoning one"),
+            Message::User("Q2".into()),
+        ];
+        assert_eq!(
+            build_prompt(&msgs, &qwen3_instruct()).unwrap(),
+            "<|im_start|>system\nYou are a pirate.<|im_end|>\n\
+             <|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\nA1<|im_end|>\n\
+             <|im_start|>user\nQ2<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+
+        // A turn past the last query, which the Qwen3 base template WOULD wrap
+        // because it carries reasoning. Instruct-2507 has no block to put it in,
+        // so the field is dropped.
+        let msgs = [
+            Message::User("Q1".into()),
+            assistant("A1", "reasoning one"),
+            Message::User("<tool_response>\nsunny\n</tool_response>".into()),
+        ];
+        let bare_turn = "<|im_start|>user\nQ1<|im_end|>\n\
+             <|im_start|>assistant\nA1<|im_end|>\n\
+             <|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n\
+             <|im_start|>assistant\n";
+        assert_eq!(build_prompt(&msgs, &qwen3_instruct()).unwrap(), bare_turn);
+        assert_ne!(
+            build_prompt(&msgs, &qwen3(true)).unwrap(),
+            bare_turn,
+            "the base template does wrap this turn"
+        );
+    }
+
+    // Tools are refused on both Qwen3 dialects, whether they arrive as a
+    // request's tool list or replayed in an assistant turn. The template writes
+    // calls as JSON and the serve-side parser reads only the `<function=…>`
+    // form, so a half-supported round trip would come back unparseable.
+    #[test]
+    fn tools_are_refused_on_the_qwen3_dialects() {
+        let msgs = [Message::User("weather?".into())];
+        for dialect in [ChatDialect::Qwen3, ChatDialect::Qwen3Instruct] {
+            let opts = ChatOptions {
+                tools: fixture_tools(),
+                ..ChatOptions::for_dialect(dialect)
+            };
+            assert_eq!(
+                error(build_prompt(&msgs, &opts)),
+                ChatError::ToolsUnsupported { dialect }
+            );
+
+            let replayed = [
+                Message::User("weather?".into()),
+                Message::Assistant {
+                    content: String::new(),
+                    reasoning: None,
+                    tool_calls: vec![call("get_weather", vec![("location", json!("Paris"))])],
+                },
+                Message::User("thanks".into()),
+            ];
+            assert_eq!(
+                error(build_prompt(&replayed, &ChatOptions::for_dialect(dialect))),
+                ChatError::ToolsUnsupported { dialect }
+            );
+        }
+    }
+
+    // A continuation still works on the Qwen3 dialects, and is the only thing
+    // that makes the base template's header open a `<think>` block with
+    // thinking on — the builder's own extension, since the template itself
+    // never writes one there.
+    #[test]
+    fn a_continuation_opens_the_block_the_qwen3_header_otherwise_omits() {
+        let msgs = [Message::User("Hi".into())];
+        let head = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+
+        let injected = Continuation {
+            thinking: Some("part of a thought".into()),
+            close_thinking: false,
+            prefix: None,
+        };
+        let parts =
+            build_prompt_parts_with_spans_continued(&msgs, &qwen3(true), Some(&injected)).unwrap();
+        assert_eq!(
+            format!("{}{}", parts.context, parts.header),
+            format!("{head}<think>\npart of a thought")
+        );
+        assert!(parts.thinking_entry.starts_in_thinking());
+
+        let closed = Continuation {
+            thinking: Some("done thinking".into()),
+            close_thinking: true,
+            prefix: Some("The answer is".into()),
+        };
+        let parts =
+            build_prompt_parts_with_spans_continued(&msgs, &qwen3(true), Some(&closed)).unwrap();
+        assert_eq!(
+            format!("{}{}", parts.context, parts.header),
+            format!("{head}<think>\ndone thinking\n</think>\n\nThe answer is")
+        );
+        assert!(!parts.thinking_entry.starts_in_thinking());
+
+        // Instruct-2507 has no block for reasoning to go in, so injecting some
+        // is refused; a bare prefix continues the turn directly.
+        assert!(matches!(
+            error(build_prompt_parts_with_spans_continued(
+                &msgs,
+                &qwen3_instruct(),
+                Some(&injected)
+            )),
+            ChatError::UnrenderableContinuation { .. }
+        ));
+        let prefix_only = Continuation {
+            thinking: None,
+            close_thinking: false,
+            prefix: Some("The answer is".into()),
+        };
+        let parts =
+            build_prompt_parts_with_spans_continued(&msgs, &qwen3_instruct(), Some(&prefix_only))
+                .unwrap();
+        assert_eq!(
+            format!("{}{}", parts.context, parts.header),
+            format!("{head}The answer is")
+        );
     }
 }

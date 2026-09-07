@@ -365,3 +365,89 @@ whichever is larger, re-derived every 250 ms while the engine queues the live
 conversation's image after the signal, and the derived value is what the
 "shutdown grace expired" line reports. Before the fix a budget past 30 s was cut off by
 the flat watchdog, and pending bytes did not count a write already claimed; they do now.
+
+**A safetensors directory identifies by provenance first, then by `rope_theta`, and
+never by a bare name (2026-09-06).** The GGUF rule above is "the file names itself, the
+architecture is only a fallback". A safetensors set has no `general.name` to read, so
+the name passes are unreachable for `Arch::Qwen3` and something else has to carry the
+weight. Provenance does: a directory is `Official` only when it IS that registry entry's
+own cached HF snapshot, compared after canonicalizing the DIRECTORY and never a file
+inside it, because hub cache files are symlinks into a shared blob store and
+canonicalizing `config.json` would compare `blobs/` against itself for every entry.
+Anything else is `Assumed` under its own directory name, with `rope_theta` choosing the
+release - 5e6 is Instruct-2507, 1e6 is the base model, which wins the tie it shares with
+the byte-identical Z-Image config. `--model-size` keeps the meaning it has everywhere
+else, a cross-check rather than an override: naming a release whose theta disagrees with
+the directory is a startup error, which is what stops `--model-size
+qwen3-4b-instruct-2507` from being silently accepted on a base-model directory by the
+existing "the file said nothing, so the flag settles it" branch. `--model <dir>` is
+therefore a real surface on every one-shot subcommand, not just serve, and a directory,
+a `config.json` inside one or a `*.safetensors` inside one all resolve to the same set.
+One seam made that affordable: `CheckpointSource` is now the single place a checkpoint
+gets opened, and `Generator::load`, `XwenModel::load`, `serve::read_config`, the disk
+tier's checkpoint id, serve startup, `one_shot_checkpoint` and `inspect` all route
+through it. The drafter open stays GGUF, there being no safetensors drafter to open
+(2026-09-06).
+
+**The Z-Image encoder is an encode-only entry, and every qwen3 entry stays unlisted
+until the surface that would run it works.** `servable()` exists as the seam a
+half-ported architecture says no through, and this is what it was kept for: all three
+qwen3 entries register with `servable()` and `auto_fetch()` false in the arc that adds
+them, and each gate flips in the arc whose surface makes it true. Nothing is listed by
+`/v1/models`, selectable on the wire, or downloadable by a zero-flag run before it can
+answer. `ZImageTurboEncoder` is the one that never flips: its weights are a corrupted
+copy of Qwen3-4B base (docs/zimage.md), harmless for the hidden state Z-Image reads and
+disqualifying for anything that evaluates the last layer, so the LM surfaces are refused
+on it by construction rather than by documentation. Pointing xwen at
+`Qwen/Qwen3-4B` is the supported way to run that model as an LM. The cost of this
+policy is one honest wart: `serve::unknown_model_message` enumerates every registry
+entry, so a 400 can name a checkpoint that a request cannot then select. That was
+already true of an uncached Flash-Next and the unservable entries make it
+unconditional; it is a message bug with a one-line fix, recorded rather than
+improvised into an unrelated arc (2026-09-06).
+
+**The tokenizer and the grammar trie follow the request's target, and a family without
+one is an error rather than a fallback (2026-09-06 decided, 2026-09-07 shipped).** Serve
+used to encode every request with the one tokenizer it loaded at startup and build every
+grammar from a process-wide factory over the embedded bytes, which was correct exactly
+while every checkpoint shared a vocabulary. Qwen3 is a second one, 151936 against 248320,
+so the two are now per `VocabFamily`: `src/serve/vocab.rs` holds one `Vocabulary` per
+family, tokenizer and trie built together, cached lazily behind a mutex that is never held
+across a build, and every reader in serve resolves from the target. Three things about the
+shape are deliberate. It is keyed by FAMILY and not by checkpoint, a family being exactly
+the set of checkpoints for which those two objects are the same object. The trie is built
+from the file the tokenizer was parsed from, `LagunaTokenizer` having gained a source path
+and `constrain::for_tokenizer` asking it, rather than from a path the caller carries
+alongside: a trie and a tokenizer from different files agree about nothing and the symptom
+is wrong output, never an error, so the question is asked of the object that knows. And a
+family with no tokenizer anywhere on the machine is a 400 naming the fetch, with NO
+fallback to the embedded copy, which is the one outcome worse than refusing: it would
+build, run and answer fluently in another vocabulary's tokens. The lookup order is the
+embedded copy for Qwen 3.6 with no search (it IS that family's vocabulary), then the
+served file's own, then any cached registry checkpoint of the family, then the error. The
+mask width is a registry constant rather than a property of an open file, for the same
+reason `CacheGeometry` is: it is asked before anything is open (2026-09-07).
+
+**The two Qwen3 language models are servable; `auto_fetch` stays false, and the encoder
+is refused on every surface including `generate` and `chat`.** `not_servable_reason()` is
+the single source of `servable()` and of the sentence the CLI and the HTTP 400 both print,
+so nothing can be refused without saying why. The two questions the gates answer are kept
+apart on purpose: "can this checkpoint run at all" is now yes for the language models,
+while "may a request download 8 GB" is still no, so an uncached checkpoint is a 400 naming
+`xwen fetch` rather than a download inside a request, exactly as Flash-Next has been since
+2026-08-30. The encoder answers no to the first question forever, and the arc that shipped
+this found the gate missing from `generate` and `chat`, where loading it SUCCEEDS: its
+weights parse and its config is a language model's, so those two surfaces would have
+generated fluent-looking garbage out of the zero-filled layer 35 rather than failing. The
+gate runs on all four surfaces now, before the fetch, and the shared sentence says "cannot
+be run" because that is what it now means. **Prompt admission asks the REQUEST TARGET
+what fits, not the served checkpoint** (d48a3f4, same day). The check had used
+`AppState.max_ctx`, which is the served checkpoint's window, so a base-default server
+clamped Instruct-2507's trained 262144 to the base model's 40960 and refused prompts the
+target would have taken. It was pre-existing across the GGUF checkpoints, where every
+window is the same and nothing could show it; one family holding two windows six times
+apart is what made it visible, and being visible is what got it fixed rather than
+recorded. `Model::trained_context()` is a registry constant read off the cached files,
+capped by the configured limit, and the refusal names the checkpoint it applies to. The
+engine still re-derives its own limit at load, which stays authoritative for what runs
+(2026-09-07).

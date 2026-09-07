@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the upstream llama.cpp parity oracle (llama-eval-callback, llama-cli,
-# llama-server, llama-tokenize) in reference/llama.cpp.
+# llama-server, llama-tokenize) in reference/llama.cpp, then xwen's own
+# llama-logits-all on top of it.
 #
 # reference/llama.cpp is a shallow git SUBMODULE; `just init` fetches it at the
 # pinned commit, which docs/parity.md also records in human-readable form. Only
@@ -15,7 +16,8 @@
 # pre-Metal-4 and every tensor kernel fails at runtime. BLAS is off: Metal does
 # the real work.
 set -euo pipefail
-REPO="$(cd "$(dirname "$0")/.." && pwd)/reference/llama.cpp"
+SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+REPO="$SCRIPTS/../reference/llama.cpp"
 cd "$REPO"
 
 SDK="$(xcrun --show-sdk-path)"
@@ -26,6 +28,17 @@ nix shell nixpkgs#cmake --command bash -c "
     -DCMAKE_FRAMEWORK_PATH='$SDK/System/Library/Frameworks' &&
   cmake --build build -j
 "
+
+# scripts/llama-logits-all.cpp is xwen's own oracle tool, not upstream's: it dumps
+# llama.cpp's logits at every position of a prompt, which no shipped binary does.
+# It links the libraries cmake just produced and lands beside them in build/bin, so
+# @loader_path is all the rpath it needs. Keep the compile line here — it is the
+# only record of how the binary was produced.
+SRC="$SCRIPTS/llama-logits-all.cpp"
+clang++ -std=c++17 -O2 -o "$REPO/build/bin/llama-logits-all" "$SRC" \
+  -I "$REPO/include" -I "$REPO/ggml/include" \
+  -L "$REPO/build/bin" -lllama -lggml -lggml-base \
+  -Wl,-rpath,@loader_path
 
 echo
 echo "built binaries in $REPO/build/bin"

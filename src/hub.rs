@@ -54,15 +54,92 @@ pub enum Model {
     /// ([`Model::supports_drafting`]).
     #[default]
     Qwen38FlashNext,
+    /// Qwen3-4B, dense (`qwen3`) — the base release, hybrid thinking. The first
+    /// checkpoint here whose weights are Hugging Face BF16 safetensors rather
+    /// than a GGUF, and the first on a second vocabulary (151936 against the
+    /// 3.6 family's 248320).
+    ///
+    /// Not listed and not fetchable on its own yet ([`Model::servable`],
+    /// [`Model::auto_fetch`]): the `qwen3` layer stack is not implemented, so
+    /// nothing can run it. `generate`/`chat` flip both in the stack arc, serve
+    /// after that.
+    Qwen34B,
+    /// Qwen3-4B-Instruct-2507, dense (`qwen3`). The same graph and geometry as
+    /// [`Model::Qwen34B`]; its `config.json` differs in exactly two values,
+    /// `rope_theta` 5e6 (against 1e6) and `max_position_embeddings` 262144
+    /// (against 40960), and its chat template has no thinking mode at all.
+    Qwen34BInstruct2507,
+    /// The Z-Image-Turbo text encoder — `Tongyi-MAI/Z-Image-Turbo`'s
+    /// `text_encoder/` directory, which is Qwen3-4B's config and (for layers
+    /// 0-34) its weights, shipped inside a diffusion pipeline.
+    ///
+    /// ENCODE-ONLY, and the one entry here that is not a language model anyone
+    /// should generate from: its third shard is corrupt. Two planes of layer 35
+    /// — `mlp.up_proj` and `mlp.down_proj` — arrive as long runs of exact zeros
+    /// that the base model's identical shard does not have. Harmless for what
+    /// this entry is for, because the pipeline reads the hidden state after
+    /// layer 34 ([`EncoderSpec::layer`]) and never evaluates layer 35's MLP;
+    /// fatal for generation, which runs the whole stack. The loader knows the
+    /// two planes by name ([`Model::safetensors_allowed_zero_runs`]) and
+    /// refuses any OTHER zero-filled plane in any set.
+    ZImageTurboEncoder,
+}
+
+/// Which tokenizer vocabulary a checkpoint speaks — see
+/// [`Model::vocab_family`]. Two families ship here, and nothing about one
+/// transfers to the other: not the ids, not the width, not the specials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VocabFamily {
+    /// Qwen 3.6/3.8 — 248320 ids padded, real tokens to 248076.
+    Qwen36,
+    /// Qwen3 — 151936 ids padded, real tokens to 151668.
+    ///
+    /// One `tokenizer.json`, shared by all three `qwen3` releases: the file is
+    /// sha256-identical in `Qwen/Qwen3-4B`, `Qwen/Qwen3-4B-Instruct-2507` and
+    /// `Tongyi-MAI/Z-Image-Turbo`. `serve::vocab::Vocabularies` relies on it —
+    /// asked for this family it answers with whichever release happens to be
+    /// cached — and would encode one release's conversation with another's ids
+    /// if it stopped being true, silently.
+    /// `serve::vocab::tests::every_qwen3_release_ships_the_same_tokenizer`
+    /// compares the bytes rather than leaving that believed.
+    Qwen3,
+}
+
+impl VocabFamily {
+    /// The LOGIT width of every checkpoint in this family — the number of
+    /// columns its output layer produces, which is what a constrained-decoding
+    /// mask has to be exactly as wide as.
+    ///
+    /// Not the tokenizer's id count, which is smaller on both families
+    /// (248320 against 248076, 151936 against 151669): the tail is padding, and
+    /// the mask is indexed by logit. A mask sized to the tokenizer would
+    /// silently ban every id past its end, which the sampler refuses.
+    ///
+    /// A registry constant rather than a value read from a checkpoint, for the
+    /// same reason [`CacheGeometry`] is: this is asked before any file is open —
+    /// the grammar trie for a family is built once, off the family's own
+    /// `tokenizer.json`, and no checkpoint need be resident to answer a
+    /// request that names one.
+    pub const fn logit_width(self) -> usize {
+        match self {
+            VocabFamily::Qwen36 => crate::tokenizer::LagunaTokenizer::PADDED_VOCAB,
+            // `vocab_size` in every Qwen3-4B `config.json`, and the first
+            // dimension of `model.embed_tokens.weight` in every shard set.
+            VocabFamily::Qwen3 => 151_936,
+        }
+    }
 }
 
 /// Every checkpoint this build knows, in the order surfaces that enumerate them
 /// (`/v1/models`, an unknown-model error's list of valid names) print them.
-pub const MODELS: [Model; 4] = [
+pub const MODELS: [Model; 7] = [
     Model::Qwen27B,
     Model::Qwen35BA3B,
     Model::Qwen3827B,
     Model::Qwen38FlashNext,
+    Model::Qwen34B,
+    Model::Qwen34BInstruct2507,
+    Model::ZImageTurboEncoder,
 ];
 
 /// The hub coordinates of one checkpoint: the repo, the Q4_K_M target (the
@@ -89,6 +166,60 @@ struct Checkpoint {
     /// checkpoint either drafts or it does not.
     drafter: Option<Drafter>,
     geometry: CacheGeometry,
+    /// What the weights ARE on disk, which decides which loader opens them —
+    /// and, for a safetensors set, everything the loader needs beyond the file
+    /// list.
+    format: Format,
+}
+
+/// How a checkpoint's weights are stored, and what opening them needs.
+///
+/// The distinction the registry has to carry rather than infer: `files()` is
+/// just a list of names either way, but a GGUF is opened as a FILE and a
+/// safetensors checkpoint as a DIRECTORY, with a separate tokenizer, a shard
+/// index, and per-checkpoint knowledge of which planes are allowed to be
+/// zero-filled. `crate::checkpoint::CheckpointSource` is what reads this.
+///
+/// Every path here is relative to the REPO root, like [`Checkpoint::files`],
+/// which is not always the checkpoint directory: the Z-Image encoder lives in a
+/// `text_encoder/` subdirectory with its tokenizer in a sibling one.
+pub enum Format {
+    Gguf,
+    SafeTensors {
+        /// `config.json` — the file `files()` lists first, so `cached_model`
+        /// and `ensure_model` hand back a path inside the checkpoint directory.
+        config: &'static str,
+        index: &'static str,
+        tokenizer: &'static str,
+        /// Tensors whose long runs of exact zeros are known and tolerated. Any
+        /// other plane with such a run fails the load: a run that long is a
+        /// truncated or mis-uploaded shard, and it produces a model that runs
+        /// and returns wrong numbers rather than one that fails.
+        allow_zero_runs: &'static [&'static str],
+        /// Present when this checkpoint is (also) a conditioning encoder, and
+        /// says which hidden state its pipeline reads. `None` on a plain LM,
+        /// which encodes from its last layer and caps nothing.
+        encoder: Option<EncoderSpec>,
+    },
+}
+
+/// Where a conditioning encoder's pipeline takes its hidden state, and how much
+/// text it feeds in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderSpec {
+    /// The `hidden_states` index the pipeline reads, in HF's numbering: 0 is the
+    /// embedding output, N is the residual after `layers[N-1]`, before the final
+    /// norm. Z-Image takes `hidden_states[-2]` of 37 entries, which is 35.
+    pub layer: usize,
+    /// The pipeline's own `max_length`, which it pads and truncates every prompt
+    /// to. Z-Image's is 512; longer prompts are truncated, exactly as the
+    /// pipeline truncates them.
+    pub max_tokens: usize,
+    /// The deepest layer this checkpoint's weights can be trusted to compute —
+    /// the ceiling on `--layer`. Equal to [`EncoderSpec::layer`] on Z-Image,
+    /// because layer 35's MLP is the corrupt plane and asking for a deeper
+    /// hidden state would evaluate it.
+    pub max_layer: usize,
 }
 
 /// One checkpoint's drafter sidecar.
@@ -193,6 +324,7 @@ const QWEN_27B: Checkpoint = Checkpoint {
         p_min: 0.5,
     }),
     geometry: DENSE_27B_GEOMETRY,
+    format: Format::Gguf,
 };
 
 const QWEN_35B_A3B: Checkpoint = Checkpoint {
@@ -220,6 +352,7 @@ const QWEN_35B_A3B: Checkpoint = Checkpoint {
         conv_kernel: 4,
         extras: None,
     },
+    format: Format::Gguf,
 };
 
 /// The 3.8 release ships no DFlash sidecar. It ships an MTP head instead — one
@@ -241,6 +374,7 @@ const QWEN_38_27B: Checkpoint = Checkpoint {
         p_min: 0.7,
     }),
     geometry: DENSE_27B_GEOMETRY,
+    format: Format::Gguf,
 };
 
 /// Qwen3.8-Flash-Next, the `qwen4exp` checkpoint — and the one entry in this
@@ -292,6 +426,124 @@ const QWEN_38_FLASH_NEXT: Checkpoint = Checkpoint {
             ple_conv_width: 4 * 2560,
         }),
     },
+    format: Format::Gguf,
+};
+
+/// 36 layers, ALL full attention, 8 KV heads at head_dim 128. Shared by every
+/// `qwen3` checkpoint: the three releases differ only in `rope_theta` and
+/// `max_position_embeddings`, neither of which a cache is sized by.
+///
+/// The `linear_*` and `conv_kernel` fields are zero because this architecture
+/// has no recurrent layers at all — which is also why its snapshots cost
+/// nothing: a `qwen3` conversation's whole state is its KV rows.
+const QWEN3_4B_GEOMETRY: CacheGeometry = CacheGeometry {
+    full_attn_layers: 36,
+    linear_layers: 0,
+    n_kv_head: 8,
+    head_dim: 128,
+    linear_k_heads: 0,
+    linear_v_heads: 0,
+    linear_head_dim: 0,
+    conv_kernel: 0,
+    extras: None,
+};
+
+/// The three shards and the two JSON files of a Qwen3-4B safetensors set, as
+/// the Hugging Face repos lay them out at the repo root. The Z-Image encoder
+/// ships the same five under `text_encoder/`.
+const QWEN3_4B_SHARDS: [&str; 3] = [
+    "model-00001-of-00003.safetensors",
+    "model-00002-of-00003.safetensors",
+    "model-00003-of-00003.safetensors",
+];
+
+const QWEN3_4B: Checkpoint = Checkpoint {
+    repo: "Qwen/Qwen3-4B",
+    files: &[
+        "config.json",
+        "model.safetensors.index.json",
+        QWEN3_4B_SHARDS[0],
+        QWEN3_4B_SHARDS[1],
+        QWEN3_4B_SHARDS[2],
+        "tokenizer.json",
+    ],
+    full_name: "Qwen3-4B",
+    arch: Arch::Qwen3,
+    // Measured with `stat -L` over the six files above: 8,056,438,199 bytes,
+    // of which 8,044,981,999 is the three shards.
+    model_size: "8.06 GB",
+    drafter: None,
+    geometry: QWEN3_4B_GEOMETRY,
+    format: Format::SafeTensors {
+        config: "config.json",
+        index: "model.safetensors.index.json",
+        tokenizer: "tokenizer.json",
+        allow_zero_runs: &[],
+        encoder: None,
+    },
+};
+
+const QWEN3_4B_INSTRUCT_2507: Checkpoint = Checkpoint {
+    repo: "Qwen/Qwen3-4B-Instruct-2507",
+    files: &[
+        "config.json",
+        "model.safetensors.index.json",
+        QWEN3_4B_SHARDS[0],
+        QWEN3_4B_SHARDS[1],
+        QWEN3_4B_SHARDS[2],
+        "tokenizer.json",
+    ],
+    full_name: "Qwen3-4B-Instruct-2507",
+    arch: Arch::Qwen3,
+    model_size: "8.06 GB",
+    drafter: None,
+    geometry: QWEN3_4B_GEOMETRY,
+    format: Format::SafeTensors {
+        config: "config.json",
+        index: "model.safetensors.index.json",
+        tokenizer: "tokenizer.json",
+        allow_zero_runs: &[],
+        encoder: None,
+    },
+};
+
+/// The Z-Image-Turbo text encoder: one subdirectory of a diffusion repo, with
+/// its tokenizer in a sibling subdirectory — the reason [`Checkpoint::files`]
+/// and [`Format::SafeTensors`] name paths relative to the REPO rather than to
+/// the checkpoint directory.
+///
+/// The two allowlisted planes are the corrupt ones (see
+/// [`Model::ZImageTurboEncoder`]), and `max_layer` is the encoder's own layer
+/// for the same reason: 35 is as deep as these weights can be trusted.
+const Z_IMAGE_TURBO_ENCODER: Checkpoint = Checkpoint {
+    repo: "Tongyi-MAI/Z-Image-Turbo",
+    files: &[
+        "text_encoder/config.json",
+        "text_encoder/model.safetensors.index.json",
+        "text_encoder/model-00001-of-00003.safetensors",
+        "text_encoder/model-00002-of-00003.safetensors",
+        "text_encoder/model-00003-of-00003.safetensors",
+        "tokenizer/tokenizer.json",
+    ],
+    full_name: "Z-Image-Turbo-text-encoder",
+    arch: Arch::Qwen3,
+    model_size: "8.06 GB",
+    drafter: None,
+    geometry: QWEN3_4B_GEOMETRY,
+    format: Format::SafeTensors {
+        config: "text_encoder/config.json",
+        index: "text_encoder/model.safetensors.index.json",
+        tokenizer: "tokenizer/tokenizer.json",
+        allow_zero_runs: &[
+            "model.layers.35.mlp.up_proj.weight",
+            "model.layers.35.mlp.down_proj.weight",
+        ],
+        encoder: Some(EncoderSpec {
+            layer: 35,
+            max_tokens: 512,
+            max_layer: 35,
+        }),
+    },
 };
 
 impl Model {
@@ -301,6 +553,129 @@ impl Model {
             Model::Qwen35BA3B => &QWEN_35B_A3B,
             Model::Qwen3827B => &QWEN_38_27B,
             Model::Qwen38FlashNext => &QWEN_38_FLASH_NEXT,
+            Model::Qwen34B => &QWEN3_4B,
+            Model::Qwen34BInstruct2507 => &QWEN3_4B_INSTRUCT_2507,
+            Model::ZImageTurboEncoder => &Z_IMAGE_TURBO_ENCODER,
+        }
+    }
+
+    /// Whether this checkpoint's weights are a Hugging Face safetensors
+    /// DIRECTORY rather than a GGUF file — which decides which loader opens it
+    /// and, on the surfaces that name a file, what `--model` may point at.
+    pub const fn is_safetensors(self) -> bool {
+        matches!(self.checkpoint().format, Format::SafeTensors { .. })
+    }
+
+    /// The repo-relative path of this checkpoint's `tokenizer.json`, or `None`
+    /// for a GGUF, whose tokenizer is embedded in the file.
+    pub const fn safetensors_tokenizer(self) -> Option<&'static str> {
+        match &self.checkpoint().format {
+            Format::SafeTensors { tokenizer, .. } => Some(tokenizer),
+            Format::Gguf => None,
+        }
+    }
+
+    /// The tensors this checkpoint is allowed to ship zero-filled. Empty for
+    /// every checkpoint but the Z-Image encoder, and empty for a GGUF, whose
+    /// loader does not scan.
+    pub const fn safetensors_allowed_zero_runs(self) -> &'static [&'static str] {
+        match &self.checkpoint().format {
+            Format::SafeTensors {
+                allow_zero_runs, ..
+            } => allow_zero_runs,
+            Format::Gguf => &[],
+        }
+    }
+
+    /// Where this checkpoint's conditioning-encoder pipeline reads its hidden
+    /// state, or `None` for a checkpoint that is only a language model.
+    pub const fn encoder_spec(self) -> Option<EncoderSpec> {
+        match &self.checkpoint().format {
+            Format::SafeTensors {
+                encoder: Some(spec),
+                ..
+            } => Some(*spec),
+            Format::SafeTensors { .. } | Format::Gguf => None,
+        }
+    }
+
+    /// The `rope_theta` this checkpoint's `config.json` carries, or `None` for a
+    /// GGUF checkpoint, whose release is named in the file instead.
+    ///
+    /// This is the cross-check a safetensors set gets in place of the name one:
+    /// a directory says nothing about which release it is, but the two `qwen3`
+    /// releases in this registry disagree here, so `--model-size` naming one of
+    /// them against a directory carrying the other's theta is refused
+    /// ([`crate::XwenConfig::identify`]).
+    pub const fn safetensors_rope_theta(self) -> Option<f32> {
+        match self {
+            Model::Qwen34B | Model::ZImageTurboEncoder => Some(1e6),
+            Model::Qwen34BInstruct2507 => Some(5e6),
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => None,
+        }
+    }
+
+    /// Which `qwen3` release a `rope_theta` names, for a directory that
+    /// identifies as nothing else.
+    ///
+    /// 5e6 is Instruct-2507's alone. 1e6 is shared by the base model and the
+    /// Z-Image text encoder, whose configs are byte-identical, and the tie goes
+    /// to the base model: it is the language model, it is what an unpacked copy
+    /// of these weights most likely is, and the encoder entry is reachable by
+    /// naming it (`--model-size zimage-turbo`) where the LM is what silence
+    /// gets. A theta neither release uses answers `None`.
+    pub fn by_safetensors_rope_theta(theta: f32) -> Option<Model> {
+        [Model::Qwen34B, Model::Qwen34BInstruct2507]
+            .into_iter()
+            .find(|model| model.safetensors_rope_theta() == Some(theta))
+    }
+
+    /// The context length this checkpoint was converted with — its
+    /// `<arch>.context_length` in a GGUF, its `max_position_embeddings` in a
+    /// safetensors `config.json`.
+    ///
+    /// A registry constant for the same reason [`CacheGeometry`] is: it is
+    /// asked BEFORE the checkpoint is open, and on the request path. A server
+    /// admits a prompt against the context of the checkpoint that will answer
+    /// it, which is not always the one it was started on — and re-reading a
+    /// config per request is a metadata read for a GGUF and an eight-gigabyte
+    /// scan for a safetensors set.
+    ///
+    /// 262144 on every checkpoint here but two: `Qwen/Qwen3-4B` trains to 40960
+    /// and the Z-Image encoder is its byte-identical config. That gap is the
+    /// whole reason this exists — a 50k prompt is servable by one Qwen3 release
+    /// and not by the other.
+    ///
+    /// Authoritative only for the OFFICIAL file. A served checkpoint's own
+    /// config is read at startup and that measurement wins for it, because a
+    /// custom file's context is a fact about the file rather than about the
+    /// checkpoint it runs as.
+    pub const fn trained_context(self) -> usize {
+        match self {
+            Model::Qwen27B
+            | Model::Qwen35BA3B
+            | Model::Qwen3827B
+            | Model::Qwen38FlashNext
+            | Model::Qwen34BInstruct2507 => 262_144,
+            Model::Qwen34B | Model::ZImageTurboEncoder => 40_960,
+        }
+    }
+
+    /// Which tokenizer vocabulary this checkpoint speaks.
+    ///
+    /// A checkpoint's ids only mean anything inside its own family: the Qwen 3.6
+    /// vocabulary is 248320 wide with `<|im_end|>` at 248046, the Qwen3 one is
+    /// 151936 wide with it at 151645. Anything holding a tokenizer, a grammar
+    /// trie or a hardcoded special id per checkpoint keys on this rather than on
+    /// the checkpoint, because every member of a family shares all of it.
+    pub const fn vocab_family(self) -> VocabFamily {
+        match self {
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => {
+                VocabFamily::Qwen36
+            }
+            Model::Qwen34B | Model::Qwen34BInstruct2507 | Model::ZImageTurboEncoder => {
+                VocabFamily::Qwen3
+            }
         }
     }
 
@@ -358,12 +733,21 @@ impl Model {
         match self {
             Model::Qwen27B | Model::Qwen35BA3B => crate::chat::ChatDialect::Qwen36,
             Model::Qwen3827B | Model::Qwen38FlashNext => crate::chat::ChatDialect::Qwen38,
+            // The encoder renders the base template: Z-Image's own
+            // `tokenizer_config.json` carries Qwen3-4B's chat template
+            // character for character, and the pipeline renders one user turn
+            // through it with `add_generation_prompt`.
+            Model::Qwen34B | Model::ZImageTurboEncoder => crate::chat::ChatDialect::Qwen3,
+            Model::Qwen34BInstruct2507 => crate::chat::ChatDialect::Qwen3Instruct,
         }
     }
 
     /// The presence penalty this checkpoint's model card asks for in the given
-    /// chat mode. Non-thinking is 1.5 on all four; thinking is 1.5 on
-    /// Qwen3.6-35B-A3B alone and 0.0 on the other three.
+    /// chat mode. On the four Qwen 3.6/3.8 checkpoints non-thinking is 1.5 and
+    /// thinking is 1.5 on Qwen3.6-35B-A3B alone, 0.0 on the other three. Zero
+    /// on every `qwen3` checkpoint: those cards list `presence_penalty` as an
+    /// optional 0-2 knob for reducing repetition, not as a recommended default,
+    /// so applying one would be this runtime's opinion rather than the card's.
     ///
     /// This is the one card value that is NOT shared across the checkpoints,
     /// which is why it sits here on `Model` rather than beside temperature and
@@ -376,11 +760,19 @@ impl Model {
     /// converters only know `repetition_penalty`, so no converted file carries
     /// a presence-penalty key at any spelling, and a value read from the file
     /// would be a value that is never there.
+    /// Exhaustive on purpose, with no `_` arm: a wildcard here handed every new
+    /// checkpoint the 3.6 family's 1.5 without anyone deciding it.
     pub const fn recommended_presence_penalty(self, thinking: bool) -> f64 {
-        match (self, thinking) {
-            (Model::Qwen35BA3B, true) => 1.5,
-            (_, true) => 0.0,
-            (_, false) => 1.5,
+        match self {
+            Model::Qwen35BA3B => 1.5,
+            Model::Qwen27B | Model::Qwen3827B | Model::Qwen38FlashNext => {
+                if thinking {
+                    0.0
+                } else {
+                    1.5
+                }
+            }
+            Model::Qwen34B | Model::Qwen34BInstruct2507 | Model::ZImageTurboEncoder => 0.0,
         }
     }
 
@@ -415,17 +807,30 @@ impl Model {
     /// Not a per-checkpoint policy knob and not read from the table's size
     /// string: it is spelled out here so that adding a big checkpoint is a
     /// decision someone makes rather than one they inherit.
+    /// False on the three `qwen3` checkpoints for a different reason than the
+    /// size one: nothing can RUN them yet, so a fetch triggered on their behalf
+    /// would download 8 GB for a load that fails. Flipped to true by the arc
+    /// that lands the `qwen3` layer stack.
     pub const fn auto_fetch(self) -> bool {
         match self {
             Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B => true,
             Model::Qwen38FlashNext => false,
+            Model::Qwen34B | Model::Qwen34BInstruct2507 | Model::ZImageTurboEncoder => false,
         }
     }
 
     /// Whether the surfaces that MOVE cache state can run this checkpoint at
     /// all: `xwen serve` and `xwen batch`.
     ///
-    /// True for every checkpoint in the registry, and has been since the
+    /// False on the three `qwen3` checkpoints, which is the first time this
+    /// seam has actually said no since it was kept for the purpose: that
+    /// architecture is half-ported — its config and its weights load, its layer
+    /// stack does not exist — so serve and batch refuse it rather than
+    /// accepting a job they cannot finish. The two language models flip to true
+    /// in the serve arc; `ZImageTurboEncoder` stays false permanently, because
+    /// it is an encoder and generating from it would run its corrupt layer.
+    ///
+    /// True for every GGUF checkpoint, and has been since the
     /// qwen4exp cache images landed (2026-08-30): the QSA indexers' raw keys
     /// travel with the full-attention rows in a `HostFullKv` and the PLE conv
     /// window and n-gram history ride on their layer's snapshot entry, so a
@@ -437,8 +842,49 @@ impl Model {
     /// needs somewhere to say no. It is not a policy knob: a checkpoint answers
     /// false here only while some part of its state has no image.
     pub const fn servable(self) -> bool {
+        self.not_servable_reason().is_none()
+    }
+
+    /// WHY this checkpoint cannot be RUN, in a clause that completes
+    /// "…cannot be run: ", or `None` for one that can.
+    ///
+    /// [`Model::servable`] is derived from this rather than the other way
+    /// round, so a checkpoint cannot be refused without saying why. The reasons
+    /// are genuinely different and so is the operator's next move — one is a
+    /// build away, the other is permanent and has a different command to
+    /// reach for — and a single "not supported" would send them both nowhere.
+    pub const fn not_servable_reason(self) -> Option<&'static str> {
         match self {
-            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => true,
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => None,
+            // Servable since the qwen3 layer stack landed: every layer is full
+            // attention, so a conversation's whole state is its KV rows and the
+            // snapshot, rewind, page-out and disk-tier paths carry it with the
+            // machinery they already had. What still gates them is
+            // [`Model::auto_fetch`], which is about the download and not the
+            // graph.
+            Model::Qwen34B | Model::Qwen34BInstruct2507 => None,
+            Model::ZImageTurboEncoder => Some(
+                "it is an encode-only conditioning encoder, and its weights are not a \
+                 faithful language model — layer 35's MLP arrives zero-filled in the \
+                 Z-Image copy, which generation would run and encoding never reaches; use \
+                 `xwen encode-text`",
+            ),
+        }
+    }
+
+    /// The one sentence every surface says when it is asked for a checkpoint it
+    /// cannot run — `generate`, `chat`, `serve` and `batch` at startup, before a
+    /// byte is downloaded, and the HTTP APIs as the body of a 400.
+    ///
+    /// Phrased for all of them, because they are refusing the same thing for the
+    /// same reason and five wordings would be five things to keep true. It says
+    /// "run" rather than "serve": the encoder is not a language model on any
+    /// surface, and a message that only mentioned serving would read as though
+    /// `xwen generate` were the way around it.
+    pub fn not_servable_message(self) -> String {
+        match self.not_servable_reason() {
+            Some(reason) => format!("{} cannot be run: {reason}", self.full_name()),
+            None => format!("{} can be run", self.full_name()),
         }
     }
 
@@ -484,6 +930,9 @@ impl Model {
         match self {
             Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B => true,
             Model::Qwen38FlashNext => false,
+            // No drafter of any kind exists for the qwen3 graph, and no release
+            // ships one: there is nothing to attach and nothing to verify with.
+            Model::Qwen34B | Model::Qwen34BInstruct2507 | Model::ZImageTurboEncoder => false,
         }
     }
 
@@ -516,6 +965,7 @@ impl Model {
             Model::Qwen27B | Model::Qwen3827B => true,
             Model::Qwen35BA3B => false,
             Model::Qwen38FlashNext => false,
+            Model::Qwen34B | Model::Qwen34BInstruct2507 | Model::ZImageTurboEncoder => false,
         }
     }
 
@@ -611,6 +1061,11 @@ impl Model {
     /// Callers that need an answer regardless fall back to [`Arch::model`] and
     /// say so.
     pub fn identify(arch: Arch, general_name: Option<&str>, file: Option<&Path>) -> Option<Self> {
+        // A safetensors checkpoint answers a different question, because it has
+        // no name to read: see `identify_cached_dir`.
+        if arch == Arch::Qwen3 {
+            return file.and_then(Self::identify_cached_dir);
+        }
         let candidates = || MODELS.into_iter().filter(|model| model.arch() == arch);
         // Only one candidate can match, or none does.
         let sole = |mut hits: Vec<Model>| -> Option<Model> {
@@ -644,6 +1099,106 @@ impl Model {
         }
         let stem = file.and_then(Path::file_stem)?.to_string_lossy();
         by_name(&stem)
+    }
+
+    /// Which official checkpoint a safetensors DIRECTORY is: the one whose own
+    /// cached snapshot it IS, and otherwise none.
+    ///
+    /// The GGUF rule cannot be reused, because it reads a name and there is no
+    /// name to read. A `config.json` says what the ARCHITECTURE is and (through
+    /// `rope_theta`) which release, but it says nothing about whose weights sit
+    /// beside it — and two of the three checkpoints on this architecture,
+    /// `Qwen/Qwen3-4B` and the Z-Image text encoder, have byte-identical
+    /// configs while shipping different weights (one of the encoder's shards is
+    /// corrupt). A directory name is worse still: in the Hugging Face cache it
+    /// is a commit hash, and anywhere else it is whatever somebody called the
+    /// folder.
+    ///
+    /// So the only thing that can honestly say "these are the official
+    /// weights" is provenance: this directory is the one the hub cache holds
+    /// for that entry. Anything else identifies as nothing, runs under its own
+    /// directory name as [`crate::Identity::Assumed`], and can still be pinned
+    /// with `--model-size` — which is exactly the shape of the GGUF rule, for
+    /// the same reason.
+    ///
+    /// Provenance is measured against the entry's REPO directory, not against
+    /// whichever snapshot `refs/main` currently points at. A cache holds every
+    /// commit it has ever fetched, and an older snapshot of `Qwen/Qwen3-4B` is
+    /// still `Qwen/Qwen3-4B` — the ref only says which one is current. Matching
+    /// the current snapshot alone made a perfectly good checkpoint identify as
+    /// nothing the moment upstream pushed a README.
+    ///
+    /// Within a snapshot the SUBDIRECTORY has to match too, and that is what
+    /// keeps the two theta-1e6 checkpoints apart from each other rather than
+    /// merely apart from Instruct-2507: the Z-Image encoder is
+    /// `snapshots/<commit>/text_encoder` and a Qwen3-4B checkpoint is
+    /// `snapshots/<commit>` itself. They are in different repos as well, so
+    /// this is belt and braces — but the config cannot tell them apart at all,
+    /// and this is the only thing that can.
+    ///
+    /// `path` may be the directory or a file inside it (`ensure_model` hands
+    /// back `config.json`), and only DIRECTORIES are canonicalized: the cache's
+    /// files are symlinks into a shared `blobs/` store, so resolving one would
+    /// compare the blob directory against itself for every entry.
+    fn identify_cached_dir(path: &Path) -> Option<Model> {
+        Self::identify_cached_dir_in(&hub_cache_root()?, path)
+    }
+
+    /// [`Model::identify_cached_dir`] against an explicit cache root — the same
+    /// split as `cached_file_in` in this module's tests, and for the same
+    /// reason: the rule is what matters and the environment variable it
+    /// normally reads is not something a test may change out from under the
+    /// threads it shares a process with.
+    fn identify_cached_dir_in(root: &Path, path: &Path) -> Option<Model> {
+        let dir = canonical_checkpoint_dir(path)?;
+        MODELS
+            .into_iter()
+            .filter(|model| model.is_safetensors())
+            .find(|model| model.is_cached_snapshot_in(root, &dir))
+    }
+
+    /// Whether `dir` — already canonicalized — is one of this entry's snapshots
+    /// under the cache at `root`, at the subdirectory this entry's files live
+    /// in.
+    ///
+    /// The last clause is not a formality: an interrupted download leaves the
+    /// config and the index in place and the shards missing, and a directory
+    /// like that is not the official weights however official its provenance.
+    /// So every file the entry names has to be there before this says yes.
+    fn is_cached_snapshot_in(self, root: &Path, dir: &Path) -> bool {
+        let Some(snapshots) = self.cached_snapshots_dir_in(root) else {
+            return false;
+        };
+        let Ok(within) = dir.strip_prefix(&snapshots) else {
+            return false;
+        };
+        let mut parts = within.components();
+        // The first component is the commit; whatever follows must be exactly
+        // the subdirectory this checkpoint sits in — empty for the two language
+        // models, `text_encoder` for the encoder.
+        let Some(commit) = parts.next() else {
+            return false;
+        };
+        if parts.as_path() != self.snapshot_subdir() {
+            return false;
+        }
+        let snapshot = snapshots.join(commit);
+        self.files().iter().all(|file| snapshot.join(file).exists())
+    }
+
+    /// This entry's `snapshots/` directory under the cache at `root`,
+    /// canonicalized, or `None` when the repo has never been fetched there.
+    fn cached_snapshots_dir_in(self, root: &Path) -> Option<PathBuf> {
+        let repo = format!("models--{}", self.repo().replace('/', "--"));
+        std::fs::canonicalize(root.join(repo).join("snapshots")).ok()
+    }
+
+    /// Where inside one snapshot this checkpoint's directory sits, derived from
+    /// the config path the entry already lists rather than stated twice: empty
+    /// for a repo whose files are at its root, `text_encoder` for the Z-Image
+    /// encoder.
+    fn snapshot_subdir(self) -> &'static Path {
+        Path::new(self.file()).parent().unwrap_or(Path::new(""))
     }
 
     /// The deepest draft this checkpoint's drafter is asked for when the run did
@@ -801,7 +1356,11 @@ impl Model {
     pub const fn snapshot_bytes(self) -> usize {
         let g = &self.checkpoint().geometry;
         let conv_dim = (2 * g.linear_k_heads + g.linear_v_heads) * g.linear_head_dim;
-        let conv = (g.conv_kernel - 1) * conv_dim * 4;
+        // Saturating because an architecture with no recurrent layers declares
+        // no conv either (`conv_kernel` 0, as `qwen3` does), and `0 - 1` on a
+        // usize is a panic rather than the zero the whole term multiplies out
+        // to.
+        let conv = g.conv_kernel.saturating_sub(1) * conv_dim * 4;
         let delta = g.linear_v_heads * g.linear_head_dim * g.linear_head_dim * 4;
         let ple = match &g.extras {
             Some(extras) => extras.ple_layers * extras.ple_conv_cols * extras.ple_conv_width * 4,
@@ -820,6 +1379,9 @@ impl std::fmt::Display for Model {
             Model::Qwen35BA3B => "35b",
             Model::Qwen3827B => "3.8-27b",
             Model::Qwen38FlashNext => "flash-next",
+            Model::Qwen34B => "qwen3-4b",
+            Model::Qwen34BInstruct2507 => "qwen3-4b-instruct-2507",
+            Model::ZImageTurboEncoder => "zimage-turbo",
         })
     }
 }
@@ -839,8 +1401,12 @@ impl std::str::FromStr for Model {
             "35" | "35b" | "35b-a3b" => Ok(Model::Qwen35BA3B),
             "38" | "3.8" | "3.8-27b" => Ok(Model::Qwen3827B),
             "flash-next" | "3.8-flash-next" => Ok(Model::Qwen38FlashNext),
+            "qwen3-4b" | "4b" => Ok(Model::Qwen34B),
+            "qwen3-4b-instruct-2507" | "4b-instruct" => Ok(Model::Qwen34BInstruct2507),
+            "zimage-turbo" | "z-image-turbo" => Ok(Model::ZImageTurboEncoder),
             other => Err(format!(
-                "unknown model {other:?} (expected 27b, 35b, 3.8-27b or flash-next)"
+                "unknown model {other:?} (expected 27b, 35b, 3.8-27b, flash-next, qwen3-4b, \
+                 qwen3-4b-instruct-2507 or zimage-turbo)"
             )),
         }
     }
@@ -875,6 +1441,18 @@ fn hyphenate(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The checkpoint directory `path` names, resolved through symlinks: `path`
+/// itself when it is a directory, otherwise its parent.
+///
+/// The directory is what gets canonicalized, never the file. A Hugging Face
+/// cache snapshot is a tree of real directories holding symlinks into a shared
+/// `blobs/` store, so canonicalizing `snapshots/<commit>/config.json` yields a
+/// path in `blobs/` whose parent is the same for every checkpoint in the cache.
+pub fn canonical_checkpoint_dir(path: &Path) -> Option<PathBuf> {
+    let dir = if path.is_dir() { path } else { path.parent()? };
+    std::fs::canonicalize(dir).ok()
 }
 
 /// The hub cache root, following the python tooling's precedence:
@@ -1083,7 +1661,11 @@ mod tests {
             assert!(model.auto_fetch(), "{model}");
             assert!(model.supports_drafting(), "{model}");
         }
-        for model in MODELS {
+        // Every GGUF checkpoint's state has a cache image, so serve and batch
+        // run all four. The qwen3 entries are the ones this seam now says no
+        // to, and they are covered in
+        // `the_qwen3_checkpoints_are_registered_but_not_runnable_yet`.
+        for model in MODELS.into_iter().filter(|m| !m.is_safetensors()) {
             assert!(model.servable(), "{model}");
         }
 
@@ -1257,15 +1839,28 @@ mod tests {
     /// only sampling default that has to be resolved with a checkpoint in hand.
     #[test]
     fn the_presence_penalty_is_per_checkpoint_and_per_mode() {
-        // Every card asks for 1.5 in non-thinking mode.
-        for model in MODELS {
+        let qwen36 = || MODELS.into_iter().filter(|m| !m.is_safetensors());
+        // Every Qwen 3.6/3.8 card asks for 1.5 in non-thinking mode.
+        for model in qwen36() {
             assert_eq!(model.recommended_presence_penalty(false), 1.5, "{model:?}");
         }
         // Thinking mode is where they part: only the 35B-A3B card carries one.
         assert_eq!(Model::Qwen35BA3B.recommended_presence_penalty(true), 1.5);
-        for model in MODELS {
+        for model in qwen36() {
             if model != Model::Qwen35BA3B {
                 assert_eq!(model.recommended_presence_penalty(true), 0.0, "{model:?}");
+            }
+        }
+        // The Qwen3 cards recommend none in either mode: they list
+        // `presence_penalty` as an optional 0-2 knob against repetition, and
+        // applying 1.5 unasked would be this runtime's opinion, not the card's.
+        for model in MODELS.into_iter().filter(|m| m.is_safetensors()) {
+            for thinking in [true, false] {
+                assert_eq!(
+                    model.recommended_presence_penalty(thinking),
+                    0.0,
+                    "{model:?} thinking={thinking}"
+                );
             }
         }
     }
@@ -1284,12 +1879,435 @@ mod tests {
                 "shard {i} is named {file}"
             );
         }
-        // Every other checkpoint is one file, and `file()` is that file.
+        // Every other GGUF checkpoint is one file, and `file()` is that file.
+        // A safetensors set is many files by nature and is covered by
+        // `the_qwen3_entries_name_every_file_of_their_set`.
         for model in MODELS {
-            if model != Model::Qwen38FlashNext {
+            if model != Model::Qwen38FlashNext && !model.is_safetensors() {
                 assert_eq!(model.files(), &[model.file()], "{model:?}");
             }
         }
+    }
+
+    /// A safetensors checkpoint is a DIRECTORY, and what the registry lists is
+    /// every file that has to be in it: the config the loader opens, the shard
+    /// index, the three shards and the tokenizer. `file()` is the config,
+    /// deliberately — it is the entry `cached_model` and `ensure_model` hand
+    /// back, and `CheckpointSource::open` resolves the directory from it.
+    #[test]
+    fn the_qwen3_entries_name_every_file_of_their_set() {
+        for model in MODELS.into_iter().filter(|m| m.is_safetensors()) {
+            let files = model.files();
+            assert_eq!(files.len(), 6, "{model:?}");
+            assert!(files[0].ends_with("config.json"), "{model:?}: {}", files[0]);
+            assert_eq!(model.file(), files[0], "{model:?}");
+            assert_eq!(
+                files.iter().filter(|f| f.ends_with(".safetensors")).count(),
+                3,
+                "{model:?}"
+            );
+            assert!(
+                files.contains(&model.safetensors_tokenizer().unwrap()),
+                "{model:?} does not list the tokenizer it names"
+            );
+            // Every path is repo-relative, never absolute and never a parent
+            // escape: `cached_file` joins them onto a snapshot directory.
+            for file in files {
+                assert!(
+                    !file.starts_with('/') && !file.contains(".."),
+                    "{model:?}: {file}"
+                );
+            }
+            // The two JSON files the format names are files the entry lists.
+            let Format::SafeTensors { config, index, .. } = &model.checkpoint().format else {
+                panic!("{model:?} is not a safetensors entry");
+            };
+            assert_eq!(*config, files[0], "{model:?}");
+            assert!(files.contains(index), "{model:?}");
+        }
+
+        // The encoder is the one whose files live in subdirectories, which is
+        // why the paths are relative to the REPO rather than to the checkpoint.
+        assert_eq!(Model::ZImageTurboEncoder.file(), "text_encoder/config.json");
+        assert_eq!(
+            Model::ZImageTurboEncoder.safetensors_tokenizer(),
+            Some("tokenizer/tokenizer.json")
+        );
+        // And a GGUF checkpoint names no tokenizer at all: its vocabulary is in
+        // the file.
+        for model in MODELS.into_iter().filter(|m| !m.is_safetensors()) {
+            assert_eq!(model.safetensors_tokenizer(), None, "{model:?}");
+            assert!(
+                model.safetensors_allowed_zero_runs().is_empty(),
+                "{model:?}"
+            );
+            assert_eq!(model.encoder_spec(), None, "{model:?}");
+            assert_eq!(model.safetensors_rope_theta(), None, "{model:?}");
+        }
+    }
+
+    /// What the three qwen3 entries answer now that their layer stack exists:
+    /// the two language models are served and batched like any other
+    /// checkpoint, and the encoder is not.
+    ///
+    /// The encoder's refusal is the permanent one. It is an encode-only entry
+    /// over weights with a zero-filled layer, and generating from it would
+    /// evaluate exactly that layer — nothing a later build changes.
+    ///
+    /// `auto_fetch` stays false on all three, which is a different question
+    /// with a different answer: they can be RUN, and they are still not
+    /// downloaded as a side effect of a request that named one.
+    #[test]
+    fn the_qwen3_language_models_are_served_and_the_encoder_is_not() {
+        for model in [
+            Model::Qwen34B,
+            Model::Qwen34BInstruct2507,
+            Model::ZImageTurboEncoder,
+        ] {
+            assert!(model.is_safetensors(), "{model:?}");
+            assert_eq!(model.arch(), Arch::Qwen3, "{model:?}");
+            assert!(!model.auto_fetch(), "{model:?}");
+            // No drafter exists for this graph and no release ships one, so
+            // every speculation question answers the same way.
+            assert!(!model.supports_drafting(), "{model:?}");
+            assert!(!model.draft_default_on(), "{model:?}");
+            assert_eq!(model.drafter_kind(), None, "{model:?}");
+            assert_eq!(model.vocab_family(), VocabFamily::Qwen3, "{model:?}");
+        }
+        for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
+            assert!(model.servable(), "{model:?}");
+            // Selectable exactly when the weights are really here: with
+            // `auto_fetch` false the cache is the whole gate.
+            assert_eq!(
+                crate::serve::checkpoint_selectable(model),
+                cached_model(model).is_some(),
+                "{model:?}"
+            );
+        }
+        // The encoder is never servable and therefore never selectable, cached
+        // or not.
+        assert!(!Model::ZImageTurboEncoder.servable());
+        assert!(!crate::serve::checkpoint_selectable(
+            Model::ZImageTurboEncoder
+        ));
+        // Nothing else moved family: the four GGUF checkpoints still speak the
+        // 3.6 vocabulary, which is what makes this a checkpoint property worth
+        // keying a tokenizer on rather than a constant.
+        for model in MODELS.into_iter().filter(|m| !m.is_safetensors()) {
+            assert_eq!(model.vocab_family(), VocabFamily::Qwen36, "{model:?}");
+        }
+
+        // The encoder is the entry with an encode spec, and its ceiling is its
+        // own layer: 35's MLP is the corrupt plane, so nothing deeper can be
+        // asked for.
+        let spec = Model::ZImageTurboEncoder.encoder_spec().unwrap();
+        assert_eq!(spec.layer, 35);
+        assert_eq!(spec.max_layer, 35);
+        assert_eq!(spec.max_tokens, 512);
+        assert_eq!(Model::Qwen34B.encoder_spec(), None);
+        assert_eq!(Model::Qwen34BInstruct2507.encoder_spec(), None);
+
+        // And the entry that allowlists the two zero-filled planes is the
+        // encoder alone: the same tensors in `Qwen/Qwen3-4B` have no zero runs,
+        // so an allowlist there would hide a real corruption.
+        assert_eq!(
+            Model::ZImageTurboEncoder.safetensors_allowed_zero_runs(),
+            [
+                "model.layers.35.mlp.up_proj.weight",
+                "model.layers.35.mlp.down_proj.weight"
+            ]
+        );
+        assert!(Model::Qwen34B.safetensors_allowed_zero_runs().is_empty());
+        assert!(
+            Model::Qwen34BInstruct2507
+                .safetensors_allowed_zero_runs()
+                .is_empty()
+        );
+    }
+
+    /// A checkpoint is never refused without a reason, and the reasons are
+    /// different reasons: `servable` is DERIVED from the explanation, so the two
+    /// cannot fall out of step.
+    ///
+    /// The distinction earns its keep because the operator's next move differs.
+    /// The two language models are waiting on a build. The encoder is not
+    /// waiting on anything — it is an encoder, its weights are not a working
+    /// language model, and the answer is a different command.
+    #[test]
+    fn a_refused_checkpoint_says_which_refusal_it_is() {
+        for model in MODELS {
+            assert_eq!(
+                model.not_servable_reason().is_none(),
+                model.servable(),
+                "{model:?}"
+            );
+        }
+
+        // The two language models are servable, so they have no refusal at
+        // all — which is the half of this rule that changed when their stack
+        // landed, and the half a stale reason would have silently kept.
+        for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
+            assert_eq!(model.not_servable_reason(), None, "{model:?}");
+        }
+
+        let encoder = Model::ZImageTurboEncoder.not_servable_message();
+        assert!(encoder.contains("encode-only"), "{encoder}");
+        // Names the actual defect and the command that does work, because
+        // "not supported" would leave someone holding these weights nowhere.
+        assert!(encoder.contains("zero-filled"), "{encoder}");
+        assert!(encoder.contains("encode-text"), "{encoder}");
+        assert!(
+            !encoder.contains("layer stack"),
+            "the encoder's refusal must not read as one a later build lifts: {encoder}"
+        );
+
+        // The wire says the same thing the CLI does, for the same checkpoint.
+        assert_eq!(
+            crate::serve::unselectable_model_message(Model::ZImageTurboEncoder),
+            Model::ZImageTurboEncoder.not_servable_message()
+        );
+    }
+
+    /// The qwen3 cache figures. All three checkpoints share one geometry — the
+    /// releases differ only in `rope_theta` and context length — and its
+    /// snapshot cost is genuinely zero: every layer is full attention, so the
+    /// whole conversation is in the KV rows and there is no recurrent state for
+    /// a snapshot to copy.
+    #[test]
+    fn the_qwen3_geometry_is_all_attention_and_no_recurrent_state() {
+        // 36 layers x 8 KV heads x 128 head_dim x (K and V) x 2 bytes f16.
+        assert_eq!(Model::Qwen34B.kv_bytes_per_token(), 144 * 1024);
+        for model in MODELS.into_iter().filter(|m| m.is_safetensors()) {
+            assert_eq!(
+                model.kv_bytes_per_token(),
+                Model::Qwen34B.kv_bytes_per_token(),
+                "{model:?}"
+            );
+            // No DeltaNet layers, so nothing to snapshot — and the formula has
+            // to reach that answer rather than underflow on a conv kernel of 0.
+            assert_eq!(model.snapshot_bytes(), 0, "{model:?}");
+        }
+        // And the counter-intuitive half of it, worth pinning because a sizing
+        // estimate that assumed "small model, small cache" would be wrong by
+        // more than a factor of two: the 4B model's KV rows cost MORE per token
+        // than the 27B's. Being a hybrid is what makes the 27B cheap — only 16
+        // of its 64 layers hold KV at all — while every one of these 36 does.
+        assert_eq!(Model::Qwen27B.kv_bytes_per_token(), 64 * 1024);
+        assert!(Model::Qwen34B.kv_bytes_per_token() > Model::Qwen27B.kv_bytes_per_token());
+        // Snapshots go the other way, and to the limit: a 27B prefix snapshot
+        // is 150 MB of recurrent state and a qwen3 one is nothing at all.
+        assert!(Model::Qwen27B.snapshot_bytes() > 0);
+    }
+
+    /// A safetensors directory has no name to read, so identity is provenance:
+    /// the directory the hub cache holds for an entry IS that entry, and every
+    /// other directory identifies as nothing and runs under its own name.
+    ///
+    /// The `Assumed` fallback is then the one config value that separates the
+    /// releases, `rope_theta` — which is also the cross-check `--model-size`
+    /// gets in place of the name one.
+    #[test]
+    fn a_safetensors_directory_identifies_by_provenance_then_by_rope_theta() {
+        use crate::config::{Identity, RopeKind};
+
+        // A directory nobody's cache knows is nobody's checkpoint.
+        let scratch = scratch("identify_dir");
+        assert_eq!(
+            Model::identify(Arch::Qwen3, None, Some(&scratch)),
+            None,
+            "an arbitrary directory must not claim an official checkpoint"
+        );
+        // Not even one whose NAME spells a checkpoint: a name is exactly what a
+        // directory cannot be trusted about.
+        let named = scratch.join("Qwen3-4B");
+        std::fs::create_dir_all(&named).unwrap();
+        assert_eq!(Model::identify(Arch::Qwen3, None, Some(&named)), None);
+        // A general.name is not consulted on this architecture either — there
+        // is nowhere in a safetensors set for one to come from.
+        assert_eq!(
+            Model::identify(Arch::Qwen3, Some("Qwen3-4B"), Some(&named)),
+            None
+        );
+
+        // The release cross-check. `--model-size` naming a release whose theta
+        // the directory does not carry is refused, both ways round.
+        let base = qwen3_config_at(1e6);
+        let instruct = qwen3_config_at(5e6);
+        assert!(
+            instruct
+                .identify(&scratch, Some(Model::Qwen34B), "--model-size")
+                .is_err(),
+            "a 5e6 directory is not the base release"
+        );
+        assert!(
+            base.identify(&scratch, Some(Model::Qwen34BInstruct2507), "--model-size")
+                .is_err(),
+            "a 1e6 directory is not Instruct-2507"
+        );
+        // The encoder shares the base config exactly, so naming it against an
+        // unidentified 1e6 directory is allowed — that is the case where the
+        // flag settles what the files cannot.
+        assert_eq!(
+            base.identify(&scratch, Some(Model::ZImageTurboEncoder), "--model-size")
+                .unwrap(),
+            Identity::Official(Model::ZImageTurboEncoder)
+        );
+        assert_eq!(
+            base.identify(&scratch, Some(Model::Qwen34B), "--model-size")
+                .unwrap(),
+            Identity::Official(Model::Qwen34B)
+        );
+
+        // With no flag, theta alone decides, and the base model wins the 1e6
+        // tie it shares with the encoder.
+        assert_eq!(
+            base.identify(&scratch, None, "--model-size").unwrap(),
+            Identity::Assumed(Model::Qwen34B)
+        );
+        assert_eq!(
+            instruct.identify(&scratch, None, "--model-size").unwrap(),
+            Identity::Assumed(Model::Qwen34BInstruct2507)
+        );
+        assert_eq!(Model::by_safetensors_rope_theta(1e6), Some(Model::Qwen34B));
+        assert_eq!(
+            Model::by_safetensors_rope_theta(5e6),
+            Some(Model::Qwen34BInstruct2507)
+        );
+        // A theta no release uses names none of them, and the architecture's
+        // registry entry is what such a file falls back to.
+        assert_eq!(Model::by_safetensors_rope_theta(1e4), None);
+        assert_eq!(
+            qwen3_config_at(1e4)
+                .identify(&scratch, None, "--model-size")
+                .unwrap(),
+            Identity::Assumed(Model::Qwen34B)
+        );
+
+        // The architecture still narrows first: a qwen3 selection against a
+        // GGUF architecture is the same error it has always been.
+        assert!(
+            base.identify(&scratch, Some(Model::Qwen27B), "--model-size")
+                .is_err()
+        );
+        assert!(matches!(base.rope(), RopeKind::Plain { n_rot: 128, .. }));
+
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// The provenance half of the rule, against the real cache. Self-skips when
+    /// the checkpoint is not downloaded — there is nothing to have provenance
+    /// from.
+    #[test]
+    fn the_cached_snapshot_of_an_entry_identifies_as_that_entry() {
+        for model in MODELS.into_iter().filter(|m| m.is_safetensors()) {
+            let Some(config) = crate::test_support::checkpoint_or_skip(model) else {
+                continue;
+            };
+            let dir = config.parent().unwrap();
+            // Both spellings the callers have: the directory, and the
+            // `config.json` inside it that `ensure_model` hands back.
+            assert_eq!(
+                Model::identify(Arch::Qwen3, None, Some(dir)),
+                Some(model),
+                "{model:?} at {}",
+                dir.display()
+            );
+            assert_eq!(
+                Model::identify(Arch::Qwen3, None, Some(&config)),
+                Some(model),
+                "{model:?} via its config.json"
+            );
+        }
+    }
+
+    /// Provenance is the entry's REPO in the cache, not the snapshot `refs/main`
+    /// happens to point at today, and within a snapshot the SUBDIRECTORY has to
+    /// match too.
+    ///
+    /// Built against a synthetic cache rather than this machine's, so it can
+    /// hold two snapshots of one repo and a half-downloaded third — states a
+    /// real cache reaches and a test cannot wait around for.
+    #[test]
+    fn every_intact_snapshot_of_an_entrys_repo_identifies_as_that_entry() {
+        let root = scratch("snapshots");
+        // Two commits of Qwen/Qwen3-4B, as a cache that has fetched the repo
+        // twice holds. Neither is "current" here — there is no refs/main at all,
+        // which is the point: the ref says which snapshot is newest, not which
+        // ones are that repo.
+        let base_old = install_set(&root, Model::Qwen34B, "aaa111");
+        let base_new = install_set(&root, Model::Qwen34B, "bbb222");
+        let encoder = install_set(&root, Model::ZImageTurboEncoder, "ccc333");
+
+        let identify = |dir: &Path| Model::identify_cached_dir_in(&root, dir);
+
+        // Both snapshots are Qwen3-4B. Matching only the current one made an
+        // intact checkpoint identify as nothing the moment upstream pushed a
+        // README.
+        assert_eq!(identify(&base_old), Some(Model::Qwen34B));
+        assert_eq!(identify(&base_new), Some(Model::Qwen34B));
+        // And so is the config.json inside one, which is the path
+        // `ensure_model` hands back.
+        assert_eq!(
+            identify(&base_new.join("config.json")),
+            Some(Model::Qwen34B)
+        );
+
+        // The encoder is its own entry, and the two are never each other —
+        // which nothing else can decide, since their configs are identical
+        // down to the byte.
+        assert_eq!(identify(&encoder), Some(Model::ZImageTurboEncoder));
+        assert_ne!(identify(&encoder), Some(Model::Qwen34B));
+        assert_ne!(identify(&base_new), Some(Model::ZImageTurboEncoder));
+
+        // The SNAPSHOT ROOT of the encoder's repo is not the encoder: the
+        // checkpoint is `text_encoder/` inside it, and the root holds a
+        // tokenizer and nothing else this build can run.
+        assert_eq!(identify(encoder.parent().unwrap()), None);
+
+        // A half-downloaded snapshot is not the official weights, however
+        // official its provenance: the config and the index arrive first and
+        // the shards do not.
+        let partial = install_set(&root, Model::Qwen34B, "ddd444");
+        std::fs::remove_file(partial.join("model-00002-of-00003.safetensors")).unwrap();
+        assert_eq!(identify(&partial), None);
+
+        // A directory outside the cache is nobody's checkpoint, whatever it is
+        // called.
+        let outside = root.join("Qwen3-4B");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(identify(&outside), None);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// One snapshot of `model` under the cache at `root`, with every file the
+    /// registry says the checkpoint has. Returns the CHECKPOINT directory,
+    /// which for the encoder is a subdirectory of the snapshot.
+    fn install_set(root: &Path, model: Model, commit: &str) -> PathBuf {
+        let snapshot = repo_dir(root, model.repo()).join("snapshots").join(commit);
+        for file in model.files() {
+            let path = snapshot.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        snapshot.join(model.snapshot_subdir())
+    }
+
+    /// A synthetic `XwenConfig` on the qwen3 architecture at a given rope base.
+    /// Built through `from_qwen3` from a hand-written `config.json`, so it is
+    /// the real constructor under test and not a struct literal that could
+    /// drift from it.
+    fn qwen3_config_at(theta: f32) -> crate::XwenConfig {
+        let json = format!(
+            r#"{{"model_type":"qwen3","hidden_size":2560,"intermediate_size":9728,
+               "num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,
+               "head_dim":128,"rms_norm_eps":1e-6,"rope_theta":{theta},
+               "max_position_embeddings":40960,"vocab_size":151936,
+               "tie_word_embeddings":true,"attention_bias":false,
+               "use_sliding_window":false,"hidden_act":"silu","rope_scaling":null}}"#
+        );
+        let cfg = crate::qwen3::Qwen3Config::from_json_bytes(json.as_bytes()).unwrap();
+        crate::XwenConfig::from_qwen3(&cfg, None)
     }
 
     /// The two dense checkpoints share a graph and a geometry — 3.8's config is

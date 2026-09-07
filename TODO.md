@@ -180,6 +180,9 @@ entry is what would find the rest) and the syncs plus the serial scan.]
   banned → 0, adjusting the total by the delta rather than resumming), which is
   exact for everything except `force` on a token whose probability underflowed —
   and `force` can short-circuit. Unmeasured against real control-heavy runs.
+  TRIAGED 2026-09-07: kept, and this arc gave it a second class of user. Constrained
+  decoding now runs on the Qwen3 vocabulary too, one JSON-schema reply per request paying
+  this pass over 151936 logits on a checkpoint whose plain token is ~16 ms.
   From: Deferred from the sampler-tail pass (2026-07-28).
 
 - [ ] [measured] **Flash-Next decode is bimodal round over round.**
@@ -591,6 +594,10 @@ entry is what would find the rest) and the syncs plus the serial scan.]
       the machine heated, against a 35B classic arm that repeated to within 0.8%).
       Treat the 27B figures as ±10% and re-measure off an idle machine before using
       them as a baseline for anything. See decisions.md "Measurement discipline".
+    - TRIAGED 2026-09-07: kept, untouched and outside the dense-Qwen3 arcs, which added a
+      checkpoint rather than changing the 27B. Still worth it for the same reason as in
+      July: it is the only shipped checkpoint whose interactive behaviour nobody has
+      watched, and its figures are the ones a future comparison would reach for.
   From: Priority order (decided 2026-07-28; P1-P9 shipped by 2026-07-29).
 
 - [ ] [small] **Snapshot-replay-vs-scratch has no Track-B parity case.** The equivalence was
