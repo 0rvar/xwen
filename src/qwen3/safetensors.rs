@@ -1523,6 +1523,8 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::{LmHead, SHARD_A, SHARD_B, Tweaks, write_set};
     use super::*;
+    use crate::hub::Model;
+    use crate::test_support;
 
     /// A fresh directory per test, named after the case so a failure leaves
     /// something inspectable behind.
@@ -2372,30 +2374,22 @@ mod tests {
     // per file and nothing more. They skip themselves when the HF cache does
     // not have the checkpoint: the weights are not a checkout dependency.
 
-    fn snapshot(repo: &str, sha: &str) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        let dir = PathBuf::from(home)
-            .join(".cache/huggingface/hub")
-            .join(repo)
-            .join("snapshots")
-            .join(sha);
-        dir.is_dir().then_some(dir)
-    }
-
     /// The Z-Image-Turbo `text_encoder/` copy of Qwen3-4B has two zero-filled
     /// planes in layer 35. Harmless for the encoder, which reads
     /// `hidden_states[-2]` and never evaluates that layer's MLP, but the copy is
     /// not a faithful full LM and the loader has to say so rather than run it.
     #[test]
     fn the_zimage_text_encoder_reports_its_two_corrupt_planes() {
-        let Some(root) = snapshot(
-            "models--Tongyi-MAI--Z-Image-Turbo",
-            "f332072aa78be7aecdf3ee76d5c247082da564a6",
-        ) else {
-            eprintln!("skipping: Z-Image-Turbo is not in the local HF cache");
+        let model = Model::ZImageTurboEncoder;
+        let Some(config) = test_support::checkpoint_or_skip(model) else {
             return;
         };
-        let dir = root.join("text_encoder");
+        // The registry points at `text_encoder/config.json`; the set is the
+        // directory holding it.
+        let dir = config
+            .parent()
+            .expect("a config.json has a directory")
+            .to_path_buf();
         let corrupt = [
             "model.layers.35.mlp.up_proj.weight",
             "model.layers.35.mlp.down_proj.weight",
@@ -2437,10 +2431,11 @@ mod tests {
         assert_eq!(set.config().n_layer, 36);
         assert_eq!(set.config().rope.theta, 1e6);
         assert!(!set.has_lm_head());
-        // The tokenizer lives in the repo's sibling `tokenizer/` directory.
+        // The tokenizer lives in the repo's sibling `tokenizer/` directory, and
+        // the loader finds it without being told.
         assert_eq!(
             set.tokenizer_path(),
-            root.join("tokenizer").join("tokenizer.json")
+            test_support::tokenizer_or_skip(model).expect("the set that resolved carries one")
         );
         eprintln!(
             "Z-Image text encoder f16 range scan: {:?} over {} elements",
@@ -2453,20 +2448,24 @@ mod tests {
     /// allowlist opens it.
     #[test]
     fn the_base_checkpoint_has_no_zero_runs() {
-        let Some(dir) = snapshot(
-            "models--Qwen--Qwen3-4B",
-            "1cfa9a7208912126459214e8b04321603b3df60c",
-        ) else {
-            eprintln!("skipping: Qwen/Qwen3-4B is not in the local HF cache");
+        let model = Model::Qwen34B;
+        let Some(config) = test_support::checkpoint_or_skip(model) else {
             return;
         };
+        let dir = config
+            .parent()
+            .expect("a config.json has a directory")
+            .to_path_buf();
         let set = Qwen3Set::open(&dir, None, &[]).unwrap();
         assert!(set.zero_runs().is_empty());
         assert_eq!(set.config().n_layer, 36);
         assert_eq!(set.config().vocab_size, 151936);
         assert_eq!(set.config().rope.theta, 1e6);
         assert!(!set.has_lm_head());
-        assert_eq!(set.tokenizer_path(), dir.join("tokenizer.json"));
+        assert_eq!(
+            set.tokenizer_path(),
+            test_support::tokenizer_or_skip(model).expect("the set that resolved carries one")
+        );
         assert_eq!(set.shard_paths().len(), 3);
         eprintln!(
             "Qwen3-4B f16 range scan: {:?} over {} elements",

@@ -277,7 +277,8 @@ impl Qwen3Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::hub::Model;
+    use crate::test_support;
 
     /// A minimal config.json that passes every check, as a base for the negative
     /// tests to break one field at a time.
@@ -306,59 +307,21 @@ mod tests {
         Qwen3Config::from_json_bytes(v.to_string().as_bytes())
     }
 
-    /// `$HF_HUB_CACHE`-style snapshot dirs the real-file tests read. A missing
-    /// cache skips the test rather than failing it: the weights are 8 GB a
-    /// piece and are not a checkout dependency.
-    fn cache_snapshot(repo: &str, sha: &str) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        let dir = PathBuf::from(home)
-            .join(".cache/huggingface/hub")
-            .join(repo)
-            .join("snapshots")
-            .join(sha);
-        dir.is_dir().then_some(dir)
-    }
-
     #[test]
     fn the_shipped_configs_parse_and_differ_only_in_rope_theta_and_context() {
         let cases = [
-            (
-                "Z-Image-Turbo text encoder",
-                cache_snapshot(
-                    "models--Tongyi-MAI--Z-Image-Turbo",
-                    "f332072aa78be7aecdf3ee76d5c247082da564a6",
-                )
-                .map(|d| d.join("text_encoder")),
-                1e6,
-                40960,
-            ),
-            (
-                "Qwen3-4B",
-                cache_snapshot(
-                    "models--Qwen--Qwen3-4B",
-                    "1cfa9a7208912126459214e8b04321603b3df60c",
-                ),
-                1e6,
-                40960,
-            ),
-            (
-                "Qwen3-4B-Instruct-2507",
-                cache_snapshot(
-                    "models--Qwen--Qwen3-4B-Instruct-2507",
-                    "cdbee75f17c01a7cc42f958dc650907174af0554",
-                ),
-                5e6,
-                262144,
-            ),
+            (Model::ZImageTurboEncoder, 1e6, 40960),
+            (Model::Qwen34B, 1e6, 40960),
+            (Model::Qwen34BInstruct2507, 5e6, 262144),
         ];
-        let mut seen = 0;
-        for (label, dir, theta, max_pos) in cases {
-            let Some(dir) = dir else {
-                eprintln!("skipping {label}: not in the local HF cache");
+        for (model, theta, max_pos) in cases {
+            // The registry's entry point for a safetensors set IS its
+            // config.json, which is exactly the file under test.
+            let Some(config) = test_support::checkpoint_or_skip(model) else {
                 continue;
             };
-            seen += 1;
-            let bytes = std::fs::read(dir.join("config.json")).unwrap();
+            let label = model.full_name();
+            let bytes = std::fs::read(&config).unwrap();
             let cfg = Qwen3Config::from_json_bytes(&bytes).unwrap();
             assert_eq!(cfg.hidden_size, 2560, "{label}");
             assert_eq!(cfg.intermediate_size, 9728, "{label}");
@@ -376,9 +339,6 @@ mod tests {
             assert_eq!(cfg.rope.theta, theta, "{label}");
             assert_eq!(cfg.max_position_embeddings, max_pos, "{label}");
             assert_eq!(cfg.eog, [151645, 151643], "{label}");
-        }
-        if seen == 0 {
-            eprintln!("no qwen3 checkpoint in the local HF cache; nothing asserted");
         }
     }
 
