@@ -461,7 +461,7 @@ impl XwenConfig {
             "qwen3" => bail!(
                 "this is a qwen3 (Qwen3-4B) GGUF, which this build does not read: point \
                  --model at the Hugging Face safetensors directory instead (or use \
-                 --model-size qwen3-4b / qwen3-4b-instruct-2507 / zimage-turbo)"
+                 --model-size qwen3-4b / qwen3-4b-instruct-2507 / zimage-turbo-encoder)"
             ),
             other => bail!(
                 "expected a Qwen GGUF (architecture \"qwen35\", \"qwen35moe\" or \"qwen4exp\"), \

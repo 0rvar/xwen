@@ -131,7 +131,7 @@ architecture and a second vocabulary (2026-09-07):
 | --- | --- | --- | --- |
 | `Qwen3-4B` | `Qwen/Qwen3-4B` | `qwen3-4b` / `4b` | full LM, hybrid thinking |
 | `Qwen3-4B-Instruct-2507` | `Qwen/Qwen3-4B-Instruct-2507` | `qwen3-4b-instruct-2507` / `4b-instruct` | full LM, no thinking mode |
-| `Z-Image-Turbo-text-encoder` | `Tongyi-MAI/Z-Image-Turbo`, `text_encoder/` | `zimage-turbo` / `z-image-turbo` | encode-only, never an LM |
+| `Z-Image-Turbo-text-encoder` | `Tongyi-MAI/Z-Image-Turbo`, `text_encoder/` | `zimage-turbo-encoder` / `z-image-turbo-encoder` | encode-only, never an LM |
 
 8.06 GB each, three shards plus config, index and tokenizer. **Every surface runs the two
 language models** - `generate`, `chat`, `serve`, `batch` and `encode-text` - and both are
@@ -154,7 +154,7 @@ correctness target rather than a throughput one, and the figures and their condi
 in `docs/perf-state.md`.
 
 ```
-xwen encode-text --model-size zimage-turbo --prompt "a cat on a windowsill" \
+xwen encode-text --model-size zimage-turbo-encoder --prompt "a cat on a windowsill" \
   --output /tmp/enc.safetensors --verbose
 ```
 

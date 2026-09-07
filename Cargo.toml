@@ -73,6 +73,8 @@ toml = "1"
 # TUI adds no second terminal library — and drops the widgets that pull a date
 # crate we have no use for.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "layout-cache"] }
+# `xwen image`: the PNG writer for the Z-Image pipeline (src/zimage/pipeline.rs).
+png = "0.18.1"
 
 [profile.release]
 debug = true

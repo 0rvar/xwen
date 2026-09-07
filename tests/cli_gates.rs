@@ -51,7 +51,10 @@ fn xwen() -> Command {
 #[test]
 fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
     let config = empty_config("serve_refuses");
-    for (alias, expected) in [("zimage-turbo", "encode-only")] {
+    for (alias, expected) in [
+        ("zimage-turbo-encoder", "encode-only"),
+        ("zimage-turbo", "text-to-image"),
+    ] {
         let out = xwen()
             .args(["serve", "--config"])
             .arg(&config)

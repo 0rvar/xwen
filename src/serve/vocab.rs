@@ -295,7 +295,7 @@ fn cached_tokenizer(model: Model) -> Option<PathBuf> {
 pub(super) fn missing_vocabulary(family: VocabFamily) -> anyhow::Error {
     let names: Vec<String> = hub::MODELS
         .into_iter()
-        .filter(|model| model.vocab_family() == family)
+        .filter(|model| model.vocab_family() == family && model.safetensors_tokenizer().is_some())
         .map(|model| format!("xwen fetch --model-size {model}"))
         .collect();
     anyhow::anyhow!(
@@ -478,9 +478,12 @@ mod tests {
     #[test]
     fn every_qwen3_release_ships_the_same_tokenizer() {
         let mut seen: Vec<(Model, Vec<u8>)> = Vec::new();
+        // The pipeline entry speaks the family too but names no tokenizer of
+        // its own: its encoder entry's is the one it uses.
         for model in hub::MODELS
             .into_iter()
             .filter(|model| model.vocab_family() == VocabFamily::Qwen3)
+            .filter(|model| model.safetensors_tokenizer().is_some())
         {
             let Some(path) = crate::test_support::tokenizer_or_skip(model) else {
                 continue;
