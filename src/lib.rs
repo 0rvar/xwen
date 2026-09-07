@@ -29,6 +29,7 @@ pub mod stack_profile;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tokenizer;
+pub mod zimage;
 
 pub use checkpoint::CheckpointSource;
 pub use config::XwenConfig;

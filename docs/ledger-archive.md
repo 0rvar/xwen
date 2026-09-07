@@ -2990,3 +2990,7 @@ blocks use of the feature; item (a) is the one with a known trigger.
   [Record](records/qwen3-dense.md), [runbook](parity.md).
   From: Deferred from the dense Qwen3-4B arcs (2026-09-07).
 
+
+## Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A)
+
+[Nothing closed here yet; the heading exists because TODO.md items name it in their From: line.]

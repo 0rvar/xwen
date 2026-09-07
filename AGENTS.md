@@ -18,8 +18,10 @@ one that owns it:
   behind a stub in the log.
 - **`docs/parity.md`** is the verification runbook.
 - **`docs/qwen3-dense.md`** and **`docs/zimage.md`** are the dense Qwen3-4B architecture
-  and its Z-Image encoder role, the way `docs/qwen4exp-port.md` is Flash-Next's port:
-  per-architecture reference, not a rule and not a timeline.
+  and the whole Z-Image-Turbo pipeline (the encoder role it came in for, then the
+  diffusion transformer, the VAE, the scheduler and their traps), the way
+  `docs/qwen4exp-port.md` is Flash-Next's port: per-architecture reference, not a rule
+  and not a timeline.
 - **`docs/perf-state.md`** is the current figures, and it is their single source.
 - **`docs/benching.md`** is how to measure anything on this machine.
 - **`TODO.md`** is the backlog and the open ledger: a ranked **Front** of at most ten
@@ -82,6 +84,13 @@ Rules for keeping it that way:
   to come, and it is NOT a tok/s target. It is held to correctness bars and to costing
   the checkpoints above nothing; no arc of it argues for a hot-path change on its behalf
   (decisions.md "Dense Qwen3-4B is a full checkpoint AND the conditioning encoder").
+  **Amended again 2026-09-07:** the diffusion image transformers are in scope on the same
+  terms, Z-Image-Turbo first. They are held to correctness bars against the reference
+  pipeline, they get a secondary time-per-image figure in docs/perf-state.md so it can be
+  known, and no image arc argues for a hot-path change in the language models on its
+  behalf. A denoising step is prefill-shaped compute, so the decode levers here do not
+  transfer either way (decisions.md "Diffusion image transformers are in scope, held to
+  correctness bars first").
 - TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, it
   becomes a ledger item with context, or it is retired with a dated reason and a reopen
   condition (retired means not planned, not forbidden). Ledger text is never deleted:
@@ -297,7 +306,9 @@ Traps, each of which has already cost someone time:
   `model.layers.35.mlp.up_proj.weight` zero-filled for 14,772,816 contiguous elements
   from element 27,003 and `down_proj` for 3,938,425 from element 20,930,265; base
   Qwen3-4B has none. Harmless for the encoder (index 35 never evaluates layer 35) and
-  disqualifying for anything else, which is why that entry is encode-only. The loader
+  disqualifying for anything else, which is why that entry is encode-only. Its alias is
+  `zimage-turbo-encoder` as of 2026-09-07; `zimage-turbo` names the full diffusion
+  pipeline now (see below). The loader
   refuses any zero run past 4096 elements unless the REGISTRY ENTRY allowlists that
   tensor by name, so a bare directory is refused and only the documented entry passes.
   Never widen the allowlist to make a load succeed, and never point an LM surface at
@@ -365,6 +376,72 @@ Traps, each of which has already cost someone time:
   checkpoint's, which on a base-default server clamped Instruct-2507's 262144 to 40960;
   do not reintroduce that by reaching for the served window in a handler. The engine
   re-derives its own limit at load and that stays authoritative for what actually runs.
+
+## Z-Image-Turbo (diffusion, vendored candle module)
+
+The first thing here that is not a language model. `xwen image --prompt <text>` renders a
+PNG: the repo's own Qwen3-4B encoder at hidden index 35, the S3-DiT transformer, eight
+flow-match Euler steps, the Flux VAE decoder. [docs/zimage.md](docs/zimage.md) is the
+architecture and the full trap list,
+[docs/decisions/zimage.md](docs/decisions/zimage.md) the decisions,
+[docs/records/zimage-pipeline.md](docs/records/zimage-pipeline.md) the arc.
+
+Shape: 6,154,908,736 parameters, dim 3840, 30 heads of 128 with no GQA, SwiGLU 10240,
+34 blocks executed (30 `layers` plus 2 `noise_refiner`, all modulated, plus 2
+`context_refiner` that are not), RMSNorm eps 1e-5 in the HF `+eps` form, one
+affine-free LayerNorm at eps 1e-6 in the final layer. Latent 16 channels at 8x, patch 2,
+so 1024x1024 is 4096 image tokens. Shipped F32 (24.6 GB, three shards), run bf16
+(12.3 GB resident). VAE is the Flux VAE, bf16 on disk, 168 MB, run in f32 under
+`force_upcast`, `shift_factor` 0.1159 and `scaling_factor` 0.3611. Scheduler is
+`FlowMatchEulerDiscreteScheduler`, static `shift` 3.0, 8 steps, no CFG.
+
+The seams, so a change lands in one place:
+
+- **`src/zimage/`** is candle's `z_image` at rev 21cca0b (PR #3261), vendored and
+  corrected in four places toward the reference (caption padding after the embedder with
+  the learned pad token and no mask; the sigma grid; rope tables in f64 and the rotation
+  in f32; QK-norm eps from the config). `src/zimage/pipeline.rs` is ours. Never
+  "resync" it with upstream: the corrections are the point, and its scheduler, padding
+  and step count were all wrong.
+- **`Model::text_encoder()`** is where the conditioning comes from. The pipeline entry
+  holds no encoder spec of its own and `src/zimage/` has no text encoder: it takes a
+  `[T, 2560]` caption tensor and `XwenModel::encode` produces it. candle's own
+  `text_encoder.rs` was deliberately not vendored, being an ungraded second
+  implementation of the one thing in this path that has a reference gate.
+- **`Format::Diffusion`** is a third registry format beside GGUF and safetensors, and
+  exactly one of `is_gguf()`, `is_safetensors()` and `is_diffusion()` is true per entry
+  (tested). `is_safetensors()` means specifically "a Qwen3 set the Qwen3 loader opens",
+  which is why the pipeline could not be one: `identify_cached_dir` iterates those and
+  would have made the snapshot root identify as a language model.
+- **`check_size`** owns the accepted resolutions, and there are three rules: both sides
+  positive multiples of 16, `(w/16) * (h/16)` a multiple of 32, and each side at most
+  8192 px, which is the 512 positions its RoPE table holds. The `x_pad_token` path that
+  would lift the second rule is unimplemented, so a size needing it is refused with the
+  token count in the message rather than silently padded. The third rule exists because
+  candle's Metal `index_select` clamps an out-of-range position instead of failing, so
+  past it the run returns a wrong image rather than an error; the same bound is re-checked
+  inside `forward` against the loaded `axes_lens`, which also catches a caption long
+  enough to push the image past axis 0's 1536.
+- Aliases: `zimage-turbo` is the PIPELINE and `zimage-turbo-encoder` is the encode-only
+  entry. Neither is auto-fetched, neither is servable, and neither appears in
+  `/v1/models`.
+
+Traps that are silent, the short list (all of them, with evidence, in docs/zimage.md):
+rope is INTERLEAVED-pair, not the NEoX every Qwen graph here uses; the joint sequence is
+IMAGE FIRST and the output is a prefix narrow; modulation is `1 + scale` with `tanh`
+gates and no shift term, in the order scale_msa/gate_msa/scale_mlp/gate_mlp; the `t` fed
+in is `1 - sigma` AND the model output is negated; the 32-multiple pad tokens are
+learned, applied after the embedder, and NOT masked; 8 steps, not the 9 the model card
+says; the static shift is 3.0 and `calculate_shift` is dead code; fp16 is disqualified,
+not merely slower, because activations exceed 65504 and the image comes out black.
+
+Two things not to expect. There is no reference dump of the transformer yet, so nothing
+downstream of `encode` is numerically graded: Stage 3 (step-0 velocity, gated) and
+Stage 4 (final-image PSNR, reported) are the next arc, both driven by an injected latent
+through `xwen image --latents`. And there is no `CheckpointSource` arm for diffusion
+weights; `ZImagePipeline::load` goes through candle's `VarBuilder` directly, casting
+fp32 to bf16 one tensor at a time, which is a deliberate deferral until a second consumer
+exists.
 
 ## The candle situation
 

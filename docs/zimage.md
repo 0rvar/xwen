@@ -1,12 +1,18 @@
 # Z-Image and the text-conditioning encoder
 
 Z-Image-Turbo is a flow-matching image model whose text conditioning is a dense
-Qwen3-4B. This file is the reading of the diffusers pipeline that xwen has to match, the
-checkpoint facts that came out of that reading, and the reference dump that grades it.
-The architecture itself is in [qwen3-dense.md](qwen3-dense.md).
+Qwen3-4B. This file is the per-architecture reference for the whole pipeline: first the
+reading of the diffusers text-conditioning path that xwen has to match, the checkpoint
+facts that came out of that reading and the reference dump that grades it, then, from
+"The transformer" onward, the transformer, the VAE and the scheduler as they were read
+off the shipped configs and the two reference implementations, and the traps in them.
+The encoder architecture itself is in [qwen3-dense.md](qwen3-dense.md), the decisions
+are in [decisions/zimage.md](decisions/zimage.md), and the arc that landed the pipeline
+is [records/zimage-pipeline.md](records/zimage-pipeline.md).
 
-Everything below was fetched from primary sources on 2026-09-06 and, where it is a claim
-about the shipped files, verified against the downloaded bytes. The diffusers source is
+The encoder half was fetched from primary sources on 2026-09-06 and the pipeline half on
+2026-09-07; where either is a claim about the shipped files, it is verified against the
+downloaded bytes. The diffusers source is
 `src/diffusers/pipelines/z_image/pipeline_z_image.py` on main
 (https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/z_image/pipeline_z_image.py);
 the transformers sources are `models/qwen3/modeling_qwen3.py` and
@@ -232,3 +238,338 @@ headroom over pure output quantization, not 100x. Today's 0.00388 is barely abov
 floor, which is the strongest available statement that the graph itself contributes
 almost nothing; a future result between 0.004 and 0.01 should be read as the cast plus
 something, and comparing against an f32 encode output is how to tell the two apart.
+
+## The transformer
+
+An S3-DiT, single stream, 6,154,908,736 parameters. `transformer/config.json`, read off
+the downloaded file:
+
+```json
+{
+  "_class_name": "ZImageTransformer2DModel",
+  "all_f_patch_size": [1], "all_patch_size": [2],
+  "axes_dims": [32, 48, 48], "axes_lens": [1536, 512, 512],
+  "cap_feat_dim": 2560, "dim": 3840, "in_channels": 16,
+  "n_heads": 30, "n_kv_heads": 30, "n_layers": 30, "n_refiner_layers": 2,
+  "norm_eps": 1e-05, "qk_norm": true, "rope_theta": 256.0, "t_scale": 1000.0
+}
+```
+
+Everything else derives from it. `head_dim` is 3840 / 30 = 128, which is also
+`sum(axes_dims)` = 32 + 48 + 48, and the code asserts that. `n_kv_heads == n_heads`, so
+there is no GQA: plain MHA, 30 heads of 128. The FFN hidden is `int(dim / 3 * 8)` =
+10240, a SwiGLU `w2(silu(w1(x)) * w3(x))` with no bias. `cap_feat_dim` 2560 is the
+encoder's hidden size, which is the join between the two halves of this file.
+
+The parameter count is the strongest single check available on that reading: computed
+analytically from the module tree it comes to 6,154,908,736, which matches the F32
+parameter total HF reports for the `transformer/` folder exactly, to the parameter. Every
+shape and every bias below is therefore confirmed rather than inferred. **The tech report
+contradicts the config and the report is wrong**: arXiv 2511.22699 Table 2 says 32
+attention heads, but 3840 / 32 = 120 is not 128, `norm_q.weight` is [128], and the
+`head_dim == sum(axes_dims)` assertion only holds at 30. Use 30.
+
+The weights ship **F32, every tensor**, three shards totalling 24.62 GB, and both
+reference implementations load them as bf16. xwen casts at load, so the resident
+transformer is 12.3 GB (decisions.md "Weights load through candle's `VarBuilder`").
+
+**34 blocks execute and 32 of them are modulated.** Two `context_refiner` blocks see
+only the caption and are UNMODULATED, with no adaLN tensor at all; two `noise_refiner`
+blocks see only the image and are modulated; then 30 `layers` see the concatenation. The
+refiners are modality-specific preprocessors, not extra depth on the joint stream.
+Counting `all_final_layer`'s, the checkpoint holds 33 adaLN projections; only
+`t_embedder`'s 256-wide output is shared between them.
+
+Tensor names, with the shapes that pin them:
+
+```
+all_x_embedder.2-1.{weight [3840,64], bias [3840]}   # ModuleDict key is "{patch}-{f_patch}"
+cap_embedder.0.weight [2560]                          # RMSNorm(cap_feat_dim)
+cap_embedder.1.{weight [3840,2560], bias [3840]}
+t_embedder.mlp.0.{weight [1024,256], bias [1024]}
+t_embedder.mlp.2.{weight [256,1024], bias [256]}
+x_pad_token [1,3840]      cap_pad_token [1,3840]
+noise_refiner.{0,1}.*     context_refiner.{0,1}.*     layers.{0..29}.*
+all_final_layer.2-1.linear.{weight [64,3840], bias [64]}
+all_final_layer.2-1.adaLN_modulation.1.{weight [3840,256], bias [3840]}
+```
+
+and per block:
+
+```
+attention.to_q/to_k/to_v/to_out.0.weight  [3840,3840]  (no bias)
+attention.norm_q.weight / norm_k.weight   [128]        RMSNorm over head_dim
+attention_norm1 / attention_norm2         [3840]       pre- and POST-attention
+ffn_norm1 / ffn_norm2                     [3840]       pre- and POST-FFN
+feed_forward.w1 [10240,3840]  w3 [10240,3840]  w2 [3840,10240]   (no bias)
+adaLN_modulation.0.{weight [15360,256], bias [15360]}  # modulated blocks only
+```
+
+There are **no biases anywhere in attention or the FFN**. Biases exist only on
+`all_x_embedder`, `cap_embedder.1`, `t_embedder.mlp.{0,2}`, every `adaLN_modulation`, and
+`all_final_layer.linear`. RMSNorm is the HF `x * rsqrt(mean(x²) + eps) * w` form at eps
+1e-5, not llama.cpp's clamp form, which matters if a norm is ever reused from the GGUF
+side of this repo.
+
+The block, which is the whole model:
+
+```
+adaln_input = t_embedder(t * 1000.0)                       # [B, 256]
+
+# modulated
+scale_msa, gate_msa, scale_mlp, gate_mlp = adaLN_modulation(adaln_input).chunk(4)
+gate_msa, gate_mlp   = tanh(gate_msa), tanh(gate_mlp)
+scale_msa, scale_mlp = 1 + scale_msa, 1 + scale_mlp
+x = x + gate_msa * attention_norm2(attention(attention_norm1(x) * scale_msa))
+x = x + gate_mlp * ffn_norm2(feed_forward(ffn_norm1(x) * scale_mlp))
+
+# unmodulated (context_refiner only)
+x = x + attention_norm2(attention(attention_norm1(x)))
+x = x + ffn_norm2(feed_forward(ffn_norm1(x)))
+```
+
+Four things in that are not the usual DiT. There is **no shift term**: four modulation
+vectors, not adaLN-Zero's six, hence `4 * dim` = 15360. The **gates are `tanh`**, bounded
+in (-1, 1), and the network was trained that way. The `*_norm2` norms are a **sandwich**,
+applied to the sublayer output before the gate rather than to the residual stream. And
+the block's `adaLN_modulation` has **no SiLU** in front of it, consuming `t_embedder`'s
+raw output, where `all_final_layer`'s adaLN does have one; the asymmetry is real and both
+reference implementations agree on it. The modulation broadcasts per token from a
+`[B, 3840]` vector, one modulation for the whole sequence, image and caption alike.
+
+Attention: `to_q/to_k/to_v`, unflatten to [B, S, 30, 128], RMSNorm q and k over the 128
+axis (**before rope**, v untouched), rope q and k, then non-causal SDPA at scale
+1/sqrt(128), flatten, `to_out`. Bidirectional over the whole joint sequence.
+
+Rope is **3-axis and the axes are concatenated, not interleaved across axes**. Per axis
+`i` of dim `d` and length `e`, `freqs = 1 / theta^(arange(0,d,2)/d)` accumulated in
+float64 and then cast to float32, `angles = outer(arange(e), freqs)`, a complex table of
+[e, d/2]. A token at integer position `(p0, p1, p2)` takes
+`cat([table_0[p0], table_1[p1], table_2[p2]])`: 64 complex values, 128 real dims, exactly
+`head_dim`. Complex pairs 0..15 come from axis 0, 16..39 from axis 1, 40..63 from axis 2.
+Position `(5, 3, 7)` gives first pairs `(0.283662, -0.958924)`, `(-0.923403, -0.383831)`,
+`(-0.801144, 0.598472)`, with pair 16 at `(-0.989992, 0.141120)` and pair 40 at
+`(0.753902, 0.656987)`; those five values pin the whole scheme and are what
+`src/zimage/transformer.rs`'s unit test asserts.
+
+Position ids on the txt2img path. Let `cap_len` be the caption count padded up to a
+multiple of 32 and `(H_t, W_t)` the image token grid:
+
+| tokens | axis 0 | axis 1 | axis 2 |
+| --- | --- | --- | --- |
+| caption, real and inner pad | `1 .. cap_len`, sequential | 0 | 0 |
+| image, real | `cap_len + 1`, constant | `0 .. H_t-1` | `0 .. W_t-1` |
+| image, inner pad | 0 | 0 | 0 |
+
+So axis 0 is a text-position axis on which the whole image occupies one slot past the
+caption, and axes 1 and 2 are the image's height and width. `axes_lens` bound the tables
+at 1536 on axis 0 and 512 tokens on axes 1 and 2, which is 8192 px per side.
+
+**Those bounds are checked, and the check is not a formality.** candle's Metal
+`index_select` CLAMPS an out-of-range id to the table's last row rather than failing
+(`indexing.metal`, "Force prevent out of bounds indexing"), while the CPU backend errors
+— so an over-long caption or an over-large image would come back on this machine as a
+plausible picture built from the wrong rotations, and a CPU unit test would catch what the
+shipped path would not. `check_size` refuses a side past 8192 px before anything loads,
+and `ZImageTransformer2DModel::forward` re-checks `cap_len + f_tokens` against
+`axes_lens[0]` and the token grid against axes 1 and 2 from the LOADED config, which is
+the authority for what runs. Neither is reachable through `xwen image` today (the encoder
+truncates to 512 tokens and no admitted size exceeds the grid), but `generate` and
+`forward` are both `pub` and take arbitrary `cap_feats`.
+
+Sequence construction, and the order is load-bearing:
+
+```
+cap = cap_embedder(cap_feats)             # RMSNorm(2560) then Linear(2560, 3840)
+cap[pad positions] = cap_pad_token        # learned [1,3840], AFTER the embedder
+cap = context_refiner(cap)                # 2 unmodulated blocks
+
+x = all_x_embedder["2-1"](patchify(latent))
+x[pad positions] = x_pad_token
+x = noise_refiner(x, adaln_input)         # 2 modulated blocks
+
+unified = cat([x, cap], dim=1)            # IMAGE FIRST
+unified = layers(unified, adaln_input)    # 30 modulated blocks
+out     = unpatchify(final_layer(unified)[:image_len])
+```
+
+`patchify` maps `(C=16, F=1, H, W)` to `[F_t*H_t*W_t, 64]` with the channel axis LAST in
+the patch vector, so the 64-vector is ordered `(pf, ph, pw, c)` with `c` fastest.
+`unpatchify` is the exact inverse over the first `image_len` rows, which is why the
+image-first order matters: recovery is a prefix narrow.
+
+The timestep embedding is sinusoidal at half 128, `max_period` 10000, **cos first**, in
+f32 with autocast off, then `Linear(256,1024)` / SiLU / `Linear(1024,256)`. The `t` handed
+in is `1 - sigma`, so the argument runs 0 at pure noise up to 1000 as sigma reaches 0,
+which is inverted relative to the Flux and SD3 convention.
+
+The final layer is the one LayerNorm in the model: `scale = 1 + adaLN(silu(adaln_input))`,
+then `layer_norm(x, eps=1e-6, elementwise_affine=False) * scale`, then
+`Linear(3840, 64)`. Everything else is RMSNorm at 1e-5.
+
+At 1024x1024 the latent is 128x128, patch 2 gives 64x64 = **4096 image tokens**, and
+4096 mod 32 = 0, so there is no image padding at all at the default size. Caption padding
+is the only padding in practice, and at batch 1 the attention mask is `None`: plain dense
+bidirectional attention over `4096 + cap_len` tokens.
+
+## The VAE is the Flux VAE
+
+`vae/config.json` says `AutoencoderKL` with `_name_or_path: "flux-dev"`, and it means it
+literally: 16 latent channels, 8x spatial, `scaling_factor` 0.3611 and `shift_factor`
+0.1159, which are the Flux values. `block_out_channels` [128,256,512,512],
+`layers_per_block` 2, `norm_num_groups` 32, `force_upcast` true, `use_quant_conv` and
+`use_post_quant_conv` both false, so there are no 1x1 quant convs at all.
+
+It ships **BF16**, one file, 167.7 MB, 83,819,683 parameters, of which the decoder is
+49,545,475 across 138 tensors. Only the decoder is needed for txt2img. Decoder topology,
+derived from the tensor shapes: `conv_in` 16 to 512, a mid block of resnet / single-head
+spatial self-attention over HW / resnet, then four up blocks of three `ResnetBlock2D`
+each (`layers_per_block + 1`, the diffusers decoder asymmetry) at 512, 512, 256, 128 with
+a nearest-2x-then-conv3x3 `Upsample2D` on the first three, then `GroupNorm(32, eps=1e-6)`
+and `conv_out` to 3. `ResnetBlock2D` is GroupNorm / silu / conv3x3 / GroupNorm / silu /
+conv3x3 with an unscaled residual and a 1x1 shortcut where the channel count changes.
+
+The decode path is `latents / 0.3611 + 0.1159`, decode, then `image / 2 + 0.5` clamped to
+[0, 1] and rounded to bytes. **`force_upcast: true` means the VAE runs in f32 even though
+the transformer is bf16**, which xwen matches: the Flux VAE overflows in fp16 and is
+marginal in bf16. The pipeline's divisibility constraint is 16 per side rather than the
+VAE's 8, because the transformer's patch size is 2 on top of it.
+
+## The scheduler and the Euler loop
+
+`scheduler/scheduler_config.json`, complete:
+
+```json
+{"_class_name":"FlowMatchEulerDiscreteScheduler","num_train_timesteps":1000,
+ "use_dynamic_shifting":false,"shift":3.0}
+```
+
+The raw grid is `sigma_k = 1 - k/n` for `k = 0..n-1`; the official repo spells it
+`linspace(1000, 0, n+1)[:-1] / 1000`, which is algebraically the same for every n. The
+lower endpoint is 0 there only because the pipeline assigns `scheduler.sigma_min = 0.0`
+on the line before it asks for the timesteps; left at the constructor's own 0.0029940 the
+same interpolation gives a grid up to 5.0e-3 away, which is candle upstream's and which
+nothing ships (decisions.md "The sigma grid is diffusers', and the official pipeline
+computes the same one"). Each sigma then takes the static shift
+`sigma' = 3*sigma / (1 + 2*sigma)`, and a terminal 0 is appended to the sigma array. At
+the shipped defaults, n = 8 and shift 3.0:
+
+| k | raw σ | shifted σ | t = 1 − σ | dt = σ<sub>k+1</sub> − σ<sub>k</sub> |
+| --- | --- | --- | --- | --- |
+| 0 | 1.000000 | 1.000000 | 0.000000 | −0.045455 |
+| 1 | 0.875000 | 0.954545 | 0.045455 | −0.054545 |
+| 2 | 0.750000 | 0.900000 | 0.100000 | −0.066667 |
+| 3 | 0.625000 | 0.833333 | 0.166667 | −0.083333 |
+| 4 | 0.500000 | 0.750000 | 0.250000 | −0.107143 |
+| 5 | 0.375000 | 0.642857 | 0.357143 | −0.142857 |
+| 6 | 0.250000 | 0.500000 | 0.500000 | −0.200000 |
+| 7 | 0.125000 | 0.300000 | 0.700000 | −0.300000 |
+| — | — | 0.0 terminal | — | — |
+
+That table is what `src/zimage/scheduler.rs`'s unit test pins. The step, all in f32:
+
+```
+noise_pred = -transformer(latent, 1 - sigma_k, cap_feats)
+latents    = latents + (sigma_{k+1} - sigma_k) * noise_pred
+```
+
+`dt` is negative and the model output is negated, so the two signs compose into ordinary
+flow-matching descent. Latents stay f32 for the whole loop; both reference
+implementations assert that.
+
+**There is no resolution-dependent shift in effect.** Both pipelines compute
+`mu = calculate_shift(image_seq_len, 256, 4096, 0.5, 1.15)` and hand it to
+`set_timesteps`, and `use_dynamic_shifting: false` throws it away. The
+`calculate_shift` call is dead code inherited from Flux; xwen does not implement it and
+refuses a config that sets `use_dynamic_shifting: true` rather than pretending to support
+it. `shift` itself is a legitimate user-facing knob upstream (the official Space exposes
+1.0 to 10.0), and non-Turbo `Z-Image` ships 6.0 against Turbo's 3.0.
+
+**Eight steps, not nine.** The HF model card's sample says `num_inference_steps=9, # This
+actually results in 8 DiT forwards`, and that comment is false against current diffusers:
+n = 9 gives nine sigmas and nine forwards. diffusers commit 32ecbe383, 2026-05-29, "Fix
+redundant Z-Image terminal timestep (#13730)", changed every Z-Image default from 9 to 8
+and replaced `scheduler.sigma_min = 0.0` with an explicit
+`get_default_z_image_sigmas(num_inference_steps)`; the official repo's
+`DEFAULT_INFERENCE_STEPS` is 8 and the paper says 8 NFE. Anything that says 9 predates
+that commit. `DEFAULT_STEPS` here is 8.
+
+**Turbo does no CFG.** `guidance_scale` is 0.0 in the official repo's defaults, the model
+card's Model Zoo marks Turbo's CFG column as unsupported, and diffusers' own `__call__`
+default of 5.0 is a footgun to pass 0.0 past. One encoder pass, one transformer forward
+per step, no negative prompt. Non-Turbo `Z-Image` does use CFG, at 50 steps.
+
+## Traps in the pipeline, each of which runs and produces plausible garbage
+
+None of these fails loudly. They are ordered by how easy they are to get wrong.
+
+- **Rope is INTERLEAVED-pair, not NEoX.** `reshape(..., -1, 2)` pairs adjacent dims
+  `(x0,x1), (x2,x3), ...`. Every Qwen graph in this repo pairs `i` with `i + d/2`. Reusing
+  a NEoX rope here runs and denoises noise. The rotation is also done in f32 regardless of
+  the activation dtype (`x_in.float()` then `.type_as`), and the tables are accumulated in
+  float64 before the f32 cast.
+- **The joint sequence is IMAGE FIRST**, `cat([x, cap])`, and the output is recovered as a
+  prefix narrow. Reversing it is silent because the rope positions travel with the tokens.
+- **Modulation is `1 + scale` and `tanh(gate)`, with no shift term.** Four vectors, in the
+  order `scale_msa, gate_msa, scale_mlp, gate_mlp`.
+- **`t` fed to the transformer is `1 - sigma`, and the model output is NEGATED** before
+  the Euler step. Getting exactly one of the two right produces a diverging trajectory
+  that still looks like an image early on.
+- **The pad tokens are learned and UNMASKED.** Both modalities pad up to a multiple of 32
+  with `cap_pad_token` / `x_pad_token`, applied AFTER their embedder, and those rows
+  participate in attention as ordinary keys and queries. Zero-padding before the embedder
+  and masking the result, which is the obvious implementation, is a different model. Do
+  not optimize them away.
+- **Eight steps, not nine**, per the commit above.
+- **The static shift is 3.0 and the dynamic-shift code is dead.** Implementing
+  `calculate_shift` because both pipelines call it reproduces neither reference.
+- **fp16 is disqualified**, not merely inadvisable: activations exceed 65504 and the
+  result is NaN latents and a black image
+  (decisions.md "The transformer runs bf16 end to end"). The transformer is bf16 with f32
+  accumulation.
+- **The VAE is bf16 on disk and runs in f32** under `force_upcast`, with the Flux
+  `shift_factor` 0.1159 and `scaling_factor` 0.3611 applied as
+  `latents / scale + shift` on the way in.
+- **`cap_embedder.0` is an RMSNorm over 2560 and `cap_embedder.1` is the projection**, so
+  the caption is normed before it is projected; `all_final_layer`'s adaLN has a SiLU and
+  the blocks' do not.
+- **`all_patch_size` / `all_f_patch_size` are a ModuleDict with exactly one key, `"2-1"`.**
+  Hardcode it. `siglip_feat_dim` is null on both public checkpoints, so there is no SigLIP
+  tower and no Omni path; `controlnet_block_samples` is an unused hook.
+
+## What the vendored candle module got wrong
+
+`src/zimage/` is candle's `z_image` at rev 21cca0b (PR #3261), vendored and corrected
+(decisions.md "candle's `z_image` module is vendored into `src/zimage/`"). It was
+right on every trap in the list above except the ones below, which is a better record
+than two commits of upstream history would suggest, and it was wrong in four places that
+matter. Each correction moves it TOWARD the reference; none is an optimization.
+
+1. **Caption padding.** Upstream zero-padded the caption before `cap_embedder` and masked
+   the pad. The reference pads after the embedder with the learned `cap_pad_token` and
+   does not mask. `forward` now takes `(x, t, cap_feats)` with no mask at all and bails on
+   batch != 1.
+2. **The sigma grid.** Upstream `set_timesteps` interpolated between the already-shifted
+   training extremes and then shifted again, which is not the reference grid at any n. It
+   is now the raw `1 - k/n` ladder, the static shift, and an appended terminal zero, with
+   the 8-step table pinned by a test. `mu` and dynamic shifting are gone, and a config
+   asking for them is refused at load.
+3. **Rope dtype.** Upstream built the tables in f32 in the model dtype, so bf16. They are
+   now built in f64 and kept in f32, and the rotation is done in f32 and cast back.
+4. **QK-norm eps** came from a hardcoded 1e-5 and now comes from `cfg.norm_eps`, which is
+   the same value on this checkpoint and is not guaranteed to be.
+
+Four smaller ones. The timestep stays f32 into the model rather than being cast to bf16
+first. The VAE and the Euler loop run f32 with the model output negated before the step,
+which the reference does and candle's library did not (its example did). The postprocess
+rounds to nearest byte where upstream truncated. And the CUDA flash-attn arm, the CFG
+helpers, `calculate_shift` and `preprocess.rs` are removed; what is kept is a
+`use_accelerated_attn` switch selecting candle's Metal SDPA against a plain matmul chain.
+That switch is reachable as **`XWEN_ZIMAGE_ATTN=basic`** (unset or `fused` is the shipped
+path; a value that names neither is a load error rather than a silent default), read when
+the `Config` is built, which is where the shipped `transformer/config.json` — carrying no
+such key — takes its `serde` default. The arm is a real A/B: the two share no attention
+kernel, and the unit test asserts their outputs differ by a NONZERO amount under the bar,
+because a bit-identical result would mean the switch selected one kernel twice. It was
+unreachable and untested in the first arc, which is the shape the `XWEN_QWEN3_ATTN=sdpa`
+ablation was vacuous in for a whole arc (AGENTS.md "Verification workflow").

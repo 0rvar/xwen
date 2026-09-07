@@ -59,7 +59,7 @@ struct ModelArgs {
     /// drafter), the dense Qwen3.6-27B, the Qwen3.6-35B-A3B MoE, or the dense
     /// Qwen3.8-27B, or the dense Qwen3-4B pair — `qwen3-4b` (hybrid thinking)
     /// and `qwen3-4b-instruct-2507` (no thinking) — which run on every surface.
-    /// `zimage-turbo` is the Z-Image text encoder: `xwen encode-text` only, and
+    /// `zimage-turbo-encoder` is the Z-Image text encoder: `xwen encode-text` only, and
     /// refused by generate, chat, serve and batch, because its weights are not a
     /// working language model.
     /// Each checkpoint's full name works here too. A `--model` path (a GGUF, or
@@ -69,7 +69,7 @@ struct ModelArgs {
     /// no release — on every surface alike.
     #[arg(
         long,
-        value_name = "27b|35b|3.8-27b|flash-next|qwen3-4b|qwen3-4b-instruct-2507|zimage-turbo"
+        value_name = "27b|35b|3.8-27b|flash-next|qwen3-4b|qwen3-4b-instruct-2507|zimage-turbo-encoder|zimage-turbo"
     )]
     model_size: Option<Model>,
 }
@@ -544,16 +544,20 @@ enum Cmd {
         /// cache — downloaded on first use, cached forever after).
         #[arg(short, long)]
         model: Option<PathBuf>,
-        /// Which Qwen3 checkpoint to encode with: zimage-turbo (the Z-Image
+        /// Which Qwen3 checkpoint to encode with: zimage-turbo-encoder (the Z-Image
         /// text encoder; the default here, unlike every other command),
-        /// qwen3-4b or qwen3-4b-instruct-2507. A GGUF checkpoint has no
-        /// hidden-state encoder.
-        #[arg(long, value_name = "zimage-turbo|qwen3-4b|qwen3-4b-instruct-2507")]
+        /// qwen3-4b or qwen3-4b-instruct-2507. `zimage-turbo`, the whole
+        /// diffusion pipeline, is accepted and encodes with its text encoder.
+        /// A GGUF checkpoint has no hidden-state encoder.
+        #[arg(
+            long,
+            value_name = "zimage-turbo-encoder|zimage-turbo|qwen3-4b|qwen3-4b-instruct-2507"
+        )]
         model_size: Option<Model>,
         /// The HF `hidden_states` index to return: 0 is the embedding output,
         /// N the residual after layer N-1 (before the final norm), 36 the
         /// normed output. Default: what the checkpoint's pipeline reads (35 on
-        /// zimage-turbo), or the normed output on a plain language model.
+        /// zimage-turbo-encoder), or the normed output on a plain language model.
         #[arg(long)]
         layer: Option<usize>,
         /// The prompt text.
@@ -572,6 +576,46 @@ enum Cmd {
         /// Also print the rendered prompt and the token ids to stderr.
         #[arg(long)]
         verbose: bool,
+    },
+    /// Generate an image with Z-Image-Turbo: encode the prompt with its text
+    /// encoder (the same render and hidden state `encode-text` produces), run
+    /// the diffusion transformer for `--steps` flow-matching steps from seeded
+    /// noise, decode with the VAE and write a PNG. Runs the whole pipeline on
+    /// the Metal device with the encoder kept resident.
+    Image {
+        /// The prompt text.
+        #[arg(long)]
+        prompt: String,
+        /// Output width in pixels: a multiple of 16 whose cell count with the
+        /// height is a multiple of 32 (1024x1024, 1024x768, 512x512, ...).
+        #[arg(long, default_value_t = 1024)]
+        width: usize,
+        /// Output height in pixels (same rule as --width).
+        #[arg(long, default_value_t = 1024)]
+        height: usize,
+        /// Denoising steps. 8 is what the Turbo release is fitted for.
+        #[arg(long, default_value_t = xwen::zimage::pipeline::DEFAULT_STEPS)]
+        steps: usize,
+        /// Noise seed; a random one is drawn and printed when omitted. A seed
+        /// here is xwen's own draw, unrelated to a torch seed.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// The PNG to write.
+        #[arg(short, long, default_value = "out.png")]
+        out: PathBuf,
+        /// A Z-Image-Turbo snapshot root (the directory holding
+        /// `model_index.json`, `transformer/`, `vae/`, `text_encoder/` and
+        /// `tokenizer/`) instead of the cached official checkpoint.
+        #[arg(short, long)]
+        model: Option<PathBuf>,
+        /// Which checkpoint: zimage-turbo, the only text-to-image one.
+        #[arg(long, value_name = "zimage-turbo")]
+        model_size: Option<Model>,
+        /// A safetensors file whose `latents` tensor, `[1, 16, H/8, W/8]` f32,
+        /// replaces the seeded noise — for comparing against a reference run
+        /// that started from the same latent.
+        #[arg(long)]
+        latents: Option<PathBuf>,
     },
 }
 
@@ -1098,14 +1142,17 @@ fn resolve_model(model: Option<PathBuf>, size: Model) -> Result<PathBuf> {
                 // onto it, because only two of the three shapes end in a file
                 // name: "Qwen/Qwen3-4B/6 files" is not a path and does not read
                 // as one.
-                let (what, total) = match (size.files(), size.is_safetensors()) {
-                    ([one], _) => (format!("{}/{one}", size.repo()), ""),
-                    (files, true) => (format!("{} ({} files)", size.repo(), files.len()), " total"),
-                    (shards, false) => (
-                        format!("{}/{} ({} shards)", size.repo(), shards[0], shards.len()),
-                        " total",
-                    ),
-                };
+                let (what, total) =
+                    match (size.files(), size.is_safetensors() || size.is_diffusion()) {
+                        ([one], _) => (format!("{}/{one}", size.repo()), ""),
+                        (files, true) => {
+                            (format!("{} ({} files)", size.repo(), files.len()), " total")
+                        }
+                        (shards, false) => (
+                            format!("{}/{} ({} shards)", size.repo(), shards[0], shards.len()),
+                            " total",
+                        ),
+                    };
                 eprintln!(
                     "xwen: {what} is not in the Hugging Face cache; downloading ({}{total}, resumes in place)",
                     size.size(),
@@ -1673,6 +1720,19 @@ fn main() -> Result<()> {
             // that every run named a checkpoint, and a `--model` pointing at
             // something else would then be a contradiction that never fired.
             let selected = select.model_size;
+            // Ahead of `resolve_model`, which fetches. A diffusion entry's
+            // first file is `model_index.json`, so without this the run
+            // downloaded 32.9 GB and then handed a JSON index to the GGUF
+            // parser. `servable()` is the wrong question for inspect — the
+            // Z-Image text encoder is unservable and inspecting it is exactly
+            // what someone wants — so the gate is the format, and the sentence
+            // is the entry's own.
+            let requested = select.size();
+            ensure!(
+                !requested.is_diffusion(),
+                "{}",
+                requested.not_servable_message()
+            );
             let path = resolve_model(model, select.size())?;
             let device = candle_core::Device::Cpu;
             let source = CheckpointSource::open(&path, &device, selected)?;
@@ -2040,6 +2100,27 @@ fn main() -> Result<()> {
             max_ctx,
             verbose,
         ),
+        Some(Cmd::Image {
+            prompt,
+            width,
+            height,
+            steps,
+            seed,
+            out,
+            model,
+            model_size,
+            latents,
+        }) => run_image(ImageArgs {
+            prompt,
+            width,
+            height,
+            steps,
+            seed,
+            out,
+            model,
+            model_size,
+            latents,
+        }),
     }
 }
 
@@ -2078,6 +2159,35 @@ fn run_encode_text(
         }
         (Some(_), Some(_)) => bail!("--prompt and --prompt-file are mutually exclusive"),
     };
+    // `--model-size zimage-turbo` names the whole diffusion pipeline, and the
+    // part of it that encodes is its text encoder entry — the same weights,
+    // the same repo, one subdirectory down. Both aliases therefore encode, and
+    // the remap happens here rather than being a second name for the encoder
+    // entry, because `xwen image` wants the pipeline under that alias.
+    let (model_size, model) = match model_size {
+        Some(pipeline) if pipeline.is_diffusion() => {
+            let encoder = pipeline
+                .text_encoder()
+                .with_context(|| format!("{} names no text encoder", pipeline.full_name()))?;
+            let subdir = Path::new(encoder.file()).parent().unwrap_or(Path::new(""));
+            // A snapshot the operator named holds the encoder inside it;
+            // anything else is passed through as given. Either spelling of the
+            // snapshot counts — the directory or its `model_index.json`, which
+            // is what `xwen fetch` prints — and the rule is
+            // `checkpoint::diffusion_snapshot_root`'s, the same one the loader
+            // refuses that path by. Written twice they drift, and the drift is
+            // this command accepting a shape the loader then refuses.
+            let model = match model
+                .as_deref()
+                .and_then(xwen::checkpoint::diffusion_snapshot_root)
+            {
+                Some(root) => Some(root.join(subdir)),
+                None => model,
+            };
+            (Some(encoder), model)
+        }
+        other => (other, model),
+    };
     // Unlike every other command, the zero-flag default is the encoder entry:
     // encoding is what that checkpoint is for, and the global default
     // (Flash-Next, a GGUF) has no hidden-state encoder at all.
@@ -2088,10 +2198,20 @@ fn run_encode_text(
         Model::ZImageTurboEncoder,
     )?;
     let size = checkpoint.model;
+    // Kept even though the remap above makes it unreachable from the flag: it
+    // is the sentence a future route into here would need, and it must not be
+    // the GGUF one, a diffusion pipeline being neither.
+    ensure!(
+        !size.is_diffusion(),
+        "{} is a text-to-image pipeline rather than a language model; its text encoder is \
+         --model-size {}, and `xwen image` runs the pipeline itself",
+        size.full_name(),
+        Model::ZImageTurboEncoder
+    );
     ensure!(
         size.is_safetensors(),
         "{} is a GGUF checkpoint; the hidden-state encoder runs the Qwen3 dense safetensors \
-         checkpoints only (--model-size zimage-turbo, qwen3-4b or qwen3-4b-instruct-2507)",
+         checkpoints only (--model-size zimage-turbo-encoder, qwen3-4b or qwen3-4b-instruct-2507)",
         size.full_name()
     );
     let path = resolve_model(model, size)?;
@@ -2133,29 +2253,7 @@ fn run_encode_text(
         );
     }
 
-    // The pipeline's rendering: one user turn, generation prompt, thinking
-    // on (the dialect default), through the checkpoint's own template.
-    let chat_opts = ChatOptions::for_dialect(size.chat_dialect());
-    // The third element is the thinking state the generation prompt leaves
-    // the model in; an encoder generates nothing, so it has no reader here.
-    let (text, content_ranges, _thinking) =
-        build_prompt_with_spans(&[Message::User(prompt)], &chat_opts)?;
-    let tokenizer = xwen::tokenizer::LagunaTokenizer::from_file(set.tokenizer_path())
-        .with_context(|| format!("loading {}", set.tokenizer_path().display()))?;
-    let mut ids = tokenizer.encode_prompt(&text, &content_ranges)?;
-    if let Some(spec) = spec {
-        if ids.len() > spec.max_tokens {
-            eprintln!(
-                "xwen: prompt is {} tokens, truncated to {}'s pipeline limit of {} (the text \
-                 past that is not encoded)",
-                ids.len(),
-                size.full_name(),
-                spec.max_tokens
-            );
-            ids.truncate(spec.max_tokens);
-        }
-    }
-    ensure!(!ids.is_empty(), "the rendered prompt tokenized to nothing");
+    let (text, ids) = encoder_prompt_ids(size, set.tokenizer_path(), prompt)?;
     if verbose {
         eprintln!("xwen: rendered prompt ({} bytes):\n{text}", text.len());
         eprintln!("xwen: {} token ids: {ids:?}", ids.len());
@@ -2185,6 +2283,183 @@ fn run_encode_text(
         "{n_tokens} tokens, hidden state {layer} [{n_tokens}, {}] bf16 written to {} ({encode_ms:.0}ms)",
         set.config().hidden_size,
         output.display()
+    );
+    Ok(())
+}
+
+/// The prompt as a diffusion pipeline's text encoder sees it: rendered as one
+/// user turn with the generation prompt appended and thinking on (which on the
+/// Qwen3 dialect opens no `<think>` block) through the same renderer the chat
+/// surfaces use, tokenized with the checkpoint's OWN `tokenizer.json`, and
+/// truncated to the encoder entry's `max_tokens` with a warning — exactly
+/// diffusers' `ZImagePipeline._encode_prompt`. Both `encode-text` and `image`
+/// go through here so the two cannot drift.
+fn encoder_prompt_ids(
+    size: Model,
+    tokenizer_path: &Path,
+    prompt: String,
+) -> Result<(String, Vec<u32>)> {
+    let chat_opts = ChatOptions::for_dialect(size.chat_dialect());
+    // The third element is the thinking state the generation prompt leaves
+    // the model in; an encoder generates nothing, so it has no reader here.
+    let (text, content_ranges, _thinking) =
+        build_prompt_with_spans(&[Message::User(prompt)], &chat_opts)?;
+    let tokenizer = xwen::tokenizer::LagunaTokenizer::from_file(tokenizer_path)
+        .with_context(|| format!("loading {}", tokenizer_path.display()))?;
+    let mut ids = tokenizer.encode_prompt(&text, &content_ranges)?;
+    if let Some(spec) = size.encoder_spec() {
+        if ids.len() > spec.max_tokens {
+            eprintln!(
+                "xwen: prompt is {} tokens, truncated to {}'s pipeline limit of {} (the text \
+                 past that is not encoded)",
+                ids.len(),
+                size.full_name(),
+                spec.max_tokens
+            );
+            ids.truncate(spec.max_tokens);
+        }
+    }
+    ensure!(!ids.is_empty(), "the rendered prompt tokenized to nothing");
+    Ok((text, ids))
+}
+
+/// `xwen image`'s flags, gathered so the run function has a name per field.
+struct ImageArgs {
+    prompt: String,
+    width: usize,
+    height: usize,
+    steps: usize,
+    seed: Option<u64>,
+    out: PathBuf,
+    model: Option<PathBuf>,
+    model_size: Option<Model>,
+    latents: Option<PathBuf>,
+}
+
+/// `xwen image`: Z-Image-Turbo, prompt to PNG.
+///
+/// The text encoder is opened as its OWN registry entry — the pipeline entry's
+/// `text_encoder()` — through `CheckpointSource` and `XwenModel::load_encoder`,
+/// so it gets the zero-run allowlist and the tokenizer path that entry
+/// carries, and its hidden state is the one `encode-text` writes. The
+/// transformer and the VAE load through `zimage::ZImagePipeline`. Everything
+/// stays resident for the run.
+fn run_image(args: ImageArgs) -> Result<()> {
+    use xwen::zimage::pipeline::{ImageOptions, ZImagePipeline, write_png};
+
+    let size = args.model_size.unwrap_or(Model::ZImageTurbo);
+    let encoder_entry = size.text_encoder().with_context(|| {
+        format!(
+            "{} is not a text-to-image checkpoint; `xwen image` runs {} (--model-size {})",
+            size.full_name(),
+            Model::ZImageTurbo.full_name(),
+            Model::ZImageTurbo
+        )
+    })?;
+    let spec = encoder_entry
+        .encoder_spec()
+        .context("the pipeline's text encoder entry carries no encoder spec")?;
+    // Every input the run can be wrong about is checked before a byte loads:
+    // the size rule, the step count, the bisect switch, and the injected
+    // latent, which is a file and therefore the one of the four that can be
+    // missing or misshapen. `ZImagePipeline::load` re-reads the switch for its
+    // library callers, but by then the 7.6 GB encoder is already resident, and
+    // a typo in a bisect run should cost nothing.
+    xwen::zimage::AttnImpl::from_env()?;
+    ZImagePipeline::check_size(args.width, args.height)?;
+    ensure!(args.steps >= 1, "--steps must be at least 1");
+    let latents = match &args.latents {
+        Some(path) => Some(ZImagePipeline::read_latents(path, args.width, args.height)?),
+        None => None,
+    };
+
+    let root = match args.model {
+        Some(root) => root,
+        None => {
+            let index = resolve_model(None, size)?;
+            index
+                .parent()
+                .context("the cached model_index.json has no parent directory")?
+                .to_path_buf()
+        }
+    };
+    ensure!(
+        root.join("model_index.json").is_file(),
+        "{} is not a Z-Image snapshot root (no model_index.json in it)",
+        root.display()
+    );
+    let encoder_dir = root.join(
+        Path::new(encoder_entry.file())
+            .parent()
+            .context("the encoder entry's config has no parent directory")?,
+    );
+
+    let device = gguf::metal_device()?;
+    let total_start = std::time::Instant::now();
+
+    // The text encoder, and the prompt as the pipeline renders it.
+    let load_start = std::time::Instant::now();
+    let source = CheckpointSource::open(&encoder_dir, &device, Some(encoder_entry))?;
+    let set = source
+        .safetensors()
+        .with_context(|| {
+            format!(
+                "{} did not open as a safetensors set",
+                encoder_dir.display()
+            )
+        })?
+        .clone();
+    let (_text, ids) = encoder_prompt_ids(encoder_entry, set.tokenizer_path(), args.prompt)?;
+    let mut encoder = xwen::model::XwenModel::load_encoder(source, spec.max_tokens)?;
+    eprintln!(
+        "xwen: text encoder loaded in {:.1}s",
+        load_start.elapsed().as_secs_f64()
+    );
+    let encode_start = std::time::Instant::now();
+    let (cap_feats, n_tokens) = encoder.encode(&ids, spec.layer)?;
+    eprintln!(
+        "xwen: {n_tokens} prompt tokens encoded in {:.0}ms",
+        encode_start.elapsed().as_secs_f64() * 1000.0
+    );
+
+    let load_start = std::time::Instant::now();
+    let pipeline = ZImagePipeline::load(&root, &device)?;
+    eprintln!(
+        "xwen: transformer and VAE loaded in {:.1}s",
+        load_start.elapsed().as_secs_f64()
+    );
+
+    // Drawn even when a latent was injected, `ImageOptions` wanting a value,
+    // but then it decides nothing and is reported as deciding nothing: a run
+    // that printed a seed it did not use would be a reference comparison
+    // nobody could reproduce from its own log line.
+    let seed = args.seed.unwrap_or_else(rand::random::<u64>);
+    let noise_source = match &args.latents {
+        Some(path) => format!("latents from {}", path.display()),
+        None => format!("seed {seed}"),
+    };
+    eprintln!("xwen: {noise_source}");
+
+    let opts = ImageOptions {
+        width: args.width,
+        height: args.height,
+        steps: args.steps,
+        seed,
+        latents,
+    };
+    let (image, timings) = pipeline.generate(&cap_feats, &opts)?;
+    for (i, secs) in timings.steps.iter().enumerate() {
+        eprintln!("xwen: step {}/{} {:.2}s", i + 1, args.steps, secs);
+    }
+    eprintln!("xwen: VAE decode {:.2}s", timings.vae_decode);
+    write_png(&image, &args.out)?;
+    println!(
+        "{}x{}, {} steps, {noise_source}, written to {} ({:.1}s total)",
+        args.width,
+        args.height,
+        args.steps,
+        args.out.display(),
+        total_start.elapsed().as_secs_f64()
     );
     Ok(())
 }
@@ -2413,9 +2688,11 @@ mod tests {
         for model in [Model::Qwen34B, Model::Qwen34BInstruct2507] {
             assert!(ensure_servable(model).is_ok(), "{model:?}");
         }
-        // The encoder is the one entry still refused, and its reason does not
-        // lift when a build lands: the operator's next move is a different
-        // command, not a different version.
+        // Two entries are still refused, and neither reason lifts when a build
+        // lands: the operator's next move is a different command, not a
+        // different version. Which command is the part worth asserting —
+        // sending someone from the pipeline to `encode-text` would still pass
+        // a test for "was refused".
         let err = ensure_servable(Model::ZImageTurboEncoder)
             .unwrap_err()
             .to_string();
@@ -2423,6 +2700,12 @@ mod tests {
         assert!(err.contains("encode-only"), "{err}");
         assert!(err.contains("zero-filled"), "{err}");
         assert!(err.contains("encode-text"), "{err}");
+
+        let err = ensure_servable(Model::ZImageTurbo).unwrap_err().to_string();
+        assert!(err.contains(Model::ZImageTurbo.full_name()), "{err}");
+        assert!(err.contains("text-to-image"), "{err}");
+        assert!(err.contains("xwen image"), "{err}");
+        assert!(!err.contains("encode-text"), "{err}");
 
         for model in xwen::hub::MODELS {
             assert_eq!(

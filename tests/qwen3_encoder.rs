@@ -23,7 +23,7 @@
 //! * `XWEN_ZIMAGE_REF_DIR` — required; the dump directory, holding `00/`..`11/`.
 //! * `XWEN_ZIMAGE_DIR` — the checkpoint's `text_encoder/` directory. Defaults to
 //!   the registry entry's cached snapshot; absent from the cache, the test says
-//!   to run `xwen fetch --model-size zimage-turbo`.
+//!   to run `xwen fetch --model-size zimage-turbo-encoder`.
 //! * `XWEN_ZIMAGE_ONLY` — comma-separated prompt indices, to run a subset.
 //! * `XWEN_ZIMAGE_VERIFY_SHA=1` — also verify each dump file against the sha256
 //!   the fixture records, which catches a stale or half-written dump directory.
@@ -401,7 +401,7 @@ fn encoder_dir() -> Result<PathBuf> {
     }
     let config = xwen::hub::cached_model(xwen::hub::Model::ZImageTurboEncoder).context(
         "the Z-Image text encoder is not in the Hugging Face cache: run \
-         `xwen fetch --model-size zimage-turbo`, or point $XWEN_ZIMAGE_DIR at an \
+         `xwen fetch --model-size zimage-turbo-encoder`, or point $XWEN_ZIMAGE_DIR at an \
          existing text_encoder/ directory",
     )?;
     Ok(config

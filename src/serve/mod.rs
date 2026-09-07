@@ -1894,7 +1894,8 @@ mod tests {
                 "Qwen3.8-Flash-Next",
                 "Qwen3-4B",
                 "Qwen3-4B-Instruct-2507",
-                "Z-Image-Turbo-text-encoder"
+                "Z-Image-Turbo-text-encoder",
+                "Z-Image-Turbo"
             ],
             "the served checkpoint leads and appears once"
         );
@@ -1957,13 +1958,14 @@ mod tests {
         let served = types::Target::official(Model::Qwen3827B);
         let served_id = "Qwen3.8-27B";
 
-        // The engine half refuses one entry and one only: the Z-Image encoder,
-        // which is not a language model. Every checkpoint that IS one passes it,
-        // which is what leaves the download rule as Flash-Next's only gate.
+        // The engine half refuses the two Z-Image entries and nothing else: the
+        // encoder and the pipeline, neither of which is a language model. Every
+        // checkpoint that IS one passes it, which is what leaves the download
+        // rule as Flash-Next's only gate.
         for model in crate::hub::MODELS {
             assert_eq!(
                 model.servable(),
-                model != Model::ZImageTurboEncoder,
+                !matches!(model, Model::ZImageTurboEncoder | Model::ZImageTurbo),
                 "{model}"
             );
         }

@@ -85,7 +85,7 @@ export const CHECKPOINTS = {
   // The encoder lives in a subdirectory of a diffusion repo, with its tokenizer
   // in a sibling one — which is why every path here is relative to the REPO and
   // not to the checkpoint directory.
-  "zimage-turbo": {
+  "zimage-turbo-encoder": {
     repo: "Tongyi-MAI/Z-Image-Turbo",
     model: "text_encoder/config.json",
     files: [
@@ -95,6 +95,31 @@ export const CHECKPOINTS = {
       "text_encoder/model-00002-of-00003.safetensors",
       "text_encoder/model-00003-of-00003.safetensors",
       "tokenizer/tokenizer.json",
+    ],
+    drafter: null,
+  },
+  // The whole Z-Image-Turbo pipeline at the repo root: the encoder entry's files
+  // again plus the transformer (fp32, three shards), the VAE and the scheduler.
+  // `model` is model_index.json so that its parent is the snapshot root.
+  "zimage-turbo": {
+    repo: "Tongyi-MAI/Z-Image-Turbo",
+    model: "model_index.json",
+    files: [
+      "model_index.json",
+      "text_encoder/config.json",
+      "text_encoder/model.safetensors.index.json",
+      "text_encoder/model-00001-of-00003.safetensors",
+      "text_encoder/model-00002-of-00003.safetensors",
+      "text_encoder/model-00003-of-00003.safetensors",
+      "tokenizer/tokenizer.json",
+      "transformer/config.json",
+      "transformer/diffusion_pytorch_model.safetensors.index.json",
+      "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+      "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+      "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+      "vae/config.json",
+      "vae/diffusion_pytorch_model.safetensors",
+      "scheduler/scheduler_config.json",
     ],
     drafter: null,
   },

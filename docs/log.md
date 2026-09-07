@@ -4,6 +4,44 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-07 — `xwen image` renders through Z-Image-Turbo: a coherent 1024x1024 in 52 s warm, and no bars on it yet
+
+Arc A, and the first thing in this repo that is not a language model. `xwen image
+--prompt <text>` runs the Z-Image-Turbo pipeline end to end: the repo's own verified
+Qwen3-4B encoder at hidden index 35, the S3-DiT transformer, eight flow-match Euler
+steps, the Flux VAE decoder, a PNG. The transformer, VAE, scheduler and sampler are
+candle's `z_image` at rev 21cca0b vendored into `src/zimage/` and corrected in four
+places against the reference, none of them an optimization. Two prompts came out
+photorealistic and prompt-faithful with legible sign text, and a seed reproduces
+byte-identically across processes. **Timings: 5.0-5.5 s per transformer step, eight
+steps, VAE decode ~5 s, ~52 s wall warm**, with transformer and VAE load 3.3 s warm and
+31.9 s cold on the fp32-to-bf16 cast; `pmset -g` read `lowpowermode 0` and no
+performance work was done. The registry entry is `Model::ZImageTurbo` under a new
+`Format::Diffusion`, not servable and not auto-fetched, and the encoder alias moved to
+`zimage-turbo-encoder`. What is NOT verified is the arithmetic: there is no reference
+dump of the transformer yet, so the block math is graded by reading and by the images
+looking right, and that is Arc B. Image transformers are in scope as a correctness
+target with a secondary time-per-image figure, on the same terms as the dense 4B.
+A three-reviewer round on the same day found and fixed six things, none of them in the
+block math: the RoPE tables were unbounded where candle's Metal `index_select` clamps
+rather than errors (so `check_size` gained an 8192 px rule and `forward` a check against
+the loaded `axes_lens`), a PNG write truncated the previous image before encoding,
+`encode-text --model-size zimage-turbo` refused the pipeline alias as a GGUF, `--latents`
+was read after 33 GB had loaded and its run printed an unused seed, the documented
+attention reference arm was unreachable (now `XWEN_ZIMAGE_ATTN=basic`, with a nonzero-diff
+A/B test), and the scheduler's comments described the official repo's sigma grid wrongly.
+A second outside round the same day found four more, one of them that correction: the
+official PIPELINE sets `scheduler.sigma_min = 0` and lands on the shipped grid exactly, so
+the two references agree and the 5.0e-3 gap belongs to the scheduler's constructor
+default, which only candle upstream computes. The other three were the pipeline entry
+falling through to the GGUF reader (`inspect --model-size zimage-turbo` fetched 32.9 GB
+and then parsed `model_index.json` as a GGUF; refused at the `CheckpointSource` seam and
+ahead of the fetch now), a PNG temp name that two in-process writers to one destination
+would share, and an attention A/B bar loose enough that dropping the 1/√128 scale passed
+it — now pinned by a mutation check that measures the broken arms.
+[Record](records/zimage-pipeline.md), [architecture](zimage.md),
+[decisions](decisions/zimage.md), [figures](perf-state.md).
+
 ## 2026-09-07 — Dense Qwen3 parity bars decided: Stage 1 passes on both oracle arms, consistency at 0.2, the sdpa ablation rules the attention kernel out
 
 Arc 4, the last of the dense Qwen3-4B arcs and the one that turns two measurements into
