@@ -5,8 +5,16 @@
 //! (multi-token) against the f16 vector sdpa (one token), `matmul_bf16`'s gemv
 //! (t <= 8) against its tensor gemm (t > 8), and the shipped attention arm
 //! against the f32 sdpa bisect arm (`XWEN_QWEN3_ATTN=sdpa`). Bar: max-abs
-//! logit difference <= 2e-2 and an identical argmax at every position
-//! (docs/parity.md, the qwen3 section).
+//! logit difference <= 2e-2 (`XWEN_QWEN3_CONSISTENCY_MAX_ABS` overrides it)
+//! and an identical argmax at every position (docs/parity.md, the qwen3
+//! section).
+//!
+//! Every comparison runs before anything is asserted: the whole table is
+//! printed (prompt, arm, chunk size, positions, the worst |Δ| and where, argmax
+//! agreements, positions over the bar), and the test then fails listing every
+//! row that missed. A first failure that stopped the run would leave the other
+//! chunkings and the flash-vs-sdpa arm unmeasured, which is exactly the number
+//! the bar's owner needs to decide where it belongs.
 //!
 //! Ignored by default (needs the 8 GB checkpoint and a Metal device). ONE test
 //! body, deliberately: the second half switches the attention arm through the
@@ -31,8 +39,24 @@ use xwen::model::XwenModel;
 use xwen::ops::ExpertRunner;
 use xwen::qwen3::stack::{ATTN_ENV, AttnImpl};
 
-const MAX_ABS: f32 = 2e-2;
+/// The bar unless `XWEN_QWEN3_CONSISTENCY_MAX_ABS` moves it.
+const DEFAULT_MAX_ABS: f32 = 2e-2;
 const CHUNKS: [usize; 5] = [1, 7, 8, 9, 16];
+
+fn max_abs_bar() -> Result<f32> {
+    match std::env::var("XWEN_QWEN3_CONSISTENCY_MAX_ABS") {
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX_ABS),
+        Err(e) => anyhow::bail!("XWEN_QWEN3_CONSISTENCY_MAX_ABS: {e}"),
+        Ok(v) => v
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|b| b.is_finite() && *b >= 0.0)
+            .with_context(|| {
+                format!("XWEN_QWEN3_CONSISTENCY_MAX_ABS={v:?} is not a non-negative number")
+            }),
+    }
+}
 const MAX_CTX: usize = 4096;
 
 /// The three fixture prompts the brief names: short, medium and the 610-token one.
@@ -115,39 +139,159 @@ fn logits_in_chunks(
     Ok(out)
 }
 
-/// Compare two all-position logit sets under the bar; returns the measured
-/// max-abs difference and panics with the first offending position. Every
-/// value must be finite before anything is folded: `f32::max` returns its
-/// non-NaN operand, so a NaN-filled output would otherwise read as a match.
-fn assert_same(label: &str, a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
-    assert_eq!(a.len(), b.len(), "{label}: position counts differ");
-    let mut worst = 0f32;
-    for (p, (x, y)) in a.iter().zip(b).enumerate() {
-        assert_eq!(
-            x.len(),
-            y.len(),
-            "{label}: vocab widths differ at position {p}"
-        );
-        let mut d = 0f32;
-        for (i, (u, v)) in x.iter().zip(y).enumerate() {
-            assert!(
-                u.is_finite() && v.is_finite(),
-                "{label}: non-finite logit at position {p} index {i}: {u} vs {v}"
-            );
-            d = d.max((u - v).abs());
-        }
-        worst = worst.max(d);
-        assert!(
-            d <= MAX_ABS,
-            "{label}: position {p}: max |Δlogit| {d:.4e} exceeds {MAX_ABS:.0e}"
-        );
-        assert_eq!(
-            argmax(x),
-            argmax(y),
-            "{label}: argmax differs at position {p}"
-        );
+/// One comparison of two all-position logit (or hidden-state) sets.
+struct Row {
+    prompt: String,
+    arm: &'static str,
+    /// What was compared against the arm's one-prefill run: a chunk size, or
+    /// a description for the cross-arm and encode rows.
+    against: String,
+    positions: usize,
+    /// The worst |Δ| over every position and vocabulary entry, and its position.
+    max_abs: f32,
+    max_at: usize,
+    argmax_agree: usize,
+    over_bar: usize,
+    /// Values that were inf or NaN on either side. A comparison with any is a
+    /// failure whatever the fold says: `f32::max` returns its non-NaN operand,
+    /// so a NaN-filled output would otherwise read as a match.
+    nonfinite: usize,
+}
+
+impl Row {
+    fn failed(&self, bar: f32) -> bool {
+        self.nonfinite > 0
+            || self.over_bar > 0
+            || self.argmax_agree != self.positions
+            || self.max_abs > bar
     }
-    worst
+}
+
+/// Every row of the run, printed as one table at the end and asserted after.
+struct Table {
+    bar: f32,
+    rows: Vec<Row>,
+}
+
+impl Table {
+    /// Compare `a` (the reference side) with `b` position by position and
+    /// record the row. Shape disagreements are the one thing that stops the
+    /// run: they are a harness bug, not a number to tabulate.
+    fn compare(
+        &mut self,
+        prompt: &str,
+        arm: &'static str,
+        against: impl Into<String>,
+        a: &[Vec<f32>],
+        b: &[Vec<f32>],
+    ) {
+        let label = format!("{prompt} {arm} {}", against.into());
+        assert_eq!(a.len(), b.len(), "{label}: position counts differ");
+        let mut row = Row {
+            prompt: prompt.to_string(),
+            arm,
+            against: label[prompt.len() + arm.len() + 2..].to_string(),
+            positions: a.len(),
+            max_abs: 0.0,
+            max_at: 0,
+            argmax_agree: 0,
+            over_bar: 0,
+            nonfinite: 0,
+        };
+        for (p, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(x.len(), y.len(), "{label}: widths differ at position {p}");
+            let mut d = 0f32;
+            for (u, v) in x.iter().zip(y) {
+                if !(u.is_finite() && v.is_finite()) {
+                    row.nonfinite += 1;
+                    continue;
+                }
+                d = d.max((u - v).abs());
+            }
+            if d > row.max_abs {
+                row.max_abs = d;
+                row.max_at = p;
+            }
+            if d > self.bar {
+                row.over_bar += 1;
+            }
+            if argmax(x) == argmax(y) {
+                row.argmax_agree += 1;
+            }
+        }
+        self.rows.push(row);
+    }
+
+    fn print(&self) {
+        println!(
+            "\nqwen3 consistency, bar max |Δ| <= {:.3e} (XWEN_QWEN3_CONSISTENCY_MAX_ABS), identical argmax",
+            self.bar
+        );
+        println!(
+            "{:<20} {:<6} {:<24} {:>5} {:>11} {:>6} {:>9} {:>8} {:>9}  {}",
+            "prompt",
+            "arm",
+            "against",
+            "pos",
+            "max|Δ|",
+            "at",
+            "argmax=",
+            "over",
+            "nonfinite",
+            "verdict"
+        );
+        for r in &self.rows {
+            println!(
+                "{:<20} {:<6} {:<24} {:>5} {:>11.4e} {:>6} {:>4}/{:<4} {:>8} {:>9}  {}",
+                r.prompt,
+                r.arm,
+                r.against,
+                r.positions,
+                r.max_abs,
+                r.max_at,
+                r.argmax_agree,
+                r.positions,
+                r.over_bar,
+                r.nonfinite,
+                if r.failed(self.bar) { "FAIL" } else { "ok" }
+            );
+        }
+    }
+
+    /// Print, then fail once with every row that missed the bar.
+    fn finish(self) -> Result<()> {
+        self.print();
+        let failures: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.failed(self.bar))
+            .map(|r| {
+                format!(
+                    "{} {} {}: max |Δ| {:.4e} at position {}, {} of {} positions over the bar, \
+                     argmax agrees at {} of {}, {} non-finite values",
+                    r.prompt,
+                    r.arm,
+                    r.against,
+                    r.max_abs,
+                    r.max_at,
+                    r.over_bar,
+                    r.positions,
+                    r.argmax_agree,
+                    r.positions,
+                    r.nonfinite
+                )
+            })
+            .collect();
+        anyhow::ensure!(
+            failures.is_empty(),
+            "{} of {} comparisons missed the bar {:.3e}:\n  {}",
+            failures.len(),
+            self.rows.len(),
+            self.bar,
+            failures.join("\n  ")
+        );
+        Ok(())
+    }
 }
 
 #[test]
@@ -160,10 +304,15 @@ fn the_qwen3_stack_is_consistent_across_chunkings_arms_and_encode_indices() -> R
         return Ok(());
     };
     let device = xwen::gguf::metal_device()?;
+    let mut table = Table {
+        bar: max_abs_bar()?,
+        rows: Vec::new(),
+    };
     // The encode-index half first: it loads under the default arm and must
     // not observe the environment switch the second half sets.
-    encode_indices_match_the_forward_taps(&dir, &device)?;
-    chunked_teacher_forcing_matches_one_prefill_at_every_position(&dir, &device)
+    encode_indices_match_the_forward_taps(&dir, &device, &mut table)?;
+    chunked_teacher_forcing_matches_one_prefill_at_every_position(&dir, &device, &mut table)?;
+    table.finish()
 }
 
 /// The same ids as one prefill, one token at a time and in uneven chunks, on
@@ -171,6 +320,7 @@ fn the_qwen3_stack_is_consistent_across_chunkings_arms_and_encode_indices() -> R
 fn chunked_teacher_forcing_matches_one_prefill_at_every_position(
     dir: &PathBuf,
     device: &Device,
+    table: &mut Table,
 ) -> Result<()> {
     let device = device.clone();
     let dir = dir.clone();
@@ -188,11 +338,7 @@ fn chunked_teacher_forcing_matches_one_prefill_at_every_position(
         let single = logits_in_chunks(&mut flash, ids, ids.len(), &device)?;
         for &chunk in &CHUNKS {
             let chunked = logits_in_chunks(&mut flash, ids, chunk, &device)?;
-            let worst = assert_same(&format!("{name} chunk {chunk}"), &single, &chunked);
-            println!(
-                "{name} ({} tokens): chunk {chunk:>2} vs one prefill: max |Δlogit| {worst:.3e}",
-                ids.len()
-            );
+            table.compare(name, "flash", format!("chunk {chunk}"), &single, &chunked);
         }
         single_flash.push(single);
     }
@@ -213,16 +359,16 @@ fn chunked_teacher_forcing_matches_one_prefill_at_every_position(
     );
     for ((name, ids), single) in prompts.iter().zip(&single_flash) {
         let sdpa_single = logits_in_chunks(&mut sdpa, ids, ids.len(), &device)?;
-        let worst = assert_same(&format!("{name} flash vs sdpa"), single, &sdpa_single);
-        println!("{name}: flash vs sdpa, one prefill: max |Δlogit| {worst:.3e}");
+        table.compare(name, "sdpa", "one prefill vs flash", single, &sdpa_single);
         for &chunk in &CHUNKS {
             let chunked = logits_in_chunks(&mut sdpa, ids, chunk, &device)?;
-            let worst = assert_same(
-                &format!("{name} sdpa chunk {chunk}"),
+            table.compare(
+                name,
+                "sdpa",
+                format!("chunk {chunk}"),
                 &sdpa_single,
                 &chunked,
             );
-            println!("{name}: sdpa chunk {chunk:>2} vs one prefill: max |Δlogit| {worst:.3e}");
         }
     }
     unsafe { std::env::remove_var(ATTN_ENV) };
@@ -233,7 +379,11 @@ fn chunked_teacher_forcing_matches_one_prefill_at_every_position(
 /// checkpoint: index 0 is the embedding rows, index 36 is the normed residual
 /// after layer 35 (the full forward's `l_out-35` tap through `output_norm`),
 /// and index 35 is that residual raw (the `l_out-34` tap).
-fn encode_indices_match_the_forward_taps(dir: &PathBuf, device: &Device) -> Result<()> {
+fn encode_indices_match_the_forward_taps(
+    dir: &PathBuf,
+    device: &Device,
+    table: &mut Table,
+) -> Result<()> {
     let mut model = load(dir, device)?;
     let device = device.clone();
     let n_layer = model.config().n_layer;
@@ -246,9 +396,12 @@ fn encode_indices_match_the_forward_taps(dir: &PathBuf, device: &Device) -> Resu
         (&[ids.len(), 2560][..], DType::BF16, ids.len())
     );
     let embed = model.embed_ids(&ids)?.to_dtype(DType::BF16)?;
-    assert_eq!(
-        assert_same("encode 0 vs embeddings", &rows(&h0)?, &rows(&embed)?),
-        0.0
+    table.compare(
+        "corpus-middle",
+        "encode",
+        "index 0 vs embeddings",
+        &rows(&h0)?,
+        &rows(&embed)?,
     );
 
     model.set_tap_capture(true);
@@ -266,13 +419,23 @@ fn encode_indices_match_the_forward_taps(dir: &PathBuf, device: &Device) -> Resu
 
     let (h35, _) = model.encode(&ids, 35)?;
     let l_out_34 = tap("l_out-34").to_dtype(DType::BF16)?;
-    let d35 = assert_same("encode 35 vs l_out-34", &rows(&h35)?, &rows(&l_out_34)?);
-    println!("encode 35 vs l_out-34: max |Δ| {d35:.3e}");
+    table.compare(
+        "corpus-middle",
+        "encode",
+        "index 35 vs l_out-34",
+        &rows(&h35)?,
+        &rows(&l_out_34)?,
+    );
 
     let (h36, _) = model.encode(&ids, 36)?;
     let normed = model.final_norm(&tap("l_out-35"))?.to_dtype(DType::BF16)?;
-    let d36 = assert_same("encode 36 vs norm(l_out-35)", &rows(&h36)?, &rows(&normed)?);
-    println!("encode 36 vs norm(l_out-35): max |Δ| {d36:.3e}");
+    table.compare(
+        "corpus-middle",
+        "encode",
+        "index 36 vs norm(l_out-35)",
+        &rows(&h36)?,
+        &rows(&normed)?,
+    );
 
     assert!(
         model.encode(&ids, 37).is_err(),
