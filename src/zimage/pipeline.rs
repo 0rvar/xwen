@@ -52,6 +52,22 @@ pub struct Timings {
     pub vae_decode: f64,
 }
 
+/// What one run produced: the image, and the two intermediate tensors the
+/// parity gate grades (docs/zimage.md, Stages 3 and 4). Both are small and on
+/// the device, so keeping them costs nothing a caller would notice.
+#[derive(Debug, Clone)]
+pub struct Rendered {
+    /// `[3, H, W]` u8 RGB on the CPU.
+    pub image: Tensor,
+    pub timings: Timings,
+    /// The velocity fed to the first Euler step, `(1, 16, H/8, W/8)` f32:
+    /// the negated transformer output at sigma 1, which is the one forward
+    /// whose inputs are known exactly on both sides of a comparison.
+    pub velocity0: Tensor,
+    /// The latent after the last step and before the VAE, same shape, f32.
+    pub final_latents: Tensor,
+}
+
 /// The transformer, the VAE and the scheduler config, resident on one device.
 pub struct ZImagePipeline {
     transformer: ZImageTransformer2DModel,
@@ -206,10 +222,42 @@ impl ZImagePipeline {
             .with_context(|| format!("casting the latents in {} to f32", path.display()))
     }
 
+    /// Read injected caption features, the encoder's `[T, 2560]` hidden state,
+    /// from a safetensors file holding them under `cap_feats`, in whatever
+    /// float dtype they were saved in. The width is checked against the
+    /// loaded transformer by [`Self::generate`]; this only refuses what cannot
+    /// be a caption at all, and it does so before anything loads, like
+    /// [`Self::read_latents`].
+    pub fn read_cap_feats(path: &Path) -> Result<Tensor> {
+        let tensors = candle_core::safetensors::load(path, &Device::Cpu)
+            .with_context(|| format!("reading the caption file {}", path.display()))?;
+        let cap = tensors.get("cap_feats").with_context(|| {
+            format!(
+                "{} has no `cap_feats` tensor; it holds {}",
+                path.display(),
+                if tensors.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    tensors.keys().cloned().collect::<Vec<_>>().join(", ")
+                }
+            )
+        })?;
+        let (t, _dim) = cap
+            .dims2()
+            .with_context(|| format!("the caption in {} is not [T, dim]", path.display()))?;
+        ensure!(t > 0, "the caption in {} has no tokens", path.display());
+        ensure!(
+            cap.dtype().is_float(),
+            "the caption in {} is {:?}, not a float dtype",
+            path.display(),
+            cap.dtype()
+        );
+        Ok(cap.clone())
+    }
+
     /// Generate one image from `cap_feats`, the text encoder's `[T, 2560]`
-    /// hidden state (any float dtype, any device). Returns `[3, H, W]` u8 RGB
-    /// on the CPU plus the phase timings.
-    pub fn generate(&self, cap_feats: &Tensor, opts: &ImageOptions) -> Result<(Tensor, Timings)> {
+    /// hidden state (any float dtype, any device).
+    pub fn generate(&self, cap_feats: &Tensor, opts: &ImageOptions) -> Result<Rendered> {
         Self::check_size(opts.width, opts.height)?;
         ensure!(opts.steps >= 1, "steps must be at least 1");
         let (t, cap_dim) = cap_feats
@@ -249,34 +297,72 @@ impl ZImagePipeline {
         let mut scheduler = FlowMatchEulerDiscreteScheduler::new(self.scheduler_cfg.clone())?;
         scheduler.set_timesteps(opts.steps)?;
         let mut timings = Timings::default();
+        let mut velocity0 = None;
 
         for _ in 0..opts.steps {
             let started = Instant::now();
-            // The timestep stays f32: the sinusoidal embedding is computed in
-            // f32 from it (as the reference does, autocast off) and only the
-            // embedding is cast to the model dtype. A bf16 timestep would
-            // round 0.0454 to 0.0454102 before anything used it.
             let t = scheduler.current_timestep_normalized();
-            let t = Tensor::new(&[t as f32], &self.device)?;
-            let x = latents.to_dtype(self.dtype)?.unsqueeze(2)?;
-            let pred = self.transformer.forward(&x, &t, &cap_feats)?;
-            // The transformer predicts the flow towards noise; the Euler step
-            // wants the velocity towards data. Kept in f32 like the latent.
-            let velocity = pred.squeeze(2)?.to_dtype(DType::F32)?.neg()?;
+            let velocity = self.velocity_batched(&latents, &cap_feats, t as f32)?;
+            if velocity0.is_none() {
+                velocity0 = Some(velocity.clone());
+            }
             latents = scheduler.step(&velocity, &latents)?;
             // The step's arithmetic is asynchronous on Metal; reading one
             // element back is what makes the timing mean anything.
             let _ = latents.flatten_all()?.get(0)?.to_scalar::<f32>()?;
             timings.steps.push(started.elapsed().as_secs_f64());
         }
+        let velocity0 = velocity0.expect("at least one step ran");
 
         let started = Instant::now();
-        let image = self.vae.decode(&latents)?; // (1, 3, H, W) f32
-        let image = postprocess_image(&image)?
-            .squeeze(0)?
-            .to_device(&Device::Cpu)?;
+        let image = self.decode(&latents)?;
         timings.vae_decode = started.elapsed().as_secs_f64();
-        Ok((image, timings))
+        Ok(Rendered {
+            image,
+            timings,
+            velocity0,
+            final_latents: latents,
+        })
+    }
+
+    /// One transformer forward: the velocity towards data at normalized
+    /// timestep `t` (`1 - sigma`) for a `(1, 16, H/8, W/8)` f32 latent and
+    /// the encoder's `[T, 2560]` caption. The body of one Euler step in
+    /// [`Self::generate`], public so the parity gate can grade a single
+    /// forward and so a deliberately wrong `t` can bracket its bar.
+    pub fn velocity(&self, latents: &Tensor, cap_feats: &Tensor, t: f32) -> Result<Tensor> {
+        let cap_feats = cap_feats
+            .to_device(&self.device)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(0)?;
+        let latents = latents.to_device(&self.device)?.to_dtype(DType::F32)?;
+        self.velocity_batched(&latents, &cap_feats, t)
+    }
+
+    /// [`Self::velocity`] with the caption already batched and in the model
+    /// dtype, which the step loop does once rather than per step.
+    fn velocity_batched(&self, latents: &Tensor, cap_feats: &Tensor, t: f32) -> Result<Tensor> {
+        // The timestep stays f32: the sinusoidal embedding is computed in
+        // f32 from it (as the reference does, autocast off) and only the
+        // embedding is cast to the model dtype. A bf16 timestep would
+        // round 0.0454 to 0.0454102 before anything used it.
+        let t = Tensor::new(&[t], &self.device)?;
+        let x = latents.to_dtype(self.dtype)?.unsqueeze(2)?;
+        let pred = self.transformer.forward(&x, &t, cap_feats)?;
+        // The transformer predicts the flow towards noise; the Euler step
+        // wants the velocity towards data. Kept in f32 like the latent.
+        Ok(pred.squeeze(2)?.to_dtype(DType::F32)?.neg()?)
+    }
+
+    /// Decode a `(1, 16, H/8, W/8)` latent through the VAE into `[3, H, W]`
+    /// u8 RGB on the CPU. The tail of [`Self::generate`], public so a
+    /// reference latent can be decoded through this VAE alone.
+    pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        let latents = latents.to_device(&self.device)?.to_dtype(DType::F32)?;
+        let image = self.vae.decode(&latents)?; // (1, 3, H, W) f32
+        Ok(postprocess_image(&image)?
+            .squeeze(0)?
+            .to_device(&Device::Cpu)?)
     }
 
     pub fn transformer_config(&self) -> &Config {
@@ -303,14 +389,7 @@ impl ZImagePipeline {
 /// output. The counter only supplies the next candidate; the filesystem decides
 /// who got it.
 pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
-    let (c, h, w) = image.dims3().context("the image is [3, H, W]")?;
-    ensure!(c == 3, "the image has {c} channels, PNG RGB needs 3");
-    // Channel-last, interleaved, as PNG wants it.
-    let pixels: Vec<u8> = image
-        .permute((1, 2, 0))?
-        .contiguous()?
-        .flatten_all()?
-        .to_vec1::<u8>()?;
+    let bytes = encode_png(image)?;
     // A sibling, so the rename is within one filesystem and therefore atomic.
     let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         bail!("{} is not a file path to write a PNG to", path.display());
@@ -346,12 +425,9 @@ pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
         }
     };
     let write = || -> Result<()> {
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header()?;
-        writer.write_image_data(&pixels)?;
-        writer.finish()?;
+        let mut file = file;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        std::io::Write::flush(&mut file)?;
         Ok(())
     };
     if let Err(e) = write() {
@@ -372,6 +448,27 @@ pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Encode a `[3, H, W]` u8 tensor as RGB8 PNG bytes, the form an HTTP
+/// response wants and [`write_png`] writes.
+pub fn encode_png(image: &Tensor) -> Result<Vec<u8>> {
+    let (c, h, w) = image.dims3().context("the image is [3, H, W]")?;
+    ensure!(c == 3, "the image has {c} channels, PNG RGB needs 3");
+    // Channel-last, interleaved, as PNG wants it.
+    let pixels: Vec<u8> = image
+        .permute((1, 2, 0))?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<u8>()?;
+    let mut bytes = Vec::with_capacity(pixels.len() / 2);
+    let mut encoder = png::Encoder::new(&mut bytes, w as u32, h as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&pixels)?;
+    writer.finish()?;
+    Ok(bytes)
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {

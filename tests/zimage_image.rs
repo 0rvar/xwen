@@ -73,7 +73,8 @@ fn zimage_turbo_produces_a_non_degenerate_image() -> Result<()> {
         seed: 0,
         latents: None,
     };
-    let (image, timings) = pipeline.generate(&cap_feats, &opts)?;
+    let rendered = pipeline.generate(&cap_feats, &opts)?;
+    let (image, timings) = (rendered.image, rendered.timings);
     eprintln!("steps {:?} vae {:.2}s", timings.steps, timings.vae_decode);
     assert_eq!(image.dims(), &[3, 1024, 1024]);
 

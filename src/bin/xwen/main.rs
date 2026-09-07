@@ -616,6 +616,18 @@ enum Cmd {
         /// that started from the same latent.
         #[arg(long)]
         latents: Option<PathBuf>,
+        /// A safetensors file whose `cap_feats` tensor, `[T, 2560]`, replaces
+        /// the text encoder's output; the encoder is not loaded and the prompt
+        /// is ignored. With `--latents` this makes the run a pure transformer
+        /// comparison against a reference that read the same two files.
+        #[arg(long)]
+        cap_feats: Option<PathBuf>,
+        /// A directory to write the run's step-0 velocity
+        /// (`velocity0.safetensors`, key `velocity`) and final latent
+        /// (`latents-final.safetensors`, key `latents`) into, both
+        /// `[1, 16, H/8, W/8]` f32, for grading against a reference dump.
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
 }
 
@@ -2110,6 +2122,8 @@ fn main() -> Result<()> {
             model,
             model_size,
             latents,
+            cap_feats,
+            dump,
         }) => run_image(ImageArgs {
             prompt,
             width,
@@ -2120,6 +2134,8 @@ fn main() -> Result<()> {
             model,
             model_size,
             latents,
+            cap_feats,
+            dump,
         }),
     }
 }
@@ -2334,6 +2350,8 @@ struct ImageArgs {
     model: Option<PathBuf>,
     model_size: Option<Model>,
     latents: Option<PathBuf>,
+    cap_feats: Option<PathBuf>,
+    dump: Option<PathBuf>,
 }
 
 /// `xwen image`: Z-Image-Turbo, prompt to PNG.
@@ -2372,6 +2390,14 @@ fn run_image(args: ImageArgs) -> Result<()> {
         Some(path) => Some(ZImagePipeline::read_latents(path, args.width, args.height)?),
         None => None,
     };
+    let injected_cap = match &args.cap_feats {
+        Some(path) => Some(ZImagePipeline::read_cap_feats(path)?),
+        None => None,
+    };
+    if let Some(dir) = &args.dump {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating the dump directory {}", dir.display()))?;
+    }
 
     let root = match args.model {
         Some(root) => root,
@@ -2397,30 +2423,47 @@ fn run_image(args: ImageArgs) -> Result<()> {
     let device = gguf::metal_device()?;
     let total_start = std::time::Instant::now();
 
-    // The text encoder, and the prompt as the pipeline renders it.
-    let load_start = std::time::Instant::now();
-    let source = CheckpointSource::open(&encoder_dir, &device, Some(encoder_entry))?;
-    let set = source
-        .safetensors()
-        .with_context(|| {
-            format!(
-                "{} did not open as a safetensors set",
-                encoder_dir.display()
-            )
-        })?
-        .clone();
-    let (_text, ids) = encoder_prompt_ids(encoder_entry, set.tokenizer_path(), args.prompt)?;
-    let mut encoder = xwen::model::XwenModel::load_encoder(source, spec.max_tokens)?;
-    eprintln!(
-        "xwen: text encoder loaded in {:.1}s",
-        load_start.elapsed().as_secs_f64()
-    );
-    let encode_start = std::time::Instant::now();
-    let (cap_feats, n_tokens) = encoder.encode(&ids, spec.layer)?;
-    eprintln!(
-        "xwen: {n_tokens} prompt tokens encoded in {:.0}ms",
-        encode_start.elapsed().as_secs_f64() * 1000.0
-    );
+    // The text encoder, and the prompt as the pipeline renders it — unless
+    // the caption came in as a file, in which case the encoder is not opened
+    // at all: that run is a transformer comparison and the prompt has no say.
+    let cap_feats = match injected_cap {
+        Some(cap) => {
+            let (t, dim) = cap.dims2()?;
+            eprintln!(
+                "xwen: caption features from {} ({t} tokens x {dim}, {:?}); the prompt is ignored",
+                args.cap_feats.as_deref().unwrap_or(Path::new("")).display(),
+                cap.dtype()
+            );
+            cap
+        }
+        None => {
+            let load_start = std::time::Instant::now();
+            let source = CheckpointSource::open(&encoder_dir, &device, Some(encoder_entry))?;
+            let set = source
+                .safetensors()
+                .with_context(|| {
+                    format!(
+                        "{} did not open as a safetensors set",
+                        encoder_dir.display()
+                    )
+                })?
+                .clone();
+            let (_text, ids) =
+                encoder_prompt_ids(encoder_entry, set.tokenizer_path(), args.prompt)?;
+            let mut encoder = xwen::model::XwenModel::load_encoder(source, spec.max_tokens)?;
+            eprintln!(
+                "xwen: text encoder loaded in {:.1}s",
+                load_start.elapsed().as_secs_f64()
+            );
+            let encode_start = std::time::Instant::now();
+            let (cap_feats, n_tokens) = encoder.encode(&ids, spec.layer)?;
+            eprintln!(
+                "xwen: {n_tokens} prompt tokens encoded in {:.0}ms",
+                encode_start.elapsed().as_secs_f64() * 1000.0
+            );
+            cap_feats
+        }
+    };
 
     let load_start = std::time::Instant::now();
     let pipeline = ZImagePipeline::load(&root, &device)?;
@@ -2447,12 +2490,31 @@ fn run_image(args: ImageArgs) -> Result<()> {
         seed,
         latents,
     };
-    let (image, timings) = pipeline.generate(&cap_feats, &opts)?;
+    let rendered = pipeline.generate(&cap_feats, &opts)?;
+    let timings = &rendered.timings;
     for (i, secs) in timings.steps.iter().enumerate() {
         eprintln!("xwen: step {}/{} {:.2}s", i + 1, args.steps, secs);
     }
     eprintln!("xwen: VAE decode {:.2}s", timings.vae_decode);
-    write_png(&image, &args.out)?;
+    write_png(&rendered.image, &args.out)?;
+    if let Some(dir) = &args.dump {
+        let cpu = |t: &candle_core::Tensor| t.to_device(&candle_core::Device::Cpu);
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([("velocity".to_string(), cpu(&rendered.velocity0)?)]),
+            dir.join("velocity0.safetensors"),
+        )?;
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([(
+                "latents".to_string(),
+                cpu(&rendered.final_latents)?,
+            )]),
+            dir.join("latents-final.safetensors"),
+        )?;
+        eprintln!(
+            "xwen: velocity0 and final latents written under {}",
+            dir.display()
+        );
+    }
     println!(
         "{}x{}, {} steps, {noise_source}, written to {} ({:.1}s total)",
         args.width,

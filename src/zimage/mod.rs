@@ -41,7 +41,7 @@ pub mod scheduler;
 pub mod transformer;
 pub mod vae;
 
-pub use pipeline::{ImageOptions, ZImagePipeline};
+pub use pipeline::{ImageOptions, Rendered, Timings, ZImagePipeline, encode_png, write_png};
 pub use sampling::{postprocess_image, seeded_noise};
 pub use scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};
 pub use transformer::{ATTN_ENV, AttnImpl, Config, ZImageTransformer2DModel};
