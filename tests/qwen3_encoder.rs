@@ -584,7 +584,9 @@ fn zimage_encoder_matches_the_fp32_reference() -> Result<()> {
     let device = xwen::gguf::metal_device().context("this test needs the Metal device")?;
     let source = xwen::CheckpointSource::open(&dir, &device, Some(entry))
         .with_context(|| format!("opening the Z-Image text encoder at {}", dir.display()))?;
-    let mut model = xwen::XwenModel::load(source, xwen::ops::ExpertRunner::Fused, spec.max_tokens)
+    // The encoder entry ships zero-filled planes in layer 35, which the LM load
+    // refuses; `load_encoder` is the one entry that accepts an encode-only set.
+    let mut model = xwen::XwenModel::load_encoder(source, spec.max_tokens)
         .context("loading the Z-Image text encoder")?;
 
     let mut rows = Vec::new();
