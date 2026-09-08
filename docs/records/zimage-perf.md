@@ -1228,7 +1228,55 @@ the first three steps.
 | the SwiGLU bf16 store | REFUTED, see the arc above | the row's basis was the profiler's pool eviction; the gemm runs at 37-45 TFLOP/s with the f32 store, bandwidth caps the lever at ~0.2 s per image, and the built kernel measured parity within 5% with an unstable sign | none | on the branch `zimage-ffn` (5e7a6ea), not on master (decisions.md "The bf16 SwiGLU store is REFUTED") |
 
 The dense bf16 floor of the previous ledger, a 1.25 s step, is where the FIRST step already
-sits; there is no floor to quote for the plateau until the envelope is read.
+sits; the plateau's floor is now a joules figure, below.
+
+### The energy budget of a step, and what it does to the rows above (2026-09-08, evening)
+
+The envelope reading turns the ledger into an energy ledger, and this is the budget as far
+as it can be built tonight. At the High Power plateau a 1024x1024 step is 35 W for 1.87 s,
+**about 65 J**; at the full clock it is 86 W for 1.32 s, about 114 J, so the plateau's
+operating point is 1.75x more efficient per joule and the machine is choosing it. The CPU
+draws 2.8 W of the 38 W package during the steps (`CPU Power` in the 24-step High Power
+trace, steady part), so there is nothing to reclaim from the host side. A step is about 59
+TFLOP (50 in the four gemms over 34 blocks, 9 in attention) and, by an estimate from the
+tensor shapes, **110-120 GB of memory traffic**: 12.3 GB of bf16 weights and roughly 3 GB per
+block of f32 activations (the q/k/v chain alone is about 1 GB per block: the gemm's f32
+output, the QK-norm pass, the rope pass, the head transpose, the f16 cast for attention and
+the untranspose). The one number missing is the split of the 65 J between compute and
+traffic. At plausible LPDDR path costs of 80-160 pJ per byte the traffic is 10-19 J, 15-30%
+of the step, which would make halving the activation bytes worth 7-15% at the plateau; at
+half that cost it is under 10% and nothing on this page short of int8, the step count or
+caching reaches double digits. **The instrument that settles it is an hour**: run
+`ops::bandwidth::tests::bandwidth_sweep` and the gemm rows of `tests/zimage_microbench.rs`
+under `scripts/zimage-power.sh` (it needs a mode that wraps an arbitrary command instead of
+`xwen image`), read joules per byte and joules per FLOP on this machine, and rebuild the 65 J
+from measured parts. Until then every percentage below is a guess with its assumption
+attached.
+
+What the rows become under that budget, without int8 and without touching the step count:
+
+- **The q/k/v chain as one pass.** QK-norm, the interleaved-pair rope, the head transpose and
+  the f16 cast in one kernel that writes f16 heads straight into what `flash_attn_tensor`
+  reads, and the untranspose folded into the out-projection's input read. Removes about four
+  full passes over q, k and v per block, 25-30 GB per step, a quarter of the activation
+  traffic. Accuracy unchanged by construction: the math stays f32 in registers and attention
+  already consumes f16. This is the "four full-tensor copies" and the `attn.qknorm` and rope
+  rows of the elementwise tail taken together, and it is the only row with a double-digit
+  case at the plateau, 4-10% depending on the joules per byte. Days.
+- **Gemm tile tuning at N 11520 and 20480**, the fusion item above. Cycles per FLOP fall, but
+  at a fixed power budget only the overhead share of those cycles (leakage, control, memory
+  stalls) converts to time. 3-8%, and `tests/zimage_microbench.rs` under the power script
+  prices it in an afternoon.
+- **The VAE decode**, 1.2-1.4 s of a ~13 s render at the plateau, traffic-bound f32 NCHW
+  convs. 3-5% if halved, and halving needs either bf16, which the 60 dB bar refused, or
+  resnet-block fusion that keeps tiles resident across the two convs. Not priced.
+- **The FFN intermediate in f16** would halve about 500 MB per block and is refuted as it
+  stands: the measured maximum is 284,507 against f16's 65,504. A per-row scale folded into
+  w2's input read would reopen it (decisions.md "The bf16 SwiGLU store is REFUTED"), a
+  different arc.
+- **Cooling** is not code, and it is the largest number here: the automatic-mode budget is
+  22-29 W and the High Power budget 33-38 W, and every sustained watt is about 3% of the
+  plateau step.
 
 Below the kernels, three record lines with reopen conditions, re-based on the new step.
 

@@ -135,6 +135,7 @@ priced, not their rank ([the record](docs/records/zimage-perf.md), "The power en
 5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
 6. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
 7. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
+8. **Joules per byte and per FLOP on this machine, under the power script** (Image generation, measured, an instrument): a 1024x1024 step is 65 J at the 35 W plateau and the split between its ~59 TFLOP and ~110-120 GB of traffic is the one number that prices every remaining image row; an hour, and it decides whether the q/k/v chain fusion is worth 4% or 10%
 
 ## Decode performance
 
@@ -809,6 +810,23 @@ priced, not their rank ([the record](docs/records/zimage-perf.md), "The power en
 ## Tokenizer, chat and sampling
 
 ## Image generation
+
+- [ ] [measured] **Joules per byte and per FLOP on this machine, read under the power script.**
+  An instrument. The envelope reading made the image ledger an energy ledger: at the High
+  Power plateau a 1024x1024 step is 35 W for 1.87 s, about 65 J, against 114 J at the full
+  clock, and time at the plateau is joules over a fixed budget. A step is ~59 TFLOP and, by an
+  estimate from the shapes, 110-120 GB of traffic, and the split of the 65 J between the two
+  is unmeasured: at 80-160 pJ per byte the traffic is 15-30% of the step and halving the
+  activation bytes is worth 7-15%; at half that it is under 10% and no row short of int8, the
+  step count or caching reaches double digits. What to run: `ops::bandwidth::tests::
+  bandwidth_sweep` and the gemm rows of `tests/zimage_microbench.rs` under
+  `scripts/zimage-power.sh`, which needs a mode that wraps an arbitrary command instead of
+  `xwen image`; read GPU watts against the GB/s and TFLOP/s each reports, and rebuild the 65 J
+  from the parts. What it prices: the q/k/v chain fusion (25-30 GB per step, the only row with
+  a double-digit case), gemm tile tuning, the VAE decode and the FFN per-row scale, all listed
+  with their guesses in the record's "The energy budget of a step". An hour (2026-09-08).
+  [Record](docs/records/zimage-perf.md), [figures](docs/perf-state.md).
+  From: Deferred from the Z-Image power envelope reading (2026-09-08).
 
 - [ ] [unpriced] **Fuse Z-Image's q/k/v and SwiGLU gemms, then tune the tiles at those shapes.**
   The four gemms are ~1.26 s of a 2.15 s step on the merged tree, which is the largest
