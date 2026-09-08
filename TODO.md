@@ -135,7 +135,7 @@ priced, not their rank ([the record](docs/records/zimage-perf.md), "The power en
 5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
 6. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
 7. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
-8. **Joules per byte and per FLOP on this machine, under the power script** (Image generation, measured, an instrument): a 1024x1024 step is 65 J at the 35 W plateau and the split between its ~59 TFLOP and ~110-120 GB of traffic is the one number that prices every remaining image row; an hour, and it decides whether the q/k/v chain fusion is worth 4% or 10%
+8. **Joules per byte and per FLOP on this machine, read under the power script** (Image generation, measured, an instrument): a 1024x1024 step is 65 J at the 35 W plateau and the split between its ~59 TFLOP and ~110-120 GB of traffic is the one number that prices every remaining image row; an hour, and it decides whether the q/k/v chain fusion is worth 4% or 10%
 
 ## Decode performance
 
