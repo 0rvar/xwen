@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-08",
+  "purpose": "Manual one-seed visual smoke; not golden pixel assertions or a general quality study.",
+  "pipeline": {
+    "repo": "Tongyi-MAI/Z-Image-Turbo",
+    "revision": "f332072aa78be7aecdf3ee76d5c247082da564a6"
+  },
+  "preprocessors": {
+    "pose": {
+      "repo": "yzd-v/DWPose",
+      "revision": "1a7144101628d69ee7a3768d1ee3a094070dc388",
+      "files": [
+        "yolox_l.onnx",
+        "dw-ll_ucoco_384.onnx"
+      ]
+    },
+    "depth": {
+      "repo": "jeroenvlek/depth-anything-v2-safetensors",
+      "revision": "a8cd5eb93485537f612b31b78864b41f659b245d",
+      "file": "depth_anything_v2_vits.safetensors"
+    },
+    "canny": "xwen built-in canny"
+  },
+  "source_fixture": {
+    "path": "tests/fixtures/zimage-transformer/512x512-p1-s0/image-fp32.png",
+    "sha256": "a0966d9d8db0fc326e24fa63a7592f1214370061cbfc8fada17c9dac59216cd1"
+  },
+  "binary_sha256": "c834441caf23ca719e135c2d3368aee839698354a47fe9841594f1ac22cb677c",
+  "runs": [
+    {
+      "output": "neutral-baseline.png",
+      "prompt": "A full-body photograph of a man, both feet visible, plain studio background",
+      "seed": 47,
+      "width": 512,
+      "height": 512,
+      "steps": 8,
+      "loras": [],
+      "init_image": null,
+      "mask": null,
+      "surface": "POST /v1/images/render",
+      "control": null
+    },
+    {
+      "output": "full-neutral-pose.png",
+      "prompt": "A full-body photograph of a man, both feet visible, plain studio background",
+      "seed": 47,
+      "width": 512,
+      "height": 512,
+      "steps": 8,
+      "loras": [],
+      "init_image": null,
+      "mask": null,
+      "surface": "POST /v1/images/render",
+      "control": {
+        "repo": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
+        "revision": "5155fc56d17821007d6f62ac192c09e0f0e72016",
+        "file": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+        "scale": 0.75,
+        "start": 0,
+        "end": 0.8,
+        "map": "extracted-pose-map.png",
+        "preprocess": "pose",
+        "source": "tests/fixtures/zimage-transformer/512x512-p1-s0/image-fp32.png"
+      }
+    },
+    {
+      "output": "full-neutral-synthetic.png",
+      "prompt": "A full-body photograph of a man, both feet visible, plain studio background",
+      "seed": 47,
+      "width": 512,
+      "height": 512,
+      "steps": 8,
+      "loras": [],
+      "init_image": null,
+      "mask": null,
+      "surface": "POST /v1/images/render",
+      "control": {
+        "repo": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
+        "revision": "5155fc56d17821007d6f62ac192c09e0f0e72016",
+        "file": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+        "scale": 0.75,
+        "start": 0,
+        "end": 0.8,
+        "map": "synthetic-pose.png",
+        "preprocess": "none",
+        "source": "tests/fixtures/zimage-control-study/synthetic-pose.png"
+      }
+    },
+    {
+      "output": "lite-neutral-synthetic.png",
+      "prompt": "A full-body photograph of a man, both feet visible, plain studio background",
+      "seed": 47,
+      "width": 512,
+      "height": 512,
+      "steps": 8,
+      "loras": [],
+      "init_image": null,
+      "mask": null,
+      "surface": "xwen image CLI",
+      "control": {
+        "repo": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
+        "revision": "5155fc56d17821007d6f62ac192c09e0f0e72016",
+        "file": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps.safetensors",
+        "scale": 0.75,
+        "start": 0,
+        "end": 0.8,
+        "map": "synthetic-pose.png",
+        "preprocess": "none",
+        "source": "tests/fixtures/zimage-control-study/synthetic-pose.png"
+      }
+    },
+    {
+      "output": "lite-depth.png",
+      "prompt": "A full-body photograph of a man standing with his arms stretched out horizontally, both feet visible, plain studio background",
+      "seed": 47,
+      "width": 512,
+      "height": 512,
+      "steps": 8,
+      "loras": [],
+      "init_image": null,
+      "mask": null,
+      "surface": "POST /v1/images/render",
+      "control": {
+        "repo": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
+        "revision": "5155fc56d17821007d6f62ac192c09e0f0e72016",
+        "file": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps.safetensors",
+        "scale": 0.75,
+        "start": 0,
+        "end": 0.8,
+        "map": "depth-map.png",
+        "preprocess": "depth",
+        "source": "tests/fixtures/zimage-transformer/512x512-p1-s0/image-fp32.png"
+      }
+    },
+    {
+      "output": "lite-canny.png",
+      "prompt": "A full-body photograph of a man standing with his arms stretched out horizontally, both feet visible, plain studio background",
+      "seed": 47,
+      "width": 512,
+      "height": 512,
+      "steps": 8,
+      "loras": [],
+      "init_image": null,
+      "mask": null,
+      "surface": "POST /v1/images/render",
+      "control": {
+        "repo": "alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1",
+        "revision": "5155fc56d17821007d6f62ac192c09e0f0e72016",
+        "file": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps.safetensors",
+        "scale": 0.75,
+        "start": 0,
+        "end": 0.8,
+        "map": "canny-map.png",
+        "preprocess": "canny",
+        "source": "tests/fixtures/zimage-transformer/512x512-p1-s0/image-fp32.png"
+      }
+    }
+  ],
+  "observations": [
+    "Both lite and full follow the synthetic T-pose under the same pose-neutral prompt in this seed.",
+    "Full follows the extracted seated pose broadly; no exact-prompt lite extracted comparison is included.",
+    "Lite depth changes composition toward seated source geometry.",
+    "Lite canny imposes source geometry but creates ghost limbs and anatomical artifacts.",
+    "Adding standing naturally caused lite synthetic output to keep arms down in a separate unsaved diagnostic; prompt sensitivity prevents broad conclusions."
+  ],
+  "files": {
+    "synthetic-pose.png": {
+      "sha256": "c1bcb11d5f7c4f72a71180f48a97248c5a44d1ec8caf3241e2ca0eec1e379735",
+      "bytes": 2844
+    },
+    "synthetic-pose.json": {
+      "sha256": "378aeef35057850f662dbb2aef97e6f768e579da179f5fd547c40a37c06add9e",
+      "bytes": 2595
+    },
+    "neutral-baseline.png": {
+      "sha256": "6cdfdd851cbcb4e1b16f38089efd9bd57f4b7c9a2f50a4d27beec64202a439df",
+      "bytes": 226550
+    },
+    "full-neutral-pose.png": {
+      "sha256": "fb96dcc0be5575938dcf025855e2f5469f6278c6141852ab1adc68f97ecace08",
+      "bytes": 239055
+    },
+    "extracted-pose-map.png": {
+      "sha256": "feaacf409170935d9b5b878e73bfff5660e5a176ce15e9c0c9ac8a76b3dab80b",
+      "bytes": 6522
+    },
+    "full-neutral-synthetic.png": {
+      "sha256": "07fdd387f00e758ee28f11d9855fa1e160f21ac9523bb88bf1578da2db5a707b",
+      "bytes": 199597
+    },
+    "lite-neutral-synthetic.png": {
+      "sha256": "f883f85d4f2783f50cd2266269b2ad2d3df2468e8ac0a4e8b1f67ed953a5912d",
+      "bytes": 212424
+    },
+    "lite-depth.png": {
+      "sha256": "0f8ec9c3afb681623f6e3ad1bfa675077e740db0b366e0207cf4749d7a7590d4",
+      "bytes": 268171
+    },
+    "depth-map.png": {
+      "sha256": "87183331a503411a3c7132e6bc771d0f1cbffa203fccb99da930e96a244a5a95",
+      "bytes": 40446
+    },
+    "lite-canny.png": {
+      "sha256": "e9369297d04ec5e674981510751cdc9b8475055e896b5bf24b8e237b646f58e4",
+      "bytes": 278367
+    },
+    "canny-map.png": {
+      "sha256": "5a41666106ee48bb8655ec047c238bc0c1eeb13759d7870b8ada2de696b91c06",
+      "bytes": 7451
+    },
+    "timing.json": {
+      "sha256": "2c80f1dc960cbd5451f3620c438967f6d011de463336ca2846e3cc695891edd8",
+      "bytes": 22239
+    },
+    "timing-control.png": {
+      "sha256": "9f9909e6893db4ab7537b14d2c314721f7e25d625dc1d185003b9175abab9216",
+      "bytes": 153782
+    }
+  },
+  "timing": {
+    "data": "timing.json",
+    "control_map": "timing-control.png"
+  }
+}

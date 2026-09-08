@@ -16,9 +16,13 @@ in plain and trained-inpaint modes. The original text-to-image gate remains at
 46.54 dB. Depth matches its author's raw output at relative L2 7.996e-7; pose points
 differ by at most 0.914 pixels on the reference fixture. Control follows the checkpoint
 author's graph, resolving incompatible diffusers and ComfyUI implementations. Depth
-uses a fixed 518-square input, and pose rasterization approximates OpenCV. Runtime
-HTTP verification and controlled ControlNet cost measurements are recorded with this arc
-as they complete. CFG and the GUI retain the PRD's conditional and excluded scope.
+uses a fixed 518-square input, and pose rasterization approximates OpenCV. Real HTTP/CLI
+smokes pass, including adapter reset and combined controls; all standing 35B-A3B and 27B
+regression tiers pass too. Both side models follow a
+hand-drawn T-pose in the saved neutral-prompt study. At 512x512 on pinned `aee38d5`,
+`lowpowermode 2`, lite adds 27.8% and full 66.4% to logged step/decode intervals;
+[perf-state.md](perf-state.md) states the timing boundaries and protocol. CFG and the GUI
+retain the PRD's conditional and excluded scope.
 
 ## 2026-09-08 — The Z-Image plateau is a hardware clock limiter, step count priced (6 steps -23%, 4 steps -48% of the render), and `serve --image-steps`
 

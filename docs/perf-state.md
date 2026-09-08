@@ -297,6 +297,28 @@ The 8-step render of 13.97 s sits under the 15.5-17.5 s quoted above because thi
 ramp read +31% over eight steps (1.37 to 1.80 s) where the clean e5d9775 runs read +55%; the
 first step matched. That spread is the envelope question, unchanged.
 
+**ControlNet cost, measured 2026-09-08 on a pinned build of aee38d5.** 512x512, eight
+steps, saved caption/noise tensors, the same supplied Canny map, scale 0.75 and window
+`[0,0.8)`. No text encoder. Three warm interleaved base/lite/full rounds, 60 seconds
+idle between rounds, after a complete warm-up round. The power line throughout was
+` lowpowermode         2`.
+
+| Arm | Logged step + decode intervals | Added interval time | Approximate CLI wall after load |
+|---|---:|---:|---:|
+| Base | 2.95 s | baseline | 3.0 s |
+| Lite 2602 8-step | 3.77 s | 0.82 s, 27.8% | 3.9 s |
+| Full 2602 8-step | 4.91 s | 1.96 s, 66.4% | 5.1 s |
+
+The first logged step includes pending GPU control preparation: the control VAE encode
+is enqueued before the timer and completed by the step's readback. The interval sum
+therefore excludes some host setup, but not all control encoding. CLI wall minus load
+includes preparation and PNG writing and is approximate because both inputs round to
+0.1 seconds. Later active steps read 0.33–0.34 s for base, 0.39–0.40 s for lite and
+0.53–0.65 s for full; full's upper end appeared in the last round. The warm baseline
+anchor moved 2.96 to 2.95 s, -0.34%, below the 3% drift flag. These figures do not price
+1024x1024's sustained clock envelope or HTTP residency. Protocol and limitations:
+[control record](records/zimage-controlnet.md).
+
 | Figure, resolution-independent | Value |
 | --- | --- |
 | encode, 20-39 tokens | 6-11 ms warm, 166 ms cold |

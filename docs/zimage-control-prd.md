@@ -267,6 +267,15 @@ runs as its own arc with its own doc.
 - Whether img2img at eighth-step granularity is fine enough. If not, the fix is a
   denser schedule for the img2img tail, which is a scheduler change and not free.
 
+2026-09-08 verification answers: the [control record](records/zimage-controlnet.md)
+contains a saved one-seed study where both lite and full follow a synthetic OpenPose
+map, full follows an extracted seated pose, and depth changes composition. Prompt
+sensitivity and Canny anatomy artifacts remain visible, so this is not a general
+quality guarantee. The same record holds the pinned cost protocol, with the current
+figures in [perf-state.md](perf-state.md). No tested case requires reopening CFG.
+Finer img2img schedule control and shared language/image residency remain conditional
+on an actual client workload.
+
 ## Not in scope
 
 - Z-Image base as a second generator. Same shapes, but a different resident set, CFG,

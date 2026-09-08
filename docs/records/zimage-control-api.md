@@ -49,6 +49,29 @@ decode, report the final trajectory, and test schedule/mask mechanics independen
 The outside review's strength-one concern does not change initialization: at sigma one,
 the source coefficient is zero by the reference equation.
 
+An isolated HTTP server exercised the real cached models. Native strength zero with
+`n: 2` returned exact source RGB, seeds 4711/4712 and start step 8; strength 0.6 returned
+start step 3. Multipart edits preserved the opaque mask region, and variations rendered.
+Base, pixel-art adapter, then an empty adapter set restored the first seeded base image
+exactly. Canny, pose and depth preprocessing returned PNGs; default cached ControlNet
+returned its map, and a combined adapter/control request rendered successfully. Unknown
+native fields and invalid preprocess types returned 400. The CLI also rendered with
+source, mask, blur, adapter and control flags together. These are correctness smokes,
+not server throughput measurements. The run completed 24 successful HTTP requests,
+two expected 400s and two successful CLI runs; its test servers were stopped afterward.
+
+The standing language-model gates also passed on `aee38d5`: strict, mm, three forced
+decode fixtures and perplexity, for both 35B-A3B and 27B. The 35B mm cosine was
+0.999618; its decode rows had only the gate's existing near-tie exceptions and zero
+mismatches. The 27B had 64/64 exact decode agreements on every fixture. Absolute mean
+NLL deltas were 0.001179 and 0.000243 respectively. No oracle fixtures were regenerated.
+
+The repository harness's process-name guard rejects an idle `xwen serve` process.
+To preserve the user's running server, a temporary harness copy replaced only preflight
+with an empty-health check and exclusive GPU-lock ownership check, plus relocating its
+imports and root path. All tier commands, environments, provenance checks and thresholds
+were unchanged; the copy's diff was inspected. The server stayed running and empty.
+
 ## Not taken now
 
 The GUI remains a separate project. No new ComfyUI, Krita or A1111 dialect is

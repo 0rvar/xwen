@@ -990,8 +990,8 @@ XWEN_CONTROLNET_FILE="$control_file" XWEN_CONTROL_REF=/tmp/xwen-image-control-re
 
 Set `adapter_file`, `control_file` and `control_image` to existing files. Run full
 and lite in separate output directories. Both tests apply the existing first-velocity
-bar (cosine >= 0.998, mean relative error <= 0.04) and VAE decode bar (PSNR >= 60 dB).
-The adapter test also compares a merged plane and its delta. Control compares the
+bar (cosine >= 0.998, mean relative error <= 0.04). The adapter test also compares a
+merged plane and its delta. Control applies the VAE decode bar (PSNR >= 60 dB), compares the
 33-channel context, covers plain and trained inpaint, and requires zero-scale velocity
 to match base exactly. Final latent and generated-image differences are reported under
 the same policy as the original image gate; they are not substituted for local graph

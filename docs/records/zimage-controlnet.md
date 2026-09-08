@@ -76,10 +76,67 @@ bitwise equal to base. These runs use author revision
 `5155fc56d17821007d6f62ac192c09e0f0e72016`. The loader accepts the 2601 filenames
 with the same architecture, but only 2602 was numerically compared.
 
+## A bounded control-map study
+
+One 512x512 case, eight steps, scale 0.75, window `[0,0.8)`. Canny and depth maps
+extracted from the existing fisherman fixture changed a standing composition into
+a seated one. Canny also introduced conspicuous limb and clothing artifacts. These
+outputs establish that depth is consumed; they do not establish a general quality
+ranking between preprocessing modes.
+
+A hand-drawn OpenPose skeleton specified a centered person with horizontal arms and
+visible feet. At seed 47, the prompt "A full-body photograph of a man, both feet
+visible, plain studio background" produced cropped standing legs without control.
+Both full and lite produced a coherent full-body arms-out image with the synthetic
+map. Full also followed the broad seated geometry of the DWPose map extracted from
+the fisherman. The generated pose is therefore not explained by the prompt alone.
+
+Prompt sensitivity matters. Earlier lite runs with "standing naturally" left the arms
+down; changing the prompt as well as the checkpoint initially made full appear to be
+the only working variant. Repeating lite with the exact neutral prompt resolved that
+confound. Keep lite as the cached default. These few images justify supporting
+hand-drawn maps and do not justify opening CFG or claiming reliable pose adherence
+across prompts and seeds.
+
+The [study manifest](../../tests/fixtures/zimage-control-study/manifest.json) preserves
+the exact settings, checkpoint revisions and image hashes. Its images include the
+[uncontrolled baseline](../../tests/fixtures/zimage-control-study/neutral-baseline.png),
+[synthetic map](../../tests/fixtures/zimage-control-study/synthetic-pose.png),
+[lite result](../../tests/fixtures/zimage-control-study/lite-neutral-synthetic.png),
+[full result](../../tests/fixtures/zimage-control-study/full-neutral-synthetic.png), and
+[extracted-pose result](../../tests/fixtures/zimage-control-study/full-neutral-pose.png).
+They are manual-study evidence, not pixel goldens for automated tests.
+
+## Cost protocol
+
+The current figures live in [perf-state.md](../perf-state.md). The pinned binary was
+built in a detached worktree at `aee38d5`; its SHA256, per-run arguments, power lines,
+intervals and aggregation are in the [timing artifact](../../tests/fixtures/zimage-control-study/timing.json).
+Base, lite 2602 and full 2602 ran serially at 512x512 with the existing caption/noise
+fixture, eight steps, scale 0.75 and window `[0,0.8)`. The supplied
+[control map](../../tests/fixtures/zimage-control-study/timing-control.png) bypasses
+preprocessing. Use `--cap-feats` and `--latents` from
+`tests/fixtures/zimage-transformer/512x512-p1-s0`, plus `--control-type none` for control
+arms, and select the side file with `XWEN_CONTROLNET_FILE`.
+
+All `XWEN_ZIMAGE_*` overrides were cleared. One complete base/lite/full round was
+recorded as warm-up after the first base process paid a cold shader compilation cost.
+Three further complete rounds supply the medians; each round and the final baseline
+anchor follow 60 seconds idle. The GPU lock was exclusive, peer builds stopped, the
+existing server was empty and the smoke server was stopped. Fixed base/lite/full order
+means full follows two short model runs; its later-step spread is retained, not
+filtered. The closing warm anchor stayed below the protocol's drift threshold.
+
+The first step's readback also drains the pending control VAE encode, so its timer is
+not an isolated transformer measurement. Logged intervals round to 0.01 seconds, and
+CLI total/load times to 0.1 seconds. These runs price short 512x512 generation with
+control active for seven of eight steps. They do not price sustained 1024x1024, trained
+inpaint, a full control window, text encoding or preprocessor latency.
+
 ## Not taken now
 
 The non-distilled ControlNet and CFG stay conditional. Reopen them for a named
-pose or inpaint composition whose 8-step artifacts are the blocker. A synthetic
-pose-map quality study remains a separate product judgement; numeric graph
-parity alone does not establish how well the trained model follows a hand-drawn
-skeleton. Tile upscaling and base Z-Image remain outside this PRD.
+pose or inpaint composition whose 8-step artifacts are the blocker. A broad pose
+quality study remains unmeasured; reopen it for a client workflow that needs a
+reliability estimate beyond the bounded case above. Tile upscaling and base
+Z-Image remain outside this PRD.
