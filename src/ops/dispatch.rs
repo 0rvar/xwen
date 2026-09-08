@@ -5451,6 +5451,26 @@ pub(crate) fn run_flash_attn_tensor(
             bail!("flash_attn_tensor {what} ({val}) overflows the kernel's i32 extents");
         }
     }
+    // Offsets into q, k, v and the output are formed in i32 inside the
+    // kernel, so each whole tensor has to be addressable, not only its extents.
+    glue_index_fits_i32(checked_elems(
+        &[n_head, seq, head_dim],
+        "flash_attn_tensor q",
+    )?)?;
+    glue_index_fits_i32(checked_elems(
+        &[n_kv, k_len, head_dim],
+        "flash_attn_tensor k",
+    )?)?;
+    // Padded key columns hold the lowest finite float and are multiplied by
+    // the scale before exp2, so only a positive finite scale keeps them at zero
+    // weight.
+    if !(scale > 0.0 && scale.is_finite()) {
+        bail!("flash_attn_tensor requires a positive finite scale, got {scale}");
+    }
+    // The Q tile is staged through float4 loads.
+    if !view_offset_aligned_16(q) {
+        bail!("flash_attn_tensor requires q to start on a 16-byte boundary");
+    }
 
     let out_count = checked_elems(&[n_head, seq, head_dim], "flash_attn_tensor")?;
     let dst = mdev.new_buffer(out_count, DType::F32, "flash_attn_tensor")?;
@@ -7988,7 +8008,7 @@ pub(crate) fn run_group_norm_fold(
     }
     glue_index_fits_i32(checked_elems(&[batch, channels, h, w], "group_norm input")?)?;
     let runs = batch * groups;
-    let vec4 = len.is_multiple_of(4);
+    let vec4 = len.is_multiple_of(4) && view_offset_aligned_16(x);
     let mut chunk = len.div_ceil(GN_MAX_PARTIALS).max(GN_SLICE_TARGET);
     if vec4 {
         chunk = chunk.div_ceil(4) * 4;
@@ -8088,7 +8108,7 @@ pub(crate) fn run_group_norm_apply(
     if n == 0 {
         bail!("group_norm: empty tensor");
     }
-    let vec4 = hw.is_multiple_of(4);
+    let vec4 = hw.is_multiple_of(4) && view_offset_aligned_16(x);
     let (n_thr, hw_thr) = if vec4 { (n / 4, hw / 4) } else { (n, hw) };
     let pipeline = pipelines::group_norm_pipeline(mdev.device(), "kernel_group_norm_apply")?;
     let dst = mdev.new_buffer(n, DType::F32, "group_norm_apply")?;

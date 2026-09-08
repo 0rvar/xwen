@@ -241,8 +241,12 @@ impl Conv {
 }
 
 impl Module for Conv {
-    /// candle's conv2d, the candle arm.
+    /// The plain convolution: the direct kernel where the arm resolved to it,
+    /// candle's conv2d otherwise.
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if self.direct.is_some() {
+            return self.forward_fused(xs, Conv2dFusion::default());
+        }
         self.candle.forward(xs)
     }
 }
