@@ -5461,9 +5461,10 @@ pub(crate) fn run_flash_attn_tensor(
         &[n_kv, k_len, head_dim],
         "flash_attn_tensor k",
     )?)?;
-    // Padded key columns hold the lowest finite float and are multiplied by
-    // the scale before exp2, so only a positive finite scale keeps them at zero
-    // weight.
+    // The kernel scales the scores before it writes the masked sentinel, so
+    // the sentinel holds at any scale; the scale itself must still be positive
+    // and finite, a non-finite one poisoning every score through the row max
+    // and a non-positive one being an attention this kernel does not offer.
     if !(scale > 0.0 && scale.is_finite()) {
         bail!("flash_attn_tensor requires a positive finite scale, got {scale}");
     }
@@ -7807,15 +7808,21 @@ pub(crate) fn run_conv2d_direct(
                     batch * c_in
                 );
             }
+            if !x.device().same_device(t.device()) {
+                bail!("conv2d_direct: {name} must live on x's Metal device");
+            }
         }
     }
-    if let Some(r) = fusion.residual
-        && r.dims() != [batch, c_out, h, wd]
-    {
-        bail!(
-            "conv2d_direct: residual is {:?}, expected [{batch}, {c_out}, {h}, {wd}]",
-            r.dims()
-        );
+    if let Some(r) = fusion.residual {
+        if r.dims() != [batch, c_out, h, wd] {
+            bail!(
+                "conv2d_direct: residual is {:?}, expected [{batch}, {c_out}, {h}, {wd}]",
+                r.dims()
+            );
+        }
+        if !x.device().same_device(r.device()) {
+            bail!("conv2d_direct: residual must live on x's Metal device");
+        }
     }
     for (name, t) in [("w", w), ("bias", bias)] {
         if !x.device().same_device(t.device()) {

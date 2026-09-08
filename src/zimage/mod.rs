@@ -54,4 +54,4 @@ pub use profile::{PROFILE_ENV, Profiler};
 pub use sampling::{postprocess_image, seeded_noise};
 pub use scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};
 pub use transformer::{ATTN_ENV, AttnImpl, Config, ZImageTransformer2DModel};
-pub use vae::{AutoEncoderKL, VaeConfig};
+pub use vae::{AutoEncoderKL, VAE_ENV, VaeConfig, VaeImpl};

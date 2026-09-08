@@ -2362,12 +2362,14 @@ fn run_image(args: ImageArgs) -> Result<()> {
         .encoder_spec()
         .context("the pipeline's text encoder entry carries no encoder spec")?;
     // Every input the run can be wrong about is checked before a byte loads:
-    // the size rule, the step count, the bisect switch, and the injected
-    // latent, which is a file and therefore the one of the four that can be
-    // missing or misshapen. `ZImagePipeline::load` re-reads the switch for its
-    // library callers, but by then the 7.6 GB encoder is already resident, and
-    // a typo in a bisect run should cost nothing.
+    // the size rule, the step count, all three bisect switches, and the
+    // injected latent, which is a file and therefore the one that can be
+    // missing or misshapen. `ZImagePipeline::load` re-reads the switches for
+    // its library callers, but by then the 7.6 GB encoder is already resident,
+    // and a typo in a bisect run should cost nothing.
     xwen::zimage::AttnImpl::from_env()?;
+    xwen::zimage::LinearImpl::from_env()?;
+    xwen::zimage::VaeImpl::from_env()?;
     ZImagePipeline::check_size(args.width, args.height)?;
     ensure!(args.steps >= 1, "--steps must be at least 1");
     let latents = match &args.latents {

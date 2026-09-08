@@ -174,8 +174,10 @@ impl VaeConfig {
 
 /// A square convolution with `padding = kernel / 2`: candle's `Conv2d` for
 /// the candle arm and for any shape the direct kernel declines, plus, on the
-/// xwen arm, the weight permuted to the direct kernel's `[k*k, c_in, c_out]`
-/// plane and the bias it stores.
+/// xwen arm on a Metal device, the weight permuted to the direct kernel's
+/// `[k*k, c_in, c_out]` plane and the bias it stores. `direct` being `Some`
+/// is what [`Module::forward`] reads as "the direct kernel is usable here",
+/// so it carries the device condition and not just the arm.
 #[derive(Debug, Clone)]
 struct Conv {
     candle: Conv2d,
@@ -195,17 +197,19 @@ impl Conv {
             padding: kernel / 2,
             ..Default::default()
         };
+        let metal = vb.device().is_metal();
         let candle = conv2d(in_channels, out_channels, kernel, cfg, vb)?;
-        let direct = if arm == VaeImpl::Xwen && ops::conv2d_direct_supported(in_channels, kernel) {
-            let w = ops::permute_conv_weight(candle.weight()).map_err(wrap)?;
-            let b = match candle.bias() {
-                Some(b) => b.clone(),
-                None => Tensor::zeros(out_channels, w.dtype(), w.device())?,
+        let direct =
+            if arm == VaeImpl::Xwen && metal && ops::conv2d_direct_supported(in_channels, kernel) {
+                let w = ops::permute_conv_weight(candle.weight()).map_err(wrap)?;
+                let b = match candle.bias() {
+                    Some(b) => b.clone(),
+                    None => Tensor::zeros(out_channels, w.dtype(), w.device())?,
+                };
+                Some((w, b))
+            } else {
+                None
             };
-            Some((w, b))
-        } else {
-            None
-        };
         Ok(Self {
             candle,
             kernel,
@@ -1054,6 +1058,76 @@ mod tests {
         assert!(err.contains(VAE_ENV), "{err}");
         assert_eq!(VaeImpl::Xwen.label(), "xwen");
         assert_eq!(VaeImpl::Candle.label(), "candle");
+    }
+
+    /// `Conv::forward_fused`'s fallback for a shape the direct kernel
+    /// declines, against the same chain written in candle. `c_in = 12` is not
+    /// a multiple of the kernel's channel chunk, so `direct` is `None` on the
+    /// shipped arm and this branch is what runs; it has to apply the affine,
+    /// the silu, the upsample, the convolution and the residual in the
+    /// kernel's order.
+    #[test]
+    fn a_declined_shape_falls_back_to_the_candle_chain() {
+        use candle_core::DType;
+        use candle_nn::VarMap;
+        let Ok(dev) = crate::gguf::metal_device() else {
+            return;
+        };
+        let (batch, c_in, c_out, h, w) = (2usize, 12usize, 24usize, 5usize, 7usize);
+        assert!(!ops::conv2d_direct_supported(c_in, 3));
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let conv = Conv::new(c_in, c_out, 3, VaeImpl::Xwen, vb.pp("conv")).unwrap();
+        assert!(
+            conv.direct.is_none(),
+            "the direct kernel must have declined this shape"
+        );
+        // A non-zero bias, so the fallback's convolution has one to add.
+        for (name, var) in varmap.data().lock().unwrap().iter() {
+            if name.ends_with("bias") {
+                var.set(&var.randn_like(0.0, 0.5).unwrap()).unwrap();
+            }
+        }
+
+        let x = Tensor::randn(0f32, 1.0, (batch, c_in, h, w), &dev).unwrap();
+        let scale = Tensor::randn(1f32, 0.2, (batch, c_in), &dev).unwrap();
+        let shift = Tensor::randn(0f32, 0.5, (batch, c_in), &dev).unwrap();
+        let residual = Tensor::randn(0f32, 1.0, (batch, c_out, h * 2, w * 2), &dev).unwrap();
+        let got = conv
+            .forward_fused(
+                &x,
+                Conv2dFusion {
+                    norm: Some((&scale, &shift)),
+                    silu: true,
+                    upsample: true,
+                    residual: Some(&residual),
+                },
+            )
+            .unwrap();
+
+        let plane = |t: &Tensor| t.reshape((batch, c_in, 1, 1)).unwrap();
+        let want = x
+            .broadcast_mul(&plane(&scale))
+            .unwrap()
+            .broadcast_add(&plane(&shift))
+            .unwrap()
+            .silu()
+            .unwrap()
+            .upsample_nearest2d(h * 2, w * 2)
+            .unwrap();
+        let want = (conv.candle.forward(&want).unwrap() + &residual).unwrap();
+
+        assert_eq!(got.dims(), &[batch, c_out, h * 2, w * 2]);
+        let norm = |t: &Tensor| {
+            t.sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+        let rel = (norm(&(&got - &want).unwrap()) / norm(&want).max(1e-30)).sqrt();
+        assert!(rel < 1e-5, "the fallback against candle: rel_l2 {rel:.3e}");
     }
 
     /// A small decoder built from random weights decodes the same latent on

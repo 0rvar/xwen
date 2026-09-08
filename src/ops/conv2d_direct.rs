@@ -248,6 +248,21 @@ mod tests {
         }
     }
 
+    /// The same ragged sizes on the deep 3x3 template: `c_in` past the
+    /// shallow bound selects the CO=64, TH=8 kernel, which is every resnet
+    /// convolution of the real decode and was otherwise only ever run at a
+    /// whole tile. The last case pairs a batch of two with a `c_out` past one
+    /// 64-wide block, so the threadgroup z-index carries both.
+    #[test]
+    fn matches_candle_on_deep_ragged_sizes() {
+        let dev = metal_device().unwrap();
+        check(
+            &dev, 500, 1, 256, 128, 13, 33, 3, false, false, false, false,
+        );
+        check(&dev, 501, 1, 512, 128, 9, 17, 3, false, false, false, false);
+        check(&dev, 502, 2, 256, 128, 9, 17, 3, true, true, false, true);
+    }
+
     /// The fused input read and store: the folded norm, silu, the upsample
     /// and the residual, alone and together.
     #[test]

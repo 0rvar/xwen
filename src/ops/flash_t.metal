@@ -60,6 +60,10 @@
 // Masked scores use the finite minimum rather than -INFINITY: the library is
 // compiled math_mode(fast) like every vendored kernel, and exp2 of a huge
 // negative finite value is exactly 0 without depending on infinity semantics.
+// That holds only because the softmax scale is applied to S BEFORE the
+// sentinel is written: multiplying the finite minimum by a scale above ln 2
+// overflows, and the exponent loop would then be back to needing infinity to
+// behave.
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -126,6 +130,12 @@ kernel void flash_attn_t(
     // Row statistics a lane holds (see the header).
     constexpr int R_SLOTS = 2;
     static_assert(ROWS == 16, "the row-slot selects are written for 16-row tiles");
+    // The slot bitmasks below hold one bit per element a lane owns, and a
+    // lane owns its share of the tile over the simdgroup's 32 threads. A
+    // geometry whose share outgrows a mask would shift past its width, which
+    // is undefined and picks the wrong row statistic rather than failing.
+    static_assert(ROWS * BK / 32 <= 32, "s_slot is 32 bits wide, one per element of S");
+    static_assert(ROWS * BD / 32 <= 64, "o_slot is 64 bits wide, one per element of O");
 
     const int h  = tgpig.y;
     const int qb = tgpig.x * BQ;
@@ -181,7 +191,11 @@ kernel void flash_attn_t(
     using P_t = decltype(mmO.template get_left_input_cooperative_tensor<float, half, float>(S));
     auto Oacc = mmO.template get_destination_cooperative_tensor<P_t, decltype(tV), float>();
 
-    if (alpha.get_capacity() != R_SLOTS) {
+    // The layout this kernel is written for: two row statistics per lane, and
+    // a share of S and of O that fits its bitmask. The static asserts above
+    // cover the geometry; this covers a device that pads the layout at
+    // runtime, and it poisons the output rather than computing a wrong one.
+    if (alpha.get_capacity() != R_SLOTS || S.get_capacity() > 32 || Oacc.get_capacity() > 64) {
         FOR_UNROLL (uint16_t i = 0; i < Oacc.get_capacity(); ++i) {
             Oacc[i] = as_type<float>(0x7fc00000u);
         }
@@ -220,6 +234,14 @@ kernel void flash_attn_t(
         auto mK = tK.slice(0, k0);
         mmS.run(mQ, mK, S);
 
+        // Into log2 units first, so the sentinel below is written on an
+        // already-scaled score and stays the finite minimum whatever the
+        // scale is. Scaling it afterwards would overflow to negative infinity
+        // for any scale above ln 2, and this library assumes no infinities.
+        FOR_UNROLL (uint16_t i = 0; i < S.get_capacity(); ++i) {
+            S[i] *= c;
+        }
+
         // Columns past the last key read as zero through the extent clip;
         // give them the finite minimum so their exp2 is exactly 0.
         if (k0 + BK > args.n_k) {
@@ -231,20 +253,21 @@ kernel void flash_attn_t(
             }
         }
 
-        // New running max in log2 units; alpha rescales the old sum and O.
+        // New running max, already in log2 units; alpha rescales the old sum
+        // and O.
         mpp::tensor_ops::reduce_rows(S, r_new, mpp::tensor_ops::reduction_operation::max, lowest);
         FOR_UNROLL (uint16_t i = 0; i < R_SLOTS; ++i) {
-            const float m_new = max(r_new[i] * c, m_run[i]);
+            const float m_new = max(r_new[i], m_run[i]);
             alpha[i] = exp2(m_run[i] - m_new);
             m_run[i] = m_new;
         }
         const float m0 = m_run[0];
         const float m1 = m_run[1];
 
-        // P = exp2(S * c - m) in place.
+        // P = exp2(S - m) in place.
         FOR_UNROLL (uint16_t i = 0; i < S.get_capacity(); ++i) {
             const float m = ((s_slot >> i) & 1u) ? m1 : m0;
-            S[i] = exp2(S[i] * c - m);
+            S[i] = exp2(S[i] - m);
         }
 
         mpp::tensor_ops::reduce_rows(S, r_new, mpp::tensor_ops::reduction_operation::sum, 0.0f);

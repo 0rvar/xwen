@@ -177,6 +177,70 @@ mod tests {
         }
     }
 
+    /// A softmax scale above ln 2, where the masked columns of a partial key
+    /// block would overflow if the sentinel were scaled rather than written on
+    /// an already-scaled score. Both cases leave a partial last key block, so
+    /// the sentinel is written. The first shrinks q so the logits land in the
+    /// range the accuracy bars were fitted at; the second keeps the raw range,
+    /// where the softmax is peaked enough that operand precision moves the
+    /// output past those bars but every element must still be a convex
+    /// combination of v's values, which no overflow survives.
+    #[test]
+    fn flash_attn_tensor_masks_at_a_scale_above_one() {
+        let dev = metal_device().unwrap();
+        let hd = 128usize;
+        let scale = 2.0f32;
+        for geometry in FlashTGeometry::ALL {
+            for &(n_head, seq, k_len) in &[(6usize, 203usize, 203usize), (4, 45, 45)] {
+                let seed = (n_head * 7000 + seq) as u64;
+                let q = rand_t(seed, (n_head, seq, hd), &dev);
+                let k16 = rand_kv(seed + 1, (n_head, k_len, hd), &dev);
+                let v16 = rand_kv(seed + 2, (n_head, k_len, hd), &dev);
+
+                // The logit range of the shipped scale, reached with this one.
+                let matched = q
+                    .affine(1.0 / (scale as f64 * (hd as f64).sqrt()), 0.0)
+                    .unwrap();
+                let got = flash_attn_tensor_with(&matched, &k16, &v16, scale, geometry).unwrap();
+                let want = reference(&matched, &k16, &v16, scale);
+                let (rel_l2, max_abs) = errors(&got, &want);
+                println!(
+                    "scale {scale} matched logits {seq}x{k_len} {}: rel_l2 {rel_l2:.3e}, \
+                     max abs {max_abs:.3e}",
+                    geometry.label()
+                );
+                assert!(rel_l2 <= REL_L2_BAR, "rel_l2 {rel_l2:.3e}");
+                assert!(max_abs <= MAX_ABS_BAR, "max abs {max_abs:.3e}");
+
+                // errors() asserts finiteness; the convex-combination bound is
+                // what catches a masked column that got a nonzero weight.
+                let raw = flash_attn_tensor_with(&q, &k16, &v16, scale, geometry).unwrap();
+                let (rel_l2, max_abs) = errors(&raw, &reference(&q, &k16, &v16, scale));
+                println!(
+                    "scale {scale} raw logits {seq}x{k_len} {}: rel_l2 {rel_l2:.3e}, \
+                     max abs {max_abs:.3e}",
+                    geometry.label()
+                );
+                let out: Vec<f32> = raw.flatten_all().unwrap().to_vec1().unwrap();
+                let v: Vec<f32> = v16
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let lo = v.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                for &a in &out {
+                    assert!(
+                        a >= lo - 1e-3 && a <= hi + 1e-3,
+                        "{a} is outside v's range [{lo}, {hi}]: some weight is not a softmax weight"
+                    );
+                }
+            }
+        }
+    }
+
     /// Every query sees every key: against the causal flash kernel on the
     /// same inputs, the last row agrees (it sees all keys under both rules,
     /// so the two differ only by operand precision) and the first row does
@@ -290,6 +354,13 @@ mod tests {
              iterator compatible S->R {compat_s}, O->R {compat_o}"
         );
         assert!(cap_s > 0 && cap_o > 0);
+        // The whole row-statistics scheme is written for two rows per lane:
+        // the kernel keeps m, l and alpha in two scalars each and selects
+        // between them by one bit per element.
+        assert_eq!(
+            cap_r, 2,
+            "the kernel is written for 2 row statistics per lane, the device reports {cap_r}"
+        );
         assert!(
             8 + 32 * cap_s * 2 + 32 * cap_o * 2 <= dispatch::FLASH_T_PROBE_WORDS,
             "probe dump exceeded its buffer"
