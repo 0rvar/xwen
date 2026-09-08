@@ -1177,6 +1177,36 @@ what was read.
 The summaries are `/tmp/zpm-out/140858.txt` and `/tmp/zpm-out/140947.txt`, the raw logs
 under `/tmp/zimage-power-20260908-{140858,140932,140947}/`.
 
+### High Power Mode, the same three runs, `powermode 2`
+
+The user switched Energy Mode to High Power and re-ran the three commands ten minutes later
+(`/tmp/zimage-power-20260908-{142201,142240,142253}/`). `pmset -g` read `powermode 2`, and 0
+in the automatic runs above, so on this machine the key does track the setting.
+
+| 1024x1024 | automatic, `powermode 0` | High Power, `powermode 2` |
+| --- | --- | --- |
+| step 2 | 1.35 s, 85.9 W, 1620 MHz | 1.32 s, 86.1 W, 1619 MHz |
+| step 5 | 1.74 s, 36.2 W, 1161 MHz | 1.53 s, 53.1 W, 1369 MHz |
+| step 8 | 1.78 s, 34.5 W, 1121 MHz | 1.67 s, 41.1 W, 1216 MHz |
+| eight steps together | 13.01 s | 11.99 s, -8% |
+| 24-step run, steps 7-24 | sinks from 1.70 to a 2.25 s floor at 22.4 W and 875 MHz, back to 2.04-2.16 at the end | flat: 1.76-1.87 s at 33-38 W and 1090-1170 MHz from step 7 to step 24 |
+| 24 steps together | 45.4 s | 42.5 s, -6%; the last eight 15.0 against 17.1 s, -12% |
+
+The first three steps are identical in both modes, at the full clock and 86-89 W. What the
+mode changes is the sustained budget: about 34 W and 1100 MHz held flat in High Power,
+against a slide to 22-29 W and 875-1016 MHz in automatic. The 512x512 run is unchanged
+(steps 0.33-0.34 s in both, 74-86 W, 1538-1616 MHz), being too short to reach either budget.
+So High Power Mode is worth 8% on an 8-step 1024x1024 render, 12% on a sustained load, and
+nothing on a short one; the figures in [perf-state.md](../perf-state.md) stay on automatic
+and a run that used High Power says so by its `pmset` line.
+
+One more observation for whoever chases the first-decode cost: this session's first process
+paid 15.9 s of transformer load (a cold page cache) and its VAE decode read 1.18 s, while the
+automatic-mode first process above loaded in 3.5 s and decoded in 4.31 s at 26% GPU active.
+The 3-4 s first decode is therefore not "the first process" and not the page cache; it has
+appeared twice and been absent once, and it is CPU-side. Unpriced, paid at most once per
+server load.
+
 ## Lever ledger
 
 Rewritten 2026-09-08 for the third time, after the third arc, and re-based the same evening
@@ -1191,7 +1221,7 @@ the first three steps.
 
 | lever | today | ceiling, and how it was derived | gain per image | cost class |
 | --- | --- | --- | --- | --- |
-| the power envelope, an INSTRUMENT, READ the same evening | a hardware clock limiter: 1620 MHz and 86-89 W for three steps, then 1100-1160 MHz at 33-36 W by step 5 and 875-1016 MHz at 22-29 W by step 20; driver at P13, GPU 96-100% active, pressure Nominal throughout ("The power envelope read" above) | `scripts/zimage-power.sh` from a sudo shell; the next reading is the same three runs in High Power Mode | priced every row below twice: full-clock time for the first three steps, joules at the plateau for the rest | done; the open follow-up is the High Power Mode run, ten minutes, the user's |
+| the power envelope, an INSTRUMENT, READ the same evening | a hardware clock limiter: 1620 MHz and 86-89 W for three steps, then 1100-1160 MHz at 33-36 W by step 5 and 875-1016 MHz at 22-29 W by step 20; driver at P13, GPU 96-100% active, pressure Nominal throughout ("The power envelope read" above) | `scripts/zimage-power.sh` from a sudo shell; High Power Mode read the same way holds the plateau flat at 34 W and 1100 MHz, -8% on eight steps | priced every row below twice: full-clock time for the first three steps, joules at the plateau for the rest | done, both modes read |
 | gemm launch fusion and tile tuning | the four gemms, 46.7 TFLOP, at 37-45 TFLOP/s isolated, so 1.04-1.26 s and most of the step | UNPRICED: q, k and v as one N=11520 gemm and the SwiGLU pair as one N=20480, then tiles tuned for M around 4000 at those N, which no sweep has covered | unknown, and `tests/zimage_microbench.rs` prices it in an hour at these shapes | host-side plus tile work, no new kernel class |
 | the elementwise tail | ~1.05 s profiled per step over nine rows (norm+scale 184, `attn.qknorm` 138, `ffn.norm+scale` 124, transpose 121, rope 119, untranspose 58, `ffn.silu_mul` 254, the gates 52); real is the residual after the gemms and attention, at most ~0.1-0.3 s depending on where in the ramp the step sits | about half of that with gemm epilogues and a fused per-head `attn.qknorm` | under 1 s, probably well under; no single row is worth an arc | small kernels, no math change |
 | the VAE mid-block attention | 108-119 ms profiled, 7-8% of the 1.4 s decode | candle's SDPA or a flash arm at head_dim 512 | ~0.1 s | one call site; reopen when the decode is wanted under 1 s |

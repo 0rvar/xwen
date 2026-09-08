@@ -13,7 +13,8 @@ per-step ramp is a hardware clock limiter**, GPU frequency 1620 MHz and 86-89 W 
 first three 1024x1024 steps, then 1100-1160 MHz at 33-36 W by step 5 and 875-1016 MHz at
 22-29 W by step 20 of 24, with the GPU 96-100% active, the driver requesting the top P-state
 on every sample and the OS thermal pressure Nominal throughout; a 512x512 run is too short
-to reach it. Not a power cap (power falls with the clock), not the driver, not starvation.
+to reach it. High Power Mode (`powermode 2`) holds the plateau at 34 W and 1100 MHz instead
+of sliding to 22 W and 875, -8% on eight steps and -12% on a sustained run. Not a power cap (power falls with the clock), not the driver, not starvation.
 The sustained point is 25-35 W at 900-1150 MHz on a MacBook in automatic power mode, so at
 the plateau a kernel pays through its joules per unit of work, which is why the third arc's
 3.5x attention kernel moved step 8 by 5%. Front item 6 shipped to the archive; the open

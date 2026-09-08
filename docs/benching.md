@@ -55,7 +55,10 @@ the owner switched to high performance; 0 is automatic.
 
 The mode moved nothing measurable that day (decode 47.0 to 47.3, prefill 1140 to 1139,
 streaming read +4-5% at most; log.md "Ceiling diagnosis"), so figures measured on
-automatic stand.
+automatic stand. It does move Z-Image at 1024x1024, whose render reaches the sustained
+budget: -8% on eight steps and a flat 1.87 s plateau against a 2.25 s slide at 24 steps
+(2026-09-08, records/zimage-perf.md "The power envelope read"), so an image figure names
+the mode value.
 
 ## Rates and units
 

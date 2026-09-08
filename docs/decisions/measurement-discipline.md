@@ -18,7 +18,14 @@ shell, on automatic); which name a shell prints is unexplained, the value is wha
 And the mode did not move the numbers: bandwidth sweep, plain decode and 3851-token
 prefill re-run in high performance mode landed inside the automatic-mode spread (log.md
 2026-09-05 "Ceiling diagnosis"), so absolute figures measured on automatic stand, and a
-run still quotes the line it saw.
+run still quotes the line it saw. AMENDED 2026-09-08, evening: for Z-Image at 1024x1024 the
+mode DOES move the numbers, because that workload reaches the sustained budget the language
+models never do. `scripts/zimage-power.sh` read the first three steps identical in both modes
+(86-89 W, 1620 MHz), then automatic sliding to 22-29 W and 875-1016 MHz while High Power held
+33-38 W and 1090-1170 MHz flat: eight steps 13.01 s against 11.99 (-8%), a 24-step plateau
+2.25 s against 1.87. The perf-state figures stay on automatic; an image figure taken in High
+Power is quoted with its `powermode 2` line beside it and never mixed into an automatic
+range (records/zimage-perf.md "The power envelope read").
 
 **Achievable bandwidth is MEASURED, not quoted, since 2026-09-05: argue bytes-moved
 against 537-565 GB/s, and price a dispatch at 2.5 µs of floor plus its own ramp.**

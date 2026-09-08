@@ -275,7 +275,11 @@ power mode on AC. At the plateau a kernel converts to wall time through its ener
 of work, not its full-clock FLOP/s, which is why the third arc's 3.5x attention kernel moved
 step 8 by 5% ([records/zimage-perf.md](records/zimage-perf.md) "The power envelope read",
 decisions.md "A Z-Image step is quoted at steady state", as amended). Quote "1.35 s first
-step rising to 2.0-2.1 s by step 8".
+step rising to 2.0-2.1 s by step 8". **High Power Mode (`powermode 2`) raises the sustained
+budget to about 34 W and holds 1100 MHz flat**: the first three steps are identical, step 8
+reads 1.67 s against 1.78, eight steps 11.99 s against 13.01 (-8%), and a 24-step run stops
+sinking at 1.87 s where automatic reaches 2.25. The figures on this page are automatic mode;
+a run in High Power says so by its `pmset` line.
 
 **Step count, measured 2026-09-08 on a pinned build of eeec7bb**, warm, same seed and prompt,
 the pipeline being bit-deterministic across repeats. 8 is the default and what the parity
