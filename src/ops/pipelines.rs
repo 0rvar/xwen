@@ -134,6 +134,12 @@ const GROUP_NORM_SOURCE: &str = include_str!("group_norm.metal");
 /// masking). Own library (no Metal-4 dependency), compiled fast-math like
 /// candle's metallib with no contract pragmas — see flash.metal's header.
 const FLASH_SOURCE: &str = include_str!("flash.metal");
+
+/// Bidirectional flash attention on the Metal-4 cooperative-tensor ops
+/// (`src/ops/flash_t.metal`, the `tensor` arm of `XWEN_ZIMAGE_ATTN`). Own
+/// library, compiled lazily on first dispatch, so `flash.metal` carries no
+/// Metal-4 dependency and a tensor-op compile problem breaks only this arm.
+const FLASH_T_SOURCE: &str = include_str!("flash_t.metal");
 /// Vendored fused gated-DeltaNet kernels (conv+silu+state, beta/decay head,
 /// recurrent scan, gated output norm). Own library (no Metal-4 dependency).
 /// The conv and beta/decay kernels pin FP contraction/reassociation off at
@@ -381,6 +387,12 @@ pub(crate) fn group_norm_pipeline(device: &Device, name: &str) -> Result<Compute
 /// Pipeline for a `flash.metal` kernel (vendored flash-attention prefill).
 pub(crate) fn flash_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, FLASH_SOURCE, "flash", name)
+}
+
+/// Pipeline for a `flash_t.metal` kernel (bidirectional flash attention on the
+/// cooperative-tensor ops). Its own library, compiled lazily on first dispatch.
+pub(crate) fn flash_t_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, FLASH_T_SOURCE, "flash_t", name)
 }
 
 /// Pipeline for a `delta.metal` kernel (vendored fused gated-DeltaNet ops).

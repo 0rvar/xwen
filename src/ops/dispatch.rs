@@ -5340,6 +5340,241 @@ fn check_flash_kv(
 }
 
 // ---------------------------------------------------------------------------
+// Bidirectional flash attention on the cooperative-tensor path, see
+// src/ops/flash_t.metal.
+
+/// Matches the Metal `flash_t_args` struct (src/ops/flash_t.metal). `#[repr(C)]`
+/// pins the layout: four 4-byte fields (16 bytes) then four `i64` strides.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashTArgs {
+    n_q: i32,
+    n_k: i32,
+    gqa_factor: i32,
+    scale_log2: f32,
+    q_stride_h: i64,
+    k_stride_h: i64,
+    v_stride_h: i64,
+    o_stride_h: i64,
+}
+
+/// The geometries `flash_t.metal` instantiates: query rows per simdgroup and
+/// key columns per block. The kernel name carries the block width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashTGeometry {
+    pub rows: usize,
+    pub bk: usize,
+}
+
+impl FlashTGeometry {
+    /// Simdgroups per threadgroup, fixed in the kernel (`FLASH_T_NSG`).
+    pub const NSG: usize = 4;
+
+    /// Every instantiated geometry, for the tests and the microbench.
+    pub const ALL: [FlashTGeometry; 2] = [
+        FlashTGeometry { rows: 16, bk: 32 },
+        FlashTGeometry { rows: 16, bk: 64 },
+    ];
+
+    /// The geometry `flash_attn_tensor` dispatches: the faster of
+    /// [`Self::ALL`] at both diffusion shapes in `tests/zimage_microbench.rs`.
+    pub const DEFAULT: FlashTGeometry = FlashTGeometry { rows: 16, bk: 32 };
+
+    /// Short label for a table row, e.g. `r16k32`.
+    pub fn label(self) -> String {
+        format!("r{}k{}", self.rows, self.bk)
+    }
+
+    /// Query rows per threadgroup.
+    fn block_rows(self) -> usize {
+        self.rows * Self::NSG
+    }
+
+    /// Threadgroup memory the kernel needs: the staged half Q block.
+    fn threadgroup_bytes(self) -> usize {
+        self.block_rows() * FLASH_BD * DType::F16.size_in_bytes()
+    }
+
+    fn kernel_name(self) -> Result<&'static str> {
+        Ok(match (self.rows, self.bk) {
+            (16, 32) => "kernel_flash_attn_t_k32",
+            (16, 64) => "kernel_flash_attn_t_k64",
+            (r, k) => bail!("flash_attn_tensor has no kernel for rows {r} x bk {k}"),
+        })
+    }
+}
+
+/// Bidirectional flash attention through the `kernel_flash_attn_t_*` family:
+/// every query row sees every key column, both products on the Metal-4
+/// cooperative tensor ops. Same operand contract as `run_flash_attn`: `q`
+/// `[n_head, seq, 128]` f32 contiguous, `k`/`v` `[n_kv, K, 128]` f16 with
+/// contiguous rows (head-strided views allowed), `[n_head, seq, 128]` f32 out.
+pub(crate) fn run_flash_attn_tensor(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    geometry: FlashTGeometry,
+) -> Result<Tensor> {
+    let cdev = q.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("flash_attn_tensor requires q on a Metal device");
+    };
+
+    let (n_head, seq, head_dim) = q
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("q must be rank-3 [n_head, seq, head_dim]: {e}"))?;
+    if q.dtype() != DType::F32 {
+        bail!("q must be f32, got {:?}", q.dtype());
+    }
+    if !q.is_contiguous() {
+        bail!("q must be contiguous");
+    }
+    if head_dim != FLASH_BD {
+        bail!("flash_attn_tensor is compiled for head_dim {FLASH_BD}, got {head_dim}");
+    }
+    if seq == 0 {
+        bail!("flash_attn_tensor requires at least one query row");
+    }
+
+    let (n_kv, k_len, _) = check_flash_kv(k, "k", head_dim, &cdev)?;
+    let (n_kv_v, v_len, _) = check_flash_kv(v, "v", head_dim, &cdev)?;
+    if (n_kv_v, v_len) != (n_kv, k_len) {
+        bail!("k [{n_kv}, {k_len}] and v [{n_kv_v}, {v_len}] disagree on shape");
+    }
+    if n_kv == 0 || !n_head.is_multiple_of(n_kv) {
+        bail!("n_head ({n_head}) must be a positive multiple of n_kv ({n_kv})");
+    }
+    // The kernel's tensor extents are i32.
+    for (what, val) in [("seq", seq), ("K", k_len)] {
+        if i32::try_from(val).is_err() {
+            bail!("flash_attn_tensor {what} ({val}) overflows the kernel's i32 extents");
+        }
+    }
+
+    let out_count = checked_elems(&[n_head, seq, head_dim], "flash_attn_tensor")?;
+    let dst = mdev.new_buffer(out_count, DType::F32, "flash_attn_tensor")?;
+
+    let (q_guard, q_layout) = q.storage_and_layout();
+    let Storage::Metal(q_storage) = &*q_guard else {
+        bail!("q is not on a Metal device");
+    };
+    let (k_guard, k_layout) = k.storage_and_layout();
+    let Storage::Metal(k_storage) = &*k_guard else {
+        bail!("k is not on a Metal device");
+    };
+    let (v_guard, v_layout) = v.storage_and_layout();
+    let Storage::Metal(v_storage) = &*v_guard else {
+        bail!("v is not on a Metal device");
+    };
+
+    let pipeline = pipelines::flash_t_pipeline(mdev.device(), geometry.kernel_name()?)?;
+
+    let i64_stride = |s: usize, what: &str| -> Result<i64> {
+        i64::try_from(s)
+            .map_err(|_| anyhow::anyhow!("flash_attn_tensor {what} stride {s} overflows i64"))
+    };
+    let args = FlashTArgs {
+        n_q: seq as i32,
+        n_k: k_len as i32,
+        gqa_factor: (n_head / n_kv) as i32,
+        scale_log2: scale * std::f32::consts::LOG2_E,
+        q_stride_h: i64_stride(q_layout.stride()[0], "q head")?,
+        k_stride_h: i64_stride(k_layout.stride()[0], "k head")?,
+        v_stride_h: i64_stride(v_layout.stride()[0], "v head")?,
+        o_stride_h: (seq * head_dim) as i64,
+    };
+
+    let nq = seq.div_ceil(geometry.block_rows());
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(q_storage.buffer()),
+            q_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(k_storage.buffer()),
+            k_layout.start_offset() * DType::F16.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            3,
+            Some(v_storage.buffer()),
+            v_layout.start_offset() * DType::F16.size_in_bytes(),
+        );
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        encoder.set_threadgroup_memory_length(0, geometry.threadgroup_bytes());
+        // One threadgroup per (query block, query head); NSG simdgroups.
+        let grid = mtl_size(nq, n_head, 1);
+        encoder.dispatch_thread_groups(grid, mtl_size(32 * FlashTGeometry::NSG, 1, 1));
+    }
+    drop(q_guard);
+    drop(k_guard);
+    drop(v_guard);
+
+    Ok(output_tensor(dst, mdev, out_count, (n_head, seq, head_dim)))
+}
+
+/// Number of `i32` words `kernel_flash_attn_t_probe` writes for the r16/k32
+/// geometry: an 8-word header, then a (column, row) pair per lane per element
+/// of S (capacity 16 x 32 / 32 lanes) and of O (16 x 128 / 32 lanes). Sized
+/// for a layout that spreads the tile evenly; a larger per-lane capacity is
+/// caught by the probe's own header before the dump is read.
+#[cfg(test)]
+pub(crate) const FLASH_T_PROBE_WORDS: usize =
+    8 + 32 * (16 * 32 / 32) * 2 * 4 + 32 * (16 * 128 / 32) * 2 * 4;
+
+/// Run the test-only cooperative-tensor layout probe (flash_t.metal) and
+/// return its words. One simdgroup of 32 threads; the buffer is zeroed first.
+#[cfg(test)]
+pub(crate) fn run_flash_attn_t_probe(dev: &Device) -> Result<Vec<i32>> {
+    let Device::Metal(mdev) = dev else {
+        bail!("the flash_t probe needs a Metal device");
+    };
+    let zeros = Tensor::zeros(FLASH_T_PROBE_WORDS, DType::I64, dev)?;
+    let k = Tensor::zeros((32, 128), DType::F16, dev)?;
+    let (k_guard, _) = k.storage_and_layout();
+    let (z_guard, _) = zeros.storage_and_layout();
+    let (Storage::Metal(ks), Storage::Metal(zs)) = (&*k_guard, &*z_guard) else {
+        bail!("probe tensors are not on a Metal device");
+    };
+    let pipeline = pipelines::flash_t_pipeline(mdev.device(), "kernel_flash_attn_t_probe")?;
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_input_buffer(2, Some(ks.buffer()), 0);
+        encoder.set_input_buffer(3, Some(ks.buffer()), 0);
+        encoder.set_output_buffer(4, Some(zs.buffer()), 0);
+        encoder.dispatch_thread_groups(mtl_size(1, 1, 1), mtl_size(32, 1, 1));
+    }
+    drop(k_guard);
+    drop(z_guard);
+    // The buffer was allocated as i64 words so it is twice the i32 count; read
+    // it back as bytes and reinterpret.
+    let raw: Vec<i64> = zeros.to_vec1()?;
+    let words: Vec<i32> = raw
+        .iter()
+        .flat_map(|w| {
+            let b = w.to_le_bytes();
+            [
+                i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            ]
+        })
+        .collect();
+    Ok(words)
+}
+
+// ---------------------------------------------------------------------------
 // QSA decode row gather — see src/ops/qsa_gather.metal.
 
 /// Matches the Metal `qsa_gather_args` struct (src/ops/qsa_gather.metal).

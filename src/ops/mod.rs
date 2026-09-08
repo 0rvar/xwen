@@ -9,6 +9,7 @@ mod dispatch;
 pub mod f16;
 pub mod f32_mv;
 pub mod flash;
+pub mod flash_t;
 pub mod gated_residual;
 pub mod group_norm;
 pub mod hc;
@@ -41,6 +42,7 @@ pub(crate) use dispatch::view_offset_aligned_16;
 pub use f16::matmul_f16;
 pub use f32_mv::{matmul_f32, matmul_f32_supported};
 pub use flash::{flash_attn, flash_attn_bidirectional};
+pub use flash_t::{FlashTGeometry, flash_attn_tensor, flash_attn_tensor_with};
 pub use gated_residual::gated_residual;
 pub use group_norm::{group_norm, group_norm_apply, group_norm_fold};
 pub use hc::{

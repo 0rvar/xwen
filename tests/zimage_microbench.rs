@@ -465,6 +465,64 @@ fn bench_attention(dev: &Device, rows: &mut Vec<Row>) -> Result<()> {
     Ok(())
 }
 
+/// xwen's two bidirectional flash kernels at the shapes `attention_flash`
+/// hands them: f32 q, f16 k and v, head-major, no mask. `flash` is the
+/// vendored steel kernel (classic simdgroup matrices) and `tensor` the
+/// cooperative-tensor kernel, on every geometry it instantiates. TFLOPS
+/// counts both products, 4 * H * T * T * D.
+fn bench_flash_kernels(dev: &Device, rows: &mut Vec<Row>) -> Result<()> {
+    use xwen::ops::{FlashTGeometry, flash_attn_bidirectional, flash_attn_tensor_with};
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let attn_tflops = |t: usize, ms: f64| {
+        let flops = 4.0 * N_HEADS as f64 * (t as f64) * (t as f64) * HEAD_DIM as f64;
+        format!("{:.2} TFLOPS", flops / (ms * 1e-3) / 1e12)
+    };
+    for &t in SEQ_LENS.iter() {
+        let q = rand_tensor(&[N_HEADS, t, HEAD_DIM], DType::F32, dev)?;
+        let k = rand_tensor(&[N_HEADS, t, HEAD_DIM], DType::F16, dev)?;
+        let v = rand_tensor(&[N_HEADS, t, HEAD_DIM], DType::F16, dev)?;
+
+        let (ms, iters) = time_op(dev, || {
+            let _ = flash_attn_bidirectional(&q, &k, &v, scale)?;
+            Ok(())
+        })?;
+        rows.push(Row {
+            group: "flash",
+            what: "flash_attn_bidirectional (steel, XWEN_ZIMAGE_ATTN=flash)".to_string(),
+            seq: t,
+            dtype: "f32 q / f16 kv",
+            ms,
+            iters,
+            metric: attn_tflops(t, ms),
+        });
+
+        for geometry in FlashTGeometry::ALL {
+            let (ms, iters) = time_op(dev, || {
+                let _ = flash_attn_tensor_with(&q, &k, &v, scale, geometry)?;
+                Ok(())
+            })?;
+            let default = if geometry == FlashTGeometry::DEFAULT {
+                " (DEFAULT)"
+            } else {
+                ""
+            };
+            rows.push(Row {
+                group: "flash",
+                what: format!(
+                    "flash_attn_tensor {}{default} (XWEN_ZIMAGE_ATTN=tensor)",
+                    geometry.label()
+                ),
+                seq: t,
+                dtype: "f32 q / f16 kv",
+                ms,
+                iters,
+                metric: attn_tflops(t, ms),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// (e): the elementwise tail, at the activation shape every block carries it
 /// at. Bytes counted are the minimum the op must move: inputs read once,
 /// output written once.
@@ -828,6 +886,17 @@ fn xwen_bf16_gemm_only() -> Result<()> {
     Ok(())
 }
 
+/// The two flash kernels alone, for the attention arm's A/B.
+#[test]
+#[ignore = "GPU microbenchmark; run alone"]
+fn zimage_flash_kernels_only() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let mut rows = Vec::new();
+    bench_flash_kernels(&dev, &mut rows)?;
+    print_table(&rows);
+    Ok(())
+}
+
 #[test]
 #[ignore = "GPU microbenchmark; run alone and read docs/benching.md first"]
 fn zimage_op_microbench() -> Result<()> {
@@ -853,6 +922,7 @@ fn zimage_op_microbench() -> Result<()> {
     bench_xwen_bf16(&dev, &mut rows)?;
     bench_conversions(&dev, &mut rows)?;
     bench_attention(&dev, &mut rows)?;
+    bench_flash_kernels(&dev, &mut rows)?;
     bench_elementwise(&dev, &mut rows)?;
     bench_launch_overhead(&dev, &mut rows)?;
 
