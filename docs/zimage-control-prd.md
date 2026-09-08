@@ -30,7 +30,9 @@ what the controls below exist for.
 - The decision that a ComfyUI node pack of our own is built "only when the user names a
   composition that needs it: img2img, inpainting, LoRA or an upscale chain"
   ([decisions/zimage.md](decisions/zimage.md), 2026-09-07). This doc names three of the
-  four, so that condition is now met and the node pack is in scope, in the last phase.
+  four but does not take the node pack: the client for these controls is a GUI of our
+  own, planned separately (see "Clients"), so the condition is superseded rather than
+  met. Reopen if driving xwen from inside ComfyUI or Krita becomes something named.
 
 ## Corrections to the naive plan
 
@@ -157,12 +159,16 @@ the generate request, so a client can inspect or hand-edit a skeleton before ren
 
 ### API
 
-Two surfaces on the existing image engine thread.
+Two surfaces on the existing image engine thread. The native one is primary and is
+designed for a single client we control; the OpenAI one stays for SDKs and scripts.
 
 The OpenAI images endpoints for compatibility, as today plus `edits` (image + mask +
-prompt, which is tier-one inpainting at strength 1.0) and `variations` (img2img at a
-fixed strength). They cannot express LoRAs, strength, control or the window, so those
-take defaults.
+prompt, which is tier-one inpainting at strength 1.0, and img2img when the mask is
+absent) and `variations` (img2img at a fixed strength). They cannot express LoRAs,
+strength, control or the window, so those take defaults. No further work to court
+third-party apps: no field aliases beyond the ones already accepted, no extra path
+prefixes, no A1111 dialect. That was surveyed on 2026-09-08 and dropped in favour of
+our own client.
 
 A native endpoint, `POST /v1/images/render`, one JSON shape, images as base64 or as a
 path the server can read:
@@ -191,11 +197,20 @@ The CLI grows the same fields as flags: `--init`, `--strength`, `--mask`, `--mas
 `--lora name[:weight]` repeatable, `--control path`, `--control-type`, `--control-scale`,
 `--control-window`.
 
-### ComfyUI
+### Clients
 
-The node pack condition is met. Three nodes with real CONDITIONING and LATENT sockets so
-an xwen latent can feed local nodes and a local latent can come back for img2img, as the
-2026-09-07 decision describes. Last phase; the native endpoint is what it wraps.
+The native endpoint's client is a GUI of our own, xwen-gui, planned as its own doc and
+not part of this PRD. What this PRD owes it is the contract above and one response
+shape that carries everything the GUI will show: the image, the seed, the start step,
+and the preprocessed control map. The requirements the prompt study surfaced for that
+GUI are recorded here so the endpoint does not paint it into a corner: a grid keyed on
+one prompt across seeds and on one seed across prompt variants, since that is how this
+model is judged; a mask painter for the inpaint path; a control-map preview for pose.
+Nothing in the endpoint should assume one image per request or hide the map.
+
+The OpenAI route's clients are the openai SDKs with `base_url`, LiteLLM, and the MCP
+image servers that take a base URL, so Claude Code can render through it. Those already
+work with the route as it is.
 
 ## Phases
 
@@ -214,10 +229,12 @@ Each phase is an arc with its own record. Order is by what it unlocks per unit o
    `ZImageControlNetPipeline` at scale 0.75, full window, since diffusers has no window.
    Then the window on top. Then inpaint mode, tier two.
 5. **Pose and depth preprocessors**, and the preprocess endpoint.
-6. **ComfyUI node pack.**
-7. **CFG and the non-distilled ControlNet.** Only if phase 4's 8-step variant falls
+6. **CFG and the non-distilled ControlNet.** Only if phase 4's 8-step variant falls
    short on pose or inpaint in practice, which the discussion threads say it may. Reopen
    condition: a named composition where the 8-step file's artifacts are the blocker.
+
+The GUI is not a phase here. It starts once phase 3 gives it an endpoint to talk to and
+runs as its own arc with its own doc.
 
 ## Risks and open questions
 
@@ -225,7 +242,7 @@ Each phase is an arc with its own record. Order is by what it unlocks per unit o
   phase 4 before building the pose preprocessor around the stickman use case. If it
   fails, the workflow is a posed reference photo through DWPose.
 - The 8-step ControlNet may be canny-only in practice. Phase 4's record answers this
-  with the same prompt study protocol as the batch, and phase 7's reopen condition is
+  with the same prompt study protocol as the batch, and phase 6's reopen condition is
   written against it.
 - Memory. Turbo is ~20 GB resident on the engine thread; the full ControlNet adds 6.7
   GB, lite 2 GB, LoRAs merge at zero cost. Idle unload covers it; a request that needs
@@ -246,6 +263,7 @@ Each phase is an arc with its own record. Order is by what it unlocks per unit o
   2026-09-08; there is no checkpoint. Instruction editing waits for one.
 - Tile upscaling. Separate checkpoint, separate arc, and the prompt study did not need it.
 - Training or fine-tuning of any kind.
+- The GUI itself, and any ComfyUI or Krita integration. See "Clients".
 
 ## Sources
 
