@@ -46,7 +46,10 @@ use crate::zimage::pipeline::{DEFAULT_STEPS, ImageOptions, ZImagePipeline, encod
 /// come back rather than queued into a wait it did not ask for.
 pub(crate) const QUEUE_CAPACITY: usize = 4;
 const MAX_N: u32 = 4;
-const MAX_STEPS: usize = 50;
+/// The step ceiling a request may ask for, and equally the ceiling on the
+/// server-wide default: the two bounds are the same number so an operator
+/// cannot configure a default no request could have named.
+pub(crate) const MAX_STEPS: usize = 50;
 const DEFAULT_SIZE: (usize, usize) = (1024, 1024);
 const PROXY_PATH: &str = "/proxy/openai/images/generations";
 
@@ -130,6 +133,15 @@ pub(crate) fn spawn(
 ) -> (Handle, std::thread::JoinHandle<()>) {
     let (sender, receiver) = crossbeam_channel::bounded::<ImageJob>(QUEUE_CAPACITY);
     let resident = Arc::new(AtomicBool::new(false));
+    // Said once at startup, because a step count nobody asked for in a request
+    // is otherwise only visible in each render's own log line. The pipeline's
+    // own default needs no announcement.
+    if let Some(steps) = settings.image_steps.filter(|&n| n != DEFAULT_STEPS) {
+        logger.log(ServeLog::HostLine(format!(
+            "xwen serve: images render in {steps} steps unless a request names its own \
+             (pipeline default {DEFAULT_STEPS})"
+        )));
+    }
     let idle = settings.idle_unload;
     let thread_resident = Arc::clone(&resident);
     let thread = std::thread::Builder::new()
@@ -380,7 +392,16 @@ fn parse_size(text: &str) -> Result<(usize, usize), ApiError> {
 
 /// Turn a parsed body into what the engine runs, or the 400 saying why not.
 /// `proxy` is whether the request came in on the ComfyUI proxy path.
-pub(crate) fn validate(request: ImagesRequest, proxy: bool) -> Result<ImageParams, ApiError> {
+/// `server_steps` is the server-wide step default, which a request's own
+/// `steps` overrides and `None` falls through to [`DEFAULT_STEPS`]. It is a
+/// parameter rather than a read of the settings because the step count is the
+/// one render knob a client cannot always send: ComfyUI's stock OpenAI image
+/// node has no field for it.
+pub(crate) fn validate(
+    request: ImagesRequest,
+    proxy: bool,
+    server_steps: Option<usize>,
+) -> Result<ImageParams, ApiError> {
     let prompt = request.prompt.trim();
     if prompt.is_empty() {
         return Err(bad_param(
@@ -488,7 +509,7 @@ pub(crate) fn validate(request: ImagesRequest, proxy: bool) -> Result<ImageParam
                 format!("steps {a} and num_inference_steps {b} disagree; pass one of them"),
             ));
         }
-        (a, b) => a.or(b).unwrap_or(DEFAULT_STEPS),
+        (a, b) => a.or(b).or(server_steps).unwrap_or(DEFAULT_STEPS),
     };
     if !(1..=MAX_STEPS).contains(&steps) {
         return Err(bad_param(
@@ -523,7 +544,11 @@ pub(crate) async fn generations(
             return bad_request(format!("could not parse the request body: {e}")).into_response();
         }
     };
-    let params = match validate(request, uri.path() == PROXY_PATH) {
+    let params = match validate(
+        request,
+        uri.path() == PROXY_PATH,
+        state.settings.image_steps,
+    ) {
         Ok(params) => params,
         Err(err) => return err.into_response(),
     };
@@ -611,7 +636,7 @@ mod tests {
 
     #[test]
     fn a_bare_prompt_gets_every_default() {
-        let params = validate(parse(r#"{"prompt":"a cat"}"#), false).unwrap();
+        let params = validate(parse(r#"{"prompt":"a cat"}"#), false, None).unwrap();
         assert_eq!(
             params,
             ImageParams {
@@ -629,11 +654,11 @@ mod tests {
     #[test]
     fn the_comfyui_stock_node_payload_is_accepted_on_the_proxy_path_only() {
         let body = r#"{"model":"gpt-image-1","prompt":"a cat","quality":"low","background":"auto","n":1,"size":"1024x1024","moderation":"low"}"#;
-        let params = validate(parse(body), true).unwrap();
+        let params = validate(parse(body), true, None).unwrap();
         assert_eq!(params.model_note.as_deref(), Some("gpt-image-1"));
         assert_eq!((params.width, params.height), (1024, 1024));
 
-        let err = validate(parse(body), false).unwrap_err();
+        let err = validate(parse(body), false, None).unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(param(&err).as_deref(), Some("model"));
         assert!(message(&err).contains("Z-Image-Turbo"), "{}", message(&err));
@@ -642,11 +667,17 @@ mod tests {
     #[test]
     fn the_full_name_or_nothing_selects_the_model_on_the_v1_path() {
         for model in [r#""model":"Z-Image-Turbo","#, r#""model":"","#, ""] {
-            let params = validate(parse(&format!(r#"{{{model}"prompt":"x"}}"#)), false).unwrap();
+            let params =
+                validate(parse(&format!(r#"{{{model}"prompt":"x"}}"#)), false, None).unwrap();
             assert_eq!(params.model_note, None);
         }
         // The CLI alias is refused on the wire, as it is on every LM route.
-        let err = validate(parse(r#"{"model":"zimage-turbo","prompt":"x"}"#), false).unwrap_err();
+        let err = validate(
+            parse(r#"{"model":"zimage-turbo","prompt":"x"}"#),
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(message(&err).contains("zimage-turbo"), "{}", message(&err));
     }
 
@@ -668,7 +699,7 @@ mod tests {
 
     #[test]
     fn a_size_the_pipeline_refuses_is_a_400_with_its_reason() {
-        let err = validate(parse(r#"{"prompt":"x","size":"1000x1000"}"#), false).unwrap_err();
+        let err = validate(parse(r#"{"prompt":"x","size":"1000x1000"}"#), false, None).unwrap_err();
         assert_eq!(param(&err).as_deref(), Some("size"));
         assert!(
             message(&err).contains("multiples of 16"),
@@ -676,7 +707,7 @@ mod tests {
             message(&err)
         );
         // A cell count that would need pad rows is refused rather than padded.
-        let err = validate(parse(r#"{"prompt":"x","size":"1040x1040"}"#), false).unwrap_err();
+        let err = validate(parse(r#"{"prompt":"x","size":"1040x1040"}"#), false, None).unwrap_err();
         assert!(
             message(&err).contains("not a multiple of 32"),
             "{}",
@@ -689,21 +720,25 @@ mod tests {
         let params = validate(
             parse(r#"{"prompt":"x","size":"1024x1024","width":512,"height":768}"#),
             false,
+            None,
         )
         .unwrap();
         assert_eq!((params.width, params.height), (512, 768));
-        let err = validate(parse(r#"{"prompt":"x","width":512}"#), false).unwrap_err();
+        let err = validate(parse(r#"{"prompt":"x","width":512}"#), false, None).unwrap_err();
         assert!(message(&err).contains("go together"), "{}", message(&err));
     }
 
     #[test]
     fn n_is_one_through_four() {
         assert_eq!(
-            validate(parse(r#"{"prompt":"x","n":4}"#), false).unwrap().n,
+            validate(parse(r#"{"prompt":"x","n":4}"#), false, None)
+                .unwrap()
+                .n,
             4
         );
         for n in [0, 5, 10] {
-            let err = validate(parse(&format!(r#"{{"prompt":"x","n":{n}}}"#)), false).unwrap_err();
+            let err =
+                validate(parse(&format!(r#"{{"prompt":"x","n":{n}}}"#)), false, None).unwrap_err();
             assert_eq!(param(&err).as_deref(), Some("n"));
         }
     }
@@ -756,7 +791,7 @@ mod tests {
             ),
         ];
         for (body, field, needle) in cases {
-            let err = validate(parse(body), false).unwrap_err();
+            let err = validate(parse(body), false, None).unwrap_err();
             assert_eq!(err.status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(param(&err).as_deref(), Some(field), "{body}");
             assert!(message(&err).contains(needle), "{body}: {}", message(&err));
@@ -774,6 +809,7 @@ mod tests {
                     "output_compression":80,"rng_seed":9,"num_inference_steps":4}"#,
             ),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(params.seed, Some(9));
@@ -782,8 +818,37 @@ mod tests {
         let params = validate(
             parse(r#"{"prompt":"x","seed":3,"rng_seed":3,"steps":2,"num_inference_steps":2}"#),
             false,
+            None,
         )
         .unwrap();
         assert_eq!((params.seed, params.steps), (Some(3), 2));
+    }
+
+    /// The step count resolves request first, then the server-wide default,
+    /// then the pipeline's own. The middle rung is what a client with no step
+    /// field of its own — ComfyUI's stock OpenAI image node — renders at.
+    #[test]
+    fn the_server_wide_step_default_fills_in_for_a_request_that_names_none() {
+        let bare = r#"{"prompt":"a cat"}"#;
+        assert_eq!(
+            validate(parse(bare), false, None).unwrap().steps,
+            DEFAULT_STEPS
+        );
+        // 4 is a real turbo step count and not the pipeline's, so a pass-through
+        // of the default would fail this rather than read the same either way.
+        assert_ne!(4, DEFAULT_STEPS);
+        assert_eq!(validate(parse(bare), false, Some(4)).unwrap().steps, 4);
+        // Either spelling of the request's own count wins over the server's.
+        for named in [r#""steps":6"#, r#""num_inference_steps":6"#] {
+            let body = format!(r#"{{"prompt":"a cat",{named}}}"#);
+            assert_eq!(validate(parse(&body), false, Some(4)).unwrap().steps, 6);
+        }
+        // The proxy path resolves it the same way; nothing about the step count
+        // is per-path.
+        assert_eq!(validate(parse(bare), true, Some(4)).unwrap().steps, 4);
+        // A request out of range is refused whatever the server default is: the
+        // bound belongs to the pipeline, not to who supplied the number.
+        let err = validate(parse(r#"{"prompt":"x","steps":0}"#), false, Some(4)).unwrap_err();
+        assert_eq!(param(&err).as_deref(), Some("steps"));
     }
 }

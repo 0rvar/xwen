@@ -502,9 +502,11 @@ it as `image_model_loaded`. Fields: `prompt`, `size` (`WxH` or `auto`, default 1
 `n` (1 to 4), `seed`, `steps` (default 8), `response_format` (`b64_json` only); `model` is
 `Z-Image-Turbo` or absent, and anything the ComfyUI dropdown says on the proxy path. A
 negative prompt or a guidance scale is a 400, since Turbo runs without guidance and would
-ignore them silently. 1024x1024 measured 49 s warm and 80 s cold with load included, both
-taken before the four performance arcs of 2026-09-07 and 2026-09-08 cut the render from
-about 47 s to 15.5-17.5 s; the route has not been re-timed since.
+ignore them silently. `--image-steps <N>` (config `image.steps`, 1 to 50) sets the step
+count for every request that names none, which is how a client with no step field of its
+own renders at 4 or 6. 1024x1024 measured 49 s warm and 80 s cold with load included,
+both taken before the four performance arcs of 2026-09-07 and 2026-09-08 cut the render
+from about 47 s to 15.5-17.5 s; the route has not been re-timed since.
 
 ```
 curl -sS http://127.0.0.1:8080/v1/images/generations \

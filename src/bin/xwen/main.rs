@@ -818,6 +818,13 @@ struct ServeArgs {
     /// planes (see --cache-slots).
     #[arg(long)]
     draft_ctx: Option<usize>,
+    /// Denoising steps `POST /v1/images/generations` renders at when a request
+    /// names no count of its own (1 to 50; default: Z-Image-Turbo's own 8). A
+    /// request's `steps` / `num_inference_steps` wins over this; the flag is
+    /// for the clients that cannot send one, ComfyUI's stock OpenAI image node
+    /// among them.
+    #[arg(long, value_name = "STEPS")]
+    image_steps: Option<usize>,
 }
 
 impl ServeArgs {
@@ -870,6 +877,7 @@ impl ServeArgs {
             draft_p_min: self.draft_p_min,
             draft_pause_margin: self.draft_pause_margin,
             draft_ctx: self.draft_ctx,
+            image_steps: self.image_steps,
         }
     }
 }

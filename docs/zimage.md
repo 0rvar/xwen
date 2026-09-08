@@ -122,6 +122,13 @@ The node's `model` dropdown is accepted whatever it says, its `size` dropdown of
 1024x1024, 1024x1536, 1536x1024 and auto, and it carries no seed or step count on the
 wire; the `seed` and `steps` extension fields exist for clients that do.
 
+`serve --image-steps <N>`, or `steps` under the config file's `[image]` table, is the
+step count the route renders at when a request names none. It takes 1 to 50, the same
+range a request may ask for, and a value outside it is a startup error; unset, the
+pipeline's own eight steps apply. A request's `steps` or `num_inference_steps` still
+wins, so the setting is what serves the clients that cannot send one, the ComfyUI node
+above among them.
+
 ## `hidden_states[-2]` is index 35, and why
 
 Current transformers collects hidden states through forward hooks, not an in-loop

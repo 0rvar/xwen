@@ -356,6 +356,7 @@ pub struct ServeToml {
     pub sampling: SamplingToml,
     pub cache: CacheToml,
     pub draft: DraftToml,
+    pub image: ImageToml,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -374,6 +375,15 @@ pub struct SamplingToml {
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
     pub presence_penalty: Option<f64>,
+}
+
+/// The images route's server-wide defaults. Separate from the sampling and
+/// cache tables because it configures a different engine, the one behind
+/// `POST /v1/images/generations`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImageToml {
+    pub steps: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -514,6 +524,7 @@ pub struct CliOverrides {
     pub draft_p_min: Option<f32>,
     pub draft_pause_margin: Option<f32>,
     pub draft_ctx: Option<usize>,
+    pub image_steps: Option<usize>,
 }
 
 /// Fully resolved configuration handed to [`super::run`].
@@ -608,6 +619,12 @@ pub struct ServeSettings {
     /// Positions the drafter's cache is sized for, at least 1. Also how far into a
     /// conversation speculation stays active.
     pub draft_ctx: usize,
+    /// Denoising steps the images route renders at when a request names no
+    /// count of its own, or `None` for the pipeline's own default
+    /// ([`crate::zimage::pipeline::DEFAULT_STEPS`]). A request's `steps` /
+    /// `num_inference_steps` always wins; this exists for the clients that
+    /// cannot send one, ComfyUI's stock OpenAI image node among them.
+    pub image_steps: Option<usize>,
 }
 
 /// Read a config file. A missing file resolves to defaults, so the common case
@@ -1085,6 +1102,15 @@ pub fn resolve(
             origin,
             &mut warnings,
         ),
+        // Absent stays absent, meaning the pipeline's own step count.
+        image_steps: pick_opt(
+            "image-steps",
+            "image.steps",
+            cli.image_steps,
+            file.image.steps,
+            origin,
+            &mut warnings,
+        ),
     };
 
     // Zero queued jobs is not "no queueing", it is a server that can accept
@@ -1160,6 +1186,20 @@ pub fn resolve(
          forever; 0 disables pausing and always drafts)",
         settings.draft_pause_margin
     );
+
+    // The same range the images route enforces on a request's own step count.
+    // Refused at startup rather than clamped per render, so an operator learns
+    // about it before the first image instead of from a 400 a client sent no
+    // step count to earn.
+    if let Some(steps) = settings.image_steps {
+        ensure!(
+            (1..=super::images::MAX_STEPS).contains(&steps),
+            "image.steps must be between 1 and {}, not {steps} (it is the denoising \
+             step count the images route renders at, the same range a request may ask \
+             for)",
+            super::images::MAX_STEPS
+        );
+    }
 
     Ok((settings, warnings))
 }
@@ -1388,6 +1428,11 @@ pub fn init_template() -> String {
     let disk_cache = DEFAULT_DISK_CACHE;
     let disk_max_gib = DEFAULT_DISK_MAX_GIB;
     let disk_min_tokens = DEFAULT_DISK_MIN_TOKENS;
+    // The images route's step count has no resolved default of its own: absent
+    // means the pipeline's, so the template quotes that one and leaves the key
+    // commented out.
+    let default_steps = crate::zimage::pipeline::DEFAULT_STEPS;
+    let max_steps = super::images::MAX_STEPS;
     // One 20k-token conversation's file, which is the size to reason about: the
     // full-attention rows plus every snapshot the slot retained, and the drafter's
     // planes when speculation is on.
@@ -1668,6 +1713,15 @@ pause_margin = {draft_pause_margin}
 # target's context would spend several times as much on positions speculation
 # rarely reaches.
 ctx = {draft_ctx}
+
+[image]
+# Denoising steps POST /v1/images/generations renders at when a request names
+# no count of its own, 1 to {max_steps}. Left unset, Z-Image-Turbo's own {default_steps} are used,
+# which is what the checkpoint was distilled for; 4 or 6 trade quality for a
+# proportionally shorter render. A request's own steps / num_inference_steps
+# wins over this, so the key is for the clients that cannot send one —
+# ComfyUI's stock OpenAI image node has no field for it.
+# steps = {default_steps}
 "#
     )
 }
@@ -1812,6 +1866,49 @@ mod tests {
         assert_eq!(s.draft_p_min, None);
         assert_eq!(s.draft_pause_margin, DEFAULT_DRAFT_PAUSE_MARGIN);
         assert_eq!(s.draft_ctx, DEFAULT_DRAFT_CTX);
+        // Unresolved too: absent means the image pipeline's own step count, and
+        // that number belongs to the pipeline rather than to the server.
+        assert_eq!(s.image_steps, None);
+    }
+
+    /// The images route's step default: absent means the pipeline's own count,
+    /// a flag beats a config file with a warning naming both, and a value
+    /// outside the range a request may ask for is a startup error rather than
+    /// something the first render discovers.
+    #[test]
+    fn the_image_step_default_is_optional_and_range_checked() {
+        let file: ServeToml = toml::from_str("[image]\nsteps = 6\n").unwrap();
+        let (from_file, warnings) =
+            resolve(&file, Some(Path::new("/etc/serve.toml")), &model_only()).unwrap();
+        assert_eq!(from_file.image_steps, Some(6));
+        assert!(warnings.is_empty());
+
+        let cli = CliOverrides {
+            image_steps: Some(4),
+            ..model_only()
+        };
+        let (merged, warnings) = resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
+        assert_eq!(merged.image_steps, Some(4));
+        assert_eq!(
+            warnings,
+            vec![
+                "warning: --image-steps 4 overrides config image.steps = 6 (/etc/serve.toml)"
+                    .to_string()
+            ]
+        );
+
+        for bad in [0, crate::serve::images::MAX_STEPS + 1] {
+            let cli = CliOverrides {
+                image_steps: Some(bad),
+                ..model_only()
+            };
+            let err = resolve(&ServeToml::default(), None, &cli).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("image.steps must be between 1 and"),
+                "{bad}: {err:#}"
+            );
+        }
     }
 
     /// The drafting floor is the one drafter default that follows the
@@ -2772,5 +2869,7 @@ mod tests {
         assert_eq!(parsed.draft.enabled, None);
         assert_eq!(parsed.cache_dir, None);
         assert_eq!(parsed.disk_cache, Some(DEFAULT_DISK_CACHE));
+        // The image step count is the same case: absent means the pipeline's own.
+        assert_eq!(parsed.image.steps, None);
     }
 }

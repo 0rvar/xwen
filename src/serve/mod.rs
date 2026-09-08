@@ -1657,6 +1657,8 @@ pub(crate) mod testutil {
             draft_p_min: None,
             draft_pause_margin: config::DEFAULT_DRAFT_PAUSE_MARGIN,
             draft_ctx: config::DEFAULT_DRAFT_CTX,
+            // Absent, so the images route renders at the pipeline's own count.
+            image_steps: None,
         }
     }
 
