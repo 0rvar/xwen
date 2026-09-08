@@ -3368,6 +3368,24 @@ struct RopeArgs {
     pos: i32,
 }
 
+/// Matches the Metal `rope_pair_args` struct (src/ops/rope_pair.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopePairArgs {
+    batch: i32,
+    seq: i32,
+    heads: i32,
+    half_dim: i32,
+}
+
+/// Matches the Metal `gated_residual_args` struct (src/ops/gated_residual.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GatedResidualArgs {
+    n: i32,
+    channels: i32,
+}
+
 /// Matches the Metal `flash_attn_params` struct (src/ops/flash.metal).
 /// `#[repr(C)]` pins the layout byte-for-byte: twelve 4-byte fields (48 bytes,
 /// a multiple of 8) followed by eight `i64` element strides — no implicit
@@ -3723,6 +3741,199 @@ pub(crate) fn run_rope(
         candle_core::op::BackpropOp::none(),
         false,
     ))
+}
+
+/// Interleaved-pair rope against `kernel_rope_pair` (rope_pair.metal): dims
+/// `(2i, 2i+1)` of `x` `[batch, seq, heads, head_dim]` f32 rotate by column
+/// `i` of `cos`/`sin` `[seq, head_dim/2]` f32, one read and one write of `x`.
+/// Bit-identical to the strided candle chain it replaces (rope_pair.rs tests).
+pub(crate) fn run_rope_pair(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("rope_pair requires x on a Metal device");
+    };
+    let (batch, seq, heads, head_dim) = x
+        .dims4()
+        .map_err(|e| anyhow::anyhow!("x must be rank-4 [batch, seq, heads, head_dim]: {e}"))?;
+    if x.dtype() != DType::F32 {
+        bail!("x must be f32, got {:?}", x.dtype());
+    }
+    if !x.is_contiguous() {
+        bail!("x must be contiguous");
+    }
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        bail!("head_dim ({head_dim}) must be even: dims rotate in interleaved pairs");
+    }
+    let half = head_dim / 2;
+    for (name, t) in [("cos", cos), ("sin", sin)] {
+        let (rows, cols) = t
+            .dims2()
+            .map_err(|e| anyhow::anyhow!("{name} must be rank-2 [seq, head_dim/2]: {e}"))?;
+        if cols != half {
+            bail!("{name} has {cols} columns, expected head_dim/2 = {half}");
+        }
+        if rows != seq {
+            bail!("{name} has {rows} rows, expected seq = {seq}");
+        }
+        if t.dtype() != DType::F32 {
+            bail!("{name} must be f32, got {:?}", t.dtype());
+        }
+        if !t.is_contiguous() {
+            bail!("{name} must be contiguous");
+        }
+        if !x.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as x");
+        }
+    }
+    let n = checked_elems(&[batch, seq, heads, head_dim], "rope_pair")?;
+    glue_index_fits_i32(n)?;
+    let n_pairs = n / 2;
+
+    let pipeline = pipelines::rope_pair_pipeline(mdev.device(), "kernel_rope_pair")?;
+    let dst = mdev.new_buffer(n, DType::F32, "rope_pair")?;
+
+    let (x_guard, x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_storage) = &*x_guard else {
+        bail!("x is not on a Metal device");
+    };
+    let (cos_guard, cos_layout) = cos.storage_and_layout();
+    let Storage::Metal(cos_storage) = &*cos_guard else {
+        bail!("cos is not on a Metal device");
+    };
+    let (sin_guard, sin_layout) = sin.storage_and_layout();
+    let Storage::Metal(sin_storage) = &*sin_guard else {
+        bail!("sin is not on a Metal device");
+    };
+
+    let args = RopePairArgs {
+        batch: batch as i32,
+        seq: seq as i32,
+        heads: heads as i32,
+        half_dim: half as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(x_storage.buffer()),
+            x_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(cos_storage.buffer()),
+            cos_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            3,
+            Some(sin_storage.buffer()),
+            sin_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n_pairs);
+    }
+    drop(x_guard);
+    drop(cos_guard);
+    drop(sin_guard);
+
+    Ok(output_tensor(dst, mdev, n, (batch, seq, heads, head_dim)))
+}
+
+/// Gated residual add against `kernel_gated_residual` (gated_residual.metal):
+/// `out = h + gate[c] * y` with `gate` one f32 per channel of the last dim, `h`
+/// and `y` same-shape f32 contiguous. One pass, bit-identical to candle's
+/// `broadcast_mul` then `add` (gated_residual.rs tests).
+pub(crate) fn run_gated_residual(h: &Tensor, y: &Tensor, gate: &Tensor) -> Result<Tensor> {
+    let cdev = h.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("gated_residual requires h on a Metal device");
+    };
+    for (name, t) in [("h", h), ("y", y), ("gate", gate)] {
+        if t.dtype() != DType::F32 {
+            bail!("{name} must be f32, got {:?}", t.dtype());
+        }
+        if !t.is_contiguous() {
+            bail!("{name} must be contiguous");
+        }
+        if !h.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as h");
+        }
+    }
+    if h.dims() != y.dims() {
+        bail!("h shape {:?} must equal y shape {:?}", h.dims(), y.dims());
+    }
+    let channels = h
+        .dims()
+        .last()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("h must have at least one dim"))?;
+    if channels == 0 {
+        bail!("h has an empty last dim");
+    }
+    if gate.elem_count() != channels {
+        bail!(
+            "gate has {} elements, expected one per channel of h's last dim ({channels})",
+            gate.elem_count()
+        );
+    }
+    let shape = h.shape().clone();
+    let n = checked_elems(shape.dims(), "gated_residual")?;
+    glue_index_fits_i32(n)?;
+
+    let pipeline = pipelines::gated_residual_pipeline(mdev.device(), "kernel_gated_residual")?;
+    let dst = mdev.new_buffer(n, DType::F32, "gated_residual")?;
+
+    let (h_guard, h_layout) = h.storage_and_layout();
+    let Storage::Metal(h_storage) = &*h_guard else {
+        bail!("h is not on a Metal device");
+    };
+    let (y_guard, y_layout) = y.storage_and_layout();
+    let Storage::Metal(y_storage) = &*y_guard else {
+        bail!("y is not on a Metal device");
+    };
+    let (g_guard, g_layout) = gate.storage_and_layout();
+    let Storage::Metal(g_storage) = &*g_guard else {
+        bail!("gate is not on a Metal device");
+    };
+
+    let args = GatedResidualArgs {
+        n: n as i32,
+        channels: channels as i32,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(h_storage.buffer()),
+            h_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(y_storage.buffer()),
+            y_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            3,
+            Some(g_storage.buffer()),
+            g_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(h_guard);
+    drop(y_guard);
+    drop(g_guard);
+
+    Ok(output_tensor(dst, mdev, n, shape))
 }
 
 /// Matches the Metal `delta_conv_args` struct (src/ops/delta.metal).

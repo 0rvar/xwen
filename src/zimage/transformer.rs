@@ -515,10 +515,25 @@ impl RopeEmbedder {
 ///
 /// x: (B, seq_len, n_heads, head_dim)
 /// cos, sin: (seq_len, head_dim/2), f32
+///
+/// On Metal this is one kernel, `ops::rope_pair`, reading and writing `x`
+/// once. Off Metal it is the candle chain below, which the kernel reproduces
+/// bit for bit (the ops test proves it); the chain's even/odd views have
+/// stride 2, so every one of its six elementwise ops runs candle's strided
+/// path, and on the 68 calls per step that was 13% of a 1024x1024 step.
 pub fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let (b, seq_len, n_heads, head_dim) = x.dims4()?;
     let half_dim = head_dim / 2;
     let x_dtype = x.dtype();
+
+    if x.device().is_metal() {
+        let x = x.to_dtype(DType::F32)?.contiguous()?;
+        let cos = cos.contiguous()?;
+        let sin = sin.contiguous()?;
+        let rotated = crate::ops::rope_pair(&x, &cos, &sin)
+            .map_err(|e| candle_core::Error::Msg(format!("z-image rope_pair kernel: {e:#}")))?;
+        return rotated.to_dtype(x_dtype);
+    }
 
     // Reshape x to interleaved real/imag form: (B, seq_len, n_heads, half_dim, 2)
     let x = x
@@ -738,15 +753,78 @@ impl ZImageAttention {
 
 // ==================== ZImageTransformerBlock ====================
 
+/// The block's RMSNorm: the same fused `candle_nn::ops::rms_norm` kernel
+/// `candle_nn::RmsNorm` runs on a contiguous input, holding the weight itself
+/// so the adaLN scale can be folded into it.
+///
+/// The modulated block computes `rms_norm(x) * w * (1 + scale)` with `scale`
+/// one value per channel for the whole image. `w * (1 + scale)` is a
+/// `[dim]` vector, so the norm can take it as its weight and the full-tensor
+/// `broadcast_mul` after the norm disappears. The two forms differ only in
+/// which of two f32 multiplies rounds first; the parity gate grades that.
+#[derive(Debug, Clone)]
+pub struct BlockNorm {
+    weight: Tensor,
+    eps: f32,
+}
+
+impl BlockNorm {
+    pub fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get(dim, "weight")?.to_dtype(DType::F32)?.contiguous()?;
+        Ok(Self {
+            weight,
+            eps: eps as f32,
+        })
+    }
+
+    /// From a weight already in hand, for tests and for callers that build
+    /// the block without a checkpoint.
+    pub fn from_weight(weight: Tensor, eps: f64) -> Result<Self> {
+        Ok(Self {
+            weight: weight.to_dtype(DType::F32)?.contiguous()?,
+            eps: eps as f32,
+        })
+    }
+
+    /// `rms_norm(x) * w`.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps)
+    }
+
+    /// `rms_norm(x) * w * scale` for a per-channel `scale` (any shape with
+    /// `dim` elements, `[1, 1, dim]` in the block), as one norm over the
+    /// folded weight.
+    pub fn forward_scaled(&self, x: &Tensor, scale: &Tensor) -> Result<Tensor> {
+        let scale = scale.flatten_all()?.to_dtype(DType::F32)?;
+        let folded = (&self.weight * scale)?;
+        candle_nn::ops::rms_norm(&x.contiguous()?, &folded, self.eps)
+    }
+}
+
+/// `h + gate ⊙ y` with `gate` one value per channel, `[1, 1, dim]` in the
+/// block: one kernel on Metal (`ops::gated_residual`), the candle
+/// `broadcast_mul` and `add` pair elsewhere. The kernel reproduces the pair
+/// bit for bit (the ops test proves it).
+fn gated_residual(h: &Tensor, y: &Tensor, gate: &Tensor) -> Result<Tensor> {
+    if h.device().is_metal() {
+        let h = h.contiguous()?;
+        let y = y.contiguous()?;
+        let gate = gate.contiguous()?;
+        return crate::ops::gated_residual(&h, &y, &gate)
+            .map_err(|e| candle_core::Error::Msg(format!("z-image gated_residual kernel: {e:#}")));
+    }
+    h + gate.broadcast_mul(y)?
+}
+
 /// Z-Image transformer block with optional AdaLN modulation
 #[derive(Debug, Clone)]
 pub struct ZImageTransformerBlock {
     attention: ZImageAttention,
     feed_forward: FeedForward,
-    attention_norm1: RmsNorm,
-    attention_norm2: RmsNorm,
-    ffn_norm1: RmsNorm,
-    ffn_norm2: RmsNorm,
+    attention_norm1: BlockNorm,
+    attention_norm2: BlockNorm,
+    ffn_norm1: BlockNorm,
+    ffn_norm2: BlockNorm,
     adaln_modulation: Option<Projection>,
     profiler: Option<Arc<Profiler>>,
 }
@@ -760,10 +838,10 @@ impl ZImageTransformerBlock {
         let attention = ZImageAttention::new(cfg, vb.pp("attention"))?;
         let feed_forward = FeedForward::new(dim, hidden_dim, vb.pp("feed_forward"), arm)?;
 
-        let attention_norm1 = RmsNorm::new(dim, cfg.norm_eps, vb.pp("attention_norm1"))?;
-        let attention_norm2 = RmsNorm::new(dim, cfg.norm_eps, vb.pp("attention_norm2"))?;
-        let ffn_norm1 = RmsNorm::new(dim, cfg.norm_eps, vb.pp("ffn_norm1"))?;
-        let ffn_norm2 = RmsNorm::new(dim, cfg.norm_eps, vb.pp("ffn_norm2"))?;
+        let attention_norm1 = BlockNorm::new(dim, cfg.norm_eps, vb.pp("attention_norm1"))?;
+        let attention_norm2 = BlockNorm::new(dim, cfg.norm_eps, vb.pp("attention_norm2"))?;
+        let ffn_norm1 = BlockNorm::new(dim, cfg.norm_eps, vb.pp("ffn_norm1"))?;
+        let ffn_norm2 = BlockNorm::new(dim, cfg.norm_eps, vb.pp("ffn_norm2"))?;
 
         let adaln_modulation = if modulation {
             let adaln_dim = dim.min(ADALN_EMBED_DIM);
@@ -828,22 +906,21 @@ impl ZImageTransformerBlock {
             let scale_mlp = (scale_mlp + 1.0)?;
             profile::mark(&self.profiler, "adaln");
 
-            // Attention block
-            let normed = self.attention_norm1.forward(x)?;
-            let scaled = normed.broadcast_mul(&scale_msa)?;
+            // Attention block: the norm carries the (1 + scale) modulation in
+            // its weight, and the gate and the residual add are one pass.
+            let scaled = self.attention_norm1.forward_scaled(x, &scale_msa)?;
             profile::mark(&self.profiler, "attn.norm+scale");
             let attn_out = self.attention.forward(&scaled, attn_mask, cos, sin)?;
             let attn_out = self.attention_norm2.forward(&attn_out)?;
-            let x = (x + gate_msa.broadcast_mul(&attn_out)?)?;
+            let x = gated_residual(x, &attn_out, &gate_msa)?;
             profile::mark(&self.profiler, "attn.gate+residual");
 
             // FFN block
-            let normed = self.ffn_norm1.forward(&x)?;
-            let scaled = normed.broadcast_mul(&scale_mlp)?;
+            let scaled = self.ffn_norm1.forward_scaled(&x, &scale_mlp)?;
             profile::mark(&self.profiler, "ffn.norm+scale");
             let ffn_out = self.feed_forward.forward(&scaled)?;
             let ffn_out = self.ffn_norm2.forward(&ffn_out)?;
-            let out = (x + gate_mlp.broadcast_mul(&ffn_out)?)?;
+            let out = gated_residual(&x, &ffn_out, &gate_mlp)?;
             profile::mark(&self.profiler, "ffn.gate+residual");
             Ok(out)
         } else {
@@ -1426,6 +1503,52 @@ mod tests {
 
     fn cpu() -> Device {
         Device::Cpu
+    }
+
+    /// Folding the adaLN scale into the norm weight computes the same thing as
+    /// the norm followed by the broadcast multiply: `rms(x) * w * s` either way,
+    /// the two differing only in which f32 multiply rounds first. Graded on the
+    /// device that runs it when Metal is available, on the CPU otherwise.
+    #[test]
+    fn the_scale_folds_into_the_norm_weight() {
+        let dev = crate::gguf::metal_device().unwrap_or(Device::Cpu);
+        let (t, dim) = (37usize, 96usize);
+        let x = Tensor::randn(0f32, 3.0, (1, t, dim), &dev).unwrap();
+        let w = Tensor::randn(1f32, 0.2, dim, &dev).unwrap();
+        let scale = (Tensor::randn(0f32, 0.5, (1, 1, dim), &dev).unwrap() + 1.0).unwrap();
+        let norm = BlockNorm::from_weight(w.clone(), 1e-5).unwrap();
+        let folded = norm.forward_scaled(&x, &scale).unwrap();
+        let chain = norm.forward(&x).unwrap().broadcast_mul(&scale).unwrap();
+        let f: Vec<f32> = folded.flatten_all().unwrap().to_vec1().unwrap();
+        let c: Vec<f32> = chain.flatten_all().unwrap().to_vec1().unwrap();
+        let (mut num, mut den) = (0f64, 0f64);
+        for (a, b) in f.iter().zip(&c) {
+            num += ((a - b) * (a - b)) as f64;
+            den += (b * b) as f64;
+        }
+        let rel_l2 = (num / den).sqrt();
+        assert!(rel_l2 < 1e-6, "folded norm vs chain: rel_l2 {rel_l2:.3e}");
+    }
+
+    /// The gated residual helper matches the candle pair on whichever device
+    /// runs it; on Metal that is the kernel, elsewhere the pair itself.
+    #[test]
+    fn the_gated_residual_matches_the_candle_pair() {
+        let dev = crate::gguf::metal_device().unwrap_or(Device::Cpu);
+        let (t, dim) = (37usize, 96usize);
+        let h = Tensor::randn(0f32, 3.0, (1, t, dim), &dev).unwrap();
+        let y = Tensor::randn(0f32, 3.0, (1, t, dim), &dev).unwrap();
+        let gate = Tensor::randn(0f32, 0.5, (1, 1, dim), &dev)
+            .unwrap()
+            .tanh()
+            .unwrap();
+        let got = gated_residual(&h, &y, &gate).unwrap();
+        let want = (&h + gate.broadcast_mul(&y).unwrap()).unwrap();
+        let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+        let w: Vec<f32> = want.flatten_all().unwrap().to_vec1().unwrap();
+        for (a, b) in g.iter().zip(&w) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
     }
 
     /// The five values from working the reference's `polar(theta=256)` tables

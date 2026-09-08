@@ -115,6 +115,13 @@ const ATTN_GLUE_SOURCE: &str = include_str!("attn_glue.metal");
 /// rope rotation must instead compile under the same default math mode as
 /// candle's own rope kernel to stay bit-identical (see rope.metal).
 const ROPE_SOURCE: &str = include_str!("rope.metal");
+/// Interleaved-pair rope for the Z-Image transformer (rope_pair.metal). Own
+/// library; FP contraction and reassociation pinned off so it rounds like the
+/// candle chain it replaces.
+const ROPE_PAIR_SOURCE: &str = include_str!("rope_pair.metal");
+/// Gated residual add for the Z-Image transformer (gated_residual.metal). Own
+/// library, same pinning as above for the same reason.
+const GATED_RESIDUAL_SOURCE: &str = include_str!("gated_residual.metal");
 /// Vendored flash-attention prefill kernel (the modified copy of candle's MLX
 /// steel attention: float Q/O, half K/V, in-kernel causal+sliding-window
 /// masking). Own library (no Metal-4 dependency), compiled fast-math like
@@ -342,6 +349,16 @@ pub(crate) fn attn_glue_pipeline(device: &Device, name: &str) -> Result<ComputeP
 /// Pipeline for a `rope.metal` kernel (vendored partial-rotary NEOX rope).
 pub(crate) fn rope_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, ROPE_SOURCE, "rope", name)
+}
+
+/// Pipeline for the `rope_pair.metal` kernel (Z-Image interleaved-pair rope).
+pub(crate) fn rope_pair_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, ROPE_PAIR_SOURCE, "rope_pair", name)
+}
+
+/// Pipeline for the `gated_residual.metal` kernel (Z-Image gated residual add).
+pub(crate) fn gated_residual_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, GATED_RESIDUAL_SOURCE, "gated_residual", name)
 }
 
 /// Pipeline for a `flash.metal` kernel (vendored flash-attention prefill).

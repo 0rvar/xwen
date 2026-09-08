@@ -8,6 +8,7 @@ mod dispatch;
 pub mod f16;
 pub mod f32_mv;
 pub mod flash;
+pub mod gated_residual;
 pub mod hc;
 pub mod mm_id;
 pub mod moe_glue;
@@ -19,6 +20,7 @@ pub mod q8;
 pub mod qsa_gather;
 pub mod qsa_select;
 pub mod qsa_tiles;
+pub mod rope_pair;
 pub mod silu_mul;
 
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
@@ -34,6 +36,7 @@ pub(crate) use dispatch::view_offset_aligned_16;
 pub use f16::matmul_f16;
 pub use f32_mv::{matmul_f32, matmul_f32_supported};
 pub use flash::flash_attn;
+pub use gated_residual::gated_residual;
 pub use hc::{
     hc_gate_down, hc_gate_fused_supported, hc_gate_up_mix, hc_mix, hc_norm, hc_norm_supported,
     hc_silu_quarter, hc_write,
@@ -46,6 +49,7 @@ pub use moe_glue::{
 pub use mv_ext::{matmul_mv_ext, mv_ext_supported};
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
 pub use q8::matmul_q8;
+pub use rope_pair::rope_pair;
 pub use silu_mul::{silu_mul, silu_mul_l2, silu_mul_l2_supported};
 
 pub use crate::gguf::ExpertStack;
