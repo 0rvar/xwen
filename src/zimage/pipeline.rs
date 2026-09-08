@@ -103,7 +103,7 @@ impl ZImagePipeline {
         let mut transformer_cfg: Config = read_json(&transformer_dir.join("config.json"))?;
         transformer_cfg.set_attn_impl(attn);
         transformer_cfg.set_linear_impl(linear);
-        if attn != AttnImpl::Fused {
+        if attn != AttnImpl::Flash {
             eprintln!("xwen: z-image attention arm: {}", attn.label());
         }
         if linear != LinearImpl::Xwen {

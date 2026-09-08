@@ -27,6 +27,9 @@ pub const ADALN_EMBED_DIM: usize = 256;
 pub const SEQ_MULTI_OF: usize = 32;
 /// Frequency embedding size for timestep encoding
 pub const FREQUENCY_EMBEDDING_SIZE: usize = 256;
+/// The head width `ops::flash_attn_bidirectional` is compiled for, and the
+/// shipped checkpoint's.
+pub const FLASH_HEAD_DIM: usize = 128;
 /// Max period for sinusoidal encoding
 pub const MAX_PERIOD: f64 = 10000.0;
 
@@ -80,13 +83,14 @@ pub struct Config {
     pub axes_dims: Vec<usize>,
     #[serde(default = "default_axes_lens")]
     pub axes_lens: Vec<usize>,
-    /// Whether attention runs through candle's fused Metal SDPA kernel (the
-    /// default) or through the plain matmul-softmax-matmul chain, which is the
-    /// reference arm for an A/B. Not a key in the shipped config.json, so the
-    /// `serde` default is what decides it, and that default reads
-    /// [`ATTN_ENV`] — `XWEN_ZIMAGE_ATTN=basic` selects the reference arm.
-    #[serde(default = "default_use_accelerated_attn")]
-    pub use_accelerated_attn: bool,
+    /// Which attention chain runs: xwen's bidirectional flash kernel (the
+    /// default), candle's fused SDPA kernel, or the plain
+    /// matmul-softmax-matmul chain, which is the reference arm for an A/B.
+    /// Not a key in the shipped config.json, so the `serde` default is what
+    /// decides it, and that default reads [`ATTN_ENV`]: `XWEN_ZIMAGE_ATTN=basic`
+    /// selects the reference arm, `fused` candle's kernel.
+    #[serde(default = "default_attn_impl")]
+    pub attn_impl: AttnImpl,
     /// Whether the linear layers run through xwen's Metal-4 tensor gemm (the
     /// default) or through candle's bf16 gemm, the pre-kernel path and the
     /// bisect arm. Not a key in the shipped config.json either; the `serde`
@@ -110,9 +114,18 @@ pub fn compute_padding_len(ori_len: usize) -> usize {
 pub const ATTN_ENV: &str = "XWEN_ZIMAGE_ATTN";
 
 /// Which attention chain a built [`Config`] runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AttnImpl {
-    /// The shipped path on Metal: candle's fused SDPA kernel.
+    /// The shipped path on Metal: xwen's flash kernel in its bidirectional
+    /// mode (`ops::flash_attn_bidirectional`), f32 queries over f16 keys and
+    /// values, with the head-major permutes and the f16 cast fused into one
+    /// pass each. Needs head_dim 128, which is what the kernel is compiled
+    /// for.
+    Flash,
+    /// candle's fused SDPA kernel on f32 q, k and v: the path that shipped
+    /// before the flash arm, and the one a masked call falls back to, the
+    /// flash kernel taking no mask.
     Fused,
     /// The explicit chain — Q·Kᵀ, additive mask, softmax, P·V — through
     /// candle's plain matmul and softmax. It is the reference arm: it shares
@@ -126,7 +139,7 @@ impl AttnImpl {
     /// must name an arm.
     pub fn from_env() -> Result<Self> {
         match std::env::var(ATTN_ENV) {
-            Err(std::env::VarError::NotPresent) => Ok(Self::Fused),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Flash),
             Err(std::env::VarError::NotUnicode(_)) => {
                 candle_core::bail!("{ATTN_ENV} is not valid UTF-8")
             }
@@ -140,37 +153,41 @@ impl AttnImpl {
     /// opens anything, so a typo in a bisect run is a load error rather than
     /// a silent measurement of the wrong arm.
     pub fn from_env_or_default() -> Self {
-        Self::from_env().unwrap_or(Self::Fused)
+        Self::from_env().unwrap_or(Self::Flash)
     }
 
-    /// `fused` / `flash` (or empty) select the shipped path, `basic` the
-    /// reference chain; anything else is refused rather than defaulted.
+    /// `flash` / `xwen` (or empty) select the shipped path, `fused` / `sdpa`
+    /// candle's kernel, `basic` the reference chain; anything else is refused
+    /// rather than defaulted.
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "fused" | "flash" | "sdpa" => Ok(Self::Fused),
+            "" | "flash" | "xwen" => Ok(Self::Flash),
+            "fused" | "sdpa" => Ok(Self::Fused),
             "basic" => Ok(Self::Basic),
             other => candle_core::bail!(
-                "{ATTN_ENV}={other:?}: expected `fused` (the default) or `basic`"
+                "{ATTN_ENV}={other:?}: expected `flash` (the default), `fused` or `basic`"
             ),
         }
     }
 
-    /// Whether this arm is the fused kernel, which is how [`Config`] stores it.
+    /// Whether this arm runs a fused attention kernel rather than the
+    /// explicit reference chain.
     pub fn is_accelerated(self) -> bool {
-        matches!(self, Self::Fused)
+        !matches!(self, Self::Basic)
     }
 
     /// The name a dump or a log records for provenance.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Flash => "flash",
             Self::Fused => "fused",
             Self::Basic => "basic",
         }
     }
 }
 
-fn default_use_accelerated_attn() -> bool {
-    AttnImpl::from_env_or_default().is_accelerated()
+fn default_attn_impl() -> AttnImpl {
+    AttnImpl::from_env_or_default()
 }
 
 fn default_use_xwen_linear() -> bool {
@@ -248,7 +265,7 @@ impl Config {
             t_scale: 1000.0,
             axes_dims: vec![32, 48, 48],
             axes_lens: AXES_LENS.to_vec(),
-            use_accelerated_attn: AttnImpl::from_env_or_default().is_accelerated(),
+            attn_impl: AttnImpl::from_env_or_default(),
             use_xwen_linear: LinearImpl::from_env_or_default().is_xwen(),
         }
     }
@@ -270,18 +287,14 @@ impl Config {
 
     /// Which attention chain this config runs.
     pub fn attn_impl(&self) -> AttnImpl {
-        if self.use_accelerated_attn {
-            AttnImpl::Fused
-        } else {
-            AttnImpl::Basic
-        }
+        self.attn_impl
     }
 
     /// Pick the attention chain explicitly, overriding what [`ATTN_ENV`] said
     /// when this config was built. What a test uses to run both arms in one
     /// process without touching the environment its siblings share.
     pub fn set_attn_impl(&mut self, attn: AttnImpl) {
-        self.use_accelerated_attn = attn.is_accelerated();
+        self.attn_impl = attn;
     }
 
     /// Get head dimension
@@ -570,7 +583,7 @@ pub struct ZImageAttention {
     qk_norm: Option<QkNorm>,
     n_heads: usize,
     head_dim: usize,
-    use_accelerated_attn: bool,
+    attn: AttnImpl,
     profiler: Option<Arc<Profiler>>,
 }
 
@@ -592,6 +605,15 @@ impl ZImageAttention {
             None
         };
 
+        // The flash kernel is compiled for one head width; a checkpoint with
+        // another is refused here rather than at the first forward.
+        if cfg.attn_impl == AttnImpl::Flash && head_dim != FLASH_HEAD_DIM {
+            candle_core::bail!(
+                "{ATTN_ENV}=flash needs head_dim {FLASH_HEAD_DIM}, this model has {head_dim}; \
+                 run it with {ATTN_ENV}=fused"
+            );
+        }
+
         Ok(Self {
             to_q,
             to_k,
@@ -600,7 +622,7 @@ impl ZImageAttention {
             qk_norm,
             n_heads,
             head_dim,
-            use_accelerated_attn: cfg.use_accelerated_attn,
+            attn: cfg.attn_impl,
             profiler: None,
         })
     }
@@ -651,28 +673,65 @@ impl ZImageAttention {
         let k = apply_rotary_emb(&k, cos, sin)?;
         profile::mark(&self.profiler, "attn.rope");
 
-        // Transpose for attention: (B, n_heads, seq_len, head_dim)
-        let q = q.transpose(1, 2)?.contiguous()?;
-        let k = k.transpose(1, 2)?.contiguous()?;
-        let v = v.transpose(1, 2)?.contiguous()?;
-        profile::mark(&self.profiler, "attn.transpose");
-
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let on_metal = hidden_states.device().is_metal();
 
-        let context = if self.use_accelerated_attn && hidden_states.device().is_metal() {
-            self.attention_metal(&q, &k, &v, attention_mask, scale)?
-        } else {
-            self.attention_basic(&q, &k, &v, attention_mask, scale)?
-        };
-        profile::mark(&self.profiler, "attn.sdpa");
+        // The flash arm takes head-major operands and no mask: batch 1 and no
+        // keep-mask is what every pipeline call is. A masked call (the tests)
+        // runs candle's kernel below instead, which does take one.
+        let context =
+            if self.attn == AttnImpl::Flash && on_metal && attention_mask.is_none() && b == 1 {
+                self.attention_flash(&q, &k, &v, scale)?
+            } else {
+                // Transpose for attention: (B, n_heads, seq_len, head_dim)
+                let q = q.transpose(1, 2)?.contiguous()?;
+                let k = k.transpose(1, 2)?.contiguous()?;
+                let v = v.transpose(1, 2)?.contiguous()?;
+                profile::mark(&self.profiler, "attn.transpose");
 
-        // Reshape back: (B, n_heads, seq_len, head_dim) -> (B, seq_len, dim)
-        let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
-        profile::mark(&self.profiler, "attn.untranspose");
+                let context = if self.attn.is_accelerated() && on_metal {
+                    self.attention_metal(&q, &k, &v, attention_mask, scale)?
+                } else {
+                    self.attention_basic(&q, &k, &v, attention_mask, scale)?
+                };
+                profile::mark(&self.profiler, "attn.sdpa");
+
+                // Reshape back: (B, n_heads, seq_len, head_dim) -> (B, seq_len, dim)
+                let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;
+                profile::mark(&self.profiler, "attn.untranspose");
+                context
+            };
 
         let out = context.apply(&self.to_out)?;
         profile::mark(&self.profiler, "attn.out");
         Ok(out)
+    }
+
+    /// Metal: xwen's flash kernel, bidirectional. `q`, `k`, `v` arrive
+    /// token-major `[1, seq, n_heads, 128]` f32; the kernel wants head-major
+    /// `[n_heads, seq, 128]`, f32 for q and f16 for k and v, so each goes
+    /// through one fused permute (`permute_01`, with the f16 rounding folded in
+    /// for k and v), and the head-major f32 output comes back through one
+    /// more. Four passes, as the transpose-and-copy chain took, but each is a
+    /// single pass and k and v are written at half width. The f16 keys and
+    /// values are the one rounding this arm adds over the fused one; the
+    /// parity gate is where it is graded.
+    fn attention_flash(&self, q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+        let (_, seq_len, _, _) = q.dims4()?;
+        let msg =
+            |e: anyhow::Error| candle_core::Error::Msg(format!("z-image flash attention: {e:#}"));
+        let q = crate::ops::permute_01(&q.squeeze(0)?.contiguous()?).map_err(msg)?;
+        let k = crate::ops::permute_01_f16(&k.squeeze(0)?.contiguous()?).map_err(msg)?;
+        let v = crate::ops::permute_01_f16(&v.squeeze(0)?.contiguous()?).map_err(msg)?;
+        profile::mark(&self.profiler, "attn.transpose");
+        let out = crate::ops::flash_attn_bidirectional(&q, &k, &v, scale as f32).map_err(msg)?;
+        profile::mark(&self.profiler, "attn.sdpa");
+        // (n_heads, seq_len, head_dim) -> (seq_len, n_heads, head_dim) -> (1, seq_len, dim)
+        let context = crate::ops::permute_01(&out)
+            .map_err(msg)?
+            .reshape((1, seq_len, ()))?;
+        profile::mark(&self.profiler, "attn.untranspose");
+        Ok(context)
     }
 
     /// Metal: candle's fused SDPA kernel (bf16/f16/f32, head_dim 128).
@@ -1684,14 +1743,18 @@ mod tests {
 
     #[test]
     fn the_attention_env_switch_names_its_arms_and_refuses_a_typo() {
-        assert_eq!(AttnImpl::parse("").unwrap(), AttnImpl::Fused);
+        assert_eq!(AttnImpl::parse("").unwrap(), AttnImpl::Flash);
+        assert_eq!(AttnImpl::parse(" Flash ").unwrap(), AttnImpl::Flash);
+        assert_eq!(AttnImpl::parse("xwen").unwrap(), AttnImpl::Flash);
         assert_eq!(AttnImpl::parse("fused").unwrap(), AttnImpl::Fused);
-        assert_eq!(AttnImpl::parse(" Flash ").unwrap(), AttnImpl::Fused);
+        assert_eq!(AttnImpl::parse("sdpa").unwrap(), AttnImpl::Fused);
         assert_eq!(AttnImpl::parse("basic").unwrap(), AttnImpl::Basic);
         assert_eq!(AttnImpl::parse("BASIC").unwrap(), AttnImpl::Basic);
         assert!(AttnImpl::parse("reference").is_err());
+        assert_eq!(AttnImpl::Flash.label(), "flash");
         assert_eq!(AttnImpl::Fused.label(), "fused");
         assert_eq!(AttnImpl::Basic.label(), "basic");
+        assert!(AttnImpl::Flash.is_accelerated());
         assert!(AttnImpl::Fused.is_accelerated());
         assert!(!AttnImpl::Basic.is_accelerated());
 
@@ -1700,9 +1763,93 @@ mod tests {
         let mut cfg = Config::z_image_turbo();
         cfg.set_attn_impl(AttnImpl::Basic);
         assert_eq!(cfg.attn_impl(), AttnImpl::Basic);
-        assert!(!cfg.use_accelerated_attn);
         cfg.set_attn_impl(AttnImpl::Fused);
         assert_eq!(cfg.attn_impl(), AttnImpl::Fused);
+        cfg.set_attn_impl(AttnImpl::Flash);
+        assert_eq!(cfg.attn_impl(), AttnImpl::Flash);
+    }
+
+    /// The flash arm agrees with the basic chain within a bar and not to the
+    /// bit, on the tiny model (head_dim 128, which the kernel needs). The bar
+    /// is wider than [`ATTN_AB_BAR`] because this arm rounds k and v to f16
+    /// on the way in, which the two f32 arms do not; the mutations in
+    /// `the_attention_bar_is_tighter_than_a_broken_arm` sit at 1e-2 and above,
+    /// so a bar of 1e-4 still separates a broken arm from a rounded one. A
+    /// masked call falls back to candle's kernel and must equal the fused arm
+    /// bit for bit, that being the same computation.
+    #[test]
+    fn the_flash_attention_arm_matches_the_basic_chain() {
+        let Some(dev) = metal_or_skip("the_flash_attention_arm_matches_the_basic_chain") else {
+            return;
+        };
+        let mut flash_cfg = tiny_config();
+        flash_cfg.set_attn_impl(AttnImpl::Flash);
+        let mut fused_cfg = tiny_config();
+        fused_cfg.set_attn_impl(AttnImpl::Fused);
+        let mut basic_cfg = tiny_config();
+        basic_cfg.set_attn_impl(AttnImpl::Basic);
+        let flash = ZImageAttention::new(&flash_cfg, random_vb(&dev)).unwrap();
+        let fused = ZImageAttention::new(&fused_cfg, random_vb(&dev)).unwrap();
+        let basic = ZImageAttention::new(&basic_cfg, random_vb(&dev)).unwrap();
+
+        // 200 tokens: unaligned for both the 32-row query blocks and the
+        // 16-column key blocks, so the ragged kernel variant runs.
+        let seq = 200;
+        let hidden = random_vb(&dev)
+            .get((1, seq, flash_cfg.dim), "hidden_states")
+            .unwrap();
+        let ids = create_coordinate_grid((1, 10, 20), (1, 0, 0), &dev).unwrap();
+        let rope = RopeEmbedder::new(
+            flash_cfg.rope_theta,
+            flash_cfg.axes_dims.clone(),
+            flash_cfg.axes_lens.clone(),
+            &dev,
+        )
+        .unwrap();
+        let (cos, sin) = rope.forward(&ids).unwrap();
+
+        let a = flash.forward(&hidden, None, &cos, &sin).unwrap();
+        let b = basic.forward(&hidden, None, &cos, &sin).unwrap();
+        assert_eq!(a.dims(), &[1, seq, flash_cfg.dim]);
+        let diff = max_abs_diff(&a, &b);
+        eprintln!("z-image attention, flash vs basic: max |delta| {diff:.3e}");
+        assert!(diff <= FLASH_AB_BAR, "max abs diff {diff}");
+        assert!(
+            diff > 0.0,
+            "the two arms produced bit-identical output, so they ran the same kernel"
+        );
+
+        let keep: Vec<f32> = (0..seq)
+            .map(|i| if i < seq / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let mask = Tensor::from_vec(keep, (1, seq), &dev).unwrap();
+        let a_masked = flash.forward(&hidden, Some(&mask), &cos, &sin).unwrap();
+        let f_masked = fused.forward(&hidden, Some(&mask), &cos, &sin).unwrap();
+        assert_eq!(
+            max_abs_diff(&a_masked, &f_masked),
+            0.0,
+            "a masked call on the flash arm runs candle's kernel, the same as the fused arm"
+        );
+    }
+
+    /// The flash arm refuses a head width the kernel is not compiled for at
+    /// construction, naming the switch that runs such a model.
+    #[test]
+    fn the_flash_attention_arm_refuses_another_head_dim() {
+        let Some(dev) = metal_or_skip("the_flash_attention_arm_refuses_another_head_dim") else {
+            return;
+        };
+        let mut cfg = tiny_config();
+        cfg.n_heads = 4;
+        cfg.n_kv_heads = 4;
+        cfg.set_attn_impl(AttnImpl::Flash);
+        let err = match ZImageAttention::new(&cfg, random_vb(&dev)) {
+            Err(e) => e,
+            Ok(_) => panic!("head_dim 64 must be refused on the flash arm"),
+        };
+        assert!(err.to_string().contains("head_dim 128"), "{err}");
+        cfg.set_attn_impl(AttnImpl::Fused);
+        ZImageAttention::new(&cfg, random_vb(&dev)).unwrap();
     }
 
     /// Deterministic pseudo-random weights for any name and shape, so a whole
@@ -1772,7 +1919,7 @@ mod tests {
             t_scale: 1000.0,
             axes_dims: vec![32, 48, 48],
             axes_lens: vec![40, 8, 8],
-            use_accelerated_attn: true,
+            attn_impl: AttnImpl::Flash,
             use_xwen_linear: true,
         }
     }
@@ -1867,6 +2014,10 @@ mod tests {
     /// with a uniform distribution, at 8.9e-5. The whole gap between 1.2e-8 and
     /// 2e-3 was unmeasured.
     const ATTN_AB_BAR: f32 = 2e-5;
+
+    /// The bar for the flash arm against the basic chain, wider than
+    /// [`ATTN_AB_BAR`] by the f16 rounding of k and v it carries.
+    const FLASH_AB_BAR: f32 = 1e-4;
 
     /// The basic attention arm agrees with the fused Metal kernel, within a
     /// bar and NOT to the bit.

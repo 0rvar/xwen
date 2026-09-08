@@ -35,7 +35,7 @@ pub use dispatch::mv_vendored_supported;
 pub(crate) use dispatch::view_offset_aligned_16;
 pub use f16::matmul_f16;
 pub use f32_mv::{matmul_f32, matmul_f32_supported};
-pub use flash::flash_attn;
+pub use flash::{flash_attn, flash_attn_bidirectional};
 pub use gated_residual::gated_residual;
 pub use hc::{
     hc_gate_down, hc_gate_fused_supported, hc_gate_up_mix, hc_mix, hc_norm, hc_norm_supported,

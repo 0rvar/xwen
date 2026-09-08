@@ -5085,6 +5085,56 @@ pub(crate) fn run_flash_attn(
     scale: f32,
     disable_skip: bool,
 ) -> Result<Tensor> {
+    run_flash_attn_impl(
+        q,
+        k,
+        v,
+        FlashMask::Causal { pos, k_off, window },
+        scale,
+        disable_skip,
+    )
+}
+
+/// Bidirectional flash attention: every query row sees every key column.
+/// `q` is `[n_head, seq, 128]` f32 contiguous, `k`/`v` `[n_kv, K, 128]` f16
+/// with contiguous rows, returns `[n_head, seq, 128]` f32. The kernel is the
+/// causal one unchanged: query row 0 is placed at absolute position `K` with
+/// the keys at 0..K, so no key is ever in a query's future, and the window is
+/// unbounded, so none is ever expired. The block-skip bounds then cover the
+/// whole key range and the in-kernel mask touches only the out-of-range
+/// columns of an unaligned last key block.
+pub(crate) fn run_flash_attn_bidirectional(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    run_flash_attn_impl(q, k, v, FlashMask::Bidirectional, scale, false)
+}
+
+/// Which visibility rule a flash dispatch runs. Both are expressed to the
+/// kernel through the same three args (`q_off`, `k_off`, `window`).
+#[derive(Clone, Copy, Debug)]
+enum FlashMask {
+    /// Query row i at absolute `pos + i` sees key column j at `k_off + j` iff
+    /// it is not in the future and within `window`.
+    Causal {
+        pos: usize,
+        k_off: usize,
+        window: Option<usize>,
+    },
+    /// Every query sees every key.
+    Bidirectional,
+}
+
+fn run_flash_attn_impl(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: FlashMask,
+    scale: f32,
+    disable_skip: bool,
+) -> Result<Tensor> {
     let cdev = q.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("flash_attn requires q on a Metal device");
@@ -5115,34 +5165,53 @@ pub(crate) fn run_flash_attn(
         bail!("n_head ({n_head}) must be a positive multiple of n_kv ({n_kv})");
     }
 
-    // The mask semantics require every query's own key in range: row i's own
-    // key sits at column `pos + i - k_off`, which must lie in [0, K). A row
-    // with NO visible key would divide 0/0 in the softmax normalizer.
-    if k_off > pos {
-        bail!("k_off ({k_off}) exceeds pos ({pos}): query rows before the key range");
-    }
-    let q_end = pos
-        .checked_add(seq)
-        .ok_or_else(|| anyhow::anyhow!("pos + seq ({pos} + {seq}) overflows usize"))?;
-    let k_end = k_off
-        .checked_add(k_len)
-        .ok_or_else(|| anyhow::anyhow!("k_off + K ({k_off} + {k_len}) overflows usize"))?;
-    if q_end > k_end {
-        bail!(
-            "query rows reach absolute position {q_end} but keys end at {k_end}: \
-             each query's own key must be present"
-        );
-    }
-    // The kernel does its position math in i32.
-    for (what, val) in [("pos + seq", q_end), ("k_off + K", k_end)] {
-        if i32::try_from(val).is_err() {
-            bail!("flash_attn {what} ({val}) overflows the kernel's i32 position math");
+    let (pos, k_off, window) = match mask {
+        FlashMask::Causal { pos, k_off, window } => {
+            // The mask semantics require every query's own key in range: row
+            // i's own key sits at column `pos + i - k_off`, which must lie in
+            // [0, K). A row with NO visible key would divide 0/0 in the softmax
+            // normalizer.
+            if k_off > pos {
+                bail!("k_off ({k_off}) exceeds pos ({pos}): query rows before the key range");
+            }
+            let q_end = pos
+                .checked_add(seq)
+                .ok_or_else(|| anyhow::anyhow!("pos + seq ({pos} + {seq}) overflows usize"))?;
+            let k_end = k_off
+                .checked_add(k_len)
+                .ok_or_else(|| anyhow::anyhow!("k_off + K ({k_off} + {k_len}) overflows usize"))?;
+            if q_end > k_end {
+                bail!(
+                    "query rows reach absolute position {q_end} but keys end at {k_end}: \
+                     each query's own key must be present"
+                );
+            }
+            // The kernel does its position math in i32.
+            for (what, val) in [("pos + seq", q_end), ("k_off + K", k_end)] {
+                if i32::try_from(val).is_err() {
+                    bail!("flash_attn {what} ({val}) overflows the kernel's i32 position math");
+                }
+            }
+            let window = match window {
+                None => i32::MAX,
+                Some(0) => bail!("flash_attn window must be >= 1"),
+                Some(w) => i32::try_from(w).unwrap_or(i32::MAX),
+            };
+            (pos, k_off, window)
         }
-    }
-    let window = match window {
-        None => i32::MAX,
-        Some(0) => bail!("flash_attn window must be >= 1"),
-        Some(w) => i32::try_from(w).unwrap_or(i32::MAX),
+        FlashMask::Bidirectional => {
+            // Query row 0 sits at absolute position K, so the newest key
+            // (K - 1) is in every row's past; the unbounded window keeps every
+            // key unexpired. Row positions reach K + seq, which the kernel
+            // holds in i32.
+            let q_end = k_len
+                .checked_add(seq)
+                .ok_or_else(|| anyhow::anyhow!("K + seq ({k_len} + {seq}) overflows usize"))?;
+            if i32::try_from(q_end).is_err() {
+                bail!("flash_attn K + seq ({q_end}) overflows the kernel's i32 position math");
+            }
+            (k_len, 0usize, i32::MAX)
+        }
     };
 
     let out_count = checked_elems(&[n_head, seq, head_dim], "flash_attn")?;

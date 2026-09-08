@@ -35,6 +35,18 @@ pub fn flash_attn(
     dispatch::run_flash_attn(q, k, v, pos, k_off, window, scale, false)
 }
 
+/// Bidirectional flash attention, `softmax(q·kᵀ·scale)·v` with every query
+/// seeing every key: the diffusion transformer's attention, where the image
+/// and caption tokens form one unordered set. Same operand contract as
+/// [`flash_attn`] (`q` `[n_head, seq, 128]` f32, `k`/`v` `[n_kv, K, 128]` f16
+/// with contiguous rows, `[n_head, seq, 128]` f32 out) and the same kernel:
+/// the causal rule is satisfied vacuously by placing the queries after the
+/// last key, so nothing in the kernel changes and the causal callers keep
+/// their bit-identical results. Metal only.
+pub fn flash_attn_bidirectional(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+    dispatch::run_flash_attn_bidirectional(q, k, v, scale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +272,106 @@ mod tests {
         let full =
             dispatch::run_flash_attn(&q, &k16, &v16, pos, 0, Some(window), scale, true).unwrap();
         assert_bits_eq(&skipping, &full, "block-skip vs no-skip");
+    }
+
+    /// UNIT 4: the bidirectional entry matches candle's UNMASKED f32 sdpa over
+    /// the widened k/v, at the diffusion shape (30 heads of 128, no GQA,
+    /// 4128 = the 1024x1024 image tokens plus a 32-token caption), at an
+    /// unaligned length, at the minimal one, with fewer queries than keys and
+    /// with GQA, which the entry does not forbid. The kernel path is the
+    /// causal one with every key in the past, so bitwise agreement is the
+    /// expected outcome and `check_close` prints which it was.
+    #[test]
+    fn flash_attn_bidirectional_matches_f32_sdpa() {
+        let dev = metal_device().unwrap();
+        let hd = 128usize;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        // (label, n_head, n_kv, seq, K).
+        type Case = (&'static str, usize, usize, usize, usize);
+        let cases: &[Case] = &[
+            ("z-image 1024x1024", 30, 30, 4128, 4128),
+            ("unaligned seq and K", 6, 6, 203, 203),
+            ("seq=2", 4, 4, 2, 2),
+            ("fewer queries than keys", 4, 4, 40, 64),
+            ("gqa 8/2 unaligned", 8, 2, 45, 45),
+        ];
+
+        for &(label, n_head, n_kv, seq, k_len) in cases {
+            let seed = (n_head * 1000 + seq * 3 + k_len) as u64;
+            let q = rand_t(seed, (n_head, seq, hd), &dev);
+            let k16 = rand_kv(seed + 1, (n_kv, k_len, hd), &dev);
+            let v16 = rand_kv(seed + 2, (n_kv, k_len, hd), &dev);
+
+            let got = flash_attn_bidirectional(&q, &k16, &v16, scale).unwrap();
+
+            // The kernel maps query head h to kv head h / gqa_factor, which is
+            // the tiled expansion below (kv head j serves q heads
+            // j*factor .. (j+1)*factor).
+            let expand = |t: &Tensor| -> Tensor {
+                let factor = n_head / n_kv;
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .unsqueeze(1)
+                    .unwrap()
+                    .expand((n_kv, factor, k_len, hd))
+                    .unwrap()
+                    .reshape((n_head, k_len, hd))
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
+            };
+            let want = candle_nn::ops::sdpa(
+                &q.unsqueeze(0).unwrap(),
+                &expand(&k16).unsqueeze(0).unwrap(),
+                &expand(&v16).unsqueeze(0).unwrap(),
+                None,
+                false,
+                scale,
+                1.0,
+            )
+            .unwrap()
+            .squeeze(0)
+            .unwrap();
+            check_close(&got, &want, label);
+        }
+    }
+
+    /// The bidirectional entry is not the causal one with a big `pos`: the
+    /// same inputs through both differ wherever a key is in a query's future.
+    #[test]
+    fn flash_attn_bidirectional_sees_future_keys() {
+        let dev = metal_device().unwrap();
+        let (n_head, seq, hd) = (4usize, 48usize, 128usize);
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let q = rand_t(300, (n_head, seq, hd), &dev);
+        let k16 = rand_kv(301, (n_head, seq, hd), &dev);
+        let v16 = rand_kv(302, (n_head, seq, hd), &dev);
+        let causal = flash_attn(&q, &k16, &v16, 0, 0, None, scale).unwrap();
+        let both = flash_attn_bidirectional(&q, &k16, &v16, scale).unwrap();
+        let c: Vec<f32> = causal.flatten_all().unwrap().to_vec1().unwrap();
+        let b: Vec<f32> = both.flatten_all().unwrap().to_vec1().unwrap();
+        // The last query row sees every key under both rules and must agree;
+        // the first row sees one key causally and all of them here.
+        let row =
+            |v: &[f32], h: usize, r: usize| v[(h * seq + r) * hd..(h * seq + r + 1) * hd].to_vec();
+        for h in 0..n_head {
+            assert_eq!(
+                row(&c, h, seq - 1)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                row(&b, h, seq - 1)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                "head {h}: the last row sees all keys under both rules"
+            );
+            assert!(
+                row(&c, h, 0) != row(&b, h, 0),
+                "head {h}: the first row must differ once future keys are visible"
+            );
+        }
     }
 
     /// Rejection paths: shape/dtype/stride/position preconditions fail cleanly.
