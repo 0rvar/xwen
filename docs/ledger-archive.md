@@ -3096,3 +3096,73 @@ blocks use of the feature; item (a) is the one with a known trigger.
   (2026-09-07).
   [Record](records/zimage-perf.md).
   From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+[Shipped 2026-09-08 by the tensor-op attention arc (e5d9775, log.md "Z-Image's VAE on a direct conv kernel and its attention on the tensor units"): `src/ops/flash_t.metal` runs QK^T and PV through `mpp::tensor_ops::matmul2d`, 5.80 ms against the steel copy's 20.05 at 30 x 4128 x 128 (45.1 against 13.1 TFLOP/s), profiled `attn.sdpa` 698 to 231 ms, parity step-0 cosine 0.999999 and image PSNR 45.60 dB; `tensor` is the default arm and `flash` stays selectable (decisions.md "The shipped attention arm is a Metal-4 tensor-op kernel"). Its remainder is not an item: the kernel is per-simdgroup rather than P through threadgroup memory because the SDK forces it, the output permute was not taken with it, and the not-taken variants with their reopen conditions are in docs/records/zimage-perf.md "Attention on the cooperative tensor ops, 13 to 45 TFLOP/s". What the arc found beside the kernel is the ramp, 1.35 to 2.0-2.1 s over eight steps, which is the new Front instrument.]
+
+- [x] [measured] **A Metal-4 tensor-op attention kernel for the Z-Image transformer.**
+  `attn.sdpa` is the slowest large plane at ~16 TFLOP/s where the same chip's gemms reach
+  30-39, and the reason is now known rather than assumed: the vendored flash kernel
+  shipped on 2026-09-08 is a COPY of candle's MLX steel attention, simdgroup matmul with
+  f32 accumulate, so it runs at candle's rate and the bidirectional switch bought traffic
+  and copies only, 740 to 687 ms (decisions.md "Bidirectional attention is a query-position
+  trick on the causal flash kernel"). The merged profiler pass prices it: 0.53 s of a 2.15 s
+  step, and 0.23 s at the gemms' rate, so **0.30 s per step and 2.4 s per 1024x1024 image**.
+  It is the third-largest lever on this graph, behind the VAE conv path and the SwiGLU f32
+  store. The shape: `matmul2d` for QK^T and for PV with an online softmax over
+  cooperative-tensor elements and P staged through threadgroup memory, head_dim 128,
+  bidirectional, f32 accumulate. It would also take the output permute with it if it can
+  write token-major, ~40 ms deflated. Attention grows quadratically in tokens, so it is the
+  first term at any size above 1024x1024 (2026-09-08).
+  [Record](records/zimage-perf.md), [figures](perf-state.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+[Shipped 2026-09-08 by the VAE conv arc (a763c61, log.md "Z-Image's VAE on a direct conv kernel and its attention on the tensor units"): `src/ops/conv2d_direct.metal` and `src/ops/group_norm.metal`, an implicit-gemm f32 conv on NCHW at 10-11 TFLOP/s with the norm, the silu, the upsample and the residual folded into its read and store; decode 5.2 s to 1.36-1.44 s at 1024x1024 and 1.06 to 0.26 s at 512x512, VAE-alone PSNR 92.32 dB (decisions.md "The VAE decodes on a direct implicit-gemm conv over NCHW"). The three cheap wins it named were overtaken rather than done: the silu and the GroupNorm passes are inside the conv now, and the mid-block attention, ~0.1 s and 7% of the decode, is a record line with its reopen condition and not an item. Not taken, with reopen conditions in docs/records/zimage-perf.md "The VAE on an implicit-gemm conv, 5.2 s to 1.4 s": the 16-row tile for the deep convs, the statistics fold into the preceding conv's epilogue, an f32 tensor-op conv, and the footprint, which stays the `[small]` item in TODO.md.]
+
+- [x] [measured] **The VAE decode's conv path: 4.93 s, and not bandwidth-bound.**
+  One decode is 4.93 s cool and 5.15 s hot against eight 3.6 s steps, so it is 13% of a
+  ~37 s image and a second saved there is worth 130 ms of step time. It is 9.89 TFLOP of
+  f32 convolution at ~2.0 effective TFLOP/s; at the tensor gemm's rate that arithmetic is
+  ~0.3 s, and 1-1.5 s is the realistic target for a direct 3x3 kernel or MPSGraph. bf16 is
+  REFUTED as the cheap version of this, measured and reverted: 4.79 s against 4.93 at
+  1024x1024 and 1.09 against 1.08 at 512x512, and the VAE-alone PSNR fell to 54.38 dB
+  against the 60 dB bar (decisions.md "The VAE decodes in f32 and bf16 is refuted"). The
+  cost is candle's im2col structure, a 9x materialization plus a narrow-`n` gemm plus an
+  NHWC-to-NCHW permute per conv, all of which shrink with dtype and none of which get
+  fewer. `up3.resnets` alone is a third of the decode and the top two resolutions are 68%.
+  The cheap wins first: `Activation::Swish` to the fused `Activation::Silu` at 28 sites,
+  SDPA for the mid-block's materialized 16384-token softmax, a fused GroupNorm for nine
+  full-tensor passes (2026-09-07).
+  **2026-09-08: it is now the LARGEST lever on this graph.** The two step-time arcs left the
+  decode untouched, so its 5.2 s is a quarter of a ~25 s image against 13% of a ~37 s one,
+  and 5.2 to 1.0-1.5 s is **3.7-4.2 s per image**, more than any step-side row. The merged
+  profile localizes it: `up3.resnets` 2343 ms profiled of 6792, the top two resolutions
+  about two thirds. Take the three cheap wins first, worth maybe 0.5-1 s on their own before
+  any new conv kernel.
+  [Record](records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+## Deferred from the Z-Image VAE conv and tensor-op attention arcs (2026-09-08)
+
+[Opened 2026-09-08 by the third Z-Image arc of the day (a763c61, e5d9775, and the refuted branch `zimage-ffn`; log.md "Z-Image's VAE on a direct conv kernel and its attention on the tensor units"). Nothing has closed under it yet; its open items sit in TODO.md "Image generation", the power-envelope instrument first.]
+
+## Retired: Image generation
+
+[Retired 2026-09-08: its basis was the profiler's buffer-pool eviction and not the f32 store. The bf16 store was built on the branch `zimage-ffn` (5e7a6ea), is bit-exact, and measured parity within 5% with an unstable sign; the f32-store gemm runs 37-45 TFLOP/s isolated, w2's own class, and bandwidth caps the lever at ~0.2 s per image (decisions.md "The bf16 SwiGLU store is REFUTED"). A half intermediate for w2 is disqualified by a measured activation max of 284,507 against f16's 65,504. Reopen if a future MPP release adds a converting cooperative-tensor store or documents the tile lane layout so a vectorized epilogue can skip the index math, or with a per-row scaled activation folded into w2's gemm, which is a different arc.]
+
+- [ ] [measured] **The 10240-wide f32 activation write in Z-Image's SwiGLU.**
+  `ffn.w1w3` runs at 24.5 TFLOP/s against `ffn.w2`'s 38.7 for identical FLOPs, and the
+  difference is the f32 activation it writes: 4128x10240 f32 is 169 MB each against w2's
+  63 MB. About 5 ms per wide gemm, ~300 ms per step, ~2.4 s per image, and it is the price
+  of the f32 activation stream at the one place the stream is 10240 wide. Two fixes and
+  they are not equivalent: a `silu_mul` epilogue on the gemm removes the intermediate
+  entirely and is not a precision change, while having the gemm write bf16 for the SwiGLU
+  intermediate is, and the parity gate arbitrates that one. `ffn.silu_mul` is a further
+  ~118 ms per step that the epilogue would also absorb (2026-09-07).
+  **2026-09-08: the epilogue route is REFUTED** and the bf16 intermediate is what remains.
+  The dual gemm was built, is right at rel_l2 5e-8, and is 15% slower isolated and 2-4%
+  slower in situ (decisions.md "The SwiGLU dual gemm is REFUTED"). Repriced on the merged
+  tree: 22.1 TFLOP at 24.5 TFLOP/s is 0.90 s of a 2.15 s step against 0.57 at `ffn.w2`'s own
+  38.7, so **0.33 s per step and 2.6 s per image**, the second-largest lever here. That is
+  the per-row basis; the aggregate 1.19x deflation would put the row at 0.67 s and the gain
+  nearer 1 s per image, and the microbench settles which holds.
+  [Record](records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).

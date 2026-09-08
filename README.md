@@ -20,8 +20,8 @@ its own reference gate at cosine 0.99999449.
 **And since 2026-09-07 one thing here is not a language model.** `xwen image` renders a
 prompt to a PNG through the Z-Image-Turbo diffusion pipeline, conditioned on that same
 4B encoder in process. It produces coherent, prompt-faithful 1024x1024 images in about
-38 s, and its transformer is graded against a diffusers fp32 dump at a step-0 velocity
-cosine of 0.999999 (Models, below).
+22-25 s warm, and its transformer is graded against a diffusers fp32 dump at a step-0
+velocity cosine of 0.999999 (Models, below).
 
 ## Docs
 
@@ -206,17 +206,21 @@ and neither side past 8192 px; 1024x1024, 1024x768, 512x512 and 1536x1024 all sa
 three. Anything else is refused with the reason, because the padded-image path is not
 implemented and 8192 px is as far as the model's position tables reach.
 
-One image at 1024x1024 takes about 25 s warm, roughly 16 s of it in the eight transformer
-steps and 5.2 s in the VAE decode; 512x512 takes 8.6 s. A 1024x1024 step is 2.15 s at
-steady state and 1.78 s for the first step, after two days of work: 2026-09-07 moved the
-transformer's linears onto xwen's Metal-4 tensor gemm (5.0-5.25 s to 3.6 s) and 2026-09-08
-fused the rope, the modulation scale, the gated residual and attention (3.6 s to 2.15 s).
-The VAE decode has had no performance work and is now the largest single piece of an image.
-`XWEN_ZIMAGE_ATTN` selects the attention arm, `flash` (the default) or `fused` (candle's
-SDPA) or `basic`; `XWEN_ZIMAGE_LINEAR=candle` runs the previous gemm path as a bisect arm;
-`XWEN_ZIMAGE_PROFILE=1` prints per-stage times for a run. A non-default arm is named in the
-startup log and the default is silent. The transformer is
-graded against a diffusers fp32 dump (`tests/zimage_parity.rs`, docs/parity.md).
+One image at 1024x1024 takes 22-25 s warm, of which 14-16 s is the eight transformer steps
+and 1.4 s the VAE decode, the rest being load; 512x512 takes 8.1 s. A 1024x1024 step reads
+1.35 s first and rises to 2.0-2.1 s by the eighth, after two days of work: 2026-09-07 moved
+the transformer's linears onto xwen's Metal-4 tensor gemm (5.0-5.25 s to 3.6 s), and
+2026-09-08 fused the rope, the modulation scale and the gated residual (to 2.15 s), then
+put attention on the tensor units and the VAE on a direct conv kernel (the decode 5.2 s to
+1.4 s). The ramp is quoted with the step because it is now larger than the plateau's gain,
+which docs/perf-state.md explains. `XWEN_ZIMAGE_ATTN` selects the attention arm, `tensor`
+(the default, xwen's Metal-4 kernel) or `flash` (the vendored steel copy, the previous
+default) or `fused` (candle's SDPA) or `basic`; `XWEN_ZIMAGE_VAE=candle` runs the VAE on the
+vendored conv chain instead of the direct kernel; `XWEN_ZIMAGE_LINEAR=candle` runs the
+previous gemm path as a bisect arm; `XWEN_ZIMAGE_PROFILE=1` prints per-stage times for a
+run. A non-default arm is named in the startup log and the default is silent. The
+transformer is graded against a diffusers fp32 dump (`tests/zimage_parity.rs`,
+docs/parity.md).
 `docs/zimage.md` is the architecture and the traps, `docs/records/zimage-pipeline.md` the
 arcs, `docs/perf-state.md` the timings and their conditions.
 
@@ -499,8 +503,8 @@ it as `image_model_loaded`. Fields: `prompt`, `size` (`WxH` or `auto`, default 1
 `Z-Image-Turbo` or absent, and anything the ComfyUI dropdown says on the proxy path. A
 negative prompt or a guidance scale is a 400, since Turbo runs without guidance and would
 ignore them silently. 1024x1024 measured 49 s warm and 80 s cold with load included, both
-taken before the tensor-gemm arc cut about 16 s off the eight steps; the route has not
-been re-timed since.
+taken before the four performance arcs of 2026-09-07 and 2026-09-08 cut the render from
+about 47 s to 15.5-17.5 s; the route has not been re-timed since.
 
 ```
 curl -sS http://127.0.0.1:8080/v1/images/generations \

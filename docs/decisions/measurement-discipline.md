@@ -204,6 +204,24 @@ what licenses deflating the rest: the elementwise and copy rows carry the whole 
 and read about 1.9x high. So take a gemm or sdpa row as a measurement, take a small row
 as an upper bound, and take a bucket share only from the deflated table in
 [records/zimage-perf.md](../records/zimage-perf.md) "Lever ledger" (2026-09-07).
+AMENDED 2026-09-08, twice. First, the gemm rows are not measurements either: the merged
+profile put the four gemm rows at 1.19x, and the `ffn.w1w3` row at 24.5 TFLOP/s was the
+pool eviction making every dispatch first-touch a fresh 169 MB buffer, the same gemm reading
+37-45 TFLOP/s isolated (the paragraph below). A profiled row prices nothing until its rate is
+confirmed in the microbench. Second, and the reason "steady state" is no longer one number:
+on master e5d9775 a warm 1024x1024 run reads 1.35 s on the first step and 1.9-2.1 s by the
+eighth, a 55% ramp, where the day's earlier states ramped 17% (3.06 to 3.57) and 20% (1.78
+to 2.15). Every arc moved the first step more than the plateau, the third arc taking the
+first step 1.78 to 1.35 with a 3.5x attention kernel while the eighth step moved 2.15 to
+2.0-2.1. That is the signature of a power or thermal cap, faster kernels reaching the
+throttle sooner and the step past it governed by the envelope and not the kernel. It is an
+observation, not a confirmed cause; the confirmation is a `powermetrics` trace across a run,
+from a user shell with sudo, and it is the first item on the Front because it decides
+whether any further kernel win converts to wall time at the plateau. Until it is read, quote
+a step as a RANGE with its ramp, "1.35 s first step rising to 2.0-2.1 s by step 8", quote
+the render as the sum of the eight steps actually observed plus the decode, and never quote
+a single steady figure ([records/zimage-perf.md](../records/zimage-perf.md) "Results on
+master e5d9775, clean").
 
 **A profiled row that shows a fusion win is not a result until the fusion is confirmed
 unprofiled.** The Z-Image profiler syncs at every mark and `wait_until_completed` also
@@ -224,3 +242,17 @@ the rows shrinking: at a 2.65 s step the measured gemm and sdpa rows leave 380 m
 the elementwise work where the profiled table claims 1562 ms, so the honest bound on the
 small rows is the residual and not the deflated row
 ([records/zimage-perf.md](../records/zimage-perf.md) "Lever ledger", 2026-09-08).
+SECOND INSTANCE, the same day, and it widens the rule from fusions to any row: **a profiled
+row's basis must be confirmed isolated before it prices a lever.** The ledger's SwiGLU
+f32-store row was sized from `ffn.w1w3` reading 24.5 TFLOP/s against `ffn.w2`'s 38.7 for the
+same kernel, attributed to the 169 MB f32 intermediate it writes, and worth 2.6 s per image
+on that basis. The microbench read the f32-store gemm at 37 to 45 TFLOPS isolated, w2's own
+class: the profiled row was slow because the eviction between marks made every w1/w3 dispatch
+first-touch a fresh 169 MB buffer, 14.8 ms per gemm profiled against 7.3-8.8 isolated, and a
+bf16 store that halves the write moved nothing (decisions.md "The bf16 SwiGLU store is
+REFUTED"). The two cases have one shape: the profiler charges an intermediate's allocation
+to whichever row touches it, so a row that owns a large intermediate reads slow, and the
+lever that removes or shrinks the intermediate reads like a win. Before a row enters the
+ledger with a number, run the op alone in `tests/zimage_microbench.rs` at the model's shape
+and take THAT rate; the profiled table decides which op to run, never what it costs
+([records/zimage-perf.md](../records/zimage-perf.md), 2026-09-08).

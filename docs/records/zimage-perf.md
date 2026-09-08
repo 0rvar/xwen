@@ -671,63 +671,355 @@ the conv work actually sits:
 thirds of it, which is the same reading as 2026-09-07 and is what makes a direct 3x3 conv
 the lever rather than anything global.
 
+## 2026-09-08 — The VAE on a direct conv kernel, attention on the tensor units, and the SwiGLU bf16 store refuted
+
+The third arc of the day, run as three worktrees off e630ebb against the three largest rows
+of the lever ledger below as it stood that morning: the VAE conv path (3.7-4.2 s per image),
+the SwiGLU f32 store (2.6 s on the per-row basis, ~1 s on the aggregate one) and a Metal-4
+tensor-op attention kernel (2.4 s). Two shipped, a763c61 and e5d9775 on master; the third
+was built, measured, refuted and kept on the branch `zimage-ffn` as 5e7a6ea so the code
+stays readable beside its numbers. Conditions: `pmset -g` read `lowpowermode 0` in every
+session, no high-power claim. The three implementers shared the machine behind a GPU lock,
+so their absolute step times ran 2.2-3.6 s against the 2.15 s recorded steady state and only
+their same-session A/B pairs are quoted here; the clean figures at the end were taken on
+master e5d9775 alone.
+
+### The VAE on an implicit-gemm conv, 5.2 s to 1.4 s
+
+The decode ran candle's `conv2d`, which at these shapes is nine im2col copies of the input,
+a narrow gemm, an NHWC permute and 16 GB of pooled buffers per decode, at 1.2-4.4 TFLOP/s.
+`src/ops/conv2d_direct.metal` replaces it with an implicit-gemm f32 3x3 and 1x1 convolution
+over NCHW as candle stores it, so nothing is permuted: a 256-thread threadgroup owns a
+`TH x 16` pixel tile (TH 8, or 16 when `c_in <= 128`) for 64 output channels, stages the
+input tile with its one-pixel halo and eight input channels of weights in about 26 KB of
+threadgroup memory, and runs one k-step per (tap, 8 channels) on simdgroup 8x8 f32 matrix
+ops, the A operand being a transposed `simdgroup_load` of the staged tile at the tap's
+offset. The weights are permuted once at load to `[k*k, c_in, c_out]`. The bias is in the
+store, and everything the decoder wraps around a conv is folded into the conv itself: the
+GroupNorm affine and the silu on the input read, the 2x nearest upsample as a read at half
+coordinates so the 4x tensor never exists, and the residual add in the store. GroupNorm is
+then `src/ops/group_norm.metal`, one statistics read (sum and sum of squares of `x - x0`
+over up to 64 slices per group, `x0` the group's first element so the single-pass variance
+does not cancel) plus a per-channel fold into `scale` and `shift`; the normalized tensor is
+written only for the mid-block attention's norm and the fallback path. Four kernel
+instantiations cover every decoder conv in the shipped config; anything outside `k = 3` or
+`k = 1`, stride 1, `c_in % 8 == 0` falls back to the candle chain.
+
+| conv, at 1024x1024 output scale | direct | candle `conv2d` |
+| --- | --- | --- |
+| 512->512 at 128x128 | 7.1 ms, 10.9 TFLOP/s | 17.5 ms, 4.4 |
+| 512->512 at 256x256 | 27.4 ms, 11.3 | 71.5 ms, 4.3 |
+| 512->256 at 512x512 | 54.1 ms, 11.4 | 220.7 ms, 2.8 |
+| 256->256 at 512x512 | 28.6 ms, 10.8 | 121.4 ms, 2.5 |
+| 256->128 at 1024x1024 | 55.5 ms, 11.1 | 459.6 ms, 1.3 |
+| 128->128 at 1024x1024 | 30.7 ms, 10.1 (6.3 at TH 8) | 266.2 ms, 1.2 |
+
+At 10-11 TFLOP/s the decode's 9.89 TFLOP of convolution is about 0.95 s, and the rest of
+the 1.4 s decode is the norms' statistics reads, the mid-block attention and the shortcuts.
+Same binary, same session, arms back to back on the shared box:
+
+| VAE decode | `XWEN_ZIMAGE_VAE=xwen` (default) | `XWEN_ZIMAGE_VAE=candle` | master e630ebb, pinned |
+| --- | --- | --- | --- |
+| 1024x1024 | 1.36 s, 1.44 s | 6.45 s, 6.52 s | 5.94 s, 6.09 s |
+| 512x512 | 0.25 s, 0.26 s | 1.06 s, 1.27 s | |
+
+The profiled table, for ranking only, went 8826 ms on the baseline binary to 1471 on the
+xwen arm, with `up3.resnets` 3605 to 335, `up2.resnets` 1613 to 301, `up2.upsample` 1176
+to 181 and `norm_out+conv_out` 615 to 5; the four conv-heavy rows are 70% of what is left
+and `mid.attn` at 108 ms is 7%. Parity: VAE alone 92.62 to 92.32 dB against the 60 dB bar
+(same f32 math, a different summation order and the shifted single-pass variance), image
+PSNR 46.09 dB unchanged, step-0 lines unchanged. The rendered PNGs are the same picture on
+both arms.
+
+Two traps cost the arc time and are pinned in the code. The first kernel ran a flat
+1.04 TFLOP/s at every shape, slower than candle: the simdgroup accumulator array
+`acc[NPB][NCB]` was not staying in registers because the tile loops over constexpr bounds
+were not unrolled, so every MMA went through memory, and `#pragma clang loop unroll(full)`
+took it to 10-11 TFLOP/s with no other change. The fold kernel bounded its threads on
+`threads_per_grid`, the rounded-up launch count, so stray threads wrote past `scale` and
+`shift` into pooled buffers; the kernel tests passed by luck and the decoder-level A/B test
+caught it as NaN. Glue kernels here bound on an explicit `n` in their args, every one.
+
+Not taken now, each with its reopen condition:
+
+- The mid-block attention, 108-166 ms profiled across the runs and now 7% of the decode.
+  Reopen when the decode is wanted under 1 s; the fix is candle's SDPA or a flash arm on the
+  `(1, 1, 16384, 512)` q/k/v, head_dim 512 being outside the flash kernels' shapes.
+- The 16-row tile for the 256- and 512-channel convs. It was priced only for `c_in <= 128`,
+  where it took 6.3 to 10.1 TFLOP/s; the deeper convs already read 10.8-11.4 at 8 rows.
+  Reopen with the microbench if the last 10% is wanted.
+- Folding the GroupNorm statistics read into the preceding conv's epilogue, one fewer read of
+  each 537 MB activation at 1024x1024, about 14 of them at the top two resolutions, perhaps
+  30-60 ms. Reopen with a profile that shows the norm rows; today they sit inside the resnet
+  rows.
+- An f32 cooperative-tensor conv through `matmul2d`. Unpriced; the `_t_hp` MoE family read
+  25% below the f16 tiles, and 10-11 TFLOP/s on simdgroup MMA is probably near this device's
+  f32 FMA peak. The tensor units pay for f16 or bf16 operands, which the 60 dB bar refused
+  (decisions.md "The VAE decodes in f32 and bf16 is refuted"). Reopen only with an
+  f16-weights, f32-activations variant that passes the bar.
+- Footprint, not measured. The xwen arm allocates no im2col buffers, so the 16 GB and 8 GB
+  pooled buckets the path map found should be gone on this arm; the permuted weight planes
+  add about 200 MB of f32 beside the candle copies, which stay for the bisect arm. Worth a
+  `footprint` check from a user shell for the serve route.
+
+### Attention on the cooperative tensor ops, 13 to 45 TFLOP/s
+
+The ledger said a kernel and not a flag, and `src/ops/flash_t.metal` is that kernel:
+bidirectional flash attention for head_dim 128 whose QK^T and PV products both run through
+`mpp::tensor_ops::matmul2d`, the primitive the gemms run on. One threadgroup per
+(64-query block, head), four simdgroups. The threadgroup stages its 64 Q rows as half into
+16 KB of threadgroup memory once, then every tensor op runs at `execution_simdgroup` scope,
+each simdgroup owning 16 rows and walking the whole key range in blocks of 32 with no further
+barrier: `S = Q K^T` with K read from device as an f16 tensor with no staging, columns past
+T zero-filled by the extent clip and set to the finite minimum in the tail block, row max
+and row sum through `reduce_rows` into row-reduction cooperative tensors, `P = exp2(S *
+scale * log2e - m)` in place, O rescaled per row and skipped under `simd_any` when no
+row's max moved, then `P` converted into the left input of the PV op through
+`get_left_input_cooperative_tensor` and V read from device. O lives in its cooperative
+destination tensor for the whole key loop and never touches threadgroup memory; the per-row
+rescale works because `map_iterator` from O onto the S op's row-reduction tensor is
+compatible on this device, queried once before the loop and packed into one bit per element,
+so the hot loop does two-way selects and no index arithmetic. A device whose row-reduction
+capacity is not two gets NaN rather than a wrong answer, by a guard in the kernel.
+
+The per-simdgroup structure was forced, not chosen: input cooperative tensors,
+`reduce_rows` and `map_iterator` are all `static_assert`ed to simdgroup scope in this SDK
+(MacOSX26.5), so the threadgroup-scope design the brief sketched, 64x32 S tiles with the
+softmax through threadgroup memory, cannot be written against these headers. Two more facts
+for the next kernel here: `get_mask`, which the header's own example uses, does not exist
+and `is_valid_element` does; and an f32 operand under `relaxed_precision` is consumed at
+less than f16 precision (Q as f32 from device read rel L2 9.6e-4 against 4.5e-4 with Q staged
+as half), which is why Q is staged and why every operand is half.
+
+Isolated, 30 heads x 128, f32 q, f16 k and v, same session
+(`cargo test --release --test zimage_microbench zimage_flash_kernels_only -- --ignored`):
+
+| kernel | T=4128 | TFLOP/s | T=1056 | TFLOP/s |
+| --- | --- | --- | --- | --- |
+| `flash_attn_bidirectional`, the steel copy (`flash`) | 20.05 ms | 13.1 | 1.380 ms | 12.4 |
+| `flash_attn_tensor`, 16 rows x BK 32 (`tensor`, default) | 5.80 ms | 45.1 | 0.473 ms | 36.2 |
+| `flash_attn_tensor`, 16 rows x BK 64 | 7.28 ms | 36.0 | 0.669 ms | 25.6 |
+
+3.5x at the 1024x1024 shape and 2.9x at 512x512, and by the attention flop count the kernel
+is now past the gemms' 36-38 TFLOP/s on the same primitive. The attempts, in order and in
+one session at T 4128: the first version with device f32 Q and per-element `map_iterator`
+inside the loop, 18.3 ms; unrolled index loops, slot masks computed once and the lazy
+rescale, 11.3 ms; Q held in a left-input cooperative tensor, 28.4 ms (refuted, 64 more
+registers per lane); Q staged as half in threadgroup memory, 6.07-6.44 ms and more accurate,
+which shipped; K and V tiles staged through threadgroup memory for the four simdgroups,
+13.1 ms (refuted, the two barriers per block couple simdgroups that are otherwise
+independent and the tensor op reads device operands well); P through a per-simdgroup half
+threadgroup tile so PV runs half x half, 8.3 ms and wrong as written (refuted on time, never
+debugged); BK 64, slower at both shapes and kept instantiated so the choice stays priced. A
+diagnostic split put QK^T alone at 4.4 ms and QK^T plus softmax at 6.1, so the softmax is
+about 1.7 ms of the 5.8 and the PV product hides behind it.
+
+Whole image on the shared box, unprofiled, two runs per arm alternating, steps 6 to 8:
+
+| arm | run | step 6 | step 7 | step 8 | image total |
+| --- | --- | --- | --- | --- | --- |
+| flash | 1 | 2.15 s | 2.27 s | 2.36 s | 27.9 s |
+| tensor | 1 | 1.83 s | 1.85 s | 1.89 s | 24.6 s |
+| flash | 2 | 2.27 s | 2.34 s | 2.32 s | 27.5 s |
+| tensor | 2 | 1.77 s | 1.88 s | 1.97 s | 24.2 s |
+
+About 0.4 s per step and 3.3-3.5 s per image in that session; profiled `attn.sdpa` 697.6 to
+246.4 ms per step, no other row moving. Accuracy against candle's unmasked f32 sdpa over
+five shapes including the production one: rel L2 1.6e-4 to 4.5e-4 against a 2e-3 bar, max
+abs 2.0e-4 to 8.5e-4 against 2e-2, both bars derived from the f16 rounding of q, k and v.
+Layer-level against the basic chain 6.8e-6 (the steel arm 5.4e-6), and the test asserts the
+tensor and steel arms are NOT bit-identical, the shape a reference arm's test has to have.
+
+| parity, 512x512 fixture, T = 1120 | step-0 cosine | mean rel | max rel | final latent | image PSNR |
+| --- | --- | --- | --- | --- | --- |
+| `tensor` | 0.999999 | 0.0010 | 0.0050 | 0.999627 / 0.0077 | 45.60 dB |
+| `flash` | 0.999999 | 0.0008 | 0.0041 | 0.999672 / 0.0070 | 46.09 dB |
+| reference bf16 against fp32, its own spread | 0.999560 | 0.0175 | 0.0890 | 0.994750 / 0.0492 | 32.40 dB |
+| bracket, timestep one grid point off | 0.610796 | 0.6224 | | | |
+| bracket, caption tokens reversed | 0.870805 | 0.3144 | | | |
+
+The tensor arm costs 0.5 dB of image PSNR against the steel arm and sits 13 dB above torch's
+own bf16 arm. `XWEN_ZIMAGE_ATTN` now names four arms, `tensor` (the default, alias `xwen`),
+`flash` (alias `steel`, the previous default), `fused` (candle's sdpa) and `basic`, and
+`AttnImpl::SHIPPED` names the default once so the pipeline's log guard and the serde default
+cannot drift apart.
+
+Not taken now: two independent 16-row groups per simdgroup sharing each K/V load, reopen if a
+profile shows the kernel L1/L2-bound rather than register-bound (the Q-in-registers result
+says 64 more registers per lane costs 2.5x today); the threadgroup-scope kernel, reopen only
+if a future SDK lifts the simdgroup-scope static_asserts or the per-simdgroup kernel stalls
+below the gemm rate at a new shape; fewer `reduce_rows` per block, about 1.7 ms of the 5.8,
+reopen if attention is again the largest `attn.*` row, `attn.qkv` being larger now.
+
+### The SwiGLU bf16 store: built, bit-exact, and not faster
+
+The ledger row carried two bases for the same lever, 2.6 s per image if `ffn.w1w3`'s
+profiled 24.5 TFLOP/s was the f32 store's price and about 1 s if the aggregate 1.19x
+deflation held, and said the microbench would settle it. It did, and neither basis survived.
+The arc built `kernel_mul_mm_bf16_f32_t_bf16out`, the tensor gemm with a bf16 rounding
+epilogue (the cooperative tensor's own `store` static-asserts that the destination element
+type equals the accumulator's, so a bfloat destination would mean a bfloat accumulator, and
+the epilogue rounds per element instead), `silu_mul` over bf16 inputs,
+`Projection::forward_bf16`, an `XWEN_ZIMAGE_FFN_STORE` arm and an `XWEN_ZIMAGE_FFN_STATS`
+activation-max instrument. The store is bit-exact by construction, the f32 result rounded
+once to nearest even, identical to `matmul_bf16(...).to_dtype(BF16)` at every shape tested.
+
+Isolated (`zimage_ffn_store_only`), the chain being w1 x, w3 x, `silu_mul`, min over seven
+interleaved reps; the GPU was under outside load in the middle runs:
+
+| run | T | f32 chain | bf16 chain | f32 gemm | bf16 gemm | `silu_mul` f32 / bf16 |
+| --- | --- | --- | --- | --- | --- | --- |
+| scalar epilogue, first | 4128 | 15.11 ms | 14.28 | 8.76 | 9.76 | 1.00 / 0.69 |
+| scalar epilogue, first | 1056 | 4.82 | 5.56 | 2.63 | 2.63 | 0.25 / 0.16 |
+| threadgroup-staged bfloat4 store | 4128 | 15.47 | 16.95 | 13.14 | 14.47 | 1.07 / 0.76 |
+| bfloat2 pair epilogue | 4128 | 15.61 | 16.54 | 14.56 | 15.30 | 1.03 / 0.79 |
+| scalar epilogue, last, quiet GPU | 4128 | 15.41 | 15.28 | 7.25 | 7.79 | 1.01 / 0.72 |
+| scalar epilogue, last, quiet GPU | 1056 | 3.83 | 4.06 | 2.27 | 2.20 | 0.25 / 0.16 |
+
+`silu_mul_bf16` reliably saves 0.3 ms at 4128 and 0.09 at 1056, which is exactly its bytes at
+470-550 GB/s. Every bf16 store form costs the gemm 0.5 to 1.3 ms at 4128 in most runs, more
+than the activation saves, so the chain nets to parity within 5% with an unstable sign. The
+bandwidth ceiling closes the question independently of any run: the store saves 338 MB per
+block, 11.5 GB per step, about 25 ms per step at 450 GB/s and about 0.2 s per image, 1% of
+the render. Whole-image A/B was indistinguishable inside a noise band where the f32 arm alone
+spanned 2.2 to 3.4 s per step across identical runs.
+
+The finding that matters beyond this row: **the f32-store gemm isolated runs at 37 to 45
+TFLOPS, w2's own class, so the profiled 24.5 TFLOP/s was never the store.** It was the
+profiler's buffer-pool eviction: every mark evicts the pool, so every w1/w3 dispatch
+first-touches a fresh 169 MB buffer, and the profiled row reads 14.8 ms per gemm against
+7.3-8.8 isolated. The same run shows unrelated rows moving 25% between arms, which is the
+profiled table's own spread. The stretch, a half `h` for w2, is closed by measurement: max
+|silu(w1 x) * (w3 x)| over an 8-step 1024x1024 run is 284,507, 64,695 already at step 1,
+against f16's 65,504. Parity on the bf16 arm held the bars but cost 3.9 dB of image PSNR
+(42.19 against 46.09) and doubled step-0 mean rel to 0.0018; the default arm read master's
+numbers exactly. The default stays f32, the branch keeps the code, and master carries only
+the decision (decisions.md "The bf16 SwiGLU store is REFUTED").
+
+Not taken now: a converting store, reopen if a future MPP release adds one (the `_b16` store
+intrinsics exist in the header behind the same-element-type static_assert) or documents the
+tile lane layout so a vectorized epilogue can skip the index math; a per-row scaled
+activation folded into w2's gemm, which is what a half intermediate would need and a
+different arc; and a profiler mode that syncs without evicting, or reuses a pre-allocated
+scratch, which would give a true per-row rate and was not built.
+
+### Results on master e5d9775, clean
+
+Nothing else on the GPU, `pmset -g` reading `lowpowermode 0`, dev-tree release build, seed 7,
+"a lighthouse on a rocky shore at dusk, oil painting". The per-step times of three warm
+1024x1024 runs, in order:
+
+| run | steps 1 through 8 | VAE | wall (load) |
+| --- | --- | --- | --- |
+| 1 | 1.62 1.81 2.33 2.14 2.09 2.12 1.96 2.02 | 1.36 s | 25.2 s (5.0) |
+| 2 | 1.47 1.56 1.65 1.71 1.80 1.93 2.04 3.27 | 1.78 s | 22.0 s (3.5) |
+| 3, cold page cache | 1.35 1.36 1.61 1.77 1.94 1.91 2.06 2.12 | 1.44 s | load 44.7, excluded |
+
+512x512: 0.35 0.37 0.38 0.39 0.39 0.39 0.40 0.39, VAE 0.26 s, 8.1 s wall with 3.7 s of load.
+
+| | master e630ebb, clean | master e5d9775, clean |
+| --- | --- | --- |
+| 1024x1024 first step | 1.78 s | 1.35 s |
+| 1024x1024 step by step 8 | 2.15 s | 2.0-2.1 s |
+| 1024x1024 eight steps | 17.2 s at steady state | 14.1-16.1 s |
+| VAE decode, 1024x1024 | 5.19 s | 1.36-1.44 s (one 1.78) |
+| render, steps plus decode | ~21.5 s | 15.5-17.5 s |
+| total wall, warm | ~25 s | 22-25 s |
+| 512x512 step | 0.37-0.41 s | 0.35-0.40 s |
+| VAE decode, 512x512 | 1.06-1.10 s | 0.26 s |
+| 512x512 total wall | 8.6 s | 8.1 s |
+
+**The step profile changed shape, and that is the finding to carry.** The first step fell
+1.78 to 1.35 s, 24%, the isolated attention kernel is 3.5x, and the step still reaches
+1.9-2.1 s by step 8, so the plateau moved by 0.1-0.2 s where the first step moved by 0.43.
+The ramp is now 1.35 to 2.1, 55% over eight steps, where it was 1.78 to 2.15, 20%, and
+before the rope arc 3.06 to 3.57, 17%. Every arc has made the first step faster and the ramp
+steeper. That is the signature of a power or thermal cap: faster kernels reach the throttle
+sooner, and past it the step is governed by the envelope and not by the kernel. The budget
+says the same thing from the other side. At 1.35 s a step is about 46 TFLOP/s end to end; the
+four gemms are 46.7 TFLOP, which at the 37 TFLOP/s the kernel measured in isolation on
+2026-09-07 would already be 1.26 s, more than the whole step leaves after attention, so the
+cool chip runs the gemm above any isolated figure taken on a warm one (the FFN arc's
+isolated gemm spanned 37 to 45). This is an observation and not a confirmed cause. The
+confirmation is a `powermetrics` reading during a run, which needs sudo from a user shell and
+is the first thing the next arc does, because it decides whether any further kernel win
+converts to wall time at steady state or only to a lower first step. Until then a step is
+quoted as a range with its ramp, "1.35 s first step rising to 2.0-2.1 s by step 8", and
+never as one steady number (decisions.md "A Z-Image step is quoted at steady state").
+
+The profiled run on e5d9775, for ranking only (`/tmp/arc3-1024-prof.log`, transformer total
+3120.88 ms per step against unprofiled steps of 1.35-2.1): `ffn.w1w3` 863, `attn.qkv` 392,
+`ffn.w2` 272, `ffn.silu_mul` 254, `attn.sdpa` 231, `attn.norm+scale` 184, `attn.qknorm`
+138, `ffn.norm+scale` 124, `attn.transpose` 121, `attn.rope` 119, `attn.out` 85,
+`attn.untranspose` 58, the two gated residuals 26 each. `attn.sdpa` fell 698 to 231 and is
+the fifth row now, below `ffn.silu_mul`. The VAE profiles at 1395 ms against 1.36-1.44 s
+real, so its marks cost almost nothing now that the im2col buffers are gone: `up3.resnets`
+324, `up2.resnets` 283, `up1.resnets` 207, `up2.upsample` 170, `up1.upsample` 147,
+`mid.attn` 119.
+
+Parity on the merged tree is the tensor arm's row above: step-0 cosine 0.999999, mean rel
+0.0010, max rel 0.0050, final latent 0.999627 / 0.0077, image PSNR 45.60 dB, VAE alone
+92.32 dB, both brackets outside. The lib suite is green at 1347 tests.
+
+### Review fixes, c43a3e9
+
+The outside review of a763c61 and e5d9775 (Codex, `/tmp/agent-report-review-arc3-codex.md`)
+found one defect on the shipped path and three contract gaps in the exported wrappers, all
+fixed in c43a3e9 and pushed. The decoder's entry conv (16 to 512 channels at 128x128) went
+through the `Module` impl, which always called candle's conv2d, so its permuted weight plane
+sat unused; the impl now takes the direct kernel where the arm resolved to it, and the
+parity gate's VAE-alone line moved from 92.32 to 93.11 dB with `conv_in` at 4.3 ms profiled
+where it read 12.6. The attention wrapper now requires q, k and v to be addressable in i32
+as whole tensors (the kernel forms offsets in `int`, and the per-extent check alone let
+about 16.7M query rows overflow), refuses a non-positive or non-finite scale (padded key
+columns hold the lowest finite float and rely on the scale to keep them at zero weight; at
+scale 0 they would each contribute 1 to the softmax sum), and refuses a q that does not
+start on a 16-byte boundary, the Q tile being staged through float4 loads. The GroupNorm
+kernels take their float4 path only when x is 16-byte aligned. No shipped caller changed
+behaviour: every one hands over freshly allocated tensors and a positive scale. Classes the
+review checked and found clean: conv tile, halo and partial-channel bounds; explicit-n
+bounding; barriers; threadgroup memory sizing; the online softmax at a positive scale; the
+encoder staying on candle; env parsing; the shared dispatch changes for the language-model
+paths.
+
 ## Lever ledger
 
-Rewritten 2026-09-08, after the two arcs above and the profiler pass on the merged tree.
-The base is the **measured 2.15 s steady-state step** and a warm image of about 25 s, whose
-render is **22.4 s, being 17.2 s of eight steady-state steps plus the 5.19 s decode**, with
-about 3 s of load and encode outside it. Every figure below is a REAL figure off the
-deflation in "The merged profile, and the deflator refitted" above: gemms and sdpa at 1.19x,
-the elementwise sum at about 3x. Gain per image is the row's saving times eight steps, or
-the row itself for the VAE.
+Rewritten 2026-09-08 for the third time, after the arc above. The base is master e5d9775:
+a 1024x1024 step of **1.35 s first rising to 2.0-2.1 s by step 8**, eight steps in 14.1-16.1 s,
+a 1.4 s decode, a render of **15.5-17.5 s** and a warm wall of 22-25 s. Two rows of the
+previous ledger shipped and one is refuted, and the base itself is the open question: the
+ramp says the steady state is governed by a power or thermal envelope, so every gain below is
+a gain in the FIRST step until `powermetrics` says otherwise, and the instrument comes first.
 
 | lever | today | ceiling, and how it was derived | gain per image | cost class |
 | --- | --- | --- | --- | --- |
-| the VAE conv path | 5.2 s per image | 1.0-1.5 s with a direct 3x3 conv or MPSGraph; 9.89 TFLOP at the gemms' rate is ~0.3 s, so 1.0-1.5 is the realistic form | **3.7-4.2 s** | new conv path, but the cheap wins come first and may be worth 0.5-1 s alone: fused silu at the 28 `Activation::Swish` sites, SDPA for the mid-block's materialized 16384-token softmax, a fused GroupNorm for nine full-tensor passes. bf16 is refuted, below |
-| the f32 store in the SwiGLU pair | 0.90 s/step, `ffn.w1w3`'s 22.1 TFLOP at 24.5 TFLOP/s | 0.57 s at `ffn.w2`'s own 38.7 for the same kernel and the same shape class; the difference is the 169 MB of f32 it writes against w2's 63, so the route is a bf16 SwiGLU intermediate | **2.6 s**, on the per-row basis; ~1 s if the aggregate basis holds | a precision change the parity gate arbitrates. The `silu_mul` gemm-epilogue route is REFUTED (decisions.md "The SwiGLU dual gemm is REFUTED") |
-| a Metal-4 tensor-op attention kernel | 0.53 s/step at ~16 TFLOP/s | 0.23 s at the gemms' own rate; the flag route is spent, the vendored flash kernel being a copy of candle's steel attention | **2.4 s** | new kernel: `matmul2d` for both products, online softmax over cooperative-tensor elements, P through threadgroup memory, head_dim 128, bidirectional, f32 accumulate |
-| the gemm rate beyond that | ~1.26 s/step for the four gemms at 30-39 TFLOP/s | ~1.0 s, UNPRICED: fuse q, k and v into one N=11520 gemm and the SwiGLU pair into one N=20480, then tune the tiles for M around 4000, which no sweep has covered | ~2 s | host-side plus tile work, no new kernel class, and **cheap to price**: `tests/zimage_microbench.rs` already runs these shapes |
-| the remaining elementwise and copies | ~0.34 s/step for all of them together: norm+scale ~0.09, `attn.qknorm` ~0.05, `ffn.silu_mul` ~0.08, copies ~0.06, `attn.rope` ~0.04, gates ~0.02 | ~0.15 s with gemm epilogues and a fused per-head `attn.qknorm`; no single row is worth an arc, which is why they are one line | ~1.5 s | small kernels, no math change |
+| the power envelope, an INSTRUMENT | the ramp: 1.35 to 2.0-2.1 s over eight steps, 55%, where it was 20% before this arc and 17% before the rope arc | a `powermetrics` trace of GPU power, frequency and the thermal state across a 1024x1024 run, read beside the per-step times | prices every row below: if the plateau is the envelope, a kernel win converts to wall time only until the cap and the render's floor is the cap's, not the kernels' | sudo from a user shell, an hour; the sandbox cannot run it |
+| gemm launch fusion and tile tuning | the four gemms, 46.7 TFLOP, at 37-45 TFLOP/s isolated, so 1.04-1.26 s and most of the step | UNPRICED: q, k and v as one N=11520 gemm and the SwiGLU pair as one N=20480, then tiles tuned for M around 4000 at those N, which no sweep has covered | unknown, and `tests/zimage_microbench.rs` prices it in an hour at these shapes | host-side plus tile work, no new kernel class |
+| the elementwise tail | ~1.05 s profiled per step over nine rows (norm+scale 184, `attn.qknorm` 138, `ffn.norm+scale` 124, transpose 121, rope 119, untranspose 58, `ffn.silu_mul` 254, the gates 52); real is the residual after the gemms and attention, at most ~0.1-0.3 s depending on where in the ramp the step sits | about half of that with gemm epilogues and a fused per-head `attn.qknorm` | under 1 s, probably well under; no single row is worth an arc | small kernels, no math change |
+| the VAE mid-block attention | 108-119 ms profiled, 7-8% of the 1.4 s decode | candle's SDPA or a flash arm at head_dim 512 | ~0.1 s | one call site; reopen when the decode is wanted under 1 s |
+| the SwiGLU bf16 store | REFUTED, see the arc above | the row's basis was the profiler's pool eviction; the gemm runs at 37-45 TFLOP/s with the f32 store, bandwidth caps the lever at ~0.2 s per image, and the built kernel measured parity within 5% with an unstable sign | none | on the branch `zimage-ffn` (5e7a6ea), not on master (decisions.md "The bf16 SwiGLU store is REFUTED") |
 
-**The dense bf16 floor is a ~1.25 s step, ~10 s of steps, a ~1.2 s decode and a ~11.5 s
-render**, against 22.4 s today, with every row above taken. It is not the sum of the
-savings, because the SwiGLU f32 store lives inside the four-gemm bucket: taking the store
-and then fusing the pair does not pay twice. Read the floor as the figure and the rows as
-the ranking.
+The dense bf16 floor of the previous ledger, a 1.25 s step, is where the FIRST step already
+sits; there is no floor to quote for the plateau until the envelope is read.
 
-Below that floor nothing is a kernel, and all three are record lines with reopen conditions
-rather than ledger items.
+Below the kernels, three record lines with reopen conditions, re-based on the new step.
 
-- **Fewer denoising steps.** Six instead of eight saves 4.3 s of today's render and four
-  saves 8.6 s; after the kernel work above those become 2.5 s and 5 s, so this gets less
-  attractive as the step gets cheaper, not more. Turbo is distilled for eight and the model
-  card says nine ([zimage.md](../zimage.md)), so it is an image-quality judgement and not a
-  measurement, and the stock ComfyUI node's `quality` field is the natural switch to hang it
-  on, that being the one knob the node already sends. Reopen on a product decision about how
-  many steps an image gets.
-- **Step caching**, TeaCache or a first-block cache, reusing part of a step's result across
-  neighbouring steps. Worth 0 to 2 s and UNPRICED, and the reason the range starts at zero is
-  structural: an 8-step schedule at static shift 3.0 spaces its sigmas far apart, which is
-  the regime these caches work worst in, having been built for 30-plus-step schedules where
-  adjacent steps barely differ. Reopen on a priced experiment, which is a day.
-- **int8 gemms on the tensor units**, worth about 1.8x fp16 compute and so about 4.5 s of
-  today's render. Weeks of work: W8A8 calibration and a new set of parity bars, because the
-  existing ones are read against bf16 arithmetic. Reopen if sub-10 s at eight steps becomes a
-  requirement rather than a nice number (decisions.md "The transformer runs bf16 end to
-  end").
+- **Fewer denoising steps.** At 1.35-2.1 s a step, six instead of eight saves 3.5-4 s of the
+  render and four saves 7-8 s, which is now the largest number on this page and the one that
+  is not a measurement: Turbo is distilled for eight and the model card says nine
+  ([zimage.md](../zimage.md)), so it is an image-quality judgement, and the stock ComfyUI
+  node's `quality` field is the natural switch. Reopen on a product decision about how many
+  steps an image gets.
+- **Step caching**, TeaCache or a first-block cache. Worth 0 to 2 s and UNPRICED, the range
+  starting at zero because an 8-step schedule at static shift 3.0 spaces its sigmas far
+  apart, the regime these caches were not built for. Reopen on a priced experiment, a day.
+- **int8 gemms on the tensor units**, about 1.8x fp16 compute on the gemm plane, so perhaps
+  4-5 s of today's render if the envelope is not the cap and much less if it is. Weeks: W8A8
+  calibration and a new set of parity bars. Reopen if sub-10 s at eight steps becomes a
+  requirement (decisions.md "The transformer runs bf16 end to end").
 
-Three things are priced as non-levers rather than argued away.
-
-- **The per-step readback is free.** `latents.flatten_all()?.get(0)?.to_scalar::<f32>()?`
-  reaches `drop_unused_buffers` and evicts the buffer pool once per step, which looked
-  like a real cost. Removing it entirely reads 35.8 s total against a 35.3 s baseline at
-  1024x1024, the work moving into the VAE number rather than disappearing. Keep it: it is
-  what makes per-step timing mean anything.
-- **`context_refiner` is 13 ms/step** at a 32-token caption, and everything outside the
-  block loops, meaning patchify, the embedders, the rope tables, the final layer and the
-  Euler step, is 18 ms/step. Neither is worth an arc.
-- **The VAE in bf16 is refuted**, measured and reverted: 4.79 s against 4.93 at
-  1024x1024, 1.09 against 1.08 at 512x512, and the VAE-alone PSNR falls to 54.38 dB
-  against the 60 dB bar. Halving every byte of conv traffic being worth 140 ms is the
-  interesting half: the decode is not bandwidth-bound at f32, so only the conv structure
-  can move it (decisions.md "The VAE decodes in f32 and bf16 is refuted").
+Priced as non-levers, unchanged from the previous ledger: the per-step readback is free
+(removing it read 35.8 s against 35.3 at the time, the work moving into the VAE number);
+`context_refiner` is 13 ms a step and everything outside the block loops 18; the VAE in
+bf16 is refuted (decisions.md "The VAE decodes in f32 and bf16 is refuted"), and the direct
+conv path that replaced the dtype question is what shipped above.

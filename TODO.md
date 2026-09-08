@@ -98,12 +98,29 @@ of the three that is a bounded piece of kernel work. Taking every priced row put
 ~1.25 s and a render at ~11.5 s against 2.15 and 22.4
 ([the record](docs/records/zimage-perf.md), "Lever ledger").]
 
+[Amended 2026-09-08, evening, after the VAE conv, tensor-op attention and SwiGLU store arcs
+(log.md "Z-Image's VAE on a direct conv kernel and its attention on the tensor units"): the
+Front's attention kernel shipped (e5d9775) and moved to the archive, the VAE conv path area
+item shipped with it (a763c61), and the SwiGLU f32-store item is RETIRED to the archive
+under "Retired: Image generation", its basis having been the profiler's pool eviction and
+the built bf16 store measuring parity (decisions.md "The bf16 SwiGLU store is REFUTED").
+ONE item is promoted into the gap and it is an instrument rather than a lever: a
+`powermetrics` trace across a 1024x1024 run, because the clean figures on e5d9775 read
+1.35 s on the first step rising to 2.0-2.1 s by step 8, a 55% ramp where it was 20%, and
+until that is read no image lever has a ceiling at the plateau. Same rank as the item it
+replaces, below every decode lever, images not being a tok/s target. The Front is eight.
+Two Z-Image items carry fresh dated lines because their basis changed: the gemm fusion
+(the four gemms are the whole large bucket now, and the microbench prices it) and the
+elementwise tail (bounded by the residual at ~0.1-0.3 s a step). Not items, by the intake
+rule: the VAE mid-block attention at ~0.1 s per image and the step-count question are
+record lines ([the record](docs/records/zimage-perf.md), "Lever ledger").]
+
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
 2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
 3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
 4. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
 5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
-6. **A Metal-4 tensor-op attention kernel for the Z-Image transformer** (Image generation, measured): 0.53 s of a 2.15 s step at ~16 TFLOP/s against 0.23 s at the gemms' rate, so 2.4 s per image, the third-largest Z-Image lever; the 2026-09-08 arc proved the flag route cannot get there, the flash kernel being a copy of candle's steel attention, so this is a new kernel
+6. **Read the Z-Image power envelope with `powermetrics` during a 1024x1024 run** (Image generation, measured, an instrument): the step ramps 1.35 to 2.0-2.1 s over eight steps on e5d9775 where it ramped 20% before the third arc of 2026-09-08, and the trace decides whether the plateau is a power or thermal cap, which prices every remaining image lever (gemm fusion, the elementwise tail, the mid-block attention, int8) as a first-step gain or a render gain
 7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
 8. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
 
@@ -781,22 +798,26 @@ of the three that is a bounded piece of kernel work. Taking every priced row put
 
 ## Image generation
 
-- [ ] [measured] **A Metal-4 tensor-op attention kernel for the Z-Image transformer.**
-  `attn.sdpa` is the slowest large plane at ~16 TFLOP/s where the same chip's gemms reach
-  30-39, and the reason is now known rather than assumed: the vendored flash kernel
-  shipped on 2026-09-08 is a COPY of candle's MLX steel attention, simdgroup matmul with
-  f32 accumulate, so it runs at candle's rate and the bidirectional switch bought traffic
-  and copies only, 740 to 687 ms (decisions.md "Bidirectional attention is a query-position
-  trick on the causal flash kernel"). The merged profiler pass prices it: 0.53 s of a 2.15 s
-  step, and 0.23 s at the gemms' rate, so **0.30 s per step and 2.4 s per 1024x1024 image**.
-  It is the third-largest lever on this graph, behind the VAE conv path and the SwiGLU f32
-  store. The shape: `matmul2d` for QK^T and for PV with an online softmax over
-  cooperative-tensor elements and P staged through threadgroup memory, head_dim 128,
-  bidirectional, f32 accumulate. It would also take the output permute with it if it can
-  write token-major, ~40 ms deflated. Attention grows quadratically in tokens, so it is the
-  first term at any size above 1024x1024 (2026-09-08).
-  [Record](docs/records/zimage-perf.md), [figures](docs/perf-state.md).
-  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+- [ ] [measured] **Read the Z-Image power envelope with `powermetrics` during a 1024x1024 run.**
+  An instrument, and the first thing the next image arc does. On master e5d9775, clean, a
+  warm 1024x1024 run reads 1.35 s on the first step and 1.9-2.1 s by the eighth: the third
+  arc of 2026-09-08 took the first step 1.78 to 1.35 with a 3.5x attention kernel and a 4x
+  VAE decode, and the eighth step only 2.15 to 2.0-2.1, so the ramp is 55% where it was
+  20% that morning and 17% the day before. Faster kernels reaching a throttle sooner is the
+  signature of a power or thermal cap, and if that is the cause every kernel lever below
+  converts to wall time only until the cap, and the render's floor is the envelope's. It is
+  an observation, not a confirmed cause. What to run: `sudo powermetrics --samplers
+  gpu_power,thermal -i 500` from a user shell (the agent sandbox has no sudo) beside
+  `xwen image --prompt "a lighthouse on a rocky shore at dusk, oil painting" --seed 7` at
+  1024x1024, and read GPU power, GPU frequency and the thermal pressure level against the
+  per-step times; then the same at 512x512, whose steps ramp 0.35 to 0.40, and once with
+  `--steps 24` to see whether the plateau holds or drifts. What it prices: whether the gemm
+  fusion, the elementwise tail and the mid-block attention are first-step gains or render
+  gains, and whether int8's 1.8x compute would land at all. If the cap is confirmed, the
+  follow-up is a per-kernel-class power reading, not another kernel (2026-09-08).
+  [Record](docs/records/zimage-perf.md), [figures](docs/perf-state.md),
+  [measurement](docs/decisions/measurement-discipline.md).
+  From: Deferred from the Z-Image VAE conv and tensor-op attention arcs (2026-09-08).
 
 - [ ] [unpriced] **Fuse Z-Image's q/k/v and SwiGLU gemms, then tune the tiles at those shapes.**
   The four gemms are ~1.26 s of a 2.15 s step on the merged tree, which is the largest
@@ -809,26 +830,12 @@ of the three that is a bounded piece of kernel work. Taking every priced row put
   price**: `tests/zimage_microbench.rs` already runs these shapes. Note the overlap: the
   SwiGLU f32-store item below lives inside this bucket, so the two do not pay twice
   (2026-09-08).
+  **2026-09-08, evening: re-based.** The four gemms are the whole large bucket now, attention
+  having moved to the tensor units at 45 TFLOP/s isolated and the SwiGLU store item having
+  been retired (its gemm reads 37-45 TFLOP/s with the f32 store), so they are 1.04-1.26 s of a
+  step that reads 1.35 s cool. Still UNPRICED, and the instrument above decides whether a
+  gain here reaches the plateau.
   [Record](docs/records/zimage-perf.md), [figures](docs/perf-state.md).
-  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
-
-- [ ] [measured] **The 10240-wide f32 activation write in Z-Image's SwiGLU.**
-  `ffn.w1w3` runs at 24.5 TFLOP/s against `ffn.w2`'s 38.7 for identical FLOPs, and the
-  difference is the f32 activation it writes: 4128x10240 f32 is 169 MB each against w2's
-  63 MB. About 5 ms per wide gemm, ~300 ms per step, ~2.4 s per image, and it is the price
-  of the f32 activation stream at the one place the stream is 10240 wide. Two fixes and
-  they are not equivalent: a `silu_mul` epilogue on the gemm removes the intermediate
-  entirely and is not a precision change, while having the gemm write bf16 for the SwiGLU
-  intermediate is, and the parity gate arbitrates that one. `ffn.silu_mul` is a further
-  ~118 ms per step that the epilogue would also absorb (2026-09-07).
-  **2026-09-08: the epilogue route is REFUTED** and the bf16 intermediate is what remains.
-  The dual gemm was built, is right at rel_l2 5e-8, and is 15% slower isolated and 2-4%
-  slower in situ (decisions.md "The SwiGLU dual gemm is REFUTED"). Repriced on the merged
-  tree: 22.1 TFLOP at 24.5 TFLOP/s is 0.90 s of a 2.15 s step against 0.57 at `ffn.w2`'s own
-  38.7, so **0.33 s per step and 2.6 s per image**, the second-largest lever here. That is
-  the per-row basis; the aggregate 1.19x deflation would put the row at 0.67 s and the gain
-  nearer 1 s per image, and the microbench settles which holds.
-  [Record](docs/records/zimage-perf.md).
   From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
 
 - [ ] [measured] **The four full-tensor copies around Z-Image's attention.**
@@ -844,29 +851,10 @@ of the three that is a bounded piece of kernel work. Taking every priced row put
   merged tree all NINE elementwise and copy rows together are ~0.34 s of a 2.15 s step
   against ~0.15 s with epilogues and a fused per-head `attn.qknorm`, so ~1.5 s per image
   for the lot; no single row of them is worth an arc, which is why they are one ledger line.
-  [Record](docs/records/zimage-perf.md).
-  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
-
-- [ ] [measured] **The VAE decode's conv path: 4.93 s, and not bandwidth-bound.**
-  One decode is 4.93 s cool and 5.15 s hot against eight 3.6 s steps, so it is 13% of a
-  ~37 s image and a second saved there is worth 130 ms of step time. It is 9.89 TFLOP of
-  f32 convolution at ~2.0 effective TFLOP/s; at the tensor gemm's rate that arithmetic is
-  ~0.3 s, and 1-1.5 s is the realistic target for a direct 3x3 kernel or MPSGraph. bf16 is
-  REFUTED as the cheap version of this, measured and reverted: 4.79 s against 4.93 at
-  1024x1024 and 1.09 against 1.08 at 512x512, and the VAE-alone PSNR fell to 54.38 dB
-  against the 60 dB bar (decisions.md "The VAE decodes in f32 and bf16 is refuted"). The
-  cost is candle's im2col structure, a 9x materialization plus a narrow-`n` gemm plus an
-  NHWC-to-NCHW permute per conv, all of which shrink with dtype and none of which get
-  fewer. `up3.resnets` alone is a third of the decode and the top two resolutions are 68%.
-  The cheap wins first: `Activation::Swish` to the fused `Activation::Silu` at 28 sites,
-  SDPA for the mid-block's materialized 16384-token softmax, a fused GroupNorm for nine
-  full-tensor passes (2026-09-07).
-  **2026-09-08: it is now the LARGEST lever on this graph.** The two step-time arcs left the
-  decode untouched, so its 5.2 s is a quarter of a ~25 s image against 13% of a ~37 s one,
-  and 5.2 to 1.0-1.5 s is **3.7-4.2 s per image**, more than any step-side row. The merged
-  profile localizes it: `up3.resnets` 2343 ms profiled of 6792, the top two resolutions
-  about two thirds. Take the three cheap wins first, worth maybe 0.5-1 s on their own before
-  any new conv kernel.
+  **2026-09-08, evening: bounded by the residual.** ~1.05 s profiled over nine rows on e5d9775
+  and at most ~0.1-0.3 s real, the residual after 1.04-1.26 s of gemms and ~0.2 s of tensor
+  attention in a step that reads 1.35-2.1 s; under 1 s per image and probably well under.
+  Still one line, and behind the instrument above.
   [Record](docs/records/zimage-perf.md).
   From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
 
@@ -888,6 +876,9 @@ of the three that is a bounded piece of kernel work. Taking every priced row put
   7.6 GB encoder, 12.3 GB bf16 transformer, 0.34 GB f32 VAE, so ~20 GB plus activations,
   with the fp32-to-bf16 cast transiently holding one f32 tensor. Five minutes with the GPU
   free, and the serve route has to plan around whatever it says (2026-09-07).
+  2026-09-08: the direct VAE conv path allocates no im2col buffers, so the 16 GB pooled
+  bucket should be gone on the default arm, against ~200 MB of permuted f32 planes; still
+  unmeasured, and the number is worth more now that the route renders in 15-18 s.
   From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
 
 ## Research candidates

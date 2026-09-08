@@ -133,15 +133,19 @@ and the next op re-allocates and re-zeros a power-of-two-rounded buffer. Measure
 inflation against the same run's unprofiled steady state is 1.39x for a 1024x1024 step,
 1.60x at 512x512, 1.45x for the VAE at 1024x1024 and 1.57x at 512x512. Within a table the
 rows are not equally inflated: the four gemm rows and the sdpa row are single large
-dispatches, hold up against their own FLOP counts, and are measurements; the small
-elementwise and copy rows carry the whole inflation and read about 1.9x high. Deflate them
-by that factor or read the deflated table in
-[records/zimage-perf.md](records/zimage-perf.md) "Lever ledger". Two more rules for this
-pipeline: quote a 1024x1024 step at its 3.6 s steady state and not as an 8-step mean, the
-first step of a cool run being 3.06 s (decisions.md "A Z-Image step is quoted at steady
-state"); and price an op rather than a stage with `cargo test --release --test
-zimage_microbench -- --ignored --nocapture`, the ignored bench that holds the gemm, sdpa
-and elementwise arms at the model's own shapes.
+dispatches and hold up better than the small elementwise and copy rows, which carry most of
+the inflation and read about 1.9x high. But no row is a measurement (2026-09-08): the gemm
+rows carried 1.19x on the merged tree, and `ffn.w1w3` read 24.5 TFLOP/s profiled against
+37-45 isolated because every mark's eviction makes the next dispatch first-touch its 169 MB
+intermediate. Rank with the table and price an op with `cargo test --release --test
+zimage_microbench -- --ignored --nocapture`, the ignored bench that holds the gemm, sdpa,
+flash-attention, conv and elementwise arms at the model's own shapes (decisions.md "A
+profiled row that shows a fusion win is not a result until the fusion is confirmed
+unprofiled"). And quote a 1024x1024 step as a range with its ramp, "1.35 s first step rising
+to 2.0-2.1 s by step 8" on master e5d9775, never as an 8-step mean and, since 2026-09-08, not
+as one steady number either: the ramp is 55% where it was 20%, which reads as a power or
+thermal envelope until `powermetrics` says otherwise (decisions.md "A Z-Image step is
+quoted at steady state").
 
 **Neither instrument sees occupancy.** A kernel that leaves the GPU mostly idle is
 invisible to both the byte budget and the probe; see the third refinement under

@@ -419,7 +419,7 @@ The seams, so a change lands in one place:
   `XWEN_ZIMAGE_ATTN`, sharing no matmul code with the shipped path, and
   `tests/zimage_microbench.rs` is the ignored bench that priced the choice
   (decisions/zimage.md "The transformer's linears run on xwen's Metal-4 tensor gemm").
-- **Four fused seams from 2026-09-08**, none of them a math change. `ops::rope_pair` is
+- **Four fused seams from the morning of 2026-09-08**, none of them a math change. `ops::rope_pair` is
   the interleaved-pair rotation in one kernel, bitwise identical to the candle chain ONLY
   because contraction and reassociation are pinned off in it. `BlockNorm::forward_scaled`
   folds `1 + scale` into the `[dim]` norm weight instead of running a full-tensor
@@ -427,20 +427,59 @@ The seams, so a change lands in one place:
   PSNR over eight steps, accepted (decisions/zimage.md "The adaLN scale folds into the norm
   weight"). `ops::gated_residual` is `h + gate * y` in one pass. And
   `ops::flash_attn_bidirectional` reuses the CAUSAL kernel unedited, by placing the
-  queries at absolute position K so both mask tests go vacuous; `XWEN_ZIMAGE_ATTN` now
-  names three arms, `flash` (default) / `fused` (candle's SDPA, the old default) / `basic`.
-  **The flash kernel is a vendored copy of candle's steel attention, so it is NOT a faster
-  arithmetic path**: it moved `attn.sdpa` 740 to 687 ms profiled, about 11.3 to 12.5
-  TFLOP/s, and what it bought was f16 k/v and single-pass permutes. Attention at the gemms'
-  rate needs a Metal-4 tensor-op kernel that does not exist (decisions/zimage.md
-  "Bidirectional attention is a query-position trick on the causal flash kernel").
+  queries at absolute position K so both mask tests go vacuous. **That flash kernel is a
+  vendored copy of candle's steel attention, 13.1 TFLOP/s isolated, so it is NOT a faster
+  arithmetic path**: it moved `attn.sdpa` 740 to 687 ms profiled and what it bought was f16
+  k/v and single-pass permutes (decisions/zimage.md "Bidirectional attention is a
+  query-position trick on the causal flash kernel"). It is the `flash` arm now, not the
+  default.
+- **`src/ops/flash_t.metal` / `flash_t.rs` is the shipped attention as of 2026-09-08
+  (e5d9775)**, `ops::flash_attn_tensor`: bidirectional flash attention for head_dim 128 with
+  QK^T and PV both through `mpp::tensor_ops::matmul2d`, the primitive the gemms run on. Q
+  staged once as half, K and V read from device as f16, S to P in registers, O held in its
+  cooperative destination tensor and rescaled per row through a slot mask, everything at
+  simdgroup scope because this SDK static_asserts input cooperative tensors, `reduce_rows`
+  and `map_iterator` to it. 5.80 ms against the steel copy's 20.05 at 30 x 4128 x 128, 45.1
+  against 13.1 TFLOP/s; profiled `attn.sdpa` 698 to 231 ms; rel L2 1.6e-4 to 4.5e-4 against
+  candle's f32 sdpa (NOT bitwise, q/k/v are f16 on the way in, and the test asserts the
+  arms differ); parity step-0 cosine 0.999999, image PSNR 45.60 dB, 0.5 dB under the steel
+  arm. `XWEN_ZIMAGE_ATTN` names FOUR arms: `tensor` (default, alias `xwen`) / `flash`
+  (alias `steel`, the previous default) / `fused` (candle's SDPA) / `basic`, and
+  `AttnImpl::SHIPPED` names the default once so the log guard and the serde default cannot
+  drift. Two facts a rewrite will rediscover the hard way: an f32 operand under
+  `relaxed_precision` is consumed at LESS than f16 precision (so Q is staged half), and
+  `get_mask` from the header's own example does not exist, `is_valid_element` does
+  (decisions/zimage.md "The shipped attention arm is a Metal-4 tensor-op kernel").
+- **`src/ops/conv2d_direct.metal` / `.rs` and `src/ops/group_norm.metal` / `.rs` are the
+  VAE decoder's conv path as of 2026-09-08 (a763c61)**, the `xwen` arm of
+  `XWEN_ZIMAGE_VAE` (`candle` is the vendored im2col chain, the bisect arm). An
+  implicit-gemm f32 3x3 and 1x1 conv on NCHW as candle stores it, simdgroup 8x8 MMA, the
+  input tile and halo staged in threadgroup memory and the im2col operand formed as a
+  transposed `simdgroup_load` at each tap, never written; 10-11 TFLOP/s at every decoder
+  shape against candle's 1.2-4.4. Bias in the store; the GroupNorm affine, the silu and the
+  2x nearest upsample folded into the input read and the residual into the store, so
+  GroupNorm is one statistics read plus a per-channel fold and the apply kernel runs only for
+  the mid-block attention's norm and the fallback. Decode 5.2 s to 1.36-1.44 s at 1024x1024,
+  1.06 to 0.26 s at 512x512; VAE-alone PSNR 92.32 dB (bar 60), image PSNR unchanged. **Two
+  kernel traps, each of which cost a day**: a simdgroup-matrix accumulator array spills to
+  memory unless the tile loops are force-unrolled (`#pragma clang loop unroll(full)`; the
+  first version ran 1 TFLOP/s, slower than candle), and a glue kernel bounds on an explicit
+  `n` in its args and NEVER on `threads_per_grid`, the rounded-up launch count having
+  written past the fold's outputs into pooled buffers while the kernel tests passed by luck
+  (decisions/zimage.md "The VAE decodes on a direct implicit-gemm conv over NCHW").
 - **`src/zimage/profile.rs`** is the per-stage profiler, `XWEN_ZIMAGE_PROFILE=1`, printing
   transformer stages as a mean per step over steps 2..8 and the VAE decode's stages; off,
   it is one `Option` check per site. **Profiled numbers are not figures**: every mark syncs
   AND evicts candle's buffer pool, so a table runs 1.39x high at 1024x1024 and its small
-  elementwise rows about 1.9x, while the gemm and sdpa rows hold up. Quote a step at its
-  3.6 s steady state, never as an 8-step mean (docs/benching.md, and
-  decisions/measurement-discipline.md "A Z-Image step is quoted at steady state").
+  elementwise rows about 1.9x, and since 2026-09-08 the gemm rows are known to carry it too
+  (`ffn.w1w3` read 24.5 TFLOP/s profiled against 37-45 isolated, the pool eviction making
+  every dispatch first-touch its 169 MB intermediate), so a row RANKS and
+  `tests/zimage_microbench.rs` prices. Quote a step as a range with its ramp, "1.35 s first
+  step rising to 2.0-2.1 s by step 8" on master e5d9775, never as an 8-step mean and not as
+  one steady number: the ramp is 55% where it was 20% before the third arc, which reads as a
+  power or thermal envelope and is unconfirmed until `powermetrics` is run
+  (docs/benching.md, and decisions/measurement-discipline.md "A Z-Image step is quoted at
+  steady state").
 - **`Model::text_encoder()`** is where the conditioning comes from. The pipeline entry
   holds no encoder spec of its own and `src/zimage/` has no text encoder: it takes a
   `[T, 2560]` caption tensor and `XwenModel::encode` produces it. candle's own
@@ -487,9 +526,11 @@ gates and no shift term, in the order scale_msa/gate_msa/scale_mlp/gate_mlp; the
 in is `1 - sigma` AND the model output is negated; the 32-multiple pad tokens are
 learned, applied after the embedder, and NOT masked; 8 steps, not the 9 the model card
 says; the static shift is 3.0 and `calculate_shift` is dead code; fp16 is disqualified,
-not merely slower, because activations exceed 65504 and the image comes out black; and the
-vendored flash kernel is candle's own steel attention, so reaching for it is a traffic win
-and not an arithmetic one.
+not merely slower, because activations exceed 65504 and the image comes out black; the
+`flash` attention arm is candle's own steel attention at 13 TFLOP/s and the shipped `tensor`
+arm is the Metal-4 kernel at 45, so an attention change is sized against `flash_t.metal` and
+not against the steel copy; and the VAE runs f32 on purpose, so its conv kernel is simdgroup
+MMA at 10-11 TFLOP/s and not the tensor path, the 60 dB bar having refused bf16.
 
 The transformer IS graded, as of 2026-09-07: `tests/zimage_parity.rs` (run with
 `--ignored`, 13-14 s) gates the step-0 velocity against diffusers' fp32 run of the same

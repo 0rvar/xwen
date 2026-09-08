@@ -4,6 +4,33 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-08 — Z-Image's VAE on a direct conv kernel and its attention on the tensor units: the decode 5.2 s to 1.4 s, the first step 1.78 to 1.35 s, and the SwiGLU bf16 store refuted
+
+Three worktrees against the three largest rows of the morning's lever ledger. a763c61 is
+`src/ops/conv2d_direct.metal` and `src/ops/group_norm.metal`: an implicit-gemm f32 3x3 and
+1x1 conv on NCHW at 10-11 TFLOP/s against candle's 1.2-4.4, with the GroupNorm affine, the
+silu and the 2x upsample folded into the input read and the residual into the store, so the
+normalized tensor is never written except for the mid-block attention. **VAE decode
+1024x1024 5.2 s to 1.36-1.44 s, 512x512 1.06 to 0.26 s**, VAE-alone PSNR 92.32 dB against the
+60 bar, image PSNR unchanged; `XWEN_ZIMAGE_VAE=candle` is the bisect arm. e5d9775 is
+`src/ops/flash_t.metal`, bidirectional flash attention with QK^T and PV through
+`mpp::tensor_ops::matmul2d`: **5.80 ms against 20.05 isolated at 30 x 4128 x 128, 45.1 against
+13.1 TFLOP/s**, profiled `attn.sdpa` 698 to 231 ms, parity step-0 cosine 0.999999 at mean
+rel 0.0010 and image PSNR 45.60 dB (0.5 dB under the steel arm); `XWEN_ZIMAGE_ATTN` names
+`tensor` (default), `flash`, `fused` and `basic`. The bf16 SwiGLU store was built on the
+branch `zimage-ffn` (5e7a6ea), is bit-exact and is REFUTED: the gemm runs 37-45 TFLOP/s
+with the f32 store, the profiled 24.5 that priced the row was the buffer-pool eviction, and
+bandwidth caps the lever at ~0.2 s per image; a half intermediate is disqualified by a
+measured activation max of 284,507. Clean on master e5d9775, `lowpowermode 0`: **a
+1024x1024 step reads 1.35 s first and rises to 2.0-2.1 s by step 8**, eight steps
+14.1-16.1 s, a render of 15.5-17.5 s against ~21.5, a warm wall of 22-25 s; 512x512 8.1 s.
+The first step fell 24% and the plateau 0.1-0.2 s, so the ramp is 55% where it was 20%: the
+signature of a power or thermal envelope, an observation and not a confirmed cause, and a
+`powermetrics` trace is the new first item on the Front because it decides whether further
+kernel wins convert at steady state. Steps are quoted as a range with their ramp from here on.
+[Record](records/zimage-perf.md), [decisions](decisions/zimage.md),
+[measurement](decisions/measurement-discipline.md), [figures](perf-state.md).
+
 ## 2026-09-08 — Z-Image's elementwise rows and its attention: a 1024x1024 step from 3.6 s to 2.15 s, a warm image from 37.7 s to about 25 s
 
 Two arcs off the lever ledger, in parallel worktrees, so their gains are measured against

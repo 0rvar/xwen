@@ -522,7 +522,10 @@ The decode path is `latents / 0.3611 + 0.1159`, decode, then `image / 2 + 0.5` c
 [0, 1] and rounded to bytes. **`force_upcast: true` means the VAE runs in f32 even though
 the transformer is bf16**, which xwen matches: the Flux VAE overflows in fp16 and is
 marginal in bf16. The pipeline's divisibility constraint is 16 per side rather than the
-VAE's 8, because the transformer's patch size is 2 on top of it.
+VAE's 8, because the transformer's patch size is 2 on top of it. Since 2026-09-08 the
+decoder's convs run on xwen's direct conv kernel rather than candle's im2col `conv2d`, still
+in f32 (the section "The fused kernels" below, and decisions.md "The VAE decodes on a direct
+implicit-gemm conv over NCHW"); the decode is 1.36-1.44 s at 1024x1024.
 
 ## The scheduler and the Euler loop
 
@@ -748,15 +751,53 @@ norm, and none of them a math change. The record is
   through K-1 with an unbounded window, which makes both of the kernel's mask tests vacuous
   and its block-skip bound evaluate to the full key count. It is bitwise identical to
   candle's unmasked f32 sdpa at every shape tested. k and v go in through
-  `ops::permute_01_f16`, which does the permute and the f16 cast in one pass.
+  `ops::permute_01_f16`, which does the permute and the f16 cast in one pass. It is the
+  `flash` arm (alias `steel`) and was the default for part of 2026-09-08.
 
-**The trap on that last one: the flash kernel is not a faster arithmetic path.** It is a
+**The trap on that one: the flash kernel is not a faster arithmetic path.** It is a
 vendored copy of candle's MLX steel attention, simdgroup matmul with f32 accumulate, so it
-runs at candle's rate and the switch moved `attn.sdpa` only 740 to 687 ms profiled, about
-11.3 to 12.5 TFLOP/s on the profiled basis, or about 16 real once the merged profile is
-deflated. What it bought was the f16 k/v traffic and the single-pass permutes, not
-arithmetic.
-Do not size an attention change on this graph as if the flash arm were the tensor path;
-attention at the gemms' rate is a Metal-4 tensor-op kernel that does not exist yet
-(TODO.md, and decisions.md "Bidirectional attention is a query-position trick on the
-causal flash kernel").
+runs at candle's rate, 13.1 TFLOP/s isolated at the production shape, and the switch moved
+`attn.sdpa` only 740 to 687 ms profiled. What it bought was the f16 k/v traffic and the
+single-pass permutes, not arithmetic (decisions.md "Bidirectional attention is a
+query-position trick on the causal flash kernel").
+
+Two more seams landed later on 2026-09-08 (a763c61 and e5d9775), and one of them is the
+kernel that trap said did not exist.
+
+- **`ops::flash_attn_tensor(q, k, v, scale)`**, `src/ops/flash_t.metal`, is the shipped
+  attention, the `tensor` arm (alias `xwen`) that `AttnImpl::SHIPPED` names. QK^T and PV both
+  run through `mpp::tensor_ops::matmul2d`, the cooperative-tensor primitive the gemms use,
+  with the online softmax over cooperative-tensor elements. One threadgroup per 64-query
+  block and head, four simdgroups, each owning 16 rows and walking the keys in blocks of 32
+  with no barrier: Q is staged once as half in threadgroup memory, K and V are read from
+  device as f16 tensors, S to P happens in registers and O stays in its cooperative
+  destination tensor for the whole key loop, rescaled per row through a slot mask. Isolated
+  at 30 x 4128 x 128 it reads 5.80 ms against the steel copy's 20.05, 45.1 against 13.1
+  TFLOP/s; profiled `attn.sdpa` fell 698 to 231 ms per step. Against candle's f32 sdpa it is
+  rel L2 1.6e-4 to 4.5e-4, not bitwise: q, k and v are rounded to f16 on the way in, and the
+  test asserts the tensor and steel arms differ. Parity on this arm is step-0 cosine 0.999999
+  at mean rel 0.0010 and image PSNR 45.60 dB, 0.5 dB under the steel arm. Two things about it
+  are forced by the SDK rather than chosen: the per-simdgroup structure, because input
+  cooperative tensors, `reduce_rows` and `map_iterator` are all `static_assert`ed to
+  simdgroup scope, and the half Q, because an f32 operand under `relaxed_precision` is
+  consumed at less than f16 precision (decisions.md "The shipped attention arm is a Metal-4
+  tensor-op kernel").
+- **`ops::conv2d_direct` and `ops::group_norm`**, `src/ops/conv2d_direct.metal` and
+  `src/ops/group_norm.metal`, are the VAE decoder's conv path, the `xwen` arm of
+  `XWEN_ZIMAGE_VAE` (`candle` is the vendored chain). An implicit-gemm f32 3x3 and 1x1
+  convolution on NCHW as candle stores it, simdgroup 8x8 matrix ops, the input tile and its
+  halo staged in threadgroup memory and the im2col operand formed as a transposed
+  `simdgroup_load` at each tap's offset so it is never written; 10-11 TFLOP/s at every decoder
+  shape against candle's 1.2-4.4. The bias is in the store, and the GroupNorm affine, the
+  silu, the 2x nearest upsample (a read at half coordinates) and the residual add are folded
+  into the conv's read and store, so GroupNorm is one statistics read plus a per-channel fold
+  and the normalized tensor exists only for the mid-block attention. The decode went 5.2 s to
+  1.36-1.44 s at 1024x1024 and 1.06 to 0.26 s at 512x512, VAE-alone PSNR 92.62 to 92.32 dB.
+  Two traps pinned in the code: the simdgroup accumulator array spills unless the tile loops
+  are force-unrolled (1 TFLOP/s otherwise), and a glue kernel bounds on an explicit `n`,
+  never on `threads_per_grid` (decisions.md "The VAE decodes on a direct implicit-gemm conv
+  over NCHW").
+
+The record for both is [records/zimage-perf.md](records/zimage-perf.md) "The VAE on a direct
+conv kernel, attention on the tensor units, and the SwiGLU bf16 store refuted"; the third
+part of that arc, a bf16 store for the SwiGLU intermediate, is refuted there and not shipped.
