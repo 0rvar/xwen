@@ -4,6 +4,18 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-08 — The image API lists LoRAs from disk on every request
+
+`GET /v1/images/loras` returns sorted adapter filenames, absolute paths and byte sizes from the same
+directory render requests resolve names in. Every call scans disk again and sends
+`Cache-Control: no-store`, so new and removed files appear without a restart. It reads
+metadata without loading models or waiting behind rendering; a missing directory is an
+empty list, while other directory failures are errors. Adapter compatibility remains
+the render-time check. Seven focused tests and nine live HTTP checks passed, with
+no model weights loaded; review caught and fixed working-directory filename shadowing.
+[Usage](../README.md),
+[API record](records/zimage-control-api.md#lora-discovery-reads-the-directory-on-every-request).
+
 ## 2026-09-08 — Image edits, transformer adapters, full and lite ControlNet, and pose/depth preprocessing
 
 The [image-control PRD](zimage-control-prd.md) phases 1–5 are implemented on the CLI

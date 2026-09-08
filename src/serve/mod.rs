@@ -607,6 +607,7 @@ fn router(state: AppState) -> Router {
             // One handler on three paths; see `images` for why each exists.
             .route("/v1/images/generations", post(images::generations))
             .route("/v1/images/render", post(image_control::render))
+            .route("/v1/images/loras", get(image_control::loras))
             .route("/v1/images/preprocess", post(image_control::preprocess))
             .route("/v1/images/edits", post(image_control::edits))
             .route("/v1/images/variations", post(image_control::variations))

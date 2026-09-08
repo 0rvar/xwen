@@ -64,6 +64,7 @@ pub(crate) fn is_images_path(path: &str) -> bool {
             | "/v1/images/edits"
             | "/v1/images/variations"
             | "/v1/images/preprocess"
+            | "/v1/images/loras"
     )
 }
 
@@ -798,6 +799,7 @@ mod tests {
             "/v1/images/variations",
             "/v1/images/render",
             "/v1/images/preprocess",
+            "/v1/images/loras",
         ] {
             assert!(is_images_path(path));
         }

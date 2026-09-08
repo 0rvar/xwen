@@ -16,6 +16,36 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
+pub(crate) async fn loras() -> Response {
+    match crate::zimage::lora::configured_dir() {
+        Ok(directory) => loras_in(directory).await,
+        Err(error) => lora_list_error(format!("{error:#}")),
+    }
+}
+
+async fn loras_in(directory: std::path::PathBuf) -> Response {
+    match tokio::task::spawn_blocking(move || crate::zimage::lora::scan_dir(&directory)).await {
+        Ok(Ok(data)) => (
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            axum::Json(json!({"object":"list", "data":data})),
+        )
+            .into_response(),
+        Ok(Err(error)) => lora_list_error(format!("{error:#}")),
+        Err(error) => lora_list_error(format!("LoRA directory scan failed: {error}")),
+    }
+}
+
+fn lora_list_error(message: String) -> Response {
+    super::openai::error(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        None,
+        message,
+    )
+    .with_header("cache-control", "no-store")
+    .into_response()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ControlRequest {
@@ -616,5 +646,142 @@ mod tests {
         assert_eq!(params.n, 2);
         assert_eq!(params.prompt, "a painted room");
         assert!(inputs.edit.is_some());
+    }
+}
+
+#[cfg(test)]
+mod lora_listing_tests {
+    use super::*;
+    use axum::http::{StatusCode, header::CACHE_CONTROL};
+    use std::{
+        os::unix::fs::{PermissionsExt, symlink},
+        path::{Path, PathBuf},
+    };
+
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "xwen-lora-list-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    async fn listing(path: &Path, expected_status: StatusCode) -> serde_json::Value {
+        let response = loras_in(path.to_owned()).await;
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if let Some(entries) = body["data"].as_array_mut() {
+            for entry in entries {
+                let listed_path = Path::new(entry["path"].as_str().unwrap());
+                assert!(listed_path.is_absolute());
+                assert_eq!(
+                    listed_path,
+                    path.canonicalize()
+                        .unwrap()
+                        .join(entry["name"].as_str().unwrap())
+                );
+                entry.as_object_mut().unwrap().remove("path");
+            }
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn each_lora_listing_sees_current_files_and_sizes() {
+        let dir = TestDirectory::new();
+        assert_eq!(
+            listing(&dir.0, StatusCode::OK).await,
+            json!({"object":"list","data":[]})
+        );
+        std::fs::write(dir.0.join("z.safetensors"), b"not a valid adapter").unwrap();
+        std::fs::write(dir.0.join("a.safetensors"), b"x").unwrap();
+        assert_eq!(
+            listing(&dir.0, StatusCode::OK).await["data"],
+            json!([
+                {"name":"a.safetensors","size_bytes":1},{"name":"z.safetensors","size_bytes":19}
+            ])
+        );
+        std::fs::write(dir.0.join("a.safetensors"), b"changed").unwrap();
+        std::fs::rename(dir.0.join("z.safetensors"), dir.0.join("b.safetensors")).unwrap();
+        assert_eq!(
+            listing(&dir.0, StatusCode::OK).await["data"],
+            json!([
+                {"name":"a.safetensors","size_bytes":7},{"name":"b.safetensors","size_bytes":19}
+            ])
+        );
+        std::fs::remove_file(dir.0.join("a.safetensors")).unwrap();
+        assert_eq!(
+            listing(&dir.0, StatusCode::OK).await["data"],
+            json!([
+                {"name":"b.safetensors","size_bytes":19}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn lora_listing_filters_names_and_follows_only_file_symlinks() {
+        let root = TestDirectory::new();
+        let dir = root.0.join("listed");
+        std::fs::create_dir(&dir).unwrap();
+        let target = root.0.join("outside.bin");
+        std::fs::write(&target, b"abc").unwrap();
+        symlink(&target, dir.join("link.safetensors")).unwrap();
+        symlink(root.0.join("missing"), dir.join("broken.safetensors")).unwrap();
+        symlink(&root.0, dir.join("directory-link.safetensors")).unwrap();
+        std::fs::create_dir(dir.join("nested.safetensors")).unwrap();
+        std::fs::write(dir.join("nested.safetensors/hidden.safetensors"), b"nested").unwrap();
+        std::fs::write(dir.join("upper.SAFETENSORS"), b"upper").unwrap();
+        std::fs::write(dir.join("readme.md"), b"text").unwrap();
+        assert_eq!(
+            listing(&dir, StatusCode::OK).await["data"],
+            json!([{"name":"link.safetensors","size_bytes":3}])
+        );
+    }
+
+    #[tokio::test]
+    async fn lora_listing_missing_directory_is_empty_but_not_directory_is_server_error() {
+        let dir = TestDirectory::new();
+        assert_eq!(
+            listing(&dir.0.join("missing"), StatusCode::OK).await,
+            json!({"object":"list","data":[]})
+        );
+        let file = dir.0.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let error = listing(&file, StatusCode::INTERNAL_SERVER_ERROR).await;
+        assert_eq!(error["error"]["type"], "server_error");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reading LoRA directory")
+        );
+    }
+
+    #[tokio::test]
+    async fn lora_listing_unreadable_directory_is_server_error() {
+        let dir = TestDirectory::new();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let response = loras_in(dir.0.clone()).await;
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
     }
 }

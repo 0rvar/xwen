@@ -16,6 +16,95 @@ pub struct LoraSpec {
     pub weight: f64,
 }
 
+/// The directory used for both adapter discovery and short-name resolution.
+pub fn configured_dir() -> Result<PathBuf> {
+    match std::env::var_os("XWEN_LORA_DIR") {
+        Some(path) => Ok(directory_or_current(PathBuf::from(path))),
+        None => Ok(PathBuf::from(
+            std::env::var_os("HOME").context("HOME is unset; set XWEN_LORA_DIR")?,
+        )
+        .join(".local/share/xwen/loras")),
+    }
+}
+
+fn directory_or_current(path: PathBuf) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        path
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LoraCandidate {
+    pub name: String,
+    /// Absolute directory plus published filename, retaining a file symlink's name.
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+fn candidate_name(name: &std::ffi::OsStr) -> Option<&str> {
+    let name = name.to_str()?;
+    (Path::new(name).extension() == Some(std::ffi::OsStr::new("safetensors"))).then_some(name)
+}
+
+/// Discover top-level candidate files without opening adapter tensors or headers.
+pub fn scan_dir(directory: &Path) -> Result<Vec<LoraCandidate>> {
+    let directory = match directory.canonicalize() {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading LoRA directory {}", directory.display()));
+        }
+    };
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading LoRA directory {}", directory.display()));
+        }
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading LoRA directory {}", directory.display()));
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = candidate_name(&name) else {
+            continue;
+        };
+        // Follow file symlinks, including HF-cache links outside this directory.
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading LoRA candidate {}", entry.path().display()));
+            }
+        };
+        if metadata.is_file() {
+            candidates.push(LoraCandidate {
+                name: name.to_owned(),
+                path: directory
+                    .join(name)
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("LoRA candidate path is not UTF-8"))?,
+                size_bytes: metadata.len(),
+            });
+        }
+    }
+    candidates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Ok(candidates)
+}
+
 #[derive(Clone, Debug)]
 pub struct AdapterError(pub String);
 impl std::fmt::Display for AdapterError {
@@ -54,13 +143,7 @@ impl LoraSpec {
                 "LoRA file does not exist: {}",
                 self.name
             );
-            let dir = match std::env::var_os("XWEN_LORA_DIR") {
-                Some(p) => PathBuf::from(p),
-                None => PathBuf::from(
-                    std::env::var_os("HOME").context("HOME is unset; set XWEN_LORA_DIR")?,
-                )
-                .join(".local/share/xwen/loras"),
-            };
+            let dir = configured_dir()?;
             let exact = dir.join(&self.name);
             if exact.is_file() {
                 exact
@@ -735,6 +818,107 @@ impl PreparedLoras {
                 );
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn lora_listing_empty_configured_path_means_current_directory() {
+        assert_eq!(directory_or_current(PathBuf::new()), PathBuf::from("."));
+        assert_eq!(
+            directory_or_current(PathBuf::from("adapters")),
+            PathBuf::from("adapters")
+        );
+    }
+
+    #[test]
+    fn lora_listing_ignores_names_that_cannot_be_json_strings() {
+        assert!(candidate_name(std::ffi::OsStr::from_bytes(b"bad\xff.safetensors")).is_none());
+        assert!(candidate_name(std::ffi::OsStr::new("upper.SAFETENSORS")).is_none());
+        assert_eq!(
+            candidate_name(std::ffi::OsStr::new("portrait.safetensors")),
+            Some("portrait.safetensors")
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalog_path_tests {
+    use super::*;
+
+    struct Fixtures {
+        directory: PathBuf,
+        cwd_file: PathBuf,
+    }
+    impl Drop for Fixtures {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.cwd_file);
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn lora_listing_path_selects_its_file_despite_a_cwd_name_collision() -> Result<()> {
+        let name = format!(
+            "xwen-lora-collision-{}-{}.safetensors",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let cwd_file = std::env::current_dir()?.join(&name);
+        let directory = std::env::temp_dir().join(format!(
+            "xwen-lora-catalog-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&directory)?;
+        if let Err(error) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cwd_file)
+        {
+            let _ = std::fs::remove_dir(&directory);
+            return Err(error.into());
+        }
+        let fixtures = Fixtures {
+            directory,
+            cwd_file,
+        };
+        let weights = |value: f32| -> Result<HashMap<String, Tensor>> {
+            Ok(HashMap::from([
+                (
+                    "diffusion_model.layers.0.attention.to_q.lora_A.weight".into(),
+                    Tensor::full(value, (1, 2), &Device::Cpu)?,
+                ),
+                (
+                    "diffusion_model.layers.0.attention.to_q.lora_B.weight".into(),
+                    Tensor::full(value, (2, 1), &Device::Cpu)?,
+                ),
+            ]))
+        };
+        candle_core::safetensors::save(&weights(1.)?, &fixtures.cwd_file)?;
+        let listed_file = fixtures.directory.join(&name);
+        candle_core::safetensors::save(&weights(2.)?, &listed_file)?;
+        let candidates = scan_dir(&fixtures.directory)?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, name);
+        let by_name = LoraSpec {
+            name: name.clone(),
+            weight: 1.,
+        }
+        .resolve()?;
+        assert_eq!(by_name.path, fixtures.cwd_file.canonicalize()?);
+        let by_path = LoraSpec {
+            name: candidates[0].path.clone(),
+            weight: 1.,
+        }
+        .resolve()?;
+        assert_eq!(by_path.path, listed_file.canonicalize()?);
+        assert_ne!(std::fs::read(by_name.path)?, std::fs::read(by_path.path)?);
         Ok(())
     }
 }

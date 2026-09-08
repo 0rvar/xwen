@@ -598,3 +598,14 @@ LayerNorm epsilon 1e-6. Depth inputs resize to the trained 518-square position g
 aspect-preserving position interpolation is not implemented. Requests never download
 these models. [The preprocessor record](../records/zimage-preprocessors.md) states the
 numerical gates and the limits of the pose rasterizer.
+
+**LoRA discovery scans the directory for every request.** 2026-09-08. The user asked
+for a catalogue that reflects the folder immediately. `GET /v1/images/loras` therefore
+shares render's directory resolver, scans top-level `.safetensors` files each time and
+returns sorted names, absolute paths and byte sizes under `Cache-Control: no-store`. It runs outside
+the image queue. Missing directories are empty catalogues; other I/O failures are
+errors. Discovery reads metadata, and rendering checks adapter compatibility. This
+keeps refresh cost independent of weight-file size. Clients select the absolute path
+so a same-named working-directory file cannot shadow the listed adapter; existing
+CLI and render path resolution keep their precedence. The [API record](../records/zimage-control-api.md#lora-discovery-reads-the-directory-on-every-request)
+holds the response contract and filesystem behavior.

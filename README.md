@@ -246,6 +246,22 @@ Q/K/V and embedder/refiner projections. Changing the adapter set reloads the
 pipeline from the base weights. Unknown targets and unsupported adapter formats
 are errors.
 
+`GET /v1/images/loras` lists the top-level `.safetensors` files in that LoRA directory.
+Every request scans the directory again, so adding, replacing, renaming or removing a
+file needs no server restart. The response uses `Cache-Control: no-store`:
+
+```json
+{"object":"list","data":[{"name":"portrait.safetensors","path":"/srv/loras/portrait.safetensors","size_bytes":170000000}]}
+```
+
+Use `name` for display and pass the absolute `path` as `loras[].name` in a render
+request. This selects the listed file even if the server's working directory contains
+another adapter with the same name. Results are sorted by name and include symlinks
+to files. A missing directory returns an empty list; an
+unreadable directory or a path that is not a directory returns an error. Listing reads
+file metadata, not adapter weights; compatibility is checked when rendering. It uses
+the image API's authentication policy and does not load models or wait for a render.
+
 `POST /v1/images/render` is the native JSON endpoint. Image strings accept local
 server paths, plain base64 or image data URLs. Unknown fields, including nested
 fields, return 400. The response has a `data` array with `b64_json`, `seed`,

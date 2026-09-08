@@ -72,6 +72,42 @@ with an empty-health check and exclusive GPU-lock ownership check, plus relocati
 imports and root path. All tier commands, environments, provenance checks and thresholds
 were unchanged; the copy's diff was inspected. The server stayed running and empty.
 
+## LoRA discovery reads the directory on every request
+
+2026-09-08. `GET /v1/images/loras` supplies filenames for a client's adapter picker.
+It shares the directory resolver used by render requests: `XWEN_LORA_DIR`, otherwise
+`~/.local/share/xwen/loras`. Each request scans the directory and reads file metadata
+again, without the image worker or model loading. `Cache-Control: no-store` prevents a
+client cache from hiding a changed directory.
+
+The response is `{"object":"list","data":[{"name":"style.safetensors","path":"/srv/loras/style.safetensors","size_bytes":123}]}`.
+Entries are sorted by their complete filenames. Clients display `name` and pass
+`path` as `loras[].name`: an absolute path avoids the existing resolver's preference
+for a same-named file in the server's working directory. The directory is canonicalized;
+the file's published name is retained even when it is a symlink into an HF blob store.
+Only top-level `.safetensors` files are listed. File symlinks are
+included; subdirectories, other extensions, broken symlinks and names that cannot be
+represented as UTF-8 are skipped. A missing directory is an empty catalogue, including
+when it has not yet been created. Other directory errors return an OpenAI-shaped 500.
+
+This is file discovery, not an adapter compatibility scan. Reading weight planes on
+every picker refresh would make the request proportional to adapter bytes; listing
+uses metadata and leaves header, target and tensor validation to rendering. A file
+being replaced may disappear during a scan and is skipped until the next request.
+
+Seven focused CPU tests passed, including successive listings after file changes,
+symlinks, directory errors and a valid-adapter filename collision between the catalogue
+and working directory. Review exposed that collision; returning an absolute selection
+path fixes it without changing existing resolver precedence. Both reviewers approved
+the fix, and the outside Qwen review reported no additional findings. Existing LoRA
+tests, image-auth classification, `cargo check --tests` and formatting checks passed.
+
+A release server on an isolated port passed nine live HTTP checks: missing credentials,
+empty and populated listings, file overwrite/rename/removal, directory replacement and
+restoration, a missing directory, and health. Listed absolute paths and `no-store`
+headers were verified. Both model residency flags remained false, and the test server
+was stopped afterward. No model math changed in this addition.
+
 ## Not taken now
 
 The GUI remains a separate project. No new ComfyUI, Krita or A1111 dialect is
