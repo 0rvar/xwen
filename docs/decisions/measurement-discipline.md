@@ -204,3 +204,23 @@ what licenses deflating the rest: the elementwise and copy rows carry the whole 
 and read about 1.9x high. So take a gemm or sdpa row as a measurement, take a small row
 as an upper bound, and take a bucket share only from the deflated table in
 [records/zimage-perf.md](../records/zimage-perf.md) "Lever ledger" (2026-09-07).
+
+**A profiled row that shows a fusion win is not a result until the fusion is confirmed
+unprofiled.** The Z-Image profiler syncs at every mark and `wait_until_completed` also
+calls `drop_unused_buffers`, so the buffer pool is evicted between marks and the next op
+re-allocates and re-zeros a power-of-two-rounded buffer. That penalty falls on
+intermediates, which means it falls hardest on exactly the code a fusion is meant to
+remove, and a fusion therefore looks better under the profiler than it is. The case that
+established it: the SwiGLU dual gemm read 769.5 ms against the chain's 904.6 plus 275.1,
+so the profiled table credited it with 410 ms per step, and an alternating unprofiled A/B
+measured 3.49 and 3.58 s per step against the chain's 3.42 and 3.46, a 2 to 4% regression,
+matching an isolated bench that had it 15% behind. It was removed
+(decisions.md "The SwiGLU dual gemm is REFUTED"). The rule generalizes past this profiler,
+because any instrument that serializes and evicts between stages mis-prices the removal of
+an intermediate: price a fusion by an interleaved A/B of the whole run with the instrument
+OFF, and use the profiled table only to decide which fusion to try. The same day produced
+the other half of it, which is that a multiplicative deflator fitted once does not survive
+the rows shrinking: at a 2.65 s step the measured gemm and sdpa rows leave 380 ms for all
+the elementwise work where the profiled table claims 1562 ms, so the honest bound on the
+small rows is the residual and not the deflated row
+([records/zimage-perf.md](../records/zimage-perf.md) "Lever ledger", 2026-09-08).

@@ -206,13 +206,16 @@ and neither side past 8192 px; 1024x1024, 1024x768, 512x512 and 1536x1024 all sa
 three. Anything else is refused with the reason, because the padded-image path is not
 implemented and 8192 px is as far as the model's position tables reach.
 
-One image at 1024x1024 takes about 38 s warm, roughly 28 s of it in the eight transformer
-steps and 5 s in the VAE decode; 512x512 takes about 10 s. Those are after the 2026-09-07
-arc that moved the transformer's linears onto xwen's Metal-4 tensor gemm, which took a
-1024x1024 step from 5.0-5.25 s to 3.6 s (3.06 s for the first step of a cool run, then a
-bounded ramp to a 3.6 s plateau). `XWEN_ZIMAGE_LINEAR=candle` runs the previous path as a
-bisect arm, `XWEN_ZIMAGE_PROFILE=1` prints per-stage times for a run, and the VAE has had
-no performance work. The transformer is
+One image at 1024x1024 takes about 25 s warm, roughly 16 s of it in the eight transformer
+steps and 5.2 s in the VAE decode; 512x512 takes 8.6 s. A 1024x1024 step is 2.15 s at
+steady state and 1.78 s for the first step, after two days of work: 2026-09-07 moved the
+transformer's linears onto xwen's Metal-4 tensor gemm (5.0-5.25 s to 3.6 s) and 2026-09-08
+fused the rope, the modulation scale, the gated residual and attention (3.6 s to 2.15 s).
+The VAE decode has had no performance work and is now the largest single piece of an image.
+`XWEN_ZIMAGE_ATTN` selects the attention arm, `flash` (the default) or `fused` (candle's
+SDPA) or `basic`; `XWEN_ZIMAGE_LINEAR=candle` runs the previous gemm path as a bisect arm;
+`XWEN_ZIMAGE_PROFILE=1` prints per-stage times for a run. A non-default arm is named in the
+startup log and the default is silent. The transformer is
 graded against a diffusers fp32 dump (`tests/zimage_parity.rs`, docs/parity.md).
 `docs/zimage.md` is the architecture and the traps, `docs/records/zimage-pipeline.md` the
 arcs, `docs/perf-state.md` the timings and their conditions.

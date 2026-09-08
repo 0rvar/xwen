@@ -652,16 +652,29 @@ Four smaller ones. The timestep stays f32 into the model rather than being cast 
 first. The VAE and the Euler loop run f32 with the model output negated before the step,
 which the reference does and candle's library did not (its example did). The postprocess
 rounds to nearest byte where upstream truncated. And the CUDA flash-attn arm, the CFG
-helpers, `calculate_shift` and `preprocess.rs` are removed; what is kept is a
-`use_accelerated_attn` switch selecting candle's Metal SDPA against a plain matmul chain.
-That switch is reachable as **`XWEN_ZIMAGE_ATTN=basic`** (unset or `fused` is the shipped
-path; a value that names neither is a load error rather than a silent default), read when
-the `Config` is built, which is where the shipped `transformer/config.json` — carrying no
-such key — takes its `serde` default. The arm is a real A/B: the two share no attention
-kernel, and the unit test asserts their outputs differ by a NONZERO amount under the bar,
-because a bit-identical result would mean the switch selected one kernel twice. It was
-unreachable and untested in the first arc, which is the shape the `XWEN_QWEN3_ATTN=sdpa`
-ablation was vacuous in for a whole arc (AGENTS.md "Verification workflow").
+helpers, `calculate_shift` and `preprocess.rs` are removed; what is kept is an attention
+switch, which since 2026-09-08 is `AttnImpl` with three arms rather than the original
+`use_accelerated_attn` boolean.
+
+**`XWEN_ZIMAGE_ATTN` names three arms**, read when the `Config` is built, which is where
+the shipped `transformer/config.json` — carrying no such key — takes its `serde` default.
+A value that names none of them is a load error rather than a silent default.
+
+- **`flash`, or `xwen`, or unset** is the shipped path: xwen's own
+  `ops::flash_attn_bidirectional`, below.
+- **`fused`, or `sdpa`**, is candle's Metal SDPA. It was the default before 2026-09-08 and
+  it is what a masked or non-Metal or batched call still takes.
+- **`basic`** is the explicit matmul, scale, softmax, matmul chain, the reference arm.
+
+The pipeline logs the attention arm only when it is NOT the default, which is the rule
+`XWEN_ZIMAGE_LINEAR` already followed: a silent startup means `flash`, and any line naming
+an arm means someone set the variable.
+
+The arms are a real A/B: no two of them share an attention kernel, and the unit tests
+assert the outputs differ by a NONZERO amount under the bar, because a bit-identical
+result would mean the switch selected one kernel twice. The switch was unreachable and
+untested in the first arc, which is the shape the `XWEN_QWEN3_ATTN=sdpa` ablation was
+vacuous in for a whole arc (AGENTS.md "Verification workflow").
 
 ## The linear layers run on the Metal-4 tensor gemm
 
@@ -705,3 +718,43 @@ activations, sharing no matmul code with the shipped path, with a unit test asse
 two agree to a nonzero 2.34e-3 under a 5e-3 bar. A value naming neither arm is a load
 error. `tests/zimage_microbench.rs` is the ignored bench that priced the kernel choice,
 and [records/zimage-perf.md](records/zimage-perf.md) is where its tables live.
+
+## The fused kernels: rope, the norm scale, the gated residual, bidirectional attention
+
+Four seams added 2026-09-08 (bee11da and the arc after it), all in `src/ops` except the
+norm, and none of them a math change. The record is
+[records/zimage-perf.md](records/zimage-perf.md) and the decisions are
+[decisions/zimage.md](decisions/zimage.md).
+
+- **`ops::rope_pair(x, cos, sin)`** is the interleaved-pair rotation in one kernel over
+  `[batch, seq, heads, head_dim]` f32 with `[seq, head_dim/2]` f32 tables, one thread per
+  pair. It is **bitwise identical** to the candle chain it replaced, tested at the
+  production shape `[1, 4128, 30, 128]`, and it stays that way only because FP contraction
+  and reassociation are pinned off in the kernel: turn either back on and the f32
+  rotation, which is one of the four corrections above, quietly stops being the correction.
+  `ops::rope_neox` is by-halves and does not apply to this graph.
+- **`BlockNorm`** replaces `with_tracing::RmsNorm` for the block's four modulated norms
+  (`QkNorm` and `cap_embedder_norm` still use candle's). `forward` is the same fused
+  `candle_nn::ops::rms_norm`; `forward_scaled(x, scale)` multiplies `1 + scale` into the
+  `[dim]` weight and runs ONE norm, which removes a full-tensor `broadcast_mul` per site.
+  It is the one part of the arc that is not bitwise: two f32 multiplies round in a
+  different order, worth 0.9 dB of image PSNR over eight steps and nothing at step 0, and
+  that cost is accepted (decisions.md "The adaLN scale folds into the norm weight").
+- **`ops::gated_residual(h, y, gate)`** is `h + gate[c] * y` in one pass, bitwise
+  identical to candle's broadcast-multiply-then-add, which ran at 48 GB/s against 530 for
+  the contiguous kernel.
+- **`ops::flash_attn_bidirectional(q, k, v, scale)`** reuses the CAUSAL flash kernel with
+  no kernel edit, by placing the queries at absolute position K while the keys sit at 0
+  through K-1 with an unbounded window, which makes both of the kernel's mask tests vacuous
+  and its block-skip bound evaluate to the full key count. It is bitwise identical to
+  candle's unmasked f32 sdpa at every shape tested. k and v go in through
+  `ops::permute_01_f16`, which does the permute and the f16 cast in one pass.
+
+**The trap on that last one: the flash kernel is not a faster arithmetic path.** It is a
+vendored copy of candle's MLX steel attention, simdgroup matmul with f32 accumulate, so it
+runs at candle's rate and the switch moved `attn.sdpa` only 740 to 687 ms profiled, about
+11.3 to 12.5 TFLOP/s. What it bought was the f16 k/v traffic and the single-pass permutes.
+Do not size an attention change on this graph as if the flash arm were the tensor path;
+attention at the gemms' rate is a Metal-4 tensor-op kernel that does not exist yet
+(TODO.md, and decisions.md "Bidirectional attention is a query-position trick on the
+causal flash kernel").

@@ -3051,4 +3051,48 @@ blocks use of the feature; item (a) is the one with a known trigger.
 
 ## Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07)
 
-[Nothing closed here yet; the heading exists because TODO.md items name it in their From: line.]
+[Shipped 2026-09-08 by the rope-and-norm arc (bee11da, log.md "Z-Image's elementwise rows and its attention"): `ops::rope_pair` is the interleaved-pair rotation in one kernel, bitwise identical to the candle chain at the production shape, and the row went from ~465 to ~66 ms per step deflated, 892 to 126 profiled. Nothing of this item stays open: it is now under the 70-120 ms its own traffic predicted. The one thing to carry forward is a trap rather than a remainder, and it lives in docs/zimage.md "The fused kernels": the bitwise identity holds only because FP contraction and reassociation are pinned off in the kernel.]
+
+- [x] [measured] **A fused interleaved-pair rope kernel for the Z-Image transformer.**
+  `apply_rotary_emb` is ~465 ms of a 3.6 s step at 1024x1024, ~13%, so ~2.9 s of a ~37 s
+  image, and it is 6-7x slower than its own traffic explains: 700 MB per call at 400 GB/s
+  would be 119 ms per step over the 68 calls, not 465. The cause is in the graph and not
+  the kernel count. The real and imaginary halves are strided views (`x.i((..,..,..,..,0))`,
+  stride 2 on the last axis), so all six broadcast multiplies and adds run candle's strided
+  binary kernel with uncoalesced reads, and `Tensor::stack` copies the result back. A fused
+  kernel is the fix and it is the same shape of kernel `src/ops` already ships, except that
+  `ops::rope_neox` is by-halves and does NOT transfer: Z-Image is interleaved-pair, so this
+  is a new kernel. It re-runs the parity gate, the f32 rotation being one of the four
+  deliberate corrections toward the reference (2026-09-07).
+  [Record](records/zimage-perf.md), [figures](perf-state.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+[Shipped 2026-09-08 by the attention arc (66e7202, log.md "Z-Image's elementwise rows and its attention"): `ops::flash_attn_bidirectional` reuses the CAUSAL kernel with no kernel edit at all, by placing the queries at absolute position K so both mask tests go vacuous and the block-skip bound opens by itself, and it is bitwise identical to candle's unmasked f32 sdpa at every shape tested (decisions.md "Bidirectional attention is a query-position trick on the causal flash kernel"). Its OWN ceiling was wrong and that is the finding: the vendored flash kernel is a copy of candle's steel attention, so `attn.sdpa` moved only 740 to 687 ms at about 12.5 TFLOP/s and the gain came from f16 k/v and single-pass permutes. The ~300 ms this item priced needs a Metal-4 tensor-op attention kernel, which is a NEW item on the Front and not a remainder of this one.]
+
+- [x] [measured] **A bidirectional mode on xwen's flash kernel, for Z-Image attention.**
+  candle's fused sdpa is 740 ms of a 3.6 s step at 1024x1024, 21%, and it runs at 11.3
+  TFLOP/s where the same chip's tensor gemm reaches 30-39 in the same step. At the gemm's
+  rate attention would be ~300 ms, so ~3.5 s of a ~37 s image. `ops::flash_attn` is the
+  candidate and head_dim 128 already matches, but it is causal-only: the edit is a
+  bidirectional flag through `FlashAttnArgs`, dropping the future test in the one mask
+  block, opening the two block-skip bounds (the `disable_skip` plumbing exists), and
+  relaxing the two host causal guards. Its K and V must be f16, which is a precision
+  decision on this graph rather than a correctness one, there being no mask to interact
+  with; the parity gate arbitrates. Attention also grows quadratically in tokens, so this
+  is the first term at any size above 1024x1024 (2026-09-07).
+  [Record](records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
+
+[Shipped 2026-09-08 by the rope-and-norm arc (bee11da, log.md "Z-Image's elementwise rows and its attention"), and with no kernel: `BlockNorm::forward_scaled` folds `1 + scale` into the `[dim]` norm weight, `ops::gated_residual` is the gate and the residual add in one pass, and the row went ~370 to ~245 ms per step deflated. The fold is the arc's one non-bitwise change and its 1.3 dB of image PSNR is accepted (decisions.md "The adaLN scale folds into the norm weight"). Its open remainder is `attn.qknorm`, two per-head norms per block at ~130 ms profiled and ~69 deflated, about 0.5 s per image: that is a record line in docs/records/zimage-perf.md "Lever ledger" and deliberately NOT an item, the gain being too small to rank on a figure that is not a target. Reopen it if a norm-shaped arc is happening anyway.]
+
+- [x] [measured] **Fold the Z-Image modulation scale and gate into the norm kernel.**
+  Norms and modulation are ~370 ms of a 3.6 s step, ~11%, so ~3.0 s of an image. Per block
+  there are four fused RMSNorms plus two QK-norms, and each is followed by a separate
+  `broadcast_mul` for the scale or the gate and a separate residual add: five extra
+  full-tensor passes over 63 MB per block that a norm-with-scale kernel folds in. The
+  microbench also priced the broadcast itself, 48 GB/s against 530 for the contiguous
+  `mul`, so even materializing the `[1, 3840]` row before multiplying recovers most of the
+  four modulation applications. No new math and no parity risk beyond the usual re-run
+  (2026-09-07).
+  [Record](records/zimage-perf.md).
+  From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).

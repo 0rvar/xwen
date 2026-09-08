@@ -4,6 +4,53 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-08 — Z-Image's elementwise rows and its attention: a 1024x1024 step from 3.6 s to 2.15 s, a warm image from 37.7 s to about 25 s
+
+Two arcs off the lever ledger, in parallel worktrees, so their gains are measured against
+the same 3.55-3.67 s base and do not add. bee11da took the three elementwise rows the
+profiler ranked: `ops::rope_pair` is the interleaved-pair rope in one kernel instead of six
+strided candle ops plus a `stack`, bitwise identical at the production shape;
+`BlockNorm::forward_scaled` folds `1 + scale` into the norm weight, which is a `[3840]`
+multiply replacing a full-tensor pass, and needed no kernel at all; `ops::gated_residual`
+is `h + gate * y` in one pass. **1024x1024 steady state 3.6 s to 2.7 s per step, first step
+3.06 to 2.14, and 512x512 0.63-0.68 to 0.45-0.52**, with `attn.rope` 892 to 126 ms
+profiled, norm+scale 437 to 284 and gate+residual 132 to 51. 66e7202 shipped
+`ops::flash_attn_bidirectional` **by placing the queries at absolute position K, so the
+causal kernel's two mask tests go vacuous and the kernel itself is untouched**; it is
+bitwise identical to candle's unmasked f32 sdpa at all five shapes tested, and
+`XWEN_ZIMAGE_ATTN` now names `flash` (default), `fused` (candle's kernel, the old default)
+and `basic`, logging the arm only when it is not the default, the rule the linear arm
+already followed. That arc read **3.42-3.46 s per step and 512x512 0.56-0.58**, and it
+corrected its own ceiling: the flash kernel is a vendored copy of candle's steel attention,
+so `attn.sdpa` only moved 740 to 687 ms at ~12.5 TFLOP/s and the gain came from f16 k/v and
+fused permutes instead. Attention at the gemms' rate needs a Metal-4 tensor-op attention
+kernel, which is the new Front item at ~400 ms per step. The ledger's other route, a
+`silu_mul` epilogue on the SwiGLU gemm, is REFUTED: the dual gemm was built, is
+numerically right at 5e-8, and is 15% slower isolated and 2-4% slower in situ. The
+profiler had credited it with 410 ms per step, because its sync-and-evict charges the
+chain for the intermediate the fusion removes, and that reading rule is now a decision of
+its own. **Merged, the two compose almost perfectly: a 1024x1024 step is 2.15 s steady and
+1.78 s first, an 8-step render about 21 s and a warm image about 25 s, and 512x512 runs
+0.37-0.41 s per step and 8.6 s end to end**, against 3.6 s and 37.7 s yesterday and
+5.0-5.25 s and 50.2 s the morning before. That is 29 TFLOP/s end to end against the gemms'
+own 30-39, so
+the step now runs at close to the rate of its dominant kernel. At 512x512 xwen is level with
+torch MPS bf16, which was 3.5x ahead on 2026-09-07. A profiler pass on the merged tree
+refitted the deflator into the two numbers it always needed, 1.19x on the four gemm and sdpa
+marks and about 3x on the nine elementwise ones, so a step is **1.26 s of gemms, 0.53 s of
+attention and 0.34 s of everything else**, and the ledger is re-ranked off it: the VAE conv
+path is now the largest lever on the graph at 3.7-4.2 s per image, the SwiGLU f32 store
+second at 2.6 s, the tensor-op attention kernel third at 2.4 s, gemm fusion unpriced at ~2 s.
+Taking all of them puts a step at ~1.25 s and a render at ~11.5 s against 22.4 today, and
+below that floor there is only fewer steps, step caching or int8.
+Parity on the merged tree: step-0 velocity cosine 0.999999 at mean relative error 0.0008,
+final latent 0.999672, image PSNR 46.09 dB against the reference's own bf16 arm at 32.40,
+VAE 92.62, both brackets outside, 1336 lib tests green. The 0.9 dB the norm fold costs is
+accepted and recorded. `pmset -g` read `lowpowermode 0`.
+[Record](records/zimage-perf.md), [decisions](decisions/zimage.md),
+[measurement](decisions/measurement-discipline.md), [architecture](zimage.md),
+[figures](perf-state.md).
+
 ## 2026-09-07 — The Z-Image transformer's linears on the Metal-4 tensor gemm: a 1024x1024 step from 5.0-5.25 s to 3.06-3.59 s, image PSNR 29.71 to 47.03 dB
 
 Every projection in the transformer went through candle's steel gemm, which measures

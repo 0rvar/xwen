@@ -948,11 +948,12 @@ from the fixture. Regenerating the fixture, or adding a case at another size, is
 Stage 2 venv plus `diffusers accelerate` (its header has the lines), about two minutes.
 The same comparison by hand is `xwen image --latents <case>/latents0.safetensors
 --cap-feats <case>/cap_feats.safetensors --dump <dir>` (docs/zimage.md "The transformer
-reference dump, Stages 3 and 4"). Two bisect arms run the gate on different code:
-`XWEN_ZIMAGE_ATTN=basic` swaps candle's Metal SDPA for an explicit matmul chain, and
-`XWEN_ZIMAGE_LINEAR=candle` swaps xwen's tensor gemm and its f32 activation stream for
-candle's gemm over bf16 activations, which is where the pre-2026-09-07 velocity figures
-came from.
+reference dump, Stages 3 and 4"). Two bisect arms run the gate on different code.
+`XWEN_ZIMAGE_ATTN` names three of them since 2026-09-08: `flash` (unset, the shipped
+`ops::flash_attn_bidirectional`), `fused` (candle's Metal SDPA, the default before that
+date) and `basic` (an explicit matmul chain). And `XWEN_ZIMAGE_LINEAR=candle` swaps
+xwen's tensor gemm and its f32 activation stream for candle's gemm over bf16 activations,
+which is where the pre-2026-09-07 velocity figures came from.
 
 Decode consistency, which needs no oracle at all:
 

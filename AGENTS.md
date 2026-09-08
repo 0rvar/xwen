@@ -419,6 +419,21 @@ The seams, so a change lands in one place:
   `XWEN_ZIMAGE_ATTN`, sharing no matmul code with the shipped path, and
   `tests/zimage_microbench.rs` is the ignored bench that priced the choice
   (decisions/zimage.md "The transformer's linears run on xwen's Metal-4 tensor gemm").
+- **Four fused seams from 2026-09-08**, none of them a math change. `ops::rope_pair` is
+  the interleaved-pair rotation in one kernel, bitwise identical to the candle chain ONLY
+  because contraction and reassociation are pinned off in it. `BlockNorm::forward_scaled`
+  folds `1 + scale` into the `[dim]` norm weight instead of running a full-tensor
+  `broadcast_mul`, which is the one non-bitwise change of the arc and costs 0.9 dB of image
+  PSNR over eight steps, accepted (decisions/zimage.md "The adaLN scale folds into the norm
+  weight"). `ops::gated_residual` is `h + gate * y` in one pass. And
+  `ops::flash_attn_bidirectional` reuses the CAUSAL kernel unedited, by placing the
+  queries at absolute position K so both mask tests go vacuous; `XWEN_ZIMAGE_ATTN` now
+  names three arms, `flash` (default) / `fused` (candle's SDPA, the old default) / `basic`.
+  **The flash kernel is a vendored copy of candle's steel attention, so it is NOT a faster
+  arithmetic path**: it moved `attn.sdpa` 740 to 687 ms profiled, about 11.3 to 12.5
+  TFLOP/s, and what it bought was f16 k/v and single-pass permutes. Attention at the gemms'
+  rate needs a Metal-4 tensor-op kernel that does not exist (decisions/zimage.md
+  "Bidirectional attention is a query-position trick on the causal flash kernel").
 - **`src/zimage/profile.rs`** is the per-stage profiler, `XWEN_ZIMAGE_PROFILE=1`, printing
   transformer stages as a mean per step over steps 2..8 and the VAE decode's stages; off,
   it is one `Option` check per site. **Profiled numbers are not figures**: every mark syncs
@@ -472,7 +487,9 @@ gates and no shift term, in the order scale_msa/gate_msa/scale_mlp/gate_mlp; the
 in is `1 - sigma` AND the model output is negated; the 32-multiple pad tokens are
 learned, applied after the embedder, and NOT masked; 8 steps, not the 9 the model card
 says; the static shift is 3.0 and `calculate_shift` is dead code; fp16 is disqualified,
-not merely slower, because activations exceed 65504 and the image comes out black.
+not merely slower, because activations exceed 65504 and the image comes out black; and the
+vendored flash kernel is candle's own steel attention, so reaching for it is a traffic win
+and not an arithmetic one.
 
 The transformer IS graded, as of 2026-09-07: `tests/zimage_parity.rs` (run with
 `--ignored`, 13-14 s) gates the step-0 velocity against diffusers' fp32 run of the same

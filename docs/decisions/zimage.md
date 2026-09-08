@@ -84,7 +84,12 @@ quantized arm here would likely be slower at the same FLOPs. Quantization is a f
 lever on this graph and nothing else. Reopen on either of two conditions: a W8A8 kernel
 that reaches the M5 neural accelerators, which raises the ceiling instead of lowering
 the byte count and is the only precision lever that could move a step, or footprint
-pressure that makes 12.3 GB the problem (2026-09-07).
+pressure that makes 12.3 GB the problem (2026-09-07). **Sized 2026-09-08**, now that a step
+is 2.15 s: an int8 gemm path through that W8A8 kernel would be worth about 4.5 s of a 22.4 s
+render, which puts it behind the VAE conv path, the SwiGLU f32 store and the tensor-op
+attention kernel on the ledger while costing weeks rather than days
+([records/zimage-perf.md](../records/zimage-perf.md) "Lever ledger"). The reopen condition is
+unchanged; what changed is that it now has a price and the price is not competitive.
 
 **Verification is a torch dump with an injected latent, gated at the step-0 velocity
 field and reported at the final image.** The pipeline's noise draw cannot be reproduced
@@ -380,3 +385,74 @@ convolution, which is a ledger item with 9.89 TFLOP and ~2.0 effective TFLOP/s b
 (TODO.md, "Image generation"). Reopen the dtype question only on a conv path that is
 bandwidth-bound, where halving the bytes would mean something; on this one it does not
 ([records/zimage-perf.md](../records/zimage-perf.md), 2026-09-07).
+
+**Bidirectional attention is a query-position trick on the causal flash kernel, not a
+kernel edit.** The ledger's plan was a bidirectional flag: drop the future test in the one
+mask block, open the two block-skip bounds, relax the two host causal guards. That would
+have put a second mode inside a kernel four other call sites depend on, and it was
+unnecessary. The causal kernel masks a key when `col_abs > row_abs` or when
+`row_abs - col_abs >= window`, and both tests are vacuous if the queries are placed at
+absolute positions K through K+T-1 with the keys at 0 through K-1 and the window
+unbounded: every key is then in the past of every query and none is expired. The block-skip
+bound `kb_lim = min(NK, (q_hi - k_off) / BK + 1)` evaluates to NK by itself under the same
+placement, so it needed no plumbing either. `run_flash_attn` dispatches on a private
+`FlashMask { Causal { pos, k_off, window }, Bidirectional }`; the bidirectional arm sets
+`q_off = K`, `k_off = 0` and `window = i32::MAX` and bypasses exactly one host guard, the
+one requiring each query's own key to be present. The causal callers are untouched and
+their tests still report bitwise identity. The evidence that the trick is sound rather than
+merely plausible is that `ops::flash_attn_bidirectional` is **bitwise identical** to
+candle's unmasked f32 sdpa at all five shapes tested, the production 30 heads at
+T = K = 4128 among them, and that a second test shows the entry differing from the causal
+one on row 0 and agreeing bitwise on the last row, so the identity is not one kernel
+compared with itself (AGENTS.md "Verification workflow"). **What the switch did NOT buy is
+arithmetic.** The vendored flash kernel is a copy of candle's MLX steel attention, the same
+simdgroup-matmul class the 2026-09-07 gemm A/B named as the wrong one for this chip, so it
+runs at candle's rate: `attn.sdpa` moved 740 to 687 ms profiled, about 11.3 to 12.5
+TFLOP/s. The gain that did arrive came from f16 k and v and from `ops::permute_01_f16`
+fusing each permute into one pass, which took `attn.transpose` 328 to 158 ms and
+`attn.untranspose` 121 to 76. Attention at the gemms' rate is a Metal-4 tensor-op attention
+kernel and a Front item, not a flag. `XWEN_ZIMAGE_ATTN` now names three arms, `flash` (the
+default), `fused` (candle's kernel, the previous default) and `basic`
+([records/zimage-perf.md](../records/zimage-perf.md), 2026-09-08).
+
+**The SwiGLU dual gemm is REFUTED: two weight planes against one activation in one kernel
+is correct and slower than the chain it replaces.** The ledger had the 10240-wide f32
+intermediate at ~300 ms a step and named a `silu_mul` gemm epilogue as the fix that costs
+no precision, so it was built: `kernel_mul_mm_bf16_f32_swiglu_t` stages the w1 and w3 bf16
+planes into two half tiles against one activation tensor, runs two `matmul2d`
+accumulations into two destination cooperative tensors, applies
+`cGate[i] = silu(cGate[i]) * cUp[i]` over `get_capacity()` under `is_valid_element(i)`, and
+stores once. It is numerically right, at relative L2 5e-8 against the two-gemm plus
+`silu_mul` chain and 7.4e-4 against CPU f32, which is the tensor path's own class. It is
+also slower at every tile shape tried. The best of three variants, 64 rows per plane over 8
+simdgroups, runs 17.3 ms against the chain's 14.9 at the model's own T 4128 by K 3840 by
+N 10240, and an alternating unprofiled A/B in the pipeline reads 3.49 and 3.58 s per step
+against the chain's 3.42 and 3.46, so 15% off isolated and 2 to 4% off in situ, in both
+orders. It was removed whole. The likely cause, given that the winning variant matched the
+single kernel's per-thread accumulator footprint and read the activation tile once, is the
+second staging pass plus an exponential per element inside a tile that is already
+compute-bound. Reopen on either of two conditions: a dual variant that hides the second
+accumulator inside the tensor-op tile, or a bf16 store for the intermediate, which was not
+tried because it is a precision change and the parity gate arbitrates those. And note what
+the profiler said while this was being decided, because it is the reason the decision needed
+an unprofiled A/B at all: the profiled table credited the fusion with 410 ms a step
+(decisions.md "A profiled row that shows a fusion win is not a result until the fusion is
+confirmed unprofiled") ([records/zimage-perf.md](../records/zimage-perf.md), 2026-09-08).
+
+**The adaLN scale folds into the norm weight, and the rounding-order cost is accepted.**
+The modulated block computed `rms_norm(x) * w` and then a full-tensor `broadcast_mul` by
+`1 + scale`, which is a second pass over 63 MB per site per block at candle's 48 GB/s
+broadcast rate. Both factors are `[dim]` vectors, so `BlockNorm::forward_scaled` multiplies
+`w` by `1 + scale` into a `[3840]` vector and runs one norm; the ledger's
+"norm-with-scale kernel" ceiling was reached with no kernel at all. The cost is that
+`rms(x) * w * s` and `rms(x) * (w * s)` round two f32 multiplies in a different order, and
+that is a real change rather than a bit-identical one: the step-0 velocity field is
+unchanged to every printed digit, and eight Euler steps compound the difference into an
+image PSNR of 46.09 dB on the merged tree against 47.03 before, with the arc measured alone
+reading 45.75. It is accepted for two reasons. The reference pipeline's own bf16 arm sits at
+32.40 dB, so 46.09 is 14 dB above the arithmetic this graph is meant to reproduce and nowhere near the 0.998 cosine gate, which the step-0 field passes
+at 0.999999. And the alternative is keeping a full-tensor pass whose only purpose is to
+preserve a rounding order that no reference specifies. What is NOT accepted is discovering
+this by accident later: the PSNR figure is reported by the gate on every run, so a future
+change that costs another decibel is visible in the same place this one was
+([records/zimage-perf.md](../records/zimage-perf.md), 2026-09-08).
