@@ -62,7 +62,7 @@ rand = "0.9"
 # streams; crossbeam carries jobs from the async handlers to the single
 # blocking inference thread (the model is strictly one-at-a-time). toml parses
 # the serve config file.
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
 tokio-stream = "0.1"
 crossbeam-channel = "0.5"
@@ -75,6 +75,8 @@ toml = "1"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "layout-cache"] }
 # `xwen image`: the PNG writer for the Z-Image pipeline (src/zimage/pipeline.rs).
 png = "0.18.1"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "api-27", "coreml"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 # `xwen serve`: the images route returns the PNG as `b64_json`.
 base64 = "0.22"
 

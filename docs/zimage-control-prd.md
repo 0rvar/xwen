@@ -16,6 +16,12 @@ what the controls below exist for.
 
 ## Where we are
 
+The list below is the starting point on 2026-09-08. Phases 1–5 now have implementations
+and reference gates: [edits](records/zimage-img2img.md), [LoRA](records/zimage-lora.md),
+[CLI and HTTP](records/zimage-control-api.md), [ControlNet](records/zimage-controlnet.md)
+and [preprocessors](records/zimage-preprocessors.md). Their records own the measured
+results and limitations. Phase 6 remains conditional; the GUI remains outside this PRD.
+
 - `xwen image` renders text-to-image on Metal: Qwen3-4B encoder, 8 flow-matching steps
   from seeded noise, VAE decode. `--latents` replaces the step-0 noise with a tensor from
   a file, `--cap-feats` replaces the encoder output. Both are parity instruments, not
@@ -68,8 +74,9 @@ threads on 2026-09-08. Sources at the end.
   for upscaling is a separate file. The `-8steps` files are the same size, re-distilled
   on top of 2.1.
 - The control image is VAE-encoded once into latent space, not run through a pixel-space
-  hint encoder. Inpaint mode takes 33 latent channels: 16 control, 1 mask, 16 masked
-  source, masked regions zeroed in latent space.
+  hint encoder. **Corrected during implementation, 2026-09-08:** inpaint mode takes
+  33 latent channels: 16 control, one keep-mask, and 16 masked source. The source is
+  grey-masked in pixel space before VAE encoding; both encodes use the posterior mode.
 - The ControlNet runs the base transformer's embedders and refiners by reference
   (`from_transformer` shares `t_embedder`, `all_x_embedder`, `cap_embedder`,
   `rope_embedder`, `noise_refiner`, `context_refiner`). A LoRA on any of those changes
@@ -83,8 +90,9 @@ threads on 2026-09-08. Sources at the end.
   is reported good on canny and artifact-prone on the other modes (HF discussion #14).
 - Synthetic pose maps (3D pose editor, hand-placed OpenPose) are reported as not
   recognized at all, while extracted ones work (HF discussion #28, open, unanswered).
-- LoRA gotcha: many Turbo LoRAs ship split `to_q`/`to_k`/`to_v` deltas while the
-  checkpoint stores fused QKV. Loaded without a remap the attention deltas silently no-op.
+- LoRA gotcha: adapter ecosystems use both split and fused QKV. The shipped xwen
+  transformer uses split `to_q`/`to_k`/`to_v` planes; fused adapter deltas need a row
+  remap. Unknown or unapplied deltas must fail instead of silently doing nothing.
 - Size rule stays: both dimensions a multiple of 16, `(w/16)*(h/16)` a multiple of 32.
 
 ## End state
@@ -119,11 +127,13 @@ allowed and documented as also changing ControlNet output.
 
 ### img2img
 
-VAE-encode the init image with the Flux `shift_factor`/`scaling_factor` on the way in,
-blend with seeded noise at `strength` using the flow-matching interpolation
-`x = (1 - s) * z_init + s * noise`, start at the schedule step nearest `s`. With 8 steps
-strength is effectively quantized to eighths; the API accepts any float and the response
-reports the step it started from. The init image is resized to the request size, or the
+VAE-encode the init image with the Flux `shift_factor`/`scaling_factor` on the way in.
+**Corrected against the executable reference, 2026-09-08:** strength selects
+`floor(N - N * strength)` as the start index. Initialize using that step's shifted
+sigma, `x = (1 - sigma) * z_init + sigma * noise`. Eight steps at strength 0.6
+starts at index 3, sigma 0.8333333, and runs five steps. The API accepts any float
+in `[0,1]` and reports the actual start index; zero is source pass-through. The init
+image is resized to the request size, or the
 request size defaults to the image's, snapped to the size rule. This retires the
 user-facing role of `--latents`, which stays as the parity instrument it is.
 
@@ -225,8 +235,11 @@ Each phase is an arc with its own record. Order is by what it unlocks per unit o
    documented, not tested, until phase 4.
 3. **Native endpoint and CLI flags for phases 1-2**, plus `edits` and `variations` on
    the OpenAI route.
-4. **ControlNet, 8-step union, canny preprocessor.** Parity against diffusers
-   `ZImageControlNetPipeline` at scale 0.75, full window, since diffusers has no window.
+4. **ControlNet, 8-step union, canny preprocessor.** **Oracle corrected during
+   implementation:** the checkpoint author's VideoX-Fun graph is authoritative.
+   Diffusers omits generator refiner injections and ComfyUI uses image-only control
+   attention; the author uses both refiner injections and joint caption/image
+   attention. Gate against the author at scale 0.75, full window.
    Then the window on top. Then inpaint mode, tier two.
 5. **Pose and depth preprocessors**, and the preprocess endpoint.
 6. **CFG and the non-distilled ControlNet.** Only if phase 4's 8-step variant falls

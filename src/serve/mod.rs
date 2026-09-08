@@ -15,6 +15,7 @@ pub mod config;
 pub mod disk_cache;
 mod disk_tier;
 pub mod engine;
+mod image_control;
 pub mod images;
 pub mod log;
 pub(crate) mod native;
@@ -605,6 +606,10 @@ fn router(state: AppState) -> Router {
             .route("/v1/chat/completions", post(openai::chat_completions))
             // One handler on three paths; see `images` for why each exists.
             .route("/v1/images/generations", post(images::generations))
+            .route("/v1/images/render", post(image_control::render))
+            .route("/v1/images/preprocess", post(image_control::preprocess))
+            .route("/v1/images/edits", post(image_control::edits))
+            .route("/v1/images/variations", post(image_control::variations))
             .route("/images/generations", post(images::generations))
             .route(
                 "/proxy/openai/images/generations",

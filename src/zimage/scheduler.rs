@@ -167,6 +167,16 @@ impl FlowMatchEulerDiscreteScheduler {
         self.step_index = 0;
     }
 
+    /// Select the img2img tail, using diffusers' truncated step count.
+    pub fn start_at_strength(&mut self, strength: f64) -> Result<usize> {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            candle_core::bail!("strength must be finite and between 0 and 1");
+        }
+        self.step_index =
+            (self.timesteps.len() as f64 - self.timesteps.len() as f64 * strength).floor() as usize;
+        Ok(self.step_index)
+    }
+
     pub fn num_inference_steps(&self) -> usize {
         self.timesteps.len()
     }
@@ -235,5 +245,23 @@ mod tests {
             ..SchedulerConfig::z_image_turbo()
         };
         assert!(FlowMatchEulerDiscreteScheduler::new(cfg).is_err());
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    #[test]
+    fn strength_selects_the_shifted_schedule_tail() -> Result<()> {
+        let mut scheduler = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo())?;
+        scheduler.set_timesteps(8)?;
+        assert_eq!(scheduler.start_at_strength(0.6)?, 3);
+        assert!((scheduler.current_sigma() - 5.0 / 6.0).abs() < 1e-12);
+        assert_eq!(scheduler.start_at_strength(1.0)?, 0);
+        assert_eq!(scheduler.start_at_strength(0.0)?, 8);
+        assert!(scheduler.is_complete());
+        assert_eq!(scheduler.current_sigma(), 0.0);
+        assert!(scheduler.start_at_strength(f64::NAN).is_err());
+        Ok(())
     }
 }

@@ -588,11 +588,11 @@ enum Cmd {
         prompt: String,
         /// Output width in pixels: a multiple of 16 whose cell count with the
         /// height is a multiple of 32 (1024x1024, 1024x768, 512x512, ...).
-        #[arg(long, default_value_t = 1024)]
-        width: usize,
+        #[arg(long)]
+        width: Option<usize>,
         /// Output height in pixels (same rule as --width).
-        #[arg(long, default_value_t = 1024)]
-        height: usize,
+        #[arg(long)]
+        height: Option<usize>,
         /// Denoising steps. 8 is what the Turbo release is fitted for.
         #[arg(long, default_value_t = xwen::zimage::pipeline::DEFAULT_STEPS)]
         steps: usize,
@@ -628,6 +628,8 @@ enum Cmd {
         /// `[1, 16, H/8, W/8]` f32, for grading against a reference dump.
         #[arg(long)]
         dump: Option<PathBuf>,
+        #[command(flatten)]
+        controls: ImageControlArgs,
     },
 }
 
@@ -2132,6 +2134,7 @@ fn main() -> Result<()> {
             latents,
             cap_feats,
             dump,
+            controls,
         }) => run_image(ImageArgs {
             prompt,
             width,
@@ -2144,6 +2147,7 @@ fn main() -> Result<()> {
             latents,
             cap_feats,
             dump,
+            controls,
         }),
     }
 }
@@ -2332,10 +2336,42 @@ fn encoder_prompt_ids(
 }
 
 /// `xwen image`'s flags, gathered so the run function has a name per field.
+#[derive(clap::Args, Debug)]
+struct ImageControlArgs {
+    /// Source image for img2img or masked editing.
+    #[arg(long)]
+    init: Option<PathBuf>,
+    /// Amount of denoising, from zero to one.
+    #[arg(long, requires = "init")]
+    strength: Option<f64>,
+    /// Repaint mask: white repaints and black preserves.
+    #[arg(long, requires = "init")]
+    mask: Option<PathBuf>,
+    /// Gaussian mask blur in output pixels.
+    #[arg(long, requires = "mask")]
+    mask_blur: Option<f32>,
+    /// Transformer adapter file or name, optionally followed by :weight.
+    #[arg(long = "lora")]
+    loras: Vec<String>,
+    /// Control map or photograph to preprocess.
+    #[arg(long)]
+    control: Option<PathBuf>,
+    /// Control-map preparation: none, canny, pose, depth.
+    #[arg(long, requires = "control")]
+    control_type: Option<String>,
+    /// Control residual scale (default 0.75).
+    #[arg(long, requires = "control")]
+    control_scale: Option<f64>,
+    /// Schedule fractions start:end (default 0:0.8).
+    #[arg(long, requires = "control")]
+    control_window: Option<String>,
+}
+
 struct ImageArgs {
     prompt: String,
-    width: usize,
-    height: usize,
+    width: Option<usize>,
+    height: Option<usize>,
+    controls: ImageControlArgs,
     steps: usize,
     seed: Option<u64>,
     out: PathBuf,
@@ -2378,10 +2414,118 @@ fn run_image(args: ImageArgs) -> Result<()> {
     xwen::zimage::AttnImpl::from_env()?;
     xwen::zimage::LinearImpl::from_env()?;
     xwen::zimage::VaeImpl::from_env()?;
-    ZImagePipeline::check_size(args.width, args.height)?;
+    ensure!(
+        args.controls.init.is_none() || args.latents.is_none(),
+        "--init conflicts with --latents; injected edit noise is a library parity instrument"
+    );
+    let requested_size = match (args.width, args.height) {
+        (Some(w), Some(h)) => Some((w, h)),
+        (None, None) => None,
+        _ => anyhow::bail!("--width and --height must be supplied together"),
+    };
+    let source = args
+        .controls
+        .init
+        .as_ref()
+        .map(|path| xwen::zimage::inputs::prepare_image(&std::fs::read(path)?, requested_size))
+        .transpose()?;
+    let (width, height) = match &source {
+        Some(image) => (image.dim(2)?, image.dim(1)?),
+        None => requested_size.unwrap_or((1024, 1024)),
+    };
+    ZImagePipeline::check_size(width, height)?;
+    let edit = source
+        .map(|source| -> Result<_> {
+            let mask = args
+                .controls
+                .mask
+                .as_ref()
+                .map(|path| {
+                    xwen::zimage::inputs::prepare_mask(
+                        &std::fs::read(path)?,
+                        width,
+                        height,
+                        args.controls.mask_blur.unwrap_or(0.),
+                    )
+                })
+                .transpose()?;
+            let edit = xwen::zimage::pipeline::ImageEdit {
+                init_image: source,
+                mask,
+                strength: args
+                    .controls
+                    .strength
+                    .unwrap_or(if args.controls.mask.is_some() {
+                        1.0
+                    } else {
+                        0.6
+                    }),
+                posterior_noise: None,
+            };
+            edit.validate(width, height)?;
+            Ok(edit)
+        })
+        .transpose()?;
+    let lora_specs = args
+        .controls
+        .loras
+        .iter()
+        .map(|text| -> Result<_> {
+            let (name, weight) = match text.rsplit_once(':') {
+                Some((name, weight)) => (
+                    name,
+                    weight
+                        .parse::<f64>()
+                        .context("LoRA weight must be a number")?,
+                ),
+                None => (text.as_str(), 1.0),
+            };
+            Ok(xwen::zimage::lora::LoraSpec {
+                name: name.to_owned(),
+                weight,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let adapters = xwen::zimage::lora::PreparedLoras::prepare(&lora_specs)?;
+    let mut control = args
+        .controls
+        .control
+        .as_ref()
+        .map(|path| -> Result<_> {
+            let image =
+                xwen::zimage::inputs::prepare_image(&std::fs::read(path)?, Some((width, height)))?;
+            let (start, end) = match &args.controls.control_window {
+                Some(window) => {
+                    let (start, end) = window
+                        .split_once(':')
+                        .context("--control-window must be start:end")?;
+                    (start.parse::<f64>()?, end.parse::<f64>()?)
+                }
+                None => (0., 0.8),
+            };
+            let control = xwen::zimage::pipeline::ImageControl {
+                image,
+                scale: args.controls.control_scale.unwrap_or(0.75),
+                start,
+                end,
+            };
+            control.validate(width, height)?;
+            Ok(control)
+        })
+        .transpose()?;
+    let control_kind = args
+        .controls
+        .control_type
+        .as_deref()
+        .unwrap_or("none")
+        .parse::<xwen::zimage::preprocess::Kind>()?;
+    let control_path = control
+        .as_ref()
+        .map(|_| xwen::zimage::controlnet::cached_default())
+        .transpose()?;
     ensure!(args.steps >= 1, "--steps must be at least 1");
     let latents = match &args.latents {
-        Some(path) => Some(ZImagePipeline::read_latents(path, args.width, args.height)?),
+        Some(path) => Some(ZImagePipeline::read_latents(path, width, height)?),
         None => None,
     };
     let injected_cap = match &args.cap_feats {
@@ -2416,6 +2560,11 @@ fn run_image(args: ImageArgs) -> Result<()> {
 
     let device = gguf::metal_device()?;
     let total_start = std::time::Instant::now();
+    adapters.validate_base(&root)?;
+    if let Some(control) = &mut control {
+        control.image =
+            xwen::zimage::preprocess::Preprocessor::new().run(&control.image, control_kind)?;
+    }
 
     // The text encoder, and the prompt as the pipeline renders it — unless
     // the caption came in as a file, in which case the encoder is not opened
@@ -2460,7 +2609,12 @@ fn run_image(args: ImageArgs) -> Result<()> {
     };
 
     let load_start = std::time::Instant::now();
-    let pipeline = ZImagePipeline::load(&root, &device)?;
+    let pipeline = ZImagePipeline::load_with_loras_and_control(
+        &root,
+        &device,
+        &adapters,
+        control_path.as_deref(),
+    )?;
     eprintln!(
         "xwen: transformer and VAE loaded in {:.1}s",
         load_start.elapsed().as_secs_f64()
@@ -2478,13 +2632,23 @@ fn run_image(args: ImageArgs) -> Result<()> {
     eprintln!("xwen: {noise_source}");
 
     let opts = ImageOptions {
-        width: args.width,
-        height: args.height,
+        width,
+        height,
         steps: args.steps,
         seed,
         latents,
     };
-    let rendered = pipeline.generate(&cap_feats, &opts)?;
+    let rendered = match (&edit, &control) {
+        (edit, Some(control)) => {
+            pipeline.generate_controlled(&cap_feats, &opts, edit.as_ref(), control)?
+        }
+        (Some(edit), None) => pipeline.generate_edited(&cap_feats, &opts, edit)?,
+        (None, None) => pipeline.generate(&cap_feats, &opts)?,
+    };
+    eprintln!(
+        "xwen: schedule starts at step {} of {}",
+        rendered.start_step, args.steps
+    );
     let timings = &rendered.timings;
     for (i, secs) in timings.steps.iter().enumerate() {
         eprintln!("xwen: step {}/{} {:.2}s", i + 1, args.steps, secs);
@@ -2494,7 +2658,13 @@ fn run_image(args: ImageArgs) -> Result<()> {
     if let Some(dir) = &args.dump {
         let cpu = |t: &candle_core::Tensor| t.to_device(&candle_core::Device::Cpu);
         candle_core::safetensors::save(
-            &std::collections::HashMap::from([("velocity".to_string(), cpu(&rendered.velocity0)?)]),
+            &std::collections::HashMap::from([(
+                "velocity".to_string(),
+                cpu(rendered
+                    .velocity0
+                    .as_ref()
+                    .context("no velocity: no denoising step ran")?)?,
+            )]),
             dir.join("velocity0.safetensors"),
         )?;
         candle_core::safetensors::save(
@@ -2511,8 +2681,8 @@ fn run_image(args: ImageArgs) -> Result<()> {
     }
     println!(
         "{}x{}, {} steps, {noise_source}, written to {} ({:.1}s total)",
-        args.width,
-        args.height,
+        width,
+        height,
         args.steps,
         args.out.display(),
         total_start.elapsed().as_secs_f64()
@@ -2525,6 +2695,40 @@ mod tests {
     use super::*;
     use xwen::batch::{BatchStats, FinishReason, ItemResponse, Usage};
     use xwen::chat::ChatDialect;
+
+    #[test]
+    fn image_control_flags_require_their_inputs() {
+        for flags in [
+            vec!["--strength", "0.5"],
+            vec!["--mask", "mask.png"],
+            vec!["--mask-blur", "2"],
+            vec!["--control-scale", "0.75"],
+            vec!["--control-window", "0:1"],
+        ] {
+            let mut args = vec!["xwen", "image", "--prompt", "x"];
+            args.extend(flags);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "xwen",
+                "image",
+                "--prompt",
+                "x",
+                "--init",
+                "source.png",
+                "--strength",
+                "0.5",
+                "--lora",
+                "identity:0.8",
+                "--control",
+                "map.png",
+                "--control-type",
+                "canny"
+            ])
+            .is_ok()
+        );
+    }
 
     /// The prefill a batch record reports is the whole prefill phase, which is
     /// the runner's own figure PLUS the shared prefix: the runner opens its

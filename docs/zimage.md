@@ -634,7 +634,42 @@ None of these fails loudly. They are ordered by how easy they are to get wrong.
   the blocks' do not.
 - **`all_patch_size` / `all_f_patch_size` are a ModuleDict with exactly one key, `"2-1"`.**
   Hardcode it. `siglip_feat_dim` is null on both public checkpoints, so there is no SigLIP
-  tower and no Omni path; `controlnet_block_samples` is an unused hook.
+  tower and no Omni path. The control hooks now carry the Fun Union residuals described
+  below.
+
+## Image edits, adapters and control
+
+Added 2026-09-08. `src/zimage/inputs.rs` owns RGB decoding, grid sizing, masks and the
+final source-pixel composite. `ImageEdit` selects a tail of the existing schedule with
+`floor(N - N * strength)`. Source VAE sampling uses a separate reproducible noise draw,
+clamped log variance `[-30,20]`, and `(z - 0.1159) * 0.3611` once. Tier-one inpainting
+restores the source latent at the next sigma after each step. White means repaint;
+black-mask output pixels are copied exactly from the source. Strength zero returns
+the prepared source without denoising.
+
+`src/zimage/lora.rs` overlays the transformer VarBuilder at load. It merges deltas in
+f32 before the weight cast, supports split and fused QKV exports, and rejects unknown
+or unused targets. A changed adapter set reloads a fresh base. No per-step adapter
+operations are added.
+
+`src/zimage/controlnet.rs` implements the author's full and lite Fun Union 8-step
+graphs. Both reuse the generator's embedders and refiners, including merged adapters.
+Two control-refiner outputs reach the generator; main residuals follow layers
+0,2,...,28 for full and 0,10,20 for lite. Main control attention is joint image/caption.
+The input is `[control mode:16, keep-mask:1, masked-source mode:16]`; mask the normalized
+source pixels to grey before VAE mode encoding. Missing source conditioning is zero
+latent. This trained inpaint path omits tier-one latent restoration but retains the
+final pixel composite. Control is active in a half-open fraction of the full schedule,
+default `[0,0.8)` at scale 0.75. Zero scale skips its forward.
+
+`src/zimage/preprocess.rs` owns native Canny and lazy CPU depth/pose models. Depth uses
+the trained 518-square grid; DWPose uses the author's detector and whole-body ONNX
+weights. Models are cache-only and unload with the image engine. Native render and
+preprocess routes share that engine with OpenAI generation, edits and variations.
+
+Reference results and remaining limits: [edits](records/zimage-img2img.md),
+[adapters](records/zimage-lora.md), [control](records/zimage-controlnet.md),
+[preprocessors](records/zimage-preprocessors.md), [HTTP and CLI](records/zimage-control-api.md).
 
 ## What the vendored candle module got wrong
 

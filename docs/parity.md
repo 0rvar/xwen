@@ -955,6 +955,49 @@ date) and `basic` (an explicit matmul chain). And `XWEN_ZIMAGE_LINEAR=candle` sw
 xwen's tensor gemm and its f32 activation stream for candle's gemm over bf16 activations,
 which is where the pre-2026-09-07 velocity figures came from.
 
+### Image-edit reference
+
+Generate the img2img and inpaint reference with the existing manual venv, then
+run the Rust gate. Both pipelines read saved posterior and diffusion noise, so
+the comparison does not assume torch and Rust share an RNG.
+
+```bash
+/tmp/zimage-venv/bin/python scripts/zimage-ref-dump.py --stage edits --out-dir /tmp/xwen-image-control-ref
+XWEN_IMAGE_EDIT_REF=/tmp/xwen-image-control-ref/edits cargo test --release --test zimage_edits -- --ignored --nocapture
+```
+
+The VAE encoding gate requires cosine >= 0.99999 and mean relative error < 0.001.
+The first velocity uses the existing transformer bars, cosine >= 0.998 and mean
+relative error <= 0.04. Final latent differences are reported; preserved image
+pixels must match the source exactly. Strength 0.6 at eight steps must start at
+index 3 and run five steps. [The record](records/zimage-img2img.md) holds results
+and the boundary between reference behavior and pixel compositing.
+
+### Adapter and ControlNet references
+
+The adapter fixture uses diffusers' actual load/set/fuse APIs. The control fixture
+imports the checkpoint author's SHA-pinned VideoX-Fun modules; a diffusers control
+dump is not interchangeable because it omits the generator's refiner injections.
+The manual reference environment and checkpoint revisions are recorded in the
+[adapter](records/zimage-lora.md) and [control](records/zimage-controlnet.md) records.
+
+```bash
+/tmp/zimage-venv/bin/python scripts/zimage-ref-dump.py --stage lora --lora-file "$adapter_file" --lora-weight 0.8 --out-dir /tmp/xwen-image-control-ref
+XWEN_LORA_REF=/tmp/xwen-image-control-ref/lora cargo test --release --test zimage_lora -- --ignored --nocapture
+/tmp/zimage-venv/bin/python scripts/zimage-ref-dump.py --stage control --author-source /tmp/xwen-videox-author --control-file "$control_file" --control-image "$control_image" --out-dir /tmp/xwen-image-control-ref
+XWEN_CONTROLNET_FILE="$control_file" XWEN_CONTROL_REF=/tmp/xwen-image-control-ref/control cargo test --release --test zimage_control -- --ignored --nocapture
+```
+
+Set `adapter_file`, `control_file` and `control_image` to existing files. Run full
+and lite in separate output directories. Both tests apply the existing first-velocity
+bar (cosine >= 0.998, mean relative error <= 0.04) and VAE decode bar (PSNR >= 60 dB).
+The adapter test also compares a merged plane and its delta. Control compares the
+33-channel context, covers plain and trained inpaint, and requires zero-scale velocity
+to match base exactly. Final latent and generated-image differences are reported under
+the same policy as the original image gate; they are not substituted for local graph
+checks. CPU tests pin the schedule, mask restoration, control window and residual
+recurrence separately.
+
 Decode consistency, which needs no oracle at all:
 
 ```
@@ -1109,3 +1152,42 @@ argument in [records/qwen3-dense.md](records/qwen3-dense.md).
   assumed and not verified, and it is one of the things a Stage 1 failure could be. The
   encoder's Stage 2 reference has no such gap, being dumped from the safetensors
   themselves.
+
+### Image-preprocessor reference
+
+Populate the cache, then run all preprocessor tests, including the real-model
+checks. These run on CPU and use the committed fixture at
+`tests/fixtures/zimage-preprocess`; missing weights fail with a fetch command.
+
+```bash
+bun scripts/hf-fetch.ts jeroenvlek/depth-anything-v2-safetensors depth_anything_v2_vits.safetensors
+bun scripts/hf-fetch.ts yzd-v/DWPose yolox_l.onnx dw-ll_ucoco_384.onnx --jobs 2
+cargo test --release --lib zimage::preprocess -- --include-ignored --nocapture --test-threads=1
+```
+
+The depth gate compares the raw output on a shared normalized 518x518 input and
+requires relative L2 < 0.001. The pose gate requires the same person count,
+maximum visible-point distance < 3 pixels, maximum confidence difference < 0.1
+and rendered foreground intersection over union > 0.7. `XWEN_PREPROCESS_REF_DIR`
+overrides the fixture directory; `XWEN_PREPROCESS_TEST_IMAGE` overrides the source
+photograph. The overrides must refer to a matching image/reference pair.
+[The preprocessor record](records/zimage-preprocessors.md) holds the results,
+model revisions and the square-depth and approximate-rasterization limits.
+
+To regenerate the reference, use the existing manual venv with
+`opencv-python-headless`, `onnxruntime`, `matplotlib` and a torchvision version
+matching its torch. Put the pinned Depth Anything V2 repository at
+`/tmp/xwen-depth-source`, and the pinned DWPose ONNX branch's
+`ControlNet-v1-1-nightly/annotator/dwpose` directory at
+`/tmp/xwen-dwpose-author/dwpose`. Each root's optional `revision` text file is
+copied into provenance; source files are hashed regardless.
+
+```bash
+/tmp/zimage-venv/bin/python scripts/zimage-ref-dump.py --stage preprocess --depth-author-source /tmp/xwen-depth-source --dwpose-author-source /tmp/xwen-dwpose-author --control-image tests/fixtures/zimage-transformer/512x512-p1-s0/image-fp32.png --out-dir /tmp/xwen-preprocess-author --threads 8
+XWEN_PREPROCESS_REF_DIR=/tmp/xwen-preprocess-author/preprocess cargo test --release --lib zimage::preprocess -- --include-ignored --nocapture --test-threads=1
+```
+
+`--preprocess-input <safetensors>` reuses a saved normalized tensor named `input`
+instead of OpenCV's square resize. The script writes depth tensors, pose points,
+a rendered pose PNG and version/source/model/output hashes. It does not copy the
+new files into the committed fixture automatically.

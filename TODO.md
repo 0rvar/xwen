@@ -693,6 +693,9 @@ priced, not their rank ([the record](docs/records/zimage-perf.md), "The power en
   class needs); it wants a fixture batch with a long shared prefix and enough items to
   make one near-tie likely. Until then a regression in the restore path would be caught
   only by someone running the demo.
+  TRIAGED 2026-09-08: kept; image controls do not exercise batch restore. Next step is
+  a shared-prefix fixture in the decode tier of `scripts/parity-gate.ts`, retaining
+  the existing near-tie rule and comparing the cached and scratch arms.
   From: Deferred from the batch + scored-classification arc (2026-08-09).
 
 - [ ] [small] **No parity-gate or retune arm for Qwen3.8-27B.** `scripts/parity-gate.ts` accepts

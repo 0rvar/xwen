@@ -47,6 +47,82 @@ pub struct ImageOptions {
     pub latents: Option<Tensor>,
 }
 
+/// Source pixels and optional repaint mask, already resized to the render size.
+#[derive(Debug, Clone)]
+pub struct ImageEdit {
+    pub init_image: Tensor,
+    pub mask: Option<Tensor>,
+    pub strength: f64,
+    pub posterior_noise: Option<Tensor>,
+}
+
+/// A prepared RGB control map and the part of the full schedule it conditions.
+#[derive(Debug, Clone)]
+pub struct ImageControl {
+    pub image: Tensor,
+    pub scale: f64,
+    pub start: f64,
+    pub end: f64,
+}
+
+impl ImageControl {
+    pub fn validate(&self, width: usize, height: usize) -> Result<()> {
+        ZImagePipeline::check_size(width, height)?;
+        ensure!(
+            self.image.dims() == [3, height, width] && self.image.dtype() == DType::U8,
+            "control image must be RGB8 [3,{height},{width}]"
+        );
+        ensure!(
+            self.scale.is_finite() && (0.0..=1.0).contains(&self.scale),
+            "control scale must be finite and between 0 and 1"
+        );
+        ensure!(
+            self.start.is_finite()
+                && self.end.is_finite()
+                && 0.0 <= self.start
+                && self.start <= self.end
+                && self.end <= 1.0,
+            "control window must satisfy 0 <= start <= end <= 1"
+        );
+        Ok(())
+    }
+
+    pub fn active(&self, step: usize, steps: usize) -> bool {
+        let fraction = step as f64 / steps as f64;
+        self.scale != 0.0 && fraction >= self.start && fraction < self.end
+    }
+}
+
+impl ImageEdit {
+    pub fn validate(&self, width: usize, height: usize) -> Result<()> {
+        ensure!(
+            self.strength.is_finite() && (0.0..=1.0).contains(&self.strength),
+            "strength must be finite and between 0 and 1"
+        );
+        ensure!(
+            self.init_image.dtype() == DType::U8 && self.init_image.dims() == [3, height, width],
+            "init image must be RGB u8 [3, height, width]"
+        );
+        if let Some(mask) = &self.mask {
+            ensure!(
+                mask.dtype() == DType::F32 && mask.dims() == [1, height, width],
+                "mask must be f32 [1, height, width]"
+            );
+            let pixels = mask
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            ensure!(
+                pixels
+                    .iter()
+                    .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+                "mask values must be finite and between 0 and 1"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Wall time of each phase of one run, for the caller to print.
 #[derive(Debug, Clone, Default)]
 pub struct Timings {
@@ -65,8 +141,10 @@ pub struct Rendered {
     pub timings: Timings,
     /// The velocity fed to the first Euler step, `(1, 16, H/8, W/8)` f32:
     /// the negated transformer output at sigma 1, which is the one forward
-    /// whose inputs are known exactly on both sides of a comparison.
-    pub velocity0: Tensor,
+    /// whose inputs are known exactly on both sides of a comparison. None when no denoising step runs.
+    pub velocity0: Option<Tensor>,
+    /// Index into the full requested schedule.
+    pub start_step: usize,
     /// The latent after the last step and before the VAE, same shape, f32.
     pub final_latents: Tensor,
 }
@@ -74,6 +152,7 @@ pub struct Rendered {
 /// The transformer, the VAE and the scheduler config, resident on one device.
 pub struct ZImagePipeline {
     transformer: ZImageTransformer2DModel,
+    controlnet: Option<super::controlnet::ControlNet>,
     transformer_cfg: Config,
     vae: AutoEncoderKL,
     scheduler_cfg: SchedulerConfig,
@@ -94,6 +173,24 @@ impl ZImagePipeline {
     /// load and everything else (norms, pad tokens, biases) stays f32; the
     /// VAE's bf16 weights are widened to f32, which is the dtype it decodes in.
     pub fn load(root: &Path, device: &Device) -> Result<Self> {
+        Self::load_with_loras(root, device, &super::lora::PreparedLoras::load(&[])?)
+    }
+
+    /// Load a fresh base transformer and merge this adapter set before weight conversion.
+    pub fn load_with_loras(
+        root: &Path,
+        device: &Device,
+        loras: &super::lora::PreparedLoras,
+    ) -> Result<Self> {
+        Self::load_with_loras_and_control(root, device, loras, None)
+    }
+
+    pub fn load_with_loras_and_control(
+        root: &Path,
+        device: &Device,
+        loras: &super::lora::PreparedLoras,
+        control_path: Option<&Path>,
+    ) -> Result<Self> {
         // Before anything opens: a typo in a bisect switch is a load error,
         // not a run that quietly measures the shipped arm twice.
         let attn = AttnImpl::from_env()?;
@@ -116,9 +213,27 @@ impl ZImagePipeline {
         let shards = shard_paths(&transformer_dir)?;
         let dtype = DType::F32;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, device)? };
+        let (vb, merge_check) = if loras.is_empty() {
+            (vb, None)
+        } else {
+            let (vb, check) = loras.wrap(vb);
+            (vb, Some(check))
+        };
         let mut transformer = ZImageTransformer2DModel::new(&transformer_cfg, vb)
+            .map_err(
+                |error| match merge_check.as_ref().and_then(|check| check.request_error()) {
+                    Some(error) => anyhow::Error::new(error),
+                    None => anyhow::Error::new(error),
+                },
+            )
             .context("building the Z-Image transformer")?;
+        if let Some(check) = merge_check {
+            check.finish()?;
+        }
         eprintln!("xwen: {}", transformer.weight_range().summary());
+        let controlnet = control_path
+            .map(|path| super::controlnet::ControlNet::load(path, &transformer_cfg, device))
+            .transpose()?;
         let profiler = if profiling {
             let profiler = Arc::new(Profiler::new(device));
             transformer.set_profiler(profiler.clone());
@@ -144,6 +259,7 @@ impl ZImagePipeline {
 
         Ok(Self {
             transformer,
+            controlnet,
             transformer_cfg,
             vae,
             scheduler_cfg,
@@ -287,6 +403,44 @@ impl ZImagePipeline {
     /// Generate one image from `cap_feats`, the text encoder's `[T, 2560]`
     /// hidden state (any float dtype, any device).
     pub fn generate(&self, cap_feats: &Tensor, opts: &ImageOptions) -> Result<Rendered> {
+        self.generate_inner(cap_feats, opts, None, None)
+    }
+
+    pub fn generate_edited(
+        &self,
+        cap_feats: &Tensor,
+        opts: &ImageOptions,
+        edit: &ImageEdit,
+    ) -> Result<Rendered> {
+        edit.validate(opts.width, opts.height)?;
+        self.generate_inner(cap_feats, opts, Some(edit), None)
+    }
+
+    pub fn generate_controlled(
+        &self,
+        cap_feats: &Tensor,
+        opts: &ImageOptions,
+        edit: Option<&ImageEdit>,
+        control: &ImageControl,
+    ) -> Result<Rendered> {
+        control.validate(opts.width, opts.height)?;
+        if let Some(edit) = edit {
+            edit.validate(opts.width, opts.height)?;
+        }
+        ensure!(
+            self.controlnet.is_some(),
+            "load a ControlNet before requesting control"
+        );
+        self.generate_inner(cap_feats, opts, edit, Some(control))
+    }
+
+    fn generate_inner(
+        &self,
+        cap_feats: &Tensor,
+        opts: &ImageOptions,
+        edit: Option<&ImageEdit>,
+        control: Option<&ImageControl>,
+    ) -> Result<Rendered> {
         Self::check_size(opts.width, opts.height)?;
         ensure!(opts.steps >= 1, "steps must be at least 1");
         let (t, cap_dim) = cap_feats
@@ -325,20 +479,98 @@ impl ZImagePipeline {
 
         let mut scheduler = FlowMatchEulerDiscreteScheduler::new(self.scheduler_cfg.clone())?;
         scheduler.set_timesteps(opts.steps)?;
+        let start_step = match edit {
+            Some(edit) => scheduler.start_at_strength(edit.strength)?,
+            None => 0,
+        };
+        let noise = latents.clone();
+        let mut source = None;
+        let mut latent_mask = None;
+        if let Some(edit) = edit {
+            if edit.strength == 0.0 {
+                return Ok(Rendered {
+                    image: edit.init_image.to_device(&Device::Cpu)?,
+                    timings: Timings::default(),
+                    velocity0: None,
+                    start_step,
+                    final_latents: self.vae.encode_mode(
+                        &((edit
+                            .init_image
+                            .to_device(&self.device)?
+                            .to_dtype(DType::F32)?
+                            / 127.5)?
+                            - 1.0)?
+                            .unsqueeze(0)?,
+                    )?,
+                });
+            }
+            if edit.strength < 1.0 || (edit.mask.is_some() && control.is_none()) {
+                let pixels = ((edit
+                    .init_image
+                    .to_device(&self.device)?
+                    .to_dtype(DType::F32)?
+                    / 127.5)?
+                    - 1.0)?
+                    .unsqueeze(0)?;
+                // Separate the VAE posterior draw from the diffusion draw with an ASCII domain tag.
+                let posterior = match &edit.posterior_noise {
+                    Some(noise) => noise.clone(),
+                    None => {
+                        seeded_noise(opts.seed ^ 0x5641455f504f5354, latent_shape, &self.device)?
+                    }
+                };
+                let encoded = self.vae.encode_with_noise(&pixels, &posterior)?;
+                latents = blend_noise(&encoded, &noise, scheduler.current_sigma())?;
+                source = Some(encoded);
+            }
+            if let Some(mask) = &edit.mask
+                && control.is_none()
+            {
+                latent_mask = Some(
+                    super::inputs::resize_mask(mask, lat_w, lat_h)?
+                        .to_device(&self.device)?
+                        .unsqueeze(0)?,
+                );
+            }
+        }
+        let run_steps = opts.steps - start_step;
+        let context = control.map(|c| self.control_context(c, edit)).transpose()?;
         let mut timings = Timings::default();
         let mut velocity0 = None;
 
         if let Some(prof) = &self.profiler {
             prof.reset();
         }
-        for step in 0..opts.steps {
+        for step in start_step..opts.steps {
             let started = Instant::now();
             let t = scheduler.current_timestep_normalized();
-            let velocity = self.velocity_batched(&latents, &cap_feats, t as f32)?;
+            let velocity = match (control, context.as_ref()) {
+                (Some(control), Some(context)) if control.active(step, opts.steps) => {
+                    let t = Tensor::new(&[t as f32], &self.device)?;
+                    self.transformer
+                        .forward_controlled(
+                            &latents.unsqueeze(2)?,
+                            &t,
+                            &cap_feats,
+                            self.controlnet.as_ref().expect("validated control model"),
+                            context,
+                            control.scale,
+                        )?
+                        .squeeze(2)?
+                        .to_dtype(DType::F32)?
+                        .neg()?
+                }
+                _ => self.velocity_batched(&latents, &cap_feats, t as f32)?,
+            };
             if velocity0.is_none() {
                 velocity0 = Some(velocity.clone());
             }
             latents = scheduler.step(&velocity, &latents)?;
+            if let (Some(source), Some(mask)) = (&source, &latent_mask) {
+                let preserved = blend_noise(source, &noise, scheduler.current_sigma())?;
+                latents =
+                    (latents.broadcast_mul(mask)? + preserved.broadcast_mul(&(1.0 - mask)?)?)?;
+            }
             // The step's arithmetic is asynchronous on Metal; reading one
             // element back is what makes the timing mean anything.
             let _ = latents.flatten_all()?.get(0)?.to_scalar::<f32>()?;
@@ -347,23 +579,26 @@ impl ZImagePipeline {
             // The first step pays for the lazily created buffers and the
             // kernel compiles of the whole graph, so the profile covers the
             // steps after it whenever there is more than one.
-            if step == 0
-                && opts.steps > 1
+            if step == start_step
+                && run_steps > 1
                 && let Some(prof) = &self.profiler
             {
                 prof.reset();
             }
         }
-        let velocity0 = velocity0.expect("at least one step ran");
         if let Some(prof) = &self.profiler {
             eprintln!(
                 "xwen: profiled run: every mark synchronizes the device, so the \
                  stages below sum to more than an unprofiled step takes"
             );
-            let (title, counted) = if opts.steps > 1 {
+            let (title, counted) = if run_steps > 1 {
                 (
-                    format!("transformer, mean per step over steps 2..{}", opts.steps),
-                    opts.steps - 1,
+                    format!(
+                        "transformer, mean per step over steps {}..{}",
+                        start_step + 2,
+                        opts.steps
+                    ),
+                    run_steps - 1,
                 )
             } else {
                 ("transformer, the one step, warm-up included".to_string(), 1)
@@ -373,7 +608,12 @@ impl ZImagePipeline {
         }
 
         let started = Instant::now();
-        let image = self.decode(&latents)?;
+        let mut image = self.decode(&latents)?;
+        if let Some(edit) = edit
+            && let Some(mask) = &edit.mask
+        {
+            image = super::inputs::composite(&image, &edit.init_image, mask)?;
+        }
         timings.vae_decode = started.elapsed().as_secs_f64();
         if let Some(prof) = &self.profiler {
             profile::print_table("VAE, one decode", &prof.report(), 1);
@@ -382,6 +622,7 @@ impl ZImagePipeline {
             image,
             timings,
             velocity0,
+            start_step,
             final_latents: latents,
         })
     }
@@ -398,6 +639,41 @@ impl ZImagePipeline {
             .unsqueeze(0)?;
         let latents = latents.to_device(&self.device)?.to_dtype(DType::F32)?;
         self.velocity_batched(&latents, &cap_feats, t)
+    }
+
+    /// One author-graph control step over already prepared latent conditioning.
+    pub fn velocity_controlled(
+        &self,
+        latents: &Tensor,
+        cap_feats: &Tensor,
+        t: f32,
+        context: &Tensor,
+        scale: f64,
+    ) -> Result<Tensor> {
+        ensure!(
+            scale.is_finite() && (0.0..=1.0).contains(&scale),
+            "invalid control scale"
+        );
+        let cap = cap_feats
+            .to_device(&self.device)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(0)?;
+        let x = latents
+            .to_device(&self.device)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(2)?;
+        let t = Tensor::new(&[t], &self.device)?;
+        let context = context.to_device(&self.device)?.to_dtype(self.dtype)?;
+        let controlnet = self
+            .controlnet
+            .as_ref()
+            .context("load a ControlNet before requesting control")?;
+        Ok(self
+            .transformer
+            .forward_controlled(&x, &t, &cap, controlnet, &context, scale)?
+            .squeeze(2)?
+            .to_dtype(DType::F32)?
+            .neg()?)
     }
 
     /// [`Self::velocity`] with the caption already batched and in the model
@@ -434,6 +710,66 @@ impl ZImagePipeline {
 
     pub fn transformer_config(&self) -> &Config {
         &self.transformer_cfg
+    }
+
+    /// Encode RGB8 source pixels with an explicit posterior draw for reference replay.
+    pub fn encode_image(&self, image: &Tensor, posterior_noise: &Tensor) -> Result<Tensor> {
+        let (c, h, w) = image.dims3()?;
+        ensure!(
+            c == 3 && image.dtype() == DType::U8,
+            "image must be RGB8 [3,H,W]"
+        );
+        Self::check_size(w, h)?;
+        let pixels = ((image.to_device(&self.device)?.to_dtype(DType::F32)? / 127.5)? - 1.0)?
+            .unsqueeze(0)?;
+        Ok(self.vae.encode_with_noise(&pixels, posterior_noise)?)
+    }
+
+    /// The author's ControlNet conditions on VAE posterior modes, with no random draw.
+    pub fn control_context(
+        &self,
+        control: &ImageControl,
+        edit: Option<&ImageEdit>,
+    ) -> Result<Tensor> {
+        let (_, h, w) = control.image.dims3()?;
+        control.validate(w, h)?;
+        if let Some(edit) = edit {
+            edit.validate(w, h)?;
+        }
+        let pixels = ((control
+            .image
+            .to_device(&self.device)?
+            .to_dtype(DType::F32)?
+            / 127.5)?
+            - 1.0)?
+            .unsqueeze(0)?;
+        let map = self.vae.encode_mode(&pixels)?;
+        let (lat_h, lat_w) = Self::latent_size(w, h);
+        let (keep, source) = match edit.filter(|edit| edit.mask.is_some()) {
+            Some(edit) => {
+                let mask = edit.mask.as_ref().expect("filtered mask");
+                let keep = (1.0 - super::inputs::resize_mask(mask, lat_w, lat_h)?)?
+                    .to_device(&self.device)?
+                    .unsqueeze(0)?;
+                let source = ((edit
+                    .init_image
+                    .to_device(&self.device)?
+                    .to_dtype(DType::F32)?
+                    / 127.5)?
+                    - 1.0)?;
+                let preserve = mask
+                    .to_device(&self.device)?
+                    .lt(0.5)?
+                    .to_dtype(DType::F32)?;
+                let masked = source.broadcast_mul(&preserve)?.unsqueeze(0)?;
+                (keep, self.vae.encode_mode(&masked)?)
+            }
+            None => (
+                Tensor::zeros((1, 1, lat_h, lat_w), DType::F32, &self.device)?,
+                Tensor::zeros((1, LATENT_CHANNELS, lat_h, lat_w), DType::F32, &self.device)?,
+            ),
+        };
+        Ok(Tensor::cat(&[map, keep, source], 1)?.unsqueeze(2)?)
     }
 
     pub fn scheduler_config(&self) -> &SchedulerConfig {
@@ -774,5 +1110,72 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// Flow interpolation at the scheduler's actual sigma.
+pub fn blend_noise(source: &Tensor, noise: &Tensor, sigma: f64) -> Result<Tensor> {
+    Ok(((source * (1.0 - sigma))? + (noise * sigma)?)?)
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    #[test]
+    fn control_window_uses_the_full_schedule_and_excludes_its_end() -> Result<()> {
+        let mut control = ImageControl {
+            image: Tensor::zeros((3, 128, 128), DType::U8, &Device::Cpu)?,
+            scale: 0.75,
+            start: 0.0,
+            end: 0.8,
+        };
+        control.validate(128, 128)?;
+        let active: Vec<_> = (0..8).filter(|&i| control.active(i, 8)).collect();
+        assert_eq!(active, [0, 1, 2, 3, 4, 5, 6]);
+        control.start = 0.5;
+        control.end = 0.75;
+        assert_eq!(
+            (0..8).filter(|&i| control.active(i, 8)).collect::<Vec<_>>(),
+            [4, 5]
+        );
+        control.scale = 0.0;
+        assert!((0..8).all(|i| !control.active(i, 8)));
+        control.start = 0.9;
+        assert!(control.validate(128, 128).is_err());
+        Ok(())
+    }
+    #[test]
+    fn flow_interpolation_uses_the_same_noise_at_each_level() -> Result<()> {
+        let source = Tensor::new(&[2f32, 4.], &Device::Cpu)?;
+        let noise = Tensor::new(&[-2f32, 8.], &Device::Cpu)?;
+        assert_eq!(
+            blend_noise(&source, &noise, 0.25)?.to_vec1::<f32>()?,
+            [1., 5.]
+        );
+        assert_eq!(
+            blend_noise(&source, &noise, 0.)?.to_vec1::<f32>()?,
+            [2., 4.]
+        );
+        assert_eq!(
+            blend_noise(&source, &noise, 1.)?.to_vec1::<f32>()?,
+            [-2., 8.]
+        );
+        Ok(())
+    }
+    #[test]
+    fn edit_rejects_invalid_masks_and_strength() -> Result<()> {
+        let mut edit = ImageEdit {
+            init_image: Tensor::zeros((3, 16, 16), DType::U8, &Device::Cpu)?,
+            mask: None,
+            strength: 0.5,
+            posterior_noise: None,
+        };
+        edit.validate(16, 16)?;
+        edit.strength = f64::INFINITY;
+        assert!(edit.validate(16, 16).is_err());
+        edit.strength = 0.5;
+        edit.mask = Some(Tensor::full(2f32, (1, 16, 16), &Device::Cpu)?);
+        assert!(edit.validate(16, 16).is_err());
+        Ok(())
     }
 }

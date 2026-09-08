@@ -40,8 +40,12 @@
 //! the transformer and the VAE.
 
 pub mod conditioning;
+pub mod controlnet;
+pub mod inputs;
 pub mod linear;
+pub mod lora;
 pub mod pipeline;
+pub mod preprocess;
 pub mod profile;
 pub mod sampling;
 pub mod scheduler;

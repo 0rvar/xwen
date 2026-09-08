@@ -10,6 +10,13 @@
 #     && /tmp/zimage-venv/bin/python scripts/zimage-ref-dump.py --stage finalize
 #   /tmp/zimage-venv/bin/python scripts/zimage-ref-dump.py --stage transformer --dtype fp32 \
 #     && /tmp/zimage-venv/bin/python scripts/zimage-ref-dump.py --stage transformer --dtype bf16
+# Control and LoRA reuse the checked-in 512x512 caption/noise fixture:
+#   --stage control --author-source /tmp/xwen-videox-author --control-file <8steps.safetensors>
+#     --control-image <map.png> --out-dir /tmp/xwen-image-control-ref
+#   --stage lora --lora-file <adapter.safetensors> --lora-weight 0.8
+#     --out-dir /tmp/xwen-image-control-ref
+# Author sources are the three AUTHOR_FILES below from VideoX-Fun at AUTHOR_REVISION,
+# under videox_fun/models/. They live outside the repo and their hashes are checked.
 #
 # This is the only Python in the repo. It exists because the Z-Image text encoder has no
 # ONNX export and there is no bun path to torch; it runs once, by hand, to produce the
@@ -737,10 +744,356 @@ def run_transformer(
         print(f"[bf16] wrote {fixture}", flush=True)
 
 
+def run_image_edits(snapshot: Path, out_root: Path, seed: int, strength: float) -> None:
+    """Run the actual diffusers edit pipelines with explicit posterior and diffusion noise."""
+    import PIL.Image
+    import diffusers
+    from unittest.mock import patch
+    from diffusers import (
+        AutoencoderKL, FlowMatchEulerDiscreteScheduler, ZImageTransformer2DModel,
+        ZImageImg2ImgPipeline, ZImageInpaintPipeline,
+    )
+    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+    from diffusers.pipelines.z_image.pipeline_z_image import get_default_z_image_sigmas
+
+    assert 0 < strength <= 1
+    source_dir = TRANSFORMER_FIXTURE_DIR / "512x512-p1-s0"
+    source = PIL.Image.open(source_dir / "image-fp32.png").convert("RGB")
+    width, height = source.size
+    cap = load_st(source_dir / "cap_feats.safetensors", "cap_feats")
+    generator = torch.Generator("cpu").manual_seed(seed)
+    shape = (1, 16, height // 8, width // 8)
+    posterior_noise = torch.randn(shape, generator=generator)
+    diffusion_noise = torch.randn(shape, generator=generator)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    mask[height // 4:3 * height // 4, width // 4:3 * width // 4] = 255
+    mask_image = PIL.Image.fromarray(mask)
+    device = torch.device("mps")
+    vae = AutoencoderKL.from_pretrained(
+        snapshot / "vae", torch_dtype=torch.float32, local_files_only=True
+    ).eval().to(device)
+    transformer = ZImageTransformer2DModel.from_pretrained(
+        snapshot / "transformer", torch_dtype=torch.float32, local_files_only=True
+    ).eval().to(device)
+
+    for mode, pipeline_cls in [("img2img", ZImageImg2ImgPipeline), ("inpaint", ZImageInpaintPipeline)]:
+        out = out_root / "edits" / mode
+        out.mkdir(parents=True, exist_ok=True)
+        source.save(out / "source.png")
+        mask_image.save(out / "mask.png")
+        save_st(out / "cap_feats.safetensors", "cap_feats", cap)
+        save_st(out / "posterior-noise.safetensors", "noise", posterior_noise)
+        save_st(out / "noise.safetensors", "latents", diffusion_noise)
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            snapshot / "scheduler", local_files_only=True
+        )
+        pipe = pipeline_cls(
+            scheduler=scheduler, vae=vae, transformer=transformer,
+            text_encoder=None, tokenizer=None,
+        )
+        samples = []
+        velocities = []
+        noise_draws = []
+
+        def posterior_sample(distribution, generator=None):
+            assert tuple(distribution.mean.shape) == shape
+            value = distribution.mean + distribution.std * posterior_noise.to(device)
+            if not samples:
+                save_st(out / "mean.safetensors", "mean", distribution.mean)
+                save_st(out / "logvar.safetensors", "logvar", distribution.logvar)
+                save_st(out / "source-latents.safetensors", "latents",
+                        (value - vae.config.shift_factor) * vae.config.scaling_factor)
+            samples.append(True)
+            return value
+
+        def draw_noise(requested_shape, generator=None, device=None, dtype=None, **kwargs):
+            assert tuple(requested_shape) == shape
+            noise_draws.append(True)
+            return diffusion_noise.to(device=device, dtype=dtype)
+
+        def capture_velocity(_module, _args, output):
+            if not velocities:
+                predictions = output[0]
+                velocities.append(-torch.stack([o.float() for o in predictions]).squeeze(2).cpu())
+
+        hook = transformer.register_forward_hook(capture_velocity)
+        module = pipeline_cls.__module__
+        kwargs = dict(
+            prompt=None, image=source, strength=strength, num_inference_steps=NUM_STEPS,
+            sigmas=get_default_z_image_sigmas(NUM_STEPS), guidance_scale=0,
+            prompt_embeds=[cap.to(device).float()], output_type="latent",
+        )
+        if mode == "inpaint":
+            kwargs["mask_image"] = mask_image
+        started = time.time()
+        try:
+            with torch.inference_mode(), patch.object(DiagonalGaussianDistribution, "sample", posterior_sample), \
+                    patch(f"{module}.randn_tensor", draw_noise):
+                final = pipe(**kwargs).images
+                if isinstance(final, list):
+                    final = torch.stack(final)
+                decoded = vae.decode(
+                    final / vae.config.scaling_factor + vae.config.shift_factor, return_dict=False
+                )[0]
+        finally:
+            hook.remove()
+        assert samples and len(noise_draws) == 1 and velocities
+        image = ((decoded / 2 + .5).clamp(0, 1))[0].permute(1, 2, 0).cpu().numpy()
+        image = (image * 255).round().astype(np.uint8)
+        PIL.Image.fromarray(image).save(out / "raw.png")
+        composited = np.where(mask[:, :, None] != 0, image, np.asarray(source)) if mode == "inpaint" else image
+        PIL.Image.fromarray(composited).save(out / "image.png")
+        save_st(out / "velocity.safetensors", "velocity", velocities[0])
+        save_st(out / "final.safetensors", "latents", final)
+        meta = dict(
+            mode=mode, width=width, height=height, strength=strength, steps=NUM_STEPS,
+            start_step=int(max(NUM_STEPS - NUM_STEPS * strength, 0)), seed=seed,
+            sigmas=scheduler.sigmas.tolist(), torch=torch.__version__, diffusers=diffusers.__version__,
+            pipeline=f"{module}.{pipeline_cls.__name__}", revision=REVISION,
+            seconds=time.time() - started,
+            note="Actual reference pipeline; only its random draws are replaced by saved tensors. Pixel composite is xwen's extension.",
+        )
+        meta["sha256"] = {p.name: sha256_file(p) for p in sorted(out.iterdir()) if p.name != "meta.json"}
+        (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+        print(f"[{mode}] start {meta['start_step']}, {meta['seconds']:.1f}s -> {out}", flush=True)
+
+
+AUTHOR_REVISION = "968f0e2192ba4c7a12868bf36d73260d135424ca"
+AUTHOR_FILES = {
+    "z_image_transformer2d.py": "d5a55c34a3f09721e0090106121f71f588da93492d606fd3d652ad4806261902",
+    "z_image_transformer2d_control.py": "ae19699dbdb48a6698197dde698e00a918d3be1b2c46373b5715e2668ff57773",
+    "attention_utils.py": "8cc9b14c299393423ce5bfb735fea0e4b14138851b041ad239792c3ffec062fc",
+}
+
+
+def author_control_class(source: Path):
+    """Import unchanged pinned author files with unused multi-GPU/CUDA imports refused."""
+    import importlib
+    import sys
+    import types
+
+    for filename, digest in AUTHOR_FILES.items():
+        assert sha256_file(source / filename) == digest, f"wrong author source: {filename}"
+    package = "_xwen_videox_reference"
+    root = types.ModuleType(package)
+    root.__path__ = []
+    models = types.ModuleType(package + ".models")
+    models.__path__ = [str(source)]
+    sys.modules[package] = root
+    sys.modules[models.__name__] = models
+
+    def unsupported(*args, **kwargs):
+        raise AssertionError("the single-device SDPA reference cannot enter CUDA/distributed code")
+
+    distributed = types.ModuleType(package + ".dist")
+    for name in ("ZMultiGPUsSingleStreamAttnProcessor", "get_sequence_parallel_rank",
+                 "get_sequence_parallel_world_size", "get_sp_group"):
+        setattr(distributed, name, unsupported)
+    sys.modules[distributed.__name__] = distributed
+    sparse = types.ModuleType(package + ".models.attention_kernel")
+    sparse._sparse_linear_attention = unsupported
+    sparse.get_block_map = unsupported
+    sys.modules[sparse.__name__] = sparse
+    os.environ["VIDEOX_ATTENTION_TYPE"] = "SDPA"
+    module = importlib.import_module(package + ".models.z_image_transformer2d_control")
+    return module.ZImageControlTransformer2DModel
+
+
+def controlled_reference(snapshot: Path, author_source: Path, control_file: Path):
+    from accelerate import init_empty_weights
+    from safetensors.torch import load_file
+    cls = author_control_class(author_source)
+    config = json.loads((snapshot / "transformer/config.json").read_text())
+    import inspect
+    config = {k: v for k, v in config.items() if k in inspect.signature(cls.__init__).parameters}
+    count = 3 if "-lite-" in control_file.name else 15
+    config.update(control_in_dim=33, control_layers_places=list(range(0, 30, 30 // count)),
+                  control_refiner_layers_places=[0, 1], add_control_noise_refiner=True,
+                  add_control_noise_refiner_correctly=True)
+    with init_empty_weights():
+        model = cls(**config)
+    index = json.loads((snapshot / "transformer/diffusion_pytorch_model.safetensors.index.json").read_text())
+    state = {}
+    for shard in sorted(set(index["weight_map"].values())):
+        state.update(load_file(snapshot / "transformer" / shard))
+    state.update(load_file(control_file))
+    model.load_state_dict(state, strict=True, assign=True)
+    del state
+    return model.float().eval().to("mps")
+
+
+def dump_control_or_lora(args) -> None:
+    """Replay saved inputs through author ControlNet or the actual diffusers LoRA loader."""
+    import PIL.Image
+    import diffusers
+    from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, ZImageTransformer2DModel, ZImagePipeline
+    from diffusers.pipelines.z_image.pipeline_z_image import get_default_z_image_sigmas
+    source_dir = TRANSFORMER_FIXTURE_DIR / "512x512-p1-s0"
+    cap = load_st(source_dir / "cap_feats.safetensors", "cap_feats")
+    noise = load_st(source_dir / "latents0.safetensors", "latents")
+    device = torch.device("mps")
+    root = args.out_dir / args.stage
+    root.mkdir(parents=True, exist_ok=True)
+    vae = AutoencoderKL.from_pretrained(args.snapshot / "vae", torch_dtype=torch.float32,
+                                       local_files_only=True).eval().to(device)
+    source = PIL.Image.open(source_dir / "image-fp32.png").convert("RGB")
+    pixels = torch.from_numpy(np.asarray(source).copy()).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1
+    # Use the published canny control map so preprocessor differences stay out of the graph gate.
+    if args.stage == "control":
+        assert args.author_source and args.control_file and args.control_image
+        control_image = PIL.Image.open(args.control_image).convert("RGB").resize(source.size, PIL.Image.Resampling.LANCZOS)
+        control_pixels = torch.from_numpy(np.asarray(control_image).copy()).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1
+        with torch.inference_mode():
+            control_mean = vae.encode(control_pixels).latent_dist.mode()
+            control_latent = (control_mean - VAE_SHIFT_FACTOR) * VAE_SCALING_FACTOR
+        model = controlled_reference(args.snapshot, args.author_source, args.control_file)
+        cases = ["plain", "inpaint"]
+        provenance = dict(author_revision=AUTHOR_REVISION, author_sha256=AUTHOR_FILES,
+                          control_file=str(args.control_file), control_sha256=sha256_file(args.control_file))
+    else:
+        assert args.lora_file
+        model = ZImageTransformer2DModel.from_pretrained(args.snapshot / "transformer", torch_dtype=torch.float32,
+                                                        local_files_only=True).eval().to(device)
+        pipe = ZImagePipeline(scheduler=FlowMatchEulerDiscreteScheduler(), transformer=model,
+                              vae=vae, text_encoder=None, tokenizer=None)
+        before = model.layers[0].attention.to_q.weight.detach().cpu().clone()
+        pipe.load_lora_weights(str(args.lora_file.parent), weight_name=args.lora_file.name, adapter_name="parity")
+        pipe.set_adapters("parity", adapter_weights=args.lora_weight)
+        pipe.fuse_lora(components=["transformer"], lora_scale=1.0, safe_fusing=True)
+        pipe.unload_lora_weights()
+        after = model.layers[0].attention.to_q.weight.detach().cpu().clone()
+        assert torch.count_nonzero(after - before) > 0, "split Q attention adapter did not merge"
+        save_st(root / "attention-q-merged.safetensors", "weight", after)
+        save_st(root / "attention-q-delta.safetensors", "weight", after - before)
+        del before, after
+        cases = ["merged"]
+        provenance = dict(lora_file=str(args.lora_file), lora_sha256=sha256_file(args.lora_file),
+                          lora_weight=args.lora_weight, merge="diffusers load_lora_weights/set_adapters/fuse_lora/unload_lora_weights in fp32")
+    with torch.inference_mode():
+        for case in cases:
+            out = root / case
+            out.mkdir(parents=True, exist_ok=True)
+            save_st(out / "cap_feats.safetensors", "cap_feats", cap)
+            save_st(out / "noise.safetensors", "latents", noise)
+            if args.stage == "control":
+                control_image.save(out / "control.png")
+                source.save(out / "source.png")
+                mask = torch.zeros((1, 1, 512, 512), device=device)
+                mask[:, :, 128:384, 128:384] = 1
+                PIL.Image.fromarray((mask[0,0].cpu().numpy()*255).astype(np.uint8)).save(out / "mask.png")
+                if case == "inpaint":
+                    masked_pixels = pixels * (mask < .5)
+                    masked_mean = vae.encode(masked_pixels).latent_dist.mode()
+                    source_latent = (masked_mean - VAE_SHIFT_FACTOR) * VAE_SCALING_FACTOR
+                    keep = torch.nn.functional.interpolate(1-mask, size=(64,64), mode="nearest")
+                    save_st(out / "masked-mean.safetensors", "mean", masked_mean)
+                else:
+                    source_latent = torch.zeros_like(control_latent)
+                    keep = torch.zeros((1,1,64,64), device=device)
+                context = torch.cat([control_latent, keep, source_latent], dim=1).unsqueeze(2)
+                save_st(out / "control-mean.safetensors", "mean", control_mean)
+                save_st(out / "context.safetensors", "context", context)
+                print(f"[control/{case}] posterior.mode, context {tuple(context.shape)}, keep=[{keep.min().item()}, {keep.max().item()}]", flush=True)
+            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.snapshot / "scheduler", local_files_only=True)
+            scheduler.set_timesteps(sigmas=get_default_z_image_sigmas(NUM_STEPS), device=device)
+            scheduler.set_begin_index(0)
+            latents = noise.to(device)
+            started = time.time()
+            for i, t in enumerate(scheduler.timesteps):
+                timestep = ((1000-t.expand(1))/1000).to(device)
+                x = [latents.unsqueeze(2)[0]]
+                if args.stage == "control":
+                    output = model(x, timestep, [cap.to(device).float()],
+                                   control_context=[context[0]], control_context_scale=.75)[0]
+                    velocity = -output.float().squeeze(2)
+                else:
+                    output = model(x, timestep, [cap.to(device).float()], return_dict=False)[0]
+                    velocity = -torch.stack([o.float() for o in output]).squeeze(2)
+                if i == 0:
+                    save_st(out / "velocity.safetensors", "velocity", velocity)
+                latents = scheduler.step(velocity, t, latents, return_dict=False)[0]
+                torch.mps.synchronize()
+                print(f"[{args.stage}/{case}] step {i} elapsed {time.time()-started:.1f}s", flush=True)
+            decoded = vae.decode(latents / VAE_SCALING_FACTOR + VAE_SHIFT_FACTOR, return_dict=False)[0]
+            image = ((decoded/2+.5).clamp(0,1))[0].permute(1,2,0).cpu().numpy()
+            PIL.Image.fromarray((image*255).round().astype(np.uint8)).save(out / "image.png")
+            save_st(out / "final.safetensors", "latents", latents)
+            meta = dict(width=512, height=512, steps=NUM_STEPS, scale=.75, case=case,
+                        torch=torch.__version__, diffusers=diffusers.__version__, dtype="fp32",
+                        sigmas=scheduler.sigmas.tolist(), seconds=time.time()-started, **provenance)
+            meta["sha256"] = {p.name:sha256_file(p) for p in sorted(out.iterdir()) if p.name != "meta.json"}
+            (out / "meta.json").write_text(json.dumps(meta, indent=2)+"\n")
+
+
+def dump_preprocess_reference(args) -> None:
+    """Author CPU models with shared input tensors for native preprocessing parity."""
+    import sys
+    import cv2
+    import onnxruntime as ort
+    from safetensors.torch import load_file
+    from huggingface_hub import hf_hub_download
+    import PIL.Image
+
+    assert args.depth_author_source and args.dwpose_author_source and args.control_image
+    sys.path.insert(0, str(args.depth_author_source))
+    sys.path.insert(0, str(args.dwpose_author_source))
+    from depth_anything_v2.dpt import DepthAnythingV2
+    from dwpose.onnxdet import inference_detector
+    from dwpose.onnxpose import inference_pose
+    from dwpose.wholebody import Wholebody
+    from dwpose import draw_pose
+    out = args.out_dir / "preprocess"
+    out.mkdir(parents=True, exist_ok=True)
+    rgb = np.asarray(PIL.Image.open(args.control_image).convert("RGB"))
+    depth_file = hf_hub_download("jeroenvlek/depth-anything-v2-safetensors", "depth_anything_v2_vits.safetensors", local_files_only=True)
+    model = DepthAnythingV2(encoder="vits", features=64, out_channels=[48, 96, 192, 384]).eval()
+    model.load_state_dict(load_file(depth_file), strict=True)
+    if args.preprocess_input:
+        depth_input = load_st(args.preprocess_input, "input")
+    else:
+        pixels = cv2.resize(rgb, (518, 518), interpolation=cv2.INTER_CUBIC).astype(np.float32) / 255
+        pixels = (pixels - np.array([.485, .456, .406], dtype=np.float32)) / np.array([.229, .224, .225], dtype=np.float32)
+        depth_input = torch.from_numpy(pixels.transpose(2, 0, 1).copy())[None]
+    save_st(out / "depth-input.safetensors", "input", depth_input)
+    depth = model(depth_input).unsqueeze(1)
+    save_st(out / "depth-reference.safetensors", "depth", depth)
+    del model
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    detector_file = hf_hub_download("yzd-v/DWPose", "yolox_l.onnx", local_files_only=True)
+    estimator_file = hf_hub_download("yzd-v/DWPose", "dw-ll_ucoco_384.onnx", local_files_only=True)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = args.threads
+    detector = ort.InferenceSession(detector_file, sess_options=options, providers=["CPUExecutionProvider"])
+    estimator = ort.InferenceSession(estimator_file, sess_options=options, providers=["CPUExecutionProvider"])
+    boxes = inference_detector(detector, bgr)
+    author = Wholebody.__new__(Wholebody)
+    author.session_det, author.session_pose = detector, estimator
+    points, scores = author(bgr)
+    (out / "pose-reference.json").write_text(json.dumps({"boxes": boxes.tolist(), "points": points.tolist(), "scores": scores.tolist()}, indent=2) + "\n")
+    h, w = rgb.shape[:2]
+    candidate = points.copy()
+    candidate[..., 0] /= w
+    candidate[..., 1] /= h
+    body = candidate[:, :18].copy().reshape(-1, 2)
+    subset = scores[:, :18].copy()
+    for i in range(len(subset)):
+        for j in range(18):
+            subset[i, j] = 18 * i + j if subset[i, j] > .3 else -1
+    candidate[scores < .3] = -1
+    pose = {"bodies": {"candidate": body, "subset": subset}, "faces": candidate[:, 24:92], "hands": np.vstack([candidate[:, 92:113], candidate[:, 113:]])}
+    PIL.Image.fromarray(draw_pose(pose, h, w)).save(out / "pose-reference.png")
+    sources = list((args.depth_author_source / "depth_anything_v2").rglob("*.py")) + list((args.dwpose_author_source / "dwpose").glob("*.py"))
+    manifest = {"torch": torch.__version__, "onnxruntime": ort.__version__, "opencv": cv2.__version__, "source_image": str(args.control_image), "source_sha256": sha256_file(args.control_image), "depth_policy": "518 square, shared RGB ImageNet-normalized f32 input, author model", "sha256": {str(p): sha256_file(p) for p in [Path(depth_file), Path(detector_file), Path(estimator_file)] + sources}}
+    manifest["author_revisions"] = {name: (root / "revision").read_text().strip() if (root / "revision").is_file() else None for name, root in [("DepthAnything/Depth-Anything-V2", args.depth_author_source), ("IDEA-Research/DWPose", args.dwpose_author_source)]}
+    manifest["fixture_sha256"] = {p.name: sha256_file(p) for p in sorted(out.iterdir()) if p.name != "meta.json"}
+    (out / "meta.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"[preprocess] wrote author references to {out}", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--stage", required=True, choices=["fp32", "bf16", "finalize", "transformer"]
+        "--stage", required=True, choices=["fp32", "bf16", "finalize", "transformer", "edits", "control", "lora", "preprocess"]
     )
     ap.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
     ap.add_argument("--out-dir", type=Path, default=Path("/tmp/zimage-ref"))
@@ -754,6 +1107,15 @@ def main() -> None:
     ap.add_argument("--height", type=int, default=512)
     ap.add_argument("--prompt-idx", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--strength", type=float, default=0.6)
+    ap.add_argument("--author-source", type=Path)
+    ap.add_argument("--control-file", type=Path)
+    ap.add_argument("--control-image", type=Path)
+    ap.add_argument("--lora-file", type=Path)
+    ap.add_argument("--lora-weight", type=float, default=0.8)
+    ap.add_argument("--depth-author-source", type=Path)
+    ap.add_argument("--dwpose-author-source", type=Path)
+    ap.add_argument("--preprocess-input", type=Path)
     args = ap.parse_args()
 
     torch.set_num_threads(args.threads)
@@ -761,8 +1123,17 @@ def main() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.stage == "preprocess":
+        dump_preprocess_reference(args)
+        return
+    if args.stage in ("control", "lora"):
+        dump_control_or_lora(args)
+        return
     if args.stage == "finalize":
         finalize(args.out_dir)
+        return
+    if args.stage == "edits":
+        run_image_edits(args.snapshot, args.out_dir, args.seed, args.strength)
         return
     if args.stage == "transformer":
         run_transformer(

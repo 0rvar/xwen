@@ -1013,6 +1013,25 @@ impl AutoEncoderKL {
         (z - self.shift_factor)? * self.scale_factor
     }
 
+    /// Encode using an explicit standard-normal posterior draw.
+    pub fn encode_with_noise(&self, xs: &Tensor, noise: &Tensor) -> Result<Tensor> {
+        let moments = xs.apply(&self.encoder)?;
+        let chunks = moments.chunk(2, 1)?;
+        if noise.dims() != chunks[0].dims() {
+            candle_core::bail!("posterior noise shape does not match the VAE latent");
+        }
+        let std = (chunks[1].clamp(-30.0, 20.0)? * 0.5)?.exp()?;
+        let noise = noise.to_device(xs.device())?.to_dtype(xs.dtype())?;
+        let z = (&chunks[0] + (std * noise)?)?;
+        (z - self.shift_factor)? * self.scale_factor
+    }
+
+    /// Encode at the posterior mean, with the Flux affine applied once.
+    pub fn encode_mode(&self, xs: &Tensor) -> Result<Tensor> {
+        let chunks = xs.apply(&self.encoder)?.chunk(2, 1)?;
+        (&chunks[0] - self.shift_factor)? * self.scale_factor
+    }
+
     /// Decode latent to image
     /// xs: (B, latent_channels, H/8, W/8)
     /// Returns: (B, 3, H, W) RGB image, range [-1, 1]

@@ -224,6 +224,72 @@ docs/parity.md).
 `docs/zimage.md` is the architecture and the traps, `docs/records/zimage-pipeline.md` the
 arcs, `docs/perf-state.md` the timings and their conditions.
 
+Image controls use the same pipeline and image-engine queue. An init image selects
+img2img; adding a white-repaint mask selects inpainting. Strength defaults to 0.6
+without a mask and 1.0 with one. Source dimensions are used when size is omitted,
+snapped to the existing size rule. Eight steps at strength 0.6 starts at index 3
+and runs five forwards; the result reports that index. Strength zero preserves
+the source image. Mask blur is Gaussian sigma in output pixels, and pixels
+outside the mask are preserved after decode.
+
+```bash
+xwen image --prompt "a watercolour landscape" --init source.png --strength 0.6 -o variation.png
+xwen image --prompt "a red bicycle" --init source.png --mask repaint.png --mask-blur 8 -o edit.png
+xwen image --prompt "Pixel art style. A harbour" --lora /path/style.safetensors:0.8 -o styled.png
+xwen image --prompt "a stone house" --control photo.png --control-type canny --control-scale 0.75 --control-window 0:0.8 -o controlled.png
+```
+
+`--lora name[:weight]` is repeatable. A name is a local file or a file under
+`$XWEN_LORA_DIR` (default `~/.local/share/xwen/loras`), with `.safetensors` optional
+in that directory. Transformer adapters are merged at load, including attention
+Q/K/V and embedder/refiner projections. Changing the adapter set reloads the
+pipeline from the base weights. Unknown targets and unsupported adapter formats
+are errors.
+
+`POST /v1/images/render` is the native JSON endpoint. Image strings accept local
+server paths, plain base64 or image data URLs. Unknown fields, including nested
+fields, return 400. The response has a `data` array with `b64_json`, `seed`,
+`start_step` and, for control requests, `control_map`. `n` can request up to four
+images; successive seeds increment by one.
+
+```json
+{
+  "prompt": "a stone house at dusk", "n": 2, "seed": 4711,
+  "init_image": "/path/source.png", "strength": 0.6,
+  "mask": "/path/repaint.png", "mask_blur": 8,
+  "loras": [{"name": "style", "weight": 0.8}],
+  "control": {"image": "/path/photo.png", "preprocess": "canny", "scale": 0.75, "start": 0.0, "end": 0.8}
+}
+```
+
+`POST /v1/images/preprocess` takes `{"image":"...","type":"canny"}`;
+`pose` and `depth` are also supported. It returns the map before generation so
+it can be inspected or edited. `--control-type` accepts those three types and
+`none`, which uses a prepared map unchanged. Pose uses DWPose whole-body keypoints;
+depth uses Depth Anything V2 Small. Both run locally and require cached weights.
+
+ControlNet is optional and uses the Fun Union 8-step full or lite files. Set
+`XWEN_CONTROLNET_FILE` to an official file path, or cache the recommended lite
+file with:
+
+```bash
+bun scripts/hf-fetch.ts alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps.safetensors
+bun scripts/hf-fetch.ts yzd-v/DWPose yolox_l.onnx dw-ll_ucoco_384.onnx
+bun scripts/hf-fetch.ts jeroenvlek/depth-anything-v2-safetensors depth_anything_v2_vits.safetensors
+```
+
+The first file is ~2 GB; full is ~6.7 GB. Pose weights total ~351 MB and depth
+~99 MB. Requests never download them. Control scale defaults to 0.75 and its
+window to `[0, 0.8)`, measured over the full schedule. Init image plus mask plus
+control selects trained inpainting. Guidance and negative prompts remain
+unsupported on Turbo.
+
+The OpenAI compatibility surface also accepts multipart
+`POST /v1/images/edits` and `/v1/images/variations`. Its mask uses OpenAI's
+transparent-repaint convention; the native endpoint and CLI use white-repaint
+masks. Edits use strength 1.0 with a mask and 0.6 without one; variations use
+0.6. The GUI and CFG phase remain outside this implementation.
+
 **`--model <path>` takes a safetensors directory** on every one-shot subcommand, not
 only `serve`: a directory, a `config.json` inside one or a `*.safetensors` inside one all
 resolve to the same set. The file decides which checkpoint it is, and `--model-size`

@@ -284,7 +284,13 @@ fn grade_case(pipeline: &ZImagePipeline, dir: &Path) -> Result<Vec<String>> {
             latents: Some(latents0.clone()),
         },
     )?;
-    let velocity_in_run = Spread::between(&rendered.velocity0, &velocity)?;
+    let velocity_in_run = Spread::between(
+        rendered
+            .velocity0
+            .as_ref()
+            .context("generation must produce a velocity")?,
+        &velocity,
+    )?;
     ensure!(
         velocity_in_run.max_rel < 1e-6,
         "{}: the run's step-0 velocity differs from the single forward's (max rel {:.2e}), \

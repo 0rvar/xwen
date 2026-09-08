@@ -958,7 +958,7 @@ impl ZImageTransformerBlock {
         self.profiler = Some(profiler);
     }
 
-    fn projections(&self) -> Vec<&Projection> {
+    pub(crate) fn projections(&self) -> Vec<&Projection> {
         let mut all: Vec<&Projection> = self.attention.projections().to_vec();
         all.extend(self.feed_forward.projections());
         all.extend(self.adaln_modulation.iter());
@@ -1437,6 +1437,35 @@ impl ZImageTransformer2DModel {
     /// that path has no reference comparison yet, so it is refused rather
     /// than run unverified.
     pub fn forward(&self, x: &Tensor, t: &Tensor, cap_feats: &Tensor) -> Result<Tensor> {
+        self.forward_inner(x, t, cap_feats, None)
+    }
+
+    /// Evaluate the author Fun Union graph, including both noise-refiner skips.
+    /// The caller prepares the 33-channel context once and gates the step window.
+    pub fn forward_controlled(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        controlnet: &super::controlnet::ControlNet,
+        context: &Tensor,
+        scale: f64,
+    ) -> Result<Tensor> {
+        if !scale.is_finite() || scale < 0.0 {
+            candle_core::bail!("ControlNet scale must be finite and nonnegative");
+        }
+        super::controlnet::ControlNet::validate_context(context, x)?;
+        let control = (scale != 0.0).then_some((controlnet, context, scale));
+        self.forward_inner(x, t, cap_feats, control)
+    }
+
+    fn forward_inner(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        control: Option<(&super::controlnet::ControlNet, &Tensor, f64)>,
+    ) -> Result<Tensor> {
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         if b != 1 || cap_feats.dim(0)? != 1 {
@@ -1520,13 +1549,20 @@ impl ZImageTransformer2DModel {
         let (cap_cos, cap_sin) = self.rope_embedder.forward(&cap_pos_ids)?;
         profile::mark(&self.profiler, "rope.tables");
 
+        let control_refiners = control
+            .map(|(net, context, _)| net.refine(context, &x, &x_cos, &x_sin, &adaln_input))
+            .transpose()?;
+
         // 5. Noise refiner (image, modulated)
         // The refiner loops run the same block code as the main layers, so
         // their stages are told apart by a phase prefix rather than by
         // labels of their own.
         profile::set_phase(&self.profiler, "noise_refiner.");
-        for layer in &self.noise_refiner {
+        for (i, layer) in self.noise_refiner.iter().enumerate() {
             x = layer.forward(&x, None, &x_cos, &x_sin, Some(&adaln_input))?;
+            if let (Some(samples), Some((_, _, scale))) = (&control_refiners, control) {
+                x = (x + (&samples.residuals[i] * scale)?)?;
+            }
         }
 
         // 6. Context refiner (caption, unmodulated)
@@ -1543,8 +1579,21 @@ impl ZImageTransformer2DModel {
         // The joint concatenation is counted with the table lookups it feeds.
         profile::mark(&self.profiler, "rope.tables");
 
+        let control_samples = match (&control_refiners, control) {
+            (Some(samples), Some((net, _, _))) => Some(net.main_samples(
+                &samples.hidden,
+                &cap,
+                &unified,
+                &unified_cos,
+                &unified_sin,
+                &adaln_input,
+            )?),
+            _ => None,
+        };
+        let mut next_control = 0;
+
         // 8. Main transformer layers
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             unified = layer.forward(
                 &unified,
                 None,
@@ -1552,6 +1601,13 @@ impl ZImageTransformer2DModel {
                 &unified_sin,
                 Some(&adaln_input),
             )?;
+            if let (Some(samples), Some((net, _, scale))) = (&control_samples, control) {
+                let stride = 30 / net.variant().blocks();
+                if i % stride == 0 && next_control < samples.len() {
+                    unified = (unified + (&samples[next_control] * scale)?)?;
+                    next_control += 1;
+                }
+            }
         }
 
         // 9. Final layer on the image rows, then unpatchify
@@ -2030,6 +2086,42 @@ mod tests {
             attn_impl: AttnImpl::Flash,
             use_xwen_linear: true,
         }
+    }
+
+    #[test]
+    fn control_refiner_residuals_reach_the_generator_and_zero_scale_is_exact() {
+        let dev = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.dim = 48;
+        cfg.n_heads = 1;
+        cfg.n_kv_heads = 1;
+        cfg.axes_dims = vec![16, 16, 16];
+        cfg.n_layers = 30;
+        cfg.n_refiner_layers = 2;
+        cfg.attn_impl = AttnImpl::Basic;
+        let model = ZImageTransformer2DModel::new(&cfg, random_vb(&dev)).unwrap();
+        let net =
+            super::super::controlnet::ControlNet::synthetic(&cfg, random_vb(&dev), true).unwrap();
+        let x = Tensor::ones((1, 4, 1, 8, 16), DType::F32, &dev).unwrap();
+        let cap = Tensor::ones((1, 3, 16), DType::F32, &dev).unwrap();
+        let t = Tensor::new(&[0.25f32], &dev).unwrap();
+        let context = Tensor::ones((1, 33, 1, 8, 16), DType::F32, &dev).unwrap();
+        let plain = model.forward(&x, &t, &cap).unwrap();
+        let zero = model
+            .forward_controlled(&x, &t, &cap, &net, &context, 0.)
+            .unwrap();
+        assert_eq!(
+            plain.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            zero.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        let controlled = model
+            .forward_controlled(&x, &t, &cap, &net, &context, 0.75)
+            .unwrap();
+        let delta = max_abs_diff(&plain, &controlled);
+        assert!(
+            delta.is_finite() && delta > 1e-7,
+            "refiner-only control must reach the output, delta={delta}"
+        );
     }
 
     fn metal_or_skip(what: &str) -> Option<Device> {

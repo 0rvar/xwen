@@ -558,3 +558,43 @@ OpenAI node), with an explicit request value still winning. Not taken: reading t
 route interpret an OpenAI field against its meaning, and which tier means how many steps is
 a product decision; the record holds the sketch and the reopen condition
 ([records/zimage-perf.md](../records/zimage-perf.md) "Step count priced").
+
+**Image-edit strength selects the reference schedule tail.** 2026-09-08. The image-control PRD described strength as interpolation at the nearest sigma. The executable diffusers img2img and inpaint pipelines instead select `floor(N - N * strength)` and initialize at that step's shifted sigma. We use that rule so reference replay compares the same computation: at eight steps, 0.6 selects index 3 and sigma 0.8333333. VAE posterior noise and diffusion noise are separate seeded draws, both injectable for parity. Strength zero returns source pixels without a transformer forward; this is an explicit extension to diffusers. Masks mean white=repaint, latent restoration uses the next sigma, and final compositing preserves unmasked source bytes. [The phase record](../records/zimage-img2img.md) holds the measured gate.
+
+**Adapters merge once, into a fresh transformer.** 2026-09-08. Accumulate the base and
+`weight * alpha/rank * B@A` in f32, then cast once to the requested weight dtype. Missing
+alpha means rank. The transformer stores separate Q/K/V planes; fused adapters split
+by output rows. Validate adapter headers before loading the base and reject unused
+targets or a merged weight outside the existing f16 staging range. Residency follows
+the ordered adapters and file identities; an empty set reloads the base. This keeps
+adapter arithmetic out of denoising. [The adapter record](../records/zimage-lora.md)
+holds the diffusers comparison and supported formats.
+
+**The checkpoint author's graph is the ControlNet oracle.** 2026-09-08. VideoX-Fun uses
+joint image/caption control attention and injects both noise-refiner residuals into the
+generator. Diffusers omits those injections; ComfyUI uses image-only main control
+attention. Follow the author throughout. The 33-channel input is control VAE mode,
+keep-mask, and the VAE mode of the source masked in pixel space. Trained inpainting
+does not apply the tier-one latent restoration loop. Full and lite 8-step files are
+identified by published basename, byte length and tensor structure; the same-shaped
+non-distilled files remain unsupported. Lite is the cached default, scale is 0.75,
+and the active window is `[0,0.8)` of the full schedule. The shared base modules carry
+their merged adapters into control. [The control record](../records/zimage-controlnet.md)
+holds the source disagreement and reference gates.
+
+**Native image controls are strict and keep their control maps.** 2026-09-08.
+`/v1/images/render` rejects unknown fields and returns the image, seed, start step and
+prepared map for each result. OpenAI edits and variations retain their compatibility
+contract, including alpha-transparent repaint masks. Native and CLI masks use white
+for repaint. Rendering and preprocessing use the existing serialized image queue;
+adapter or control changes drop the old pipeline before loading its replacement.
+[The API record](../records/zimage-control-api.md) describes the validation and lifecycle.
+
+**Pose and depth preprocessing run on the CPU, with cached weights.** 2026-09-08.
+DWPose uses its author's ONNX detector and whole-body model through statically linked
+ONNX Runtime. Depth Anything V2 Small uses a bounded vendored graph, corrected against
+the author's output: bilinear DPT resizing, unpadded final projection, erf GELU and
+LayerNorm epsilon 1e-6. Depth inputs resize to the trained 518-square position grid;
+aspect-preserving position interpolation is not implemented. Requests never download
+these models. [The preprocessor record](../records/zimage-preprocessors.md) states the
+numerical gates and the limits of the pose rasterizer.

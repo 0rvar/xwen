@@ -1,0 +1,40 @@
+{
+  "torch": "2.14.0",
+  "onnxruntime": "1.29.0",
+  "opencv": "5.0.0",
+  "source_image": "tests/fixtures/zimage-transformer/512x512-p1-s0/image-fp32.png",
+  "source_sha256": "a0966d9d8db0fc326e24fa63a7592f1214370061cbfc8fada17c9dac59216cd1",
+  "depth_policy": "518 square, shared RGB ImageNet-normalized f32 input, author model",
+  "sha256": {
+    "/Users/orvar/.cache/huggingface/hub/models--jeroenvlek--depth-anything-v2-safetensors/snapshots/a8cd5eb93485537f612b31b78864b41f659b245d/depth_anything_v2_vits.safetensors": "07635472183d063a80e6b2d78645ab944a9210fd973b1c88e4b7e3ba23981f75",
+    "/Users/orvar/.cache/huggingface/hub/models--yzd-v--DWPose/snapshots/1a7144101628d69ee7a3768d1ee3a094070dc388/yolox_l.onnx": "7860ae79de6c89a3c1eb72ae9a2756c0ccfbe04b7791bb5880afabd97855a411",
+    "/Users/orvar/.cache/huggingface/hub/models--yzd-v--DWPose/snapshots/1a7144101628d69ee7a3768d1ee3a094070dc388/dw-ll_ucoco_384.onnx": "724f4ff2439ed61afb86fb8a1951ec39c6220682803b4a8bd4f598cd913b1843",
+    "/tmp/xwen-depth-source/depth_anything_v2/dpt.py": "7cc9a29b41d31e1628e5c8b8705e25ae95bc6490f779dbb695297ce2341566f5",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2.py": "d22df8d0da44c8525ebed898fd9c33b3acfcda919a84d577cc2a08bfd3d50ac1",
+    "/tmp/xwen-depth-source/depth_anything_v2/util/transform.py": "a97df1dbb687457a40c387fdc3482edee7ddc5c142c7d2735ca6235a8ae2885f",
+    "/tmp/xwen-depth-source/depth_anything_v2/util/blocks.py": "351aa24b8af4bef923ebe3bed5e5e8503b08e39bf06ee045d6444a485a2036a8",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2_layers/attention.py": "0d2410ce8b8b4499a6b0cdab939ae2bceab8971efd8660d999b0f3088f28cbf7",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2_layers/swiglu_ffn.py": "df81d9901240214edc1831ce1b77558dcd6227b29a2f000fc5f546df55d2d09a",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2_layers/__init__.py": "e3c28c7b775165b6844000eb69f44d104d6c3803ac7da5d59f6ac3ecfb46d9d8",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2_layers/layer_scale.py": "356817b5d1390737128cbcc03a5333fd3060b73beae478772282ccb851d0ef85",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2_layers/mlp.py": "c18c5b3f021408597a473bb710070ec3fb3b39f5a2e42e88ae83ced425a608b5",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2_layers/patch_embed.py": "b3f82e19926c9cfb63f10136aca5e8a723bde1ad62dae1d04f90d405f9439baf",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2_layers/block.py": "093266ea08084c7cce7b8ddd779ecfaaa13055735faa8a7d68b5924f385b395b",
+    "/tmp/xwen-depth-source/depth_anything_v2/dinov2_layers/drop_path.py": "949100aac4d9c19c9d65319dbd362886c5d46a72d7586ba4fd500e9f1d51570c",
+    "/tmp/xwen-dwpose-author/dwpose/util.py": "f8c73d120b59c83e1c9538fff0025ec1c2bde4303ad84fc3da18baa7dc756877",
+    "/tmp/xwen-dwpose-author/dwpose/__init__.py": "a0925acf535a3a8f24e33b7a5de71b3d48f96063b15dcca0f3e789c8c06b03bc",
+    "/tmp/xwen-dwpose-author/dwpose/onnxpose.py": "16fb69ab54f5e1ce8a5ad186e92f357da0162fc2ca2eeec4ccf1db72949291a2",
+    "/tmp/xwen-dwpose-author/dwpose/onnxdet.py": "4c82a928ced32883b9a6acf89a2ce90ce9a266ab98c9e01231eb0f8d4a52751d",
+    "/tmp/xwen-dwpose-author/dwpose/wholebody.py": "4682f2df65ac3eb597fb89eda9fa19127f85b3e64178730c7d27569db60c8567"
+  },
+  "author_revisions": {
+    "DepthAnything/Depth-Anything-V2": "a561b849ebae10a6f5ef49e26c83cbbcd36c71bf",
+    "IDEA-Research/DWPose": "3dca5db79d9f9ffdd378753ddf6ec66535aace88"
+  },
+  "fixture_sha256": {
+    "depth-input.safetensors": "0dfec04081c04f8beaa6d6ddaaa2dbd0e92f079f6efa76742d4c7b04eb4c5b83",
+    "depth-reference.safetensors": "5b0db5470fe5723c5f8871dc60248bbefaa7a7e467942012ad93d05bcae3949f",
+    "pose-reference.json": "62830e39b6440e99fe3c4cc80c9692d310d694366a3bf244195207297b766f8b",
+    "pose-reference.png": "caf8fcb76e05777df74b34896c43208ad6d049236192b546bbe3db0610f9f0d2"
+  }
+}

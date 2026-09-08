@@ -57,7 +57,13 @@ const PROXY_PATH: &str = "/proxy/openai/images/generations";
 pub(crate) fn is_images_path(path: &str) -> bool {
     matches!(
         path,
-        "/v1/images/generations" | "/images/generations" | PROXY_PATH
+        "/v1/images/generations"
+            | "/images/generations"
+            | PROXY_PATH
+            | "/v1/images/render"
+            | "/v1/images/edits"
+            | "/v1/images/variations"
+            | "/v1/images/preprocess"
     )
 }
 
@@ -82,6 +88,8 @@ pub(crate) struct ImageParams {
 pub(crate) struct RenderedImage {
     pub png: Vec<u8>,
     pub seed: u64,
+    pub start_step: usize,
+    pub control_map: Option<Vec<u8>>,
 }
 
 /// Why a job failed, split by whose fault it is: a request fault is a 400, a
@@ -92,9 +100,36 @@ pub(crate) enum ImageError {
     Render(String),
 }
 
-pub(crate) struct ImageJob {
-    params: ImageParams,
-    reply: tokio::sync::oneshot::Sender<Result<Vec<RenderedImage>, ImageError>>,
+#[derive(Default)]
+pub(crate) struct ImageInputs {
+    pub edit: Option<crate::zimage::pipeline::ImageEdit>,
+    pub loras: Vec<crate::zimage::lora::ResolvedLora>,
+    pub control: Option<ControlInput>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ControlIdentity {
+    pub path: std::path::PathBuf,
+    pub fingerprint: crate::zimage::lora::Fingerprint,
+}
+
+pub(crate) struct ControlInput {
+    pub image: crate::zimage::pipeline::ImageControl,
+    pub preprocess: crate::zimage::preprocess::Kind,
+    pub checkpoint: ControlIdentity,
+}
+
+pub(crate) enum ImageJob {
+    Render {
+        inputs: ImageInputs,
+        params: ImageParams,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<RenderedImage>, ImageError>>,
+    },
+    Preprocess {
+        image: candle_core::Tensor,
+        kind: crate::zimage::preprocess::Kind,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, ImageError>>,
+    },
 }
 
 /// The handler's end of the engine: the queue and the residency flag.
@@ -158,11 +193,17 @@ struct Loaded {
     encoder_entry: Model,
     spec: crate::hub::EncoderSpec,
     tokenizer_path: std::path::PathBuf,
+    loras: Vec<crate::zimage::lora::ResolvedLora>,
+    control: Option<ControlIdentity>,
 }
 
 impl Loaded {
     /// Open everything `xwen image` opens, from the cached snapshot.
-    fn open(logger: &ServeLogger) -> Result<Self, ImageError> {
+    fn open(
+        logger: &ServeLogger,
+        loras: &[crate::zimage::lora::ResolvedLora],
+        control: Option<&ControlIdentity>,
+    ) -> Result<Self, ImageError> {
         let index = crate::hub::cached_model(Model::ZImageTurbo).ok_or_else(|| {
             ImageError::Request(format!(
                 "{} is not in the Hugging Face cache: run `xwen fetch --model-size {}` on the \
@@ -171,6 +212,13 @@ impl Loaded {
                 Model::ZImageTurbo
             ))
         })?;
+        let adapters = crate::zimage::lora::PreparedLoras::load(loras)
+            .map_err(|e| ImageError::Request(format!("invalid LoRA: {e:#}")))?;
+        adapters
+            .validate_base(index.parent().ok_or_else(|| {
+                ImageError::Request("cached pipeline has no parent directory".into())
+            })?)
+            .map_err(|e| ImageError::Request(format!("invalid LoRA: {e:#}")))?;
         let open = || -> Result<(Self, Duration, Duration)> {
             let root = index
                 .parent()
@@ -204,7 +252,12 @@ impl Loaded {
             let encoder_s = started.elapsed();
 
             let started = Instant::now();
-            let pipeline = ZImagePipeline::load(root, &device)?;
+            let pipeline = ZImagePipeline::load_with_loras_and_control(
+                root,
+                &device,
+                &adapters,
+                control.map(|c| c.path.as_path()),
+            )?;
             let pipeline_s = started.elapsed();
             Ok((
                 Self {
@@ -213,13 +266,14 @@ impl Loaded {
                     encoder_entry,
                     spec,
                     tokenizer_path,
+                    loras: loras.to_vec(),
+                    control: control.cloned(),
                 },
                 encoder_s,
                 pipeline_s,
             ))
         };
-        let (loaded, encoder_s, pipeline_s) =
-            open().map_err(|e| ImageError::Render(format!("loading the image pipeline: {e:#}")))?;
+        let (loaded, encoder_s, pipeline_s) = open().map_err(classify_load_error)?;
         logger.log(ServeLog::HostLine(format!(
             "xwen serve: image pipeline loaded in {:.1}s (encoder {:.1}s, transformer+VAE {:.1}s)",
             (encoder_s + pipeline_s).as_secs_f64(),
@@ -229,7 +283,12 @@ impl Loaded {
         Ok(loaded)
     }
 
-    fn render(&mut self, params: &ImageParams, logger: &ServeLogger) -> Result<Vec<RenderedImage>> {
+    fn render(
+        &mut self,
+        params: &ImageParams,
+        inputs: &ImageInputs,
+        logger: &ServeLogger,
+    ) -> Result<Vec<RenderedImage>> {
         let rendered = crate::zimage::conditioning::prompt_ids(
             self.encoder_entry,
             &self.tokenizer_path,
@@ -251,16 +310,23 @@ impl Loaded {
         for i in 0..params.n as u64 {
             let seed = first_seed.wrapping_add(i);
             let started = Instant::now();
-            let run = self.pipeline.generate(
-                &cap_feats,
-                &ImageOptions {
-                    width: params.width,
-                    height: params.height,
-                    steps: params.steps,
-                    seed,
-                    latents: None,
-                },
-            )?;
+            let options = ImageOptions {
+                width: params.width,
+                height: params.height,
+                steps: params.steps,
+                seed,
+                latents: None,
+            };
+            let run = match (&inputs.edit, &inputs.control) {
+                (edit, Some(control)) => self.pipeline.generate_controlled(
+                    &cap_feats,
+                    &options,
+                    edit.as_ref(),
+                    &control.image,
+                )?,
+                (Some(edit), None) => self.pipeline.generate_edited(&cap_feats, &options, edit)?,
+                (None, None) => self.pipeline.generate(&cap_feats, &options)?,
+            };
             let png = encode_png(&run.image)?;
             logger.log(ServeLog::HostLine(format!(
                 "xwen serve: image rendered {}x{} in {} steps, {:.1}s (seed {seed})",
@@ -269,9 +335,29 @@ impl Loaded {
                 params.steps,
                 started.elapsed().as_secs_f64()
             )));
-            out.push(RenderedImage { png, seed });
+            out.push(RenderedImage {
+                png,
+                seed,
+                start_step: run.start_step,
+                control_map: inputs
+                    .control
+                    .as_ref()
+                    .map(|c| encode_png(&c.image.image))
+                    .transpose()?,
+            });
         }
         Ok(out)
+    }
+}
+
+fn classify_load_error(error: anyhow::Error) -> ImageError {
+    if error
+        .downcast_ref::<crate::zimage::lora::AdapterError>()
+        .is_some()
+    {
+        ImageError::Request(format!("invalid LoRA: {error:#}"))
+    } else {
+        ImageError::Render(format!("loading the image pipeline: {error:#}"))
     }
 }
 
@@ -283,16 +369,20 @@ fn engine_loop(
     logger: ServeLogger,
 ) {
     let mut loaded: Option<Loaded> = None;
+    let mut preprocessor = crate::zimage::preprocess::Preprocessor::new();
+    let mut preprocessed = false;
     loop {
         // The idle timer only matters while something is loaded, and it is
         // measured from the moment the previous job returned.
-        let idle = idle_unload.filter(|_| loaded.is_some());
+        let idle = idle_unload.filter(|_| loaded.is_some() || preprocessed);
         let waiting_since = Instant::now();
         let job = match idle {
             Some(window) => match jobs.recv_timeout(window) {
                 Ok(job) => job,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     loaded = None;
+                    preprocessor = crate::zimage::preprocess::Preprocessor::new();
+                    preprocessed = false;
                     resident.store(false, Ordering::Relaxed);
                     logger.log(ServeLog::HostLine(format!(
                         "xwen serve: image pipeline unloaded after {:.0}s idle (configured {}s)",
@@ -309,20 +399,67 @@ fn engine_loop(
             },
         };
         if shutdown.is_cancelled() {
-            let _ = job.reply.send(Err(ImageError::Render(
-                "the server is shutting down".to_string(),
-            )));
+            match job {
+                ImageJob::Render { reply, .. } => {
+                    let _ = reply.send(Err(ImageError::Render(
+                        "the server is shutting down".into(),
+                    )));
+                }
+                ImageJob::Preprocess { reply, .. } => {
+                    let _ = reply.send(Err(ImageError::Render(
+                        "the server is shutting down".into(),
+                    )));
+                }
+            }
             continue;
         }
-        if let Some(note) = &job.params.model_note {
+        let (params, mut inputs, reply) = match job {
+            ImageJob::Preprocess { image, kind, reply } => {
+                preprocessed = true;
+                let result =
+                    preprocess_on_worker(&mut preprocessor, &image, kind).and_then(|image| {
+                        encode_png(&image).map_err(|e| ImageError::Render(format!("{e:#}")))
+                    });
+                let _ = reply.send(result);
+                continue;
+            }
+            ImageJob::Render {
+                params,
+                inputs,
+                reply,
+            } => (params, inputs, reply),
+        };
+        if let Some(control) = &mut inputs.control {
+            preprocessed = true;
+            match preprocess_on_worker(&mut preprocessor, &control.image.image, control.preprocess)
+            {
+                Ok(image) => control.image.image = image,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    continue;
+                }
+            }
+        }
+        if let Some(note) = &params.model_note {
             logger.log(ServeLog::HostLine(format!(
                 "xwen serve: images: model {note:?} served by {} (proxy path)",
                 Model::ZImageTurbo.full_name()
             )));
         }
+        if loaded.as_ref().is_some_and(|held| {
+            held.loras != inputs.loras
+                || held.control.as_ref() != inputs.control.as_ref().map(|c| &c.checkpoint)
+        }) {
+            loaded = None;
+            resident.store(false, Ordering::Relaxed);
+        }
         let result = match loaded.as_mut() {
             Some(held) => Ok(held),
-            None => match Loaded::open(&logger) {
+            None => match Loaded::open(
+                &logger,
+                &inputs.loras,
+                inputs.control.as_ref().map(|c| &c.checkpoint),
+            ) {
                 Ok(opened) => {
                     resident.store(true, Ordering::Relaxed);
                     Ok(loaded.insert(opened))
@@ -331,12 +468,12 @@ fn engine_loop(
             },
         }
         .and_then(|held| {
-            held.render(&job.params, &logger)
+            held.render(&params, &inputs, &logger)
                 .map_err(|e| ImageError::Render(format!("{e:#}")))
         });
         // A client that hung up is the only reason this fails, and its answer
         // has nowhere to go.
-        let _ = job.reply.send(result);
+        let _ = reply.send(result);
     }
     // A pipeline dropped here unregisters its buffers on the way out.
     drop(loaded);
@@ -366,14 +503,14 @@ pub(crate) struct ImagesRequest {
     pub num_inference_steps: Option<usize>,
 }
 
-fn bad_param(param: &str, message: impl Into<String>) -> ApiError {
+pub(super) fn bad_param(param: &str, message: impl Into<String>) -> ApiError {
     let mut err = bad_request(message);
     err.body["error"]["param"] = json!(param);
     err
 }
 
 /// `"WxH"` or `"auto"`, in the OpenAI spelling.
-fn parse_size(text: &str) -> Result<(usize, usize), ApiError> {
+pub(super) fn parse_size(text: &str) -> Result<(usize, usize), ApiError> {
     let text = text.trim();
     if text.eq_ignore_ascii_case("auto") {
         return Ok(DEFAULT_SIZE);
@@ -552,10 +689,22 @@ pub(crate) async fn generations(
         Ok(params) => params,
         Err(err) => return err.into_response(),
     };
+    submit_image(state, params, ImageInputs::default()).await
+}
+
+pub(crate) async fn submit_image(
+    state: AppState,
+    params: ImageParams,
+    inputs: ImageInputs,
+) -> Response {
     let (width, height, steps) = (params.width, params.height, params.steps);
 
     let (reply, answer) = tokio::sync::oneshot::channel();
-    match state.images.sender.try_send(ImageJob { params, reply }) {
+    match state.images.sender.try_send(ImageJob::Render {
+        params,
+        inputs,
+        reply,
+    }) {
         Ok(()) => {}
         Err(crossbeam_channel::TrySendError::Full(_)) => {
             return server_error(
@@ -594,6 +743,8 @@ pub(crate) async fn generations(
             json!({
                 "b64_json": base64::engine::general_purpose::STANDARD.encode(&image.png),
                 "seed": image.seed,
+                "start_step": image.start_step,
+                "control_map": image.control_map.as_ref().map(|map|base64::engine::general_purpose::STANDARD.encode(map)),
             })
         })
         .collect();
@@ -611,6 +762,19 @@ pub(crate) async fn generations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adapter_load_faults_are_request_errors_and_device_faults_are_not() {
+        let adapter = anyhow::Error::new(crate::zimage::lora::AdapterError("overflow".into()))
+            .context("building transformer");
+        assert!(matches!(
+            classify_load_error(adapter),
+            ImageError::Request(_)
+        ));
+        assert!(matches!(
+            classify_load_error(anyhow::anyhow!("device unavailable")),
+            ImageError::Render(_)
+        ));
+    }
 
     fn parse(json: &str) -> ImagesRequest {
         serde_json::from_str(json).expect("the request parses")
@@ -625,11 +789,18 @@ mod tests {
     }
 
     #[test]
-    fn the_three_paths_and_nothing_else() {
+    fn image_routes_share_the_image_auth_policy() {
         assert!(is_images_path("/v1/images/generations"));
         assert!(is_images_path("/images/generations"));
         assert!(is_images_path("/proxy/openai/images/generations"));
-        assert!(!is_images_path("/v1/images/edits"));
+        for path in [
+            "/v1/images/edits",
+            "/v1/images/variations",
+            "/v1/images/render",
+            "/v1/images/preprocess",
+        ] {
+            assert!(is_images_path(path));
+        }
         assert!(!is_images_path("/v1/chat/completions"));
         assert!(!is_images_path("/v1/images/generations/"));
     }
@@ -851,4 +1022,51 @@ mod tests {
         let err = validate(parse(r#"{"prompt":"x","steps":0}"#), false, Some(4)).unwrap_err();
         assert_eq!(param(&err).as_deref(), Some("steps"));
     }
+}
+
+/// Queue preprocessing on the same worker that owns the image models.
+pub(crate) async fn submit_preprocess(
+    state: AppState,
+    image: candle_core::Tensor,
+    kind: crate::zimage::preprocess::Kind,
+) -> Response {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    if let Err(err) = state
+        .images
+        .sender
+        .try_send(ImageJob::Preprocess { image, kind, reply })
+    {
+        return server_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("image engine unavailable: {err}"),
+        )
+        .into_response();
+    }
+    match answer.await {
+        Ok(Ok(map)) => {
+            axum::Json(json!({"b64_json":base64::engine::general_purpose::STANDARD.encode(map)}))
+                .into_response()
+        }
+        Ok(Err(ImageError::Request(message))) => bad_request(message).into_response(),
+        Ok(Err(ImageError::Render(message))) => {
+            server_error(StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+        }
+        Err(_) => server_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "image engine stopped before answering",
+        )
+        .into_response(),
+    }
+}
+
+fn preprocess_on_worker(
+    preprocessor: &mut crate::zimage::preprocess::Preprocessor,
+    image: &candle_core::Tensor,
+    kind: crate::zimage::preprocess::Kind,
+) -> Result<candle_core::Tensor, ImageError> {
+    crate::zimage::preprocess::Preprocessor::validate(kind)
+        .map_err(|e| ImageError::Request(format!("{e:#}")))?;
+    preprocessor
+        .run(image, kind)
+        .map_err(|e| ImageError::Render(format!("{e:#}")))
 }
