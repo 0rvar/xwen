@@ -178,6 +178,91 @@ impl Studio {
             None => Ok(vec![]),
         }
     }
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        let inner = self.inner.lock().unwrap();
+        match &inner.workspace {
+            Some(w) => storage::sessions(w),
+            None => Ok(vec![]),
+        }
+    }
+    pub fn delete_image(
+        &self,
+        workspace_path: String,
+        session_id: String,
+        image_id: String,
+    ) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        let workspace = inner.workspace.as_ref().ok_or("Select a workspace first")?;
+        if workspace.path != workspace_path {
+            return Err("Selected workspace changed".into());
+        }
+        let session = storage::session_path(workspace, &session_id)?;
+        let file = image_id
+            .strip_prefix(&format!("{session_id}/"))
+            .ok_or("Image does not belong to requested session")?;
+        let (png, yaml) = storage::owned_output(&session, file)?;
+        std::fs::remove_file(&png).map_err(|e| e.to_string())?;
+        std::fs::remove_file(&yaml)
+            .map_err(|e| format!("Image deleted but metadata removal failed: {e}"))?;
+        Ok(())
+    }
+    pub fn delete_session(&self, workspace_path: String, session_id: String) -> Result<Workspace> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.busy {
+            return Err("Wait for the active render before deleting sessions".into());
+        }
+        let workspace = inner.workspace.clone().ok_or("Select a workspace first")?;
+        if workspace.path != workspace_path {
+            return Err("Selected workspace changed".into());
+        }
+        let session = storage::session_path(&workspace, &session_id)?;
+        let next = if workspace.session_id == session_id {
+            make_workspace(Path::new(&workspace.path), false)?
+        } else {
+            workspace
+        };
+        if session.exists() {
+            storage::session_image_count(&session)?;
+            std::fs::remove_dir_all(&session).map_err(|e| e.to_string())?;
+        }
+        inner.workspace = Some(next.clone());
+        Ok(next)
+    }
+    pub async fn generate_prompt(&self, idea: String) -> Result<String> {
+        let value = self
+            .request(
+                &self.config()?,
+                "/v1/chat/completions",
+                Some(json!({
+                    "model": "Qwen3.8-Flash-Next",
+                    "stream": false,
+                    "max_tokens": 512,
+                    "chat_template_kwargs": {"enable_thinking": false},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Write one useful, vivid image-generation prompt based on the user's idea. Return only the prompt, with no preamble, quotes, explanation, or reasoning. If the idea is blank, invent a distinctive visual scene. Describe subject, composition, setting, lighting, and visual style in one concise paragraph."
+                        },
+                        {"role": "user", "content": idea}
+                    ]
+                })),
+            )
+            .await?;
+        let choice = &value["choices"][0];
+        if choice["finish_reason"] == "length" {
+            return Err(
+                "Prompt generation reached its token limit; try again with a simpler idea".into(),
+            );
+        }
+        let content = choice["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .trim();
+        if content.is_empty() {
+            return Err("Server returned no prompt text".into());
+        }
+        Ok(content.to_owned())
+    }
     async fn request(&self, config: &Config, endpoint: &str, body: Option<Value>) -> Result<Value> {
         let url = format!("{}{endpoint}", normalize_url(&config.server_url)?);
         let mut request = if let Some(body) = body {

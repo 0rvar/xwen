@@ -113,6 +113,57 @@ test("matrix preview runs its exact jobs sequentially and can pause", async ({ p
   await page.screenshot({ path: "/tmp/xwen-image-studio-main.png", fullPage: true });
 });
 
+test("jobs appended during a render stay in exact FIFO order", async ({ page }) => {
+  await page.goto("/?renderDelay=350");
+  await page.getByLabel("Prompt").fill("first appended job");
+  await page.getByRole("button", { name: /^Generate/ }).click();
+  await expect(page.getByText("1 running", { exact: true })).toBeVisible();
+  await page.getByLabel("Prompt").fill("second appended job");
+  await expect(page.getByRole("button", { name: /^Generate/ })).toBeEnabled();
+  await page.getByRole("button", { name: /^Generate/ }).click();
+  await expect(page.getByText("1 waiting", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 done", { exact: true })).toBeVisible({ timeout: 4_000 });
+  const prompts = await page.evaluate(() => (window as typeof window & { __XWEN_PREVIEW_REQUESTS__?: Array<{ prompt: string }> }).__XWEN_PREVIEW_REQUESTS__?.map((request) => request.prompt));
+  expect(prompts).toEqual(["first appended job", "second appended job"]);
+});
+
+test("appending while stopped preserves pause until explicit resume", async ({ page }) => {
+  await page.goto("/?renderDelay=350");
+  await page.getByLabel("Prompt").fill("paused base job");
+  await page.getByLabel("Count").fill("2");
+  await page.getByRole("button", { name: /^Generate/ }).click();
+  await expect(page.getByText("1 running", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Stop after current" }).click();
+  await page.getByLabel("Count").fill("1");
+  await page.getByLabel("Prompt").fill("appended while paused");
+  await page.getByRole("button", { name: /^Generate/ }).click();
+  await expect(page.getByRole("button", { name: "Resume queue" })).toBeVisible();
+  await expect(page.getByText("2 waiting", { exact: true })).toBeVisible();
+  await page.waitForTimeout(500);
+  const beforeResume = await page.evaluate(() => (window as typeof window & { __XWEN_PREVIEW_REQUESTS__?: unknown[] }).__XWEN_PREVIEW_REQUESTS__?.length);
+  expect(beforeResume).toBe(1);
+  await page.getByRole("button", { name: "Resume queue" }).click();
+  await expect(page.getByText("3 done", { exact: true })).toBeVisible({ timeout: 4_000 });
+  const prompts = await page.evaluate(() => (window as typeof window & { __XWEN_PREVIEW_REQUESTS__?: Array<{ prompt: string }> }).__XWEN_PREVIEW_REQUESTS__?.map((request) => request.prompt));
+  expect(prompts).toEqual(["paused base job", "paused base job", "appended while paused"]);
+});
+
+test("a submission after a stopped queue drains starts normally", async ({ page }) => {
+  await page.goto("/?renderDelay=350");
+  await page.getByLabel("Prompt").fill("draining job");
+  await page.getByRole("button", { name: /^Generate/ }).click();
+  await expect(page.getByText("1 running", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Stop after current" }).click();
+  await expect(page.getByText("1 done", { exact: true })).toBeVisible({ timeout: 2_000 });
+  await expect(page.getByRole("button", { name: "Resume queue" })).toBeVisible();
+  await page.getByLabel("Prompt").fill("fresh run after stop");
+  await page.getByRole("button", { name: /^Generate/ }).click();
+  await expect(page.getByText("2 done", { exact: true })).toBeVisible({ timeout: 3_000 });
+  await expect(page.getByRole("button", { name: "Resume queue" })).toHaveCount(0);
+  const prompts = await page.evaluate(() => (window as typeof window & { __XWEN_PREVIEW_REQUESTS__?: Array<{ prompt: string }> }).__XWEN_PREVIEW_REQUESTS__?.map((request) => request.prompt));
+  expect(prompts).toEqual(["draining job", "fresh run after stop"]);
+});
+
 test("paired validation, failed render retry, metadata restore, and workspace switch", async ({ page }) => {
   await page.goto("/");
   const tile = page.getByRole("button", { name: /Open A quiet architectural study/ });

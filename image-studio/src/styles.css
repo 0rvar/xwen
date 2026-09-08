@@ -170,6 +170,17 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .modal-heading h2 { font-size: 20px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .modal-actions.spread { justify-content: space-between; }
+.delete-backdrop { z-index: 30; }
+.danger-button { color: #a42f29; }
+.primary-button.danger-button { color: white; background: #a42f29; }
+.session-manager { margin-bottom: 20px; }
+.session-manager summary { cursor: pointer; color: var(--muted); }
+.session-manager-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.session-manager-row span { min-width: 0; overflow-wrap: anywhere; }
+.session-manager-row small { display: block; color: var(--muted); font-size: 10px; }
+.session-manager-row button { flex-shrink: 0; }
+.prompt-generator .field { margin-top: 16px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .settings-modal .field { margin-top: 14px; }
 .workspace-modal { width: min(430px, 100%); text-align: center; }
 .workspace-modal h2 { margin-bottom: 10px; font-size: 23px; }

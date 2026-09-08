@@ -632,3 +632,17 @@ time, matching the image server's single worker. Stop means stop after the curre
 image saves, because the API exposes neither cancellation nor step progress. Pending
 queue recovery is not taken now; completed images, requests and input snapshots are
 durable. The reopen conditions are in the [client record](../records/image-studio.md#not-taken-now).
+
+**Image Studio deletes within its workspace and drafts prompts through the server.**
+2026-09-08. The user requested image and session deletion, queue appends, and a
+Flash-Next prompt generator. Deletion is permanent after confirmation: an image's
+PNG and YAML go together, while shared input snapshots remain until session deletion.
+The backend checks the current workspace, direct session directory and app-owned
+records before removing files. Session deletion waits for the queue to finish or
+be discarded; completed images can be removed during another render. Appending to
+a paused queue preserves the pause, while submission after it drains starts again.
+Prompt drafts use the configured authenticated chat endpoint and the explicit
+`Qwen3.8-Flash-Next` model with thinking disabled. The user edits and accepts the
+draft before it replaces the image prompt. No local CLI process or model fallback
+is involved, so remote servers behave the same way. The
+[client record](../records/image-studio.md#gallery-cleanup-and-prompt-drafts) holds verification.

@@ -51,6 +51,9 @@ ControlNet, LoRAs and parameter batches through a local or remote xwen server.
 First launch asks for a workspace and server URL; settings live in
 `~/.config/xwen/image-studio.json`. Every session saves PNGs with YAML generation
 records and input snapshots inside its workspace.
+The gallery can delete images or whole sessions with confirmation. New jobs append
+to a running or paused queue. A prompt generator uses Flash-Next through the same
+server and lets you edit the draft before using it.
 
 ## Models
 

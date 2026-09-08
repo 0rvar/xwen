@@ -104,3 +104,9 @@ pub struct Preprocessed {
     pub width: u32,
     pub height: u32,
 }
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub image_count: usize,
+}

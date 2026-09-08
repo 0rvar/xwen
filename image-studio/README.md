@@ -70,6 +70,13 @@ new results appear as they finish. Select an image to inspect its metadata, rest
 its controls, or use it as the next source. Connection and workspace changes wait
 until the current queue has stopped.
 
+The image preview offers **Delete image**, which confirms before permanently
+removing the PNG and YAML record. Shared input snapshots stay in place. **Manage
+sessions** lists every recognized session, beyond the gallery's 200-image limit.
+Deleting a session confirms removal of all its images, records and input snapshots.
+Deleting the current session starts a fresh one. Finish or discard queued jobs before
+deleting a session; individual completed images can be deleted while rendering.
+
 ## Generation controls
 
 Choose text-to-image, img2img or inpainting. Img2img takes a source and strength;
@@ -87,6 +94,12 @@ Steps default to 8. Dimensions follow the API's 16-pixel grid and token-count ru
 Seeds are limited to JavaScript's exact integer range, 0–9007199254740991. A blank
 seed is resolved when planning a batch and saved explicitly. Turbo has no negative
 prompt or CFG controls.
+
+**Draft prompt with Flash-Next** turns an idea into an editable image prompt. A blank
+idea asks for a new scene. It calls `Qwen3.8-Flash-Next` through the configured
+server's chat API, with thinking disabled; the checkpoint must already be cached
+on that server. **Use prompt** replaces the main prompt with the draft. Closing
+the generator leaves the main prompt unchanged.
 
 ## Batches
 
@@ -109,7 +122,10 @@ axis, combinations share those seeds so the parameter comparison stays matched.
 
 The app validates the whole plan before sending anything and caps it at 1000 images.
 The queue sends one request at a time. Stop lets the current request finish and save
-before pausing; resume continues pending work. Failed jobs can be retried explicitly.
+before pausing; resume continues pending work. Submit can append jobs while rendering
+or paused. Appending to a paused queue preserves its pause; a new submission after
+the stopped queue drains starts normally. The queue allows at most 1000 unfinished
+jobs, including failures until they are cleared. Failed jobs can be retried explicitly.
 Closing the app loses pending queue state; completed images remain on disk. The
 server has no render cancellation or live step-progress API.
 

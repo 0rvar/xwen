@@ -53,6 +53,31 @@ fn list_images(state: State<'_, Studio>) -> Result<Vec<SavedImage>, String> {
     state.list_images()
 }
 #[tauri::command(async)]
+fn list_sessions(state: State<'_, Studio>) -> Result<Vec<SessionSummary>, String> {
+    state.list_sessions()
+}
+#[tauri::command(async)]
+fn delete_image(
+    state: State<'_, Studio>,
+    workspace_path: String,
+    session_id: String,
+    image_id: String,
+) -> Result<(), String> {
+    state.delete_image(workspace_path, session_id, image_id)
+}
+#[tauri::command(async)]
+fn delete_session(
+    state: State<'_, Studio>,
+    workspace_path: String,
+    session_id: String,
+) -> Result<Workspace, String> {
+    state.delete_session(workspace_path, session_id)
+}
+#[tauri::command]
+async fn generate_prompt(state: State<'_, Studio>, idea: String) -> Result<String, String> {
+    state.generate_prompt(idea).await
+}
+#[tauri::command(async)]
 fn reveal(path: String) -> Result<(), String> {
     let path = std::path::Path::new(&path)
         .canonicalize()
@@ -88,6 +113,10 @@ pub fn run() {
             preprocess,
             render,
             list_images,
+            list_sessions,
+            delete_image,
+            delete_session,
+            generate_prompt,
             reveal
         ])
         .run(tauri::generate_context!())

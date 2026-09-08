@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { PromptGenerator } from "./PromptGenerator";
 import type { InputImage, LoraCandidate, StudioSettings } from "../domain";
 
 interface Props {
@@ -40,6 +41,7 @@ export function SettingsPanel({ settings, loras, loraLoading, disabled, controlP
         {([['text', 'Text'], ['img2img', 'Image'], ['inpaint', 'Inpaint']] as const).map(([value, label]) => <button key={value} className={settings.mode === value ? "selected" : ""} onClick={() => onChange({ ...settings, mode: value, strength: value === "inpaint" ? 1 : value === "img2img" ? 0.6 : settings.strength })}>{label}</button>)}
       </div>
       <label className="field prompt-field"><span>Prompt</span><textarea name="prompt" rows={5} placeholder="Describe the image you want to make…" value={settings.prompt} onChange={(event) => change("prompt", event.target.value)} /></label>
+      <PromptGenerator prompt={settings.prompt} disabled={disabled} onUse={(prompt) => change("prompt", prompt)} />
     </section>
 
     {settings.mode !== "text" && <section className="control-section">
@@ -74,6 +76,6 @@ export function SettingsPanel({ settings, loras, loraLoading, disabled, controlP
         {controlPreview && <div className="control-preview"><img src={controlPreview.data_url} alt={`${settings.controlKind} control map preview`} /><button className="quiet-button" onClick={onUseControlPreview}>Use this map</button></div>}
       </div>}
     </details>
-    <button className="generate-button" disabled={disabled} onClick={onGenerate}><span>Generate</span><small>{disabled ? "Queue already active" : `${settings.count} image${settings.count === 1 ? "" : "s"}`}</small></button>
+    <button className="generate-button" disabled={disabled} onClick={onGenerate}><span>Generate</span><small>{disabled ? "Choose a workspace" : `${settings.count} image${settings.count === 1 ? "" : "s"}`}</small></button>
   </div>;
 }

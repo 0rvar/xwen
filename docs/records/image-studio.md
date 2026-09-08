@@ -109,6 +109,48 @@ and validated, saved assets must exist, and the supposed inverted start-step che
 was correct. No actionable findings remain. The final bundle was rebuilt after
 the fixes; docs-check and the unchanged ledger pass.
 
+## Gallery cleanup and prompt drafts
+
+2026-09-08. The follow-up adds confirmed permanent image and session deletion,
+submission into an active queue, a fix for submission after stop, and a Flash-Next
+prompt generator. Session management scans every recognized session rather than
+deriving its list or counts from the gallery's newest 200 images. Removing the
+active session rotates to a new one. Image deletion keeps shared input snapshots;
+session deletion removes the whole folder. Files outside the selected workspace,
+symlinked session/output paths and foreign records are refused. Finder metadata is
+allowed, and an owned orphan YAML record does not prevent session cleanup.
+
+The queue preserves request snapshots and FIFO ordering when more jobs arrive.
+Appending while paused preserves that pause; a new submission after the stopped
+queue drains starts without a separate resume. Unfinished work, including failed
+jobs, is capped at 1000. Workspace/server changes and session deletion remain
+blocked while running or pending work exists.
+
+The prompt dialog calls the configured server's `/v1/chat/completions` endpoint
+with the exact `Qwen3.8-Flash-Next` model, `stream: false`, a 512-token cap and
+`chat_template_kwargs.enable_thinking: false`. It reads only message content and
+rejects empty or truncated answers. The draft is editable and replaces the main
+prompt only on explicit use. Late responses after closing the dialog are ignored.
+The server must already have Flash-Next cached; its error is shown without changing
+the current prompt or falling back to another model.
+
+TypeScript and the 15 planner tests pass. Eleven browser flows cover the original
+controls plus FIFO appends, paused appends, restart after drain, canceled/confirmed
+deletion, active-session rotation and editable prompt drafts with error handling.
+The Rust suite checks actual temporary-file deletion, workspace ownership, traversal
+and symlink refusals, 205-image session counts, retained shared inputs, rendering
+concurrency and the authenticated Flash-Next request/response contract. Browser
+fixtures do not claim model quality or native window interaction.
+
+All 12 Rust tests pass (the opt-in image-render smoke test remains ignored). A live
+chat request to the existing server returned a usable telescope/observatory prompt
+from `Qwen3.8-Flash-Next`, with a normal stop and zero reasoning tokens. The response
+is saved at `/tmp/xwen-wishlist-live-prompt.json`. The server was not restarted.
+Frontend and backend reviews plus the external Qwen review ran; fixes included
+late prompt responses, stale history refreshes, Finder metadata and orphan-record
+cleanup. The final macOS bundle builds, and docs-check passes. No model math or
+performance figure changes; the existing ledger remains actionable and unchanged.
+
 ## Not taken now
 
 Pending queue recovery across an app restart is not implemented. Completed results

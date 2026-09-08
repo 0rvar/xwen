@@ -327,3 +327,160 @@ pub fn gallery(workspace: &Workspace) -> Result<Vec<SavedImage>> {
     records.truncate(200);
     Ok(records)
 }
+
+pub fn valid_session_id(id: &str) -> bool {
+    let Some((date, random)) = id.rsplit_once('-') else {
+        return false;
+    };
+    random.len() == 24
+        && random
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && chrono::NaiveDateTime::parse_from_str(date, "%Y%m%d-%H%M%S").is_ok()
+        && date.len() == 15
+}
+
+pub fn session_path(workspace: &Workspace, id: &str) -> Result<std::path::PathBuf> {
+    if !valid_session_id(id) {
+        return Err("Invalid session id".into());
+    }
+    let root = Path::new(&workspace.path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if root != Path::new(&workspace.path) {
+        return Err("Workspace path changed".into());
+    }
+    let path = root.join(id);
+    match fs::symlink_metadata(&path) {
+        Ok(info) => {
+            if !info.is_dir()
+                || info.file_type().is_symlink()
+                || path.canonicalize().map_err(|e| e.to_string())?.parent() != Some(root.as_path())
+            {
+                return Err("Session must be a direct real directory in the workspace".into());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && id == workspace.session_id => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    Ok(path)
+}
+
+pub fn owned_output(
+    session: &Path,
+    file: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    if Path::new(file).components().count() != 1
+        || !matches!(
+            Path::new(file).components().next(),
+            Some(Component::Normal(_))
+        )
+        || !file.ends_with(".png")
+    {
+        return Err("Invalid image id".into());
+    }
+    let png = session.join(file);
+    let yaml = png.with_extension("yaml");
+    for path in [&png, &yaml] {
+        let info = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !info.is_file() || info.file_type().is_symlink() {
+            return Err("Image and metadata must be regular files".into());
+        }
+    }
+    owned_metadata(session, file, &yaml)?;
+    Ok((png, yaml))
+}
+
+fn owned_metadata(session: &Path, file: &str, yaml: &Path) -> Result<()> {
+    if fs::metadata(&yaml).map_err(|e| e.to_string())?.len() > 4_000_000 {
+        return Err("Metadata too large".into());
+    }
+    let metadata: Value = serde_yaml_ng::from_slice(&fs::read(&yaml).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if metadata["app_id"] != APP_ID
+        || metadata["schema_version"] != 1
+        || metadata["session_id"].as_str() != session.file_name().and_then(|s| s.to_str())
+        || metadata["output"]["file"] != file
+    {
+        return Err("Image is not owned by this Image Studio session".into());
+    }
+    Ok(())
+}
+
+pub fn session_image_count(session: &Path) -> Result<usize> {
+    let mut count = 0;
+    for entry in fs::read_dir(session).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or("Unrecognized session file")?;
+        if kind.is_symlink() {
+            return Err("Session contains a symbolic link".into());
+        }
+        if kind.is_dir() && name == "inputs" {
+            for input in fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
+                let input = input.map_err(|e| e.to_string())?;
+                let kind = input.file_type().map_err(|e| e.to_string())?;
+                let name = input.file_name();
+                let name = name.to_str().ok_or("Invalid input snapshot")?;
+                if kind.is_file() && name == ".DS_Store" {
+                    continue;
+                }
+                let Some((hash, extension)) = name.rsplit_once('.') else {
+                    return Err("Invalid input snapshot".into());
+                };
+                if !kind.is_file()
+                    || hash.len() != 64
+                    || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    || !matches!(extension, "png" | "jpg")
+                {
+                    return Err("Session contains unrecognized input files".into());
+                }
+            }
+        } else if kind.is_file() && name == ".DS_Store" {
+            continue;
+        } else if kind.is_file() && name.ends_with(".png") {
+            owned_output(session, name)?;
+            count += 1;
+        } else if kind.is_file() && name.ends_with(".yaml") {
+            let file = format!("{}.png", name.strip_suffix(".yaml").unwrap());
+            if session.join(&file).exists() {
+                owned_output(session, &file)?;
+            } else {
+                owned_metadata(session, &file, &entry.path())?;
+            }
+        } else {
+            return Err("Session contains unrecognized files".into());
+        }
+    }
+    Ok(count)
+}
+
+pub fn sessions(workspace: &Workspace) -> Result<Vec<SessionSummary>> {
+    let mut result = Vec::new();
+    for entry in fs::read_dir(&workspace.path)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(path) = session_path(workspace, &id) else {
+            continue;
+        };
+        if let Ok(image_count) = session_image_count(&path) {
+            result.push(SessionSummary {
+                session_id: id,
+                image_count,
+            });
+        }
+    }
+    if !result.iter().any(|s| s.session_id == workspace.session_id) {
+        result.push(SessionSummary {
+            session_id: workspace.session_id.clone(),
+            image_count: 0,
+        });
+    }
+    result.sort_by(|a, b| b.session_id.cmp(&a.session_id));
+    Ok(result)
+}

@@ -139,6 +139,13 @@ async fn real_png_http_saves_provenance_and_confines_gallery() {
             .await
             .is_err()
     );
+    owned_fixture(std::path::Path::new(&workspace.session_path), "prior");
+    s.delete_image(
+        workspace.path.clone(),
+        workspace.session_id.clone(),
+        format!("{}/prior.png", workspace.session_id),
+    )
+    .unwrap();
     let mut req = request();
     req.init_image = Some(source.clone());
     req.strength = Some(0.6);
@@ -321,10 +328,27 @@ async fn workspace_and_config_cannot_switch_during_request() {
     let w = s
         .select_workspace(t.0.join("images").to_str().unwrap())
         .unwrap();
+    owned_fixture(std::path::Path::new(&w.session_path), "completed");
     let render = s.render(w.session_id, request(), json!({}));
     let assertions = async {
         started_rx.await.unwrap();
         assert!(s.save_config(c.clone()).is_err());
+        let active = s.bootstrap().unwrap().workspace.unwrap();
+        assert!(
+            s.delete_session(active.path.clone(), active.session_id.clone())
+                .is_err()
+        );
+        s.delete_image(
+            active.path.clone(),
+            active.session_id.clone(),
+            format!("{}/completed.png", active.session_id),
+        )
+        .unwrap();
+        assert!(
+            !PathBuf::from(active.session_path)
+                .join("completed.png")
+                .exists()
+        );
         assert!(
             s.select_workspace(t.0.join("other").to_str().unwrap())
                 .is_err()
@@ -460,4 +484,221 @@ async fn checking_draft_connection_does_not_save_settings() {
     invalid.api_key = "bad\nheader".into();
     assert!(s.check_server(Some(invalid)).await.is_err());
     assert_eq!(fs::read(s_config(&t)).unwrap(), before);
+}
+
+fn owned_fixture(session: &std::path::Path, name: &str) {
+    fs::create_dir_all(session).unwrap();
+    let image = png(16, 16);
+    fs::write(session.join(format!("{name}.png")), &image).unwrap();
+    let metadata = json!({"app_id":models::APP_ID,"schema_version":1,"session_id":session.file_name().unwrap().to_str().unwrap(),"output":{"file":format!("{name}.png")}});
+    fs::write(
+        session.join(format!("{name}.yaml")),
+        serde_yaml_ng::to_string(&metadata).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn deletion_is_scoped_preserves_shared_inputs_and_rotates_active_session() {
+    let t = Temp::new();
+    let s = t.studio();
+    s.bootstrap().unwrap();
+    let w = s
+        .select_workspace(t.0.join("images").to_str().unwrap())
+        .unwrap();
+    assert_eq!(s.list_sessions().unwrap()[0].image_count, 0);
+    let session = PathBuf::from(&w.session_path);
+    owned_fixture(&session, "first");
+    owned_fixture(&session, "second");
+    let asset = storage::snapshot(&session, &storage::data(&png(16, 16), "image/png")).unwrap();
+    let snapshot = session.join(asset["path"].as_str().unwrap());
+    fs::write(session.join("inputs/.DS_Store"), "Finder metadata").unwrap();
+    assert!(
+        s.delete_image(
+            "wrong-workspace".into(),
+            w.session_id.clone(),
+            format!("{}/first.png", w.session_id)
+        )
+        .is_err()
+    );
+    assert!(
+        s.delete_image(
+            w.path.clone(),
+            w.session_id.clone(),
+            format!("{}/../first.png", w.session_id)
+        )
+        .is_err()
+    );
+    assert!(
+        s.delete_session(w.path.clone(), "../outside".into())
+            .is_err()
+    );
+    s.delete_image(
+        w.path.clone(),
+        w.session_id.clone(),
+        format!("{}/first.png", w.session_id),
+    )
+    .unwrap();
+    assert!(!session.join("first.png").exists());
+    assert!(!session.join("first.yaml").exists());
+    assert!(snapshot.exists());
+    assert!(session.join("second.png").exists());
+    let next = s
+        .delete_session(w.path.clone(), w.session_id.clone())
+        .unwrap();
+    assert_ne!(next.session_id, w.session_id);
+    assert!(!session.exists());
+    assert!(!PathBuf::from(&next.session_path).exists());
+    assert_eq!(s.list_sessions().unwrap()[0].session_id, next.session_id);
+    let rotated = s
+        .delete_session(next.path.clone(), next.session_id.clone())
+        .unwrap();
+    assert_ne!(rotated.session_id, next.session_id);
+}
+
+#[test]
+fn session_listing_counts_beyond_gallery_limit_and_rejects_foreign_or_symlink() {
+    let t = Temp::new();
+    let s = t.studio();
+    s.bootstrap().unwrap();
+    let historical = s
+        .select_workspace(t.0.join("images").to_str().unwrap())
+        .unwrap();
+    let session = PathBuf::from(&historical.session_path);
+    for index in 0..205 {
+        owned_fixture(&session, &format!("output-{index}"));
+    }
+    fs::write(session.join(".DS_Store"), "Finder metadata").unwrap();
+    let current = s.select_workspace(&historical.path).unwrap();
+    let summaries = s.list_sessions().unwrap();
+    assert_eq!(
+        summaries
+            .iter()
+            .find(|s| s.session_id == historical.session_id)
+            .unwrap()
+            .image_count,
+        205
+    );
+    let foreign = "20260908-120000-aaaaaaaaaaaaaaaaaaaaaaaa";
+    let foreign_path = PathBuf::from(&current.path).join(foreign);
+    fs::create_dir(&foreign_path).unwrap();
+    fs::write(foreign_path.join("keep.txt"), "foreign").unwrap();
+    assert!(
+        s.delete_session(current.path.clone(), foreign.into())
+            .is_err()
+    );
+    assert!(foreign_path.join("keep.txt").exists());
+    let link = "20260908-120000-bbbbbbbbbbbbbbbbbbbbbbbb";
+    std::os::unix::fs::symlink(&session, PathBuf::from(&current.path).join(link)).unwrap();
+    assert!(s.delete_session(current.path.clone(), link.into()).is_err());
+    let image_link = session.join("linked.png");
+    std::os::unix::fs::symlink(session.join("output-0.png"), &image_link).unwrap();
+    fs::copy(session.join("output-0.yaml"), session.join("linked.yaml")).unwrap();
+    assert!(
+        s.delete_image(
+            current.path.clone(),
+            historical.session_id.clone(),
+            format!("{}/linked.png", historical.session_id)
+        )
+        .is_err()
+    );
+    assert!(
+        s.delete_session(current.path.clone(), historical.session_id.clone())
+            .is_err()
+    );
+    fs::remove_file(image_link).unwrap();
+    fs::remove_file(session.join("linked.yaml")).unwrap();
+    owned_fixture(&session, "orphaned-metadata");
+    fs::remove_file(session.join("orphaned-metadata.png")).unwrap();
+    assert!(
+        s.list_sessions()
+            .unwrap()
+            .iter()
+            .any(|summary| summary.session_id == historical.session_id)
+    );
+    let unchanged = s
+        .delete_session(current.path.clone(), historical.session_id)
+        .unwrap();
+    assert_eq!(unchanged.session_id, current.session_id);
+    assert!(!session.exists());
+}
+
+#[tokio::test]
+async fn prompt_generation_uses_exact_model_auth_and_plain_answer_only() {
+    use std::io::{Read, Write};
+    let t = Temp::new();
+    let s = t.studio();
+    s.bootstrap().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let thread = std::thread::spawn(move || {
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = vec![];
+            let mut chunk = [0u8; 4096];
+            let body = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&buffer[..pos]);
+                    let len = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if buffer.len() >= pos + 4 + len {
+                        assert!(header.starts_with("POST /v1/chat/completions"));
+                        assert!(
+                            header
+                                .to_lowercase()
+                                .contains("authorization: bearer secret")
+                        );
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &buffer[pos + 4..pos + 4 + len],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            assert_eq!(body["model"], "Qwen3.8-Flash-Next");
+            assert_eq!(body["stream"], false);
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+            assert_eq!(body["max_tokens"], 512);
+            assert_eq!(
+                body["messages"][1]["content"],
+                if index == 0 { "a lighthouse" } else { "" }
+            );
+            let response=match index {0=>json!({"choices":[{"finish_reason":"stop","message":{"content":" A lighthouse in violet twilight. ","reasoning_content":"Never expose reasoning"}}]}),1=>json!({"choices":[{"finish_reason":"length","message":{"content":"truncated"}}]}),_=>json!({"choices":[{"finish_reason":"stop","message":{"content":null,"reasoning_content":"Not a prompt"}}]})}.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+    let mut config = Config::default();
+    config.server_url = format!("http://{addr}");
+    config.api_key = "secret".into();
+    s.save_config(config).unwrap();
+    assert_eq!(
+        s.generate_prompt("a lighthouse".into()).await.unwrap(),
+        "A lighthouse in violet twilight."
+    );
+    assert!(
+        s.generate_prompt("".into())
+            .await
+            .unwrap_err()
+            .contains("token limit")
+    );
+    assert!(
+        s.generate_prompt("".into())
+            .await
+            .unwrap_err()
+            .contains("no prompt")
+    );
+    thread.join().unwrap();
 }

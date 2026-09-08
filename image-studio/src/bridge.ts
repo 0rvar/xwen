@@ -16,6 +16,8 @@ export interface PreprocessedImage {
   height: number;
 }
 
+export interface SessionSummary { session_id: string; image_count: number }
+
 export interface NativeBridge {
   bootstrap(): Promise<Bootstrap>;
   saveConfig(config: Config): Promise<Config>;
@@ -26,6 +28,10 @@ export interface NativeBridge {
   preprocess(image: string, kind: "canny" | "depth" | "pose"): Promise<PreprocessedImage>;
   render(sessionId: string, request: RenderRequest, context: object): Promise<SavedImage[]>;
   listImages(): Promise<SavedImage[]>;
+  listSessions(): Promise<SessionSummary[]>;
+  deleteImage(workspacePath: string, sessionId: string, imageId: string): Promise<void>;
+  deleteSession(workspacePath: string, sessionId: string): Promise<Workspace>;
+  generatePrompt(idea: string): Promise<string>;
   reveal(path: string): Promise<void>;
   chooseDirectory(title: string): Promise<string | null>;
   chooseImage(title: string): Promise<string | null>;
@@ -41,6 +47,10 @@ const nativeBridge: NativeBridge = {
   preprocess: (image, kind) => invoke<PreprocessedImage>("preprocess", { image, kind }),
   render: (sessionId, request, context) => invoke<SavedImage[]>("render", { sessionId, request, context }),
   listImages: () => invoke<SavedImage[]>("list_images"),
+  listSessions: () => invoke<SessionSummary[]>("list_sessions"),
+  deleteImage: (workspacePath, sessionId, imageId) => invoke<void>("delete_image", { workspacePath, sessionId, imageId }),
+  deleteSession: (workspacePath, sessionId) => invoke<Workspace>("delete_session", { workspacePath, sessionId }),
+  generatePrompt: (idea) => invoke<string>("generate_prompt", { idea }),
   reveal: (path) => invoke<void>("reveal", { path }),
   chooseDirectory: (title) => open({ directory: true, multiple: false, title }),
   chooseImage: (title) => open({
@@ -61,6 +71,7 @@ function createPreviewBridge(): NativeBridge {
   const query = new URLSearchParams(location.search);
   const firstLaunch = query.has("firstLaunch");
   const portraitInputs = query.has("portrait");
+  const renderDelay = Number(query.get("renderDelay") ?? 120);
   let cancelPicker = query.has("cancelPicker");
   let config: Config = {
     server_url: firstLaunch ? "" : "http://127.0.0.1:5241",
@@ -118,7 +129,7 @@ function createPreviewBridge(): NativeBridge {
     render: async (sessionId, request, context) => {
       const previewWindow = globalThis as typeof globalThis & { __XWEN_PREVIEW_REQUESTS__?: RenderRequest[] };
       previewWindow.__XWEN_PREVIEW_REQUESTS__ = [...(previewWindow.__XWEN_PREVIEW_REQUESTS__ ?? []), request];
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      await new Promise((resolve) => setTimeout(resolve, renderDelay));
       const failureKey = `${request.prompt}|${request.seed}`;
       if (request.prompt.toLowerCase().includes("fail preview") && !failedOnce.has(failureKey)) {
         failedOnce.add(failureKey);
@@ -141,6 +152,21 @@ function createPreviewBridge(): NativeBridge {
       return [saved];
     },
     listImages: async () => images.map((image) => ({ ...image })),
+    listSessions: async () => [...new Set([workspace.session_id, ...images.map((image) => image.session_id)])].map((session_id) => ({ session_id, image_count: images.filter((image) => image.session_id === session_id).length })),
+    deleteImage: async (_path, sessionId, imageId) => { images = images.filter((image) => image.session_id !== sessionId || image.id !== imageId); },
+    deleteSession: async (_path, sessionId) => {
+      images = images.filter((image) => image.session_id !== sessionId);
+      if (workspace.session_id === sessionId) {
+        const session_id = `preview-session-${Date.now()}`;
+        workspace = { ...workspace, session_id, session_path: `${workspace.path}/${session_id}` };
+      }
+      return { ...workspace };
+    },
+    generatePrompt: async (idea) => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (idea.includes("fail prompt")) throw new Error("Flash-Next is not cached on this server.");
+      return `${idea.trim() || "A secluded mountain observatory"}, soft evening light, rich textures, carefully composed photograph`;
+    },
     reveal: async () => undefined,
     chooseDirectory: async () => {
       if (cancelPicker) { cancelPicker = false; return null; }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PlannedJob, SavedImage } from "./domain";
+import { MAX_JOBS, type PlannedJob, type SavedImage } from "./domain";
 import { bridge } from "./bridge";
 
 export type QueueStatus = "pending" | "running" | "done" | "error";
@@ -38,6 +38,10 @@ export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
   }, [items, paused]);
 
   const enqueue = useCallback((jobs: PlannedJob[], sessionId: string) => {
+    const unfinished = items.filter((item) => item.status !== "done").length;
+    if (unfinished + jobs.length > MAX_JOBS) {
+      throw new Error(`The queue may contain at most ${MAX_JOBS} unfinished images.`);
+    }
     const additions = jobs.map((job) => ({
       key: crypto.randomUUID(),
       sessionId,
@@ -49,9 +53,11 @@ export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
       status: "pending" as const,
       outputs: [],
     }));
-    setPaused(false);
+    // A stop applies to work appended while it is still draining. Once no work remains,
+    // the next submission is a new queue run and should start without a separate resume.
+    if (!items.some((item) => item.status === "pending" || item.status === "running")) setPaused(false);
     setItems((current) => [...current, ...additions]);
-  }, []);
+  }, [items]);
 
   const retry = useCallback((key: string) => {
     setItems((current) => current.map((item) => item.key === key && item.status === "error" ? { ...item, status: "pending", error: undefined } : item));

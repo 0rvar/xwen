@@ -4,6 +4,15 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-08 — Image Studio adds deletion, queue appends and Flash-Next prompt drafts
+
+The gallery confirms image and whole-session deletion. Session management lists
+all recognized sessions beyond the preview limit, and deleting the current session
+starts a fresh one. Jobs can append during rendering or a pause, and submitting
+after a stopped queue drains starts normally. Flash-Next drafts editable image
+prompts through the configured server. [Usage](../image-studio/README.md),
+[behavior and verification](records/image-studio.md#gallery-cleanup-and-prompt-drafts).
+
 ## 2026-09-08 — Image Studio renders through the image APIs with workspaces and parameter batches
 
 `image-studio/` adds a separate Tauri desktop app for text-to-image, img2img,
