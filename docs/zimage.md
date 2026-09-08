@@ -753,7 +753,9 @@ norm, and none of them a math change. The record is
 **The trap on that last one: the flash kernel is not a faster arithmetic path.** It is a
 vendored copy of candle's MLX steel attention, simdgroup matmul with f32 accumulate, so it
 runs at candle's rate and the switch moved `attn.sdpa` only 740 to 687 ms profiled, about
-11.3 to 12.5 TFLOP/s. What it bought was the f16 k/v traffic and the single-pass permutes.
+11.3 to 12.5 TFLOP/s on the profiled basis, or about 16 real once the merged profile is
+deflated. What it bought was the f16 k/v traffic and the single-pass permutes, not
+arithmetic.
 Do not size an attention change on this graph as if the flash arm were the tensor path;
 attention at the gemms' rate is a Metal-4 tensor-op kernel that does not exist yet
 (TODO.md, and decisions.md "Bidirectional attention is a query-position trick on the

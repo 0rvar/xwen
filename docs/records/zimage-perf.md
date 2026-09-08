@@ -477,15 +477,18 @@ wrong for a reason worth writing down. The vendored flash kernel is a copy of ca
 steel attention: simdgroup matmul with f32 accumulate, which is the kernel class the gemm
 A/B of 2026-09-07 identified as the wrong one for this chip. Switching to it did not change
 the arithmetic path at all. **`attn.sdpa` moved 740 to 687 ms profiled**, 655 on a second
-run, which is roughly 11.3 to 12.5 TFLOP/s, and that is the same rate within noise.
+run, which on the profiled basis is roughly 11.3 to 12.5 TFLOP/s, and that is the same rate
+within noise. Deflated against the merged step the real rate is about 16 TFLOP/s, so the
+f16 k and v did lift it; what did not move is the kernel class.
 
 What the arm bought is traffic and copies. `attn.transpose` went 328 to 158 ms profiled and
 `attn.untranspose` 121 to 76, from the f16 k and v and the fused permutes, and that is where
 the measured step-time gain comes from. Attention at the gemms' rate needs a Metal-4
 tensor-op attention kernel: `matmul2d` for both products with an online softmax over
 cooperative-tensor elements and P staged through threadgroup memory. It is a new kernel and
-not a flag, it is worth roughly 400 ms per step and 3.2 s per image, and it is the Front
-item this arc promoted in place of itself.
+not a flag. The merged profiler pass sized it properly at 0.53 s per step against 0.23 at
+the gemms' rate, so 0.30 s per step and **2.4 s per image**, and it is the Front item this
+arc promoted in place of itself.
 
 ### The SwiGLU dual gemm: built, correct, and slower
 
@@ -627,23 +630,28 @@ row can carry one.
 | the four gemms together | 1495 | **~1260** |
 | the nine elementwise and copy rows together | 1001 | **~354** |
 
-**The deflator is refitted, and it is not one number.** The four gemm rows are 1495 ms
-profiled against 1.26 s real, which is 46.7 TFLOP at the ~37 TFLOP/s the kernel measures in
-isolation, so the gemm marks carry **1.19x**. Applying the same factor to `attn.sdpa` puts
-it at ~536 ms real. What is left of the 2.15 s step is then 354 ms for everything
-elementwise and every copy, against 1001 ms of profiled rows, so those rows carry about
-**3x** and **only their sum is trustworthy**. That is the shape the earlier caveat predicted
-and could not quantify: one factor for the few large marks and a much bigger one for the
-many small ones, because a mark's cost is closer to fixed than proportional.
+**This is where the budget closes, and it closes with two deflators rather than one.** The
+four gemm rows sum to 1495 ms profiled. Their arithmetic is 46.7 TFLOP, and at the
+~37 TFLOP/s the kernel measures in isolation at T 4128 that is **1.26 s real**, so the gemm
+marks carry **1.19x**. The important half of that is what it says about the instrument: the
+sync-and-evict costs the gemms too, not only the small rows, so the earlier reading that
+treated a gemm row as a measurement was already about 19% high. `attn.sdpa` deflates by the
+same factor to **~0.53 s**, which is about **16 TFLOP/s** on roughly 8.4 TFLOP of attention,
+up from 11.3 before the f16 k and v. The remainder, 2.15 less 1.26 less 0.53, is
+**~0.34 s real** for every elementwise row and every copy, against 1001 ms of profiled rows,
+so those carry about **3x** and **only their sum may be quoted**. Attributed inside that sum,
+in real seconds: norm+scale ~0.09, `attn.qknorm` ~0.05, `ffn.silu_mul` ~0.08, the four
+copies ~0.06, `attn.rope` ~0.04, the two gated residuals ~0.02.
 
-Two loose ends in the table, both stated rather than smoothed. The listed rows sum to 3155
-of the 3371 profiled total, leaving 216 ms in the per-phase refiner rows that are not broken
-out here. And **`ffn.w1w3` has two derivations that disagree by 0.23 s**: the 1.19x
-deflation puts it at ~673 ms, while its own FLOPs, 22.1 TFLOP at the 24.5 TFLOP/s the
-profiler measures for it, put it at 0.90 s. Both cannot be right, and 0.90 s does not fit
-inside the 1.26 s the four gemms share. The ledger below quotes the FLOPs-based 0.90 for
-that row because that is the figure its lever is sized against, and settling which
-derivation holds is work for the next pass rather than a thing to assert now.
+One loose end, stated rather than smoothed. The listed rows sum to 3155 of the 3371 profiled
+total, leaving 216 ms in the per-phase refiner rows that are not broken out here. And one
+number to know the basis of: `ffn.w1w3` is quoted below at 0.90 s from its own FLOPs,
+22.1 TFLOP at the 24.5 TFLOP/s the profiler measures for it, where the 1.19x aggregate
+deflation would put it at ~0.67 s. The two bases differ because the 1.26 s bucket prices all
+four gemms at one average rate and the per-row figure prices this one at its own. The
+SwiGLU lever is sized on the per-row basis, so if the aggregate basis holds instead its gain
+is nearer 1 s per image than 2.6, and `tests/zimage_microbench.rs` settles it cheaply at
+these shapes.
 
 The VAE decode profiles at 6792 ms against 5.19 s real, so 1.31x, and its rows are where
 the conv work actually sits:
@@ -666,42 +674,47 @@ the lever rather than anything global.
 ## Lever ledger
 
 Rewritten 2026-09-08, after the two arcs above and the profiler pass on the merged tree.
-The base is the **measured 2.15 s steady-state step** and a warm image of about 25 s, of
-which 22.4 s is eight steady-state steps plus the 5.19 s decode and about 3 s is load and
-encode. Every millisecond figure is a REAL figure, deflated by the two factors fitted in
-"The merged profile, and the deflator refitted" above: 1.19x on the gemm and sdpa rows,
-about 3x on the elementwise ones, whose sum alone is trustworthy. Gain per image is the
-row's saving times eight steps, or the row itself for the VAE.
+The base is the **measured 2.15 s steady-state step** and a warm image of about 25 s, whose
+render is **22.4 s, being 17.2 s of eight steady-state steps plus the 5.19 s decode**, with
+about 3 s of load and encode outside it. Every figure below is a REAL figure off the
+deflation in "The merged profile, and the deflator refitted" above: gemms and sdpa at 1.19x,
+the elementwise sum at about 3x. Gain per image is the row's saving times eight steps, or
+the row itself for the VAE.
 
 | lever | today | ceiling, and how it was derived | gain per image | cost class |
 | --- | --- | --- | --- | --- |
-| the VAE conv path | 5.19 s per image | 1.0-1.5 s with a direct 3x3 conv or MPSGraph; 9.89 TFLOP at the gemms' rate is ~0.3 s, so 1.0-1.5 is the realistic form | **3.7-4.2 s** | new conv path; bf16 is refuted, below |
-| the f32 store in the SwiGLU pair | 0.90 s/step, `ffn.w1w3` at 24.5 TFLOP/s | 0.57 s at `ffn.w2`'s own 38.7 for identical FLOPs, the difference being the 169 MB of f32 it writes against w2's 63; the route is a bf16 SwiGLU intermediate | **2.6 s** | a precision change the parity gate arbitrates; the `silu_mul` epilogue route is REFUTED |
-| a Metal-4 tensor-op attention kernel | 0.53 s/step at ~12.5 TFLOP/s | 0.23 s at the gemms' rate; the flag route is spent, the vendored flash kernel being a copy of candle's steel attention | **2.4 s** | new kernel: `matmul2d` for both products, online softmax over cooperative-tensor elements, P through threadgroup memory, head_dim 128, bidirectional, f32 accumulate |
-| gemm fusion and tile tuning | ~1.26 s/step for the four gemms at 30-39 TFLOP/s | ~1.0 s, UNPRICED: fuse q, k and v into one N=11520 gemm and the SwiGLU pair into one N=20480, then tune the tiles at those shapes | ~2 s | host-side plus tile work, no new kernel class |
-| the remaining elementwise and copies | ~0.34 s/step for all nine rows together | ~0.15 s with gemm epilogues and a fused per-head `attn.qknorm`; no single row is worth an arc, which is why they are one line now | ~1.5 s | small kernels, no math change |
-| the four gemms' own rate against the peak | 30-39 TFLOP/s | about 70 TFLOP/s hardware peak, extrapolated from a 5-core A19 at an assumed clock, medium confidence | not planned | this is the rate the kernel gives |
+| the VAE conv path | 5.2 s per image | 1.0-1.5 s with a direct 3x3 conv or MPSGraph; 9.89 TFLOP at the gemms' rate is ~0.3 s, so 1.0-1.5 is the realistic form | **3.7-4.2 s** | new conv path, but the cheap wins come first and may be worth 0.5-1 s alone: fused silu at the 28 `Activation::Swish` sites, SDPA for the mid-block's materialized 16384-token softmax, a fused GroupNorm for nine full-tensor passes. bf16 is refuted, below |
+| the f32 store in the SwiGLU pair | 0.90 s/step, `ffn.w1w3`'s 22.1 TFLOP at 24.5 TFLOP/s | 0.57 s at `ffn.w2`'s own 38.7 for the same kernel and the same shape class; the difference is the 169 MB of f32 it writes against w2's 63, so the route is a bf16 SwiGLU intermediate | **2.6 s**, on the per-row basis; ~1 s if the aggregate basis holds | a precision change the parity gate arbitrates. The `silu_mul` gemm-epilogue route is REFUTED (decisions.md "The SwiGLU dual gemm is REFUTED") |
+| a Metal-4 tensor-op attention kernel | 0.53 s/step at ~16 TFLOP/s | 0.23 s at the gemms' own rate; the flag route is spent, the vendored flash kernel being a copy of candle's steel attention | **2.4 s** | new kernel: `matmul2d` for both products, online softmax over cooperative-tensor elements, P through threadgroup memory, head_dim 128, bidirectional, f32 accumulate |
+| the gemm rate beyond that | ~1.26 s/step for the four gemms at 30-39 TFLOP/s | ~1.0 s, UNPRICED: fuse q, k and v into one N=11520 gemm and the SwiGLU pair into one N=20480, then tune the tiles for M around 4000, which no sweep has covered | ~2 s | host-side plus tile work, no new kernel class, and **cheap to price**: `tests/zimage_microbench.rs` already runs these shapes |
+| the remaining elementwise and copies | ~0.34 s/step for all of them together: norm+scale ~0.09, `attn.qknorm` ~0.05, `ffn.silu_mul` ~0.08, copies ~0.06, `attn.rope` ~0.04, gates ~0.02 | ~0.15 s with gemm epilogues and a fused per-head `attn.qknorm`; no single row is worth an arc, which is why they are one line | ~1.5 s | small kernels, no math change |
 
-**The dense floor is a ~1.25 s step and a ~11.5 s render**, against 2.15 s and 22.4 s
-today, and that is with every row above taken. It is not the sum of the savings, because
-the gemm-side rows overlap: the SwiGLU f32 store lives inside the four-gemm bucket, so
-taking the store and then fusing the pair does not pay twice. Read the floor as the figure
-and the rows as the ranking.
+**The dense bf16 floor is a ~1.25 s step, ~10 s of steps, a ~1.2 s decode and a ~11.5 s
+render**, against 22.4 s today, with every row above taken. It is not the sum of the
+savings, because the SwiGLU f32 store lives inside the four-gemm bucket: taking the store
+and then fusing the pair does not pay twice. Read the floor as the figure and the rows as
+the ranking.
 
-Below the floor there are three things and none of them is a kernel.
+Below that floor nothing is a kernel, and all three are record lines with reopen conditions
+rather than ledger items.
 
-- **Fewer steps.** Six instead of eight saves 4.3 s of today's render and four saves 8.6 s,
-  which is more than any lever in the table and is a quality decision rather than a
-  performance one. Turbo is distilled for eight and the model card says nine
-  ([zimage.md](../zimage.md)), so this needs an image-quality judgement from someone
-  looking at the output, not a measurement.
-- **Step caching**, reusing part of a denoising step's result across steps. Worth 0 to 2 s,
-  unpriced, and the range is that wide because nothing here has measured how much of a
-  Z-Image step is redundant between neighbouring sigmas.
-- **int8 gemms.** About 4.5 s of today's render at the same step structure, and weeks of
-  work, and it only pays through a W8A8 kernel that reaches the M5 neural accelerators
-  rather than through byte reduction, this graph being compute-bound by 40x
-  (decisions.md "The transformer runs bf16 end to end").
+- **Fewer denoising steps.** Six instead of eight saves 4.3 s of today's render and four
+  saves 8.6 s; after the kernel work above those become 2.5 s and 5 s, so this gets less
+  attractive as the step gets cheaper, not more. Turbo is distilled for eight and the model
+  card says nine ([zimage.md](../zimage.md)), so it is an image-quality judgement and not a
+  measurement, and the stock ComfyUI node's `quality` field is the natural switch to hang it
+  on, that being the one knob the node already sends. Reopen on a product decision about how
+  many steps an image gets.
+- **Step caching**, TeaCache or a first-block cache, reusing part of a step's result across
+  neighbouring steps. Worth 0 to 2 s and UNPRICED, and the reason the range starts at zero is
+  structural: an 8-step schedule at static shift 3.0 spaces its sigmas far apart, which is
+  the regime these caches work worst in, having been built for 30-plus-step schedules where
+  adjacent steps barely differ. Reopen on a priced experiment, which is a day.
+- **int8 gemms on the tensor units**, worth about 1.8x fp16 compute and so about 4.5 s of
+  today's render. Weeks of work: W8A8 calibration and a new set of parity bars, because the
+  existing ones are read against bf16 arithmetic. Reopen if sub-10 s at eight steps becomes a
+  requirement rather than a nice number (decisions.md "The transformer runs bf16 end to
+  end").
 
 Three things are priced as non-levers rather than argued away.
 

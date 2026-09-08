@@ -22,8 +22,8 @@ bitwise identical to candle's unmasked f32 sdpa at all five shapes tested, and
 and `basic`, logging the arm only when it is not the default, the rule the linear arm
 already followed. That arc read **3.42-3.46 s per step and 512x512 0.56-0.58**, and it
 corrected its own ceiling: the flash kernel is a vendored copy of candle's steel attention,
-so `attn.sdpa` only moved 740 to 687 ms at ~12.5 TFLOP/s and the gain came from f16 k/v and
-fused permutes instead. Attention at the gemms' rate needs a Metal-4 tensor-op attention
+so `attn.sdpa` only moved 740 to 687 ms profiled, ~16 TFLOP/s real, and the gain came from
+f16 k/v and fused permutes instead. Attention at the gemms' rate needs a Metal-4 tensor-op attention
 kernel, which is the new Front item at ~400 ms per step. The ledger's other route, a
 `silu_mul` epilogue on the SwiGLU gemm, is REFUTED: the dual gemm was built, is
 numerically right at 5e-8, and is 15% slower isolated and 2-4% slower in situ. The
@@ -35,14 +35,16 @@ its own. **Merged, the two compose almost perfectly: a 1024x1024 step is 2.15 s 
 5.0-5.25 s and 50.2 s the morning before. That is 29 TFLOP/s end to end against the gemms'
 own 30-39, so
 the step now runs at close to the rate of its dominant kernel. At 512x512 xwen is level with
-torch MPS bf16, which was 3.5x ahead on 2026-09-07. A profiler pass on the merged tree
-refitted the deflator into the two numbers it always needed, 1.19x on the four gemm and sdpa
-marks and about 3x on the nine elementwise ones, so a step is **1.26 s of gemms, 0.53 s of
-attention and 0.34 s of everything else**, and the ledger is re-ranked off it: the VAE conv
-path is now the largest lever on the graph at 3.7-4.2 s per image, the SwiGLU f32 store
-second at 2.6 s, the tensor-op attention kernel third at 2.4 s, gemm fusion unpriced at ~2 s.
-Taking all of them puts a step at ~1.25 s and a render at ~11.5 s against 22.4 today, and
-below that floor there is only fewer steps, step caching or int8.
+torch MPS bf16, which was 3.5x ahead on 2026-09-07. A profiler pass on the merged tree closed the budget
+with the two deflators it always needed, 1.19x on the four gemm rows and the sdpa row and
+about 3x on the elementwise ones, so a step is **1.26 s of gemms, 0.53 s of attention and
+0.34 s of everything else** and the sync-and-evict turns out to cost the gemms too. The
+ledger is re-ranked off it: the VAE conv path is now the largest lever on the graph at
+3.7-4.2 s per image, the SwiGLU f32 store second at 2.6 s, the tensor-op attention kernel
+third at 2.4 s, gemm fusion and tile tuning unpriced at ~2 s, and every elementwise row
+together ~1.5 s. Taking all of it is a **~1.25 s step and a ~11.5 s render against 22.4
+today**; below that floor there is only fewer steps, step caching or int8, all three record
+lines with reopen conditions.
 Parity on the merged tree: step-0 velocity cosine 0.999999 at mean relative error 0.0008,
 final latent 0.999672, image PSNR 46.09 dB against the reference's own bf16 arm at 32.40,
 VAE 92.62, both brackets outside, 1336 lib tests green. The 0.9 dB the norm fold costs is

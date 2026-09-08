@@ -408,7 +408,7 @@ compared with itself (AGENTS.md "Verification workflow"). **What the switch did 
 arithmetic.** The vendored flash kernel is a copy of candle's MLX steel attention, the same
 simdgroup-matmul class the 2026-09-07 gemm A/B named as the wrong one for this chip, so it
 runs at candle's rate: `attn.sdpa` moved 740 to 687 ms profiled, about 11.3 to 12.5
-TFLOP/s. The gain that did arrive came from f16 k and v and from `ops::permute_01_f16`
+TFLOP/s on that basis and about 16 real once the merged profile is deflated. The gain that did arrive came from f16 k and v and from `ops::permute_01_f16`
 fusing each permute into one pass, which took `attn.transpose` 328 to 158 ms and
 `attn.untranspose` 121 to 76. Attention at the gemms' rate is a Metal-4 tensor-op attention
 kernel and a Front item, not a flag. `XWEN_ZIMAGE_ATTN` now names three arms, `flash` (the

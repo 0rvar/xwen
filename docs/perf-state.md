@@ -277,10 +277,11 @@ A 1024x1024 step is about 62 TFLOP, so 2.15 s is **roughly 29 TFLOPS end to end*
 TFLOP/s in situ** and are unchanged: 30.0 for q, k and v, 31.6 for the output projection,
 24.5 for the SwiGLU pair and 38.7 for its down projection. So the step now runs at close to
 the rate of its own dominant kernel, where on 2026-09-07 it ran at about half of it.
-**Attention runs at about 12.5 TFLOP/s**, up from 11.3, and that is the flat part of the
-picture: the shipped `ops::flash_attn_bidirectional` is a vendored copy of candle's steel
-attention, so it is the same kernel class at the same rate, and only its k/v traffic and its
-permutes got cheaper. Where a step goes, in REAL milliseconds off the merged profiler pass:
+**Attention runs at about 16 TFLOP/s**, up from 11.3, and it is still the slowest large
+plane: the shipped `ops::flash_attn_bidirectional` is a vendored copy of candle's steel
+attention, so it is the same kernel class, and what lifted the rate was the f16 k and v and
+the single-pass permutes rather than the arithmetic. Where a step goes, in REAL milliseconds
+off the merged profiler pass:
 
 | bucket | ms per step, real | before 2026-09-08 |
 | --- | --- | --- |
@@ -288,17 +289,19 @@ permutes got cheaper. Where a step goes, in REAL milliseconds off the merged pro
 | `attn.sdpa` | ~536 | 740 |
 | all nine elementwise and copy rows together | ~354 | ~1190 |
 
-**The deflator is two numbers now, and that is the point.** The four gemm rows read 1495 ms
+**The deflator is two numbers, and the budget closes.** The four gemm rows read 1495 ms
 profiled against 1.26 s real, which is 46.7 TFLOP at the ~37 TFLOP/s the kernel measures in
-isolation, so the large marks carry 1.19x; the same factor puts `attn.sdpa` at ~536 ms; and
-the 354 ms of step left over faces 1001 ms of profiled elementwise rows, so those carry
-about 3x and only their SUM may be quoted. A mark's cost is closer to fixed than
+isolation, so the large marks carry 1.19x. The sync-and-evict costs the gemms too, not only
+the small rows, which is the part the earlier reading had wrong. The same factor puts
+`attn.sdpa` at ~536 ms and about 16 TFLOP/s, and the 354 ms of step left over faces 1001 ms
+of profiled elementwise rows, so those carry about 3x and **only their sum may be quoted**:
+inside it, norm+scale ~0.09 s, `attn.qknorm` ~0.05, `ffn.silu_mul` ~0.08, the four copies
+~0.06, `attn.rope` ~0.04, the gates ~0.02. A mark's cost is closer to fixed than
 proportional, which is why one multiplier was never going to fit both populations
 (decisions.md "A profiled row that shows a fusion win is not a result until the fusion is
-confirmed unprofiled"). One row has two derivations that disagree by 0.23 s, `ffn.w1w3`, and
-the record says which one its lever is sized against. The ranking with ceilings and expected
-gains is [records/zimage-perf.md](records/zimage-perf.md) "Lever ledger", whose dense floor
-is a ~1.25 s step and a ~11.5 s render against 2.15 s and 22.4 s today.
+confirmed unprofiled"). The ranking with ceilings and expected gains is
+[records/zimage-perf.md](records/zimage-perf.md) "Lever ledger", whose dense bf16 floor is a
+~1.25 s step, ~10 s of steps, a ~1.2 s decode and a ~11.5 s render against 22.4 s today.
 
 Footprint was **not measured**: `footprint`, `ps` and `vmmap` were all refused from the
 agent sandbox. The load figures
@@ -368,9 +371,9 @@ torch MPS bf16 on this model at 512x512. **36-38 TFLOPS is what xwen's own tenso
 measures** at the model's shapes in isolation, and the step runs at about 29 end to end
 after 2026-09-08, so the step is close to the rate of its own dominant kernel and the levers
 left are the two planes that are NOT at that rate plus the kernel rate itself: attention at
-12.5 TFLOP/s and the SwiGLU pair at 24.5 against its own down projection's 38.7. Taking
-every priced row puts a step at about 1.25 s and a render at about 11.5 s. At 70 TFLOPS a
-step would be 0.85 s. Quantization is not on that
+16 TFLOP/s and the SwiGLU pair at 24.5 against its own down projection's 38.7. Taking every
+priced row puts a step at about 1.25 s and a render at about 11.5 s. At 70 TFLOPS a step
+would be 0.85 s. Quantization is not on that
 list: it is a footprint lever here and cannot move a step (decisions.md "The transformer
 runs bf16 end to end"). The lever ranking itself lives in
 [records/zimage-perf.md](records/zimage-perf.md).
