@@ -16,7 +16,8 @@ normalized tensor is never written except for the mid-block attention. **VAE dec
 `src/ops/flash_t.metal`, bidirectional flash attention with QK^T and PV through
 `mpp::tensor_ops::matmul2d`: **5.80 ms against 20.05 isolated at 30 x 4128 x 128, 45.1 against
 13.1 TFLOP/s**, profiled `attn.sdpa` 698 to 231 ms, parity step-0 cosine 0.999999 at mean
-rel 0.0010 and image PSNR 45.60 dB (0.5 dB under the steel arm); `XWEN_ZIMAGE_ATTN` names
+rel 0.0010 and image PSNR 45.60 dB as landed, 46.54 after the review fixes in 7456e5c;
+`XWEN_ZIMAGE_ATTN` names
 `tensor` (default), `flash`, `fused` and `basic`. The bf16 SwiGLU store was built on the
 branch `zimage-ffn` (5e7a6ea), is bit-exact and is REFUTED: the gemm runs 37-45 TFLOP/s
 with the f32 store, the profiled 24.5 that priced the row was the buffer-pool eviction, and

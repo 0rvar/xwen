@@ -493,7 +493,9 @@ steel copy's 20.05, 45.1 against 13.1 TFLOP/s, 3.5x, and 2.9x at the 512x512 sha
 per step against 2.15-2.36. Accuracy against candle's f32 sdpa is rel L2 1.6e-4 to 4.5e-4,
 and the parity gate on the tensor arm reads step-0 cosine 0.999999, mean rel 0.0010, final
 latent 0.999627, image PSNR 45.60 dB against the steel arm's 46.09, so it costs 0.5 dB and
-stays 13 dB above the reference's own bf16 arm. Three things about the kernel are structural
+stays 13 dB above the reference's own bf16 arm. (2026-09-08, later: the second review moved the
+padded-column mask after the scaling, 7456e5c, and the same gate reads mean rel 0.0011, final
+latent 0.999635, image PSNR 46.54 dB, a rounding change inside the bars.) Three things about the kernel are structural
 rather than tuned. It is per-simdgroup, each simdgroup owning 16 query rows and walking the
 keys with no barrier, because this SDK's input cooperative tensors, `reduce_rows` and
 `map_iterator` are all `static_assert`ed to simdgroup scope, so the threadgroup-scope design

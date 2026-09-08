@@ -982,6 +982,23 @@ bounding; barriers; threadgroup memory sizing; the online softmax at a positive 
 encoder staying on candle; env parsing; the shared dispatch changes for the language-model
 paths.
 
+A second review (`/tmp/agent-report-review-arc3-opus.md`) found the kernels clean of
+out-of-bounds access, missing barriers, threadgroup overflow and softmax errors, and found
+one regression in c43a3e9 plus contract and coverage gaps, all fixed in 7456e5c. The
+regression: `Conv::new` built its direct planes from the arm alone while the blocks hand it
+the load-time arm, so once the `Module` impl took the direct path a CPU decoder on the xwen
+arm errored where it had fallen back; the planes are now built only on a Metal device. The
+kernel now masks the padded key columns AFTER the scale is applied, so the sentinel stays
+finite at any positive scale instead of overflowing to negative infinity above ln 2 under
+fast math, and two `static_assert`s pin the slot bitmask widths so a geometry past them
+fails to compile. Smaller: same-device checks on the conv's fusion tensors, the layout probe
+asserts the capacity it pins, and `xwen image` validates `XWEN_ZIMAGE_VAE` before loading.
+Tests added: the deep 3x3 template at ragged sizes and batch 2 with 128 output channels, the
+attention kernel at scale 2.0 on partial key blocks, and the conv fallback path on a declined
+shape. Splitting the scale out of the fused multiply-add moved the parity gate to mean rel
+0.0011, max rel 0.0063, final latent 0.999635 / 0.0073, image PSNR 46.54 dB (VAE alone
+93.11), a rounding change that landed 0.45 dB over the steel arm.
+
 ## Lever ledger
 
 Rewritten 2026-09-08 for the third time, after the arc above. The base is master e5d9775:

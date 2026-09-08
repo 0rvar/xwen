@@ -776,7 +776,8 @@ kernel that trap said did not exist.
   TFLOP/s; profiled `attn.sdpa` fell 698 to 231 ms per step. Against candle's f32 sdpa it is
   rel L2 1.6e-4 to 4.5e-4, not bitwise: q, k and v are rounded to f16 on the way in, and the
   test asserts the tensor and steel arms differ. Parity on this arm is step-0 cosine 0.999999
-  at mean rel 0.0010 and image PSNR 45.60 dB, 0.5 dB under the steel arm. Two things about it
+  at mean rel 0.0011 and image PSNR 46.54 dB, 0.45 dB over the steel arm (45.60 as first
+  landed, before 7456e5c masked the padded columns after the scaling). Two things about it
   are forced by the SDK rather than chosen: the per-simdgroup structure, because input
   cooperative tensors, `reduce_rows` and `map_iterator` are all `static_assert`ed to
   simdgroup scope, and the half Q, because an f32 operand under `relaxed_precision` is

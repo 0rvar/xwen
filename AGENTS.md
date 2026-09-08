@@ -442,7 +442,7 @@ The seams, so a change lands in one place:
   and `map_iterator` to it. 5.80 ms against the steel copy's 20.05 at 30 x 4128 x 128, 45.1
   against 13.1 TFLOP/s; profiled `attn.sdpa` 698 to 231 ms; rel L2 1.6e-4 to 4.5e-4 against
   candle's f32 sdpa (NOT bitwise, q/k/v are f16 on the way in, and the test asserts the
-  arms differ); parity step-0 cosine 0.999999, image PSNR 45.60 dB, 0.5 dB under the steel
+  arms differ); parity step-0 cosine 0.999999, image PSNR 46.54 dB, 0.45 dB over the steel
   arm. `XWEN_ZIMAGE_ATTN` names FOUR arms: `tensor` (default, alias `xwen`) / `flash`
   (alias `steel`, the previous default) / `fused` (candle's SDPA) / `basic`, and
   `AttnImpl::SHIPPED` names the default once so the log guard and the serde default cannot
