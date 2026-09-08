@@ -22,7 +22,7 @@ use super::scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};
 use super::transformer::{
     AXES_LENS, AttnImpl, Config, LATENT_CHANNELS, SEQ_MULTI_OF, ZImageTransformer2DModel,
 };
-use super::vae::{AutoEncoderKL, VaeConfig};
+use super::vae::{AutoEncoderKL, VaeConfig, VaeImpl};
 
 /// The pipeline's own divisibility rule: the VAE compresses 8x and the
 /// transformer patches 2x, so a side is a whole number of 16-pixel cells.
@@ -98,6 +98,7 @@ impl ZImagePipeline {
         // not a run that quietly measures the shipped arm twice.
         let attn = AttnImpl::from_env()?;
         let linear = LinearImpl::from_env()?;
+        let vae_arm = VaeImpl::from_env()?;
         let profiling = profile::from_env()?;
         let transformer_dir = root.join("transformer");
         let mut transformer_cfg: Config = read_json(&transformer_dir.join("config.json"))?;
@@ -108,6 +109,9 @@ impl ZImagePipeline {
         }
         if linear != LinearImpl::Xwen {
             eprintln!("xwen: z-image linear arm: {}", linear.label());
+        }
+        if vae_arm != VaeImpl::Xwen {
+            eprintln!("xwen: z-image vae arm: {}", vae_arm.label());
         }
         let shards = shard_paths(&transformer_dir)?;
         let dtype = DType::F32;
@@ -129,7 +133,8 @@ impl ZImagePipeline {
         let vae_file = vae_dir.join("diffusion_pytorch_model.safetensors");
         ensure!(vae_file.is_file(), "missing {}", vae_file.display());
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&vae_file], DType::F32, device)? };
-        let vae = AutoEncoderKL::new(&vae_cfg, vb).context("building the Z-Image VAE")?;
+        let vae = AutoEncoderKL::new_with_impl(&vae_cfg, vb, vae_arm)
+            .context("building the Z-Image VAE")?;
 
         let scheduler_cfg: SchedulerConfig =
             read_json(&root.join("scheduler").join("scheduler_config.json"))?;

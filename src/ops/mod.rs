@@ -2,6 +2,7 @@ pub mod attn_glue;
 pub mod bandwidth;
 pub mod bf16;
 pub mod combine;
+pub mod conv2d_direct;
 pub mod delta;
 pub mod dense_mm;
 mod dispatch;
@@ -9,6 +10,7 @@ pub mod f16;
 pub mod f32_mv;
 pub mod flash;
 pub mod gated_residual;
+pub mod group_norm;
 pub mod hc;
 pub mod mm_id;
 pub mod moe_glue;
@@ -26,6 +28,9 @@ pub mod silu_mul;
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
 pub use bf16::matmul_bf16;
 pub use combine::combine;
+pub use conv2d_direct::{
+    Conv2dFusion, conv2d_direct, conv2d_direct_supported, permute_conv_weight,
+};
 pub use delta::{
     DELTA_HEAD_DIM, delta_ba, delta_ba_fused, delta_ba_fused_applies, delta_conv, delta_gnorm,
     delta_l2norm, delta_scan, delta_scan_with_trail,
@@ -37,6 +42,7 @@ pub use f16::matmul_f16;
 pub use f32_mv::{matmul_f32, matmul_f32_supported};
 pub use flash::{flash_attn, flash_attn_bidirectional};
 pub use gated_residual::gated_residual;
+pub use group_norm::{group_norm, group_norm_apply, group_norm_fold};
 pub use hc::{
     hc_gate_down, hc_gate_fused_supported, hc_gate_up_mix, hc_mix, hc_norm, hc_norm_supported,
     hc_silu_quarter, hc_write,

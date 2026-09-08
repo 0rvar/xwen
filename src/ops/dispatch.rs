@@ -7412,3 +7412,475 @@ pub(crate) fn run_bw_probe(
     encoder.dispatch_thread_groups(mtl_size(groups, 1, 1), mtl_size(256, 1, 1));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Z-Image VAE decoder: direct convolution and fused GroupNorm.
+
+/// Matches the Metal `conv2d_direct_args` struct (src/ops/conv2d_direct.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Conv2dDirectArgs {
+    batch: i32,
+    c_in: i32,
+    c_out: i32,
+    height: i32,
+    width: i32,
+    src_height: i32,
+    src_width: i32,
+    flags: i32,
+}
+
+const CONV_FLAG_SILU: i32 = 1;
+const CONV_FLAG_AFFINE: i32 = 2;
+const CONV_FLAG_RESIDUAL: i32 = 4;
+const CONV_FLAG_UPSAMPLE: i32 = 8;
+
+/// The direct kernel's output tile, `conv2d_direct.metal`'s CONV_TH / CONV_TW,
+/// and its input-channel chunk CONV_CI, which `c_in` must be a multiple of.
+pub(crate) const CONV_DIRECT_TILE_H: usize = 8;
+pub(crate) const CONV_DIRECT_TILE_W: usize = 16;
+pub(crate) const CONV_DIRECT_CI: usize = 8;
+const CONV_DIRECT_THREADS: usize = 256;
+/// Input channel count up to which a 3x3 conv takes the 16-row tile.
+const CONV_DIRECT_SHALLOW_C_IN: usize = 128;
+
+/// A read-locked Metal tensor argument: the storage guard plus the byte
+/// offset of its first element, for binding while the guard is held.
+struct MetalArg<'a> {
+    guard: std::sync::RwLockReadGuard<'a, Storage>,
+    offset: usize,
+}
+
+impl MetalArg<'_> {
+    fn buffer(&self) -> Result<&Buffer> {
+        match &*self.guard {
+            Storage::Metal(s) => Ok(s.buffer()),
+            _ => bail!("tensor is not on a Metal device"),
+        }
+    }
+}
+
+fn metal_arg<'a>(t: &'a Tensor, name: &str) -> Result<MetalArg<'a>> {
+    if t.dtype() != DType::F32 {
+        bail!("{name} must be f32, got {:?}", t.dtype());
+    }
+    if !t.is_contiguous() {
+        bail!("{name} must be contiguous");
+    }
+    let (guard, layout) = t.storage_and_layout();
+    let offset = layout.start_offset() * DType::F32.size_in_bytes();
+    let arg = MetalArg { guard, offset };
+    arg.buffer()
+        .map_err(|_| anyhow::anyhow!("{name} is not on a Metal device"))?;
+    Ok(arg)
+}
+
+/// The optional fusions of [`run_conv2d_direct`].
+#[derive(Clone, Copy, Default)]
+pub struct Conv2dDirectFusion<'a> {
+    /// Per-(batch, input channel) affine applied on the input read,
+    /// `(scale, shift)` each `[batch, c_in]`: a folded GroupNorm.
+    pub norm: Option<(&'a Tensor, &'a Tensor)>,
+    /// silu on the input read, after the affine.
+    pub silu: bool,
+    /// Read the input at half coordinates: a 2x nearest upsample folded in.
+    /// The output is `2 * H` by `2 * W` of the stored input.
+    pub upsample: bool,
+    /// Added to the output, same shape as the output.
+    pub residual: Option<&'a Tensor>,
+}
+
+/// Whether the direct kernel covers a `kernel` by `kernel` convolution over
+/// `c_in` input channels: 3x3 (stride 1, pad 1) or 1x1, `c_in` a multiple of
+/// the kernel's channel chunk.
+pub fn conv2d_direct_supported(c_in: usize, kernel: usize) -> bool {
+    (kernel == 3 || kernel == 1) && c_in > 0 && c_in.is_multiple_of(CONV_DIRECT_CI)
+}
+
+/// Direct convolution against `kernel_conv2d_direct_*` (conv2d_direct.metal):
+/// `x` `[B, c_in, H, W]` f32 NCHW, `w` the weight permuted to `[k*k, c_in,
+/// c_out]` (`conv2d_direct::permute_weight`), `bias` `[c_out]`, output `[B,
+/// c_out, H', W']` with `H', W'` the input size or twice it under
+/// `fusion.upsample`. 3x3 is stride 1 pad 1; 1x1 has no padding.
+pub(crate) fn run_conv2d_direct(
+    x: &Tensor,
+    w: &Tensor,
+    bias: &Tensor,
+    kernel: usize,
+    fusion: Conv2dDirectFusion<'_>,
+) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("conv2d_direct requires x on a Metal device");
+    };
+    let (batch, c_in, sh, sw) = x.dims4().map_err(|_| {
+        anyhow::anyhow!("conv2d_direct: x must be [B, C, H, W], got {:?}", x.dims())
+    })?;
+    if !conv2d_direct_supported(c_in, kernel) {
+        bail!("conv2d_direct: {kernel}x{kernel} over {c_in} input channels is not covered");
+    }
+    let taps = kernel * kernel;
+    let (wt, wc, c_out) = w.dims3().map_err(|_| {
+        anyhow::anyhow!(
+            "conv2d_direct: w must be [taps, c_in, c_out], got {:?}",
+            w.dims()
+        )
+    })?;
+    if wt != taps || wc != c_in {
+        bail!(
+            "conv2d_direct: w is {:?}, expected [{taps}, {c_in}, c_out]",
+            w.dims()
+        );
+    }
+    if bias.dims() != [c_out] {
+        bail!(
+            "conv2d_direct: bias is {:?}, expected [{c_out}]",
+            bias.dims()
+        );
+    }
+    let (h, wd) = if fusion.upsample {
+        (sh * 2, sw * 2)
+    } else {
+        (sh, sw)
+    };
+    if let Some((scale, shift)) = fusion.norm {
+        for (name, t) in [("scale", scale), ("shift", shift)] {
+            if t.elem_count() != batch * c_in {
+                bail!(
+                    "conv2d_direct: {name} has {} elements, expected batch * c_in = {}",
+                    t.elem_count(),
+                    batch * c_in
+                );
+            }
+        }
+    }
+    if let Some(r) = fusion.residual
+        && r.dims() != [batch, c_out, h, wd]
+    {
+        bail!(
+            "conv2d_direct: residual is {:?}, expected [{batch}, {c_out}, {h}, {wd}]",
+            r.dims()
+        );
+    }
+    for (name, t) in [("w", w), ("bias", bias)] {
+        if !x.device().same_device(t.device()) {
+            bail!("conv2d_direct: {name} must live on x's Metal device");
+        }
+    }
+    let n = checked_elems(&[batch, c_out, h, wd], "conv2d_direct output")?;
+    glue_index_fits_i32(n)?;
+    glue_index_fits_i32(checked_elems(
+        &[batch, c_in, sh, sw],
+        "conv2d_direct input",
+    )?)?;
+    glue_index_fits_i32(checked_elems(&[taps, c_in, c_out], "conv2d_direct weight")?)?;
+
+    // Output channel width per threadgroup: 8 when c_out is that small (the
+    // decoder's three-channel conv_out), else 64. Tile height 16 for the
+    // shallow 3x3 convs, whose chunks stage more than they compute at 8 rows.
+    let (name, co, tile_h) = match (kernel, c_out <= 8, c_in <= CONV_DIRECT_SHALLOW_C_IN) {
+        (3, true, _) => ("kernel_conv2d_direct_3x3_co8", 8usize, CONV_DIRECT_TILE_H),
+        (3, false, true) => (
+            "kernel_conv2d_direct_3x3_co64_th16",
+            64,
+            2 * CONV_DIRECT_TILE_H,
+        ),
+        (3, false, false) => ("kernel_conv2d_direct_3x3_co64", 64, CONV_DIRECT_TILE_H),
+        (1, _, _) => ("kernel_conv2d_direct_1x1_co64", 64, CONV_DIRECT_TILE_H),
+        _ => unreachable!("conv2d_direct_supported admits 1 and 3 only"),
+    };
+    let pipeline = pipelines::conv2d_direct_pipeline(mdev.device(), name)?;
+    if pipeline.max_total_threads_per_threadgroup() < CONV_DIRECT_THREADS {
+        bail!(
+            "conv2d_direct: `{name}` admits {} threads per threadgroup, the kernel needs {CONV_DIRECT_THREADS}",
+            pipeline.max_total_threads_per_threadgroup()
+        );
+    }
+    let dst = mdev.new_buffer(n, DType::F32, "conv2d_direct")?;
+
+    let mut flags = 0;
+    if fusion.silu {
+        flags |= CONV_FLAG_SILU;
+    }
+    if fusion.norm.is_some() {
+        flags |= CONV_FLAG_AFFINE;
+    }
+    if fusion.residual.is_some() {
+        flags |= CONV_FLAG_RESIDUAL;
+    }
+    if fusion.upsample {
+        flags |= CONV_FLAG_UPSAMPLE;
+    }
+    let args = Conv2dDirectArgs {
+        batch: batch as i32,
+        c_in: c_in as i32,
+        c_out: c_out as i32,
+        height: h as i32,
+        width: wd as i32,
+        src_height: sh as i32,
+        src_width: sw as i32,
+        flags,
+    };
+
+    let x_arg = metal_arg(x, "x")?;
+    let w_arg = metal_arg(w, "w")?;
+    let b_arg = metal_arg(bias, "bias")?;
+    let norm_args = match fusion.norm {
+        Some((scale, shift)) => Some((metal_arg(scale, "scale")?, metal_arg(shift, "shift")?)),
+        None => None,
+    };
+    let r_arg = match fusion.residual {
+        Some(r) => Some(metal_arg(r, "residual")?),
+        None => None,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_arg.buffer()?), x_arg.offset);
+        encoder.set_input_buffer(2, Some(w_arg.buffer()?), w_arg.offset);
+        encoder.set_input_buffer(3, Some(b_arg.buffer()?), b_arg.offset);
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        // Unused optional operands are bound to the bias so every slot holds
+        // a real buffer; the flags keep the kernel from reading them.
+        match &norm_args {
+            Some((scale, shift)) => {
+                encoder.set_input_buffer(5, Some(scale.buffer()?), scale.offset);
+                encoder.set_input_buffer(6, Some(shift.buffer()?), shift.offset);
+            }
+            None => {
+                encoder.set_input_buffer(5, Some(b_arg.buffer()?), b_arg.offset);
+                encoder.set_input_buffer(6, Some(b_arg.buffer()?), b_arg.offset);
+            }
+        }
+        match &r_arg {
+            Some(r) => encoder.set_input_buffer(7, Some(r.buffer()?), r.offset),
+            None => encoder.set_input_buffer(7, Some(b_arg.buffer()?), b_arg.offset),
+        }
+        let grid = mtl_size(
+            wd.div_ceil(CONV_DIRECT_TILE_W),
+            h.div_ceil(tile_h),
+            batch * c_out.div_ceil(co),
+        );
+        encoder.dispatch_thread_groups(grid, mtl_size(CONV_DIRECT_THREADS, 1, 1));
+    }
+    drop(x_arg);
+    drop(w_arg);
+    drop(b_arg);
+    drop(norm_args);
+    drop(r_arg);
+
+    Ok(output_tensor(dst, mdev, n, (batch, c_out, h, wd)))
+}
+
+/// Matches the Metal `group_norm_partials_args` struct (src/ops/group_norm.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GroupNormPartialsArgs {
+    len: i32,
+    partials: i32,
+    chunk: i32,
+    vec4: i32,
+}
+
+/// Matches the Metal `group_norm_fold_args` struct (src/ops/group_norm.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GroupNormFoldArgs {
+    n: i32,
+    channels: i32,
+    groups: i32,
+    partials: i32,
+    len: i32,
+    eps: f32,
+}
+
+/// Matches the Metal `group_norm_apply_args` struct (src/ops/group_norm.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GroupNormApplyArgs {
+    n: i32,
+    hw: i32,
+    silu: i32,
+    vec4: i32,
+}
+
+const GN_THREADS: usize = 256;
+/// Floats per statistics slice, before the slice count is capped: enough
+/// work per threadgroup to amortize its reduction.
+const GN_SLICE_TARGET: usize = 16384;
+const GN_MAX_PARTIALS: usize = 64;
+
+/// GroupNorm statistics folded to a per-(batch, channel) affine, against
+/// `kernel_group_norm_partials` then `kernel_group_norm_fold`
+/// (group_norm.metal): `(scale, shift)` each `[B, C]` f32 such that
+/// `x * scale + shift` is `group_norm(x)` with `gamma`/`beta` applied.
+/// `x` is `[B, C, H, W]` f32 contiguous, `C` a multiple of `groups`.
+pub(crate) fn run_group_norm_fold(
+    x: &Tensor,
+    groups: usize,
+    gamma: &Tensor,
+    beta: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("group_norm requires x on a Metal device");
+    };
+    let (batch, channels, h, w) = x
+        .dims4()
+        .map_err(|_| anyhow::anyhow!("group_norm: x must be [B, C, H, W], got {:?}", x.dims()))?;
+    if groups == 0 || !channels.is_multiple_of(groups) {
+        bail!("group_norm: {channels} channels do not split into {groups} groups");
+    }
+    for (name, t) in [("gamma", gamma), ("beta", beta)] {
+        if t.dims() != [channels] {
+            bail!(
+                "group_norm: {name} is {:?}, expected [{channels}]",
+                t.dims()
+            );
+        }
+        if !x.device().same_device(t.device()) {
+            bail!("group_norm: {name} must live on x's Metal device");
+        }
+    }
+    let len = checked_elems(&[channels / groups, h, w], "group_norm group")?;
+    if len == 0 {
+        bail!("group_norm: empty tensor");
+    }
+    glue_index_fits_i32(checked_elems(&[batch, channels, h, w], "group_norm input")?)?;
+    let runs = batch * groups;
+    let vec4 = len.is_multiple_of(4);
+    let mut chunk = len.div_ceil(GN_MAX_PARTIALS).max(GN_SLICE_TARGET);
+    if vec4 {
+        chunk = chunk.div_ceil(4) * 4;
+    }
+    let partials = len.div_ceil(chunk);
+
+    let partials_pipe =
+        pipelines::group_norm_pipeline(mdev.device(), "kernel_group_norm_partials")?;
+    let fold_pipe = pipelines::group_norm_pipeline(mdev.device(), "kernel_group_norm_fold")?;
+    if partials_pipe.max_total_threads_per_threadgroup() < GN_THREADS {
+        bail!("group_norm: the partials kernel admits fewer than {GN_THREADS} threads");
+    }
+    let partial_buf = mdev.new_buffer(runs * partials * 2, DType::F32, "group_norm_partials")?;
+    let scale = mdev.new_buffer(batch * channels, DType::F32, "group_norm_scale")?;
+    let shift = mdev.new_buffer(batch * channels, DType::F32, "group_norm_shift")?;
+
+    let x_arg = metal_arg(x, "x")?;
+    let g_arg = metal_arg(gamma, "gamma")?;
+    let b_arg = metal_arg(beta, "beta")?;
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        let args = GroupNormPartialsArgs {
+            len: len as i32,
+            partials: partials as i32,
+            chunk: chunk as i32,
+            vec4: vec4 as i32,
+        };
+        encoder.set_compute_pipeline_state(&partials_pipe);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_arg.buffer()?), x_arg.offset);
+        encoder.set_output_buffer(2, Some(&partial_buf), 0);
+        encoder.dispatch_thread_groups(mtl_size(partials, runs, 1), mtl_size(GN_THREADS, 1, 1));
+
+        let args = GroupNormFoldArgs {
+            n: (batch * channels) as i32,
+            channels: channels as i32,
+            groups: groups as i32,
+            partials: partials as i32,
+            len: len as i32,
+            eps,
+        };
+        encoder.set_compute_pipeline_state(&fold_pipe);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_arg.buffer()?), x_arg.offset);
+        encoder.set_input_buffer(2, Some(&partial_buf), 0);
+        encoder.set_input_buffer(3, Some(g_arg.buffer()?), g_arg.offset);
+        encoder.set_input_buffer(4, Some(b_arg.buffer()?), b_arg.offset);
+        encoder.set_output_buffer(5, Some(&scale), 0);
+        encoder.set_output_buffer(6, Some(&shift), 0);
+        dispatch_linear(encoder, &fold_pipe, batch * channels);
+    }
+    drop(x_arg);
+    drop(g_arg);
+    drop(b_arg);
+
+    Ok((
+        output_tensor(scale, mdev, batch * channels, (batch, channels)),
+        output_tensor(shift, mdev, batch * channels, (batch, channels)),
+    ))
+}
+
+/// `x * scale[b, c] + shift[b, c]`, then silu when `silu`, against
+/// `kernel_group_norm_apply` (group_norm.metal): the second half of a
+/// GroupNorm whose statistics [`run_group_norm_fold`] produced. `x` is
+/// `[B, C, H, W]` f32 contiguous, `scale` and `shift` `B * C` elements each.
+pub(crate) fn run_group_norm_apply(
+    x: &Tensor,
+    scale: &Tensor,
+    shift: &Tensor,
+    silu: bool,
+) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("group_norm requires x on a Metal device");
+    };
+    let (batch, channels, h, w) = x
+        .dims4()
+        .map_err(|_| anyhow::anyhow!("group_norm: x must be [B, C, H, W], got {:?}", x.dims()))?;
+    for (name, t) in [("scale", scale), ("shift", shift)] {
+        if t.elem_count() != batch * channels {
+            bail!(
+                "group_norm: {name} has {} elements, expected batch * channels = {}",
+                t.elem_count(),
+                batch * channels
+            );
+        }
+        if !x.device().same_device(t.device()) {
+            bail!("group_norm: {name} must live on x's Metal device");
+        }
+    }
+    let hw = checked_elems(&[h, w], "group_norm plane")?;
+    let n = checked_elems(&[batch, channels, hw], "group_norm input")?;
+    glue_index_fits_i32(n)?;
+    if n == 0 {
+        bail!("group_norm: empty tensor");
+    }
+    let vec4 = hw.is_multiple_of(4);
+    let (n_thr, hw_thr) = if vec4 { (n / 4, hw / 4) } else { (n, hw) };
+    let pipeline = pipelines::group_norm_pipeline(mdev.device(), "kernel_group_norm_apply")?;
+    let dst = mdev.new_buffer(n, DType::F32, "group_norm_apply")?;
+    let x_arg = metal_arg(x, "x")?;
+    let s_arg = metal_arg(scale, "scale")?;
+    let t_arg = metal_arg(shift, "shift")?;
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        let args = GroupNormApplyArgs {
+            n: n_thr as i32,
+            hw: hw_thr as i32,
+            silu: silu as i32,
+            vec4: vec4 as i32,
+        };
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_arg.buffer()?), x_arg.offset);
+        encoder.set_input_buffer(2, Some(s_arg.buffer()?), s_arg.offset);
+        encoder.set_input_buffer(3, Some(t_arg.buffer()?), t_arg.offset);
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n_thr);
+    }
+    drop(x_arg);
+    drop(s_arg);
+    drop(t_arg);
+    Ok(output_tensor(dst, mdev, n, (batch, channels, h, w)))
+}

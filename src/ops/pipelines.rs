@@ -122,6 +122,13 @@ const ROPE_PAIR_SOURCE: &str = include_str!("rope_pair.metal");
 /// Gated residual add for the Z-Image transformer (gated_residual.metal). Own
 /// library, same pinning as above for the same reason.
 const GATED_RESIDUAL_SOURCE: &str = include_str!("gated_residual.metal");
+/// Direct 3x3 / 1x1 convolution for the Z-Image VAE decoder
+/// (conv2d_direct.metal). Own library, simdgroup matrix f32, fast math;
+/// no bitwise contract with candle.
+const CONV2D_DIRECT_SOURCE: &str = include_str!("conv2d_direct.metal");
+/// Fused GroupNorm statistics, fold and apply for the Z-Image VAE decoder
+/// (group_norm.metal). Own library, same terms.
+const GROUP_NORM_SOURCE: &str = include_str!("group_norm.metal");
 /// Vendored flash-attention prefill kernel (the modified copy of candle's MLX
 /// steel attention: float Q/O, half K/V, in-kernel causal+sliding-window
 /// masking). Own library (no Metal-4 dependency), compiled fast-math like
@@ -359,6 +366,16 @@ pub(crate) fn rope_pair_pipeline(device: &Device, name: &str) -> Result<ComputeP
 /// Pipeline for the `gated_residual.metal` kernel (Z-Image gated residual add).
 pub(crate) fn gated_residual_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, GATED_RESIDUAL_SOURCE, "gated_residual", name)
+}
+
+/// Pipeline for a `conv2d_direct.metal` kernel (Z-Image VAE direct convolution).
+pub(crate) fn conv2d_direct_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, CONV2D_DIRECT_SOURCE, "conv2d_direct", name)
+}
+
+/// Pipeline for a `group_norm.metal` kernel (Z-Image VAE fused GroupNorm).
+pub(crate) fn group_norm_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, GROUP_NORM_SOURCE, "group_norm", name)
 }
 
 /// Pipeline for a `flash.metal` kernel (vendored flash-attention prefill).
