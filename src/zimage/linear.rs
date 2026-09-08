@@ -16,6 +16,14 @@
 //! `XWEN_ZIMAGE_LINEAR=candle` is the bisect arm: candle's own bf16 gemm on
 //! bf16-rounded activations, the path every projection ran before this kernel
 //! landed. It shares no matmul code with the shipped arm.
+//!
+//! [`FfnStore`] is the SwiGLU intermediate's dtype: f32 as every other
+//! projection stores (the default), or bf16 from the w1 and w3 gemms
+//! themselves ([`Projection::forward_bf16`], the kernel's own store epilogue)
+//! for a `silu_mul` that reads half the bytes. `XWEN_ZIMAGE_FFN_STORE=bf16`
+//! is the opt-in: measured, the epilogue costs the gemm more than the halved
+//! traffic saves (docs/records/zimage-perf.md, the SwiGLU bf16 store), so it
+//! stays an arm and not the default.
 
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
@@ -83,6 +91,72 @@ impl LinearImpl {
         match self {
             Self::Xwen => "xwen",
             Self::Candle => "candle",
+        }
+    }
+}
+
+/// The environment switch for the SwiGLU intermediate's dtype, read when a
+/// [`super::transformer::Config`] is built. `f32` (or unset) keeps the f32
+/// intermediate; `bf16` stores w1 x and w3 x as bf16 from the gemm.
+pub const FFN_STORE_ENV: &str = "XWEN_ZIMAGE_FFN_STORE";
+
+/// The dtype the SwiGLU pair's two gemm outputs are stored in before
+/// `silu(w1 x) * (w3 x)`. The product is f32 in both arms, being what the w2
+/// gemm reads; the arms differ only in the intermediate's rounding and bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfnStore {
+    /// The opt-in arm on the xwen kernel: `ops::matmul_bf16_to_bf16` for w1
+    /// and w3 (f32 accumulation, one round to nearest even in the store), then
+    /// `ops::silu_mul_bf16`. Off Metal, or on the candle linear arm, the f32
+    /// chain runs instead, there being no bf16 store there.
+    Bf16,
+    /// The shipped path: `ops::matmul_bf16` twice, then `ops::silu_mul`, the
+    /// f32 intermediate.
+    F32,
+}
+
+impl FfnStore {
+    /// Resolve from [`FFN_STORE_ENV`]: unset means f32, anything else must
+    /// name an arm.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(FFN_STORE_ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(Self::F32),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                candle_core::bail!("{FFN_STORE_ENV} is not valid UTF-8")
+            }
+            Ok(value) => Self::parse(&value),
+        }
+    }
+
+    /// [`Self::from_env`] with a bad value read as the shipped arm, for a
+    /// `serde` default, which cannot fail; `ZImagePipeline::load` calls
+    /// [`Self::from_env`] with a `?` first, so a typo is a load error there.
+    pub fn from_env_or_default() -> Self {
+        Self::from_env().unwrap_or(Self::F32)
+    }
+
+    /// `f32` (or empty) selects the shipped arm, `bf16` the bf16 store;
+    /// anything else is refused rather than defaulted.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "f32" => Ok(Self::F32),
+            "bf16" => Ok(Self::Bf16),
+            other => candle_core::bail!(
+                "{FFN_STORE_ENV}={other:?}: expected `f32` (the default) or `bf16`"
+            ),
+        }
+    }
+
+    /// Whether this arm is the bf16 store, which is how `Config` stores it.
+    pub fn is_bf16(self) -> bool {
+        matches!(self, Self::Bf16)
+    }
+
+    /// The name a dump or a log records for provenance.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::F32 => "f32",
         }
     }
 }
@@ -170,8 +244,41 @@ impl Projection {
         &self.name
     }
 
-    /// `x @ W^T + b` for an f32 `x` of rank 2 or 3 whose last dim is `in`.
-    fn project(&self, x: &Tensor) -> Result<Tensor> {
+    /// Whether [`Self::forward_bf16`] would run the bf16 store for an input
+    /// on `device`: the xwen kernel on Metal, and no bias to fold. Elsewhere
+    /// the caller runs the f32 chain, whose result is what the bf16 store
+    /// rounds.
+    pub fn has_bf16_store(&self, device: &Device) -> bool {
+        self.use_xwen && device.is_metal() && self.bias.is_none()
+    }
+
+    /// `x @ W^T` with the result stored as bf16 by the gemm itself
+    /// (`ops::matmul_bf16_to_bf16`): the same f32 accumulation as
+    /// [`Module::forward`], rounded once to nearest even, so the result is
+    /// exactly `forward(x).to_dtype(BF16)` with the f32 never written. For the
+    /// SwiGLU pair, whose consumer reads bf16 (`ops::silu_mul_bf16`). Refused
+    /// when [`Self::has_bf16_store`] is false: a bias would need folding
+    /// before the rounding, which no kernel does, and the candle arm and the
+    /// CPU have no such store, so the caller keeps the f32 chain there rather
+    /// than paying a cast that saves nothing.
+    pub fn forward_bf16(&self, x: &Tensor) -> Result<Tensor> {
+        if !self.has_bf16_store(x.device()) {
+            candle_core::bail!(
+                "{}: the bf16 store needs the xwen kernel on Metal and no bias",
+                self.name
+            );
+        }
+        let (x2, lead) = self.flatten_input(x)?;
+        let y = crate::ops::matmul_bf16_to_bf16(&self.weight, &x2)
+            .map_err(|e| candle_core::Error::Msg(format!("{}: {e:#}", self.name)))?;
+        let mut shape = lead;
+        shape.push(self.dims_out());
+        y.reshape(shape)
+    }
+
+    /// An f32 input of rank 2 or 3 as the contiguous `[t, in]` the kernels
+    /// take, with its leading dims for the reshape back.
+    fn flatten_input(&self, x: &Tensor) -> Result<(Tensor, Vec<usize>)> {
         let x = x.to_dtype(DType::F32)?;
         let (lead, k) = match x.dims() {
             [t, k] => (vec![*t], *k),
@@ -179,7 +286,12 @@ impl Projection {
             dims => candle_core::bail!("projection input must be rank 2 or 3, got {dims:?}"),
         };
         let t: usize = lead.iter().product();
-        let x2 = x.reshape((t, k))?.contiguous()?;
+        Ok((x.reshape((t, k))?.contiguous()?, lead))
+    }
+
+    /// `x @ W^T + b` for an f32 `x` of rank 2 or 3 whose last dim is `in`.
+    fn project(&self, x: &Tensor) -> Result<Tensor> {
+        let (x2, lead) = self.flatten_input(x)?;
         let out = self.dims_out();
         let y = if self.use_xwen && x2.device().is_metal() {
             crate::ops::matmul_bf16(&self.weight, &x2)
@@ -290,6 +402,53 @@ mod tests {
 
     fn cpu() -> Device {
         Device::Cpu
+    }
+
+    #[test]
+    fn the_ffn_store_env_switch_names_its_arms_and_refuses_a_typo() {
+        assert_eq!(FfnStore::parse("").unwrap(), FfnStore::F32);
+        assert_eq!(FfnStore::parse(" BF16 ").unwrap(), FfnStore::Bf16);
+        assert_eq!(FfnStore::parse("f32").unwrap(), FfnStore::F32);
+        let err = FfnStore::parse("half").unwrap_err().to_string();
+        assert!(err.contains(FFN_STORE_ENV) && err.contains("bf16"), "{err}");
+    }
+
+    /// The bf16 store is exactly the f32 forward rounded, and it is refused
+    /// where it does not exist: with a bias, on the candle arm, on the CPU.
+    #[test]
+    fn the_bf16_store_is_the_forward_rounded_and_refuses_where_it_has_no_kernel() {
+        let cpu_w = Tensor::randn(0f32, 0.05, (128, 256), &cpu()).unwrap();
+        let x_cpu = Tensor::randn(0f32, 1.0, (1, 64, 256), &cpu()).unwrap();
+        let on_cpu = Projection::from_weights(cpu_w.clone(), None, "p", LinearImpl::Xwen).unwrap();
+        assert!(!on_cpu.has_bf16_store(&cpu()));
+        assert!(on_cpu.forward_bf16(&x_cpu).is_err());
+
+        let Ok(dev) = crate::gguf::metal_device() else {
+            eprintln!("skipping the Metal half of the bf16 store test: no Metal");
+            return;
+        };
+        let w = cpu_w.to_device(&dev).unwrap();
+        let x = x_cpu.to_device(&dev).unwrap();
+        let b = Tensor::randn(0f32, 0.1, 128, &dev).unwrap();
+        let biased = Projection::from_weights(w.clone(), Some(b), "p", LinearImpl::Xwen).unwrap();
+        assert!(!biased.has_bf16_store(&dev));
+        assert!(biased.forward_bf16(&x).is_err());
+        let candle = Projection::from_weights(w.clone(), None, "p", LinearImpl::Candle).unwrap();
+        assert!(!candle.has_bf16_store(&dev));
+        assert!(candle.forward_bf16(&x).is_err());
+
+        let p = Projection::from_weights(w, None, "p", LinearImpl::Xwen).unwrap();
+        assert!(p.has_bf16_store(&dev));
+        let y = p.forward_bf16(&x).unwrap();
+        assert_eq!(y.dims(), &[1, 64, 128]);
+        assert_eq!(y.dtype(), DType::BF16);
+        let want = p.forward(&x).unwrap().to_dtype(DType::BF16).unwrap();
+        let y: Vec<half::bf16> = y.flatten_all().unwrap().to_vec1().unwrap();
+        let want: Vec<half::bf16> = want.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            y.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the bf16 store must be the f32 forward rounded to nearest even, bit for bit"
+        );
     }
 
     #[test]

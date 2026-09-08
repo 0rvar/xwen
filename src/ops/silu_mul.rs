@@ -15,6 +15,18 @@ pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     dispatch::run_silu_mul(gate, up)
 }
 
+/// [`silu_mul`] over bf16 `gate` and `up`, f32 out (`kernel_moe_silu_mul_bf16`).
+/// The Z-Image SwiGLU glue: w1 and w3 store bf16 through
+/// [`super::matmul_bf16_to_bf16`], this reads the pair at half the bytes, and
+/// the result stays f32 because the down gemm reads f32. The widening is
+/// exact, so on inputs that are already bf16 values this is bit-identical to
+/// [`silu_mul`] over their f32 copies (the tests pin it); against the f32
+/// chain over UNROUNDED inputs the whole difference is the inputs' rounding,
+/// about 2^-9 relative per element. Metal only.
+pub fn silu_mul_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    dispatch::run_silu_mul_bf16(gate, up)
+}
+
 /// The f16-tile prefill branch's activation glue in one pass, against
 /// `kernel_moe_silu_mul_l2` (silu_mul.metal). From the `[seq, top_k, expert_ff]`
 /// f32 `gate`/`up` pair returns `(act_s, col_l2)`:
@@ -128,6 +140,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The bf16-input kernel over values that are exactly bf16 agrees bit for
+    /// bit with the f32 kernel over the same values widened: the arithmetic
+    /// after the load is the same expression, so any difference would be a
+    /// kernel bug and not rounding. Then, against the f32 chain over the
+    /// UNROUNDED inputs, the error is the inputs' own bf16 rounding: each
+    /// input carries at most 2^-9 relative, silu is 1-Lipschitz-ish in
+    /// relative terms for |g| not near the sign change, and the product adds
+    /// the two, so the relative L2 lands well inside 4e-3, and it is bounded
+    /// there. Z-Image shapes (T x 10240 at T = 4128 and 1056) and a ragged
+    /// length.
+    #[test]
+    fn bf16_input_variant_matches_the_f32_kernel_and_bounds_the_input_rounding() {
+        let device = metal_device().unwrap();
+        let cpu = Device::Cpu;
+        for &(t, ff) in &[(4128usize, 10240usize), (1056, 10240), (7, 1000)] {
+            let n = t * ff;
+            let gate = Tensor::from_vec(wide(0x200 + t as u64, n), (t, ff), &cpu)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let up = Tensor::from_vec(wide(0x800 + t as u64, n), (t, ff), &cpu)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let gate_b = gate.to_dtype(DType::BF16).unwrap();
+            let up_b = up.to_dtype(DType::BF16).unwrap();
+
+            let got = silu_mul_bf16(&gate_b, &up_b).unwrap();
+            assert_eq!(got.dims(), &[t, ff]);
+            assert_eq!(got.dtype(), DType::F32);
+            let got: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+
+            // Bitwise against the f32 kernel over the widened bf16 values.
+            let same = silu_mul(
+                &gate_b.to_dtype(DType::F32).unwrap(),
+                &up_b.to_dtype(DType::F32).unwrap(),
+            )
+            .unwrap();
+            let same: Vec<f32> = same.flatten_all().unwrap().to_vec1().unwrap();
+            for (i, (g, w)) in got.iter().zip(&same).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "silu_mul_bf16 t={t} ff={ff}: element {i} differs from the f32 kernel over \
+                     the same bf16 values ({g:?} vs {w:?})"
+                );
+            }
+
+            // Bounded against the unrounded f32 chain.
+            let want: Vec<f32> = candle_chain(&gate, &up)
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let (mut num, mut den) = (0f64, 0f64);
+            for (g, w) in got.iter().zip(&want) {
+                num += ((*g - *w) as f64).powi(2);
+                den += (*w as f64).powi(2);
+            }
+            let rel_l2 = (num / den).sqrt();
+            eprintln!("silu_mul_bf16 t={t} ff={ff}: rel_l2 vs the f32 chain {rel_l2:.3e}");
+            assert!(rel_l2 < 4e-3, "t={t} ff={ff}: rel_l2 {rel_l2}");
+            assert!(
+                rel_l2 > 0.0,
+                "the bf16 inputs must differ from the f32 ones somewhere"
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_input_variant_shape_and_dtype_errors() {
+        let device = metal_device().unwrap();
+        let gate = Tensor::zeros((4, 8), DType::BF16, &device).unwrap();
+        let up_f32 = Tensor::zeros((4, 8), DType::F32, &device).unwrap();
+        assert!(silu_mul_bf16(&gate, &up_f32).is_err());
+        let up_bad = Tensor::zeros((4, 9), DType::BF16, &device).unwrap();
+        assert!(silu_mul_bf16(&gate, &up_bad).is_err());
     }
 
     #[test]

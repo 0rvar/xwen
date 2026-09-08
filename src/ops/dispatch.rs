@@ -1000,7 +1000,19 @@ pub(crate) fn output_tensor(
     count: usize,
     shape: impl Into<Shape>,
 ) -> Tensor {
-    let storage = MetalStorage::new(dst, device.clone(), count, DType::F32);
+    output_tensor_dtype(dst, device, count, shape, DType::F32)
+}
+
+/// [`output_tensor`] for a kernel whose destination is not f32: `count`
+/// elements of `dtype` in `dst`.
+pub(crate) fn output_tensor_dtype(
+    dst: Arc<Buffer>,
+    device: &MetalDevice,
+    count: usize,
+    shape: impl Into<Shape>,
+    dtype: DType,
+) -> Tensor {
+    let storage = MetalStorage::new(dst, device.clone(), count, dtype);
     Tensor::from_storage(
         Storage::Metal(storage),
         shape,
@@ -1629,6 +1641,29 @@ pub(crate) fn run_matmul_bf16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
     run_matmul_bf16_variant(weight, x, kernel)
 }
 
+/// `run_matmul_bf16` with the result stored as bf16, `[t, n_out]` BF16. On the
+/// tensor gemm branch (t > 8, the default kernel) the rounding happens in the
+/// kernel's store epilogue (`kernel_mul_mm_bf16_f32_t_bf16out`), so the f32
+/// output never touches memory; the gemv branch and the `XWEN_ATTN_MM_CLASSIC`
+/// kernel compute f32 and cast, neither being a path this store is for. Every
+/// arm yields the same bits: f32 accumulation, then one round to nearest even.
+pub(crate) fn run_matmul_bf16_to_bf16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
+    let t = x
+        .dim(0)
+        .map_err(|e| anyhow::anyhow!("x must be rank-2 [t, k]: {e}"))?;
+    if t > F16_MM_MIN_SEQ && !crate::ops::attn_mm_classic() {
+        run_matmul_dense_variant(
+            weight,
+            x,
+            F16MmKernel::Tensor,
+            DenseWeight::Bf16,
+            DenseOut::Bf16,
+        )
+    } else {
+        Ok(run_matmul_bf16(weight, x)?.to_dtype(DType::BF16)?)
+    }
+}
+
 /// Which prefill (ne11 > 8) mm-branch kernel `run_matmul_f16_variant`
 /// dispatches. Production only ever selects the first two (`run_matmul_f16`);
 /// `TensorMixed` is reachable exclusively from the f16.rs probe tests.
@@ -1659,7 +1694,7 @@ pub(crate) fn run_matmul_f16_variant(
     x: &Tensor,
     kernel: F16MmKernel,
 ) -> Result<Tensor> {
-    run_matmul_dense_variant(weight, x, kernel, DenseWeight::F16)
+    run_matmul_dense_variant(weight, x, kernel, DenseWeight::F16, DenseOut::F32)
 }
 
 /// `run_matmul_bf16` with the mm-branch kernel chosen explicitly (the bf16.rs
@@ -1670,7 +1705,7 @@ pub(crate) fn run_matmul_bf16_variant(
     x: &Tensor,
     kernel: F16MmKernel,
 ) -> Result<Tensor> {
-    run_matmul_dense_variant(weight, x, kernel, DenseWeight::Bf16)
+    run_matmul_dense_variant(weight, x, kernel, DenseWeight::Bf16, DenseOut::F32)
 }
 
 /// Dense f32-weight x f32-activation mat-vec — `ops::matmul_f32`'s launcher.
@@ -1678,7 +1713,13 @@ pub(crate) fn run_matmul_bf16_variant(
 /// `F16_MM_MIN_SEQ` tokens (there is no `kernel_mul_mm_f32_f32_v`), because the
 /// caller — the MoE router projection — routes larger batches back to candle.
 pub(crate) fn run_matmul_f32(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
-    run_matmul_dense_variant(weight, x, F16MmKernel::Classic, DenseWeight::F32)
+    run_matmul_dense_variant(
+        weight,
+        x,
+        F16MmKernel::Classic,
+        DenseWeight::F32,
+        DenseOut::F32,
+    )
 }
 
 /// Shape half of `ops::matmul_f32`'s admission test: the token window the gemv
@@ -1723,6 +1764,27 @@ enum DenseWeight {
     F32,
 }
 
+/// The element type the dense matmul family writes. Every kernel accumulates
+/// in f32; `Bf16` rounds each element once in the store epilogue and exists
+/// for exactly one kernel, the tensor gemm over bf16 weights
+/// (`kernel_mul_mm_bf16_f32_t_bf16out`). `run_matmul_bf16_to_bf16` keeps the
+/// other branches on f32 plus a cast, so the body below refuses the pairing
+/// rather than guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DenseOut {
+    F32,
+    Bf16,
+}
+
+impl DenseOut {
+    fn dtype(self) -> DType {
+        match self {
+            DenseOut::F32 => DType::F32,
+            DenseOut::Bf16 => DType::BF16,
+        }
+    }
+}
+
 impl DenseWeight {
     fn dtype(self) -> DType {
         match self {
@@ -1753,6 +1815,7 @@ fn run_matmul_dense_variant(
     x: &Tensor,
     kernel: F16MmKernel,
     family: DenseWeight,
+    out: DenseOut,
 ) -> Result<Tensor> {
     let name = family.op_name();
     let cdev = x.device().clone();
@@ -1797,7 +1860,15 @@ fn run_matmul_dense_variant(
     }
 
     let out_count = t * n_out;
-    let dst = mdev.new_buffer(out_count, DType::F32, name)?;
+    let dst = mdev.new_buffer(out_count, out.dtype(), name)?;
+    if out == DenseOut::Bf16
+        && !(t > F16_MM_MIN_SEQ && kernel == F16MmKernel::Tensor && family == DenseWeight::Bf16)
+    {
+        bail!(
+            "{name}: a bf16 store exists only for the tensor gemm over bf16 weights above \
+             {F16_MM_MIN_SEQ} tokens (t {t}, kernel {kernel:?}); cast the f32 result instead"
+        );
+    }
 
     let (w_guard, w_layout) = weight.storage_and_layout();
     let Storage::Metal(w_storage) = &*w_guard else {
@@ -1883,11 +1954,21 @@ fn run_matmul_dense_variant(
                     4096,
                     128,
                 ),
-                (F16MmKernel::Tensor, DenseWeight::Bf16) => (
-                    pipelines::bf16_t_pipeline(mdev.device(), "kernel_mul_mm_bf16_f32_t")?,
-                    4096,
-                    128,
-                ),
+                (F16MmKernel::Tensor, DenseWeight::Bf16) => match out {
+                    DenseOut::F32 => (
+                        pipelines::bf16_t_pipeline(mdev.device(), "kernel_mul_mm_bf16_f32_t")?,
+                        4096,
+                        128,
+                    ),
+                    DenseOut::Bf16 => (
+                        pipelines::bf16_t_pipeline(
+                            mdev.device(),
+                            "kernel_mul_mm_bf16_f32_t_bf16out",
+                        )?,
+                        4096,
+                        128,
+                    ),
+                },
                 (F16MmKernel::TensorMixed, DenseWeight::F16) => (
                     pipelines::f16_t_mixed_pipeline(
                         mdev.device(),
@@ -1972,7 +2053,13 @@ fn run_matmul_dense_variant(
     drop(w_guard);
     drop(x_guard);
 
-    Ok(output_tensor(dst, mdev, out_count, (t, n_out)))
+    Ok(output_tensor_dtype(
+        dst,
+        mdev,
+        out_count,
+        (t, n_out),
+        out.dtype(),
+    ))
 }
 
 /// q8_0-weight x f32-activation mat-vec against the vendored q8.metal kernel —
@@ -2609,6 +2696,81 @@ pub(crate) fn run_silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
             2,
             Some(up_storage.buffer()),
             up_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, n);
+    }
+    drop(gate_guard);
+    drop(up_guard);
+
+    Ok(output_tensor(dst, mdev, n, shape))
+}
+
+/// `run_silu_mul` over bf16 `gate` and `up` (`kernel_moe_silu_mul_bf16`): the
+/// inputs are widened to f32 on the way in, exactly, and the result is f32 of
+/// the same shape, since the down gemm that consumes it reads f32. Same
+/// contract otherwise: same shape, contiguous, one Metal device.
+pub(crate) fn run_silu_mul_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    let cdev = gate.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("silu_mul_bf16 requires gate on a Metal device");
+    };
+
+    if gate.dtype() != DType::BF16 {
+        bail!("gate must be bf16, got {:?}", gate.dtype());
+    }
+    if up.dtype() != DType::BF16 {
+        bail!("up must be bf16, got {:?}", up.dtype());
+    }
+    if gate.dims() != up.dims() {
+        bail!(
+            "gate shape {:?} must equal up shape {:?}",
+            gate.dims(),
+            up.dims()
+        );
+    }
+    if !gate.is_contiguous() {
+        bail!("gate must be contiguous");
+    }
+    if !up.is_contiguous() {
+        bail!("up must be contiguous");
+    }
+    if !gate.device().same_device(up.device()) {
+        bail!("gate and up must live on the same Metal device");
+    }
+    let shape = gate.shape().clone();
+    let n = checked_elems(shape.dims(), "silu_mul_bf16")?;
+    glue_index_fits_i32(n)?;
+
+    let pipeline = pipelines::silu_mul_pipeline(mdev.device(), "kernel_moe_silu_mul_bf16")?;
+    let dst = mdev.new_buffer(n, DType::F32, "silu_mul_bf16")?;
+
+    let (gate_guard, gate_layout) = gate.storage_and_layout();
+    let Storage::Metal(gate_storage) = &*gate_guard else {
+        bail!("gate is not on a Metal device");
+    };
+    let (up_guard, up_layout) = up.storage_and_layout();
+    let Storage::Metal(up_storage) = &*up_guard else {
+        bail!("up is not on a Metal device");
+    };
+
+    let args = SiluMulArgs { n: n as i32 };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(gate_storage.buffer()),
+            gate_layout.start_offset() * DType::BF16.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(up_storage.buffer()),
+            up_layout.start_offset() * DType::BF16.size_in_bytes(),
         );
         encoder.set_output_buffer(3, Some(&dst), 0);
         dispatch_linear(encoder, &pipeline, n);

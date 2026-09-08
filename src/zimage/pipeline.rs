@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
-use super::linear::LinearImpl;
+use super::linear::{FfnStore, LinearImpl};
 use super::profile::{self, Profiler};
 use super::sampling::{postprocess_image, seeded_noise};
 use super::scheduler::{FlowMatchEulerDiscreteScheduler, SchedulerConfig};
@@ -98,16 +98,21 @@ impl ZImagePipeline {
         // not a run that quietly measures the shipped arm twice.
         let attn = AttnImpl::from_env()?;
         let linear = LinearImpl::from_env()?;
+        let ffn_store = FfnStore::from_env()?;
         let profiling = profile::from_env()?;
         let transformer_dir = root.join("transformer");
         let mut transformer_cfg: Config = read_json(&transformer_dir.join("config.json"))?;
         transformer_cfg.set_attn_impl(attn);
         transformer_cfg.set_linear_impl(linear);
+        transformer_cfg.set_ffn_store(ffn_store);
         if attn != AttnImpl::Flash {
             eprintln!("xwen: z-image attention arm: {}", attn.label());
         }
         if linear != LinearImpl::Xwen {
             eprintln!("xwen: z-image linear arm: {}", linear.label());
+        }
+        if ffn_store != FfnStore::F32 {
+            eprintln!("xwen: z-image ffn store arm: {}", ffn_store.label());
         }
         let shards = shard_paths(&transformer_dir)?;
         let dtype = DType::F32;
@@ -339,6 +344,9 @@ impl ZImagePipeline {
             let _ = latents.flatten_all()?.get(0)?.to_scalar::<f32>()?;
             profile::mark(&self.profiler, "euler");
             timings.steps.push(started.elapsed().as_secs_f64());
+            if let Some(m) = super::transformer::ffn_act_max() {
+                eprintln!("xwen: ffn |act| max so far {m:.1} (step {})", step + 1);
+            }
             // The first step pays for the lazily created buffers and the
             // kernel compiles of the whole graph, so the profile covers the
             // steps after it whenever there is more than one.

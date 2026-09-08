@@ -64,7 +64,32 @@ typedef struct {
 // 1); 128 threads (4 simdgroups); 4096 B threadgroup memory (the A tile only).
 // Single-matrix (ne02 == ne12 == 1, r2 == r3 == 1) — the only case
 // matmul_bf16 dispatches — so no batch offset is threaded through.
-kernel void kernel_mul_mm_bf16_f32_t(
+//
+// One template axis, the output element type. BF16_OUT = false is the
+// kernel above, stored through the cooperative tensor's own f32 store.
+// BF16_OUT = true (`kernel_mul_mm_bf16_f32_t_bf16out`, the Z-Image SwiGLU
+// intermediate, `ops::matmul_bf16_to_bf16`) accumulates in the SAME f32
+// cooperative tensor and rounds each element to bfloat (round to nearest
+// even, Metal's float -> bfloat conversion) in a per-element epilogue, so its
+// result is bit-for-bit the f32 kernel's output cast to bf16 (pinned by an
+// ops/bf16.rs test). The epilogue exists because the cooperative tensor's
+// `store` insists on a destination of its own element type: a bfloat
+// destination tensor would require a bfloat ACCUMULATOR, which is not the
+// same arithmetic. The per-element loop writes 2-byte scalars through the
+// tile's implementation-defined lane layout, which is a bandwidth cost the
+// halved output pays back (tests/zimage_microbench.rs prices it).
+// STORE selects the epilogue: STORE_F32 is the cooperative tensor's own
+// device store; STORE_BF16_SCALAR rounds in a per-element loop over the
+// tile's lane layout and writes 2-byte scalars. Two other bf16 forms were
+// measured and dropped (docs/records/zimage-perf.md, the SwiGLU bf16 store):
+// staging the f32 tile through 32 KB of threadgroup memory for bfloat4
+// writes, and pairing adjacent lane slots into bfloat2 writes. Neither beat
+// this loop, and none of the three beat the f32 store on the gemm alone.
+#define STORE_F32 0
+#define STORE_BF16_SCALAR 1
+
+template <int STORE>
+kernel void kernel_mul_mm_bf16_f32_t_impl(
         constant mm_args   & args [[buffer(0)]],
         device const char * src0  [[buffer(1)]],
         device const char * src1  [[buffer(2)]],
@@ -169,10 +194,53 @@ kernel void kernel_mul_mm_bf16_f32_t(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Store the result tile directly to device. tD's (M, N) extents clip the
-    // out-edge and token-edge partial tiles; dst is [token][out] row-major with
-    // leading dim ne0 == M (stride {1, M}), matching the classic kernel's layout.
-    device float * dstD = (device float *)dst;
-    auto tD = tensor(dstD, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
-    cT.store(tD.slice(ra, rb));
+    if (STORE == STORE_BF16_SCALAR) {
+        // Per-element epilogue: each lane walks the elements it owns of the
+        // (NR0 out, NR1 token) tile, rounds to bfloat and writes to the
+        // [token][out] row-major destination. is_valid_element skips the lanes' unused
+        // slots; the M/N tests clip the out-edge and token-edge partial tiles,
+        // which cT.store would have clipped through tD's extents.
+        device bfloat * dstB = (device bfloat *)dst;
+        FOR_UNROLL (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+            if (cT.is_valid_element(i)) {
+                const auto idx = cT.get_multidimensional_index(i);
+                const int m = ra + idx[0];
+                const int n = rb + idx[1];
+                if (m < M && n < N) {
+                    dstB[(ulong) n * (ulong) M + (ulong) m] = bfloat(cT[i]);
+                }
+            }
+        }
+    } else {
+        // Store the result tile directly to device. tD's (M, N) extents clip the
+        // out-edge and token-edge partial tiles; dst is [token][out] row-major with
+        // leading dim ne0 == M (stride {1, M}), matching the classic kernel's layout.
+        device float * dstD = (device float *)dst;
+        auto tD = tensor(dstD, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
+        cT.store(tD.slice(ra, rb));
+    }
 }
+
+template [[host_name("kernel_mul_mm_bf16_f32_t")]]
+kernel void kernel_mul_mm_bf16_f32_t_impl<STORE_F32>(
+        constant mm_args   & args [[buffer(0)]],
+        device const char * src0  [[buffer(1)]],
+        device const char * src1  [[buffer(2)]],
+        device       char * dst   [[buffer(3)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]);
+
+template [[host_name("kernel_mul_mm_bf16_f32_t_bf16out")]]
+kernel void kernel_mul_mm_bf16_f32_t_impl<STORE_BF16_SCALAR>(
+        constant mm_args   & args [[buffer(0)]],
+        device const char * src0  [[buffer(1)]],
+        device const char * src1  [[buffer(2)]],
+        device       char * dst   [[buffer(3)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]);

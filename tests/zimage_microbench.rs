@@ -254,6 +254,136 @@ fn bench_xwen_bf16(dev: &Device, rows: &mut Vec<Row>) -> Result<()> {
     Ok(())
 }
 
+/// The SwiGLU pair as the FFN runs it, isolated: w1 x and w3 x, then
+/// `silu(w1 x) * (w3 x)`, with the two gemm outputs stored as f32 (the chain
+/// before this arm: `matmul_bf16` twice, then `silu_mul`) against stored as
+/// bf16 (`matmul_bf16_to_bf16` twice, then `silu_mul_bf16`). The arithmetic is
+/// the same f32 accumulation either way; what changes is the bytes the three
+/// kernels move through the intermediate, 3 x T x 10240 x 4 against half that
+/// for the two stores and the two reads. The w2 gemm is the same in both arms
+/// and is not timed here; its input is f32 in both. Each arm is timed as one
+/// closure over the three dispatches, several repetitions, so the row that
+/// matters is the difference between the two arms at each T.
+fn bench_ffn_store(dev: &Device, rows: &mut Vec<Row>) -> Result<()> {
+    // The arms alternate so that a clock ramp or a thermal sag lands on both;
+    // the summary rows carry the minimum and the median over the repetitions.
+    const REPS: usize = 7;
+    for &t in SEQ_LENS.iter() {
+        let w1 = rand_tensor(&[FFN_HIDDEN, DIM], DType::BF16, dev)?;
+        let w3 = rand_tensor(&[FFN_HIDDEN, DIM], DType::BF16, dev)?;
+        let x = rand_tensor(&[t, DIM], DType::F32, dev)?;
+        // Bytes through the intermediate: two stores and two reads of
+        // [t, FFN_HIDDEN], plus the f32 activation written once.
+        let f32_bytes = t * FFN_HIDDEN * (4 * 4 + 4);
+        let bf16_bytes = t * FFN_HIDDEN * (4 * 2 + 4);
+        let mut f32_ms = Vec::new();
+        let mut bf16_ms = Vec::new();
+        let mut iters_seen = 0;
+        for _ in 0..REPS {
+            let (ms, iters) = time_op(dev, || {
+                let g = xwen::ops::matmul_bf16(&w1, &x)?;
+                let u = xwen::ops::matmul_bf16(&w3, &x)?;
+                let _ = xwen::ops::silu_mul(&g, &u)?;
+                Ok(())
+            })?;
+            f32_ms.push(ms);
+            iters_seen = iters;
+            let (ms, _) = time_op(dev, || {
+                let g = xwen::ops::matmul_bf16_to_bf16(&w1, &x)?;
+                let u = xwen::ops::matmul_bf16_to_bf16(&w3, &x)?;
+                let _ = xwen::ops::silu_mul_bf16(&g, &u)?;
+                Ok(())
+            })?;
+            bf16_ms.push(ms);
+        }
+        for (label, dtype, ms_list, bytes) in [
+            ("f32 store", "f32", &f32_ms, f32_bytes),
+            ("bf16 store", "bf16", &bf16_ms, bf16_bytes),
+        ] {
+            let mut sorted = ms_list.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let min = sorted[0];
+            let median = sorted[sorted.len() / 2];
+            let all: Vec<String> = ms_list.iter().map(|m| format!("{m:.2}")).collect();
+            rows.push(Row {
+                group: "ffn-store",
+                what: format!(
+                    "w1+w3+silu_mul, {label}: min (median {median:.3}; {})",
+                    all.join(" ")
+                ),
+                seq: t,
+                dtype,
+                ms: min,
+                iters: iters_seen,
+                metric: format!(
+                    "{} gemm, {} intermediate",
+                    tflops(t, 2 * FFN_HIDDEN, DIM, min),
+                    gbps(bytes, min)
+                ),
+            });
+        }
+        // The pieces, once each, so the difference can be attributed to the
+        // gemm store or to the activation read.
+        let (ms, iters) = time_op(dev, || {
+            let _ = xwen::ops::matmul_bf16(&w1, &x)?;
+            Ok(())
+        })?;
+        rows.push(Row {
+            group: "ffn-store",
+            what: "one gemm K=3840 N=10240, f32 store".to_string(),
+            seq: t,
+            dtype: "f32",
+            ms,
+            iters,
+            metric: tflops(t, FFN_HIDDEN, DIM, ms),
+        });
+        let (ms, iters) = time_op(dev, || {
+            let _ = xwen::ops::matmul_bf16_to_bf16(&w1, &x)?;
+            Ok(())
+        })?;
+        rows.push(Row {
+            group: "ffn-store",
+            what: "one gemm K=3840 N=10240, bf16 store".to_string(),
+            seq: t,
+            dtype: "bf16",
+            ms,
+            iters,
+            metric: tflops(t, FFN_HIDDEN, DIM, ms),
+        });
+        let g = xwen::ops::matmul_bf16(&w1, &x)?;
+        let u = xwen::ops::matmul_bf16(&w3, &x)?;
+        let (ms, iters) = time_op(dev, || {
+            let _ = xwen::ops::silu_mul(&g, &u)?;
+            Ok(())
+        })?;
+        rows.push(Row {
+            group: "ffn-store",
+            what: "silu_mul alone, f32 in".to_string(),
+            seq: t,
+            dtype: "f32",
+            ms,
+            iters,
+            metric: gbps(t * FFN_HIDDEN * 12, ms),
+        });
+        let gb = g.to_dtype(DType::BF16)?;
+        let ub = u.to_dtype(DType::BF16)?;
+        let (ms, iters) = time_op(dev, || {
+            let _ = xwen::ops::silu_mul_bf16(&gb, &ub)?;
+            Ok(())
+        })?;
+        rows.push(Row {
+            group: "ffn-store",
+            what: "silu_mul alone, bf16 in".to_string(),
+            seq: t,
+            dtype: "bf16",
+            ms,
+            iters,
+            metric: gbps(t * FFN_HIDDEN * 8, ms),
+        });
+    }
+    Ok(())
+}
+
 /// The two casts a `matmul_bf16` drop-in would pay per linear layer: the
 /// activation widened to f32 going in, the result narrowed back to bf16
 /// coming out. Priced at the widths the graph uses them at.
@@ -828,6 +958,18 @@ fn xwen_bf16_gemm_only() -> Result<()> {
     Ok(())
 }
 
+/// The SwiGLU store arms alone (`bench_ffn_store`), the number that prices the
+/// bf16 intermediate.
+#[test]
+#[ignore = "GPU microbenchmark; run alone"]
+fn zimage_ffn_store_only() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let mut rows = Vec::new();
+    bench_ffn_store(&dev, &mut rows)?;
+    print_table(&rows);
+    Ok(())
+}
+
 #[test]
 #[ignore = "GPU microbenchmark; run alone and read docs/benching.md first"]
 fn zimage_op_microbench() -> Result<()> {
@@ -851,6 +993,7 @@ fn zimage_op_microbench() -> Result<()> {
     bench_gemm_ceiling(&dev, &mut rows)?;
     bench_matmuls(&dev, &mut rows)?;
     bench_xwen_bf16(&dev, &mut rows)?;
+    bench_ffn_store(&dev, &mut rows)?;
     bench_conversions(&dev, &mut rows)?;
     bench_attention(&dev, &mut rows)?;
     bench_elementwise(&dev, &mut rows)?;

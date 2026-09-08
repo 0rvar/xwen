@@ -24,7 +24,7 @@ pub mod rope_pair;
 pub mod silu_mul;
 
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
-pub use bf16::matmul_bf16;
+pub use bf16::{matmul_bf16, matmul_bf16_to_bf16};
 pub use combine::combine;
 pub use delta::{
     DELTA_HEAD_DIM, delta_ba, delta_ba_fused, delta_ba_fused_applies, delta_conv, delta_gnorm,
@@ -50,7 +50,7 @@ pub use mv_ext::{matmul_mv_ext, mv_ext_supported};
 pub use mv_id::{mul_mv, mul_mv_id, mv_classic};
 pub use q8::matmul_q8;
 pub use rope_pair::rope_pair;
-pub use silu_mul::{silu_mul, silu_mul_l2, silu_mul_l2_supported};
+pub use silu_mul::{silu_mul, silu_mul_bf16, silu_mul_l2, silu_mul_l2_supported};
 
 pub use crate::gguf::ExpertStack;
 

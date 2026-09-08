@@ -71,6 +71,30 @@ kernel void kernel_moe_silu_mul(
     dst[tid] = s * up[tid];
 }
 
+// The same activation over bf16 inputs: act[i] = silu(float(gate[i])) *
+// float(up[i]), f32 out. The Z-Image SwiGLU glue (`ops::silu_mul_bf16`), whose
+// w1 and w3 gemms store their outputs as bf16 (bf16_t.metal
+// kernel_mul_mm_bf16_f32_t_bf16out) so that this pass reads half the bytes;
+// the output stays f32 because the down gemm reads its activation as f32. The
+// bfloat -> float widening is exact, so the arithmetic after it is the kernel
+// above's verbatim: on gate/up values that are already bf16-representable
+// the two kernels agree bit for bit (silu_mul.rs pins it), and against the
+// f32 chain over unrounded inputs the difference is the inputs' bf16
+// rounding alone. One thread per element.
+kernel void kernel_moe_silu_mul_bf16(
+        constant silu_mul_args & args [[buffer(0)]],
+        device const bfloat * gate    [[buffer(1)]],
+        device const bfloat * up      [[buffer(2)]],
+        device       float * dst      [[buffer(3)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= (uint) args.n) {
+        return;
+    }
+    const float g = float(gate[tid]);
+    const float s = g / (1 + exp(-g));
+    dst[tid] = s * float(up[tid]);
+}
+
 // Matches dispatch.rs SiluMulL2Args (#[repr(C)]).
 typedef struct {
     int32_t ff;        // row width (expert_ff), <= SILU_MUL_L2_MAX_FF

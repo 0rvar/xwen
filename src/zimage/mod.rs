@@ -31,11 +31,13 @@
 //! disagree, which is the sigma grid alone, this follows DIFFUSERS
 //! ([`scheduler`] says by how much and why).
 //!
-//! Three environment switches, all read once when the pipeline loads.
+//! Four environment switches, all read once when the pipeline loads.
 //! [`ATTN_ENV`] (`XWEN_ZIMAGE_ATTN=basic`) swaps candle's fused Metal SDPA
 //! for an explicit matmul-softmax-matmul chain that shares no kernel with it,
-//! and [`LINEAR_ENV`] (`XWEN_ZIMAGE_LINEAR=candle`) swaps xwen's tensor gemm
-//! for candle's: both are for bisecting, not for speed.
+//! [`LINEAR_ENV`] (`XWEN_ZIMAGE_LINEAR=candle`) swaps xwen's tensor gemm
+//! for candle's, and [`FFN_STORE_ENV`] (`XWEN_ZIMAGE_FFN_STORE=bf16`) stores
+//! the SwiGLU intermediate as bf16 from the gemm instead of f32: all three
+//! are for bisecting and measuring, not for speed.
 //! [`PROFILE_ENV`] (`XWEN_ZIMAGE_PROFILE=1`) prints a per-stage table for
 //! the transformer and the VAE.
 
@@ -48,7 +50,7 @@ pub mod scheduler;
 pub mod transformer;
 pub mod vae;
 
-pub use linear::{LINEAR_ENV, LinearImpl};
+pub use linear::{FFN_STORE_ENV, FfnStore, LINEAR_ENV, LinearImpl};
 pub use pipeline::{ImageOptions, Rendered, Timings, ZImagePipeline, encode_png, write_png};
 pub use profile::{PROFILE_ENV, Profiler};
 pub use sampling::{postprocess_image, seeded_noise};

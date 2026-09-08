@@ -16,7 +16,7 @@ use candle_core::{D, DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::with_tracing::RmsNorm;
 
-use super::linear::{LinearImpl, Projection, WeightRange, ensure_weights_fit_f16};
+use super::linear::{FfnStore, LinearImpl, Projection, WeightRange, ensure_weights_fit_f16};
 use super::profile::{self, Profiler};
 
 // ==================== Constants ====================
@@ -97,6 +97,11 @@ pub struct Config {
     /// default reads [`super::linear::LINEAR_ENV`].
     #[serde(default = "default_use_xwen_linear")]
     pub use_xwen_linear: bool,
+    /// Whether the SwiGLU pair stores its two gemm outputs as bf16 (the
+    /// opt-in arm) or as f32 (the default). Not a key in the shipped
+    /// config.json; the `serde` default reads [`super::linear::FFN_STORE_ENV`].
+    #[serde(default = "default_ffn_store_bf16")]
+    pub ffn_store_bf16: bool,
 }
 
 /// Padding length that takes `ori_len` up to the next multiple of
@@ -194,6 +199,10 @@ fn default_use_xwen_linear() -> bool {
     LinearImpl::from_env_or_default().is_xwen()
 }
 
+fn default_ffn_store_bf16() -> bool {
+    FfnStore::from_env_or_default().is_bf16()
+}
+
 fn default_patch_size() -> Vec<usize> {
     vec![2]
 }
@@ -267,7 +276,23 @@ impl Config {
             axes_lens: AXES_LENS.to_vec(),
             attn_impl: AttnImpl::from_env_or_default(),
             use_xwen_linear: LinearImpl::from_env_or_default().is_xwen(),
+            ffn_store_bf16: FfnStore::from_env_or_default().is_bf16(),
         }
+    }
+
+    /// Which dtype the SwiGLU intermediate is stored in.
+    pub fn ffn_store(&self) -> FfnStore {
+        if self.ffn_store_bf16 {
+            FfnStore::Bf16
+        } else {
+            FfnStore::F32
+        }
+    }
+
+    /// Pick the SwiGLU intermediate's dtype explicitly, overriding what
+    /// [`super::linear::FFN_STORE_ENV`] said when this config was built.
+    pub fn set_ffn_store(&mut self, store: FfnStore) {
+        self.ffn_store_bf16 = store.is_bf16();
     }
 
     /// Which linear-layer kernel this config runs.
@@ -358,17 +383,70 @@ impl TimestepEmbedder {
 
 // ==================== FeedForward (SwiGLU) ====================
 
-/// SwiGLU feedforward network
+/// `XWEN_ZIMAGE_FFN_STATS=1` tracks the largest |silu(w1 x) * (w3 x)| seen by
+/// any FFN in the process, at the cost of a device sync per FFN call; the
+/// pipeline prints it after a run. It exists to price a half-precision
+/// activation for w2's input: f16 tops out at 65504, so the figure says
+/// whether such an arm is even admissible. Off, this is one atomic load per
+/// FFN call.
+pub const FFN_STATS_ENV: &str = "XWEN_ZIMAGE_FFN_STATS";
+
+static FFN_STATS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static FFN_ACT_MAX_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn ffn_stats_on() -> bool {
+    *FFN_STATS_ON.get_or_init(|| {
+        std::env::var(FFN_STATS_ENV)
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// The largest |silu(w1 x) * (w3 x)| recorded so far under [`FFN_STATS_ENV`],
+/// or None when the instrumentation is off or no FFN has run.
+pub fn ffn_act_max() -> Option<f32> {
+    if !ffn_stats_on() {
+        return None;
+    }
+    let bits = FFN_ACT_MAX_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    (bits != 0).then(|| f32::from_bits(bits))
+}
+
+fn record_ffn_act_max(act: &Tensor) -> Result<()> {
+    let m = act
+        .abs()?
+        .max_keepdim(D::Minus1)?
+        .max_all()?
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()?;
+    // Non-negative floats order like their bit patterns, so fetch_max on the
+    // bits is a max on the values.
+    FFN_ACT_MAX_BITS.fetch_max(m.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// SwiGLU feedforward network: `w2(silu(w1 x) * w3 x)`. The intermediate,
+/// `[T, hidden]` twice, is the widest activation in the block; `store` says
+/// whether the two gemms write it as bf16 (`Projection::forward_bf16`, read
+/// by `ops::silu_mul_bf16`) or as f32. The product is f32 either way, being
+/// what w2 reads.
 #[derive(Debug, Clone)]
 pub struct FeedForward {
     w1: Projection,
     w2: Projection,
     w3: Projection,
+    store: FfnStore,
     profiler: Option<Arc<Profiler>>,
 }
 
 impl FeedForward {
-    pub fn new(dim: usize, hidden_dim: usize, vb: VarBuilder, arm: LinearImpl) -> Result<Self> {
+    pub fn new(
+        dim: usize,
+        hidden_dim: usize,
+        vb: VarBuilder,
+        arm: LinearImpl,
+        store: FfnStore,
+    ) -> Result<Self> {
         let w1 = Projection::new(dim, hidden_dim, false, vb.pp("w1"), arm)?;
         let w2 = Projection::new(hidden_dim, dim, false, vb.pp("w2"), arm)?;
         let w3 = Projection::new(dim, hidden_dim, false, vb.pp("w3"), arm)?;
@@ -376,6 +454,7 @@ impl FeedForward {
             w1,
             w2,
             w3,
+            store,
             profiler: None,
         })
     }
@@ -392,17 +471,35 @@ impl FeedForward {
 
 impl Module for FeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = x.apply(&self.w1)?;
-        let up = x.apply(&self.w3)?;
-        profile::mark(&self.profiler, "ffn.w1w3");
-        // `silu(gate) * up` in one pass on Metal (bit-identical to the candle
-        // chain, which is what runs everywhere else).
-        let act = if gate.device().is_metal() && gate.dtype() == DType::F32 {
-            crate::ops::silu_mul(&gate, &up).map_err(|e| candle_core::Error::Msg(e.to_string()))?
+        let bf16_store = self.store.is_bf16()
+            && self.w1.has_bf16_store(x.device())
+            && self.w3.has_bf16_store(x.device());
+        let act = if bf16_store {
+            // The gemms round their outputs to bf16 in the store and the
+            // activation reads them back at half the bytes; the product is
+            // f32 for w2.
+            let gate = self.w1.forward_bf16(x)?;
+            let up = self.w3.forward_bf16(x)?;
+            profile::mark(&self.profiler, "ffn.w1w3");
+            crate::ops::silu_mul_bf16(&gate, &up)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?
         } else {
-            (gate.silu()? * up)?
+            let gate = x.apply(&self.w1)?;
+            let up = x.apply(&self.w3)?;
+            profile::mark(&self.profiler, "ffn.w1w3");
+            // `silu(gate) * up` in one pass on Metal (bit-identical to the
+            // candle chain, which is what runs everywhere else).
+            if gate.device().is_metal() && gate.dtype() == DType::F32 {
+                crate::ops::silu_mul(&gate, &up)
+                    .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+            } else {
+                (gate.silu()? * up)?
+            }
         };
         profile::mark(&self.profiler, "ffn.silu_mul");
+        if ffn_stats_on() {
+            record_ffn_act_max(&act)?;
+        }
         let out = act.apply(&self.w2)?;
         profile::mark(&self.profiler, "ffn.w2");
         Ok(out)
@@ -895,7 +992,8 @@ impl ZImageTransformerBlock {
         let arm = cfg.linear_impl();
 
         let attention = ZImageAttention::new(cfg, vb.pp("attention"))?;
-        let feed_forward = FeedForward::new(dim, hidden_dim, vb.pp("feed_forward"), arm)?;
+        let feed_forward =
+            FeedForward::new(dim, hidden_dim, vb.pp("feed_forward"), arm, cfg.ffn_store())?;
 
         let attention_norm1 = BlockNorm::new(dim, cfg.norm_eps, vb.pp("attention_norm1"))?;
         let attention_norm2 = BlockNorm::new(dim, cfg.norm_eps, vb.pp("attention_norm2"))?;
@@ -1921,6 +2019,7 @@ mod tests {
             axes_lens: vec![40, 8, 8],
             attn_impl: AttnImpl::Flash,
             use_xwen_linear: true,
+            ffn_store_bf16: false,
         }
     }
 

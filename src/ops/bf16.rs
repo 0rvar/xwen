@@ -25,6 +25,20 @@ pub fn matmul_bf16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
     dispatch::run_matmul_bf16(weight, x)
 }
 
+/// [`matmul_bf16`] with the result stored as bf16: `[t, n_out]` BF16, the
+/// same f32 accumulation rounded once to nearest even. On the tensor gemm
+/// (t > 8, the default kernel) the rounding is the kernel's store epilogue
+/// (`kernel_mul_mm_bf16_f32_t_bf16out`), so the f32 result never reaches
+/// memory: that is the point of it, an intermediate that only a bf16-reading
+/// consumer sees, the Z-Image SwiGLU pair being the one so far
+/// (`zimage::linear::Projection::forward_bf16`, then [`super::silu_mul_bf16`]).
+/// The gemv and the classic gemm compute f32 and cast. Every arm is
+/// bit-identical to `matmul_bf16(weight, x).to_dtype(BF16)` (the tests pin
+/// it), so a caller can reason about it as exactly that. Metal only.
+pub fn matmul_bf16_to_bf16(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
+    dispatch::run_matmul_bf16_to_bf16(weight, x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32,6 +46,93 @@ mod tests {
     use crate::ops::dispatch::F16MmKernel;
     use crate::ops::dispatch::testutil::{pseudo_random, rel_l2};
     use candle_core::{DType, Device, Tensor};
+
+    /// The bf16 store is the f32 tensor gemm's result rounded once to nearest
+    /// even, bit for bit, at the Z-Image SwiGLU shapes (dim 3840 -> hidden
+    /// 10240; T = 4128 at 1024x1024 and 1056 at 512x512), at a ragged token
+    /// count that leaves a partial 128-wide tile, and on the gemv branch
+    /// (t <= 8), which casts on the host. The reference rounding is computed
+    /// on the CPU from the f32 output's bits, so a kernel epilogue that
+    /// truncated or rounded half-away would fail here by name.
+    #[test]
+    fn bf16_store_is_the_f32_result_rounded_to_nearest_even() {
+        let device = metal_device().unwrap();
+        let cpu = Device::Cpu;
+        for (t, n_out, k) in [
+            (4128usize, 10240usize, 3840usize),
+            (1056, 10240, 3840),
+            (200, 1024, 256),
+            (9, 512, 256),
+            (8, 512, 256),
+            (1, 512, 256),
+        ] {
+            let seed = 0xB5_0 + t as u64 + n_out as u64;
+            let w = Tensor::from_vec(pseudo_random(n_out * k, seed, -0.5, 0.5), (n_out, k), &cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let x = Tensor::from_vec(pseudo_random(t * k, seed ^ 0xF00D, -1.0, 1.0), (t, k), &cpu)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+
+            let got = matmul_bf16_to_bf16(&w, &x).unwrap();
+            assert_eq!(got.dims(), &[t, n_out]);
+            assert_eq!(got.dtype(), DType::BF16);
+            let want_f32 = matmul_bf16(&w, &x).unwrap();
+
+            let got_bits: Vec<u16> = got
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .into_iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let want_bits: Vec<u16> = flat(&want_f32)
+                .into_iter()
+                .map(|v| half::bf16::from_f32(v).to_bits())
+                .collect();
+            assert_eq!(got_bits.len(), want_bits.len());
+            let mismatches = got_bits
+                .iter()
+                .zip(&want_bits)
+                .filter(|(g, w)| g != w)
+                .count();
+            assert_eq!(
+                mismatches,
+                0,
+                "matmul_bf16_to_bf16 t={t} n_out={n_out} k={k}: {mismatches} of {} elements differ \
+                 from the f32 result rounded to nearest even",
+                got_bits.len()
+            );
+            // A store that never landed would leave the buffer's previous
+            // contents; a checksum of the first row rules that out too.
+            let nonzero = got_bits.iter().filter(|b| **b != 0).count();
+            assert!(
+                nonzero > got_bits.len() / 2,
+                "t={t}: {nonzero} nonzero of {}",
+                got_bits.len()
+            );
+        }
+    }
+
+    /// The bf16 store's contract checks are the f32 kernel's: wrong dtypes and
+    /// shapes are refused, not cast around.
+    #[test]
+    fn bf16_store_refuses_the_f32_kernels_rejects() {
+        let device = metal_device().unwrap();
+        let w = Tensor::zeros((512, 256), DType::BF16, &device).unwrap();
+        let x_f16 = Tensor::zeros((16, 256), DType::F16, &device).unwrap();
+        assert!(matmul_bf16_to_bf16(&w, &x_f16).is_err());
+        let x_bad_k = Tensor::zeros((16, 128), DType::F32, &device).unwrap();
+        assert!(matmul_bf16_to_bf16(&w, &x_bad_k).is_err());
+        let w_f16 = Tensor::zeros((512, 256), DType::F16, &device).unwrap();
+        let x = Tensor::zeros((16, 256), DType::F32, &device).unwrap();
+        assert!(matmul_bf16_to_bf16(&w_f16, &x).is_err());
+    }
 
     /// The two sidecars' production matmul shapes as (n_out, k): q (32 heads ->
     /// 4096), k/v (8 KV heads -> 1024), o_proj, the FFN trio, and the encoder fc
