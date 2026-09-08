@@ -609,3 +609,26 @@ keeps refresh cost independent of weight-file size. Clients select the absolute 
 so a same-named working-directory file cannot shadow the listed adapter; existing
 CLI and render path resolution keep their precedence. The [API record](../records/zimage-control-api.md#lora-discovery-reads-the-directory-on-every-request)
 holds the response contract and filesystem behavior.
+
+**Image Studio is a separate Tauri client with workspace-local provenance.**
+2026-09-08. The user requested a desktop image app with selectable workspaces,
+launch-argument workspace selection and session output. `image-studio/` therefore
+has its own frontend dependencies and Rust package, and calls the existing image
+APIs through Rust HTTP commands. It does not share the inference crate or alter its
+dependency graph. Configuration lives at `~/.config/xwen/image-studio.json`; each
+workspace activation creates a new session. PNGs retain the server's bytes and YAML
+sidecars hold full generation requests and response metadata. Input assets are
+snapshotted by hash beside the outputs so history does not depend on external files.
+PNG iTXt was considered, but structured, readable provenance and preserving the
+original PNG make YAML the better default. The [client record](../records/image-studio.md)
+owns the architecture and verification.
+
+**Image batches are validated plans of sequential requests.** 2026-09-08. Numeric
+ranges and Cartesian matrices expand before work starts; paired axes support
+matching parameter rows. All requests carry explicit seeds and share the same seed
+sequence across comparison cells unless seed is itself varied. The planner rejects
+invalid cells and plans above 1000 images before submission. One request runs at a
+time, matching the image server's single worker. Stop means stop after the current
+image saves, because the API exposes neither cancellation nor step progress. Pending
+queue recovery is not taken now; completed images, requests and input snapshots are
+durable. The reopen conditions are in the [client record](../records/image-studio.md#not-taken-now).

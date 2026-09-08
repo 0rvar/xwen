@@ -45,6 +45,13 @@ velocity cosine of 0.999999 (Models, below).
 System Rust toolchain, system Apple CLT SDK (the nix shell deliberately provides no
 SDK — see flake.nix). `cargo build --release`. Ops tests need a Metal device.
 
+The desktop image client lives in [`image-studio/`](image-studio/README.md), with
+its own Bun and Tauri build. It supports image generation, img2img, mask painting,
+ControlNet, LoRAs and parameter batches through a local or remote xwen server.
+First launch asks for a workspace and server URL; settings live in
+`~/.config/xwen/image-studio.json`. Every session saves PNGs with YAML generation
+records and input snapshots inside its workspace.
+
 ## Models
 
 Four checkpoints — Q4_K_M, except Flash-Next's UD-Q4_K_XL — all resolved through the HF

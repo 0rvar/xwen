@@ -249,6 +249,9 @@ Each phase is an arc with its own record. Order is by what it unlocks per unit o
 The GUI is not a phase here. It starts once phase 3 gives it an endpoint to talk to and
 runs as its own arc with its own doc.
 
+The 2026-09-08 client arc is [Image Studio](records/image-studio.md), a Tauri app
+under `image-studio/` with workspaces, image controls and parameter batches.
+
 ## Risks and open questions
 
 - Synthetic pose maps may not work (discussion #28). Test a hand-drawn OpenPose map in

@@ -1,0 +1,1 @@
+{"identifier":"main","description":"Image Studio window and native file/directory selection","windows":["main"],"permissions":["core:default","dialog:allow-open"]}

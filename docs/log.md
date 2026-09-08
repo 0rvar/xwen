@@ -4,6 +4,16 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-08 — Image Studio renders through the image APIs with workspaces and parameter batches
+
+`image-studio/` adds a separate Tauri desktop app for text-to-image, img2img,
+mask painting, ControlNet previews and LoRAs. Home-directory configuration remembers
+the server and recent workspaces; a launch argument selects the workspace. Each
+session saves PNGs, YAML generation records and hashed input snapshots. Matrix and
+paired batches validate all combinations before sequential submission, with matched
+comparison seeds and stop-after-current behavior. The inference crate is unchanged.
+[Usage](../image-studio/README.md), [implementation and verification](records/image-studio.md).
+
 ## 2026-09-08 — The image API lists LoRAs from disk on every request
 
 `GET /v1/images/loras` returns sorted adapter filenames, absolute paths and byte sizes from the same
