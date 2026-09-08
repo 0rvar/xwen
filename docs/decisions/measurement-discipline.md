@@ -222,6 +222,16 @@ a step as a RANGE with its ramp, "1.35 s first step rising to 2.0-2.1 s by step 
 the render as the sum of the eight steps actually observed plus the decode, and never quote
 a single steady figure ([records/zimage-perf.md](../records/zimage-perf.md) "Results on
 master e5d9775, clean").
+AMENDED again 2026-09-08, evening: the ramp's cause is read and it is a hardware CLOCK LIMITER,
+not a power cap and not OS thermal pressure. A 1024x1024 run holds 1620 MHz at 86-89 W for its
+first three steps, falls to 1100-1160 MHz at 33-36 W by step 5 and to 875-1016 MHz at 22-29 W
+by step 20, with the GPU 96-100% active, the driver requesting the top P-state on every sample
+and thermal pressure Nominal throughout; power falls with the clock instead of holding a
+ceiling, which is what rules out a cap, and a 512x512 run never reaches it. So a Z-Image kernel
+change is priced TWICE: as full-clock milliseconds on the first three steps, and as joules per
+unit of work at the plateau, where wall time follows energy and not the kernel's full-clock
+FLOP/s. A first-step gain is never quoted as a render gain without a steady-state run behind it
+([records/zimage-perf.md](../records/zimage-perf.md) "The power envelope read").
 
 **A profiled row that shows a fusion win is not a result until the fusion is confirmed
 unprofiled.** The Z-Image profiler syncs at every mark and `wait_until_completed` also

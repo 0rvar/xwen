@@ -3144,6 +3144,29 @@ blocks use of the feature; item (a) is the one with a known trigger.
 
 [Opened 2026-09-08 by the third Z-Image arc of the day (a763c61, e5d9775, and the refuted branch `zimage-ffn`; log.md "Z-Image's VAE on a direct conv kernel and its attention on the tensor units"). Nothing has closed under it yet; its open items sit in TODO.md "Image generation", the power-envelope instrument first.]
 
+[Shipped 2026-09-08, evening: read by the user with `scripts/zimage-power.sh`, three runs; the ramp is a hardware clock limiter and not a power cap and not OS thermal pressure, and the result is in the record section "The power envelope read". Text as it stood in TODO.md.]
+
+- [x] [measured] **Read the Z-Image power envelope with `powermetrics` during a 1024x1024 run.**
+  An instrument, and the first thing the next image arc does. On master e5d9775, clean, a
+  warm 1024x1024 run reads 1.35 s on the first step and 1.9-2.1 s by the eighth: the third
+  arc of 2026-09-08 took the first step 1.78 to 1.35 with a 3.5x attention kernel and a 4x
+  VAE decode, and the eighth step only 2.15 to 2.0-2.1, so the ramp is 55% where it was
+  20% that morning and 17% the day before. Faster kernels reaching a throttle sooner is the
+  signature of a power or thermal cap, and if that is the cause every kernel lever below
+  converts to wall time only until the cap, and the render's floor is the envelope's. It is
+  an observation, not a confirmed cause. What to run: `sudo powermetrics --samplers
+  gpu_power,thermal -i 500` from a user shell (the agent sandbox has no sudo) beside
+  `xwen image --prompt "a lighthouse on a rocky shore at dusk, oil painting" --seed 7` at
+  1024x1024, and read GPU power, GPU frequency and the thermal pressure level against the
+  per-step times; then the same at 512x512, whose steps ramp 0.35 to 0.40, and once with
+  `--steps 24` to see whether the plateau holds or drifts. What it prices: whether the gemm
+  fusion, the elementwise tail and the mid-block attention are first-step gains or render
+  gains, and whether int8's 1.8x compute would land at all. If the cap is confirmed, the
+  follow-up is a per-kernel-class power reading, not another kernel (2026-09-08).
+  [Record](records/zimage-perf.md), [figures](perf-state.md),
+  [measurement](decisions/measurement-discipline.md).
+  From: Deferred from the Z-Image VAE conv and tensor-op attention arcs (2026-09-08).
+
 ## Retired: Image generation
 
 [Retired 2026-09-08: its basis was the profiler's buffer-pool eviction and not the f32 store. The bf16 store was built on the branch `zimage-ffn` (5e7a6ea), is bit-exact, and measured parity within 5% with an unstable sign; the f32-store gemm runs 37-45 TFLOP/s isolated, w2's own class, and bandwidth caps the lever at ~0.2 s per image (decisions.md "The bf16 SwiGLU store is REFUTED"). A half intermediate for w2 is disqualified by a measured activation max of 284,507 against f16's 65,504. Reopen if a future MPP release adds a converting cooperative-tensor store or documents the tile lane layout so a vectorized epilogue can skip the index math, or with a per-row scaled activation folded into w2's gemm, which is a different arc.]

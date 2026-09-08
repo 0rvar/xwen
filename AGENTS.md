@@ -476,9 +476,11 @@ The seams, so a change lands in one place:
   every dispatch first-touch its 169 MB intermediate), so a row RANKS and
   `tests/zimage_microbench.rs` prices. Quote a step as a range with its ramp, "1.35 s first
   step rising to 2.0-2.1 s by step 8" on master e5d9775, never as an 8-step mean and not as
-  one steady number: the ramp is 55% where it was 20% before the third arc, which reads as a
-  power or thermal envelope and is unconfirmed until `powermetrics` is run
-  (docs/benching.md, and decisions/measurement-discipline.md "A Z-Image step is quoted at
+  one steady number: the ramp is 55% where it was 20% before the third arc, and `powermetrics`
+  read it the same evening as a hardware clock limiter, 1620 MHz and 86-89 W for three steps
+  then 900-1150 MHz at 25-35 W, the driver asking for the top P-state throughout, so at the
+  plateau a kernel pays through joules and not FLOP/s; `scripts/zimage-power.sh` is the
+  instrument (docs/benching.md, and decisions/measurement-discipline.md "A Z-Image step is quoted at
   steady state").
 - **`Model::text_encoder()`** is where the conditioning comes from. The pipeline entry
   holds no encoder spec of its own and `src/zimage/` has no text encoder: it takes a

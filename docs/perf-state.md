@@ -264,11 +264,34 @@ after a cold page cache, 1.35 1.36 1.61 1.77 1.94 1.91 2.06 2.12. The first step
 1.9-2.1 s by the eighth, so the plateau moved 0.1-0.2 s. The ramp is 55% over eight steps
 where it was 20% that morning and 17% the day before. That is the signature of a power or
 thermal cap, faster kernels reaching the throttle sooner and the step past it governed by
-the envelope rather than the kernel. **It is an observation and not a confirmed cause**; the
-confirmation is a `powermetrics` trace during a run, which needs sudo from a user shell, and
-it is the first item on the Front because it decides whether any further kernel win converts
-to wall time at the plateau (decisions.md "A Z-Image step is quoted at steady state", as
-amended). Quote "1.35 s first step rising to 2.0-2.1 s by step 8".
+the envelope rather than the kernel. **Confirmed the same evening by `powermetrics`, and it
+is a hardware clock limiter**: GPU frequency 1620 MHz at step 2 falling to 1100-1160 by step
+5 and to 875-1016 by step 20 of a 24-step run, power 86-89 W falling with it to 33-36 W and
+then 22-29 W, the GPU 96-100% active and the driver requesting the top P-state on every
+sample, and the OS thermal pressure level Nominal throughout. Not a power cap, since power
+falls rather than holding a ceiling; not the driver; not starvation. The sustained operating
+point is 25-35 W at 900-1150 MHz, reached in about six seconds, on a MacBook in automatic
+power mode on AC. At the plateau a kernel converts to wall time through its energy per unit
+of work, not its full-clock FLOP/s, which is why the third arc's 3.5x attention kernel moved
+step 8 by 5% ([records/zimage-perf.md](records/zimage-perf.md) "The power envelope read",
+decisions.md "A Z-Image step is quoted at steady state", as amended). Quote "1.35 s first
+step rising to 2.0-2.1 s by step 8".
+
+**Step count, measured 2026-09-08 on a pinned build of eeec7bb**, warm, same seed and prompt,
+the pipeline being bit-deterministic across repeats. 8 is the default and what the parity
+gate grades; the others are `--steps` on the CLI, `steps` on the route and `xwen serve
+--image-steps` as a server-wide default ([records/zimage-perf.md](records/zimage-perf.md)
+"Step count priced").
+
+| steps | 1024x1024 render | 512x512 render | what the image does |
+| --- | --- | --- | --- |
+| 8 | 13.97 s | 3.01 s | the reference |
+| 6 | 10.80 s, -23% | 2.25 s, -25% | a different, equally finished painting on the lighthouse; the portrait keeps its skin and stubble |
+| 4 | 7.32 s, -48% | 1.55 s, -49% | softer sky and water on the lighthouse; the portrait loses skin, stubble and eye detail |
+
+The 8-step render of 13.97 s sits under the 15.5-17.5 s quoted above because this session's
+ramp read +31% over eight steps (1.37 to 1.80 s) where the clean e5d9775 runs read +55%; the
+first step matched. That spread is the envelope question, unchanged.
 
 | Figure, resolution-independent | Value |
 | --- | --- |

@@ -999,18 +999,199 @@ shape. Splitting the scale out of the fused multiply-add moved the parity gate t
 0.0011, max rel 0.0063, final latent 0.999635 / 0.0073, image PSNR 46.54 dB (VAE alone
 93.11), a rounding change that landed 0.45 dB over the steel arm.
 
+## 2026-09-08 — Step count priced: 6 steps is -23% render at 1024x1024 and a different painting, 4 is -48% and costs skin
+
+The one large number on the lever ledger that was not a measurement. The user reopened it
+in the evening, after the third arc, with the power envelope still unread. Two things were
+done: the step count was measured at 8, 6 and 4 on a pinned binary, with the images looked
+at, and `xwen serve` gained `--image-steps`, a server-wide default for the images route,
+because ComfyUI's stock OpenAI node cannot send a step count and a per-request `steps` field
+alone leaves that user at 8. Eight stays the default everywhere; the parity gate runs at 8
+and nothing in the transformer changed.
+
+### Protocol
+
+Pinned copy of the release build at eeec7bb under `/tmp/xwen-steps/`, one run per hold of
+the shared GPU lock, `lowpowermode 0`, no high-power claim. Prompt A is the standing
+fixture, `a lighthouse on a rocky shore at dusk, oil painting`, seed 7; prompt B is
+`a close-up portrait photo of an old fisherman, weathered skin, soft window light, 85mm`,
+seed 11, because skin and stubble are where a step count shows first. Every 1024x1024
+prompt-A run was made twice. The pipeline is bit-deterministic: each repeat was
+byte-identical to its first sample, MSE exactly 0, so the pairs price timing variance only.
+PSNR against the 8-step image of the same prompt and size is an information figure, not a
+bar: fewer steps produce a different image, not a noisier copy of the same one, so a low
+number says the image moved and never that it degraded. It was computed by a bun PNG decoder
+over the RGB planes (`/tmp/xwen-steps/psnr.ts`).
+
+### 1024x1024
+
+| steps | per-step, s | transformer | VAE | render | CLI wall |
+| --- | --- | --- | --- | --- | --- |
+| 8 | 1.37 1.44 1.52 1.58 1.67 1.70 1.74 1.80 | 12.82 | 1.15 | 13.97 | 18.2 |
+| 8, first process | 1.49 1.33 1.35 1.48 1.58 1.68 1.60 1.70 | 12.21 | 3.94 (cold, see below) | 16.15 | 36.9 |
+| 6 | 1.41 1.51 1.59 1.65 1.71 1.78 | 9.65 | 1.15 | 10.80 | 15.0 |
+| 6 | 1.32 1.34 1.39 1.53 1.61 1.70 | 8.89 | 1.18 | 10.07 | 14.2 |
+| 4 | 1.43 1.55 1.61 1.65 | 6.24 | 1.08 | 7.32 | 11.6 |
+| 4 | 1.37 1.42 1.47 1.53 | 5.79 | 1.13 | 6.92 | 11.1 |
+| portrait, 8 | 1.33 1.38 1.50 1.55 1.59 1.68 1.77 1.66 | 12.46 | 1.22 | 13.68 | 17.9 |
+| portrait, 6 | 1.35 1.35 1.39 1.50 1.69 1.65 | 8.93 | 1.14 | 10.07 | 14.7 |
+| portrait, 4 | 1.38 1.46 1.53 1.61 | 5.98 | 1.14 | 7.12 | 11.3 |
+
+Against the warm 8-step sample, **6 steps is 10.80 s against 13.97, -23%, and 4 steps is
+7.32 s, -48%**. The saving is very slightly super-linear in steps removed, because a shorter
+run ends before the ramp gets far. Two notes for the envelope instrument rather than for
+this arc: the ramp read +31% over eight steps here, 1.37 to 1.80 s, where the clean figures
+on e5d9775 read +55%, on an otherwise idle machine; and the first process of the session paid
+14.8 s of load against 3.2 for every later one, 3.7 s for a 20-token prompt encode against
+6-7 ms, and **3.94 s for the VAE decode against 1.08-1.22 s in every later run**. That decode
+is a per-process first-decode cost of about 2.8 s, not a 1024x1024 VAE figure, and it is
+unpriced as a lever because the serve route pays it once per load.
+
+### 512x512
+
+| steps | per-step, s | transformer | VAE | render | CLI wall |
+| --- | --- | --- | --- | --- | --- |
+| 8 | 0.33 0.33 0.34 0.35 0.35 0.35 0.36 0.36 | 2.77 | 0.24 | 3.01 | 7.0 |
+| 6 | 0.33 0.33 0.33 0.34 0.34 0.34 | 2.01 | 0.24 | 2.25 | 6.3 |
+| 4 | 0.33 0.32 0.33 0.33 | 1.31 | 0.24 | 1.55 | 5.7 |
+
+Same proportions, -25% and -49% of the render, and the ramp is 9% over eight steps. The
+~4 s of load swamps it on the CLI, so at 512x512 the step count moves the wall clock only on
+a resident server.
+
+### What the images say
+
+| prompt, size | 6 vs 8 | 4 vs 8 |
+| --- | --- | --- |
+| lighthouse 1024x1024 | 29.69 dB | 27.31 dB |
+| lighthouse 512x512 | 23.21 dB | 21.35 dB |
+| portrait 1024x1024 | 25.31 dB | 22.09 dB |
+
+Lighthouse at 6 against 8 is a different, equally finished painting: the foreground rock
+shelf is unchanged, the tower is taller and slimmer, the cottage door goes from red to
+green, the sky reads a little cooler and flatter. Detail as such is not worse. At 4 it
+starts to cost: the sky flattens into a hazy gradient with a smeared cloud band, the
+mid-ground whitecaps thin out and the water texture flattens, mid-ground rocks read as smooth
+blobs where at 8 they are faceted. Softer and less resolved, not noisy and not broken. At
+512x512 the 6- and 4-step images are near twins of each other and both a long way from 8
+(the red lantern housing and door are gone, the figure on the path is gone), and neither
+looks worse than 8. The portrait at 4 against 8 is a quality loss and not a variation: at 8
+the skin is granular to pore level, whiskers stand out singly, the crow's feet and cheek
+creases have hard edges and each eye has a crisp catchlight; at 4 the skin is smoothed and
+slightly waxy, the stubble collapses into a soft grey mass, the deep wrinkles flatten, the
+eyes go glassy and the jacket's zipper teeth and collar seam dissolve. Anyone looking for
+skin texture sees it at once. The portrait at 6 was run afterwards to see whether the same
+happens one step up, and it does not: pore-level texture survives on the forehead and cheek,
+the deep creases keep hard shadowed edges, single whiskers still read on the chin instead
+of merging, and the crop matches the 8-step framing where 4 pulled tighter. 25.31 dB against
+8, 10.07 s render, -26%.
+
+The read: 6 is the only count that could be argued as a new default, at -23 to -26% of the
+render for what on the lighthouse is a different painting rather than a worse one and on
+the portrait holds the skin; 4 is a good opt-in for painterly and landscape prompts and a
+bad global default. The default stays 8,
+what Turbo is distilled for and what the parity gate grades, and the choice is exposed
+instead: `--steps` on the CLI (already there), `steps` or `num_inference_steps` on the route
+(already there), and now `xwen serve --image-steps` for the client that cannot send one.
+Images under `/tmp/xwen-steps/`, logs beside them, the full report at
+`/tmp/agent-report-zimage-steps.md`.
+
+Not taken now: mapping the OpenAI `quality` field onto a step count (`low`, `medium`, `high`
+on the gpt-image dialect, `standard` and `hd` on dall-e's) so the stock ComfyUI node gets a
+per-image switch without a plugin. It is a product decision about which tier means how many
+steps, and it is the one place the route would read an OpenAI field as something other than
+its OpenAI meaning. Reopen when a ComfyUI user wants per-image control rather than a
+server-wide default; the mapping is a dozen lines in `src/serve/images.rs` beside the
+`steps` resolution.
+
+## 2026-09-08 — The power envelope read: a hardware clock limiter, not a power cap and not OS thermal pressure
+
+The Front's instrument, run by the user from a sudo shell with `scripts/zimage-power.sh`
+(eeec7bb, its summarizer fixed in 7011914: the CLI prints every step line after the render
+returns, so the first version put the whole render in step 1's window). Three runs on a
+copy of the eeec7bb release build, `pmset -g` reading `lowpowermode 0` and `powermode 0`,
+on AC with the battery at 100%, a MacBook (`Mac17,7`). `powermetrics --samplers
+gpu_power,cpu_power,thermal -i 250`, binned by the step durations laid end to end from the
+seed line.
+
+### 1024x1024, 8 steps
+
+| step | s | GPU W mean | GPU W max | GPU MHz mean | MHz min-max | active % | driver asks | pressure |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1.65 | 69.4 | 87.8 | 1429 | 599-1620 | 84 | P13 | Nominal |
+| 2 | 1.35 | 85.9 | 88.7 | 1620 | 1618-1620 | 98 | P13 | Nominal |
+| 3 | 1.39 | 79.1 | 89.1 | 1577 | 1500-1620 | 98 | P13 | Nominal |
+| 4 | 1.55 | 48.0 | 58.0 | 1339 | 1211-1489 | 96 | P13 | Nominal |
+| 5 | 1.74 | 36.2 | 39.6 | 1161 | 1122-1217 | 99 | P13 | Nominal |
+| 6 | 1.75 | 33.3 | 37.0 | 1135 | 1105-1179 | 96 | P13 | Nominal |
+| 7 | 1.80 | 32.7 | 37.2 | 1100 | 992-1183 | 98 | P13 | Nominal |
+| 8 | 1.78 | 34.5 | 38.2 | 1121 | 1010-1188 | 100 | P13 | Nominal |
+
+The VAE decode after it read 4.31 s, the first-decode cost the step-count arc also saw, at
+16.7 W mean and 26% active: that cost is not GPU work. The first step's 84% active and 599 MHz
+minimum are its own first-dispatch cost.
+
+### 1024x1024, 24 steps, does the plateau hold or drift
+
+Steps 1 to 4: 1.37 s at 81.6 W and 1590 MHz, 1.44 at 67.8 W and 1491, 1.61 at 48.7 W and
+1320, 1.79 at 34.4 W and 1144. Steps 5 to 12 sit at 1.69-1.85 s, 34-40 W, 1100-1220 MHz.
+Steps 13 to 21 sink further, 1.98-2.25 s at 22-29 W and 875-1016 MHz, the floor being step
+21 at 2.25 s, 22.4 W and 875 MHz (799 MHz minimum). Steps 22 to 24 come back a little,
+2.04-2.16 s at 26-29 W and 950-1015 MHz. Active residency 96-100% and the driver at P13 on
+every step; pressure Nominal on every sample. The 512x512 run (2.7 s of steps) sat at 78.5 W
+and 1593 MHz throughout, too short to reach the limiter, which is why its ramp is 9%.
+
+### What it says
+
+- **It is a clock limiter in hardware, not a power cap.** Power is not flat at a ceiling: it
+  falls from 86-89 W at step 2 to 33-36 W by step 5 and 22-27 W by step 20, together with
+  the frequency, 1620 to 1100 to 875 MHz. A power cap holds power and trades frequency; this
+  trades both away.
+- **Not the OS thermal pressure level**, which read Nominal on every sample of every run.
+  The limiter is below that mechanism, and `powermetrics` on this macOS has no `smc`
+  sampler, so the die temperature and the fan are not observable from it.
+- **Not starvation and not the driver.** The GPU is 96-100% active on every step after the
+  first and the driver requests the top P-state on every sample. The hardware is refusing
+  the clock it is asked for.
+- **The step is clock bound.** Step 2 at 1620 MHz is 1.35 s and step 21 at 875 MHz is 2.25 s;
+  1.35 x 1620 / 875 predicts 2.50, so the step is mostly frequency and a little memory.
+- **The sustained operating point is about 25-35 W at 900-1150 MHz**, against 86-89 W at
+  1620 MHz for the first three steps. That is a laptop's sustained GPU budget with the
+  machine in automatic power mode. It is reached in about six seconds and it keeps sinking
+  for forty more.
+
+What it prices. At the plateau the machine spends a roughly fixed number of watts, so a
+faster kernel converts to wall time only through its energy per unit of work, not its
+FLOP/s at the full clock. This is the third arc's result read back: a 3.5x attention kernel
+and a 4x VAE took the first step 24% and step 8 5%. The levers that still pay at steady
+state are the ones that cut joules per image: fewer steps (measured above), fewer FLOPs
+(int8 compute, if the tensor units have an int8 rate, still the open question) and less
+DRAM traffic (the elementwise tail and the gemm launch fusion, whose value at the plateau
+is their bytes and not their milliseconds; both unpriced on that basis). Two things to try
+that cost nothing in code, both for the user: High Power Mode in System Settings (Battery,
+Energy Mode) on this machine, which changes the fan curve and the sustained budget, and
+the same three runs with it on; and a cold-start run after minutes idle, to see how much of
+the 8-step render is spent above the plateau. Neither is claimed here; `powermode 0` is
+what was read.
+
+The summaries are `/tmp/zpm-out/140858.txt` and `/tmp/zpm-out/140947.txt`, the raw logs
+under `/tmp/zimage-power-20260908-{140858,140932,140947}/`.
+
 ## Lever ledger
 
-Rewritten 2026-09-08 for the third time, after the arc above. The base is master e5d9775:
-a 1024x1024 step of **1.35 s first rising to 2.0-2.1 s by step 8**, eight steps in 14.1-16.1 s,
-a 1.4 s decode, a render of **15.5-17.5 s** and a warm wall of 22-25 s. Two rows of the
-previous ledger shipped and one is refuted, and the base itself is the open question: the
-ramp says the steady state is governed by a power or thermal envelope, so every gain below is
-a gain in the FIRST step until `powermetrics` says otherwise, and the instrument comes first.
+Rewritten 2026-09-08 for the third time, after the third arc, and re-based the same evening
+once the envelope was read. The base is master e5d9775: a 1024x1024 step of **1.35 s first
+rising to 2.0-2.1 s by step 8**, eight steps in 14.1-16.1 s, a 1.4 s decode, a render of
+**15.5-17.5 s** and a warm wall of 22-25 s. Two rows of the previous ledger shipped and one is
+refuted. The base is no longer an open question: the plateau is a hardware clock limiter
+that settles at 25-35 W and 900-1150 MHz within six seconds ("The power envelope read"
+above), so every row below is priced twice, as a first-step gain at the full clock and as
+joules saved at the plateau, and a row that saves time without saving energy pays only on
+the first three steps.
 
 | lever | today | ceiling, and how it was derived | gain per image | cost class |
 | --- | --- | --- | --- | --- |
-| the power envelope, an INSTRUMENT | the ramp: 1.35 to 2.0-2.1 s over eight steps, 55%, where it was 20% before this arc and 17% before the rope arc | a `powermetrics` trace of GPU power, frequency and the thermal state across a 1024x1024 run, read beside the per-step times | prices every row below: if the plateau is the envelope, a kernel win converts to wall time only until the cap and the render's floor is the cap's, not the kernels' | sudo from a user shell, an hour; the sandbox cannot run it |
+| the power envelope, an INSTRUMENT, READ the same evening | a hardware clock limiter: 1620 MHz and 86-89 W for three steps, then 1100-1160 MHz at 33-36 W by step 5 and 875-1016 MHz at 22-29 W by step 20; driver at P13, GPU 96-100% active, pressure Nominal throughout ("The power envelope read" above) | `scripts/zimage-power.sh` from a sudo shell; the next reading is the same three runs in High Power Mode | priced every row below twice: full-clock time for the first three steps, joules at the plateau for the rest | done; the open follow-up is the High Power Mode run, ten minutes, the user's |
 | gemm launch fusion and tile tuning | the four gemms, 46.7 TFLOP, at 37-45 TFLOP/s isolated, so 1.04-1.26 s and most of the step | UNPRICED: q, k and v as one N=11520 gemm and the SwiGLU pair as one N=20480, then tiles tuned for M around 4000 at those N, which no sweep has covered | unknown, and `tests/zimage_microbench.rs` prices it in an hour at these shapes | host-side plus tile work, no new kernel class |
 | the elementwise tail | ~1.05 s profiled per step over nine rows (norm+scale 184, `attn.qknorm` 138, `ffn.norm+scale` 124, transpose 121, rope 119, untranspose 58, `ffn.silu_mul` 254, the gates 52); real is the residual after the gemms and attention, at most ~0.1-0.3 s depending on where in the ramp the step sits | about half of that with gemm epilogues and a fused per-head `attn.qknorm` | under 1 s, probably well under; no single row is worth an arc | small kernels, no math change |
 | the VAE mid-block attention | 108-119 ms profiled, 7-8% of the 1.4 s decode | candle's SDPA or a flash arm at head_dim 512 | ~0.1 s | one call site; reopen when the decode is wanted under 1 s |
@@ -1026,14 +1207,24 @@ Below the kernels, three record lines with reopen conditions, re-based on the ne
   is not a measurement: Turbo is distilled for eight and the model card says nine
   ([zimage.md](../zimage.md)), so it is an image-quality judgement, and the stock ComfyUI
   node's `quality` field is the natural switch. Reopen on a product decision about how many
-  steps an image gets.
+  steps an image gets. **Measured 2026-09-08, evening**: 6 steps is -23% of the render and 4
+  is -48% at 1024x1024, the 4-step portrait loses skin texture and the default stays 8, with
+  `xwen serve --image-steps` added for the client that cannot send a count (the section
+  "Step count priced" above). The `quality` mapping is the open product decision.
 - **Step caching**, TeaCache or a first-block cache. Worth 0 to 2 s and UNPRICED, the range
   starting at zero because an 8-step schedule at static shift 3.0 spaces its sigmas far
   apart, the regime these caches were not built for. Reopen on a priced experiment, a day.
 - **int8 gemms on the tensor units**, about 1.8x fp16 compute on the gemm plane, so perhaps
   4-5 s of today's render if the envelope is not the cap and much less if it is. Weeks: W8A8
   calibration and a new set of parity bars. Reopen if sub-10 s at eight steps becomes a
-  requirement (decisions.md "The transformer runs bf16 end to end").
+  requirement (decisions.md "The transformer runs bf16 end to end"). Deferred again on
+  2026-09-08, evening, behind the envelope reading and the step-count option: at 4128 tokens
+  the gemms are compute bound, so a weight-only int8 plane buys nothing and the lever is
+  int8 COMPUTE, which needs activation quantization. Two questions to settle before anyone
+  writes a kernel, both unanswered: whether `mpp::tensor_ops::matmul2d` exposes an int8 rate
+  above bf16 on the M5 Max at all (the 1.8x is a published-architecture figure, not a
+  measurement here), and whether the plateau is the envelope, in which case the FLOP cut
+  lands only as joules saved and the gain is whatever the cap gives back.
 
 Priced as non-levers, unchanged from the previous ledger: the per-step readback is free
 (removing it read 35.8 s against 35.3 at the time, the work moving into the VAE number);

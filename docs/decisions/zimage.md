@@ -539,3 +539,22 @@ or a documented tile lane layout that lets a vectorized epilogue skip the index 
 half `h` reopens only with a per-row scaled activation folded into w2's gemm, a different arc
 (decisions.md "A profiled row that shows a fusion win is not a result until the fusion is
 confirmed unprofiled"; [records/zimage-perf.md](../records/zimage-perf.md), 2026-09-08).
+
+**Eight steps stays the default, and the step count is exposed rather than lowered.**
+Measured 2026-09-08 on a pinned build of eeec7bb, same seed and prompt, the pipeline being
+bit-deterministic across repeats: at 1024x1024 six steps render in 10.80 s against 13.97
+(-23%) and four in 7.32 (-48%), the same proportions at 512x512. On the lighthouse fixture
+six steps is a different, equally finished painting (29.7 dB against the 8-step image, an
+information figure and not a bar) and four is visibly softer; on a portrait four steps loses
+skin grain, single whiskers, wrinkle edges and eye structure, which anyone looking for
+texture sees at once, while six keeps all of it. So four is a bad global default and six is arguable, and neither
+displaces eight: Turbo is distilled for eight, the parity gate grades eight, and a default
+that moves under a ComfyUI user's feet is a quality regression they did not ask for. The
+choice is exposed at every surface instead: `--steps` on the CLI and `steps` or
+`num_inference_steps` on the route already existed, and `xwen serve --image-steps <N>` is
+new, a server-wide default for the one client that cannot send a count (ComfyUI's stock
+OpenAI node), with an explicit request value still winning. Not taken: reading the OpenAI
+`quality` field as a step tier, which would give that node a per-image switch but makes the
+route interpret an OpenAI field against its meaning, and which tier means how many steps is
+a product decision; the record holds the sketch and the reopen condition
+([records/zimage-perf.md](../records/zimage-perf.md) "Step count priced").

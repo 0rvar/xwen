@@ -115,14 +115,26 @@ elementwise tail (bounded by the residual at ~0.1-0.3 s a step). Not items, by t
 rule: the VAE mid-block attention at ~0.1 s per image and the step-count question are
 record lines ([the record](docs/records/zimage-perf.md), "Lever ledger").]
 
+[Amended 2026-09-08, evening, later: the power-envelope instrument promoted an hour earlier
+is READ and its item moved to the archive; the Front is seven and nothing was promoted into
+the gap. The ramp is a hardware CLOCK LIMITER, not a power cap and not OS thermal pressure:
+1620 MHz at 86-89 W for the first three 1024x1024 steps, 1100-1160 MHz at 33-36 W by step 5,
+and 875-1016 MHz at 22-29 W by step 20 of a 24-step run, with the GPU 96-100% active, the
+driver requesting the top P-state on every sample and thermal pressure Nominal throughout.
+Power falls with the clock rather than holding a ceiling, which is what rules out a power cap,
+and a 512x512 run never reaches it. So an image kernel row is worth its full-clock
+milliseconds on the first three steps and its energy per unit of work at the plateau, which
+is why the two Z-Image annotations below now say their value there is bytes saved and not
+milliseconds. No lever is promoted on the strength of it: what it changed is how the rows are
+priced, not their rank ([the record](docs/records/zimage-perf.md), "The power envelope read").]
+
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
 2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
 3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
 4. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
 5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
-6. **Read the Z-Image power envelope with `powermetrics` during a 1024x1024 run** (Image generation, measured, an instrument): the step ramps 1.35 to 2.0-2.1 s over eight steps on e5d9775 where it ramped 20% before the third arc of 2026-09-08, and the trace decides whether the plateau is a power or thermal cap, which prices every remaining image lever (gemm fusion, the elementwise tail, the mid-block attention, int8) as a first-step gain or a render gain
-7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
-8. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
+6. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
+7. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
 
 ## Decode performance
 
@@ -798,27 +810,6 @@ record lines ([the record](docs/records/zimage-perf.md), "Lever ledger").]
 
 ## Image generation
 
-- [ ] [measured] **Read the Z-Image power envelope with `powermetrics` during a 1024x1024 run.**
-  An instrument, and the first thing the next image arc does. On master e5d9775, clean, a
-  warm 1024x1024 run reads 1.35 s on the first step and 1.9-2.1 s by the eighth: the third
-  arc of 2026-09-08 took the first step 1.78 to 1.35 with a 3.5x attention kernel and a 4x
-  VAE decode, and the eighth step only 2.15 to 2.0-2.1, so the ramp is 55% where it was
-  20% that morning and 17% the day before. Faster kernels reaching a throttle sooner is the
-  signature of a power or thermal cap, and if that is the cause every kernel lever below
-  converts to wall time only until the cap, and the render's floor is the envelope's. It is
-  an observation, not a confirmed cause. What to run: `sudo powermetrics --samplers
-  gpu_power,thermal -i 500` from a user shell (the agent sandbox has no sudo) beside
-  `xwen image --prompt "a lighthouse on a rocky shore at dusk, oil painting" --seed 7` at
-  1024x1024, and read GPU power, GPU frequency and the thermal pressure level against the
-  per-step times; then the same at 512x512, whose steps ramp 0.35 to 0.40, and once with
-  `--steps 24` to see whether the plateau holds or drifts. What it prices: whether the gemm
-  fusion, the elementwise tail and the mid-block attention are first-step gains or render
-  gains, and whether int8's 1.8x compute would land at all. If the cap is confirmed, the
-  follow-up is a per-kernel-class power reading, not another kernel (2026-09-08).
-  [Record](docs/records/zimage-perf.md), [figures](docs/perf-state.md),
-  [measurement](docs/decisions/measurement-discipline.md).
-  From: Deferred from the Z-Image VAE conv and tensor-op attention arcs (2026-09-08).
-
 - [ ] [unpriced] **Fuse Z-Image's q/k/v and SwiGLU gemms, then tune the tiles at those shapes.**
   The four gemms are ~1.26 s of a 2.15 s step on the merged tree, which is the largest
   single bucket left, and they run at 30-39 TFLOP/s where the kernel measures 36-38 in
@@ -835,6 +826,9 @@ record lines ([the record](docs/records/zimage-perf.md), "Lever ledger").]
   been retired (its gemm reads 37-45 TFLOP/s with the f32 store), so they are 1.04-1.26 s of a
   step that reads 1.35 s cool. Still UNPRICED, and the instrument above decides whether a
   gain here reaches the plateau.
+  **2026-09-08, evening: the instrument is read** and the ramp is a hardware clock limiter,
+  1620 MHz at 86-89 W on the first three steps falling to 875-1016 MHz at 22-29 W by step 20,
+  so at the plateau this row is worth its bytes saved and not its milliseconds. Still UNPRICED.
   [Record](docs/records/zimage-perf.md), [figures](docs/perf-state.md).
   From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
 
@@ -855,6 +849,9 @@ record lines ([the record](docs/records/zimage-perf.md), "Lever ledger").]
   and at most ~0.1-0.3 s real, the residual after 1.04-1.26 s of gemms and ~0.2 s of tensor
   attention in a step that reads 1.35-2.1 s; under 1 s per image and probably well under.
   Still one line, and behind the instrument above.
+  **2026-09-08, evening: the instrument is read.** The ramp is a hardware clock limiter, 1620
+  MHz at 86-89 W on the first three steps and 875-1016 MHz at 22-29 W by step 20, so the
+  0.1-0.3 s bound above is a full-clock bound and at the plateau these rows are worth bytes.
   [Record](docs/records/zimage-perf.md).
   From: Deferred from the Z-Image tensor-gemm and profiler arcs (2026-09-07).
 

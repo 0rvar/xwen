@@ -4,6 +4,34 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-08 — The Z-Image plateau is a hardware clock limiter, step count priced (6 steps -23%, 4 steps -48% of the render), and `serve --image-steps`
+
+Evening, after the third arc. `scripts/zimage-power.sh` runs `powermetrics` beside one
+`xwen image` run under the agents' GPU lock and `scripts/zimage-power-summary.ts` bins the
+trace by denoising step (eeec7bb, fixed in 7011914). The user ran it three times: **the
+per-step ramp is a hardware clock limiter**, GPU frequency 1620 MHz and 86-89 W for the
+first three 1024x1024 steps, then 1100-1160 MHz at 33-36 W by step 5 and 875-1016 MHz at
+22-29 W by step 20 of 24, with the GPU 96-100% active, the driver requesting the top P-state
+on every sample and the OS thermal pressure Nominal throughout; a 512x512 run is too short
+to reach it. Not a power cap (power falls with the clock), not the driver, not starvation.
+The sustained point is 25-35 W at 900-1150 MHz on a MacBook in automatic power mode, so at
+the plateau a kernel pays through its joules per unit of work, which is why the third arc's
+3.5x attention kernel moved step 8 by 5%. Front item 6 shipped to the archive; the open
+follow-up is the same three runs in High Power Mode, the user's to run. The step count
+was measured on a pinned build of eeec7bb, bit-deterministic across repeats: **1024x1024
+render 13.97 s at 8 steps, 10.80 at 6 (-23%), 7.32 at 4 (-48%)**, the same proportions at
+512x512. The lighthouse fixture at 6 is a different, equally finished painting and at 4
+visibly softer; a portrait at 4 loses skin, stubble and eye detail, so 8 stays the default
+and the choice is exposed instead: `xwen serve --image-steps <N>` is a server-wide default
+for the images route, for ComfyUI's stock node, which cannot send a count; an explicit
+request `steps` wins. Reading the OpenAI `quality` field as a step tier is not taken, with
+the reopen condition in the record. Int8 compute gemms deferred again behind the envelope
+reading, with two questions recorded. This session's ramp read +31% over eight steps where
+the clean e5d9775 runs read +55%, a note for the instrument
+([records/zimage-perf.md](records/zimage-perf.md) "Step count priced",
+[decisions/zimage.md](decisions/zimage.md) "Eight steps stays the default",
+[perf-state.md](perf-state.md)).
+
 ## 2026-09-08 — Z-Image's VAE on a direct conv kernel and its attention on the tensor units: the decode 5.2 s to 1.4 s, the first step 1.78 to 1.35 s, and the SwiGLU bf16 store refuted
 
 Three worktrees against the three largest rows of the morning's lever ledger. a763c61 is

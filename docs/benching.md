@@ -143,8 +143,11 @@ flash-attention, conv and elementwise arms at the model's own shapes (decisions.
 profiled row that shows a fusion win is not a result until the fusion is confirmed
 unprofiled"). And quote a 1024x1024 step as a range with its ramp, "1.35 s first step rising
 to 2.0-2.1 s by step 8" on master e5d9775, never as an 8-step mean and, since 2026-09-08, not
-as one steady number either: the ramp is 55% where it was 20%, which reads as a power or
-thermal envelope until `powermetrics` says otherwise (decisions.md "A Z-Image step is
+as one steady number either: the ramp is 55% where it was 20%, and `powermetrics` read it as a
+hardware clock limiter that settles at 25-35 W and 900-1150 MHz within six seconds, so a
+kernel is priced twice, full-clock time on the first three steps and joules at the plateau.
+`scripts/zimage-power.sh` from a sudo shell is the instrument and
+`scripts/zimage-power-summary.ts` bins its trace by step (decisions.md "A Z-Image step is
 quoted at steady state").
 
 **Neither instrument sees occupancy.** A kernel that leaves the GPU mostly idle is
