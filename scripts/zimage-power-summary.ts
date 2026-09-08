@@ -18,6 +18,8 @@ type Sample = {
   dt: number; // window length in seconds
   gpuMw?: number;
   gpuMhz?: number;
+  gpuActivePct?: number;
+  gpuSwTop?: string;
   combinedMw?: number;
   pressure?: string;
 };
@@ -55,6 +57,8 @@ function parsePowermetrics(text: string): Sample[] {
     if (!cur) continue;
     let m: RegExpMatchArray | null;
     if ((m = line.match(/GPU (?:HW )?active frequency:\s*([\d.]+)\s*MHz/i))) cur.gpuMhz = +m[1];
+    else if ((m = line.match(/GPU HW active residency:\s*([\d.]+)%/i))) cur.gpuActivePct = +m[1];
+    else if ((m = line.match(/GPU SW requested state: \((.*)\)/i))) cur.gpuSwTop = topRequestedState(m[1]);
     else if ((m = line.match(/^GPU Power:\s*([\d.]+)\s*mW/i))) cur.gpuMw = +m[1];
     else if ((m = line.match(/Combined Power.*?:\s*([\d.]+)\s*mW/i))) cur.combinedMw = +m[1];
     else if ((m = line.match(/Current pressure level:\s*(\w+)/i))) cur.pressure = m[1];
@@ -76,33 +80,35 @@ function parsePowermetrics(text: string): Sample[] {
 
 type Window = { name: string; start: number; end: number; dur: number };
 
+// The CLI prints every step line and the VAE line only after the whole render
+// returns, so their timestamps all fall within a few milliseconds of each other
+// and say nothing about when each step ran. What they carry is each stage's
+// exact duration, and the render starts right after the seed line, so the
+// windows are laid end to end from that line forward.
 function parseWindows(text: string): Window[] {
   const windows: Window[] = [];
-  let prevEnd: number | undefined;
-  let loadStart: number | undefined;
+  let cursor: number | undefined;
   for (const raw of text.split("\n")) {
     const m = raw.match(/^([\d.]+)\s+(.*)$/);
     if (!m) continue;
     const t = +m[1];
     const line = m[2];
-    if (loadStart === undefined) loadStart = t;
     let s: RegExpMatchArray | null;
     if ((s = line.match(/xwen: step (\d+)\/(\d+) ([\d.]+)s/))) {
       const dur = +s[3];
-      const start = prevEnd ?? t - dur;
-      windows.push({ name: `step ${s[1]}/${s[2]}`, start, end: t, dur });
-      prevEnd = t;
+      const start = cursor ?? t - dur;
+      windows.push({ name: `step ${s[1]}/${s[2]}`, start, end: start + dur, dur });
+      cursor = start + dur;
     } else if ((s = line.match(/xwen: VAE decode ([\d.]+)s/))) {
       const dur = +s[1];
-      windows.push({ name: "VAE decode", start: prevEnd ?? t - dur, end: t, dur });
-      prevEnd = t;
+      const start = cursor ?? t - dur;
+      windows.push({ name: "VAE decode", start, end: start + dur, dur });
+      cursor = start + dur;
     } else if ((s = line.match(/xwen: (text encoder|transformer and VAE) loaded in ([\d.]+)s/))) {
       const dur = +s[2];
       windows.push({ name: `${s[1]} load`, start: t - dur, end: t, dur });
     } else if (line.match(/xwen: seed \d+|xwen: latents from/)) {
-      // The step loop starts right after this line; the first step's window
-      // opens here rather than being back-computed from its duration.
-      prevEnd = t;
+      cursor = t;
     }
   }
   return windows;
@@ -148,6 +154,8 @@ const rows = windows.map((w) => {
   const mw = ss.map((s) => s.gpuMw).filter((x): x is number => x !== undefined);
   const mhz = ss.map((s) => s.gpuMhz).filter((x): x is number => x !== undefined);
   const comb = ss.map((s) => s.combinedMw).filter((x): x is number => x !== undefined);
+  const active = ss.map((s) => s.gpuActivePct).filter((x): x is number => x !== undefined);
+  const swTop = [...new Set(ss.map((s) => s.gpuSwTop).filter(Boolean))].join(" ") || "-";
   const pressure = [...new Set(ss.map((s) => s.pressure).filter(Boolean))].join(",") || "-";
   return {
     window: w.name,
@@ -158,6 +166,8 @@ const rows = windows.map((w) => {
     "GPU MHz": fmt(mean(mhz)),
     "MHz min": mhz.length ? String(Math.min(...mhz)) : "-",
     "MHz max": mhz.length ? String(Math.max(...mhz)) : "-",
+    "active %": fmt(mean(active)),
+    "SW asks": swTop,
     "CPU+GPU+ANE W": fmt(mean(comb) && mean(comb)! / 1000, 1),
     pressure,
   };
@@ -190,4 +200,18 @@ if (timeline) {
         `${fmt(s.gpuMhz).padStart(5)} MHz  ${s.pressure ?? "-"}`,
     );
   }
+}
+
+// `P1 : 100% P2 : 0% ...` -> the highest P-state the driver asked for with a
+// nonzero share. Read beside the HW frequency: a high request
+// met by a low frequency is the hardware refusing, a low request is the driver
+// choosing.
+function topRequestedState(list: string): string {
+  let best: { p: number; pct: number } | undefined;
+  for (const m of list.matchAll(/P(\d+)\s*:\s*([\d.]+)%/g)) {
+    const p = +m[1];
+    const pct = +m[2];
+    if (pct > 0 && (!best || p > best.p)) best = { p, pct };
+  }
+  return best ? `P${best.p}` : "-";
 }
