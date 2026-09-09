@@ -13,6 +13,8 @@ bun install --frozen-lockfile
 bun run tauri dev
 ```
 
+From the repository root, `just image-studio` builds the macOS bundle and launches it.
+
 Pass a workspace directory at launch:
 
 ```sh

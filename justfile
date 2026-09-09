@@ -21,3 +21,10 @@ install:
 launch:
     cargo install --path . --locked
     xwen serve --host 0.0.0.0
+
+# Build the macOS Image Studio application.
+image-studio-build:
+    cd image-studio && bun install --frozen-lockfile && bun run tauri build --bundles app
+
+image-studio: image-studio-build
+    open -n "image-studio/src-tauri/target/release/bundle/macos/Xwen Image Studio.app"
