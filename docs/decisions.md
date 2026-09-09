@@ -276,6 +276,7 @@ they belong to; a new topic gets a new file and a line here.
   - The bf16 SwiGLU store is REFUTED: bit-exact, not faster, and the row that priced it was a…
   - Image Studio is a separate Tauri client with workspace-local provenance.
   - Image Studio deletes within its workspace and drafts prompts through the server.
+  - Image Studio handles native drops and owns its diagnostic log in Rust.
   - Image batches are validated plans of sequential requests.
 - [Process](decisions/process.md)
   - The ledger is a memory and a backlog, and the two have different rules (2026-09-06,…

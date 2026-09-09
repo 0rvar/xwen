@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import type { Config } from "../domain";
+import { LogTools } from "./LogTools";
+import { reportError } from "../logging";
 
 interface Props {
   config: Config;
@@ -20,7 +22,7 @@ export function ServerDialog({ config, configPath, required, disabled, onClose, 
   const check = async () => {
     setChecking(true); setStatus(""); setError("");
     try { await onCheck(draft); setStatus("Server is reachable."); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { reportError("frontend.server.check", reason); setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setChecking(false); }
   };
   return (
@@ -34,11 +36,12 @@ export function ServerDialog({ config, configPath, required, disabled, onClose, 
         <label className="field"><span>Server URL</span><input autoFocus name="server-url" placeholder="http://127.0.0.1:5241" value={draft.server_url} onChange={(event) => setDraft({ ...draft, server_url: event.target.value })} /></label>
         <label className="field"><span>API key <small>optional</small></span><input name="api-key" type="password" autoComplete="off" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} /></label>
         <p className="field-help">Saved with private file permissions at {configPath || "~/.config/xwen/image-studio.json"}.</p>
+        <LogTools />
         {status && <p className="success-banner" role="status">{status}</p>}
         {error && <p className="error-banner" role="alert">{error}</p>}
         <footer className="modal-actions spread">
           <button className="quiet-button" disabled={checking || disabled || !draft.server_url.trim()} onClick={() => void check()}>{checking ? "Checking…" : "Check server"}</button>
-          <button className="primary-button" disabled={checking || disabled || !draft.server_url.trim()} onClick={() => void onSave(draft).catch((reason: unknown) => setError(String(reason)))}>Save connection</button>
+          <button className="primary-button" disabled={checking || disabled || !draft.server_url.trim()} onClick={() => void onSave(draft).catch((reason: unknown) => { reportError("frontend.server.save", reason); setError(String(reason)); })}>Save connection</button>
         </footer>
       </section>
     </div>

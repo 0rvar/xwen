@@ -54,6 +54,8 @@ records and input snapshots inside its workspace.
 The gallery can delete images or whole sessions with confirmation. New jobs append
 to a running or paused queue. A prompt generator uses Flash-Next through the same
 server and lets you edit the draft before using it.
+Source and ControlNet fields accept dropped PNG/JPEG files. Server settings can
+reveal the application log, which includes Rust and frontend errors.
 
 ## Models
 

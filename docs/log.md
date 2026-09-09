@@ -4,6 +4,14 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-09 — Image Studio accepts dropped images and writes diagnostic logs
+
+Source and ControlNet inputs accept file drops and replacements through Tauri's
+native events, sharing the chooser's validation and state updates. Rust writes a
+rotating application log that also receives frontend console messages, handled
+errors and uncaught exceptions. Server settings reveals the file. [Usage](../image-studio/README.md),
+[implementation and verification](records/image-studio.md#image-drops-and-diagnostic-logging).
+
 ## 2026-09-09 — Session deletion sits on the gallery timestamp row
 
 Image Studio places Delete session beside each session timestamp and removes the

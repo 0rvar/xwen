@@ -10,10 +10,13 @@ import { MaskEditor } from "./components/MaskEditor";
 import { QueuePanel } from "./components/QueuePanel";
 import { ServerDialog } from "./components/ServerDialog";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { useImageDrop, type ImageDropTarget } from "./useImageDrop";
+import { reportError, setLogSecrets } from "./logging";
 
 const EMPTY_CONFIG: Config = { server_url: "", api_key: "", workspaces: [], last_workspace: null };
 
 function errorText(reason: unknown): string {
+  reportError("frontend.operation", reason);
   if (reason instanceof Error) return reason.message;
   if (typeof reason === "string") return reason;
   try { return JSON.stringify(reason); } catch { return "An unexpected error occurred."; }
@@ -63,6 +66,17 @@ export default function App() {
   const controlToken = useRef(0);
   const historyToken = useRef(0);
 
+  const applyImportedImage = useCallback((kind: ImageDropTarget, image: InputImage) => {
+    setSettings((current) => {
+      if (kind === "control") return { ...current, controlImage: image };
+      const snapped = snapSize(image.width, image.height);
+      return { ...current, initImage: image, width: snapped.width, height: snapped.height, mask: null };
+    });
+    setPreview([]); setBatchError(""); setNotice("");
+    controlToken.current += 1; setControlPreview(null); setControlBusy(false);
+  }, []);
+  const imageDrop = useImageDrop(applyImportedImage, setNotice);
+
   const addOutputs = useCallback((created: SavedImage[]) => {
     setImages((current) => [...created, ...current.filter((image) => !created.some((next) => next.id === image.id))]);
     const token = ++historyToken.current;
@@ -79,6 +93,7 @@ export default function App() {
     let disposed = false;
     void bridge.bootstrap().then(async (result) => {
       if (disposed) return;
+      setLogSecrets(result.config.api_key);
       setConfig(result.config);
       setConfigPath(result.config_path);
       setWorkspace(result.workspace);
@@ -131,12 +146,7 @@ export default function App() {
   const pickImage = async (kind: "source" | "control") => {
     const path = await bridge.chooseImage(kind === "source" ? "Choose a source image" : "Choose a ControlNet image");
     if (!path) return;
-    const image = await bridge.readImage(path);
-    if (kind === "source") {
-      const snapped = snapSize(image.width, image.height);
-      changeSettings({ ...settings, initImage: image, width: snapped.width, height: snapped.height, mask: null });
-    }
-    else changeSettings({ ...settings, controlImage: image });
+    imageDrop.importPath(kind, path);
   };
   const refreshLoras = async () => {
     setLoraLoading(true);
@@ -191,12 +201,14 @@ export default function App() {
     finally { if (controlToken.current === token) setControlBusy(false); }
   };
   const saveConfig = async (draft: Config) => {
+    setLogSecrets(draft.api_key);
     const saved = await bridge.saveConfig(draft);
     controlToken.current += 1; setControlPreview(null); setControlBusy(false);
     setConfig(saved); setServerRequired(false); setServerOpen(false); setNotice("");
     if (!workspace) setWorkspacePrompt(true);
   };
   const checkConfig = async (draft: Config) => {
+    setLogSecrets(draft.api_key);
     await bridge.checkServer(draft);
   };
   const confirmDelete = async () => {
@@ -241,7 +253,11 @@ export default function App() {
     {notice && <div className="global-notice" role="status"><span>{notice}</span><button className="icon-button" onClick={() => setNotice("")} aria-label="Dismiss message">×</button></div>}
     <main className="studio-layout">
       <aside className="inspector">
-        <SettingsPanel settings={settings} loras={loras} loraLoading={loraLoading} disabled={!workspace} controlPreview={controlPreview} controlBusy={controlBusy} onChange={changeSettings} onPick={(kind) => void pickImage(kind).catch((reason: unknown) => setNotice(errorText(reason)))} onEditMask={() => setMaskOpen(true)} onRefreshLoras={() => void refreshLoras()} onPreviewControl={() => void previewControl()} onUseControlPreview={() => controlPreview && changeSettings({ ...settings, controlImage: controlPreview, controlKind: "none" })} onGenerate={generate} />
+        <SettingsPanel settings={settings} loras={loras} loraLoading={loraLoading} disabled={!workspace} controlPreview={controlPreview} controlBusy={controlBusy} activeDropTarget={imageDrop.activeTarget} onChange={changeSettings} onPick={(kind) => void pickImage(kind).catch((reason: unknown) => setNotice(errorText(reason)))} onClearImage={(kind) => {
+          imageDrop.cancel(kind);
+          if (kind === "source") changeSettings({ ...settings, initImage: null, mask: null });
+          else changeSettings({ ...settings, controlImage: null });
+        }} onEditMask={() => setMaskOpen(true)} onRefreshLoras={() => void refreshLoras()} onPreviewControl={() => void previewControl()} onUseControlPreview={() => controlPreview && changeSettings({ ...settings, controlImage: controlPreview, controlKind: "none" })} onGenerate={generate} />
         <BatchPanel settings={settings} axes={axes} mode={batchMode} preview={preview} error={batchError} disabled={!workspace} onAxes={(next) => { setAxes(next); setPreview([]); setBatchError(""); }} onMode={(next) => { setBatchMode(next); setPreview([]); setBatchError(""); }} onPreview={(jobs, error) => { setPreview(jobs); setBatchError(error); }} onQueue={() => {
           if (!workspace || !preview.length) return;
           try { queue.enqueue(preview, workspace.session_id); setNotice(""); }

@@ -14,7 +14,9 @@ does not link xwen, load model weights, alter kernels or start a server. Rust ow
 HTTP and disk writes. The webview invokes typed commands, which lets the same app
 use localhost or a remote xwen without requiring browser CORS configuration.
 
-The only Tauri plugin is the native dialog plugin, granted `dialog:allow-open`.
+Tauri plugins provide native dialogs and Rust file logging. Dialogs are granted
+`dialog:allow-open`; log ingestion uses an application command rather than plugin
+permissions in the webview.
 Images travel as data URLs through the bridge; there is no broad home-directory
 asset-protocol scope. One reqwest client handles the server connection, with
 redirects disabled and separate connection and render timeouts. Config lives at
@@ -161,6 +163,46 @@ session counts were capped at 200 was checked against the separate session catal
 and its existing 205-image test: only the image previews are capped. Docs-check
 passes, and the ledger is unchanged.
 
+## Image drops and diagnostic logging
+
+2026-09-09. The Choose image controls were click-only despite their dashed borders.
+Source and ControlNet fields now accept one dropped PNG/JPEG, including replacement
+of a populated field. Tauri's webview drag events provide paths and physical
+positions. The bridge converts positions to logical coordinates and tracks display
+scale changes; hit testing respects modal overlays. Native paths use the existing
+Rust decoder. Browser preview has a File fallback with signature-based MIME, the
+same 100 MB/8192-pixel limits, and no URL fetching. Imports share functional settings
+updates with the chooser, preserve concurrent prompt edits, and invalidate old masks
+or control previews as appropriate. Late superseded imports are ignored.
+
+The Rust logging plugin writes `~/.local/state/xwen/image-studio/logs/image-studio.log`
+in a mode-0700 directory. It rotates at 5 MiB with one archive; the plugin's
+`KeepSome(1)` means one archive plus the current file. Only application targets are
+enabled. Startup, shutdown, command outcomes and a chained panic hook use the sink.
+The frontend sends console messages, handled errors, uncaught exceptions, rejected
+promises and React failures through a custom batched command. Handlers install before
+the App module loads, and a React boundary supplies a reload screen.
+
+The frontend queue holds at most 200 records and sends at most 50 per command.
+Messages and sources are bounded, circular objects and throwing getters are handled,
+and forwarding failure uses the original console to avoid recursion. Both sides
+filter credentials and image data; configured and draft API keys are registered before
+associated errors can be logged. Normal command events do not include request bodies.
+Server settings exposes Show application log. Pending frontend records are best effort
+on process termination; no crash-upload service is introduced.
+
+Verification: TypeScript, 18 unit tests, 13 Rust tests and 16 browser flows pass.
+The browser suite exercises drops, replacements, mask reset, modal shielding,
+concurrent edits and forwarding of real console errors, uncaught exceptions and
+rejected promises. The Rust test writes actual temporary logs, checks redaction,
+rotation and command failures. The macOS bundle builds. A native startup attempt
+was denied filesystem access by this execution environment before logging could
+initialize; Finder drop delivery is therefore not claimed as manually verified.
+Two local reviews and an external Qwen review ran; display scale changes, browser
+MIME normalization and redaction ordering were corrected. The remaining external
+claims were checked and refuted. Docs-check passes; model math and the ledger are
+unchanged.
+
 ## Not taken now
 
 Pending queue recovery across an app restart is not implemented. Completed results
@@ -191,3 +233,9 @@ The implementation research checked the official
 [Playwright web-server setup](https://playwright.dev/docs/test-webserver).
 Browser tests exercise the frontend and a mock bridge; they do not replace Rust
 command tests or a native bundle launch.
+
+The file-drop and logging follow-up checked the installed Tauri APIs against the
+[webview drag event API](https://v2.tauri.app/reference/javascript/api/namespacewebview/#ondragdropevent),
+[window scale API](https://v2.tauri.app/reference/javascript/api/namespacewindow/#scalefactor),
+[logging guide](https://v2.tauri.app/plugin/logging/) and
+[Rust logging builder](https://docs.rs/tauri-plugin-log/latest/tauri_plugin_log/struct.Builder.html).

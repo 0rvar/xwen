@@ -73,6 +73,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .section-title span, .summary-note { color: var(--muted); font-size: 10px; font-weight: 500; }
 .field-help { color: var(--muted); font-size: 10px; line-height: 1.45; margin: 7px 0 0; }
 .image-input, .mask-control { display: grid; gap: 6px; }
+.image-input { margin: -5px; padding: 5px; border-radius: 12px; transition: background-color .12s, box-shadow .12s; }
+.image-input.drop-active { background: var(--accent-pale); box-shadow: 0 0 0 2px var(--accent); }
+.image-input.drop-active .drop-button, .image-input.drop-active .image-chip { border-color: var(--accent); background: #fff8f3; }
 .drop-button, .mask-ready-button { width: 100%; min-height: 62px; display: grid; place-content: center; gap: 3px; border: 1px dashed var(--line-strong); border-radius: 9px; color: var(--accent-dark); background: #fcfaf6; }
 .drop-button small, .mask-ready-button small { color: var(--muted); font-size: 10px; font-weight: 400; }
 .drop-button span, .mask-ready-button strong { font-size: 12px; }

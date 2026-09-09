@@ -66,6 +66,7 @@ impl Studio {
         })
     }
     fn load_config(&self) -> Result<Config> {
+        crate::logging::register_config_file(&self.config_path);
         match std::fs::read(&self.config_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
                 format!(
@@ -127,6 +128,7 @@ impl Studio {
         })
     }
     pub fn save_config(&self, mut config: Config) -> Result<Config> {
+        crate::logging::register_key(&config.api_key);
         let mut inner = self.inner.lock().unwrap();
         if inner.busy {
             return Err("Wait for the active render before changing settings".into());
@@ -309,6 +311,9 @@ impl Studio {
         Ok(value)
     }
     pub async fn check_server(&self, candidate: Option<Config>) -> Result<Value> {
+        if let Some(config) = &candidate {
+            crate::logging::register_key(&config.api_key);
+        }
         let mut config = match candidate {
             Some(config) => config,
             None => self.config()?,

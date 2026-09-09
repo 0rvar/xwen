@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MAX_JOBS, type PlannedJob, type SavedImage } from "./domain";
 import { bridge } from "./bridge";
+import { reportError } from "./logging";
 
 export type QueueStatus = "pending" | "running" | "done" | "error";
 export interface QueueItem {
@@ -30,6 +31,7 @@ export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
       setItems((current) => current.map((item) => item.key === next.key ? { ...item, status: "done", outputs } : item));
       callbackRef.current(outputs);
     }).catch((error: unknown) => {
+      reportError("frontend.render", error);
       setItems((current) => current.map((item) => item.key === next.key ? { ...item, status: "error", error: error instanceof Error ? error.message : String(error) } : item));
     }).finally(() => {
       runningRef.current = false;

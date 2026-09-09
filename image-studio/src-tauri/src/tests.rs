@@ -702,3 +702,83 @@ async fn prompt_generation_uses_exact_model_auth_and_plain_answer_only() {
     );
     thread.join().unwrap();
 }
+
+#[test]
+fn file_logging_redacts_rotates_and_records_command_errors() {
+    let t = Temp::new();
+    let folder = t.0.join("logs");
+    logging::secure_directory(&folder).unwrap();
+    let config = t.0.join("partial-config.json");
+    fs::write(
+        &config,
+        r#"{"api_key":"configured-private-key","broken": }"#,
+    )
+    .unwrap();
+    logging::register_config_file(&config);
+    logging::register_key("draft-private-key");
+    assert_eq!(
+        logging::sanitize(
+            "configured-private-key draft-private-key data:image/png;base64,AAAA",
+            8192
+        ),
+        "[redacted] [redacted] [image data redacted]"
+    );
+    assert_eq!(logging::sanitize("ååå", 5), "åå");
+    logging::register_key("data");
+    assert!(
+        !logging::sanitize("data:image/png;base64,PREFIX_OVERLAP_PAYLOAD", 8192)
+            .contains("PREFIX_OVERLAP_PAYLOAD")
+    );
+    let oversized: Vec<logging::Entry> = (0..51)
+        .map(|_| {
+            serde_json::from_value(json!({"level":"info","source":"test","message":"entry"}))
+                .unwrap()
+        })
+        .collect();
+    assert!(logging::frontend(oversized).is_err());
+    assert!(
+        serde_json::from_value::<logging::Entry>(
+            json!({"level":"trace","source":"test","message":"entry"})
+        )
+        .is_err()
+    );
+    let app = tauri::test::mock_app();
+    let (_, level, logger) = logging::builder(folder.clone(), 1024)
+        .split(app.handle())
+        .unwrap();
+    log::set_boxed_logger(logger).unwrap();
+    log::set_max_level(level);
+    for index in 0..20 {
+        log::info!(target:"image_studio::test","rotation {index}: {}","x".repeat(700));
+    }
+    let entries=vec![serde_json::from_value(json!({"level":"error","source":"window.error","message":"configured-private-key draft-private-key data:image/png;base64,AAAA"})).unwrap()];
+    logging::frontend(entries).unwrap();
+    let _: Result<(), String> = logging::result(
+        "test_failure",
+        Err("draft-private-key failure".into()),
+        false,
+    );
+    log::error!(target:"other_dependency","THIS_MUST_NOT_BE_LOGGED");
+    log::logger().flush();
+    let files: Vec<_> = fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 2, "one archive and current file: {files:?}");
+    let text = files
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap())
+        .collect::<String>();
+    assert!(text.contains("image_studio::frontend"));
+    assert!(text.contains("window.error"));
+    assert!(text.contains("test_failure failed: [redacted] failure"));
+    assert!(!text.contains("configured-private-key"));
+    assert!(!text.contains("draft-private-key"));
+    assert!(!text.contains("AAAA"));
+    assert!(!text.contains("THIS_MUST_NOT_BE_LOGGED"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(folder).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}

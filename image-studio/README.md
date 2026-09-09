@@ -85,6 +85,12 @@ inpainting also takes a mask. Paint the mask in the app, or import one: white me
 repaint, black means preserve. Blur is a Gaussian sigma in output pixels. The source
 and mask resize to the requested output size.
 
+Drop one PNG or JPEG onto the source or ControlNet **Choose image** field. The field
+highlights while the file is over it; dropping onto an existing image replaces it.
+Source imports set the output dimensions to the nearest valid size and clear the
+old mask. Files are limited to 100 MB and 8192 pixels per side. Multiple files and
+unsupported formats show an error without replacing the current image.
+
 ControlNet can accompany any mode. Choose Canny, pose, depth or an already prepared
 map. Preview preprocessing before rendering and use the returned map directly when
 you want to keep it fixed. The server selects the Fun Union full/lite checkpoint;
@@ -129,6 +135,20 @@ the stopped queue drains starts normally. The queue allows at most 1000 unfinish
 jobs, including failures until they are cleared. Failed jobs can be retried explicitly.
 Closing the app loses pending queue state; completed images remain on disk. The
 server has no render cancellation or live step-progress API.
+
+## Application log
+
+Rust events and frontend console messages, handled errors, uncaught exceptions and
+unhandled promise rejections go to
+`~/.local/state/xwen/image-studio/logs/image-studio.log`. Server settings has a
+**Show application log** button. Logs include startup, command outcomes, file-drop
+diagnostics and Rust panics. A React error screen offers a reload when rendering fails.
+
+The log rotates at 5 MiB and keeps one previous file. Its directory is owner-only.
+Configured API keys and image data URLs are filtered before writing; normal events
+omit request bodies and prompts. Frontend forwarding is bounded and buffered, so an
+abrupt process kill can lose pending messages. Log forwarding failure reports to the
+original console without recursively logging itself.
 
 ## Development checks
 

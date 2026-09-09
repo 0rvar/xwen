@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { PromptGenerator } from "./PromptGenerator";
 import type { InputImage, LoraCandidate, StudioSettings } from "../domain";
+import type { ImageDropTarget } from "../useImageDrop";
 
 interface Props {
   settings: StudioSettings;
@@ -11,6 +12,8 @@ interface Props {
   controlBusy: boolean;
   onChange(settings: StudioSettings): void;
   onPick(kind: "source" | "control"): void;
+  onClearImage(kind: ImageDropTarget): void;
+  activeDropTarget: ImageDropTarget | null;
   onEditMask(): void;
   onRefreshLoras(): void;
   onPreviewControl(): void;
@@ -22,11 +25,11 @@ function NumberField({ label, value, min, max, step = 1, onValue }: { label: str
   return <label className="field"><span>{label}</span><input type="number" value={value} min={min} max={max} step={step} onChange={(event) => onValue(Number(event.target.value))} /></label>;
 }
 
-function ImageInput({ label, image, hint, onPick, onClear }: { label: string; image: InputImage | null; hint: string; onPick(): void; onClear(): void }) {
-  return <div className="image-input"><span className="field-label">{label}</span>{image ? <div className="image-chip"><img src={image.data_url} alt="" /><span><strong>{image.name}</strong><small>{image.width}×{image.height}</small></span><button className="icon-button" onClick={onClear} aria-label={`Remove ${label}`}>×</button></div> : <button className="drop-button" onClick={onPick}><span>Choose image</span><small>{hint}</small></button>}</div>;
+function ImageInput({ kind, label, image, hint, active, onPick, onClear }: { kind: ImageDropTarget; label: string; image: InputImage | null; hint: string; active: boolean; onPick(): void; onClear(): void }) {
+  return <div className={`image-input ${active ? "drop-active" : ""}`} data-image-drop={kind}><span className="field-label">{label}</span>{image ? <div className="image-chip"><img src={image.data_url} alt="" /><span><strong>{image.name}</strong><small>{image.width}×{image.height} · Drop to replace</small></span><button className="icon-button" onClick={onClear} aria-label={`Remove ${label}`}>×</button></div> : <button className="drop-button" onClick={onPick}><span>Choose image</span><small>{hint} · or drop here</small></button>}</div>;
 }
 
-export function SettingsPanel({ settings, loras, loraLoading, disabled, controlPreview, controlBusy, onChange, onPick, onEditMask, onRefreshLoras, onPreviewControl, onUseControlPreview, onGenerate }: Props) {
+export function SettingsPanel({ settings, loras, loraLoading, disabled, controlPreview, controlBusy, activeDropTarget, onChange, onPick, onClearImage, onEditMask, onRefreshLoras, onPreviewControl, onUseControlPreview, onGenerate }: Props) {
   const [loraPath, setLoraPath] = useState("");
   const change = <K extends keyof StudioSettings>(key: K, value: StudioSettings[K]) => onChange({ ...settings, [key]: value });
   const addLora = () => {
@@ -45,7 +48,7 @@ export function SettingsPanel({ settings, loras, loraLoading, disabled, controlP
     </section>
 
     {settings.mode !== "text" && <section className="control-section">
-      <ImageInput label="Source image" image={settings.initImage} hint="PNG or JPEG · dimensions fill automatically" onPick={() => onPick("source")} onClear={() => change("initImage", null)} />
+      <ImageInput kind="source" label="Source image" image={settings.initImage} hint="PNG or JPEG · dimensions fill automatically" active={activeDropTarget === "source"} onPick={() => onPick("source")} onClear={() => onClearImage("source")} />
       {settings.initImage && <div className="two-columns"><NumberField label="Strength" value={settings.strength} min={0} max={1} step={0.05} onValue={(value) => change("strength", value)} />{settings.mode === "inpaint" && <NumberField label="Mask blur" value={settings.maskBlur} min={0} step={1} onValue={(value) => change("maskBlur", value)} />}</div>}
       {settings.mode === "inpaint" && <div className="mask-control"><span className="field-label">Repaint mask</span><button className={settings.mask ? "mask-ready-button" : "drop-button"} disabled={!settings.initImage} onClick={onEditMask}>{settings.mask ? <><img src={settings.mask.data_url} alt="" /><span><strong>Edit mask</strong><small>White repaints · black keeps</small></span></> : <><span>Paint or import mask</span><small>Choose a source image first</small></>}</button></div>}
     </section>}
@@ -69,7 +72,7 @@ export function SettingsPanel({ settings, loras, loraLoading, disabled, controlP
     <details className="control-section disclosure" open={settings.controlEnabled}>
       <summary onClick={(event) => { event.preventDefault(); change("controlEnabled", !settings.controlEnabled); }}><span>ControlNet</span><span className={`switch ${settings.controlEnabled ? "on" : ""}`} aria-hidden="true" /></summary>
       {settings.controlEnabled && <div className="disclosure-body">
-        <ImageInput label="Control image" image={settings.controlImage} hint="Independent from the source image" onPick={() => onPick("control")} onClear={() => change("controlImage", null)} />
+        <ImageInput kind="control" label="Control image" image={settings.controlImage} hint="Independent from the source image" active={activeDropTarget === "control"} onPick={() => onPick("control")} onClear={() => onClearImage("control")} />
         <label className="field"><span>Preprocessor</span><select value={settings.controlKind} onChange={(event) => change("controlKind", event.target.value as StudioSettings["controlKind"])}><option value="none">None · image is already a map</option><option value="canny">Canny edges</option><option value="depth">Depth</option><option value="pose">Pose</option></select></label>
         <div className="three-columns"><NumberField label="Scale" value={settings.controlScale} min={0} max={1} step={0.05} onValue={(value) => change("controlScale", value)} /><NumberField label="Start" value={settings.controlStart} min={0} max={1} step={0.05} onValue={(value) => change("controlStart", value)} /><NumberField label="End" value={settings.controlEnd} min={0} max={1} step={0.05} onValue={(value) => change("controlEnd", value)} /></div>
         {settings.controlImage && settings.controlKind !== "none" && <button className="quiet-button full-button" disabled={controlBusy} onClick={onPreviewControl}>{controlBusy ? "Building preview…" : `Preview ${settings.controlKind} map`}</button>}

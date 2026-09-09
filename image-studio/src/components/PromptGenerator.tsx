@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { bridge } from "../bridge";
+import { reportError } from "../logging";
 
 export function PromptGenerator({ prompt, disabled, onUse }: { prompt: string; disabled: boolean; onUse(prompt: string): void }) {
   const [open, setOpen] = useState(false);
@@ -14,7 +15,7 @@ export function PromptGenerator({ prompt, disabled, onUse }: { prompt: string; d
     const token = ++requestToken.current;
     setBusy(true); setError(""); setDraft(""); setHasDraft(false);
     try { const result = await bridge.generatePrompt(idea); if (requestToken.current === token) { setDraft(result); setHasDraft(true); } }
-    catch (reason) { if (requestToken.current === token) setError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { reportError("frontend.prompt", reason); if (requestToken.current === token) setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { if (requestToken.current === token) setBusy(false); }
   };
   return <>

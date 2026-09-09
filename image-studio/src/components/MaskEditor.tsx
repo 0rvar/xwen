@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { InputImage } from "../domain";
 import { bridge } from "../bridge";
+import { reportError } from "../logging";
 
 interface Props {
   source: InputImage;
@@ -63,7 +64,7 @@ export function MaskEditor({ source, initial, onCancel, onSave }: Props) {
       if (maskImage) ctx.drawImage(maskImage, 0, 0, mask.width, mask.height);
       maskRef.current = mask;
       redraw();
-    }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
+    }).catch((reason: unknown) => { reportError("frontend.mask", reason); setError(reason instanceof Error ? reason.message : String(reason)); });
     return () => { disposed = true; };
   }, [initial, redraw, source]);
 
@@ -137,7 +138,7 @@ export function MaskEditor({ source, initial, onCancel, onSave }: Props) {
           <label className="inline-field">Brush <input aria-label="Brush size" type="range" min="8" max="280" value={brush} onChange={(event) => setBrush(Number(event.target.value))} /> <span>{brush}px</span></label>
           <button className="quiet-button" onClick={() => mutate("clear")}>Clear</button>
           <button className="quiet-button" onClick={() => mutate("invert")}>Invert</button>
-          <button className="quiet-button" onClick={() => void importMask().catch((reason: unknown) => setError(String(reason)))}>Import</button>
+          <button className="quiet-button" onClick={() => void importMask().catch((reason: unknown) => { reportError("frontend.mask.import", reason); setError(String(reason)); })}>Import</button>
         </div>
         {error && <p className="error-banner" role="alert">{error}</p>}
         <div className="mask-stage">

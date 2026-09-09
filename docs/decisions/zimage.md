@@ -651,3 +651,14 @@ is involved, so remote servers behave the same way. The
 now owns the action; the separate management panel is removed. The gallery keeps
 rows from the full session catalog so deletion stays available for empty sessions
 and sessions whose images fall outside the preview limit.
+
+**Image Studio handles native drops and owns its diagnostic log in Rust.**
+2026-09-09. The user requested working drag-and-drop and a file log for both halves
+of the GUI. Tauri's native webview events supply local file paths; HTML drag events
+alone did not handle desktop drops. The same import path now serves choosing and
+dropping an image. Rust owns the log through `tauri-plugin-log`, using its rotation
+support instead of a custom file writer. Frontend messages arrive through a bounded
+application command, so no logging plugin capability or JavaScript package is added.
+The location follows xwen's existing home state directory. Credentials and image
+payloads are filtered, and normal events omit generation request bodies. The
+[client record](../records/image-studio.md#image-drops-and-diagnostic-logging) owns the details.

@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
   Bootstrap,
   Config,
@@ -17,6 +19,10 @@ export interface PreprocessedImage {
 }
 
 export interface SessionSummary { session_id: string; image_count: number }
+export type FileDropEvent =
+  | { type: "enter" | "drop"; paths: string[]; x: number; y: number }
+  | { type: "over"; x: number; y: number }
+  | { type: "leave" };
 
 export interface NativeBridge {
   bootstrap(): Promise<Bootstrap>;
@@ -32,9 +38,11 @@ export interface NativeBridge {
   deleteImage(workspacePath: string, sessionId: string, imageId: string): Promise<void>;
   deleteSession(workspacePath: string, sessionId: string): Promise<Workspace>;
   generatePrompt(idea: string): Promise<string>;
+  getLogPath(): Promise<string>;
   reveal(path: string): Promise<void>;
   chooseDirectory(title: string): Promise<string | null>;
   chooseImage(title: string): Promise<string | null>;
+  onFileDrop(callback: (event: FileDropEvent) => void): Promise<() => void>;
 }
 
 const nativeBridge: NativeBridge = {
@@ -51,6 +59,7 @@ const nativeBridge: NativeBridge = {
   deleteImage: (workspacePath, sessionId, imageId) => invoke<void>("delete_image", { workspacePath, sessionId, imageId }),
   deleteSession: (workspacePath, sessionId) => invoke<Workspace>("delete_session", { workspacePath, sessionId }),
   generatePrompt: (idea) => invoke<string>("generate_prompt", { idea }),
+  getLogPath: () => invoke<string>("get_log_path"),
   reveal: (path) => invoke<void>("reveal", { path }),
   chooseDirectory: (title) => open({ directory: true, multiple: false, title }),
   chooseImage: (title) => open({
@@ -59,6 +68,23 @@ const nativeBridge: NativeBridge = {
     title,
     filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }],
   }),
+  onFileDrop: async (callback) => {
+    const window = getCurrentWindow();
+    let scale = await window.scaleFactor();
+    const unlistenScale = await window.onScaleChanged(({ payload }) => { scale = payload.scaleFactor; });
+    try {
+      const unlistenDrop = await getCurrentWebview().onDragDropEvent(({ payload }) => {
+        if (payload.type === "leave") { callback({ type: "leave" }); return; }
+        const position = payload.position.toLogical(scale);
+        if (payload.type === "over") callback({ type: "over", x: position.x, y: position.y });
+        else callback({ type: payload.type, paths: payload.paths, x: position.x, y: position.y });
+      });
+      return () => { unlistenDrop(); unlistenScale(); };
+    } catch (error) {
+      unlistenScale();
+      throw error;
+    }
+  },
 };
 
 function svgDataUrl(label: string, color = "#bd684d"): string {
@@ -72,6 +98,7 @@ function createPreviewBridge(): NativeBridge {
   const firstLaunch = query.has("firstLaunch");
   const portraitInputs = query.has("portrait");
   const renderDelay = Number(query.get("renderDelay") ?? 120);
+  const readDelay = Number(query.get("readDelay") ?? 0);
   let cancelPicker = query.has("cancelPicker");
   let config: Config = {
     server_url: firstLaunch ? "" : "http://127.0.0.1:5241",
@@ -116,7 +143,10 @@ function createPreviewBridge(): NativeBridge {
       images = [];
       return { ...workspace };
     },
-    readImage: async (path) => previewInput(path.split("/").pop() || "image.png"),
+    readImage: async (path) => {
+      if (readDelay) await new Promise((resolve) => setTimeout(resolve, readDelay));
+      return previewInput(path.split("/").pop() || "image.png");
+    },
     listLoras: async () => [
       { name: "Ceramic light", path: "/models/ceramic-light.safetensors", size_bytes: 184_000_000 },
       { name: "Ink contour", path: "/models/ink-contour.safetensors", size_bytes: 96_000_000 },
@@ -167,12 +197,14 @@ function createPreviewBridge(): NativeBridge {
       if (idea.includes("fail prompt")) throw new Error("Flash-Next is not cached on this server.");
       return `${idea.trim() || "A secluded mountain observatory"}, soft evening light, rich textures, carefully composed photograph`;
     },
+    getLogPath: async () => "/Users/demo/.local/state/xwen/image-studio/logs/image-studio.log",
     reveal: async () => undefined,
     chooseDirectory: async () => {
       if (cancelPicker) { cancelPicker = false; return null; }
       return "/Users/demo/Pictures/new-workspace";
     },
     chooseImage: async (title) => `/Users/demo/Pictures/${title.toLowerCase().includes("mask") ? "mask.png" : "source.png"}`,
+    onFileDrop: async () => () => undefined,
   };
 }
 
