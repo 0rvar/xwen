@@ -29,6 +29,13 @@ Only text-to-image is exposed for now; client-side request validation remains th
 guard before a job is submitted. [Usage and implementation](../image-studio/README.md),
 [client record](records/image-studio.md#assistant-chat-and-queue-tool).
 
+## 2026-09-09 — Image Studio adds gallery navigation and batch comparisons
+
+The preview supports arrow-key browsing, responsive gallery/sidebar sizing, and
+selective restoration of saved generation values. Completed one- and two-axis batches
+can open as labeled comparison grids. [Usage](../image-studio/README.md),
+[client record](records/image-studio.md#gallery-navigation-selective-restore-and-comparisons).
+
 ## 2026-09-09 — Image Studio prioritizes active queue work and relaxes false refusals
 
 The queue keeps running and waiting jobs above completed work and shows an indeterminate

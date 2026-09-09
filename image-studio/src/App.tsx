@@ -37,6 +37,10 @@ function assetReference(metadata: Record<string, unknown>, key: "init_image" | "
   return typeof path === "string" ? path : null;
 }
 
+function isTypingTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
+}
+
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [fatal, setFatal] = useState("");
@@ -110,7 +114,11 @@ export default function App() {
 
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+      if (selected && (event.key === "ArrowLeft" || event.key === "ArrowRight") && !isTypingTarget(event.target)) {
+        const index = images.findIndex((image) => image.id === selected.id);
+        const next = images[index + (event.key === "ArrowRight" ? 1 : -1)];
+        if (next) { event.preventDefault(); void chooseSelected(next); }
+      } else if (event.key === "Escape") {
         if (deleteTarget) { if (!deleting) setDeleteTarget(null); }
         else if (selected) { setSelected(null); setFullUrl(""); }
         else if (maskOpen) setMaskOpen(false);
@@ -119,7 +127,7 @@ export default function App() {
     };
     window.addEventListener("keydown", close);
     return () => window.removeEventListener("keydown", close);
-  }, [maskOpen, selected, serverOpen, serverRequired, deleteTarget, deleting]);
+  }, [images, maskOpen, selected, serverOpen, serverRequired, deleteTarget, deleting]);
 
   const changeSettings = (next: StudioSettings) => {
     setSettings(next);
@@ -191,17 +199,21 @@ export default function App() {
       setSelected(null); setFullUrl("");
     } catch (reason) { setNotice(errorText(reason)); }
   };
-  const restore = async (image: SavedImage) => {
+  const restore = async (image: SavedImage, fields?: string[]) => {
     try {
       const restored = restoreSettings(image.metadata, settings);
-      const [initImage, mask, controlImage] = await Promise.all(([
-        ["init_image", "initImage"], ["mask", "mask"], ["control.image", "controlImage"],
-      ] as const).map(async ([key]) => {
-        const reference = assetReference(image.metadata, key);
-        return reference ? bridge.readImage(assetPath(image, reference)) : null;
-      }));
-      changeSettings({ ...restored, initImage, mask, controlImage });
-      setSelected(null); setFullUrl(""); setNotice("Saved settings and input assets restored.");
+      const all = !fields;
+      const next = { ...settings };
+      if (all || fields.includes("prompt")) next.prompt = restored.prompt;
+      if (all || fields.includes("dimensions")) { next.width = restored.width; next.height = restored.height; }
+      if (all || fields.includes("steps")) next.steps = restored.steps;
+      if (all || fields.includes("seed")) next.seed = restored.seed;
+      if (all || fields.includes("loras")) next.loras = restored.loras;
+      if (all || fields.includes("edit")) {
+        const [initImage, mask, controlImage] = await Promise.all((["init_image", "mask", "control.image"] as const).map(async (key) => { const reference = assetReference(image.metadata, key); return reference ? bridge.readImage(assetPath(image, reference)) : null; }));
+        next.mode = restored.mode; next.strength = restored.strength; next.maskBlur = restored.maskBlur; next.controlEnabled = restored.controlEnabled; next.controlKind = restored.controlKind; next.controlScale = restored.controlScale; next.controlStart = restored.controlStart; next.controlEnd = restored.controlEnd; next.initImage = initImage; next.mask = mask; next.controlImage = controlImage;
+      }
+      changeSettings(next); setSelected(null); setFullUrl(""); setNotice(all ? "All saved settings restored." : `Restored ${fields.join(", ")}.`);
     } catch (reason) { setNotice(errorText(reason)); }
   };
   const previewControl = async () => {

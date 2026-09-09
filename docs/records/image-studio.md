@@ -279,6 +279,21 @@ the assistant so it can acknowledge queued work or continue planning. The loop i
 bounded to four assistant rounds. This deliberately excludes img2img, inpainting and
 ControlNet until their image-input semantics have an explicit conversational design.
 
+## Gallery navigation, selective restore and comparisons
+
+The gallery preview keeps its loaded image order while left and right arrow keys move
+between images; inputs retain their native arrow behavior. Its layout uses flexible
+gallery columns and a preview details column that grows with available width. The
+preview's restore control can apply all saved settings or only prompt, dimensions,
+steps, seed, LoRAs, or edit inputs. Asset-backed edit fields still load through the
+existing safe image bridge.
+
+Images sharing a batch ID and containing one or two axis values expose a comparison
+mode. One-axis batches render labeled thumbnails. Two-axis batches form a grid with the
+smaller value set as columns, leaving the larger set as rows; missing cells remain
+empty, and selecting a cell returns to the ordinary preview. Batches with more than two
+axes stay in the normal gallery because their projection would be ambiguous.
+
 ## Not taken now
 
 Pending queue recovery across an app restart is not implemented. Batch plans,

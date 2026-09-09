@@ -76,6 +76,10 @@ Missing values in older records are labeled "Not recorded." Select an image to r
 its controls, or use it as the next source. Connection and workspace changes wait
 until the current queue has stopped.
 
+While the preview is open, use the left and right arrow keys to browse the loaded
+gallery. Text fields keep their normal arrow-key behavior. The gallery grows to use
+available window width, and the preview details column expands modestly on wider windows.
+
 The image preview offers **Delete image**, which confirms before permanently
 removing the PNG and YAML record. Shared input snapshots stay in place. **Delete
 session** sits on each session's timestamp row in the gallery. Rows include empty
@@ -159,6 +163,11 @@ every resolved request and seed, shared input snapshots, job status, attempts an
 output references. Each image YAML links back through its batch and job IDs.
 Retry keeps the same request and seed and adds an attempt. Discard records the
 pending jobs as discarded; clearing finished queue rows keeps their history.
+
+Completed one- and two-axis batches show a **Compare batch** action above the session's
+gallery. One-axis batches label each thumbnail with its tested value. Two-axis batches
+use the axis with fewer values as columns and the other as rows; clicking a cell opens
+the normal image preview.
 
 Closing the app clears the in-memory queue. Its saved plan and last recorded job
 states remain on disk, but automatic recovery and a parameter-exploration viewer
