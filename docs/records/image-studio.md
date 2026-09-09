@@ -258,6 +258,21 @@ verified. The external Qwen review was interrupted before returning a report;
 its local server was unavailable when the session resumed, so no external review
 result is claimed for this change.
 
+## Assistant chat and queue tool
+
+The Image Studio chat button opens a conversation UI backed by the configured server's
+existing OpenAI-compatible chat endpoint. The Tauri state layer owns this request, so
+API keys remain outside the webview. Each turn includes current output defaults and the
+live LoRA listing. The only advertised tool is `queue_txt2img`; its arguments are a
+prompt, dimensions, steps, seed, count and exact LoRA paths with weights.
+
+The client handles the tool loop: it validates each returned request using the same
+geometry, seed, count and LoRA checks as the regular editor, then converts it into a
+single-job batch and sends it through `useRenderQueue`. Tool results are fed back to
+the assistant so it can acknowledge queued work or continue planning. The loop is
+bounded to four assistant rounds. This deliberately excludes img2img, inpainting and
+ControlNet until their image-input semantics have an explicit conversational design.
+
 ## Not taken now
 
 Pending queue recovery across an app restart is not implemented. Batch plans,

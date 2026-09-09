@@ -10,6 +10,7 @@ import { MaskEditor } from "./components/MaskEditor";
 import { QueuePanel } from "./components/QueuePanel";
 import { ServerDialog } from "./components/ServerDialog";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { ChatPanel } from "./components/ChatPanel";
 import { useImageDrop, type ImageDropTarget } from "./useImageDrop";
 import { reportError, setLogSecrets } from "./logging";
 
@@ -251,6 +252,11 @@ export default function App() {
     finally { setDeleting(false); }
   };
   const groupedComparison = useMemo(() => preview.length > 1 && preview.some((job) => Object.keys(job.context.axes).includes("prompt")) && preview.some((job) => Object.keys(job.context.axes).includes("seed")), [preview]);
+  const queueChatRequests = useCallback(async (requests: import("./domain").RenderRequest[]) => {
+    if (!workspace) throw new Error("Choose a workspace first.");
+    const jobs = requests.map((request, index) => ({ id: crypto.randomUUID(), request, context: { mode: "text" as const, batch_index: index, axes: {}, repeat_index: 0 } }));
+    await queue.enqueue(jobs, workspace.session_id, { mode: "single", axes: [], count: 1 });
+  }, [queue, workspace]);
 
   if (loading) return <main className="loading-screen"><div className="brand-mark">x</div><p>Opening Image Studio…</p></main>;
   if (fatal) return <main className="fatal-screen"><p className="eyebrow">Image Studio could not start</p><h1>Startup error</h1><p className="error-banner">{fatal}</p><button className="primary-button" onClick={() => location.reload()}>Try again</button></main>;
@@ -282,6 +288,7 @@ export default function App() {
           try { setPreview(planJobs(settings, nextAxes, batchMode)); setBatchError(""); }
           catch (reason) { setPreview([]); setBatchError(reason instanceof Error ? reason.message : String(reason)); }
         }} />
+        <ChatPanel settings={settings} loras={loras} sessionId={workspace?.session_id ?? null} disabled={!workspace} onQueue={queueChatRequests} />
         {groupedComparison && <p className="comparison-note">The gallery labels prompt and seed so this matrix stays comparable after rendering.</p>}
       </aside>
       <div className="work-area">

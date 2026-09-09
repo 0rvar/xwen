@@ -172,6 +172,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 28px; background: rgba(39, 36, 33, .54); backdrop-filter: blur(5px); }
 .modal { width: min(500px, 100%); max-height: calc(100vh - 56px); overflow: auto; padding: 22px; border: 1px solid rgba(255,255,255,.42); border-radius: 14px; background: var(--paper); box-shadow: var(--shadow); }
+.chat-modal { width: min(650px, 100%); }
+.chat-history { display: grid; gap: 12px; max-height: 420px; overflow: auto; padding: 4px 0 14px; }
+.chat-message { padding: 11px 13px; border-radius: 10px; background: rgba(255,255,255,.45); }
+.chat-message.user { background: rgba(189,104,77,.12); }
+.chat-message strong { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+.chat-message p { margin: 5px 0 0; white-space: pre-wrap; }
 .modal-heading { display: flex; align-items: start; justify-content: space-between; margin-bottom: 10px; }
 .modal-heading h2 { font-size: 20px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }

@@ -112,6 +112,12 @@ server's chat API, with thinking disabled; the checkpoint must already be cached
 on that server. **Use prompt** replaces the main prompt with the draft. Closing
 the generator leaves the main prompt unchanged.
 
+**Chat with image assistant** opens a conversation with the configured Flash-Next
+server. The assistant receives the current output defaults and the server's live LoRA
+list, and can call `queue_txt2img` to add text-to-image jobs to the same durable queue.
+It cannot perform img2img, inpainting or ControlNet yet. Tool requests are validated by
+the client before enqueueing; use the exact LoRA paths shown by the server.
+
 ## Batches
 
 Add an axis for each parameter to vary. Numeric values can be comma-separated or

@@ -41,6 +41,7 @@ export interface NativeBridge {
   deleteImage(workspacePath: string, sessionId: string, imageId: string): Promise<void>;
   deleteSession(workspacePath: string, sessionId: string): Promise<Workspace>;
   generatePrompt(idea: string): Promise<string>;
+  chat(messages: unknown[], tools: unknown[]): Promise<Record<string, unknown>>;
   getLogPath(): Promise<string>;
   reveal(path: string): Promise<void>;
   chooseDirectory(title: string): Promise<string | null>;
@@ -64,6 +65,7 @@ const nativeBridge: NativeBridge = {
   deleteImage: (workspacePath, sessionId, imageId) => invoke<void>("delete_image", { workspacePath, sessionId, imageId }),
   deleteSession: (workspacePath, sessionId) => invoke<Workspace>("delete_session", { workspacePath, sessionId }),
   generatePrompt: (idea) => invoke<string>("generate_prompt", { idea }),
+  chat: (messages, tools) => invoke<Record<string, unknown>>("chat", { messages, tools }),
   getLogPath: () => invoke<string>("get_log_path"),
   reveal: (path) => invoke<void>("reveal", { path }),
   chooseDirectory: (title) => open({ directory: true, multiple: false, title }),
@@ -247,6 +249,9 @@ function createPreviewBridge(): NativeBridge {
       if (idea.includes("fail prompt")) throw new Error("Flash-Next is not cached on this server.");
       return `${idea.trim() || "A secluded mountain observatory"}, soft evening light, rich textures, carefully composed photograph`;
     },
+    chat: async (messages) => ({
+      choices: [{ message: { role: "assistant", content: `I can help plan an image for: ${String((messages.at(-1) as { content?: unknown })?.content ?? "your idea")}` }, finish_reason: "stop" }],
+    }),
     getLogPath: async () => "/Users/demo/.local/state/xwen/image-studio/logs/image-studio.log",
     reveal: async () => undefined,
     chooseDirectory: async () => {

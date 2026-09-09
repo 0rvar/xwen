@@ -279,6 +279,22 @@ impl Studio {
         }
         Ok(content.to_owned())
     }
+    pub async fn chat(&self, messages: Value, tools: Value) -> Result<Value> {
+        self.request(
+            &self.config()?,
+            "/v1/chat/completions",
+            Some(json!({
+                "model": "Qwen3.8-Flash-Next",
+                "stream": false,
+                "max_completion_tokens": 1024,
+                "chat_template_kwargs": {"enable_thinking": false},
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto"
+            })),
+        )
+        .await
+    }
     async fn request(&self, config: &Config, endpoint: &str, body: Option<Value>) -> Result<Value> {
         let url = format!("{}{endpoint}", normalize_url(&config.server_url)?);
         let mut request = if let Some(body) = body {

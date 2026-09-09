@@ -95,6 +95,14 @@ fn delete_session(
 async fn generate_prompt(state: State<'_, Studio>, idea: String) -> Result<String, String> {
     logging::result("generate_prompt", state.generate_prompt(idea).await, true)
 }
+#[tauri::command]
+async fn chat(
+    state: State<'_, Studio>,
+    messages: serde_json::Value,
+    tools: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    logging::result("chat", state.chat(messages, tools).await, true)
+}
 #[tauri::command(async)]
 fn reveal(path: String) -> Result<(), String> {
     logging::result(
@@ -183,7 +191,7 @@ pub fn run() {
             .invoke_handler(tauri::generate_handler![
                 create_batch,render_batch_job,discard_batch_jobs,bootstrap, save_config, select_workspace, read_image, list_loras,
                 check_server, preprocess, render, list_images, list_sessions,
-                delete_image, delete_session, generate_prompt, reveal, frontend_logs, get_log_path
+                delete_image, delete_session, generate_prompt, chat, reveal, frontend_logs, get_log_path
             ])
             .build(tauri::generate_context!())?;
         app.run(|_, event| {

@@ -13,6 +13,14 @@ squared, and bounded memory telemetry records the next incident. The reboot repo
 identified a wireless-driver timeout, not a proven GPU fault. [Design, limits and
 verification](records/memory-safety.md).
 
+## 2026-09-09 — Image Studio lets Flash-Next queue text-to-image jobs
+
+The new assistant chat receives current render defaults and live server LoRAs, then
+executes its `queue_txt2img` tool calls through the existing durable batch queue.
+Only text-to-image is exposed for now; client-side request validation remains the final
+guard before a job is submitted. [Usage and implementation](../image-studio/README.md),
+[client record](records/image-studio.md#assistant-chat-and-queue-tool).
+
 ## 2026-09-09 — Image Studio prioritizes active queue work and relaxes false refusals
 
 The queue keeps running and waiting jobs above completed work and shows an indeterminate
