@@ -1,8 +1,9 @@
-import type { BatchAxis, BatchMode, PlannedJob, StudioSettings } from "../domain";
+import type { BatchAxis, BatchMode, LoraCandidate, PlannedJob, StudioSettings } from "../domain";
 import { MAX_JOBS, planJobs } from "../domain";
 
 interface Props {
   settings: StudioSettings;
+  loras: LoraCandidate[];
   axes: BatchAxis[];
   mode: BatchMode;
   preview: PlannedJob[];
@@ -12,10 +13,11 @@ interface Props {
   onMode(mode: BatchMode): void;
   onPreview(jobs: PlannedJob[], error: string): void;
   onQueue(): void;
+  onTryAllLoras(): void;
 }
 
-export function BatchPanel({ settings, axes, mode, preview, error, disabled, onAxes, onMode, onPreview, onQueue }: Props) {
-  const parameters = ["prompt", "seed", "width", "height", "steps", ...(settings.mode === "text" ? [] : ["strength"]), ...(settings.mode === "inpaint" ? ["mask_blur"] : []), ...(settings.controlEnabled ? ["control.scale", "control.start", "control.end"] : []), ...settings.loras.map((_, index) => `loras.${index}.weight`)];
+export function BatchPanel({ settings, loras, axes, mode, preview, error, disabled, onAxes, onMode, onPreview, onQueue, onTryAllLoras }: Props) {
+  const parameters = ["prompt", "seed", "width", "height", "steps", ...(settings.mode === "text" ? [] : ["strength"]), ...(settings.mode === "inpaint" ? ["mask_blur"] : []), ...(settings.controlEnabled ? ["control.scale", "control.start", "control.end"] : []), ...(loras.length ? ["lora"] : []), ...settings.loras.map((_, index) => `loras.${index}.weight`)];
   const refresh = () => {
     try { onPreview(planJobs(settings, axes, mode), ""); }
     catch (reason) { onPreview([], reason instanceof Error ? reason.message : String(reason)); }
@@ -36,12 +38,15 @@ export function BatchPanel({ settings, axes, mode, preview, error, disabled, onA
             </select>
             {axis.parameter === "prompt"
               ? <textarea aria-label={`Batch values ${index + 1}`} rows={2} placeholder="One prompt per line" value={axis.values} onChange={(event) => onAxes(axes.map((item, itemIndex) => itemIndex === index ? { ...item, values: event.target.value } : item))} />
+              : axis.parameter === "lora"
+                ? <textarea aria-label={`Batch values ${index + 1}`} rows={2} placeholder="One LoRA path per line" value={axis.values} onChange={(event) => onAxes(axes.map((item, itemIndex) => itemIndex === index ? { ...item, values: event.target.value } : item))} />
               : <input aria-label={`Batch values ${index + 1}`} placeholder="1, 2, 3 or start:end:step" value={axis.values} onChange={(event) => onAxes(axes.map((item, itemIndex) => itemIndex === index ? { ...item, values: event.target.value } : item))} />}
             <button className="icon-button" aria-label={`Remove batch axis ${index + 1}`} onClick={() => onAxes(axes.filter((_, itemIndex) => itemIndex !== index))}>×</button>
           </div>
         ))}
         <div className="button-row">
           <button className="quiet-button" disabled={!parameters.length} onClick={() => onAxes([...axes, { parameter: parameters.find((parameter) => !axes.some((axis) => axis.parameter === parameter)) ?? parameters[0]!, values: "" }])}>Add axis</button>
+          <button className="quiet-button" disabled={!loras.length} onClick={onTryAllLoras}>Try with all LoRAs</button>
           <button className="quiet-button" onClick={refresh}>Preview batch</button>
         </div>
         {error && <p className="error-banner" role="alert">{error}</p>}

@@ -169,6 +169,11 @@ export function parseNumericValues(text: string): number[] {
 }
 
 function axisValues(axis: BatchAxis): (string | number)[] {
+  if (axis.parameter === 'lora') {
+    const values = axis.values.split('\n').map(line => line.trim()).filter(Boolean);
+    ensure(values.length > 0 && values.length <= MAX_JOBS, `Enter 1–${MAX_JOBS} LoRA paths, one per line.`);
+    return values;
+  }
   if (axis.parameter !== 'prompt') return parseNumericValues(axis.values);
   let values: unknown;
   if (axis.values.trim().startsWith('[')) {
@@ -180,6 +185,11 @@ function axisValues(axis: BatchAxis): (string | number)[] {
 
 function applyAxis(request: RenderRequest, parameter: string, value: string | number): void {
   if (parameter === 'prompt') { request.prompt = String(value); return; }
+  if (parameter === 'lora') {
+    ensure(typeof value === 'string' && value.trim(), 'LoRA values must be nonempty paths.');
+    request.loras = [{ name: value, weight: request.loras[0]?.weight ?? 1 }];
+    return;
+  }
   ensure(typeof value === 'number', `${parameter} requires numeric values.`);
   if (['seed', 'width', 'height', 'steps'].includes(parameter)) {
     (request as unknown as Record<string, unknown>)[parameter] = value;

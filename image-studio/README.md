@@ -125,11 +125,19 @@ array.
 | `steps` | `4,6,8` | Three step counts |
 | `prompt` | `["a red bicycle", "a blue bicycle"]` | Two prompts |
 | `loras.0.weight` | `0,0.5,1` | Three weights for the first LoRA |
+| `lora` | one server LoRA path per line | Replace the active LoRA stack for each row |
 
 Matrix mode renders every combination. Paired mode takes matching positions from
 each axis; a single value repeats across rows, and other axis lengths must match.
 Images per combination repeats each row with consecutive seeds. Without a seed
 axis, combinations share those seeds so the parameter comparison stays matched.
+
+The **Try with all LoRAs** button fills or replaces the `lora` axis from the
+server's current LoRA list and previews one job per adapter. It replaces the
+active LoRA stack so the comparison is one adapter against the same prompt and
+seed; other batch axes remain in place. Each adapter uses the first active LoRA's
+weight, or `1` when none is active. Refresh the LoRA list first after adding
+files to the server.
 
 The app validates the whole plan before sending anything and caps it at 1000 images.
 The queue sends one request at a time. Stop lets the current request finish and save

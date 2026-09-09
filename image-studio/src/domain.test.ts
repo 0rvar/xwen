@@ -86,6 +86,15 @@ describe('batch ranges and matrices', () => {
     expect(jobs[1]!.request.control!.scale).toBe(0.5);
     expect(jobs[1]!.request.loras[0]!.weight).toBe(1);
   });
+  test('LoRA axes try each adapter with the current weight', () => {
+    const jobs = planJobs(settings({ loras: [{ name: '/srv/base.safetensors', weight: 0.7 }, { name: '/srv/other.safetensors', weight: 0.3 }] }), [
+      { parameter: 'lora', values: '/srv/one.safetensors\n/srv/two.safetensors' },
+    ]);
+    expect(jobs.map(job => job.request.loras)).toEqual([
+      [{ name: '/srv/one.safetensors', weight: 0.7 }],
+      [{ name: '/srv/two.safetensors', weight: 0.7 }],
+    ]);
+  });
   test('random seed is resolved once and then explicit in every request', () => {
     const jobs = planJobs(settings({ seed: '', count: 2 }), [{ parameter: 'steps', values: '4,8' }]);
     expect(Number.isSafeInteger(jobs[0]!.request.seed)).toBe(true);

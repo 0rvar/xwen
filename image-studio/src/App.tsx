@@ -273,7 +273,15 @@ export default function App() {
           if (kind === "source") changeSettings({ ...settings, initImage: null, mask: null });
           else changeSettings({ ...settings, controlImage: null });
         }} onEditMask={() => setMaskOpen(true)} onRefreshLoras={() => void refreshLoras()} onPreviewControl={() => void previewControl()} onUseControlPreview={() => controlPreview && changeSettings({ ...settings, controlImage: controlPreview, controlKind: "none" })} onGenerate={generate} />
-        <BatchPanel settings={settings} axes={axes} mode={batchMode} preview={preview} error={batchError} disabled={!workspace} onAxes={(next) => { setAxes(next); setPreview([]); setBatchError(""); }} onMode={(next) => { setBatchMode(next); setPreview([]); setBatchError(""); }} onPreview={(jobs, error) => { setPreview(jobs); setBatchError(error); }} onQueue={() => void queuePreview()} />
+        <BatchPanel settings={settings} loras={loras} axes={axes} mode={batchMode} preview={preview} error={batchError} disabled={!workspace} onAxes={(next) => { setAxes(next); setPreview([]); setBatchError(""); }} onMode={(next) => { setBatchMode(next); setPreview([]); setBatchError(""); }} onPreview={(jobs, error) => { setPreview(jobs); setBatchError(error); }} onQueue={() => void queuePreview()} onTryAllLoras={() => {
+          const values = loras.map((lora) => lora.path).join("\n");
+          const nextAxes = axes.some((axis) => axis.parameter === "lora")
+            ? axes.map((axis) => axis.parameter === "lora" ? { ...axis, values } : axis)
+            : [...axes, { parameter: "lora", values }];
+          setAxes(nextAxes);
+          try { setPreview(planJobs(settings, nextAxes, batchMode)); setBatchError(""); }
+          catch (reason) { setPreview([]); setBatchError(reason instanceof Error ? reason.message : String(reason)); }
+        }} />
         {groupedComparison && <p className="comparison-note">The gallery labels prompt and seed so this matrix stays comparable after rendering.</p>}
       </aside>
       <div className="work-area">
