@@ -27,6 +27,18 @@ pub fn configured_dir() -> Result<PathBuf> {
     }
 }
 
+/// Validate a downloaded adapter before making it available for inference.
+pub fn validate_file(path: &Path) -> Result<()> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("reading LoRA {}", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "LoRA must be a file: {}",
+        path.display()
+    );
+    validate_header(path, metadata.len())
+}
+
 fn directory_or_current(path: PathBuf) -> PathBuf {
     if path.as_os_str().is_empty() {
         PathBuf::from(".")

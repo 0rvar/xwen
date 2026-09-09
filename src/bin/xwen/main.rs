@@ -316,6 +316,13 @@ enum Cmd {
         #[command(flatten)]
         select: ModelArgs,
     },
+    /// Download a LoRA into `$XWEN_LORA_DIR` (or the default local LoRA
+    /// directory). Accepts an HTTPS `.safetensors` URL or a Hugging Face
+    /// `owner/repository` containing exactly one root-level adapter.
+    FetchLora {
+        /// Direct HTTPS URL or Hugging Face `owner/repository`.
+        source: String,
+    },
     /// Summarize the per-run metrics history: what every generate, chat, batch
     /// and served request cost, grouped and totalled.
     ///
@@ -1723,6 +1730,12 @@ fn main() -> Result<()> {
                 Some(drafter) => println!("drafter  {}", drafter.display()),
                 None => println!("drafter  none ({} ships no sidecar)", size.full_name()),
             }
+            Ok(())
+        }
+        Some(Cmd::FetchLora { source }) => {
+            let directory = xwen::zimage::lora::configured_dir()?;
+            let path = xwen::hub::ensure_lora(&source, &directory)?;
+            println!("lora    {}", path.display());
             Ok(())
         }
         Some(Cmd::Stats {

@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use hf_hub::Cache;
 use hf_hub::api::sync::ApiBuilder;
 
@@ -1683,6 +1683,131 @@ pub fn ensure_drafter(model: Model) -> Result<Option<PathBuf>> {
         Some(file) => ensure_file(model.repo(), file).map(Some),
         None => Ok(None),
     }
+}
+
+/// Download one LoRA into the configured directory, returning its final path.
+/// A source is either a direct HTTPS URL ending in `.safetensors` or a
+/// Hugging Face `owner/repository` containing exactly one root-level adapter.
+/// Existing files are returned without contacting the network.
+pub fn ensure_lora(source: &str, directory: &Path) -> Result<PathBuf> {
+    ensure!(!source.is_empty(), "LoRA source must not be empty");
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("creating LoRA directory {}", directory.display()))?;
+
+    if source.starts_with("https://") {
+        let url = url::Url::parse(source).context("parsing LoRA URL")?;
+        ensure!(url.scheme() == "https", "LoRA URL must use HTTPS");
+        let filename = url
+            .path_segments()
+            .and_then(|segments| segments.last())
+            .filter(|name| !name.is_empty())
+            .context("LoRA URL has no filename")?;
+        validate_lora_filename(filename)?;
+        let destination = directory.join(filename);
+        if destination.is_file() {
+            crate::zimage::lora::validate_file(&destination)
+                .with_context(|| format!("validating existing LoRA {filename}"))?;
+            return Ok(destination);
+        }
+        return download_lora_url(source, &destination);
+    }
+
+    let mut parts = source.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    ensure!(
+        parts.next().is_none() && !owner.is_empty() && !repo.is_empty(),
+        "LoRA source must be an HTTPS URL or a Hugging Face owner/repository identifier"
+    );
+
+    let cache = cache().context("cannot locate the Hugging Face cache (HOME is unset)")?;
+    let mut builder = ApiBuilder::from_cache(cache).with_progress(true);
+    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
+    let api = builder
+        .build()
+        .context("building the Hugging Face client")?;
+    let repo_id = format!("{owner}/{repo}");
+    let files = api
+        .model(repo_id.clone())
+        .info()
+        .with_context(|| format!("looking up Hugging Face repository {repo_id}"))?
+        .siblings
+        .into_iter()
+        .map(|file| file.rfilename)
+        .filter(|file| Path::new(file).parent() == Some(Path::new("")))
+        .filter(|file| file.ends_with(".safetensors"))
+        .collect::<Vec<_>>();
+    ensure!(
+        files.len() == 1,
+        "Hugging Face repository {repo_id} must contain exactly one root-level .safetensors file (found {})",
+        files.len()
+    );
+    let filename = &files[0];
+    validate_lora_filename(filename)?;
+    let destination = directory.join(filename);
+    if destination.is_file() {
+        crate::zimage::lora::validate_file(&destination)
+            .with_context(|| format!("validating existing LoRA {filename}"))?;
+        return Ok(destination);
+    }
+    ensure_file(&repo_id, filename).map(|cached| {
+        if destination.exists() {
+            std::fs::remove_file(&destination).ok();
+        }
+        std::os::unix::fs::symlink(cached, &destination)
+            .with_context(|| format!("linking LoRA into {}", destination.display()))
+            .map(|_| destination.clone())
+    })??;
+    if let Err(error) = crate::zimage::lora::validate_file(&destination) {
+        std::fs::remove_file(&destination).ok();
+        return Err(error).with_context(|| format!("validating downloaded LoRA {filename}"));
+    }
+    Ok(destination)
+}
+
+fn validate_lora_filename(filename: &str) -> Result<()> {
+    ensure!(
+        filename.ends_with(".safetensors"),
+        "LoRA filename must end in .safetensors"
+    );
+    ensure!(
+        Path::new(filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(filename),
+        "LoRA filename must not contain directories"
+    );
+    Ok(())
+}
+
+fn download_lora_url(source: &str, destination: &Path) -> Result<PathBuf> {
+    if destination.is_file() {
+        return Ok(destination.to_path_buf());
+    }
+    let temporary = destination.with_extension("safetensors.part");
+    let result = (|| -> Result<()> {
+        let mut response = ureq::get(source)
+            .call()
+            .with_context(|| format!("downloading LoRA from {source}"))?;
+        let mut output = std::fs::File::create(&temporary)
+            .with_context(|| format!("creating {}", temporary.display()))?;
+        std::io::copy(&mut response.body_mut().as_reader(), &mut output)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        output.sync_all().context("flushing downloaded LoRA")?;
+        std::fs::rename(&temporary, destination)
+            .with_context(|| format!("installing {}", destination.display()))?;
+        if let Err(error) = crate::zimage::lora::validate_file(destination) {
+            std::fs::remove_file(destination).ok();
+            return Err(error).with_context(|| format!("validating downloaded LoRA {source}"));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&temporary).ok();
+    }
+    result.map(|_| destination.to_path_buf())
 }
 
 #[cfg(test)]

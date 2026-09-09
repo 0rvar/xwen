@@ -32,6 +32,8 @@ objc2-foundation = "=0.3.2"
 # when missing. Sync ureq API only (no tokio feature); nothing on an inference
 # path ever touches it.
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
 
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 

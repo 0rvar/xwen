@@ -4510,6 +4510,8 @@ dependencies = [
  "toktrie_hf_tokenizers",
  "toml",
  "unicode-width",
+ "ureq",
+ "url",
 ]
 
 [[package]]

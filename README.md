@@ -203,7 +203,15 @@ text-to-image pipeline, and it is never listed by `/v1/models`. What serves it i
 ```
 xwen fetch --model-size zimage-turbo
 xwen image --prompt "a red bicycle against a white brick wall, golden hour" -o out.png
+xwen fetch-lora midnight888/nsfwzimageturbo
 ```
+
+`xwen fetch-lora` downloads one LoRA into `$XWEN_LORA_DIR` (default
+`~/.local/share/xwen/loras`). Its source can be a direct HTTPS URL ending in
+`.safetensors` or a Hugging Face `owner/repository` containing exactly one
+root-level `.safetensors` file. Existing adapters are validated and reused;
+downloads use a temporary file and are installed atomically. The resulting
+filename can be passed directly to `xwen image --lora`.
 
 `--width` and `--height` default to 1024, `--steps` to 8, and `--seed` is drawn and
 printed when omitted. `--latents <file.safetensors>` injects a fixed latent for reference
