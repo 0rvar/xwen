@@ -119,7 +119,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .empty-gallery p { max-width: 320px; font-size: 12px; }
 .empty-frame { display: grid; place-items: center; width: 112px; height: 112px; border: 1px solid #cbc4b9; border-radius: 20px; color: var(--accent); background: rgba(255,255,255,.34); font-size: 33px; transform: rotate(-3deg); }
 .session-groups { display: grid; gap: 24px; }
-.session-group h3 { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; color: #514d48; }
+.session-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.session-heading h3 { display: flex; align-items: center; gap: 8px; min-width: 0; margin-bottom: 0; overflow-wrap: anywhere; color: #514d48; }
+.session-heading button { flex-shrink: 0; }
 .session-group h3 span { display: inline-grid; place-content: center; min-width: 20px; height: 18px; padding: 0 5px; border-radius: 10px; color: var(--muted); background: rgba(255,255,255,.55); font: 500 9px ui-sans-serif; }
 .gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
 .gallery-tile { min-width: 0; overflow: hidden; padding: 0; border: 1px solid rgba(80,70,60,.12); border-radius: 10px; background: #f8f6f1; text-align: left; box-shadow: 0 2px 5px rgba(55, 46, 39, .05); transition: transform .15s, box-shadow .15s; }
@@ -173,12 +175,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .delete-backdrop { z-index: 30; }
 .danger-button { color: #a42f29; }
 .primary-button.danger-button { color: white; background: #a42f29; }
-.session-manager { margin-bottom: 20px; }
-.session-manager summary { cursor: pointer; color: var(--muted); }
-.session-manager-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
-.session-manager-row span { min-width: 0; overflow-wrap: anywhere; }
-.session-manager-row small { display: block; color: var(--muted); font-size: 10px; }
-.session-manager-row button { flex-shrink: 0; }
 .prompt-generator .field { margin-top: 16px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .settings-modal .field { margin-top: 14px; }

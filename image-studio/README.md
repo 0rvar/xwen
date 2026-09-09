@@ -71,8 +71,9 @@ its controls, or use it as the next source. Connection and workspace changes wai
 until the current queue has stopped.
 
 The image preview offers **Delete image**, which confirms before permanently
-removing the PNG and YAML record. Shared input snapshots stay in place. **Manage
-sessions** lists every recognized session, beyond the gallery's 200-image limit.
+removing the PNG and YAML record. Shared input snapshots stay in place. **Delete
+session** sits on each session's timestamp row in the gallery. Rows include empty
+sessions and sessions beyond the gallery's 200-image preview limit.
 Deleting a session confirms removal of all its images, records and input snapshots.
 Deleting the current session starts a fresh one. Finish or discard queued jobs before
 deleting a session; individual completed images can be deleted while rendering.

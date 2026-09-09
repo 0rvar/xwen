@@ -12,13 +12,13 @@ test("image deletion can be canceled and removes the gallery entry", async ({ pa
   await page.getByRole("button", { name: "Delete permanently" }).click();
   await expect(tile).toHaveCount(0);
   await expect(page.getByText("Your renders will collect here")).toBeVisible();
-  await page.getByText("Manage sessions", { exact: true }).click();
   await expect(page.getByRole("button", { name: /^Delete session/ })).toHaveCount(1);
 });
 
 test("session deletion confirms all files and rotates current session", async ({ page }) => {
   await page.goto("/");
-  await page.getByText("Manage sessions", { exact: true }).click();
+  await expect(page.getByText("Manage sessions", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".session-heading").getByRole("button", { name: /^Delete session/ })).toHaveCount(1);
   const oldSession = "20260908-142210-preview";
   await page.getByRole("button", { name: `Delete session ${oldSession}` }).click();
   await expect(page.getByText(/including all 1 images, YAML records and input snapshots/)).toBeVisible();

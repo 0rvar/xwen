@@ -151,6 +151,16 @@ late prompt responses, stale history refreshes, Finder metadata and orphan-recor
 cleanup. The final macOS bundle builds, and docs-check passes. No model math or
 performance figure changes; the existing ledger remains actionable and unchanged.
 
+2026-09-09. At the user's request, Delete session moved onto each gallery session's
+timestamp row and the separate management panel was removed. Rows use the complete
+session catalog, so empty sessions and older sessions outside the 200-image preview
+limit remain accessible. Confirmation still receives the full image count. All 11
+browser flows and the bundle build pass. Two local reviews and an external Qwen
+review ran; a heading-margin regression was corrected. Qwen's suggestion that
+session counts were capped at 200 was checked against the separate session catalog
+and its existing 205-image test: only the image previews are capped. Docs-check
+passes, and the ledger is unchanged.
+
 ## Not taken now
 
 Pending queue recovery across an app restart is not implemented. Completed results

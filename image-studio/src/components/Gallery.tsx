@@ -25,15 +25,17 @@ function value(record: Record<string, unknown>, key: string): string | null {
 export function Gallery({ images, selected, fullUrl, currentSessionId, sessions: summaries, deleting, sessionDeletionDisabled, onDelete, onDeleteSession, onSelect, onUseSource, onRestore, onReveal }: Props) {
   const sessions = new Map<string, SavedImage[]>();
   for (const image of images) sessions.set(image.session_id, [...(sessions.get(image.session_id) ?? []), image]);
+  const sessionRows = new Map(summaries.map((session) => [session.session_id, session]));
+  for (const [session_id, sessionImages] of sessions) {
+    if (!sessionRows.has(session_id)) sessionRows.set(session_id, { session_id, image_count: sessionImages.length });
+  }
   return (
     <section className="gallery-panel" aria-labelledby="gallery-title">
       <header className="panel-heading"><div><p className="eyebrow">Workspace history</p><h2 id="gallery-title">Gallery</h2></div><span className="summary-note">{images.length} image{images.length === 1 ? "" : "s"}</span></header>
-      <details className="session-manager"><summary>Manage sessions</summary><div>{summaries.map((session) => <div className="session-manager-row" key={session.session_id}><span><strong>{session.session_id === currentSessionId ? "Current session" : session.session_id}</strong><small>{session.session_id} · {session.image_count} images</small></span><button className="text-button danger-button" disabled={sessionDeletionDisabled || deleting} onClick={() => onDeleteSession(session)} aria-label={`Delete session ${session.session_id}`}>Delete session</button></div>)}</div>{sessionDeletionDisabled && <p className="field-help">Finish or discard queued jobs before deleting a session.</p>}</details>
-      {!images.length ? <div className="empty-gallery"><div className="empty-frame" aria-hidden="true">◇</div><h3>Your renders will collect here</h3><p>Build a prompt, preview the batch, then add it to the queue.</p></div> : (
         <div className="session-groups">
-          {[...sessions].map(([sessionId, sessionImages]) => <section key={sessionId} className="session-group">
-            <h3>{sessionId === currentSessionId ? "Current session" : sessionId}<span>{sessionImages.length}</span></h3>
-            <div className="gallery-grid">{sessionImages.map((image) => {
+          {[...sessionRows.values()].map((session) => <section key={session.session_id} className="session-group">
+            <div className="session-heading"><h3>{session.session_id}{session.session_id === currentSessionId ? " · Current session" : ""}<span>{session.image_count}</span></h3><button className="text-button danger-button" disabled={sessionDeletionDisabled || deleting} title={sessionDeletionDisabled ? "Finish or discard queued jobs before deleting a session" : undefined} onClick={() => onDeleteSession(session)} aria-label={`Delete session ${session.session_id}`}>Delete session</button></div>
+            <div className="gallery-grid">{(sessions.get(session.session_id) ?? []).map((image) => {
               const axes = (image.metadata.context as { axes?: Record<string, unknown> } | undefined)?.axes;
               return <button key={image.id} className={`gallery-tile ${selected?.id === image.id ? "selected" : ""}`} onClick={() => onSelect(image)} aria-label={`Open ${image.prompt}, seed ${image.seed}`}>
                 <img src={image.data_url} alt="" />
@@ -42,7 +44,7 @@ export function Gallery({ images, selected, fullUrl, currentSessionId, sessions:
             })}</div>
           </section>)}
         </div>
-      )}
+      {!images.length && <div className="empty-gallery"><div className="empty-frame" aria-hidden="true">◇</div><h3>Your renders will collect here</h3><p>Build a prompt, preview the batch, then add it to the queue.</p></div>}
       {selected && <div className="modal-backdrop preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onSelect(selected); }}>
         <section className="modal preview-modal" role="dialog" aria-modal="true" aria-label="Image preview">
           <div className="preview-image"><img src={fullUrl || selected.data_url} alt={selected.prompt} /></div>

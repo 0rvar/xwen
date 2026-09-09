@@ -4,6 +4,13 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-09 — Session deletion sits on the gallery timestamp row
+
+Image Studio places Delete session beside each session timestamp and removes the
+separate management panel. Empty sessions and sessions beyond the preview limit
+retain their rows and full counts. [Usage](../image-studio/README.md),
+[client record](records/image-studio.md#gallery-cleanup-and-prompt-drafts).
+
 ## 2026-09-08 — Image Studio adds deletion, queue appends and Flash-Next prompt drafts
 
 The gallery confirms image and whole-session deletion. Session management lists

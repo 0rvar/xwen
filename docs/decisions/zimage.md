@@ -646,3 +646,8 @@ Prompt drafts use the configured authenticated chat endpoint and the explicit
 draft before it replaces the image prompt. No local CLI process or model fallback
 is involved, so remote servers behave the same way. The
 [client record](../records/image-studio.md#gallery-cleanup-and-prompt-drafts) holds verification.
+
+2026-09-09. The user wants session deletion on the gallery timestamp row. That row
+now owns the action; the separate management panel is removed. The gallery keeps
+rows from the full session catalog so deletion stays available for empty sessions
+and sessions whose images fall outside the preview limit.
