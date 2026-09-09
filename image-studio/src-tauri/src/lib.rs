@@ -1,6 +1,7 @@
 mod batch;
 mod logging;
 mod models;
+mod prompt_guide;
 mod state;
 mod storage;
 use models::*;

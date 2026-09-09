@@ -266,6 +266,12 @@ API keys remain outside the webview. Each turn includes current output defaults 
 live LoRA listing. The only advertised tool is `queue_txt2img`; its arguments are a
 prompt, dimensions, steps, seed, count and exact LoRA paths with weights.
 
+Both this chat path and **Draft prompt with Flash-Next** also receive the vendored
+guidance distilled from `/Users/orvar/Pictures/z-turbo/batch/PROMPT-GUIDE.md`, including
+prose-first prompting, positive constraints, concrete setting and lighting, and the
+known Z-Image size and step defaults. The runtime does not depend on that home-directory
+file remaining present.
+
 The client handles the tool loop: it validates each returned request using the same
 geometry, seed, count and LoRA checks as the regular editor, then converts it into a
 single-job batch and sends it through `useRenderQueue`. Tool results are fed back to

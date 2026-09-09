@@ -257,7 +257,7 @@ impl Studio {
                     "messages": [
                         {
                             "role": "system",
-                            "content": "Write one useful, vivid image-generation prompt based on the user's idea. Return only the prompt, with no preamble, quotes, explanation, or reasoning. If the idea is blank, invent a distinctive visual scene. Describe subject, composition, setting, lighting, and visual style in one concise paragraph."
+                            "content": format!("Write one useful, vivid image-generation prompt based on the user's idea. Return only the prompt, with no preamble, quotes, explanation, or reasoning. If the idea is blank, invent a distinctive visual scene. Describe subject, composition, setting, lighting, and visual style in one concise paragraph.\n\n{}", crate::prompt_guide::ZIMAGE_PROMPT_GUIDE)
                         },
                         {"role": "user", "content": idea}
                     ]
@@ -280,6 +280,7 @@ impl Studio {
         Ok(content.to_owned())
     }
     pub async fn chat(&self, messages: Value, tools: Value) -> Result<Value> {
+        let messages = add_prompt_guide(messages);
         self.request(
             &self.config()?,
             "/v1/chat/completions",
@@ -543,6 +544,28 @@ impl Studio {
         }
         Ok(saved)
     }
+}
+
+fn add_prompt_guide(mut messages: Value) -> Value {
+    if let Value::Array(items) = &mut messages {
+        if let Some(Value::Object(system)) = items
+            .iter_mut()
+            .find(|item| item.get("role").and_then(Value::as_str) == Some("system"))
+        {
+            let content = system
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            system.insert(
+                "content".into(),
+                Value::String(format!(
+                    "{content}\n\n{}",
+                    crate::prompt_guide::ZIMAGE_PROMPT_GUIDE
+                )),
+            );
+        }
+    }
+    messages
 }
 fn remember(config: &mut Config, path: &str) {
     config.workspaces.retain(|p| p != path);
