@@ -204,7 +204,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .mask-stage { display: grid; place-items: center; height: min(52vh, 600px); overflow: hidden; border-radius: 10px; background: #252422; }
 .mask-stage canvas { display: block; width: auto; height: auto; max-width: 100%; max-height: min(52vh, 600px); object-fit: contain; cursor: crosshair; touch-action: none; }
 .preview-backdrop { padding: 32px; }
-.preview-modal { width: min(1180px, 100%); height: min(820px, calc(100vh - 64px)); max-height: none; display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 25vw); padding: 0; overflow: hidden; }
+.preview-modal { width: min(1400px, 100%); height: min(820px, calc(100vh - 64px)); max-height: none; display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); padding: 0; overflow: hidden; }
 .preview-image { min-width: 0; display: grid; place-items: center; padding: 20px; background: #242321; }
 .preview-image img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 3px; }
 .preview-info { position: relative; padding: 25px 22px; overflow-y: auto; }
