@@ -205,7 +205,8 @@ export default function App() {
       const all = !fields;
       const next = { ...settings };
       if (all || fields.includes("prompt")) next.prompt = restored.prompt;
-      if (all || fields.includes("dimensions")) { next.width = restored.width; next.height = restored.height; }
+      if (all || fields.includes("dimensions") || fields.includes("width")) next.width = restored.width;
+      if (all || fields.includes("dimensions") || fields.includes("height")) next.height = restored.height;
       if (all || fields.includes("steps")) next.steps = restored.steps;
       if (all || fields.includes("seed")) next.seed = restored.seed;
       if (all || fields.includes("loras")) next.loras = restored.loras;
