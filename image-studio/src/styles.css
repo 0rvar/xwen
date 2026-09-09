@@ -141,6 +141,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .queue-counts { display: flex; gap: 12px; color: var(--muted); font-size: 10px; }
 .queue-actions { display: flex; gap: 8px; margin-bottom: 8px; }
 .queue-list { list-style: none; display: grid; gap: 2px; margin: 0; padding: 0; }
+.queue-sections { display: grid; gap: 10px; }
+.queue-empty-active { margin: 0; padding: 7px 8px; color: var(--muted); font-size: 10px; }
+.queue-completed { padding-top: 9px; border-top: 1px solid var(--line); }
+.queue-completed h3 { margin: 0 8px 3px; color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
 .queue-item { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto auto; align-items: center; gap: 9px; min-height: 42px; padding: 4px 8px; border-radius: 7px; }
 .queue-item:hover { background: var(--paper-2); }
 .queue-item > div { min-width: 0; display: grid; gap: 2px; }
