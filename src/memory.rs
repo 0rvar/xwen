@@ -461,7 +461,8 @@ pub fn admit_additional(label: &str, additional_bytes: u64) -> Result<()> {
     admit(label, additional_bytes)
 }
 
-/// Reserve a new allocation peak atop measured host use, retaining the system reserve.
+/// Admit a new allocation peak atop measured host use, up to physical RAM at normal
+/// pressure. Unknown pressure retains a reserve; warning and critical refuse admission.
 /// Existing allocations receive no footprint credit: Mach footprint and host resident
 /// accounting differ. Warm callers should pass only their additional allocation bound.
 pub fn admit(label: &str, projected_peak_bytes: u64) -> Result<()> {
@@ -497,8 +498,7 @@ fn admit_snapshot(s: &Snapshot, projected: u64) -> Result<()> {
         .context("cannot read system memory use for memory admission")?;
     s.process_footprint_bytes
         .context("cannot read process footprint for memory admission")?;
-    let reserve = system_reserve(physical);
-    let budget = physical.saturating_sub(reserve);
+    let (budget, reserve) = system_budget(physical, s.pressure);
     // Do not subtract process footprint from a differently accounted system counter.
     let future = used
         .checked_add(projected)
@@ -520,7 +520,7 @@ pub fn check_runtime() -> Result<()> {
         let snapshot = c.latest.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(reason) = runtime_stop_reason(&snapshot) {
             c.record(reason, &snapshot);
-            bail!("{reason}; stopping inference to preserve system memory reserve");
+            bail!("{reason}; stopping inference to preserve system memory headroom");
         }
     }
     Ok(())
@@ -531,16 +531,21 @@ fn runtime_stop_reason(snapshot: &Snapshot) -> Option<&'static str> {
         return Some("runtime: system memory pressure is critical");
     }
     if let (Some(physical), Some(used)) = (snapshot.physical_bytes, snapshot.system_used_bytes) {
-        let reserve = system_reserve(physical);
-        if used >= physical.saturating_sub(reserve) {
+        let (budget, _) = system_budget(physical, snapshot.pressure);
+        if used >= budget {
             return Some("runtime: system memory headroom exhausted");
         }
     }
     None
 }
 
-fn system_reserve(physical: u64) -> u64 {
-    MIN_SYSTEM_RESERVE.max(physical.saturating_mul(SYSTEM_RESERVE_PERCENT) / 100)
+fn system_budget(physical: u64, pressure: Pressure) -> (u64, u64) {
+    let reserve = if pressure == Pressure::Normal {
+        0
+    } else {
+        MIN_SYSTEM_RESERVE.max(physical.saturating_mul(SYSTEM_RESERVE_PERCENT) / 100)
+    };
+    (physical.saturating_sub(reserve), reserve)
 }
 
 pub fn sample(_label: &str, device: Option<&Device>) -> Snapshot {
@@ -743,9 +748,41 @@ mod tests {
         })
     }
     #[test]
-    fn admission_never_credits_process_footprint_and_keeps_reserve() {
+    fn normal_pressure_admits_flash_next_load_and_request() {
         let mut s = snapshot();
+        s.system_used_bytes = Some(24_545_001_472);
+        assert!(admit_snapshot(&s, 93_446_057_472).is_ok());
+        s.system_used_bytes = Some(121_846_759_424);
+        s.process_footprint_bytes = Some(20_160_107_960);
+        assert!(admit_snapshot(&s, 1_551_679_488).is_ok());
+        assert!(runtime_stop_reason(&s).is_none());
+    }
+    #[test]
+    fn normal_pressure_uses_physical_limit_without_footprint_credit() {
+        let mut s = snapshot();
+        assert!(admit_snapshot(&s, 98 * GIB).is_ok());
+        let error = admit_snapshot(&s, 98 * GIB + 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("128.0 GiB budget (0.0 GiB reserved)")
+        );
+        s.process_footprint_bytes = Some(127 * GIB);
+        assert!(admit_snapshot(&s, 99 * GIB).is_err());
+        s.system_used_bytes = Some(128 * GIB - 1);
+        assert!(runtime_stop_reason(&s).is_none());
+        s.system_used_bytes = Some(128 * GIB);
+        assert!(runtime_stop_reason(&s).is_some());
+        s.system_used_bytes = Some(128 * GIB + 1);
+        assert!(runtime_stop_reason(&s).is_some());
+    }
+    #[test]
+    fn unknown_pressure_never_credits_process_footprint_and_keeps_reserve() {
+        let mut s = snapshot();
+        s.pressure = Pressure::Unknown;
         assert!(admit_snapshot(&s, 70 * GIB).is_ok());
+        assert!(admit_snapshot(&s, 82 * GIB).is_ok());
+        assert!(admit_snapshot(&s, 82 * GIB + 1).is_err());
         assert!(admit_snapshot(&s, 90 * GIB).is_err());
         s.process_footprint_bytes = Some(127 * GIB);
         assert!(admit_snapshot(&s, 90 * GIB).is_err());
@@ -757,6 +794,29 @@ mod tests {
         assert!(admit_snapshot(&s, GIB).is_ok());
         s.physical_bytes = None;
         assert!(admit_snapshot(&s, GIB).is_err());
+    }
+    #[test]
+    fn admission_requires_counters_and_rejects_overflow() {
+        for pressure in [Pressure::Normal, Pressure::Unknown] {
+            for missing in 0..3 {
+                let mut s = snapshot();
+                s.pressure = pressure;
+                match missing {
+                    0 => s.physical_bytes = None,
+                    1 => s.system_used_bytes = None,
+                    _ => s.process_footprint_bytes = None,
+                }
+                assert!(admit_snapshot(&s, 0).is_err());
+            }
+            let mut s = snapshot();
+            s.pressure = pressure;
+            assert!(
+                admit_snapshot(&s, u64::MAX)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("overflows")
+            );
+        }
     }
     #[test]
     fn image_bounds_and_overflow() {
@@ -778,7 +838,7 @@ mod tests {
         let mut s = snapshot();
         assert!(runtime_stop_reason(&s).is_none());
         let physical = s.physical_bytes.unwrap();
-        let budget = physical - system_reserve(physical);
+        let (budget, _) = system_budget(physical, Pressure::Unknown);
         s.pressure = Pressure::Unknown;
         s.system_used_bytes = Some(budget);
         assert_eq!(
@@ -786,6 +846,8 @@ mod tests {
             Some("runtime: system memory headroom exhausted")
         );
         s.pressure = Pressure::Normal;
+        assert!(runtime_stop_reason(&s).is_none());
+        s.pressure = Pressure::Warning;
         assert!(runtime_stop_reason(&s).is_some());
         s.system_used_bytes = Some(budget - 1);
         assert!(runtime_stop_reason(&s).is_none());

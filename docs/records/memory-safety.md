@@ -35,8 +35,9 @@ do not take ownership. Direct library callers must acquire and retain a lease th
 older binaries and other applications do not participate.
 
 Admission samples physical RAM, anonymous/wired/compressor pages, process footprint
-and pressure. It adds projected new allocations to system usage and preserves
-max(16 GiB, 10% RAM). It does not subtract process footprint from a different OS
+and pressure. It adds projected new allocations to system usage. With normal native
+pressure, the ceiling is physical RAM; unknown pressure preserves max(16 GiB, 10% RAM).
+It does not subtract process footprint from a different OS
 accounting ledger. Missing required RAM/use readings refuse admission; unknown pressure
 is recorded as unknown. Metal's recommended working-set size is diagnostic, not free
 RAM. Language admission includes initial KV/state, an 8 GiB scratch allowance and up
@@ -54,8 +55,8 @@ before admitting and loading the replacement.
 The host monitor samples every 500 ms. Warning pressure stops new admissions and
 causes idle owners to unload. Critical pressure stops language work at its cancellation
 boundaries and image work between transformer blocks, denoising steps and VAE phases.
-Reaching the system headroom limit also stops work, including when native pressure
-notifications are unavailable. The fallback uses cached measurements at runtime.
+Reaching physical RAM also stops work. Unknown or warning native pressure uses the
+reserved-headroom limit instead. The monitor uses cached measurements at runtime.
 Client disconnect and shutdown use the same image checks. These checks prevent future
 GPU submissions; they cannot preempt an already-running command or repair a hung driver.
 No arithmetic or per-block synchronization was added.
@@ -85,6 +86,34 @@ process), eight cancellation-filter tests, the KV admission growth regression an
 formatting, diff checks and `bun scripts/docs-check.ts` passed. The release binary
 refused a 1536x1024 image before loading a model. Telemetry file creation was denied
 inside the sandbox and reported visibly; bounded writer tests used a temporary file.
+
+## Normal-pressure Flash-Next regression
+
+On 2026-09-09, the fixed 112 GiB budget refused the default language model while
+macOS reported normal pressure. The captured admission events for PID 99554 show
+24,545,001,472 bytes of system use plus a 93,446,057,472-byte load estimate admitted.
+After loading, system use was 121,846,759,424 bytes; adding 1,551,679,488 bytes of
+estimated host-cache growth produced the reported 114.9 GiB refusal. Process footprint
+was 20,160,107,960 bytes, a different ledger that cannot be subtracted from system use.
+Other attempts refused the same load estimate with higher baseline system use.
+
+Normal pressure now permits admission up to physical RAM, and runtime cancellation
+uses the same ceiling. The 16 GiB/10% reserve remains the unknown-pressure fallback;
+warning and critical pressure still block admission. Critical pressure still cancels
+work, and warning retains the reserved-headroom runtime cutoff. This is a policy
+correction based on a real refusal, not evidence that the mapped GPU weights are
+reclaimable or that the peak estimates are measured. Ownership still prevents language
+and image models from remaining resident together.
+
+Regression fixtures use those exact admission measurements and cover the runtime
+cutoff, physical-RAM ceiling, unknown pressure, warning and critical pressure.
+Three regressions failed before the correction; all 14 memory tests and 501 server
+tests passed after it. A release server at the default 262144 context loaded Flash-Next
+and answered `OK` with HTTP 200, then shut down. Its telemetry and metrics writes were
+denied by the execution environment, so this smoke run supplies no new footprint figure.
+Two code reviewers found no issues; the Qwen reviewer could not reach its local server.
+Release build, formatting, diff checks and the docs checker passed. No model math
+changed and no exhaustion experiment was needed.
 
 ## Not taken now
 

@@ -4,6 +4,14 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-09 — Normal memory pressure permits Flash-Next above the fallback reserve
+
+The fixed 112 GiB cutoff rejected a 114.9 GiB Flash-Next request on 128 GiB RAM
+despite normal macOS pressure. Admission and runtime checks now use physical RAM
+as the ceiling under normal pressure; unknown pressure retains the 16 GiB/10%
+reserve. Pressure refusal, critical cancellation and exclusive model ownership stay
+enforced. [Evidence and regression](records/memory-safety.md#normal-pressure-flash-next-regression).
+
 ## 2026-09-09 — Xwen coordinates resident models and responds to memory pressure
 
 Language and image engines, plus updated CLI processes, share resident memory ownership.

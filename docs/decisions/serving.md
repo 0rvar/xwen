@@ -469,3 +469,16 @@ uses system anonymous/wired/compressor usage, and gives no credit for subtractin
 process footprint because those ledgers have different meanings. Image area is capped
 at 1,048,576 pixels. These are conservative policies; they do not establish the cause
 of the wireless-driver panic. [Record](../records/memory-safety.md).
+
+**Normal pressure permits Flash-Next above the fallback reserve (2026-09-09).**
+The fixed reserve refused a Flash-Next request at 114.9 GiB projected system use on
+128 GiB RAM while macOS pressure was normal. Its load had succeeded; the subsequent
+host-cache admission failed, and the runtime cutoff would have stopped it too.
+Normal native pressure now uses physical RAM as the admission and runtime ceiling.
+Unknown pressure retains max(16 GiB, 10% RAM), the fallback implemented before this
+change (the initial paragraph above recorded 15%). Warning and critical pressure still
+refuse new allocations; critical pressure cancels active work, and warning retains
+the runtime reserve cutoff. This changes the policy, not the memory accounting:
+no process-footprint credit or assumed reclaimable GGUF weight bytes are subtracted.
+Exclusive model ownership and image allowances remain required.
+[Evidence and regression](../records/memory-safety.md#normal-pressure-flash-next-regression).
