@@ -10,8 +10,9 @@ Superseded entries are marked in the headline, never deleted.
 The API lists and accepts it only when available on disk. `fetch-model <name>`
 downloads through the Hugging Face path shared with LoRAs. Image Studio's prompt
 generator and assistant chat prefer it when listed, otherwise the regular 35B.
-The 21.2 GB download passed its SHA-256 check; generation testing is held at the
-owner's request while image generation uses the GPU.
+The 21.2 GB download passed its SHA-256 check. After the owner's image work
+finished, one CLI generation passed and the live API listed the cached ID and
+answered under that name with a clean stop.
 [Identity, download and verification](records/uncensored-35b.md).
 
 ## 2026-09-09 — Normal memory pressure permits Flash-Next above the fallback reserve

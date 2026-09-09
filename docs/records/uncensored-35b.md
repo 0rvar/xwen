@@ -85,17 +85,28 @@ above. A second invocation through the installed `xwen` command returned the sam
 cached snapshot immediately. Evidence is in `/tmp/uncensored-fetch.log`,
 `/tmp/uncensored-cache-hit.log` and `/tmp/uncensored-download-verified.json`.
 
-The owner requested a pause on live GPU testing while generating images. The
-uncensored checkpoint has therefore not run a generation command yet. Once the
-owner gives the go-ahead and the GPU is free, run one smoke test:
+The owner requested a pause on live GPU testing while generating images, then
+gave the go-ahead later on 2026-09-09. With both server engines unloaded, the
+installed CLI ran this single smoke test:
 
 ```bash
 xwen generate --model-size Qwen3.6-35B-A3B-uncensored --prompt "In one sentence, explain why the sky appears blue." --no-think --no-draft --max-tokens 96 --temp 0 --max-ctx 4096
 ```
 
-Check the reported checkpoint identity, a coherent answer and a clean stop. Then
-check that the cached ID is listed and accepted by the live API. Unit tests cover
-the cached branch; the live HTTP checks so far cover only the uncached branch.
-The temporary verification server at `127.0.0.1:5241` was left running during the
-owner's image work. It was started with regular 35B as its default and a one-second
-idle-unload interval; check its current use before stopping or replacing it.
+It exited successfully and answered: "The sky appears blue because the Earth's
+atmosphere scatters shorter wavelengths of sunlight (blue and violet) more
+effectively than longer wavelengths, a phenomenon known as Rayleigh scattering."
+It stopped before the 96-token limit. The explicit registry selection passed the
+loader's checkpoint identity cross-check. Output is `/tmp/uncensored-generate.log`.
+
+The live `/v1/models` response listed `Qwen3.6-35B-A3B-uncensored` exactly once.
+An OpenAI chat request naming that ID returned HTTP 200, the same response model
+ID, content `ready`, one completion token and `finish_reason: stop`. Evidence is
+`/tmp/uncensored-api-after.json`. Together with the earlier uncached refusal,
+these checks cover both sides of the availability rule on the live server.
+
+After the test, `/health` reported both language and image models unloaded. The
+temporary verification server at `127.0.0.1:5241` remains running, with regular
+35B as its default and a one-second idle-unload interval. Check its current use
+before stopping or replacing it. No checkpoint parity or performance comparison
+was claimed from these smoke tests.
