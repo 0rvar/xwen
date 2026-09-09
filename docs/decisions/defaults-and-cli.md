@@ -123,3 +123,16 @@ One line is emitted on the round where speculation goes dark, naming the flag th
 it. It is armed per crossing rather than per process — going live again clears it — so a
 conversation rewound back under the horizon says it again when it crosses again, and a
 long generation past the horizon says it once rather than tens of thousands of times.
+
+**The uncensored 35B is a cache-only registry entry (2026-09-09).** At the owner's
+request, the API name `Qwen3.6-35B-A3B-uncensored` names
+[HauhauCS's Qwen3.5 fine-tune](https://huggingface.co/HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive),
+not a Qwen3.6 release. The GGUF declares `qwen35moe` with the existing 35B geometry;
+all 248070 real token IDs and the merge table match the embedded tokenizer. Its
+different Q4_K/Q5_K/Q6_K mix uses existing kernels. It has no drafter and never
+downloads inside an API request. Explicit `fetch-model <name>` downloads model
+files through `ensure_model` and `ensure_file`, the latter shared with the LoRA
+repository downloader. The existing `fetch` command still includes a drafter when
+one exists. Image Studio's prompt generator and assistant chat query `/v1/models`
+for each request, prefer this entry when listed, and otherwise request the regular
+`Qwen3.6-35B-A3B`. The server default stays Flash-Next.

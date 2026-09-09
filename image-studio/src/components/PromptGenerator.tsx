@@ -19,9 +19,9 @@ export function PromptGenerator({ prompt, disabled, onUse }: { prompt: string; d
     finally { if (requestToken.current === token) setBusy(false); }
   };
   return <>
-    <button className="text-button" disabled={disabled} onClick={() => { setIdea(prompt); setDraft(""); setHasDraft(false); setError(""); setOpen(true); }}>Draft prompt with Flash-Next</button>
+    <button className="text-button" disabled={disabled} onClick={() => { setIdea(prompt); setDraft(""); setHasDraft(false); setError(""); setOpen(true); }}>Draft image prompt</button>
     {open && <div className="modal-backdrop" role="presentation"><section className="modal prompt-generator" role="dialog" aria-modal="true" aria-labelledby="prompt-generator-title">
-      <p className="eyebrow">Qwen3.8-Flash-Next</p><h2 id="prompt-generator-title">Prompt generator</h2>
+      <p className="eyebrow">xwen</p><h2 id="prompt-generator-title">Prompt generator</h2>
       <p className="muted">Describe an idea, or leave it blank for a surprise. Uses your configured xwen server.</p>
       <label className="field"><span>Idea or instructions</span><textarea rows={4} value={idea} disabled={busy} onChange={(event) => setIdea(event.target.value)} /></label>
       <button className="quiet-button" disabled={busy || disabled} onClick={() => void generate()}>{busy ? "Drafting…" : "Create draft"}</button>

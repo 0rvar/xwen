@@ -246,7 +246,7 @@ function createPreviewBridge(): NativeBridge {
     },
     generatePrompt: async (idea) => {
       await new Promise((resolve) => setTimeout(resolve, 100));
-      if (idea.includes("fail prompt")) throw new Error("Flash-Next is not cached on this server.");
+      if (idea.includes("fail prompt")) throw new Error("The language model is unavailable on this server.");
       return `${idea.trim() || "A secluded mountain observatory"}, soft evening light, rich textures, carefully composed photograph`;
     },
     chat: async (messages) => ({

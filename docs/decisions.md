@@ -24,6 +24,7 @@ they belong to; a new topic gets a new file and a line here.
   - Dense Qwen3-4B is a full checkpoint AND the conditioning encoder building block, and…
   - Diffusion image transformers are in scope, held to correctness bars first, and their…
 - [Defaults and CLI surface](decisions/defaults-and-cli.md)
+  - The uncensored 35B is a cache-only registry entry (2026-09-09).
   - Default checkpoints are ggml-org's Q4_K_M files.
   - Qwen3.8-27B is a registry entry, not a port (2026-08-14).
   - Sampling defaults follow generation_config.json: temp 1.0, top_p 0.95, top_k 20.

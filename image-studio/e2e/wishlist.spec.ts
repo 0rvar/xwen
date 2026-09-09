@@ -34,11 +34,11 @@ test("session deletion confirms all files and rotates current session", async ({
   await expect(page.getByRole("button", { name: /Open After deletion/ })).toBeVisible();
 });
 
-test("Flash-Next drafts are editable and only replace the prompt on use", async ({ page }) => {
+test("Generated drafts are editable and only replace the prompt on use", async ({ page }) => {
   await page.goto("/");
   const prompt = page.getByRole("textbox", { name: "Prompt", exact: true });
   await prompt.fill("Original idea");
-  await page.getByRole("button", { name: "Draft prompt with Flash-Next" }).click();
+  await page.getByRole("button", { name: "Draft image prompt" }).click();
   await expect(page.getByLabel("Idea or instructions")).toHaveValue("Original idea");
   await page.getByRole("button", { name: "Create draft" }).click();
   await expect(page.getByRole("textbox", { name: "Draft prompt", exact: true })).toHaveValue(/Original idea, soft evening light/);
@@ -48,10 +48,10 @@ test("Flash-Next drafts are editable and only replace the prompt on use", async 
   await page.getByRole("textbox", { name: "Draft prompt", exact: true }).fill("Edited generated prompt");
   await page.getByRole("button", { name: "Use prompt", exact: true }).click();
   await expect(prompt).toHaveValue("Edited generated prompt");
-  await page.getByRole("button", { name: "Draft prompt with Flash-Next" }).click();
+  await page.getByRole("button", { name: "Draft image prompt" }).click();
   await page.getByLabel("Idea or instructions").fill("fail prompt");
   await page.getByRole("button", { name: "Create draft" }).click();
-  await expect(page.getByRole("alert")).toContainText("Flash-Next is not cached");
+  await expect(page.getByRole("alert")).toContainText("The language model is unavailable");
   await expect(page.getByRole("button", { name: "Use prompt", exact: true })).toBeDisabled();
   await page.getByRole("button", { name: "Close generator" }).click();
   await expect(prompt).toHaveValue("Edited generated prompt");

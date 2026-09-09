@@ -1794,6 +1794,46 @@ mod tests {
 
     use testutil::{generation, probe_state, try_take};
 
+    #[test]
+    fn uncensored_model_is_listed_and_resolved_only_when_cached() {
+        use crate::hub::Model;
+        let model = Model::Qwen35BA3BUncensored;
+        let served = types::Target::official(Model::Qwen35BA3B);
+        for cached in [false, true] {
+            let selectable = |entry: Model| entry.auto_fetch() || (entry == model && cached);
+            let ids = listed_models_with(Model::Qwen35BA3B.full_name(), &selectable);
+            assert_eq!(
+                ids.iter()
+                    .filter(|id| id.as_str() == model.full_name())
+                    .count(),
+                usize::from(cached)
+            );
+            let result = resolve_requested_model_with(
+                Some(model.full_name()),
+                served,
+                Model::Qwen35BA3B.full_name(),
+                &selectable,
+            );
+            if cached {
+                assert_eq!(
+                    result.unwrap(),
+                    (
+                        types::Target::official(model),
+                        model.full_name().to_string()
+                    )
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("not in the Hugging Face cache"), "{error}");
+            }
+        }
+        assert!(!model.auto_fetch());
+        assert_eq!(
+            checkpoint_selectable(model),
+            crate::hub::cached_model(model).is_some()
+        );
+    }
+
     /// The watchdog covers the flush the engine is allowed, whatever size that
     /// is. A conversation that images tens of gigabytes buys the writer a budget
     /// past the flat connection grace, and a watchdog still counting to 30 would
@@ -1931,6 +1971,7 @@ mod tests {
             [
                 "Qwen3.6-35B-A3B",
                 "Qwen3.6-27B",
+                "Qwen3.6-35B-A3B-uncensored",
                 "Qwen3.8-27B",
                 "Qwen3.8-Flash-Next",
                 "Qwen3-4B",

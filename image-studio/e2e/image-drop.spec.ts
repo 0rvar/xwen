@@ -83,7 +83,7 @@ test("modal overlays block underlying drop targets", async ({ page }) => {
   const target = page.locator("[data-image-drop=source]");
   const bounds = await target.boundingBox();
   if (!bounds) throw new Error("No source bounds");
-  await page.getByRole("button", { name: "Draft prompt with Flash-Next" }).click();
+  await page.getByRole("button", { name: "Draft image prompt" }).click();
   await expect(page.getByRole("dialog", { name: "Prompt generator" })).toBeVisible();
   const transfer = await imageTransfer(page, "blocked-by-modal.png", 512, 512);
   await target.dispatchEvent("drop", { dataTransfer: transfer, clientX: bounds.x + bounds.width / 2, clientY: bounds.y + bounds.height / 2 });

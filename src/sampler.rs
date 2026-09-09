@@ -121,9 +121,11 @@ impl SamplerOptions {
         // Exhaustive so a new checkpoint has to state its card rather than
         // inherit the 3.6 one.
         let card = match model {
-            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => {
-                Self::recommended(thinking)
-            }
+            Model::Qwen27B
+            | Model::Qwen35BA3B
+            | Model::Qwen35BA3BUncensored
+            | Model::Qwen3827B
+            | Model::Qwen38FlashNext => Self::recommended(thinking),
             Model::Qwen34B | Model::ZImageTurboEncoder | Model::ZImageTurbo => Self {
                 temperature: if thinking { 0.6 } else { 0.7 },
                 top_p: if thinking { 0.95 } else { 0.80 },

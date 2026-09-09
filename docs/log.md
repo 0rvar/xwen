@@ -4,6 +4,14 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-09 — Uncensored 35B is selectable when cached and preferred by Image Studio
+
+`Qwen3.6-35B-A3B-uncensored` names HauhauCS's Qwen3.5 aggressive Q4_K_M fine-tune.
+The API lists and accepts it only when available on disk. `fetch-model <name>`
+downloads through the Hugging Face path shared with LoRAs. Image Studio's prompt
+generator and assistant chat prefer it when listed, otherwise the regular 35B.
+[Identity, download and verification](records/uncensored-35b.md).
+
 ## 2026-09-09 — Normal memory pressure permits Flash-Next above the fallback reserve
 
 The fixed 112 GiB cutoff rejected a 114.9 GiB Flash-Next request on 128 GiB RAM

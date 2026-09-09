@@ -23,8 +23,8 @@ use hf_hub::api::sync::ApiBuilder;
 use crate::config::Arch;
 use crate::drafter::DrafterKind;
 
-/// Which official checkpoint to run. All are ggml-org GGUF conversions; the
-/// GGUF filenames keep the model's name — only the engine is called xwen.
+/// Which registered checkpoint to run. Hub coordinates retain upstream names;
+/// API names and CLI aliases are defined by the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Model {
     /// Qwen3.6-27B, dense (`qwen35`).
@@ -34,6 +34,8 @@ pub enum Model {
     /// default a cache-moving surface cannot run. Nothing takes that branch
     /// today.
     Qwen35BA3B,
+    /// HauhauCS aggressive Qwen3.5 fine-tune, served under the 35B uncensored alias.
+    Qwen35BA3BUncensored,
     /// Qwen3.8-27B, dense (`qwen35`). The 3.8 release's config is byte-identical
     /// to [`Model::Qwen27B`]'s, so the two run the same graph at the same
     /// geometry and differ only in weights, repo — and drafter KIND: 3.8 ships an
@@ -146,9 +148,10 @@ impl VocabFamily {
 
 /// Every checkpoint this build knows, in the order surfaces that enumerate them
 /// (`/v1/models`, an unknown-model error's list of valid names) print them.
-pub const MODELS: [Model; 8] = [
+pub const MODELS: [Model; 9] = [
     Model::Qwen27B,
     Model::Qwen35BA3B,
+    Model::Qwen35BA3BUncensored,
     Model::Qwen3827B,
     Model::Qwen38FlashNext,
     Model::Qwen34B,
@@ -389,6 +392,19 @@ const QWEN_35B_A3B: Checkpoint = Checkpoint {
     format: Format::Gguf,
 };
 
+const HAUHAU_35B_NAME: &str = "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive";
+
+const QWEN_35B_A3B_UNCENSORED: Checkpoint = Checkpoint {
+    repo: "HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive",
+    files: &["Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"],
+    full_name: "Qwen3.6-35B-A3B-uncensored",
+    arch: Arch::Moe,
+    model_size: "21.2 GB",
+    drafter: None,
+    geometry: QWEN_35B_A3B.geometry,
+    format: Format::Gguf,
+};
+
 /// The 3.8 release ships no DFlash sidecar. It ships an MTP head instead — one
 /// extra trunk-flavour layer, chained rather than blocked — which is why this is
 /// the one checkpoint whose speculation is a different shape from the other two.
@@ -624,6 +640,7 @@ impl Model {
         match self {
             Model::Qwen27B => &QWEN_27B,
             Model::Qwen35BA3B => &QWEN_35B_A3B,
+            Model::Qwen35BA3BUncensored => &QWEN_35B_A3B_UNCENSORED,
             Model::Qwen3827B => &QWEN_38_27B,
             Model::Qwen38FlashNext => &QWEN_38_FLASH_NEXT,
             Model::Qwen34B => &QWEN3_4B,
@@ -712,6 +729,7 @@ impl Model {
             // encoder's entry answers for the set it holds.
             Model::Qwen27B
             | Model::Qwen35BA3B
+            | Model::Qwen35BA3BUncensored
             | Model::Qwen3827B
             | Model::Qwen38FlashNext
             | Model::ZImageTurbo => None,
@@ -757,6 +775,7 @@ impl Model {
         match self {
             Model::Qwen27B
             | Model::Qwen35BA3B
+            | Model::Qwen35BA3BUncensored
             | Model::Qwen3827B
             | Model::Qwen38FlashNext
             | Model::Qwen34BInstruct2507 => 262_144,
@@ -773,9 +792,11 @@ impl Model {
     /// the checkpoint, because every member of a family shares all of it.
     pub const fn vocab_family(self) -> VocabFamily {
         match self {
-            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => {
-                VocabFamily::Qwen36
-            }
+            Model::Qwen27B
+            | Model::Qwen35BA3B
+            | Model::Qwen35BA3BUncensored
+            | Model::Qwen3827B
+            | Model::Qwen38FlashNext => VocabFamily::Qwen36,
             Model::Qwen34B
             | Model::Qwen34BInstruct2507
             | Model::ZImageTurboEncoder
@@ -835,7 +856,9 @@ impl Model {
     /// template's.
     pub const fn chat_dialect(self) -> crate::chat::ChatDialect {
         match self {
-            Model::Qwen27B | Model::Qwen35BA3B => crate::chat::ChatDialect::Qwen36,
+            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen35BA3BUncensored => {
+                crate::chat::ChatDialect::Qwen36
+            }
             Model::Qwen3827B | Model::Qwen38FlashNext => crate::chat::ChatDialect::Qwen38,
             // The encoder renders the base template: Z-Image's own
             // `tokenizer_config.json` carries Qwen3-4B's chat template
@@ -870,7 +893,7 @@ impl Model {
     /// checkpoint the 3.6 family's 1.5 without anyone deciding it.
     pub const fn recommended_presence_penalty(self, thinking: bool) -> f64 {
         match self {
-            Model::Qwen35BA3B => 1.5,
+            Model::Qwen35BA3B | Model::Qwen35BA3BUncensored => 1.5,
             Model::Qwen27B | Model::Qwen3827B | Model::Qwen38FlashNext => {
                 if thinking {
                     0.0
@@ -923,6 +946,7 @@ impl Model {
     pub const fn auto_fetch(self) -> bool {
         match self {
             Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B => true,
+            Model::Qwen35BA3BUncensored => false,
             Model::Qwen38FlashNext => false,
             Model::Qwen34B | Model::Qwen34BInstruct2507 | Model::ZImageTurboEncoder => false,
             // 32.9 GB, and nothing but `xwen image` can use it.
@@ -966,7 +990,11 @@ impl Model {
     /// reach for — and a single "not supported" would send them both nowhere.
     pub const fn not_servable_reason(self) -> Option<&'static str> {
         match self {
-            Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B | Model::Qwen38FlashNext => None,
+            Model::Qwen27B
+            | Model::Qwen35BA3B
+            | Model::Qwen35BA3BUncensored
+            | Model::Qwen3827B
+            | Model::Qwen38FlashNext => None,
             // Servable since the qwen3 layer stack landed: every layer is full
             // attention, so a conversation's whole state is its KV rows and the
             // snapshot, rewind, page-out and disk-tier paths carry it with the
@@ -1044,6 +1072,7 @@ impl Model {
     pub const fn supports_drafting(self) -> bool {
         match self {
             Model::Qwen27B | Model::Qwen35BA3B | Model::Qwen3827B => true,
+            Model::Qwen35BA3BUncensored => false,
             Model::Qwen38FlashNext => false,
             // No drafter of any kind exists for the qwen3 graph, and no release
             // ships one: there is nothing to attach and nothing to verify with.
@@ -1081,7 +1110,7 @@ impl Model {
     pub const fn draft_default_on(self) -> bool {
         match self {
             Model::Qwen27B | Model::Qwen3827B => true,
-            Model::Qwen35BA3B => false,
+            Model::Qwen35BA3B | Model::Qwen35BA3BUncensored => false,
             Model::Qwen38FlashNext => false,
             Model::Qwen34B
             | Model::Qwen34BInstruct2507
@@ -1108,6 +1137,12 @@ impl Model {
     /// The one sentence every surface says when a run asks a checkpoint that
     /// cannot be drafted for to draft.
     pub fn no_drafting_message(self) -> String {
+        if self == Model::Qwen35BA3BUncensored {
+            return format!(
+                "{} has no validated drafter; decode plain with --no-draft",
+                self.full_name()
+            );
+        }
         format!(
             "no drafter kind is supported for {} yet: its graph has no speculative verify \
              seam, so neither an official sidecar nor a drafter GGUF of your own can be \
@@ -1169,9 +1204,11 @@ impl Model {
     /// name really is the checkpoint plus a suffix spells it with hyphens,
     /// because that is how the release spells it.
     ///
-    /// A name that matches more than one checkpoint identifies as none of them
-    /// rather than as whichever the table lists first — an ambiguous name is
-    /// exactly the case where guessing is worst.
+    /// The HauhauCS checkpoint also recognizes its upstream Qwen3.5 name; its
+    /// API name follows xwen's 35B naming convention. A shorter name wholly
+    /// contained in a longer match is the same occurrence, so the uncensored
+    /// suffix does not also identify the base model. Separate occurrences
+    /// naming different checkpoints remain ambiguous and identify as none.
     ///
     /// `general.name` is tried before the file name because it is what the
     /// converter wrote INTO the file about the model it holds, where a file name
@@ -1187,9 +1224,20 @@ impl Model {
         if arch == Arch::Qwen3 {
             return file.and_then(Self::identify_cached_dir);
         }
-        let candidates = || MODELS.into_iter().filter(|model| model.arch() == arch);
+        let candidates = || {
+            MODELS
+                .into_iter()
+                .filter(|model| model.arch() == arch)
+                .flat_map(|model| {
+                    let upstream =
+                        (model == Model::Qwen35BA3BUncensored).then_some(HAUHAU_35B_NAME);
+                    std::iter::once((model, model.full_name()))
+                        .chain(upstream.map(|name| (model, name)))
+                })
+        };
         // Only one candidate can match, or none does.
         let sole = |mut hits: Vec<Model>| -> Option<Model> {
+            hits.sort_by_key(|model| model.full_name());
             hits.dedup();
             match hits.as_slice() {
                 [only] => Some(*only),
@@ -1204,13 +1252,32 @@ impl Model {
             let folded = hyphenate(name);
             sole(
                 candidates()
-                    .filter(|model| hyphenate(model.full_name()) == folded)
+                    .filter(|(_, candidate)| hyphenate(candidate) == folded)
+                    .map(|(model, _)| model)
                     .collect(),
             )
             .or_else(|| {
+                let lowercase = name.to_ascii_lowercase();
+                let hits: Vec<_> = candidates()
+                    .flat_map(|(model, candidate)| {
+                        lowercase
+                            .match_indices(&candidate.to_ascii_lowercase())
+                            .map(|(start, matched)| (model, start, start + matched.len()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                // A base name contained in a longer checkpoint name is one occurrence.
+                // Separate occurrences still identify different checkpoints ambiguously.
                 sole(
-                    candidates()
-                        .filter(|model| contains_ignore_ascii_case(name, model.full_name()))
+                    hits.iter()
+                        .filter(|(_, start, end)| {
+                            !hits.iter().any(|(_, other_start, other_end)| {
+                                other_start <= start
+                                    && other_end >= end
+                                    && (other_start < start || other_end > end)
+                            })
+                        })
+                        .map(|(model, _, _)| *model)
                         .collect(),
                 )
             })
@@ -1498,6 +1565,7 @@ impl std::fmt::Display for Model {
         f.write_str(match self {
             Model::Qwen27B => "27b",
             Model::Qwen35BA3B => "35b",
+            Model::Qwen35BA3BUncensored => "35b-uncensored",
             Model::Qwen3827B => "3.8-27b",
             Model::Qwen38FlashNext => "flash-next",
             Model::Qwen34B => "qwen3-4b",
@@ -1521,6 +1589,7 @@ impl std::str::FromStr for Model {
         match s.trim().to_ascii_lowercase().as_str() {
             "27" | "27b" => Ok(Model::Qwen27B),
             "35" | "35b" | "35b-a3b" => Ok(Model::Qwen35BA3B),
+            "35b-uncensored" => Ok(Model::Qwen35BA3BUncensored),
             "38" | "3.8" | "3.8-27b" => Ok(Model::Qwen3827B),
             "flash-next" | "3.8-flash-next" => Ok(Model::Qwen38FlashNext),
             "qwen3-4b" | "4b" => Ok(Model::Qwen34B),
@@ -1528,18 +1597,11 @@ impl std::str::FromStr for Model {
             "zimage-turbo-encoder" | "z-image-turbo-encoder" => Ok(Model::ZImageTurboEncoder),
             "zimage-turbo" | "z-image-turbo" => Ok(Model::ZImageTurbo),
             other => Err(format!(
-                "unknown model {other:?} (expected 27b, 35b, 3.8-27b, flash-next, qwen3-4b, \
+                "unknown model {other:?} (expected 27b, 35b, 35b-uncensored, 3.8-27b, flash-next, qwen3-4b, \
                  qwen3-4b-instruct-2507, zimage-turbo-encoder or zimage-turbo)"
             )),
         }
     }
-}
-
-/// Case-insensitive substring, ASCII — every checkpoint name is ASCII, and a
-/// file name that spells one in another case is still spelling it.
-fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    let haystack = haystack.to_ascii_lowercase();
-    haystack.contains(&needle.to_ascii_lowercase())
 }
 
 /// The form the EXACT name comparison in [`Model::identify`] runs in:
@@ -1814,6 +1876,61 @@ fn download_lora_url(source: &str, destination: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn uncensored_registry_and_identity() {
+        let model = Model::Qwen35BA3BUncensored;
+        assert_eq!(model.full_name().parse::<Model>().unwrap(), model);
+        assert_eq!("35b-uncensored".parse::<Model>().unwrap(), model);
+        assert_eq!(Model::from_api_name("35b-uncensored"), None);
+        assert!(!model.auto_fetch());
+        assert!(model.servable());
+        assert!(!model.supports_drafting());
+        assert!(!model.draft_default_on());
+        assert_eq!(model.drafter_file(), None);
+        assert_eq!(model.arch(), Arch::Moe);
+        assert_eq!(
+            model.kv_bytes_per_token(),
+            Model::Qwen35BA3B.kv_bytes_per_token()
+        );
+        for name in [
+            HAUHAU_35B_NAME,
+            model.full_name(),
+            model.file(),
+            "Qwen3.6-35B-A3B-uncensored-Q4_K_M",
+        ] {
+            assert_eq!(
+                Model::identify(Arch::Moe, Some(name), None),
+                Some(model),
+                "{name}"
+            );
+            let file = if name.ends_with(".gguf") {
+                name.to_string()
+            } else {
+                format!("{name}.gguf")
+            };
+            assert_eq!(
+                Model::identify(Arch::Moe, None, Some(Path::new(&file))),
+                Some(model),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            Model::identify(Arch::Moe, Some("Qwen3.6-35B-A3B-Q4_K_M"), None),
+            Some(Model::Qwen35BA3B)
+        );
+        for name in [
+            "Qwen3.6-35B-A3B-uncensored + Qwen3.6-35B-A3B",
+            "Qwen3.6-35B-A3B + Qwen3.6-35B-A3B-uncensored",
+            "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive + Qwen3.6-35B-A3B",
+        ] {
+            assert_eq!(Model::identify(Arch::Moe, Some(name), None), None, "{name}");
+        }
+        assert_eq!(
+            Model::identify(Arch::Dense, Some(HAUHAU_35B_NAME), None),
+            None
+        );
+    }
 
     /// Offline lookup against an explicit cache root — the same call
     /// `cached_file` makes, minus the env-derived root.
@@ -2095,7 +2212,7 @@ mod tests {
         // Thinking mode is where they part: only the 35B-A3B card carries one.
         assert_eq!(Model::Qwen35BA3B.recommended_presence_penalty(true), 1.5);
         for model in qwen36() {
-            if model != Model::Qwen35BA3B {
+            if !matches!(model, Model::Qwen35BA3B | Model::Qwen35BA3BUncensored) {
                 assert_eq!(model.recommended_presence_penalty(true), 0.0, "{model:?}");
             }
         }

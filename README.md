@@ -52,22 +52,39 @@ First launch asks for a workspace and server URL; settings live in
 `~/.config/xwen/image-studio.json`. Every session saves PNGs with YAML generation
 records and input snapshots inside its workspace.
 The gallery can delete images or whole sessions with confirmation. New jobs append
-to a running or paused queue. A prompt generator uses Flash-Next through the same
-server and lets you edit the draft before using it.
+to a running or paused queue. The prompt generator and assistant chat prefer the
+uncensored 35B when the server lists it, falling back to the regular 35B.
+Generated prompts can be edited before use.
 Source and ControlNet fields accept dropped PNG/JPEG files. Server settings can
 reveal the application log, which includes Rust and frontend errors.
 
 ## Models
 
-Four checkpoints — Q4_K_M, except Flash-Next's UD-Q4_K_XL — all resolved through the HF
-cache and downloaded on first use:
+Five GGUF checkpoints, Q4_K_M except Flash-Next's UD-Q4_K_XL, resolved through the HF
+cache:
 
 | Full name | Repo | `--model-size` | Drafter |
 | --- | --- | --- | --- |
 | `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` (default) | none |
 | `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash block drafter, 3.5 GB |
 | `Qwen3.6-35B-A3B` | `ggml-org/Qwen3.6-35B-A3B-GGUF` | `35b` | DFlash block drafter, 0.8 GB, off by default |
+| `Qwen3.6-35B-A3B-uncensored` | `HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive` | `35b-uncensored` | none |
 | `Qwen3.8-27B` | `ggml-org/Qwen3.8-27B-GGUF` | `3.8-27b` | MTP head, 3.2 GB |
+
+`Qwen3.6-35B-A3B-uncensored` is an API alias for HauhauCS's **Qwen3.5** fine-tune,
+not a Qwen3.6 release. It uses the existing 35B graph and tokenizer. Its Q4_K_M file
+is 21.2 GB, with Q5_K QKV projections and some Q6_K expert down projections.
+It appears in `/v1/models` and is accepted by the chat APIs only when available
+on the server's disk. Requests never download it. Fetch it explicitly:
+
+```bash
+xwen fetch-model Qwen3.6-35B-A3B-uncensored
+xwen generate --model-size 35b-uncensored --prompt "Hello" --no-think
+```
+
+`fetch-model <model>` accepts any registry full name or CLI alias and downloads
+the model's files through the same Hugging Face cache downloader as `fetch-lora`.
+It fetches no drafter; `fetch --model-size <alias>` retains its model-and-drafter behavior.
 
 **Flash-Next is the default (2026-08-30), so a zero-flag first run downloads 111 GB**
 across four shards — the notice naming the size prints before the fetch starts, and it
@@ -76,7 +93,7 @@ unsloth/Qwen3.8-Flash-Next-GGUF <shard>... --jobs 2` does the same with parallel
 verified, resumable downloads. Pass `--model-size 35b` (or `27b`, `3.8-27b`) for a
 ~20 GB checkpoint instead.
 
-**Every surface defaults to Flash-Next as of 2026-08-30**, `xwen serve` and `xwen batch`
+**CLI and server surfaces default to Flash-Next as of 2026-08-30**, `xwen serve` and `xwen batch`
 included. Both move a whole cache state around on their ordinary path — the server
 snapshots, rewinds and pages conversations out, and a batch prefills the items' shared
 prefix once and replays that snapshot per item — and as of P4 a cache image carries

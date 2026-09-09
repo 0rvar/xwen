@@ -643,7 +643,7 @@ fn session_listing_counts_beyond_gallery_limit_and_rejects_foreign_or_symlink() 
 }
 
 #[tokio::test]
-async fn prompt_generation_uses_exact_model_auth_and_plain_answer_only() {
+async fn language_tools_resolve_available_models_with_auth_and_plain_prompt_answers() {
     use std::io::{Read, Write};
     let t = Temp::new();
     let s = t.studio();
@@ -651,7 +651,8 @@ async fn prompt_generation_uses_exact_model_auth_and_plain_answer_only() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let thread = std::thread::spawn(move || {
-        for index in 0..3 {
+        for request_index in 0..10 {
+            let index = request_index / 2;
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = vec![];
             let mut chunk = [0u8; 4096];
@@ -667,14 +668,21 @@ async fn prompt_generation_uses_exact_model_auth_and_plain_answer_only() {
                                 .strip_prefix("content-length:")
                                 .and_then(|v| v.trim().parse::<usize>().ok())
                         })
-                        .unwrap();
+                        .unwrap_or(0);
                     if buffer.len() >= pos + 4 + len {
-                        assert!(header.starts_with("POST /v1/chat/completions"));
+                        assert!(header.starts_with(if request_index % 2 == 0 {
+                            "GET /v1/models"
+                        } else {
+                            "POST /v1/chat/completions"
+                        }));
                         assert!(
                             header
                                 .to_lowercase()
                                 .contains("authorization: bearer secret")
                         );
+                        if len == 0 {
+                            break serde_json::Value::Null;
+                        }
                         break serde_json::from_slice::<serde_json::Value>(
                             &buffer[pos + 4..pos + 4 + len],
                         )
@@ -682,14 +690,42 @@ async fn prompt_generation_uses_exact_model_auth_and_plain_answer_only() {
                     }
                 }
             };
-            assert_eq!(body["model"], "Qwen3.8-Flash-Next");
+            if request_index % 2 == 0 {
+                let data = if index % 2 == 0 {
+                    json!([{"id":"Qwen3.8-Flash-Next"}, {"id":"Qwen3.6-35B-A3B"}, {"id":"Qwen3.6-35B-A3B-uncensored"}])
+                } else {
+                    json!([{"id":"Qwen3.8-Flash-Next"}, {"id":"Qwen3.6-35B-A3B"}, {"id":"Qwen3.6-35B-A3B-uncensored-other"}])
+                };
+                let response = json!({"object":"list", "data":data}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+                continue;
+            }
+            assert_eq!(
+                body["model"],
+                if index % 2 == 0 {
+                    "Qwen3.6-35B-A3B-uncensored"
+                } else {
+                    "Qwen3.6-35B-A3B"
+                }
+            );
             assert_eq!(body["stream"], false);
             assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
-            assert_eq!(body["max_tokens"], 512);
-            assert_eq!(
-                body["messages"][1]["content"],
-                if index == 0 { "a lighthouse" } else { "" }
-            );
+            if index < 3 {
+                assert_eq!(body["max_tokens"], 512);
+                assert_eq!(
+                    body["messages"][1]["content"],
+                    if index == 0 { "a lighthouse" } else { "" }
+                );
+            } else {
+                assert_eq!(body["max_completion_tokens"], 1024);
+                assert_eq!(body["tool_choice"], "auto");
+                assert_eq!(body["messages"][1]["content"], "chat idea");
+            }
             let response=match index {0=>json!({"choices":[{"finish_reason":"stop","message":{"content":" A lighthouse in violet twilight. ","reasoning_content":"Never expose reasoning"}}]}),1=>json!({"choices":[{"finish_reason":"length","message":{"content":"truncated"}}]}),_=>json!({"choices":[{"finish_reason":"stop","message":{"content":null,"reasoning_content":"Not a prompt"}}]})}.to_string();
             write!(
                 stream,
@@ -719,6 +755,11 @@ async fn prompt_generation_uses_exact_model_auth_and_plain_answer_only() {
             .unwrap_err()
             .contains("no prompt")
     );
+    for _ in 0..2 {
+        s.chat(json!([{"role":"system","content":"Image assistant"},{"role":"user","content":"chat idea"}]), json!([]))
+            .await
+            .unwrap();
+    }
     thread.join().unwrap();
 }
 

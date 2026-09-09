@@ -69,7 +69,7 @@ struct ModelArgs {
     /// no release — on every surface alike.
     #[arg(
         long,
-        value_name = "27b|35b|3.8-27b|flash-next|qwen3-4b|qwen3-4b-instruct-2507|zimage-turbo-encoder|zimage-turbo"
+        value_name = "27b|35b|35b-uncensored|3.8-27b|flash-next|qwen3-4b|qwen3-4b-instruct-2507|zimage-turbo-encoder|zimage-turbo"
     )]
     model_size: Option<Model>,
 }
@@ -315,6 +315,12 @@ enum Cmd {
     Fetch {
         #[command(flatten)]
         select: ModelArgs,
+    },
+    /// Download a registered model into the Hugging Face cache, sharing the
+    /// same resumable transfer path as Hugging Face LoRA downloads.
+    FetchModel {
+        /// Registry model name or CLI alias. Downloads weights only into the HF cache.
+        model: Model,
     },
     /// Download a LoRA into `$XWEN_LORA_DIR` (or the default local LoRA
     /// directory). Accepts an HTTPS `.safetensors` URL or a Hugging Face
@@ -1732,6 +1738,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Cmd::FetchModel { model }) => {
+            let path = resolve_model(None, model)?;
+            println!("model    {}", path.display());
+            Ok(())
+        }
         Some(Cmd::FetchLora { source }) => {
             let directory = xwen::zimage::lora::configured_dir()?;
             let path = xwen::hub::ensure_lora(&source, &directory)?;
@@ -2739,6 +2750,20 @@ mod tests {
     use super::*;
     use xwen::batch::{BatchStats, FinishReason, ItemResponse, Usage};
     use xwen::chat::ChatDialect;
+
+    #[test]
+    fn fetch_model_accepts_registry_names_and_aliases() {
+        for name in ["35b-uncensored", "Qwen3.6-35B-A3B-uncensored"] {
+            let cli = Cli::try_parse_from(["xwen", "fetch-model", name]).unwrap();
+            assert!(matches!(
+                cli.cmd,
+                Some(Cmd::FetchModel {
+                    model: Model::Qwen35BA3BUncensored
+                })
+            ));
+        }
+        assert!(Cli::try_parse_from(["xwen", "fetch-model", "unknown"]).is_err());
+    }
 
     #[test]
     fn image_control_flags_require_their_inputs() {

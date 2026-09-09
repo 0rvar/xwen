@@ -246,11 +246,8 @@ impl Studio {
     }
     pub async fn generate_prompt(&self, idea: String) -> Result<String> {
         let value = self
-            .request(
-                &self.config()?,
-                "/v1/chat/completions",
-                Some(json!({
-                    "model": "Qwen3.8-Flash-Next",
+            .language_request(
+                json!({
                     "stream": false,
                     "max_tokens": 512,
                     "chat_template_kwargs": {"enable_thinking": false},
@@ -261,7 +258,7 @@ impl Studio {
                         },
                         {"role": "user", "content": idea}
                     ]
-                })),
+                }),
             )
             .await?;
         let choice = &value["choices"][0];
@@ -281,20 +278,32 @@ impl Studio {
     }
     pub async fn chat(&self, messages: Value, tools: Value) -> Result<Value> {
         let messages = add_prompt_guide(messages);
-        self.request(
-            &self.config()?,
-            "/v1/chat/completions",
-            Some(json!({
-                "model": "Qwen3.8-Flash-Next",
-                "stream": false,
-                "max_completion_tokens": 1024,
-                "chat_template_kwargs": {"enable_thinking": false},
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": "auto"
-            })),
-        )
+        self.language_request(json!({
+            "stream": false,
+            "max_completion_tokens": 1024,
+            "chat_template_kwargs": {"enable_thinking": false},
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto"
+        }))
         .await
+    }
+    async fn language_request(&self, mut body: Value) -> Result<Value> {
+        let config = self.config()?;
+        let models = self.request(&config, "/v1/models", None).await?;
+        let available = models["data"]
+            .as_array()
+            .ok_or("Server returned no model list")?;
+        body["model"] = json!(if available
+            .iter()
+            .any(|model| model["id"] == "Qwen3.6-35B-A3B-uncensored")
+        {
+            "Qwen3.6-35B-A3B-uncensored"
+        } else {
+            "Qwen3.6-35B-A3B"
+        });
+        self.request(&config, "/v1/chat/completions", Some(body))
+            .await
     }
     async fn request(&self, config: &Config, endpoint: &str, body: Option<Value>) -> Result<Value> {
         let url = format!("{}{endpoint}", normalize_url(&config.server_url)?);
