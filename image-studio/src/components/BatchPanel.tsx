@@ -1,6 +1,11 @@
 import type { BatchAxis, BatchMode, LoraCandidate, PlannedJob, StudioSettings } from "../domain";
 import { MAX_JOBS, planJobs } from "../domain";
 
+function displayAxisValue(value: string | number): string {
+  const text = String(value);
+  return text.includes("/") || text.includes("\\") ? text.split(/[\\/]/).filter(Boolean).pop() ?? text : text;
+}
+
 interface Props {
   settings: StudioSettings;
   loras: LoraCandidate[];
@@ -52,7 +57,7 @@ export function BatchPanel({ settings, loras, axes, mode, preview, error, disabl
         {error && <p className="error-banner" role="alert">{error}</p>}
         {!!preview.length && <div className="batch-preview" aria-label="Batch preview">
           <strong>{preview.length} image{preview.length === 1 ? "" : "s"}</strong>
-          <ol>{preview.slice(0, 6).map((job) => <li key={job.id}><span>{job.request.seed}</span><span>{job.request.width}×{job.request.height}</span><span>{Object.values(job.context.axes).join(" · ") || "base settings"}</span></li>)}</ol>
+          <ol>{preview.slice(0, 6).map((job) => <li key={job.id}><span>{job.request.seed}</span><span>{job.request.width}×{job.request.height}</span><span title={Object.values(job.context.axes).join(" · ")}>{Object.values(job.context.axes).map(displayAxisValue).join(" · ") || "base settings"}</span></li>)}</ol>
           {preview.length > 6 && <p className="field-help">and {preview.length - 6} more</p>}
           <button className="primary-button full-button" disabled={disabled} onClick={onQueue}>Queue exact preview</button>
         </div>}

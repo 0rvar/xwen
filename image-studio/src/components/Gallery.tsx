@@ -24,6 +24,11 @@ function value(record: Record<string, unknown>, key: string): string | null {
   return typeof item === "string" || typeof item === "number" ? String(item) : null;
 }
 
+function displayAxisValue(value: unknown): string {
+  const text = String(value ?? "");
+  return text.includes("/") || text.includes("\\") ? text.split(/[\\/]/).filter(Boolean).pop() ?? text : text;
+}
+
 export function Gallery({ images, selected, fullUrl, currentSessionId, sessions: summaries, deleting, sessionDeletionDisabled, onDelete, onDeleteSession, onSelect, onUseSource, onRestore, onReveal }: Props) {
   const [restoreField, setRestoreField] = useState("all");
   const [comparison, setComparison] = useState<SavedImage[] | null>(null);
@@ -75,9 +80,9 @@ export function Gallery({ images, selected, fullUrl, currentSessionId, sessions:
 function ComparisonGrid({ images, onSelect }: { images: SavedImage[]; onSelect(image: SavedImage): void }) {
   const axes = Object.keys(((images[0]?.metadata.context as Record<string, unknown> | undefined)?.axes as Record<string, unknown> | undefined) ?? {});
   const values = axes.map((axis) => [...new Set(images.map((image) => String(((image.metadata.context as Record<string, unknown> | undefined)?.axes as Record<string, unknown> | undefined)?.[axis] ?? ""))) ]);
-  if (axes.length === 1) return <div className="comparison-grid one-dimensional">{images.map((image) => <button key={image.id} className="comparison-tile" onClick={() => onSelect(image)}><strong>{String(((image.metadata.context as Record<string, unknown> | undefined)?.axes as Record<string, unknown> | undefined)?.[axes[0]!] ?? "")}</strong><img src={image.data_url} alt="" /></button>)}</div>;
+  if (axes.length === 1) return <div className="comparison-grid one-dimensional">{images.map((image) => <button key={image.id} className="comparison-tile" onClick={() => onSelect(image)}><strong title={String(((image.metadata.context as Record<string, unknown> | undefined)?.axes as Record<string, unknown> | undefined)?.[axes[0]!] ?? "")}>{displayAxisValue(((image.metadata.context as Record<string, unknown> | undefined)?.axes as Record<string, unknown> | undefined)?.[axes[0]!] ?? "")}</strong><img src={image.data_url} alt="" /></button>)}</div>;
   const columnAxis = values[0]!.length <= values[1]!.length ? 0 : 1;
   const rowAxis = columnAxis === 0 ? 1 : 0;
   const imageAt = (row: string, column: string) => images.find((image) => { const imageAxes = ((image.metadata.context as Record<string, unknown> | undefined)?.axes as Record<string, unknown> | undefined) ?? {}; return String(imageAxes[axes[rowAxis]!] ?? "") === row && String(imageAxes[axes[columnAxis]!] ?? "") === column; });
-  return <div className="comparison-table" style={{ "--comparison-columns": values[columnAxis]!.length } as React.CSSProperties}><div className="comparison-axis-label">{axes[rowAxis]} ↓ / {axes[columnAxis]} →</div>{values[columnAxis]!.map((value) => <strong key={value} className="comparison-column-label">{value}</strong>)}{values[rowAxis]!.flatMap((row) => [<strong key={`${row}-label`} className="comparison-row-label">{row}</strong>, ...values[columnAxis]!.map((column) => { const image = imageAt(row, column); return image ? <button key={image.id} className="comparison-tile" onClick={() => onSelect(image)}><img src={image.data_url} alt="" /></button> : <span key={`${row}-${column}`} />; })])}</div>;
+  return <div className="comparison-table" style={{ "--comparison-columns": values[columnAxis]!.length } as React.CSSProperties}><div className="comparison-axis-label">{axes[rowAxis]} ↓ / {axes[columnAxis]} →</div>{values[columnAxis]!.map((value) => <strong key={value} className="comparison-column-label" title={value}>{displayAxisValue(value)}</strong>)}{values[rowAxis]!.flatMap((row) => [<strong key={`${row}-label`} className="comparison-row-label" title={row}>{displayAxisValue(row)}</strong>, ...values[columnAxis]!.map((column) => { const image = imageAt(row, column); return image ? <button key={image.id} className="comparison-tile" onClick={() => onSelect(image)}><img src={image.data_url} alt="" /></button> : <span key={`${row}-${column}`} />; })])}</div>;
 }

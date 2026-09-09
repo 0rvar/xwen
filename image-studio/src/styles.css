@@ -111,7 +111,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .batch-preview { padding: 10px; border-radius: 9px; background: #fff; border: 1px solid var(--line); }
 .batch-preview > strong { font-size: 12px; }
 .batch-preview ol { list-style: none; display: grid; padding: 0; margin: 8px 0; }
-.batch-preview li { display: grid; grid-template-columns: 72px 78px minmax(0, 1fr); gap: 6px; padding: 5px 0; border-top: 1px solid #eee9e1; color: var(--muted); font-size: 10px; }
+.batch-preview li { display: grid; grid-template-columns: 72px 78px minmax(0, 1fr); gap: 6px; min-width: 0; padding: 5px 0; border-top: 1px solid #eee9e1; color: var(--muted); font-size: 10px; }
+.batch-preview li span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comparison-note { margin: 9px 20px 0; color: var(--muted); font-size: 10px; line-height: 1.4; }
 
 .gallery-panel { min-height: 0; overflow-y: auto; padding: 20px clamp(16px, 2.2vw, 32px) 28px; }
@@ -215,10 +216,10 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 .comparison-modal { width: min(1180px, 100%); }
 .comparison-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
 .comparison-tile { min-width: 0; padding: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #fff; text-align: left; }
-.comparison-tile strong { display: block; padding: 7px 8px; color: var(--muted); font-size: 10px; }
+.comparison-tile strong { display: block; overflow: hidden; padding: 7px 8px; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .comparison-tile img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; }
 .comparison-table { display: grid; grid-template-columns: minmax(90px, auto) repeat(var(--comparison-columns), minmax(110px, 1fr)); gap: 7px; overflow: auto; align-items: center; }
-.comparison-axis-label, .comparison-column-label, .comparison-row-label { padding: 5px; color: var(--muted); font-size: 10px; }
+.comparison-axis-label, .comparison-column-label, .comparison-row-label { overflow: hidden; padding: 5px; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .comparison-column-label, .comparison-row-label { font-weight: 600; text-align: center; }
 .generation-details { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
 .generation-details h3 { margin-bottom: 11px; color: #514d48; }
