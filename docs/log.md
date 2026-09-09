@@ -4,6 +4,15 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-09 — Image Studio shows generation parameters and saves batch manifests
+
+The image viewer shows strength, steps and edit controls without opening raw
+metadata. A saved-file regression confirms `request.strength`, including zero,
+already survives in image YAML. Each submission now saves a batch plan with job
+and output IDs, requests, seeds and attempt history for later parameter exploration.
+[Usage](../image-studio/README.md#batches),
+[implementation and verification](records/image-studio.md#readable-parameters-and-batch-manifests).
+
 ## 2026-09-09 — Image Studio accepts dropped images and writes diagnostic logs
 
 Source and ControlNet inputs accept file drops and replacements through Tauri's

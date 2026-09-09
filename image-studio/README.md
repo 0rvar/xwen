@@ -56,9 +56,11 @@ study/
     180326248-47-<unique>.yaml
     inputs/
       <sha256>.png
+    batches/
+      batch-<unique>.yaml
 ```
 
-The YAML records the prompt, size, steps, requested controls and LoRAs, actual seed,
+The YAML records the prompt, size, steps, img2img `request.strength`, requested controls and LoRAs, actual seed,
 schedule start step, server URL, elapsed request time and batch coordinates. Inputs
 and returned control maps are saved by content hash. Image fields in the saved
 request refer to those files, so moving or deleting an original source does not
@@ -66,7 +68,9 @@ break the record. API keys are excluded. The server does not report the selected
 ControlNet filename or checkpoint hashes; the YAML cannot attest to those.
 
 Loading workspace history reads the newest 200 saved images across its sessions;
-new results appear as they finish. Select an image to inspect its metadata, restore
+new results appear as they finish. The image viewer shows steps, strength, mask blur,
+ControlNet settings and LoRA weights directly; raw metadata remains available.
+Missing values in older records are labeled "Not recorded." Select an image to restore
 its controls, or use it as the next source. Connection and workspace changes wait
 until the current queue has stopped.
 
@@ -133,8 +137,18 @@ before pausing; resume continues pending work. Submit can append jobs while rend
 or paused. Appending to a paused queue preserves its pause; a new submission after
 the stopped queue drains starts normally. The queue allows at most 1000 unfinished
 jobs, including failures until they are cleared. Failed jobs can be retried explicitly.
-Closing the app loses pending queue state; completed images remain on disk. The
-server has no render cancellation or live step-progress API.
+Each submission, including a single image, saves `batches/batch-<id>.yaml` inside
+the session before rendering starts. It records the batch mode, axes, repeat count,
+every resolved request and seed, shared input snapshots, job status, attempts and
+output references. Each image YAML links back through its batch and job IDs.
+Retry keeps the same request and seed and adds an attempt. Discard records the
+pending jobs as discarded; clearing finished queue rows keeps their history.
+
+Closing the app clears the in-memory queue. Its saved plan and last recorded job
+states remain on disk, but automatic recovery and a parameter-exploration viewer
+are not implemented. Deleting an image leaves its historical batch reference;
+deleting a session removes its manifests too. The server has no render cancellation
+or live step-progress API.
 
 ## Application log
 

@@ -1,3 +1,4 @@
+mod batch;
 mod logging;
 mod models;
 mod state;
@@ -116,6 +117,40 @@ fn reveal(path: String) -> Result<(), String> {
         false,
     )
 }
+#[tauri::command(async)]
+fn create_batch(
+    state: State<'_, Studio>,
+    session_id: String,
+    draft: batch::Draft,
+) -> Result<batch::BatchRef, String> {
+    logging::result("create_batch", state.create_batch(session_id, draft), true)
+}
+#[tauri::command]
+async fn render_batch_job(
+    state: State<'_, Studio>,
+    session_id: String,
+    batch_id: String,
+    job_id: String,
+) -> Result<Vec<SavedImage>, String> {
+    logging::result(
+        "render_batch_job",
+        state.render_batch_job(session_id, batch_id, job_id).await,
+        true,
+    )
+}
+#[tauri::command(async)]
+fn discard_batch_jobs(
+    state: State<'_, Studio>,
+    session_id: String,
+    batch_id: String,
+    job_ids: Vec<String>,
+) -> Result<(), String> {
+    logging::result(
+        "discard_batch_jobs",
+        state.discard_batch_jobs(session_id, batch_id, job_ids),
+        true,
+    )
+}
 #[tauri::command]
 fn frontend_logs(entries: Vec<logging::Entry>) -> Result<(), String> {
     logging::result("frontend_logs", logging::frontend(entries), false)
@@ -146,7 +181,7 @@ pub fn run() {
                 Ok(())
             })
             .invoke_handler(tauri::generate_handler![
-                bootstrap, save_config, select_workspace, read_image, list_loras,
+                create_batch,render_batch_job,discard_batch_jobs,bootstrap, save_config, select_workspace, read_image, list_loras,
                 check_server, preprocess, render, list_images, list_sessions,
                 delete_image, delete_session, generate_prompt, reveal, frontend_logs, get_log_path
             ])

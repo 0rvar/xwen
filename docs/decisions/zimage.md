@@ -662,3 +662,15 @@ application command, so no logging plugin capability or JavaScript package is ad
 The location follows xwen's existing home state directory. Credentials and image
 payloads are filtered, and normal events omit generation request bodies. The
 [client record](../records/image-studio.md#image-drops-and-diagnostic-logging) owns the details.
+
+**Image Studio saves each submission as an immutable batch plan.** 2026-09-09.
+The user wants to group generated images for later parameter exploration. Each
+Generate or Queue submission therefore gets a batch ID and a session-local YAML
+manifest before rendering starts, including single-image submissions. The plan
+holds explicit requests and seeds, axes and shared input references; mutable job
+state records attempts and results. Per-image YAML carries the batch and job IDs.
+Rust owns manifest writes and execution by job ID so retry uses the saved request.
+The manifest survives clearing the visible queue and records pending work after
+closing the app. Queue recovery and the exploration viewer remain separate work.
+The [client record](../records/image-studio.md#readable-parameters-and-batch-manifests)
+holds the schema and verification limits.

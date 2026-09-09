@@ -437,6 +437,25 @@ pub fn session_image_count(session: &Path) -> Result<usize> {
                     return Err("Session contains unrecognized input files".into());
                 }
             }
+        } else if kind.is_dir() && name == "batches" {
+            for manifest in fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
+                let manifest = manifest.map_err(|e| e.to_string())?;
+                let kind = manifest.file_type().map_err(|e| e.to_string())?;
+                let name = manifest.file_name();
+                let name = name.to_str().ok_or("Invalid batch filename")?;
+                if kind.is_file() && name == ".DS_Store" {
+                    continue;
+                }
+                let id = name.strip_suffix(".yaml").ok_or("Invalid batch filename")?;
+                crate::batch::load_owned(
+                    &manifest.path(),
+                    session
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .ok_or("Invalid session")?,
+                    id,
+                )?;
+            }
         } else if kind.is_file() && name == ".DS_Store" {
             continue;
         } else if kind.is_file() && name.ends_with(".png") {

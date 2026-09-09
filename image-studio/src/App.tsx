@@ -154,9 +154,24 @@ export default function App() {
     catch (reason) { setNotice(errorText(reason)); }
     finally { setLoraLoading(false); }
   };
-  const generate = () => {
+  const generate = async () => {
     if (!workspace) return;
-    try { queue.enqueue(planJobs(settings), workspace.session_id); setNotice(""); }
+    try {
+      const jobs = planJobs(settings);
+      const sessionId = workspace.session_id;
+      const definition = { mode: "single" as const, axes: [], count: settings.count };
+      setNotice("");
+      await queue.enqueue(jobs, sessionId, definition);
+    }
+    catch (reason) { setNotice(errorText(reason)); }
+  };
+  const queuePreview = async () => {
+    if (!workspace || !preview.length) return;
+    const jobs = preview;
+    const sessionId = workspace.session_id;
+    const definition = { mode: batchMode, axes: axes.map((axis) => ({ ...axis })), count: settings.count };
+    setNotice("");
+    try { await queue.enqueue(jobs, sessionId, definition); }
     catch (reason) { setNotice(errorText(reason)); }
   };
   const chooseSelected = async (image: SavedImage) => {
@@ -258,16 +273,12 @@ export default function App() {
           if (kind === "source") changeSettings({ ...settings, initImage: null, mask: null });
           else changeSettings({ ...settings, controlImage: null });
         }} onEditMask={() => setMaskOpen(true)} onRefreshLoras={() => void refreshLoras()} onPreviewControl={() => void previewControl()} onUseControlPreview={() => controlPreview && changeSettings({ ...settings, controlImage: controlPreview, controlKind: "none" })} onGenerate={generate} />
-        <BatchPanel settings={settings} axes={axes} mode={batchMode} preview={preview} error={batchError} disabled={!workspace} onAxes={(next) => { setAxes(next); setPreview([]); setBatchError(""); }} onMode={(next) => { setBatchMode(next); setPreview([]); setBatchError(""); }} onPreview={(jobs, error) => { setPreview(jobs); setBatchError(error); }} onQueue={() => {
-          if (!workspace || !preview.length) return;
-          try { queue.enqueue(preview, workspace.session_id); setNotice(""); }
-          catch (reason) { setNotice(errorText(reason)); }
-        }} />
+        <BatchPanel settings={settings} axes={axes} mode={batchMode} preview={preview} error={batchError} disabled={!workspace} onAxes={(next) => { setAxes(next); setPreview([]); setBatchError(""); }} onMode={(next) => { setBatchMode(next); setPreview([]); setBatchError(""); }} onPreview={(jobs, error) => { setPreview(jobs); setBatchError(error); }} onQueue={() => void queuePreview()} />
         {groupedComparison && <p className="comparison-note">The gallery labels prompt and seed so this matrix stays comparable after rendering.</p>}
       </aside>
       <div className="work-area">
         <Gallery images={images} selected={selected} fullUrl={fullUrl} currentSessionId={workspace?.session_id ?? null} sessions={sessions} deleting={deleting} sessionDeletionDisabled={queue.active} onDelete={(image) => workspace && setDeleteTarget({ workspacePath: workspace.path, image })} onDeleteSession={(session) => workspace && setDeleteTarget({ workspacePath: workspace.path, session })} onSelect={(image) => void chooseSelected(image)} onUseSource={(image) => void useAsSource(image)} onRestore={(image) => void restore(image)} onReveal={(image) => void bridge.reveal(image.path).catch((reason: unknown) => setNotice(errorText(reason)))} />
-        <QueuePanel items={queue.items} paused={queue.paused} running={queue.running} pending={queue.pending} onStop={queue.stopAfterCurrent} onResume={queue.resume} onRetry={queue.retry} onClear={queue.clearFinished} onDiscard={queue.discardPending} />
+        <QueuePanel items={queue.items} paused={queue.paused} running={queue.running} pending={queue.pending} preparing={queue.preparing} discarding={queue.discarding} onStop={queue.stopAfterCurrent} onResume={queue.resume} onRetry={queue.retry} onClear={queue.clearFinished} onDiscard={() => void queue.discardPending().catch((reason: unknown) => setNotice(errorText(reason)))} />
       </div>
     </main>
     {serverOpen && <ServerDialog config={config} configPath={configPath} required={serverRequired} disabled={queue.active} onClose={() => setServerOpen(false)} onSave={saveConfig} onCheck={checkConfig} />}

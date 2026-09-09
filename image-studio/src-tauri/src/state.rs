@@ -17,6 +17,7 @@ struct Inner {
 }
 pub struct Studio {
     pub client: reqwest::Client,
+    pub(crate) batch_lock: Mutex<()>,
     inner: Arc<Mutex<Inner>>,
     config_path: PathBuf,
     args: Vec<String>,
@@ -61,6 +62,7 @@ impl Studio {
                 .build()
                 .map_err(|e| e.to_string())?,
             inner: Default::default(),
+            batch_lock: Mutex::new(()),
             config_path,
             args,
         })
@@ -179,6 +181,18 @@ impl Studio {
             Some(w) => storage::gallery(&w),
             None => Ok(vec![]),
         }
+    }
+    pub(crate) fn batch_scope<T>(
+        &self,
+        session_id: &str,
+        f: impl FnOnce(&Workspace, &Config) -> Result<T>,
+    ) -> Result<T> {
+        let inner = self.inner.lock().unwrap();
+        let workspace = inner.workspace.as_ref().ok_or("Select a workspace first")?;
+        if workspace.session_id != session_id {
+            return Err("Batch session no longer matches the selected workspace".into());
+        }
+        f(workspace, inner.config.as_ref().ok_or("Bootstrap first")?)
     }
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
         let inner = self.inner.lock().unwrap();
@@ -360,6 +374,16 @@ impl Studio {
         request: RenderRequest,
         context: Value,
     ) -> Result<Vec<SavedImage>> {
+        self.render_for_server(session_id, request, context, None)
+            .await
+    }
+    pub(crate) async fn render_for_server(
+        &self,
+        session_id: String,
+        request: RenderRequest,
+        context: Value,
+        expected_server_url: Option<String>,
+    ) -> Result<Vec<SavedImage>> {
         validate(&request)?;
         if !context.is_object() {
             return Err("Render context must be an object".into());
@@ -373,12 +397,15 @@ impl Studio {
             if inner.busy {
                 return Err("A render is already active".into());
             }
+            let config = inner.config.clone().ok_or("Bootstrap first")?;
+            if expected_server_url
+                .as_deref()
+                .is_some_and(|expected| expected != config.server_url)
+            {
+                return Err("Batch server differs from the configured server".into());
+            }
             inner.busy = true;
-            (
-                workspace,
-                inner.config.clone().ok_or("Bootstrap first")?,
-                Lease(self.inner.clone()),
-            )
+            (workspace, config, Lease(self.inner.clone()))
         };
         let session = Path::new(&workspace.session_path);
         std::fs::create_dir_all(session).map_err(|e| e.to_string())?;
@@ -528,7 +555,7 @@ fn make_workspace(path: &Path, create: bool) -> Result<Workspace> {
         session_id,
     })
 }
-fn redact(mut value: Value) -> Value {
+pub(crate) fn redact(mut value: Value) -> Value {
     match &mut value {
         Value::Object(map) => {
             map.retain(|key, _| {
@@ -551,6 +578,16 @@ fn redact(mut value: Value) -> Value {
     value
 }
 pub fn validate(r: &RenderRequest) -> Result<()> {
+    validate_fields(r)?;
+    for image in [&r.init_image, &r.mask].into_iter().flatten() {
+        storage::decode_data(image)?;
+    }
+    if let Some(control) = &r.control {
+        storage::decode_data(&control.image)?;
+    }
+    Ok(())
+}
+pub(crate) fn validate_fields(r: &RenderRequest) -> Result<()> {
     if r.prompt.trim().is_empty() {
         return Err("Prompt is required".into());
     }
@@ -585,16 +622,12 @@ pub fn validate(r: &RenderRequest) -> Result<()> {
     {
         return Err("Invalid strength or mask blur".into());
     }
-    for image in [&r.init_image, &r.mask].into_iter().flatten() {
-        storage::decode_data(image)?;
-    }
     for lora in &r.loras {
         if lora.name.is_empty() || !lora.weight.is_finite() {
             return Err("Invalid LoRA".into());
         }
     }
     if let Some(c) = &r.control {
-        storage::decode_data(&c.image)?;
         if c.preprocess
             .as_deref()
             .is_some_and(|k| !matches!(k, "none" | "canny" | "pose" | "depth"))

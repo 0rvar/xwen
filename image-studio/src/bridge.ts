@@ -11,6 +11,7 @@ import type {
   SavedImage,
   Workspace,
 } from "./domain";
+import type { BatchDraft, BatchHandle } from "./batchDraft";
 
 export interface PreprocessedImage {
   data_url: string;
@@ -32,7 +33,9 @@ export interface NativeBridge {
   listLoras(): Promise<LoraCandidate[]>;
   checkServer(config?: Config): Promise<unknown>;
   preprocess(image: string, kind: "canny" | "depth" | "pose"): Promise<PreprocessedImage>;
-  render(sessionId: string, request: RenderRequest, context: object): Promise<SavedImage[]>;
+  createBatch(sessionId: string, draft: BatchDraft): Promise<BatchHandle>;
+  renderBatchJob(sessionId: string, batchId: string, jobId: string): Promise<SavedImage[]>;
+  discardBatchJobs(sessionId: string, batchId: string, jobIds: string[]): Promise<void>;
   listImages(): Promise<SavedImage[]>;
   listSessions(): Promise<SessionSummary[]>;
   deleteImage(workspacePath: string, sessionId: string, imageId: string): Promise<void>;
@@ -53,7 +56,9 @@ const nativeBridge: NativeBridge = {
   listLoras: () => invoke<LoraCandidate[]>("list_loras"),
   checkServer: (config) => invoke<unknown>("check_server", { config: config ?? null }),
   preprocess: (image, kind) => invoke<PreprocessedImage>("preprocess", { image, kind }),
-  render: (sessionId, request, context) => invoke<SavedImage[]>("render", { sessionId, request, context }),
+  createBatch: (sessionId, draft) => invoke<BatchHandle>("create_batch", { sessionId, draft }),
+  renderBatchJob: (sessionId, batchId, jobId) => invoke<SavedImage[]>("render_batch_job", { sessionId, batchId, jobId }),
+  discardBatchJobs: (sessionId, batchId, jobIds) => invoke<void>("discard_batch_jobs", { sessionId, batchId, jobIds }),
   listImages: () => invoke<SavedImage[]>("list_images"),
   listSessions: () => invoke<SessionSummary[]>("list_sessions"),
   deleteImage: (workspacePath, sessionId, imageId) => invoke<void>("delete_image", { workspacePath, sessionId, imageId }),
@@ -99,7 +104,9 @@ function createPreviewBridge(): NativeBridge {
   const portraitInputs = query.has("portrait");
   const renderDelay = Number(query.get("renderDelay") ?? 120);
   const readDelay = Number(query.get("readDelay") ?? 0);
+  const batchDelay = Number(query.get("batchDelay") ?? 0);
   let cancelPicker = query.has("cancelPicker");
+  let failDiscard = query.has("failDiscard");
   let config: Config = {
     server_url: firstLaunch ? "" : "http://127.0.0.1:5241",
     api_key: "",
@@ -112,6 +119,7 @@ function createPreviewBridge(): NativeBridge {
     session_path: `${config.last_workspace}/20260908-142210-preview`,
   };
   let counter = 2;
+  let batchCounter = 0;
   let images: SavedImage[] = [
     {
       id: "preview-1",
@@ -133,7 +141,15 @@ function createPreviewBridge(): NativeBridge {
     },
   ];
   const failedOnce = new Set<string>();
+  const batches = new Map<string, { sessionId: string; draft: BatchDraft; jobIds: string[]; discarded: Set<string> }>();
   const previewInput = (name: string): InputImage => ({ name, data_url: svgDataUrl(name, "#718074"), width: portraitInputs ? 768 : 1024, height: 1024 });
+  const hydrateRequest = (request: RenderRequest, inputs: Record<string, string>): RenderRequest => ({
+    ...request,
+    loras: request.loras.map((lora) => ({ ...lora })),
+    ...(request.init_image ? { init_image: inputs[request.init_image] ?? request.init_image } : {}),
+    ...(request.mask ? { mask: inputs[request.mask] ?? request.mask } : {}),
+    ...(request.control ? { control: { ...request.control, image: inputs[request.control.image] ?? request.control.image } } : {}),
+  });
   return {
     bootstrap: async () => ({ config: { ...config }, config_path: "/Users/demo/.config/xwen/image-studio.json", workspace: firstLaunch ? null : { ...workspace } }),
     saveConfig: async (next) => (config = { ...next }),
@@ -156,9 +172,35 @@ function createPreviewBridge(): NativeBridge {
       await new Promise((resolve) => setTimeout(resolve, 100));
       return { data_url: svgDataUrl(`${kind} preview`, "#4d6870"), width: 1024, height: 1024 };
     },
-    render: async (sessionId, request, context) => {
-      const previewWindow = globalThis as typeof globalThis & { __XWEN_PREVIEW_REQUESTS__?: RenderRequest[] };
+    createBatch: async (sessionId, draft) => {
+      if (batchDelay) await new Promise((resolve) => setTimeout(resolve, batchDelay));
+      if (draft.jobs.some((job) => job.request.prompt.toLowerCase().includes("fail manifest"))) throw new Error("Preview batch creation failed as requested.");
+      const id = `preview-batch-${++batchCounter}`;
+      const jobIds = draft.jobs.map((_, index) => `job-${String(index + 1).padStart(6, "0")}`);
+      batches.set(id, { sessionId, draft, jobIds, discarded: new Set() });
+      const handle = { id, manifest_path: `${workspace.session_path}/batches/${id}.yaml`, job_ids: jobIds };
+      const previewWindow = globalThis as typeof globalThis & {
+        __XWEN_PREVIEW_BATCH_DRAFTS__?: BatchDraft[];
+        __XWEN_PREVIEW_BATCHES__?: Array<{ handle: BatchHandle; draft: BatchDraft }>;
+      };
+      previewWindow.__XWEN_PREVIEW_BATCH_DRAFTS__ = [...(previewWindow.__XWEN_PREVIEW_BATCH_DRAFTS__ ?? []), draft];
+      previewWindow.__XWEN_PREVIEW_BATCHES__ = [...(previewWindow.__XWEN_PREVIEW_BATCHES__ ?? []), { handle, draft }];
+      return handle;
+    },
+    renderBatchJob: async (sessionId, batchId, jobId) => {
+      const batch = batches.get(batchId);
+      if (!batch || batch.sessionId !== sessionId) throw new Error("Unknown preview batch.");
+      const index = batch.jobIds.indexOf(jobId);
+      if (index < 0 || batch.discarded.has(jobId)) throw new Error("Preview batch job is unavailable.");
+      const planned = batch.draft.jobs[index]!;
+      const request = hydrateRequest(planned.request, batch.draft.inputs);
+      const context = { ...planned.context, batch_id: batchId, job_id: jobId };
+      const previewWindow = globalThis as typeof globalThis & {
+        __XWEN_PREVIEW_REQUESTS__?: RenderRequest[];
+        __XWEN_PREVIEW_BATCH_RENDERS__?: Array<{ batchId: string; jobId: string }>;
+      };
       previewWindow.__XWEN_PREVIEW_REQUESTS__ = [...(previewWindow.__XWEN_PREVIEW_REQUESTS__ ?? []), request];
+      previewWindow.__XWEN_PREVIEW_BATCH_RENDERS__ = [...(previewWindow.__XWEN_PREVIEW_BATCH_RENDERS__ ?? []), { batchId, jobId }];
       await new Promise((resolve) => setTimeout(resolve, renderDelay));
       const failureKey = `${request.prompt}|${request.seed}`;
       if (request.prompt.toLowerCase().includes("fail preview") && !failedOnce.has(failureKey)) {
@@ -180,6 +222,14 @@ function createPreviewBridge(): NativeBridge {
       };
       images = [saved, ...images];
       return [saved];
+    },
+    discardBatchJobs: async (sessionId, batchId, jobIds) => {
+      const batch = batches.get(batchId);
+      if (!batch || batch.sessionId !== sessionId || jobIds.some((id) => !batch.jobIds.includes(id))) throw new Error("Unknown preview batch jobs.");
+      if (failDiscard) { failDiscard = false; throw new Error("Preview discard failed as requested."); }
+      jobIds.forEach((id) => batch.discarded.add(id));
+      const previewWindow = globalThis as typeof globalThis & { __XWEN_PREVIEW_DISCARDS__?: Array<{ batchId: string; jobIds: string[] }> };
+      previewWindow.__XWEN_PREVIEW_DISCARDS__ = [...(previewWindow.__XWEN_PREVIEW_DISCARDS__ ?? []), { batchId, jobIds: [...jobIds] }];
     },
     listImages: async () => images.map((image) => ({ ...image })),
     listSessions: async () => [...new Set([workspace.session_id, ...images.map((image) => image.session_id)])].map((session_id) => ({ session_id, image_count: images.filter((image) => image.session_id === session_id).length })),

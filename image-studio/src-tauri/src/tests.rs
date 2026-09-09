@@ -89,105 +89,124 @@ fn missing_last_is_warning_and_atomic_never_overwrites() {
 #[tokio::test]
 async fn real_png_http_saves_provenance_and_confines_gallery() {
     use std::io::{Read, Write};
-    let t = Temp::new();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let image = png(128, 128);
-    let source = storage::data(&image, "image/png");
-    let response=json!({"model":"Z-Image-Turbo","steps":8,"size":"128x128","data":[{"b64_json":source.split_once(',').unwrap().1,"seed":47,"start_step":3,"control_map":source.split_once(',').unwrap().1}]}).to_string();
-    let thread = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = vec![];
-        let mut scratch = [0u8; 4096];
-        loop {
-            let n = stream.read(&mut scratch).unwrap();
-            buffer.extend_from_slice(&scratch[..n]);
-            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-                let header = String::from_utf8_lossy(&buffer[..pos]);
-                let len = header
-                    .lines()
-                    .find_map(|l| {
-                        l.to_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|s| s.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                if buffer.len() >= pos + 4 + len {
-                    assert!(header.starts_with("POST /v1/images/render"));
-                    assert!(
-                        header
-                            .to_lowercase()
-                            .contains("authorization: bearer test-secret")
-                    );
-                    break;
+    for strength in [0.6, 0.0] {
+        let t = Temp::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let image = png(128, 128);
+        let source = storage::data(&image, "image/png");
+        let response=json!({"model":"Z-Image-Turbo","steps":8,"size":"128x128","data":[{"b64_json":source.split_once(',').unwrap().1,"seed":47,"start_step":3,"control_map":source.split_once(',').unwrap().1}]}).to_string();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = vec![];
+            let mut scratch = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut scratch).unwrap();
+                buffer.extend_from_slice(&scratch[..n]);
+                if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&buffer[..pos]);
+                    let len = header
+                        .lines()
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|s| s.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buffer.len() >= pos + 4 + len {
+                        assert!(header.starts_with("POST /v1/images/render"));
+                        assert!(
+                            header
+                                .to_lowercase()
+                                .contains("authorization: bearer test-secret")
+                        );
+                        let wire: serde_json::Value =
+                            serde_json::from_slice(&buffer[pos + 4..pos + 4 + len]).unwrap();
+                        assert_eq!(wire["strength"].as_f64(), Some(strength));
+                        break;
+                    }
                 }
             }
-        }
-        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).unwrap();
-    });
-    let s = t.studio();
-    s.bootstrap().unwrap();
-    let mut config = Config::default();
-    config.server_url = format!("http://{addr}");
-    config.api_key = "test-secret".into();
-    s.save_config(config).unwrap();
-    let workspace = s
-        .select_workspace(t.0.join("images").to_str().unwrap())
-        .unwrap();
-    assert!(
-        s.render("wrong".into(), request(), json!({}))
-            .await
-            .is_err()
-    );
-    owned_fixture(std::path::Path::new(&workspace.session_path), "prior");
-    s.delete_image(
-        workspace.path.clone(),
-        workspace.session_id.clone(),
-        format!("{}/prior.png", workspace.session_id),
-    )
-    .unwrap();
-    let mut req = request();
-    req.init_image = Some(source.clone());
-    req.strength = Some(0.6);
-    let saved = s
-        .render(
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",response.len(),response).unwrap();
+        });
+        let s = t.studio();
+        s.bootstrap().unwrap();
+        let mut config = Config::default();
+        config.server_url = format!("http://{addr}");
+        config.api_key = "test-secret".into();
+        s.save_config(config).unwrap();
+        let workspace = s
+            .select_workspace(t.0.join("images").to_str().unwrap())
+            .unwrap();
+        assert!(
+            s.render("wrong".into(), request(), json!({}))
+                .await
+                .is_err()
+        );
+        owned_fixture(std::path::Path::new(&workspace.session_path), "prior");
+        s.delete_image(
+            workspace.path.clone(),
             workspace.session_id.clone(),
-            req,
-            json!({"mode":"img2img","api_key":"test-secret"}),
+            format!("{}/prior.png", workspace.session_id),
         )
-        .await
         .unwrap();
-    thread.join().unwrap();
-    assert_eq!(saved.len(), 1);
-    assert_eq!(fs::read(&saved[0].path).unwrap(), image);
-    let yaml = fs::read_to_string(&saved[0].metadata_path).unwrap();
-    assert!(!yaml.contains("test-secret"));
-    assert!(!yaml.contains("base64"));
-    assert_eq!(saved[0].metadata["output"]["seed"], 47);
-    assert_eq!(saved[0].metadata["output"]["start_step"], 3);
-    let relative = saved[0].metadata["request"]["init_image"].as_str().unwrap();
-    assert_eq!(
-        fs::read(
-            storage::confined(PathBuf::from(&workspace.session_path).as_path(), relative).unwrap()
+        let mut req = request();
+        req.init_image = Some(source.clone());
+        req.strength = Some(strength);
+        let saved = s
+            .render(
+                workspace.session_id.clone(),
+                req,
+                json!({"mode":"img2img","api_key":"test-secret"}),
+            )
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(fs::read(&saved[0].path).unwrap(), image);
+        let yaml = fs::read_to_string(&saved[0].metadata_path).unwrap();
+        assert!(!yaml.contains("test-secret"));
+        assert!(!yaml.contains("base64"));
+        let persisted: serde_json::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(persisted["request"]["strength"].as_f64(), Some(strength));
+        assert_eq!(persisted["request"]["steps"], 8);
+        assert_eq!(
+            persisted["request"]["init_image"],
+            saved[0].metadata["request"]["init_image"]
+        );
+        assert_eq!(saved[0].metadata["output"]["seed"], 47);
+        assert_eq!(saved[0].metadata["output"]["start_step"], 3);
+        let relative = saved[0].metadata["request"]["init_image"].as_str().unwrap();
+        assert_eq!(
+            fs::read(
+                storage::confined(PathBuf::from(&workspace.session_path).as_path(), relative)
+                    .unwrap()
+            )
+            .unwrap(),
+            image
+        );
+        let reloaded = s.list_images().unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            reloaded[0].metadata["request"]["strength"].as_f64(),
+            Some(strength)
+        );
+        let asset_path = PathBuf::from(&workspace.session_path).join(relative);
+        fs::write(&asset_path, png(128, 64)).unwrap();
+        assert!(s.list_images().unwrap().is_empty());
+        fs::write(&asset_path, &image).unwrap();
+        assert_eq!(s.list_images().unwrap().len(), 1);
+        let mut metadata = saved[0].metadata.clone();
+        metadata["assets"]["init_image"]["path"] = json!("../outside.png");
+        fs::write(
+            &saved[0].metadata_path,
+            serde_yaml_ng::to_string(&metadata).unwrap(),
         )
-        .unwrap(),
-        image
-    );
-    assert_eq!(s.list_images().unwrap().len(), 1);
-    let asset_path = PathBuf::from(&workspace.session_path).join(relative);
-    fs::write(&asset_path, png(128, 64)).unwrap();
-    assert!(s.list_images().unwrap().is_empty());
-    fs::write(&asset_path, &image).unwrap();
-    assert_eq!(s.list_images().unwrap().len(), 1);
-    let mut metadata = saved[0].metadata.clone();
-    metadata["assets"]["init_image"]["path"] = json!("../outside.png");
-    fs::write(
-        &saved[0].metadata_path,
-        serde_yaml_ng::to_string(&metadata).unwrap(),
-    )
-    .unwrap();
-    assert!(s.list_images().unwrap().is_empty());
+        .unwrap();
+        assert!(s.list_images().unwrap().is_empty());
+    }
 }
+
 #[tokio::test]
 #[ignore = "requires explicitly configured running xwen server; uses real image models"]
 async fn live_render_saves_png_yaml() {
@@ -781,4 +800,491 @@ fn file_logging_redacts_rotates_and_records_command_errors() {
         fs::metadata(folder).unwrap().permissions().mode() & 0o777,
         0o700
     );
+}
+
+fn batch_draft(image: &str, jobs: usize) -> batch::Draft {
+    serde_json::from_value(json!({"definition":{"mode":"single","axes":[],"count":jobs},"inputs":{"input_0":image},"jobs":(0..jobs).map(|index|json!({"request":{"prompt":"Batch image","width":128,"height":128,"steps":8,"seed":47+index,"n":1,"loras":[],"init_image":"input_0","strength":0.0},"context":{"mode":"img2img","batch_index":index,"axes":{},"repeat_index":index}})).collect::<Vec<_>>()})).unwrap()
+}
+
+#[tokio::test]
+async fn batch_manifest_records_plan_attempts_outputs_retry_and_discard() {
+    use std::io::{Read, Write};
+    let t = Temp::new();
+    let s = t.studio();
+    s.bootstrap().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = Config::default();
+    config.server_url = format!("http://{addr}");
+    config.api_key = "batch-private-key".into();
+    s.save_config(config).unwrap();
+    let workspace = s
+        .select_workspace(t.0.join("images").to_str().unwrap())
+        .unwrap();
+    let image = png(128, 128);
+    let source = storage::data(&image, "image/png");
+    let batch = s
+        .create_batch(workspace.session_id.clone(), batch_draft(&source, 3))
+        .unwrap();
+    let read_manifest = || {
+        serde_yaml_ng::from_slice::<serde_json::Value>(&fs::read(&batch.manifest_path).unwrap())
+            .unwrap()
+    };
+    let initial = read_manifest();
+    assert_eq!(initial["plan"]["jobs"].as_array().unwrap().len(), 3);
+    assert_eq!(initial["plan"]["assets"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        initial["plan"]["jobs"][0]["request"]["strength"].as_f64(),
+        Some(0.0)
+    );
+    assert!(
+        !fs::read_to_string(&batch.manifest_path)
+            .unwrap()
+            .contains("base64")
+    );
+    assert!(
+        !fs::read_to_string(&batch.manifest_path)
+            .unwrap()
+            .contains("batch-private-key")
+    );
+    let response_image = source.split_once(',').unwrap().1.to_owned();
+    let manifest_path = batch.manifest_path.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let mut started = Some(started_tx);
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = vec![];
+            let mut scratch = [0u8; 4096];
+            let wire = loop {
+                let n = stream.read(&mut scratch).unwrap();
+                assert!(n > 0);
+                buffer.extend_from_slice(&scratch[..n]);
+                if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&buffer[..pos]);
+                    let len = header
+                        .lines()
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|s| s.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if buffer.len() >= pos + 4 + len {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &buffer[pos + 4..pos + 4 + len],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            let seed = if index == 0 { 47 } else { 48 };
+            assert_eq!(wire["seed"], seed);
+            assert_eq!(wire["strength"].as_f64(), Some(0.0));
+            assert!(
+                wire["init_image"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            );
+            let before: serde_json::Value =
+                serde_yaml_ng::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+            let job = if index == 0 {
+                "job-000001"
+            } else {
+                "job-000002"
+            };
+            assert_eq!(before["state"]["jobs"][job]["status"], "running");
+            if index == 0 {
+                started.take().unwrap().send(()).unwrap();
+                continue_rx.recv().unwrap();
+            }
+            let (status, response) = if index == 1 {
+                (
+                    "500 Internal Server Error",
+                    json!({"error":{"message":"batch-private-key failed"}}),
+                )
+            } else {
+                (
+                    "200 OK",
+                    json!({"data":[{"b64_json":response_image,"seed":seed,"start_step":8}]}),
+                )
+            };
+            let response = response.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+    let first = s.render_batch_job(
+        workspace.session_id.clone(),
+        batch.id.clone(),
+        batch.job_ids[0].clone(),
+    );
+    let append = async {
+        started_rx.await.unwrap();
+        let appended = s
+            .create_batch(workspace.session_id.clone(), batch_draft(&source, 1))
+            .unwrap();
+        assert!(PathBuf::from(appended.manifest_path).exists());
+        assert!(
+            s.discard_batch_jobs(
+                workspace.session_id.clone(),
+                batch.id.clone(),
+                vec![batch.job_ids[0].clone()]
+            )
+            .is_err()
+        );
+        continue_tx.send(()).unwrap();
+    };
+    let (first, ()) = tokio::join!(first, append);
+    let outputs = first.unwrap();
+    assert_eq!(outputs[0].metadata["context"]["batch_id"], batch.id);
+    assert_eq!(outputs[0].metadata["context"]["job_id"], batch.job_ids[0]);
+    assert_eq!(outputs[0].metadata["context"]["attempt"], 1);
+    assert!(
+        s.render_batch_job(
+            workspace.session_id.clone(),
+            batch.id.clone(),
+            batch.job_ids[0].clone()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        s.render_batch_job(
+            workspace.session_id.clone(),
+            batch.id.clone(),
+            batch.job_ids[1].clone()
+        )
+        .await
+        .is_err()
+    );
+    let failed = read_manifest();
+    assert_eq!(
+        failed["state"]["jobs"][&batch.job_ids[1]]["status"],
+        "failed"
+    );
+    assert!(!failed.to_string().contains("batch-private-key"));
+    s.render_batch_job(
+        workspace.session_id.clone(),
+        batch.id.clone(),
+        batch.job_ids[1].clone(),
+    )
+    .await
+    .unwrap();
+    s.discard_batch_jobs(
+        workspace.session_id.clone(),
+        batch.id.clone(),
+        vec![batch.job_ids[2].clone()],
+    )
+    .unwrap();
+    assert!(
+        s.render_batch_job(
+            workspace.session_id.clone(),
+            batch.id.clone(),
+            batch.job_ids[2].clone()
+        )
+        .await
+        .is_err()
+    );
+    thread.join().unwrap();
+    let final_state = read_manifest();
+    let second = &final_state["state"]["jobs"][&batch.job_ids[1]];
+    assert_eq!(second["status"], "succeeded");
+    assert_eq!(second["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(second["attempts"][0]["status"], "failed");
+    assert_eq!(second["attempts"][1]["status"], "succeeded");
+    assert_eq!(second["outputs"][0]["seed"], 48);
+    assert_eq!(
+        final_state["state"]["jobs"][&batch.job_ids[2]]["status"],
+        "discarded"
+    );
+    assert_eq!(s.list_sessions().unwrap()[0].image_count, 2);
+    s.delete_session(workspace.path, workspace.session_id)
+        .unwrap();
+    assert!(!PathBuf::from(batch.manifest_path).exists());
+}
+
+#[tokio::test]
+async fn batch_rejects_unowned_paths_changed_assets_and_invalid_plans() {
+    let t = Temp::new();
+    let s = t.studio();
+    s.bootstrap().unwrap();
+    let workspace = s
+        .select_workspace(t.0.join("images").to_str().unwrap())
+        .unwrap();
+    let image = storage::data(&png(128, 128), "image/png");
+    assert!(
+        s.create_batch("wrong".into(), batch_draft(&image, 1))
+            .is_err()
+    );
+    assert!(
+        s.create_batch(workspace.session_id.clone(), batch_draft(&image, 1001))
+            .is_err()
+    );
+    let batch = s
+        .create_batch(workspace.session_id.clone(), batch_draft(&image, 1))
+        .unwrap();
+    for id in ["../outside", "batch-AAAAAAAAAAAAAAAAAAAAAAAA"] {
+        assert!(
+            s.discard_batch_jobs(workspace.session_id.clone(), id.into(), vec![])
+                .is_err()
+        );
+    }
+    assert!(
+        s.discard_batch_jobs(
+            workspace.session_id.clone(),
+            batch.id.clone(),
+            vec!["../job".into()]
+        )
+        .is_err()
+    );
+    let path = PathBuf::from(&batch.manifest_path);
+    let original = fs::read(&path).unwrap();
+    let copy = t.0.join("outside.yaml");
+    fs::write(&copy, &original).unwrap();
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&copy, &path).unwrap();
+    assert!(
+        s.discard_batch_jobs(
+            workspace.session_id.clone(),
+            batch.id.clone(),
+            vec![batch.job_ids[0].clone()]
+        )
+        .is_err()
+    );
+    assert!(
+        s.delete_session(workspace.path.clone(), workspace.session_id.clone())
+            .is_err()
+    );
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, &original).unwrap();
+    let m: serde_json::Value = serde_yaml_ng::from_slice(&original).unwrap();
+    let inputs = PathBuf::from(&workspace.session_path).join("inputs");
+    let real_inputs = PathBuf::from(&workspace.session_path).join("real-inputs");
+    fs::rename(&inputs, &real_inputs).unwrap();
+    std::os::unix::fs::symlink(&real_inputs, &inputs).unwrap();
+    assert!(
+        s.render_batch_job(
+            workspace.session_id.clone(),
+            batch.id.clone(),
+            batch.job_ids[0].clone()
+        )
+        .await
+        .unwrap_err()
+        .contains("real directory")
+    );
+    fs::remove_file(&inputs).unwrap();
+    fs::rename(&real_inputs, &inputs).unwrap();
+    let input = PathBuf::from(&workspace.session_path)
+        .join(m["plan"]["assets"]["input_0"]["path"].as_str().unwrap());
+    fs::write(input, png(128, 64)).unwrap();
+    assert!(
+        s.render_batch_job(
+            workspace.session_id.clone(),
+            batch.id.clone(),
+            batch.job_ids[0].clone()
+        )
+        .await
+        .unwrap_err()
+        .contains("hash mismatch")
+    );
+    let mut foreign = m;
+    foreign["app_id"] = json!("foreign");
+    fs::write(path, serde_yaml_ng::to_string(&foreign).unwrap()).unwrap();
+    assert!(
+        s.delete_session(workspace.path, workspace.session_id)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn batch_final_manifest_failure_preserves_image_reconciliation_metadata() {
+    use std::io::{Read, Write};
+    let t = Temp::new();
+    let s = t.studio();
+    s.bootstrap().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = Config::default();
+    config.server_url = format!("http://{addr}");
+    s.save_config(config).unwrap();
+    let workspace = s
+        .select_workspace(t.0.join("images").to_str().unwrap())
+        .unwrap();
+    let source = storage::data(&png(128, 128), "image/png");
+    let batch = s
+        .create_batch(workspace.session_id.clone(), batch_draft(&source, 1))
+        .unwrap();
+    let manifest = batch.manifest_path.clone();
+    let thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = vec![];
+        let mut scratch = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut scratch).unwrap();
+            assert!(n > 0);
+            buffer.extend_from_slice(&scratch[..n]);
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&buffer[..pos]);
+                let len = header
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                if buffer.len() >= pos + 4 + len {
+                    break;
+                }
+            }
+        }
+        fs::remove_file(manifest).unwrap();
+        let response=json!({"data":[{"b64_json":source.split_once(',').unwrap().1,"seed":47,"start_step":8}]}).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        )
+        .unwrap();
+    });
+    let error = s
+        .render_batch_job(
+            workspace.session_id,
+            batch.id.clone(),
+            batch.job_ids[0].clone(),
+        )
+        .await
+        .unwrap_err();
+    thread.join().unwrap();
+    assert!(error.contains("images were saved"));
+    assert!(error.contains("reconciliation"));
+    let images = s.list_images().unwrap();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].metadata["context"]["batch_id"], batch.id);
+    assert_eq!(images[0].metadata["context"]["job_id"], batch.job_ids[0]);
+    assert_eq!(images[0].metadata["context"]["attempt"], 1);
+}
+
+#[tokio::test]
+async fn render_rechecks_batch_server_when_capturing_config() {
+    let t = Temp::new();
+    let s = t.studio();
+    s.bootstrap().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut config = Config::default();
+    config.server_url = format!("http://{}", listener.local_addr().unwrap());
+    s.save_config(config).unwrap();
+    let w = s
+        .select_workspace(t.0.join("images").to_str().unwrap())
+        .unwrap();
+    let error = s
+        .render_for_server(
+            w.session_id,
+            request(),
+            json!({}),
+            Some("http://127.0.0.1:1".into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("Batch server differs"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(!PathBuf::from(w.session_path).exists());
+    s.select_workspace(&w.path).unwrap();
+}
+
+#[tokio::test]
+async fn batch_reserves_terminal_space_before_http_and_saves_maximum_error() {
+    use std::io::{Read, Write};
+    let t = Temp::new();
+    let s = t.studio();
+    s.bootstrap().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut config = Config::default();
+    config.server_url = format!("http://{}", listener.local_addr().unwrap());
+    s.save_config(config).unwrap();
+    let w = s
+        .select_workspace(t.0.join("images").to_str().unwrap())
+        .unwrap();
+    let source = storage::data(&png(128, 128), "image/png");
+    let batch = s
+        .create_batch(w.session_id.clone(), batch_draft(&source, 1))
+        .unwrap();
+    let path = PathBuf::from(&batch.manifest_path);
+    let mut manifest: serde_json::Value =
+        serde_yaml_ng::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let base = serde_yaml_ng::to_string(&manifest).unwrap().len();
+    manifest["plan"]["jobs"][0]["context"]["padding"] =
+        json!("x".repeat(16 * 1024 * 1024 - base - 32 * 1024));
+    let near_cap = serde_yaml_ng::to_string(&manifest).unwrap();
+    assert!(near_cap.len() < 16 * 1024 * 1024);
+    fs::write(&path, &near_cap).unwrap();
+    let error = s
+        .render_batch_job(
+            w.session_id.clone(),
+            batch.id.clone(),
+            batch.job_ids[0].clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("insufficient space"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), near_cap);
+    manifest["plan"]["jobs"][0]["context"]["padding"] =
+        json!("x".repeat(16 * 1024 * 1024 - base - 72 * 1024));
+    fs::write(&path, serde_yaml_ng::to_string(&manifest).unwrap()).unwrap();
+    listener.set_nonblocking(false).unwrap();
+    let thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = vec![];
+        let mut scratch = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut scratch).unwrap();
+            assert!(n > 0);
+            buffer.extend_from_slice(&scratch[..n]);
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&buffer[..pos]);
+                let len = header
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                if buffer.len() >= pos + 4 + len {
+                    break;
+                }
+            }
+        }
+        let response = json!({"error":{"message":"\u{1}".repeat(8192)}}).to_string();
+        write!(stream,"HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+    });
+    assert!(
+        s.render_batch_job(w.session_id, batch.id, batch.job_ids[0].clone())
+            .await
+            .is_err()
+    );
+    thread.join().unwrap();
+    let bytes = fs::read(path).unwrap();
+    assert!(bytes.len() <= 16 * 1024 * 1024);
+    let final_manifest: serde_json::Value = serde_yaml_ng::from_slice(&bytes).unwrap();
+    let state = &final_manifest["state"]["jobs"][&batch.job_ids[0]];
+    assert_eq!(state["status"], "failed");
+    assert_eq!(state["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(state["attempts"][0]["error"].as_str().unwrap().len(), 8192);
 }

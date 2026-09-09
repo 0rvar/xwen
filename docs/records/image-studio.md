@@ -203,13 +203,74 @@ MIME normalization and redaction ordering were corrected. The remaining external
 claims were checked and refuted. Docs-check passes; model math and the ledger are
 unchanged.
 
+## Readable parameters and batch manifests
+
+2026-09-09. The user asked whether img2img strength survives in YAML and requested
+readable image parameters plus whole-batch records for later parameter exploration.
+Strength was already serialized at `request.strength`; a regression reads the
+actual saved YAML and checks both 0.6 and 0.0, then reloads gallery history. The
+image viewer now shows mode, steps, strength, mask blur, ControlNet settings, LoRA
+weights and the reported model. Missing legacy values say "Not recorded."
+
+Every submission creates `batches/batch-<24 hex digits>.yaml` under its session
+before any job can render. Single-image submissions use the same path. The manifest
+contains `schema_version`, `app_id`, `kind`, batch and session IDs, creation time
+and server URL. `plan.definition` holds mode, ordered axes and repeat count;
+`plan.jobs` holds sequential job IDs, complete resolved requests and matrix context;
+`plan.assets` holds shared input paths, hashes and dimensions. Input payloads cross
+the bridge once per distinct image at submission and become hashed file references.
+
+`state.jobs` holds each job's last status, attempt history and output references.
+Rust records an attempt before calling the image API and records success or failure
+afterward. Retrying a failed job reuses its saved request and seed. Requests run by
+batch/job ID; the frontend cannot silently replace a saved plan during execution.
+Each image YAML includes `context.batch_id`, `job_id`, `attempt` and the relative
+`batch_manifest` path. A failed final manifest write reports the problem explicitly;
+those per-image IDs allow later reconciliation if outputs were already saved.
+
+Submission saves are ordered so appending work preserves FIFO, including when the
+queue is paused. Discard saves job states before removing queue entries; clearing
+finished rows leaves manifests intact. Session ownership checks recognize only
+owned, bounded manifest files in a real `batches` directory. Session deletion removes
+them; image deletion retains historical output references, which a future viewer
+must treat as possibly missing. Manifests omit API credentials and bound error text.
+
+The server URL is checked again while acquiring the render lease, so configuration
+cannot switch the endpoint between plan validation and request startup. Manifest
+writes reserve 64 KiB per running job for terminal state before allowing HTTP;
+nearly full records refuse a new attempt before it starts.
+Final state updates hold the workspace lock through publication so session deletion
+cannot race the write and recreate a removed directory.
+
+Verification: 19 frontend unit tests, 25 browser flows and 18 Rust tests pass; the
+opt-in live GPU render test stays ignored because this change touches no model math.
+Browser coverage includes rapid submissions, preparation status, save failures,
+paused appends, retry IDs, discard failures and readable zero-valued parameters.
+Rust tests inspect actual YAML and use local HTTP fixtures to verify persisted
+attempts before requests, shared inputs, retry seeds, output references, session
+cleanup, changed input hashes, symlinks, server changes and manifest size limits.
+The release macOS bundle builds, formatting and docs-check pass, and the existing
+ledger remains unchanged.
+
+Two independent local reviews ran. The server-configuration race, terminal-state
+space reservation and paused-queue restart with failed jobs were corrected and
+verified. The external Qwen review was interrupted before returning a report;
+its local server was unavailable when the session resumed, so no external review
+result is claimed for this change.
+
 ## Not taken now
 
-Pending queue recovery across an app restart is not implemented. Completed results
-and their input assets are durable, but pending work is in memory; reopen when
+Pending queue recovery across an app restart is not implemented. Batch plans,
+last recorded job states, completed results and input assets are durable, but the
+runtime queue is in memory; reopen when
 long-running unattended batches need interruption recovery. The current queue is
 bounded at 1000 images and history reloads at 200 previews; larger collections can add
 paging and lazy binary previews when those limits impede a real workspace.
+
+A parameter-exploration viewer is not part of the manifest change. The saved plans,
+axis coordinates and output IDs provide its input; reopen when the user requests
+the comparison interface. A saved running state after a crash is last-known state,
+not proof of completion, and no automatic retry is performed.
 
 The desktop bundle is a local development build. Distribution signing, notarization,
 auto-update and forwarding new CLI arguments into an already running instance are

@@ -1,5 +1,6 @@
 import type { SavedImage } from "../domain";
 import type { SessionSummary } from "../bridge";
+import { GenerationDetails } from "./GenerationDetails";
 
 interface Props {
   images: SavedImage[];
@@ -52,6 +53,7 @@ export function Gallery({ images, selected, fullUrl, currentSessionId, sessions:
             <button className="icon-button preview-close" onClick={() => onSelect(selected)} aria-label="Close preview">×</button>
             <p className="eyebrow">Generated image</p><h2>{selected.prompt}</h2>
             <dl><div><dt>Seed</dt><dd>{selected.seed}</dd></div><div><dt>Size</dt><dd>{selected.width}×{selected.height}</dd></div>{value(selected.metadata, "created_at") && <div><dt>Created</dt><dd>{value(selected.metadata, "created_at")}</dd></div>}{value(selected.metadata, "duration_ms") && <div><dt>Duration</dt><dd>{(Number(value(selected.metadata, "duration_ms")) / 1000).toFixed(1)}s</dd></div>}</dl>
+            <GenerationDetails metadata={selected.metadata} />
             <details className="metadata-details"><summary>Saved metadata</summary><pre>{JSON.stringify(selected.metadata, null, 2)}</pre></details>
             <div className="preview-actions"><button className="primary-button" onClick={() => onUseSource(selected)}>Use as source</button><button className="quiet-button" onClick={() => onRestore(selected)}>Restore settings</button><button className="text-button" onClick={() => onReveal(selected)}>Show in Finder</button><button className="text-button danger-button" disabled={deleting} onClick={() => onDelete(selected)}>Delete image</button></div>
           </aside>
