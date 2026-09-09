@@ -674,3 +674,16 @@ The manifest survives clearing the visible queue and records pending work after
 closing the app. Queue recovery and the exploration viewer remain separate work.
 The [client record](../records/image-studio.md#readable-parameters-and-batch-manifests)
 holds the schema and verification limits.
+
+**Image assistant turns stage one batch before image dispatch resumes.** 2026-09-09.
+The owner requested immediate action on generation requests and multiple jobs per tool
+call, with no image submission between LLM calls. The existing four-response loop
+queued each job immediately and could stop without a final assistant reply.
+`queue_txt2img` now accepts a jobs array and expands repeats into independent queue
+items. The client continues until an explicit final reply, with a 16-response guard;
+errors, truncation and guard exhaustion submit nothing. A separate scheduler hold
+waits for any active image and prevents new image requests throughout the turn,
+including manual or previously queued work. It remains held through the single batch
+commit, then releases without changing a manual pause. Chat holds also keep the
+workspace, session and server fixed. The assistant sidebar sits in the layout so the
+controls and gallery remain usable.

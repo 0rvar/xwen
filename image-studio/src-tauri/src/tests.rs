@@ -722,7 +722,7 @@ async fn language_tools_resolve_available_models_with_auth_and_plain_prompt_answ
                     if index == 0 { "a lighthouse" } else { "" }
                 );
             } else {
-                assert_eq!(body["max_completion_tokens"], 1024);
+                assert_eq!(body["max_completion_tokens"], 8192);
                 assert_eq!(body["tool_choice"], "auto");
                 assert_eq!(body["messages"][1]["content"], "chat idea");
             }

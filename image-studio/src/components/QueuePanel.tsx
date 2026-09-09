@@ -4,6 +4,7 @@ import type { QueueItem } from "../useRenderQueue";
 interface Props {
   items: QueueItem[];
   paused: boolean;
+  held: boolean;
   running: boolean;
   pending: number;
   preparing: number;
@@ -15,7 +16,7 @@ interface Props {
   onDiscard(): void;
 }
 
-export function QueuePanel({ items, paused, running, pending, preparing, discarding, onStop, onResume, onRetry, onClear, onDiscard }: Props) {
+export function QueuePanel({ items, paused, held, running, pending, preparing, discarding, onStop, onResume, onRetry, onClear, onDiscard }: Props) {
   const [, setClock] = useState(0);
   useEffect(() => {
     if (!running) return;
@@ -40,14 +41,14 @@ export function QueuePanel({ items, paused, running, pending, preparing, discard
     <section className="queue-panel" aria-labelledby="queue-title">
       <header className="panel-heading queue-heading">
         <div><p className="eyebrow">Renderer</p><h2 id="queue-title">Queue</h2></div>
-        <div className="queue-counts" aria-live="polite"><span>{running ? "1 running" : "Idle"}</span>{preparing > 0 && <span>{preparing} preparing</span>}<span>{pending} waiting</span><span>{done} done</span>{failed > 0 && <span className="danger-text">{failed} failed</span>}</div>
+        <div className="queue-counts" aria-live="polite"><span>{running ? "1 running" : held ? "Waiting for assistant" : "Idle"}</span>{preparing > 0 && <span>{preparing} preparing</span>}<span>{pending} waiting</span><span>{done} done</span>{failed > 0 && <span className="danger-text">{failed} failed</span>}</div>
       </header>
       <div className="queue-actions">
-        {paused ? <button className="quiet-button" disabled={discarding} onClick={onResume}>Resume queue</button> : <button className="quiet-button" disabled={!running && !pending && !preparing} onClick={onStop}>{running ? "Stop after current" : "Pause queue"}</button>}
+        {paused ? <button className="quiet-button" disabled={discarding} onClick={onResume}>Resume queue</button> : <button className="quiet-button" disabled={!running && !pending && !preparing && !held} onClick={onStop}>{running ? "Stop after current" : "Pause queue"}</button>}
         {paused && pending > 0 && <button className="text-button danger-text" disabled={preparing > 0 || discarding} onClick={onDiscard}>{discarding ? "Discarding…" : `Discard ${pending} waiting`}</button>}
         <button className="text-button" disabled={running || pending > 0 || preparing > 0 || discarding || !items.length} onClick={onClear}>Clear finished</button>
       </div>
-      {!items.length ? <p className="empty-note">{preparing > 0 ? "Saving batch manifest before rendering…" : "Rendered jobs appear here. Requests run one at a time."}</p> : (
+      {!items.length ? <p className="empty-note">{held ? "Image requests wait until the assistant finishes its reply." : preparing > 0 ? "Saving batch manifest before rendering…" : "Rendered jobs appear here. Requests run one at a time."}</p> : (
         <div className="queue-sections">
           {activeItems.length > 0 ? <ol className="queue-list">{activeItems.map(renderItem)}</ol> : <p className="queue-empty-active">No queued or running jobs.</p>}
           {completedItems.length > 0 && <section className="queue-completed" aria-label="Completed jobs"><h3>Completed</h3><ol className="queue-list">{completedItems.map(renderItem)}</ol></section>}

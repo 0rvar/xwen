@@ -48,6 +48,9 @@ export default function App() {
   const [config, setConfig] = useState<Config>(EMPTY_CONFIG);
   const [configPath, setConfigPath] = useState("");
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [contextBusy, setContextBusy] = useState(false);
+  const contextReserved = useRef(false);
+  const turnReserved = useRef(false);
   const [settings, setSettings] = useState<StudioSettings>(DEFAULT_SETTINGS);
   const [images, setImages] = useState<SavedImage[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -56,6 +59,7 @@ export default function App() {
   const [selected, setSelected] = useState<SavedImage | null>(null);
   const [fullUrl, setFullUrl] = useState("");
   const [serverOpen, setServerOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
   const [serverRequired, setServerRequired] = useState(false);
   const [workspacePrompt, setWorkspacePrompt] = useState(false);
   const [loras, setLoras] = useState<LoraCandidate[]>([]);
@@ -88,6 +92,28 @@ export default function App() {
     void bridge.listSessions().then((result) => { if (historyToken.current === token) setSessions(result); }).catch((reason: unknown) => { if (historyToken.current === token) setNotice(errorText(reason)); });
   }, []);
   const queue = useRenderQueue(addOutputs);
+  const queueActive = useRef(queue.active);
+  queueActive.current = queue.active;
+  const reserveContext = () => {
+    if (contextReserved.current || turnReserved.current || queueActive.current) throw new Error("Wait for the assistant and queued jobs before changing workspace or server.");
+    contextReserved.current = true;
+    setContextBusy(true);
+    return () => { contextReserved.current = false; setContextBusy(false); };
+  };
+  const acquireChatTurn = async () => {
+    if (contextReserved.current) throw new Error("Wait for the workspace or server change to finish before sending a message.");
+    if (turnReserved.current) throw new Error("An assistant turn is already active.");
+    turnReserved.current = true;
+    try {
+      const release = await queue.acquireTurn();
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        release(); turnReserved.current = false;
+      };
+    } catch (error) { turnReserved.current = false; throw error; }
+  };
 
   const refreshImages = useCallback(async () => {
     const token = ++historyToken.current;
@@ -140,17 +166,19 @@ export default function App() {
     }
   };
   const chooseWorkspace = async (path?: string, newSession = false) => {
-    if (queue.active) return;
-    const chosen = path ?? await bridge.chooseDirectory(newSession ? "Choose a workspace for the new session" : "Choose an Image Studio workspace");
-    if (!chosen) { setWorkspacePrompt(true); return; }
+    let release: (() => void) | undefined;
     try {
+      release = reserveContext();
+      const chosen = path ?? await bridge.chooseDirectory(newSession ? "Choose a workspace for the new session" : "Choose an Image Studio workspace");
+      if (!chosen) { setWorkspacePrompt(!workspace); return; }
       historyToken.current += 1;
       const next = await bridge.selectWorkspace(chosen);
       setWorkspace(next);
       setConfig((current) => ({ ...current, last_workspace: next.path, workspaces: [next.path, ...current.workspaces.filter((item) => item !== next.path)] }));
       setWorkspacePrompt(false); setImages([]); setSelected(null); setNotice(""); queue.clearFinished();
       await refreshImages();
-    } catch (reason) { setNotice(errorText(reason)); setWorkspacePrompt(true); }
+    } catch (reason) { setNotice(errorText(reason)); setWorkspacePrompt(!workspace); }
+    finally { release?.(); }
   };
   const pickImage = async (kind: "source" | "control") => {
     const path = await bridge.chooseImage(kind === "source" ? "Choose a source image" : "Choose a ControlNet image");
@@ -164,7 +192,7 @@ export default function App() {
     finally { setLoraLoading(false); }
   };
   const generate = async () => {
-    if (!workspace) return;
+    if (!workspace || contextReserved.current) return;
     try {
       const jobs = planJobs(settings);
       const sessionId = workspace.session_id;
@@ -175,7 +203,7 @@ export default function App() {
     catch (reason) { setNotice(errorText(reason)); }
   };
   const queuePreview = async () => {
-    if (!workspace || !preview.length) return;
+    if (!workspace || !preview.length || contextReserved.current) return;
     const jobs = preview;
     const sessionId = workspace.session_id;
     const definition = { mode: batchMode, axes: axes.map((axis) => ({ ...axis })), count: settings.count };
@@ -218,7 +246,7 @@ export default function App() {
     } catch (reason) { setNotice(errorText(reason)); }
   };
   const previewControl = async () => {
-    if (!settings.controlImage || settings.controlKind === "none") return;
+    if (!settings.controlImage || settings.controlKind === "none" || contextReserved.current) return;
     const token = ++controlToken.current;
     const inputUrl = settings.controlImage.data_url;
     const kind = settings.controlKind;
@@ -230,11 +258,14 @@ export default function App() {
     finally { if (controlToken.current === token) setControlBusy(false); }
   };
   const saveConfig = async (draft: Config) => {
-    setLogSecrets(draft.api_key);
-    const saved = await bridge.saveConfig(draft);
-    controlToken.current += 1; setControlPreview(null); setControlBusy(false);
-    setConfig(saved); setServerRequired(false); setServerOpen(false); setNotice("");
-    if (!workspace) setWorkspacePrompt(true);
+    const release = reserveContext();
+    try {
+      setLogSecrets(draft.api_key);
+      const saved = await bridge.saveConfig(draft);
+      controlToken.current += 1; setControlPreview(null); setControlBusy(false);
+      setConfig(saved); setServerRequired(false); setServerOpen(false); setNotice("");
+      if (!workspace) setWorkspacePrompt(true);
+    } finally { release(); }
   };
   const checkConfig = async (draft: Config) => {
     setLogSecrets(draft.api_key);
@@ -244,6 +275,7 @@ export default function App() {
     if (!deleteTarget || deleting) return;
     setDeleting(true);
     historyToken.current += 1;
+    let release: (() => void) | undefined;
     try {
       if (deleteTarget.image) {
         const image = deleteTarget.image;
@@ -254,7 +286,7 @@ export default function App() {
         const remaining = await bridge.listSessions();
         if (historyToken.current === token) setSessions(remaining);
       } else if (deleteTarget.session) {
-        if (queue.active) throw new Error("Finish or discard queued jobs before deleting a session.");
+        release = reserveContext();
         const next = await bridge.deleteSession(deleteTarget.workspacePath, deleteTarget.session.session_id);
         setWorkspace(next); selectionToken.current += 1; setSelected(null); setFullUrl("");
         queue.clearFinished();
@@ -262,11 +294,12 @@ export default function App() {
       }
       setDeleteTarget(null); setNotice("");
     } catch (reason) { setNotice(errorText(reason)); setDeleteTarget(null); }
-    finally { setDeleting(false); }
+    finally { release?.(); setDeleting(false); }
   };
   const groupedComparison = useMemo(() => preview.length > 1 && preview.some((job) => Object.keys(job.context.axes).includes("prompt")) && preview.some((job) => Object.keys(job.context.axes).includes("seed")), [preview]);
   const queueChatRequests = useCallback(async (requests: import("./domain").RenderRequest[]) => {
     if (!workspace) throw new Error("Choose a workspace first.");
+    if (contextReserved.current) throw new Error("Wait for the workspace or server change to finish before queueing images.");
     const jobs = requests.map((request, index) => ({ id: crypto.randomUUID(), request, context: { mode: "text" as const, batch_index: index, axes: {}, repeat_index: 0 } }));
     await queue.enqueue(jobs, workspace.session_id, { mode: "single", axes: [], count: 1 });
   }, [queue, workspace]);
@@ -278,21 +311,23 @@ export default function App() {
     <header className="topbar">
       <div className="brand"><span className="brand-mark">x</span><div><strong>Image Studio</strong><small>xwen</small></div></div>
       <div className="workspace-controls">
-        <label><span className="sr-only">Recent workspace</span><select aria-label="Recent workspace" value={workspace?.path ?? ""} disabled={queue.active} onChange={(event) => void chooseWorkspace(event.target.value)}><option value="" disabled>Choose workspace</option>{config.workspaces.map((path) => <option key={path} value={path}>{path}</option>)}</select></label>
-        <button className="quiet-button" disabled={queue.active} onClick={() => void chooseWorkspace()}>Open…</button>
-        <button className="quiet-button" disabled={queue.active || !workspace} onClick={() => workspace && void chooseWorkspace(workspace.path, true)}>New session</button>
+        <label><span className="sr-only">Recent workspace</span><select aria-label="Recent workspace" value={workspace?.path ?? ""} disabled={queue.active || contextBusy} onChange={(event) => void chooseWorkspace(event.target.value)}><option value="" disabled>Choose workspace</option>{config.workspaces.map((path) => <option key={path} value={path}>{path}</option>)}</select></label>
+        <button className="quiet-button" disabled={queue.active || contextBusy} onClick={() => void chooseWorkspace()}>Open…</button>
+        <button className="quiet-button" disabled={queue.active || contextBusy || !workspace} onClick={() => workspace && void chooseWorkspace(workspace.path, true)}>New session</button>
       </div>
-      <button className="icon-button settings-button" disabled={queue.active} onClick={() => setServerOpen(true)} aria-label="Server settings">⚙</button>
+      <button className="quiet-button chat-toggle" disabled={!workspace || contextBusy} aria-expanded={chatOpen} aria-controls="image-assistant" onClick={() => setChatOpen((open) => !open)}>Chat with image assistant</button>
+      <button className="icon-button settings-button" disabled={queue.active || contextBusy} onClick={() => setServerOpen(true)} aria-label="Server settings">⚙</button>
     </header>
     {notice && <div className="global-notice" role="status"><span>{notice}</span><button className="icon-button" onClick={() => setNotice("")} aria-label="Dismiss message">×</button></div>}
-    <main className="studio-layout">
+    <main className={`studio-layout${chatOpen ? " chat-open" : ""}`}>
+      <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} settings={settings} loras={loras} sessionId={workspace?.session_id ?? null} disabled={!workspace || contextBusy} acquireTurn={acquireChatTurn} onQueue={queueChatRequests} />
       <aside className="inspector">
-        <SettingsPanel settings={settings} loras={loras} loraLoading={loraLoading} disabled={!workspace} controlPreview={controlPreview} controlBusy={controlBusy} activeDropTarget={imageDrop.activeTarget} onChange={changeSettings} onPick={(kind) => void pickImage(kind).catch((reason: unknown) => setNotice(errorText(reason)))} onClearImage={(kind) => {
+        <SettingsPanel settings={settings} loras={loras} loraLoading={loraLoading} disabled={!workspace || contextBusy} controlPreview={controlPreview} controlBusy={controlBusy} activeDropTarget={imageDrop.activeTarget} onChange={changeSettings} onPick={(kind) => void pickImage(kind).catch((reason: unknown) => setNotice(errorText(reason)))} onClearImage={(kind) => {
           imageDrop.cancel(kind);
           if (kind === "source") changeSettings({ ...settings, initImage: null, mask: null });
           else changeSettings({ ...settings, controlImage: null });
         }} onEditMask={() => setMaskOpen(true)} onRefreshLoras={() => void refreshLoras()} onPreviewControl={() => void previewControl()} onUseControlPreview={() => controlPreview && changeSettings({ ...settings, controlImage: controlPreview, controlKind: "none" })} onGenerate={generate} />
-        <BatchPanel settings={settings} loras={loras} axes={axes} mode={batchMode} preview={preview} error={batchError} disabled={!workspace} onAxes={(next) => { setAxes(next); setPreview([]); setBatchError(""); }} onMode={(next) => { setBatchMode(next); setPreview([]); setBatchError(""); }} onPreview={(jobs, error) => { setPreview(jobs); setBatchError(error); }} onQueue={() => void queuePreview()} onTryAllLoras={() => {
+        <BatchPanel settings={settings} loras={loras} axes={axes} mode={batchMode} preview={preview} error={batchError} disabled={!workspace || contextBusy} onAxes={(next) => { setAxes(next); setPreview([]); setBatchError(""); }} onMode={(next) => { setBatchMode(next); setPreview([]); setBatchError(""); }} onPreview={(jobs, error) => { setPreview(jobs); setBatchError(error); }} onQueue={() => void queuePreview()} onTryAllLoras={() => {
           const values = loras.map((lora) => lora.path).join("\n");
           const nextAxes = axes.some((axis) => axis.parameter === "lora")
             ? axes.map((axis) => axis.parameter === "lora" ? { ...axis, values } : axis)
@@ -301,16 +336,15 @@ export default function App() {
           try { setPreview(planJobs(settings, nextAxes, batchMode)); setBatchError(""); }
           catch (reason) { setPreview([]); setBatchError(reason instanceof Error ? reason.message : String(reason)); }
         }} />
-        <ChatPanel settings={settings} loras={loras} sessionId={workspace?.session_id ?? null} disabled={!workspace} onQueue={queueChatRequests} />
         {groupedComparison && <p className="comparison-note">The gallery labels prompt and seed so this matrix stays comparable after rendering.</p>}
       </aside>
       <div className="work-area">
-        <Gallery images={images} selected={selected} fullUrl={fullUrl} currentSessionId={workspace?.session_id ?? null} sessions={sessions} deleting={deleting} sessionDeletionDisabled={queue.active} onDelete={(image) => workspace && setDeleteTarget({ workspacePath: workspace.path, image })} onDeleteSession={(session) => workspace && setDeleteTarget({ workspacePath: workspace.path, session })} onSelect={(image) => void chooseSelected(image)} onUseSource={(image) => void useAsSource(image)} onRestore={(image) => void restore(image)} onReveal={(image) => void bridge.reveal(image.path).catch((reason: unknown) => setNotice(errorText(reason)))} />
-        <QueuePanel items={queue.items} paused={queue.paused} running={queue.running} pending={queue.pending} preparing={queue.preparing} discarding={queue.discarding} onStop={queue.stopAfterCurrent} onResume={queue.resume} onRetry={queue.retry} onClear={queue.clearFinished} onDiscard={() => void queue.discardPending().catch((reason: unknown) => setNotice(errorText(reason)))} />
+        <Gallery images={images} selected={selected} fullUrl={fullUrl} currentSessionId={workspace?.session_id ?? null} sessions={sessions} deleting={deleting} sessionDeletionDisabled={queue.active || contextBusy} onDelete={(image) => workspace && setDeleteTarget({ workspacePath: workspace.path, image })} onDeleteSession={(session) => workspace && setDeleteTarget({ workspacePath: workspace.path, session })} onSelect={(image) => void chooseSelected(image)} onUseSource={(image) => void useAsSource(image)} onRestore={(image) => void restore(image)} onReveal={(image) => void bridge.reveal(image.path).catch((reason: unknown) => setNotice(errorText(reason)))} />
+        <QueuePanel held={queue.held} items={queue.items} paused={queue.paused} running={queue.running} pending={queue.pending} preparing={queue.preparing} discarding={queue.discarding || contextBusy} onStop={queue.stopAfterCurrent} onResume={() => { if (!contextReserved.current) queue.resume(); }} onRetry={(key) => { if (!contextReserved.current) queue.retry(key); }} onClear={queue.clearFinished} onDiscard={() => void queue.discardPending().catch((reason: unknown) => setNotice(errorText(reason)))} />
       </div>
     </main>
-    {serverOpen && <ServerDialog config={config} configPath={configPath} required={serverRequired} disabled={queue.active} onClose={() => setServerOpen(false)} onSave={saveConfig} onCheck={checkConfig} />}
-    {workspacePrompt && !serverOpen && <div className="modal-backdrop" role="presentation"><section className="modal workspace-modal" role="dialog" aria-modal="true" aria-labelledby="workspace-title"><p className="eyebrow">First workspace</p><h2 id="workspace-title">Choose where your sessions live</h2><p className="muted">Each generation is saved with its metadata and local input snapshots. You can switch among recent workspaces later.</p><button className="primary-button full-button" onClick={() => void chooseWorkspace()}>Choose workspace folder</button><p className="field-help">Canceling the folder picker is safe. This window stays here so you can try again.</p></section></div>}
+    {serverOpen && <ServerDialog config={config} configPath={configPath} required={serverRequired} disabled={queue.active || contextBusy} onClose={() => setServerOpen(false)} onSave={saveConfig} onCheck={checkConfig} />}
+    {workspacePrompt && !serverOpen && <div className="modal-backdrop" role="presentation"><section className="modal workspace-modal" role="dialog" aria-modal="true" aria-labelledby="workspace-title"><p className="eyebrow">First workspace</p><h2 id="workspace-title">Choose where your sessions live</h2><p className="muted">Each generation is saved with its metadata and local input snapshots. You can switch among recent workspaces later.</p><button className="primary-button full-button" disabled={contextBusy || queue.active} onClick={() => void chooseWorkspace()}>Choose workspace folder</button><p className="field-help">Canceling the folder picker is safe. This window stays here so you can try again.</p></section></div>}
     {maskOpen && settings.initImage && <MaskEditor source={settings.initImage} initial={settings.mask} onCancel={() => setMaskOpen(false)} onSave={(mask) => { changeSettings({ ...settings, mask }); setMaskOpen(false); }} />}
     {deleteTarget && <div className="modal-backdrop delete-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="delete-title"><h2 id="delete-title">{deleteTarget.image ? "Delete image?" : "Delete whole session?"}</h2><p className="muted">{deleteTarget.image ? "Permanently delete this image and its YAML generation record. Shared input snapshots remain available to other images." : `Permanently delete session ${deleteTarget.session?.session_id}, including all ${deleteTarget.session?.image_count} images, YAML records and input snapshots. This includes images outside the loaded gallery.`}</p><p>This cannot be undone.</p><div className="modal-actions"><button className="quiet-button" disabled={deleting} onClick={() => setDeleteTarget(null)}>Cancel</button><button className="primary-button danger-button" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? "Deleting…" : "Delete permanently"}</button></div></section></div>}
   </div>;

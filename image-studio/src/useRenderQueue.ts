@@ -3,6 +3,7 @@ import { MAX_JOBS, type PlannedJob, type SavedImage } from "./domain";
 import { bridge } from "./bridge";
 import { createBatchDraft, type BatchDefinition } from "./batchDraft";
 import { reportError } from "./logging";
+import { createRenderScheduler, type SchedulerState } from "./renderScheduler";
 
 export type QueueStatus = "pending" | "running" | "done" | "error";
 export interface QueueItem {
@@ -31,13 +32,14 @@ function copyJob(job: PlannedJob): PlannedJob {
 
 export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
   const [items, setItems] = useState<QueueItem[]>([]);
-  const [paused, setPausedState] = useState(false);
+  const [{ paused, held }, setSchedulerState] = useState<SchedulerState>({ paused: false, held: false });
+  const schedulerRef = useRef<ReturnType<typeof createRenderScheduler> | null>(null);
+  if (!schedulerRef.current) schedulerRef.current = createRenderScheduler(setSchedulerState);
+  const scheduler = schedulerRef.current;
   const [preparing, setPreparing] = useState(0);
   const [discarding, setDiscarding] = useState(false);
   const itemsRef = useRef<QueueItem[]>([]);
-  const pausedRef = useRef(false);
   const preparingRef = useRef(0);
-  const runningRef = useRef(false);
   const discardingRef = useRef(false);
   const preparationTail = useRef<Promise<void>>(Promise.resolve());
   const callbackRef = useRef(onOutputs);
@@ -49,15 +51,13 @@ export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
     setItems(next);
   }, []);
   const setPaused = useCallback((next: boolean) => {
-    pausedRef.current = next;
-    setPausedState(next);
-  }, []);
+    scheduler.setPaused(next);
+  }, [scheduler]);
 
   useEffect(() => {
-    if (pausedRef.current || discardingRef.current || paused || discarding || runningRef.current) return;
+    if (discardingRef.current || discarding) return;
     const next = itemsRef.current.find((item) => item.status === "pending");
-    if (!next) return;
-    runningRef.current = true;
+    if (!next || !scheduler.tryStart()) return;
     replaceItems((current) => current.map((item) => item.key === next.key ? { ...item, status: "running", error: undefined, startedAt: Date.now() } : item));
     void bridge.renderBatchJob(next.sessionId, next.batchId, next.jobId).then((outputs) => {
       replaceItems((current) => current.map((item) => item.key === next.key ? { ...item, status: "done", outputs } : item));
@@ -66,10 +66,10 @@ export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
       reportError("frontend.render", error);
       replaceItems((current) => current.map((item) => item.key === next.key ? { ...item, status: "error", error: error instanceof Error ? error.message : String(error) } : item));
     }).finally(() => {
-      runningRef.current = false;
+      scheduler.finish();
       replaceItems((current) => [...current]);
     });
-  }, [discarding, items, paused, replaceItems]);
+  }, [discarding, held, items, paused, replaceItems, scheduler]);
 
   const enqueue = useCallback((jobs: PlannedJob[], sessionId: string, definition: BatchDefinition): Promise<void> => {
     if (!jobs.length) throw new Error("A batch must contain at least one image.");
@@ -81,7 +81,7 @@ export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
     const startsNewRun = preparingRef.current === 0 && !itemsRef.current.some((item) => item.status === "pending" || item.status === "running");
     preparingRef.current += jobs.length;
     setPreparing(preparingRef.current);
-    if (startsNewRun) setPaused(false);
+    scheduler.prepareRun(startsNewRun);
 
     const prepare = preparationTail.current.then(async () => {
       const handle = await bridge.createBatch(sessionId, draft);
@@ -101,7 +101,7 @@ export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
     });
     preparationTail.current = prepare.catch(() => undefined);
     return prepare;
-  }, [replaceItems, setPaused]);
+  }, [replaceItems, scheduler]);
 
   const retry = useCallback((key: string) => {
     if (discardingRef.current) return;
@@ -148,7 +148,9 @@ export function useRenderQueue(onOutputs: (images: SavedImage[]) => void) {
     pending,
     preparing,
     discarding,
-    active: preparing > 0 || running || pending > 0,
+    held,
+    active: held || preparing > 0 || running || pending > 0,
+    acquireTurn: scheduler.acquireTurn,
     enqueue,
     retry,
     clearFinished,

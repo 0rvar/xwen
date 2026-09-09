@@ -280,7 +280,7 @@ impl Studio {
         let messages = add_prompt_guide(messages);
         self.language_request(json!({
             "stream": false,
-            "max_completion_tokens": 1024,
+            "max_completion_tokens": 8192,
             "chat_template_kwargs": {"enable_thinking": false},
             "messages": messages,
             "tools": tools,

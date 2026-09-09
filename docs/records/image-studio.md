@@ -294,6 +294,42 @@ smaller value set as columns, leaving the larger set as rows; missing cells rema
 empty, and selecting a cell returns to the ordinary preview. Batches with more than two
 axes stay in the normal gallery because their projection would be ambiguous.
 
+## Assistant sidebar and completed-turn batches
+
+2026-09-09. Chat now opens as a left sidebar that pushes the editor and gallery
+right. Closing it preserves the conversation and unsent text. Narrow windows stack
+the panels without horizontal overflow.
+
+Direct generation requests use the current defaults without another confirmation.
+`queue_txt2img` accepts a `jobs` array, with `n` repeats on each job. Every tool call
+is processed, and inference continues until an explicit final reply, with a
+16-response guard. Validated jobs stay local to the turn and become one saved batch
+only after that reply. Invalid, truncated or unfinished turns submit nothing.
+This supersedes the four-round, immediate-submission loop described above.
+
+A scheduler hold lets an active image finish before chat inference begins and
+prevents the next image from starting until the turn and batch save finish. Manual
+pause survives the hold. Workspace selection, server settings and session deletion
+reserve context before their asynchronous work, preventing a pending change from
+moving a chat batch into another session.
+
+Verification: 72 frontend unit tests pass, including malformed calls, seed overflow,
+multiple rounds, atomic submission and scheduler holds. All seven new browser tests
+pass; the full suite reports 31 passed and one pre-existing failure whose selector
+expects “Restore settings” instead of the gallery's “Restore selected.” The native
+language-tools test passes with the chat output budget increased to 8192 tokens.
+The production macOS app bundle builds and the documentation check passes.
+Two code reviewers checked the turn and scheduler paths; the workspace race found
+in review was reproduced and fixed.
+An outside Qwen review raised no confirmed defects: context stays reserved through
+submission, `finally` releases it on config-save failures, rejected promises cannot
+publish the cloned transcript, and the queue explicitly labels the assistant hold.
+
+A live uncensored-35B check requested six images across three prompts. It made one
+batched tool call immediately and ended on the second response without asking for
+confirmation. The queue callback was a recorder, so this check rendered no images.
+No model math or performance figures changed.
+
 ## Not taken now
 
 Pending queue recovery across an app restart is not implemented. Batch plans,

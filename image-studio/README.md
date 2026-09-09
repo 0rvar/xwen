@@ -120,11 +120,18 @@ Run `xwen fetch-model Qwen3.6-35B-A3B-uncensored` on the server to enable the pr
 model. **Use prompt** replaces the main prompt with the draft. Closing
 the generator leaves the main prompt unchanged.
 
-**Chat with image assistant** opens a conversation with the selected 35B checkpoint.
-The assistant receives the current output defaults and the server's live LoRA
-list, and can call `queue_txt2img` to add text-to-image jobs to the same durable queue.
-It cannot perform img2img, inpainting or ControlNet yet. Tool requests are validated by
-the client before enqueueing; use the exact LoRA paths shown by the server.
+**Chat with image assistant** opens a left sidebar, moving the controls and gallery
+to the right. Closing it keeps the conversation and unsent message.
+Ask directly for images, variations or comparisons; the assistant uses the current
+defaults and available LoRAs without asking for redundant confirmation. Its
+`queue_txt2img` tool accepts several jobs at once, including repeats of each prompt.
+
+Jobs stay staged until the assistant finishes its reply. The client continues through
+tool calls, then saves all the turn's jobs as one batch. A failed, truncated or
+unfinished turn submits nothing. While chat is active, an already-running image may
+finish, but no next image starts; the first LLM request waits for that image to finish.
+A manually paused queue stays paused. Staged and queued counts are shown separately.
+The assistant supports text-to-image only, not img2img, inpainting or ControlNet.
 
 ## Batches
 

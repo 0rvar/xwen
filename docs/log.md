@@ -4,6 +4,15 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-09 — Image assistant stages complete batches from a left sidebar
+
+Chat pushes the workspace right and handles direct generation requests through a
+batched tool. Jobs are submitted only after the final assistant reply; image dispatch
+waits through inference and preserves manual pause. The live uncensored-35B check
+staged six images in one tool call without confirmation. All 72 frontend unit tests
+and seven new browser tests pass. The full browser suite has one existing restore-label
+failure. [Behavior and verification](records/image-studio.md#assistant-sidebar-and-completed-turn-batches).
+
 ## 2026-09-09 — Uncensored 35B is selectable when cached and preferred by Image Studio
 
 `Qwen3.6-35B-A3B-uncensored` names HauhauCS's Qwen3.5 aggressive Q4_K_M fine-tune.
