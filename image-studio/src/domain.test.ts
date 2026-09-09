@@ -95,6 +95,10 @@ describe('batch ranges and matrices', () => {
       [{ name: '/srv/two.safetensors', weight: 0.7 }],
     ]);
   });
+  test('LoRA axes default to a restrained exploratory weight', () => {
+    const jobs = planJobs(settings(), [{ parameter: 'lora', values: '/srv/one.safetensors' }]);
+    expect(jobs[0]!.request.loras).toEqual([{ name: '/srv/one.safetensors', weight: 0.8 }]);
+  });
   test('random seed is resolved once and then explicit in every request', () => {
     const jobs = planJobs(settings({ seed: '', count: 2 }), [{ parameter: 'steps', values: '4,8' }]);
     expect(Number.isSafeInteger(jobs[0]!.request.seed)).toBe(true);

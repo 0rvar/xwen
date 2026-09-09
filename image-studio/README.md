@@ -136,7 +136,7 @@ The **Try with all LoRAs** button fills or replaces the `lora` axis from the
 server's current LoRA list and previews one job per adapter. It replaces the
 active LoRA stack so the comparison is one adapter against the same prompt and
 seed; other batch axes remain in place. Each adapter uses the first active LoRA's
-weight, or `1` when none is active. Refresh the LoRA list first after adding
+weight, or `0.8` when none is active. Refresh the LoRA list first after adding
 files to the server.
 
 The app validates the whole plan before sending anything and caps it at 1000 images.

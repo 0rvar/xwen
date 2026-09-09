@@ -187,7 +187,7 @@ function applyAxis(request: RenderRequest, parameter: string, value: string | nu
   if (parameter === 'prompt') { request.prompt = String(value); return; }
   if (parameter === 'lora') {
     ensure(typeof value === 'string' && value.trim(), 'LoRA values must be nonempty paths.');
-    request.loras = [{ name: value, weight: request.loras[0]?.weight ?? 1 }];
+    request.loras = [{ name: value, weight: request.loras[0]?.weight ?? 0.8 }];
     return;
   }
   ensure(typeof value === 'number', `${parameter} requires numeric values.`);
