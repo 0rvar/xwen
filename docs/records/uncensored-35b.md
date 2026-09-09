@@ -75,5 +75,27 @@ is in the browser preview mock, not the native server error path. No changes wer
 needed. Review output is `/tmp/uncensored-qwen-review-small.log`.
 
 The macOS application bundle built successfully. `cargo install --path . --locked`
-installed the updated CLI. Full-file download and generation verification follow
-once the ongoing `fetch-model` transfer completes.
+installed the updated CLI.
+
+## Download verified, GPU test held
+
+The new `fetch-model` command completed the 21,169,117,248-byte download successfully
+on 2026-09-09. A streamed SHA-256 check of the complete file matched the upstream hash
+above. A second invocation through the installed `xwen` command returned the same
+cached snapshot immediately. Evidence is in `/tmp/uncensored-fetch.log`,
+`/tmp/uncensored-cache-hit.log` and `/tmp/uncensored-download-verified.json`.
+
+The owner requested a pause on live GPU testing while generating images. The
+uncensored checkpoint has therefore not run a generation command yet. Once the
+owner gives the go-ahead and the GPU is free, run one smoke test:
+
+```bash
+xwen generate --model-size Qwen3.6-35B-A3B-uncensored --prompt "In one sentence, explain why the sky appears blue." --no-think --no-draft --max-tokens 96 --temp 0 --max-ctx 4096
+```
+
+Check the reported checkpoint identity, a coherent answer and a clean stop. Then
+check that the cached ID is listed and accepted by the live API. Unit tests cover
+the cached branch; the live HTTP checks so far cover only the uncached branch.
+The temporary verification server at `127.0.0.1:5241` was left running during the
+owner's image work. It was started with regular 35B as its default and a one-second
+idle-unload interval; check its current use before stopping or replacing it.
