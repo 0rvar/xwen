@@ -24,6 +24,10 @@ export function QueuePanel({ items, paused, running, pending, preparing, discard
   }, [running]);
   const done = items.filter((item) => item.status === "done").length;
   const failed = items.filter((item) => item.status === "error").length;
+  const orderedItems = [...items].sort((a, b) => {
+    const rank = { running: 0, pending: 1, error: 2, done: 3 } as const;
+    return rank[a.status] - rank[b.status];
+  });
   return (
     <section className="queue-panel" aria-labelledby="queue-title">
       <header className="panel-heading queue-heading">
@@ -37,9 +41,9 @@ export function QueuePanel({ items, paused, running, pending, preparing, discard
       </div>
       {!items.length ? <p className="empty-note">{preparing > 0 ? "Saving batch manifest before rendering…" : "Rendered jobs appear here. Requests run one at a time."}</p> : (
         <ol className="queue-list">
-          {items.map((item) => <li key={item.key} className={`queue-item ${item.status}`}>
+          {orderedItems.map((item) => <li key={item.key} className={`queue-item ${item.status}`}>
             <span className="status-dot" aria-hidden="true" />
-            <div><strong>{item.job.request.prompt}</strong><small>Seed {item.job.request.seed} · {item.job.request.width}×{item.job.request.height}</small>{item.error && <small className="danger-text">{item.error}</small>}</div>
+            <div><strong>{item.job.request.prompt}</strong><small>Seed {item.job.request.seed} · {item.job.request.width}×{item.job.request.height}</small>{item.error && <small className="danger-text">{item.error}</small>}{item.status === "running" && <progress className="queue-progress" aria-label="Rendering" />}</div>
             <span className="queue-status">{item.status === "running" && item.startedAt ? `running ${Math.floor((Date.now() - item.startedAt) / 1000)}s` : item.status}</span>
             {item.status === "error" && <button className="text-button" disabled={discarding} onClick={() => onRetry(item.key)}>Retry</button>}
           </li>)}

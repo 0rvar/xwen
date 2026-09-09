@@ -618,7 +618,7 @@ GPU buffers are released before the next load. This also covers `generate`, `cha
 can yield to a CLI command. Older binaries and other inference applications do not
 participate: stop older Xwen processes before using this build.
 
-Admission reserves at least 16 GiB or 15% of RAM for the system, whichever is larger,
+Admission reserves at least 16 GiB or 10% of RAM for the system, whichever is larger,
 and checks estimated allocation peaks against current system use. Warning pressure
 blocks new work and unloads idle models. Critical pressure cancels ongoing work at
 safe boundaries; reaching the measured headroom limit does too, even without a native

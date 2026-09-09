@@ -13,6 +13,13 @@ squared, and bounded memory telemetry records the next incident. The reboot repo
 identified a wireless-driver timeout, not a proven GPU fault. [Design, limits and
 verification](records/memory-safety.md).
 
+## 2026-09-09 — Image Studio prioritizes active queue work and relaxes false refusals
+
+The queue keeps running and waiting jobs above completed work and shows an indeterminate
+progress bar for the active render. Normal-pressure admission now reserves max(16 GiB,
+10% of RAM), while warning and critical pressure remain hard stops; this avoids rejecting
+the observed 113.7 GiB projection on a 128 GiB machine with normal pressure.
+
 ## 2026-09-09 — Image Studio shows generation parameters and saves batch manifests
 
 The image viewer shows strength, steps and edit controls without opening raw

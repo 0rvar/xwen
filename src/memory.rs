@@ -21,6 +21,8 @@ use std::{
 };
 
 const GIB: u64 = 1 << 30;
+const MIN_SYSTEM_RESERVE: u64 = 16 * GIB;
+const SYSTEM_RESERVE_PERCENT: u64 = 10;
 const POLL: Duration = Duration::from_millis(50);
 
 unsafe extern "C" {
@@ -495,7 +497,7 @@ fn admit_snapshot(s: &Snapshot, projected: u64) -> Result<()> {
         .context("cannot read system memory use for memory admission")?;
     s.process_footprint_bytes
         .context("cannot read process footprint for memory admission")?;
-    let reserve = (16 * GIB).max(physical.saturating_mul(15) / 100);
+    let reserve = system_reserve(physical);
     let budget = physical.saturating_sub(reserve);
     // Do not subtract process footprint from a differently accounted system counter.
     let future = used
@@ -529,12 +531,16 @@ fn runtime_stop_reason(snapshot: &Snapshot) -> Option<&'static str> {
         return Some("runtime: system memory pressure is critical");
     }
     if let (Some(physical), Some(used)) = (snapshot.physical_bytes, snapshot.system_used_bytes) {
-        let reserve = (16 * GIB).max(physical.saturating_mul(15) / 100);
+        let reserve = system_reserve(physical);
         if used >= physical.saturating_sub(reserve) {
             return Some("runtime: system memory headroom exhausted");
         }
     }
     None
+}
+
+fn system_reserve(physical: u64) -> u64 {
+    MIN_SYSTEM_RESERVE.max(physical.saturating_mul(SYSTEM_RESERVE_PERCENT) / 100)
 }
 
 pub fn sample(_label: &str, device: Option<&Device>) -> Snapshot {
@@ -740,9 +746,9 @@ mod tests {
     fn admission_never_credits_process_footprint_and_keeps_reserve() {
         let mut s = snapshot();
         assert!(admit_snapshot(&s, 70 * GIB).is_ok());
-        assert!(admit_snapshot(&s, 80 * GIB).is_err());
+        assert!(admit_snapshot(&s, 90 * GIB).is_err());
         s.process_footprint_bytes = Some(127 * GIB);
-        assert!(admit_snapshot(&s, 80 * GIB).is_err());
+        assert!(admit_snapshot(&s, 90 * GIB).is_err());
         s.pressure = Pressure::Warning;
         assert!(admit_snapshot(&s, GIB).is_err());
         s.pressure = Pressure::Critical;
@@ -772,7 +778,7 @@ mod tests {
         let mut s = snapshot();
         assert!(runtime_stop_reason(&s).is_none());
         let physical = s.physical_bytes.unwrap();
-        let budget = physical - (16 * GIB).max(physical * 15 / 100);
+        let budget = physical - system_reserve(physical);
         s.pressure = Pressure::Unknown;
         s.system_used_bytes = Some(budget);
         assert_eq!(

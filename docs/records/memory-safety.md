@@ -36,7 +36,7 @@ older binaries and other applications do not participate.
 
 Admission samples physical RAM, anonymous/wired/compressor pages, process footprint
 and pressure. It adds projected new allocations to system usage and preserves
-max(16 GiB, 15% RAM). It does not subtract process footprint from a different OS
+max(16 GiB, 10% RAM). It does not subtract process footprint from a different OS
 accounting ledger. Missing required RAM/use readings refuse admission; unknown pressure
 is recorded as unknown. Metal's recommended working-set size is diagnostic, not free
 RAM. Language admission includes initial KV/state, an 8 GiB scratch allowance and up
