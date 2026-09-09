@@ -50,6 +50,7 @@ unicode-width = "0.2"
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: JSON objects keep the key order they were parsed/built in.
 # The chat template dumps tool schemas and call arguments verbatim, so byte-exact

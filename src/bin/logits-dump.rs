@@ -581,9 +581,11 @@ fn observed_delta_path(cfg: &xwen::XwenConfig) -> Result<&'static str> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let _residency = xwen::memory::acquire("logits-dump", &xwen::memory::check_runtime)?;
     let runner = expert_runner(&cli.moe_impl)?;
 
     let device = gguf::metal_device()?;
+    let _drain = xwen::memory::DeviceDrain(device.clone());
     // The path decides what it is (a GGUF, a safetensors directory), exactly
     // as on every other surface; --model-size is the cross-check and the
     // source of a documented zero-run allowlist.

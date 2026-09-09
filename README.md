@@ -214,9 +214,9 @@ encoder is not loaded and the prompt is ignored; `--dump <dir>` writes the step-
 and the final latent beside the PNG, which is how a run is graded against the reference
 dump by hand (docs/parity.md). Sizes must
 be multiples of 16, with an image token count `(w/16) * (h/16)` that is a multiple of 32
-and neither side past 8192 px; 1024x1024, 1024x768, 512x512 and 1536x1024 all satisfy all
-three. Anything else is refused with the reason, because the padded-image path is not
-implemented and 8192 px is as far as the model's position tables reach.
+and neither side past 8192 px. Memory admission additionally caps the area at
+1,048,576 pixels: 1024x1024, 1024x768 and 512x512 are accepted; 1536x1024 is refused.
+Larger areas need peak-memory measurements before this limit can be raised.
 
 One image at 1024x1024 takes 22-25 s warm, of which 14-16 s is the eight transformer steps
 and 1.4 s the VAE decode, the rest being load; 512x512 takes 8.1 s. A 1024x1024 step reads
@@ -601,6 +601,29 @@ count for every request that names none, which is how a client with no step fiel
 own renders at 4 or 6. 1024x1024 measured 49 s warm and 80 s cold with load included,
 both taken before the four performance arcs of 2026-09-07 and 2026-09-08 cut the render
 from about 47 s to 15.5-17.5 s; the route has not been re-timed since.
+
+**Memory ownership (2026-09-09).** Language and image engines take turns holding
+models, including while idle. A waiting engine or another updated Xwen process
+requests an unload; the active request finishes, then the model, host caches and
+GPU buffers are released before the next load. This also covers `generate`, `chat`,
+`batch`, `encode-text`, `image`, `logits-dump` and `spec-verify-bench`. An idle server
+can yield to a CLI command. Older binaries and other inference applications do not
+participate: stop older Xwen processes before using this build.
+
+Admission reserves at least 16 GiB or 15% of RAM for the system, whichever is larger,
+and checks estimated allocation peaks against current system use. Warning pressure
+blocks new work and unloads idle models. Critical pressure cancels ongoing work at
+safe boundaries; reaching the measured headroom limit does too, even without a native
+pressure reading. Image disconnects cancel queued and running work; a submitted GPU
+command must still finish. Image memory refusals return 503 with `Retry-After: 5`;
+unsupported image area returns 400. Switching engines discards warm conversation
+caches, so the next language request may need a full prefill.
+
+`~/.local/state/xwen/memory.jsonl` records pressure, process footprint, admission
+estimates and allocation events without prompts. It keeps at most roughly 16 MiB,
+clearing the file at that limit; collect it promptly after an incident. Metal
+allocation counters appear at device events. These estimates are conservative
+policies, not measured peak guarantees. [Design and verification](docs/records/memory-safety.md).
 
 ```
 curl -sS http://127.0.0.1:8080/v1/images/generations \

@@ -451,3 +451,21 @@ recorded. `Model::trained_context()` is a registry constant read off the cached 
 capped by the configured limit, and the refusal names the checkpoint it applies to. The
 engine still re-derives its own limit at load, which stays authoritative for what runs
 (2026-09-07).
+
+
+**Resident memory ownership spans engines and processes (2026-09-09).**
+The reported Flash-Next/image overlap exhausted responsiveness on the 128 GB machine.
+The kernel panic was a Centauri wireless-controller termination timeout; memory
+pressure as its cause remains unproven. The application gap was established:
+independent engines retained both models, an explicitly deferred hazard. All updated
+Xwen inference commands now share one resident ownership slot per user, with OS file
+locks for processes and a waiter signal for idle owners. Active requests finish on
+ordinary contention; critical pressure cancels them. Transfer drops models and host
+caches without taking a new disk snapshot, drains GPU work, then releases ownership.
+A compute-only mutex was rejected because it leaves idle weights resident. The initial
+policy serializes smaller checkpoints too; allowing coexistence again requires measured
+combined peaks and a reservation design. Admission preserves max(16 GiB, 15% RAM),
+uses system anonymous/wired/compressor usage, and gives no credit for subtracting the
+process footprint because those ledgers have different meanings. Image area is capped
+at 1,048,576 pixels. These are conservative policies; they do not establish the cause
+of the wireless-driver panic. [Record](../records/memory-safety.md).

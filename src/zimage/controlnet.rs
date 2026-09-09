@@ -265,11 +265,14 @@ impl ControlNet {
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<RefinerSamples> {
+        check()?;
         let (patches, _) = patchify(context, 2, 1)?;
         let mut c = self.embedding.forward(&patches)?;
         let mut residuals = Vec::with_capacity(2);
         for block in &self.refiners {
+            check()?;
             let (skip, next) = block.forward(&c, x, cos, sin, adaln)?;
             residuals.push(skip);
             c = next;
@@ -288,10 +291,13 @@ impl ControlNet {
         cos: &Tensor,
         sin: &Tensor,
         adaln: &Tensor,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Tensor>> {
+        check()?;
         let mut c = Tensor::cat(&[image_hidden, cap], 1)?;
         let mut residuals = Vec::with_capacity(self.layers.len());
         for block in &self.layers {
+            check()?;
             let (skip, next) = block.forward(&c, unified, cos, sin, adaln)?;
             residuals.push(skip);
             c = next;

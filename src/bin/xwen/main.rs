@@ -1581,6 +1581,7 @@ fn build_generator(
 ) -> Result<Generator> {
     let runner = expert_runner(moe_impl)?;
     let device = gguf::metal_device()?;
+    let _drain = xwen::memory::DeviceDrain(device.clone());
 
     let load_start = std::time::Instant::now();
     let mut generator = Generator::load(
@@ -1694,6 +1695,22 @@ fn load_drafter(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // The server acquires ownership for each resident engine. One-shot commands
+    // keep it until their model and device have been destroyed.
+    let _residency = if matches!(
+        &cli.cmd,
+        Some(
+            Cmd::Generate { .. }
+                | Cmd::Chat { .. }
+                | Cmd::Batch { .. }
+                | Cmd::EncodeText { .. }
+                | Cmd::Image { .. }
+        )
+    ) {
+        Some(xwen::memory::acquire("cli", &xwen::memory::check_runtime)?)
+    } else {
+        None
+    };
     match cli.cmd {
         // No subcommand: serve, with whatever serve flags were passed at the
         // top level.
@@ -2244,6 +2261,7 @@ fn run_encode_text(
     );
     let path = resolve_model(model, size)?;
     let device = gguf::metal_device()?;
+    let _drain = xwen::memory::DeviceDrain(device.clone());
     let source = CheckpointSource::open(&path, &device, Some(size))?;
     let set = source
         .safetensors()
@@ -2434,6 +2452,13 @@ fn run_image(args: ImageArgs) -> Result<()> {
         None => requested_size.unwrap_or((1024, 1024)),
     };
     ZImagePipeline::check_size(width, height)?;
+    let peak = xwen::memory::image_peak(
+        u32::try_from(width)?,
+        u32::try_from(height)?,
+        args.controls.control.is_some(),
+        args.controls.loras.len(),
+    )?;
+    xwen::memory::admit("cli image", peak)?;
     let edit = source
         .map(|source| -> Result<_> {
             let mask = args
@@ -2559,6 +2584,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
     );
 
     let device = gguf::metal_device()?;
+    let _drain = xwen::memory::DeviceDrain(device.clone());
     let total_start = std::time::Instant::now();
     adapters.validate_base(&root)?;
     if let Some(control) = &mut control {
@@ -2615,6 +2641,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
         &adapters,
         control_path.as_deref(),
     )?;
+    xwen::memory::log_event("cli Z-Image-Turbo loaded", Some(&device));
     eprintln!(
         "xwen: transformer and VAE loaded in {:.1}s",
         load_start.elapsed().as_secs_f64()
@@ -2645,6 +2672,10 @@ fn run_image(args: ImageArgs) -> Result<()> {
         (Some(edit), None) => pipeline.generate_edited(&cap_feats, &opts, edit)?,
         (None, None) => pipeline.generate(&cap_feats, &opts)?,
     };
+    xwen::memory::log_event(
+        &format!("cli image finished: {width}x{height}, {} steps", args.steps),
+        Some(&device),
+    );
     eprintln!(
         "xwen: schedule starts at step {} of {}",
         rendered.start_step, args.steps

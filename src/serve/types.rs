@@ -412,6 +412,8 @@ pub enum CancelReason {
     Deadline,
     /// The server is shutting down.
     Shutdown,
+    /// The system needs memory returned before inference can continue.
+    MemoryPressure,
 }
 
 impl CancelReason {
@@ -421,6 +423,7 @@ impl CancelReason {
             CancelReason::ClientGone => "client gone",
             CancelReason::Deadline => "deadline",
             CancelReason::Shutdown => "shutdown",
+            CancelReason::MemoryPressure => "memory pressure",
         }
     }
 
@@ -430,6 +433,7 @@ impl CancelReason {
             CancelReason::ClientGone => 1,
             CancelReason::Deadline => 2,
             CancelReason::Shutdown => 3,
+            CancelReason::MemoryPressure => 4,
         }
     }
 
@@ -438,6 +442,7 @@ impl CancelReason {
             1 => Some(CancelReason::ClientGone),
             2 => Some(CancelReason::Deadline),
             3 => Some(CancelReason::Shutdown),
+            4 => Some(CancelReason::MemoryPressure),
             _ => None,
         }
     }
@@ -571,6 +576,7 @@ mod tests {
             CancelReason::ClientGone,
             CancelReason::Deadline,
             CancelReason::Shutdown,
+            CancelReason::MemoryPressure,
         ];
         let cancel = Arc::new(Cancel::default());
         let writers: Vec<_> = reasons

@@ -4,6 +4,15 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-09 — Xwen coordinates resident models and responds to memory pressure
+
+Language and image engines, plus updated CLI processes, share resident memory ownership.
+Waiting work triggers eviction after the active request; critical pressure cancels work
+at safe boundaries. Admission reserves system headroom, image area is capped at 1024
+squared, and bounded memory telemetry records the next incident. The reboot report
+identified a wireless-driver timeout, not a proven GPU fault. [Design, limits and
+verification](records/memory-safety.md).
+
 ## 2026-09-09 — Image Studio shows generation parameters and saves batch manifests
 
 The image viewer shows strength, steps and edit controls without opening raw

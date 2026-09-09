@@ -816,10 +816,19 @@ impl Encoder {
 
 impl Module for Encoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_cancellable(xs, &|| Ok(()))
+    }
+}
+
+impl Encoder {
+    fn forward_cancellable(&self, xs: &Tensor, check: &dyn Fn() -> Result<()>) -> Result<Tensor> {
+        check()?;
         let mut h = xs.apply(&self.conv_in)?;
         for block in &self.down_blocks {
+            check()?;
             h = h.apply(block)?;
         }
+        check()?;
         h.apply(&self.mid_block)?
             .apply(&self.conv_norm_out)?
             .apply(&candle_nn::Activation::Swish)?
@@ -913,20 +922,26 @@ impl Decoder {
 }
 
 impl Decoder {
-    /// [`Module::forward`] with one row per stage. Same arithmetic; the
-    /// marks synchronize the device, so a profiled decode is slower than the
-    /// decode it describes.
-    fn forward_profiled(&self, xs: &Tensor, prof: &Profiler) -> Result<Tensor> {
+    fn forward_profiled_cancellable(
+        &self,
+        xs: &Tensor,
+        prof: &Profiler,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
         let mut h = xs.apply(&self.conv_in)?;
         prof.mark("conv_in");
+        check()?;
         h = self.mid_block.forward_profiled(&h, prof)?;
         for (i, block) in self.up_blocks.iter().enumerate() {
+            check()?;
             let labels = UP_LABELS
                 .get(i)
                 .copied()
                 .unwrap_or(("up*.resnets", "up*.upsample"));
             h = block.forward_profiled(&h, prof, labels)?;
         }
+        check()?;
         let out = self.tail(&h)?;
         prof.mark("norm_out+conv_out");
         Ok(out)
@@ -935,10 +950,21 @@ impl Decoder {
 
 impl Module for Decoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let mut h = xs.apply(&self.conv_in)?.apply(&self.mid_block)?;
+        self.forward_cancellable(xs, &|| Ok(()))
+    }
+}
+
+impl Decoder {
+    fn forward_cancellable(&self, xs: &Tensor, check: &dyn Fn() -> Result<()>) -> Result<Tensor> {
+        check()?;
+        let mut h = xs.apply(&self.conv_in)?;
+        check()?;
+        h = h.apply(&self.mid_block)?;
         for block in &self.up_blocks {
+            check()?;
             h = h.apply(block)?;
         }
+        check()?;
         self.tail(&h)
     }
 }
@@ -1015,7 +1041,17 @@ impl AutoEncoderKL {
 
     /// Encode using an explicit standard-normal posterior draw.
     pub fn encode_with_noise(&self, xs: &Tensor, noise: &Tensor) -> Result<Tensor> {
-        let moments = xs.apply(&self.encoder)?;
+        self.encode_with_noise_cancellable(xs, noise, &|| Ok(()))
+    }
+
+    pub fn encode_with_noise_cancellable(
+        &self,
+        xs: &Tensor,
+        noise: &Tensor,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        let moments = self.encoder.forward_cancellable(xs, check)?;
+        check()?;
         let chunks = moments.chunk(2, 1)?;
         if noise.dims() != chunks[0].dims() {
             candle_core::bail!("posterior noise shape does not match the VAE latent");
@@ -1028,7 +1064,16 @@ impl AutoEncoderKL {
 
     /// Encode at the posterior mean, with the Flux affine applied once.
     pub fn encode_mode(&self, xs: &Tensor) -> Result<Tensor> {
-        let chunks = xs.apply(&self.encoder)?.chunk(2, 1)?;
+        self.encode_mode_cancellable(xs, &|| Ok(()))
+    }
+
+    pub fn encode_mode_cancellable(
+        &self,
+        xs: &Tensor,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        let chunks = self.encoder.forward_cancellable(xs, check)?.chunk(2, 1)?;
+        check()?;
         (&chunks[0] - self.shift_factor)? * self.scale_factor
     }
 
@@ -1036,14 +1081,33 @@ impl AutoEncoderKL {
     /// xs: (B, latent_channels, H/8, W/8)
     /// Returns: (B, 3, H, W) RGB image, range [-1, 1]
     pub fn decode(&self, xs: &Tensor) -> Result<Tensor> {
+        self.decode_cancellable(xs, &|| Ok(()))
+    }
+
+    pub fn decode_cancellable(
+        &self,
+        xs: &Tensor,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
         let xs = ((xs / self.scale_factor)? + self.shift_factor)?;
-        xs.apply(&self.decoder)
+        self.decoder.forward_cancellable(&xs, check)
     }
 
     /// [`Self::decode`] with one profile row per decoder stage.
     pub fn decode_profiled(&self, xs: &Tensor, prof: &Profiler) -> Result<Tensor> {
+        self.decode_profiled_cancellable(xs, prof, &|| Ok(()))
+    }
+
+    pub fn decode_profiled_cancellable(
+        &self,
+        xs: &Tensor,
+        prof: &Profiler,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
         let xs = ((xs / self.scale_factor)? + self.shift_factor)?;
-        self.decoder.forward_profiled(&xs, prof)
+        self.decoder.forward_profiled_cancellable(&xs, prof, check)
     }
 
     /// Get scaling factor
@@ -1066,6 +1130,47 @@ impl Module for AutoEncoderKL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_vae_stops_before_encoding_or_decoding() {
+        let dev = candle_core::Device::Cpu;
+        let cfg = VaeConfig {
+            block_out_channels: vec![8],
+            norm_num_groups: 8,
+            layers_per_block: 1,
+            ..VaeConfig::z_image()
+        };
+        let vars = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, candle_core::DType::F32, &dev);
+        let vae = AutoEncoderKL::new_with_impl(&cfg, vb, VaeImpl::Candle).unwrap();
+        let scalar = Tensor::new(0f32, &dev).unwrap();
+        let check = || -> Result<()> { candle_core::bail!("request cancelled") };
+        assert_eq!(
+            vae.decode_cancellable(&scalar, &check)
+                .unwrap_err()
+                .to_string(),
+            "request cancelled"
+        );
+        assert_eq!(
+            vae.encode_mode_cancellable(&scalar, &check)
+                .unwrap_err()
+                .to_string(),
+            "request cancelled"
+        );
+        assert_eq!(
+            vae.encode_with_noise_cancellable(&scalar, &scalar, &check)
+                .unwrap_err()
+                .to_string(),
+            "request cancelled"
+        );
+        let prof = Profiler::new(&dev);
+        assert_eq!(
+            vae.decode_profiled_cancellable(&scalar, &prof, &check)
+                .unwrap_err()
+                .to_string(),
+            "request cancelled"
+        );
+    }
 
     #[test]
     fn vae_impl_parses_its_arms() {

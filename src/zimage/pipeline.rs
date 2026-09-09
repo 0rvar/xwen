@@ -191,6 +191,23 @@ impl ZImagePipeline {
         loras: &super::lora::PreparedLoras,
         control_path: Option<&Path>,
     ) -> Result<Self> {
+        Self::load_cancellable(
+            root,
+            device,
+            loras,
+            control_path,
+            &crate::memory::check_runtime,
+        )
+    }
+
+    pub fn load_cancellable(
+        root: &Path,
+        device: &Device,
+        loras: &super::lora::PreparedLoras,
+        control_path: Option<&Path>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        check()?;
         // Before anything opens: a typo in a bisect switch is a load error,
         // not a run that quietly measures the shipped arm twice.
         let attn = AttnImpl::from_env()?;
@@ -231,6 +248,7 @@ impl ZImagePipeline {
             check.finish()?;
         }
         eprintln!("xwen: {}", transformer.weight_range().summary());
+        check()?;
         let controlnet = control_path
             .map(|path| super::controlnet::ControlNet::load(path, &transformer_cfg, device))
             .transpose()?;
@@ -244,12 +262,14 @@ impl ZImagePipeline {
         };
 
         let vae_dir = root.join("vae");
+        check()?;
         let vae_cfg: VaeConfig = read_json(&vae_dir.join("config.json"))?;
         let vae_file = vae_dir.join("diffusion_pytorch_model.safetensors");
         ensure!(vae_file.is_file(), "missing {}", vae_file.display());
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&vae_file], DType::F32, device)? };
         let vae = AutoEncoderKL::new_with_impl(&vae_cfg, vb, vae_arm)
             .context("building the Z-Image VAE")?;
+        check()?;
 
         let scheduler_cfg: SchedulerConfig =
             read_json(&root.join("scheduler").join("scheduler_config.json"))?;
@@ -403,7 +423,7 @@ impl ZImagePipeline {
     /// Generate one image from `cap_feats`, the text encoder's `[T, 2560]`
     /// hidden state (any float dtype, any device).
     pub fn generate(&self, cap_feats: &Tensor, opts: &ImageOptions) -> Result<Rendered> {
-        self.generate_inner(cap_feats, opts, None, None)
+        self.generate_cancellable(cap_feats, opts, None, None, &crate::memory::check_runtime)
     }
 
     pub fn generate_edited(
@@ -412,8 +432,13 @@ impl ZImagePipeline {
         opts: &ImageOptions,
         edit: &ImageEdit,
     ) -> Result<Rendered> {
-        edit.validate(opts.width, opts.height)?;
-        self.generate_inner(cap_feats, opts, Some(edit), None)
+        self.generate_cancellable(
+            cap_feats,
+            opts,
+            Some(edit),
+            None,
+            &crate::memory::check_runtime,
+        )
     }
 
     pub fn generate_controlled(
@@ -423,15 +448,44 @@ impl ZImagePipeline {
         edit: Option<&ImageEdit>,
         control: &ImageControl,
     ) -> Result<Rendered> {
-        control.validate(opts.width, opts.height)?;
+        self.generate_cancellable(
+            cap_feats,
+            opts,
+            edit,
+            Some(control),
+            &crate::memory::check_runtime,
+        )
+    }
+
+    /// Render with cooperative checks before submitting each substantial phase.
+    /// Checks cannot interrupt work already submitted to Metal.
+    pub fn generate_cancellable(
+        &self,
+        cap_feats: &Tensor,
+        opts: &ImageOptions,
+        edit: Option<&ImageEdit>,
+        control: Option<&ImageControl>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Rendered> {
+        check()?;
+        Self::check_size(opts.width, opts.height)?;
+        crate::memory::image_peak(
+            opts.width.try_into()?,
+            opts.height.try_into()?,
+            control.is_some(),
+            0,
+        )?;
+        if let Some(control) = control {
+            control.validate(opts.width, opts.height)?;
+            ensure!(
+                self.controlnet.is_some(),
+                "load a ControlNet before requesting control"
+            );
+        }
         if let Some(edit) = edit {
             edit.validate(opts.width, opts.height)?;
         }
-        ensure!(
-            self.controlnet.is_some(),
-            "load a ControlNet before requesting control"
-        );
-        self.generate_inner(cap_feats, opts, edit, Some(control))
+        self.generate_inner(cap_feats, opts, edit, control, check)
     }
 
     fn generate_inner(
@@ -440,7 +494,11 @@ impl ZImagePipeline {
         opts: &ImageOptions,
         edit: Option<&ImageEdit>,
         control: Option<&ImageControl>,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<Rendered> {
+        check()?;
+        let device_check =
+            || check().map_err(|error| candle_core::Error::Msg(format!("{error:#}")));
         Self::check_size(opts.width, opts.height)?;
         ensure!(opts.steps >= 1, "steps must be at least 1");
         let (t, cap_dim) = cap_feats
@@ -487,13 +545,14 @@ impl ZImagePipeline {
         let mut source = None;
         let mut latent_mask = None;
         if let Some(edit) = edit {
+            check()?;
             if edit.strength == 0.0 {
                 return Ok(Rendered {
                     image: edit.init_image.to_device(&Device::Cpu)?,
                     timings: Timings::default(),
                     velocity0: None,
                     start_step,
-                    final_latents: self.vae.encode_mode(
+                    final_latents: self.vae.encode_mode_cancellable(
                         &((edit
                             .init_image
                             .to_device(&self.device)?
@@ -501,6 +560,7 @@ impl ZImagePipeline {
                             / 127.5)?
                             - 1.0)?
                             .unsqueeze(0)?,
+                        &device_check,
                     )?,
                 });
             }
@@ -519,7 +579,9 @@ impl ZImagePipeline {
                         seeded_noise(opts.seed ^ 0x5641455f504f5354, latent_shape, &self.device)?
                     }
                 };
-                let encoded = self.vae.encode_with_noise(&pixels, &posterior)?;
+                let encoded =
+                    self.vae
+                        .encode_with_noise_cancellable(&pixels, &posterior, &device_check)?;
                 latents = blend_noise(&encoded, &noise, scheduler.current_sigma())?;
                 source = Some(encoded);
             }
@@ -534,7 +596,9 @@ impl ZImagePipeline {
             }
         }
         let run_steps = opts.steps - start_step;
-        let context = control.map(|c| self.control_context(c, edit)).transpose()?;
+        let context = control
+            .map(|c| self.control_context_cancellable(c, edit, check))
+            .transpose()?;
         let mut timings = Timings::default();
         let mut velocity0 = None;
 
@@ -542,25 +606,27 @@ impl ZImagePipeline {
             prof.reset();
         }
         for step in start_step..opts.steps {
+            check()?;
             let started = Instant::now();
             let t = scheduler.current_timestep_normalized();
             let velocity = match (control, context.as_ref()) {
                 (Some(control), Some(context)) if control.active(step, opts.steps) => {
                     let t = Tensor::new(&[t as f32], &self.device)?;
                     self.transformer
-                        .forward_controlled(
+                        .forward_controlled_cancellable(
                             &latents.unsqueeze(2)?,
                             &t,
                             &cap_feats,
                             self.controlnet.as_ref().expect("validated control model"),
                             context,
                             control.scale,
+                            &device_check,
                         )?
                         .squeeze(2)?
                         .to_dtype(DType::F32)?
                         .neg()?
                 }
-                _ => self.velocity_batched(&latents, &cap_feats, t as f32)?,
+                _ => self.velocity_batched_cancellable(&latents, &cap_feats, t as f32, check)?,
             };
             if velocity0.is_none() {
                 velocity0 = Some(velocity.clone());
@@ -576,6 +642,7 @@ impl ZImagePipeline {
             let _ = latents.flatten_all()?.get(0)?.to_scalar::<f32>()?;
             profile::mark(&self.profiler, "euler");
             timings.steps.push(started.elapsed().as_secs_f64());
+            check()?;
             // The first step pays for the lazily created buffers and the
             // kernel compiles of the whole graph, so the profile covers the
             // steps after it whenever there is more than one.
@@ -608,7 +675,7 @@ impl ZImagePipeline {
         }
 
         let started = Instant::now();
-        let mut image = self.decode(&latents)?;
+        let mut image = self.decode_cancellable(&latents, check)?;
         if let Some(edit) = edit
             && let Some(mask) = &edit.mask
         {
@@ -650,6 +717,7 @@ impl ZImagePipeline {
         context: &Tensor,
         scale: f64,
     ) -> Result<Tensor> {
+        crate::memory::check_runtime()?;
         ensure!(
             scale.is_finite() && (0.0..=1.0).contains(&scale),
             "invalid control scale"
@@ -670,7 +738,10 @@ impl ZImagePipeline {
             .context("load a ControlNet before requesting control")?;
         Ok(self
             .transformer
-            .forward_controlled(&x, &t, &cap, controlnet, &context, scale)?
+            .forward_controlled_cancellable(&x, &t, &cap, controlnet, &context, scale, &|| {
+                crate::memory::check_runtime()
+                    .map_err(|error| candle_core::Error::Msg(format!("{error:#}")))
+            })?
             .squeeze(2)?
             .to_dtype(DType::F32)?
             .neg()?)
@@ -679,13 +750,28 @@ impl ZImagePipeline {
     /// [`Self::velocity`] with the caption already batched and in the model
     /// dtype, which the step loop does once rather than per step.
     fn velocity_batched(&self, latents: &Tensor, cap_feats: &Tensor, t: f32) -> Result<Tensor> {
+        self.velocity_batched_cancellable(latents, cap_feats, t, &crate::memory::check_runtime)
+    }
+
+    fn velocity_batched_cancellable(
+        &self,
+        latents: &Tensor,
+        cap_feats: &Tensor,
+        t: f32,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
         // The timestep stays f32: the sinusoidal embedding is computed in
         // f32 from it (as the reference does, autocast off) and only the
         // embedding is cast to the model dtype. A bf16 timestep would
         // round 0.0454 to 0.0454102 before anything used it.
         let t = Tensor::new(&[t], &self.device)?;
         let x = latents.to_dtype(self.dtype)?.unsqueeze(2)?;
-        let pred = self.transformer.forward(&x, &t, cap_feats)?;
+        let pred = self
+            .transformer
+            .forward_cancellable(&x, &t, cap_feats, &|| {
+                check().map_err(|error| candle_core::Error::Msg(format!("{error:#}")))
+            })?;
         // The transformer predicts the flow towards noise; the Euler step
         // wants the velocity towards data. Kept in f32 like the latent.
         Ok(pred.squeeze(2)?.to_dtype(DType::F32)?.neg()?)
@@ -695,12 +781,26 @@ impl ZImagePipeline {
     /// u8 RGB on the CPU. The tail of [`Self::generate`], public so a
     /// reference latent can be decoded through this VAE alone.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        self.decode_cancellable(latents, &crate::memory::check_runtime)
+    }
+
+    pub fn decode_cancellable(
+        &self,
+        latents: &Tensor,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
+        let device_check =
+            || check().map_err(|error| candle_core::Error::Msg(format!("{error:#}")));
         let latents = latents.to_device(&self.device)?.to_dtype(DType::F32)?;
         // (1, 3, H, W) f32, from the same arithmetic either way.
         let image = match &self.profiler {
-            Some(prof) => self.vae.decode_profiled(&latents, prof)?,
-            None => self.vae.decode(&latents)?,
+            Some(prof) => self
+                .vae
+                .decode_profiled_cancellable(&latents, prof, &device_check)?,
+            None => self.vae.decode_cancellable(&latents, &device_check)?,
         };
+        check()?;
         let image = postprocess_image(&image)?
             .squeeze(0)?
             .to_device(&Device::Cpu)?;
@@ -714,6 +814,7 @@ impl ZImagePipeline {
 
     /// Encode RGB8 source pixels with an explicit posterior draw for reference replay.
     pub fn encode_image(&self, image: &Tensor, posterior_noise: &Tensor) -> Result<Tensor> {
+        crate::memory::check_runtime()?;
         let (c, h, w) = image.dims3()?;
         ensure!(
             c == 3 && image.dtype() == DType::U8,
@@ -722,7 +823,12 @@ impl ZImagePipeline {
         Self::check_size(w, h)?;
         let pixels = ((image.to_device(&self.device)?.to_dtype(DType::F32)? / 127.5)? - 1.0)?
             .unsqueeze(0)?;
-        Ok(self.vae.encode_with_noise(&pixels, posterior_noise)?)
+        Ok(self
+            .vae
+            .encode_with_noise_cancellable(&pixels, posterior_noise, &|| {
+                crate::memory::check_runtime()
+                    .map_err(|error| candle_core::Error::Msg(format!("{error:#}")))
+            })?)
     }
 
     /// The author's ControlNet conditions on VAE posterior modes, with no random draw.
@@ -731,6 +837,18 @@ impl ZImagePipeline {
         control: &ImageControl,
         edit: Option<&ImageEdit>,
     ) -> Result<Tensor> {
+        self.control_context_cancellable(control, edit, &crate::memory::check_runtime)
+    }
+
+    fn control_context_cancellable(
+        &self,
+        control: &ImageControl,
+        edit: Option<&ImageEdit>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
+        let device_check =
+            || check().map_err(|error| candle_core::Error::Msg(format!("{error:#}")));
         let (_, h, w) = control.image.dims3()?;
         control.validate(w, h)?;
         if let Some(edit) = edit {
@@ -743,7 +861,7 @@ impl ZImagePipeline {
             / 127.5)?
             - 1.0)?
             .unsqueeze(0)?;
-        let map = self.vae.encode_mode(&pixels)?;
+        let map = self.vae.encode_mode_cancellable(&pixels, &device_check)?;
         let (lat_h, lat_w) = Self::latent_size(w, h);
         let (keep, source) = match edit.filter(|edit| edit.mask.is_some()) {
             Some(edit) => {
@@ -762,7 +880,10 @@ impl ZImagePipeline {
                     .lt(0.5)?
                     .to_dtype(DType::F32)?;
                 let masked = source.broadcast_mul(&preserve)?.unsqueeze(0)?;
-                (keep, self.vae.encode_mode(&masked)?)
+                (
+                    keep,
+                    self.vae.encode_mode_cancellable(&masked, &device_check)?,
+                )
             }
             None => (
                 Tensor::zeros((1, 1, lat_h, lat_w), DType::F32, &self.device)?,
@@ -915,6 +1036,19 @@ fn shard_paths(transformer_dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_load_stops_before_opening_checkpoint_files() {
+        let loras = super::super::lora::PreparedLoras::load(&[]).unwrap();
+        let result = ZImagePipeline::load_cancellable(
+            Path::new("/nonexistent-xwen-cancelled-checkpoint"),
+            &Device::Cpu,
+            &loras,
+            None,
+            &|| anyhow::bail!("request cancelled"),
+        );
+        assert_eq!(result.err().unwrap().to_string(), "request cancelled");
+    }
 
     #[test]
     fn the_size_rule_admits_the_common_sizes_and_names_the_reason_otherwise() {

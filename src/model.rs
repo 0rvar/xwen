@@ -225,6 +225,14 @@ pub struct XwenModel {
     checkpoint: crate::gguf::CheckpointId,
 }
 
+impl Drop for XwenModel {
+    fn drop(&mut self) {
+        // A returned model outlives its loader's guard, including on CLI error
+        // paths. Complete submitted work before releasing its weight owners.
+        let _drain = crate::memory::DeviceDrain(self.device.clone());
+    }
+}
+
 impl XwenModel {
     /// Preconditions this stack cannot recover from, checked on the parsed
     /// config before the rope table and the ~1.2 GB token-embedding dequant
@@ -326,6 +334,7 @@ impl XwenModel {
     /// their own tensors on theirs, and candle treats two `new_metal(0)`
     /// devices as different devices.
     fn load_qwen3(set: &crate::qwen3::Qwen3Set, device: &Device, max_ctx: usize) -> Result<Self> {
+        let _drain = crate::memory::DeviceDrain(device.clone());
         let qcfg = set.config().clone();
         let cfg = XwenConfig::from_qwen3(&qcfg, None);
         Self::check_arch(&cfg)?;
@@ -354,6 +363,18 @@ impl XwenModel {
         );
 
         let load_start = std::time::Instant::now();
+        if crate::memory::is_managed() {
+            let weight_bytes = set
+                .shard_paths()
+                .into_iter()
+                .try_fold(0u64, |total, path| {
+                    anyhow::Ok(total.saturating_add(std::fs::metadata(path)?.len()))
+                })?;
+            crate::memory::admit(
+                "qwen3 load",
+                language_peak_bytes(weight_bytes, 0, &cfg, max_ctx.min(KV_INITIAL_CTX), max_ctx),
+            )?;
+        }
         let crate::qwen3::Qwen3Weights {
             embed_tokens,
             layers,
@@ -472,6 +493,14 @@ impl XwenModel {
         Self::check_arch(&cfg)?;
         let max_ctx = clamp_context_length(max_ctx, cfg.n_ctx_train)?;
         let device = gguf.device.clone();
+        let _drain = crate::memory::DeviceDrain(device.clone());
+        if crate::memory::is_managed() {
+            let (weights, ple) = gguf_weight_bytes(&gguf);
+            crate::memory::admit(
+                "language load",
+                language_peak_bytes(weights, ple, &cfg, max_ctx.min(KV_INITIAL_CTX), max_ctx),
+            )?;
+        }
         let w = Weights::from_gguf(gguf.clone());
 
         // Attention WEIGHT dtype, read ONCE at load: f16 by default — the GGUF
@@ -728,6 +757,7 @@ impl XwenModel {
     /// caches, so callers feeding chunks must pass a monotonically increasing
     /// `pos`.
     fn run_stack(&mut self, tokens: &Tensor, pos: usize) -> Result<StackOutput> {
+        crate::memory::check_runtime()?;
         // qwen4exp is a second graph over the same blocks (D14): a 4-stream
         // residual carrier, a QSA overlay on the attention layers and a PLE
         // injection, none of which fit as a branch inside the loop below.
@@ -1548,6 +1578,11 @@ impl XwenModel {
         if needed <= self.kv_slots {
             return Ok(());
         }
+        if crate::memory::is_managed() {
+            let capacity = kv_growth_capacity(self.kv_slots, needed, self.max_ctx);
+            // The new planes coexist with the old ones until the copy completes.
+            crate::memory::admit_additional("KV growth", kv_bytes(&self.cfg, capacity))?;
+        }
         let mut grown = self.kv_slots;
         for cache in &mut self.caches {
             grown = grown.max(cache.ensure_full_capacity(needed, self.max_ctx)?);
@@ -1612,6 +1647,14 @@ fn kv_bytes(cfg: &XwenConfig, slots: usize) -> u64 {
     n_full * 2 * cfg.n_kv_head as u64 * slots as u64 * cfg.head_dim as u64 * 2
 }
 
+fn kv_growth_capacity(slots: usize, needed: usize, cap: usize) -> usize {
+    let mut grown = slots.max(1);
+    while grown < needed {
+        grown = grown.saturating_mul(2);
+    }
+    grown.min(cap)
+}
+
 fn gb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
@@ -1622,6 +1665,11 @@ fn gb(bytes: u64) -> f64 {
 /// (`grow_kv_capacity`), so what is resident at load is the initial allocation;
 /// `max_ctx` is the ceiling a long conversation can grow it to.
 fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_ctx: usize) {
+    let (weight_bytes, ple_table_bytes) = gguf_weight_bytes(gguf);
+    report_footprint(weight_bytes, ple_table_bytes, cfg, kv_slots, max_ctx);
+}
+
+fn gguf_weight_bytes(gguf: &GgufFile) -> (u64, u64) {
     let tensor_bytes = |info: &candle_core::quantized::gguf_file::TensorInfo| -> u64 {
         let elems = info.shape.elem_count() as u64;
         let dt = info.ggml_dtype;
@@ -1640,7 +1688,33 @@ fn warn_if_over_budget(gguf: &GgufFile, cfg: &XwenConfig, kv_slots: usize, max_c
         .map(tensor_bytes)
         .unwrap_or(0);
     let weight_bytes = weight_bytes - ple_table_bytes;
-    report_footprint(weight_bytes, ple_table_bytes, cfg, kv_slots, max_ctx);
+    (weight_bytes, ple_table_bytes)
+}
+
+/// Admission estimate, not a measured peak. PLE is demand-paged: reserve a
+/// working window, then monitor actual pressure as pages are touched. Scratch
+/// covers dequantized planes and prefill temporaries beside persistent state.
+fn language_peak_bytes(
+    weights: u64,
+    ple: u64,
+    cfg: &XwenConfig,
+    slots: usize,
+    max_ctx: usize,
+) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
+    let n_linear = cfg.n_layer as u64 - n_full;
+    let hd = cfg.linear_head_dim as u64;
+    let state = n_linear
+        * 4
+        * ((cfg.conv_kernel as u64).saturating_sub(1) * cfg.conv_dim() as u64
+            + cfg.linear_v_heads as u64 * hd * hd)
+        + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx);
+    weights
+        .saturating_add(ple.min(4 * GIB))
+        .saturating_add(kv_bytes(cfg, slots))
+        .saturating_add(state)
+        .saturating_add(8 * GIB)
 }
 
 /// The resident-memory lines of `warn_if_over_budget`, over an already-summed
@@ -1698,6 +1772,12 @@ fn report_footprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memory_admission_reserves_every_doubling_needed_by_a_long_prefill() {
+        assert_eq!(kv_growth_capacity(8192, 20000, 131072), 32768);
+        assert_eq!(kv_growth_capacity(8192, 20000, 24000), 24000);
+        assert_eq!(kv_growth_capacity(8192, 8193, 131072), 16384);
+    }
     use crate::config::RopeKind;
 
     /// Every surface's context ceiling is trimmed to what the file was converted

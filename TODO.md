@@ -897,6 +897,9 @@ priced, not their rank ([the record](docs/records/zimage-perf.md), "The power en
   2026-09-08: the direct VAE conv path allocates no im2col buffers, so the 16 GB pooled
   bucket should be gone on the default arm, against ~200 MB of permuted f32 planes; still
   unmeasured, and the number is worth more now that the route renders in 15-18 s.
+  2026-09-09: keep open; isolated 512/1024 cold-to-unload traces now price the admission
+  allowances before larger images can return. Prerequisites and stop conditions:
+  [next experiment](docs/records/memory-safety.md#next-experiment).
   From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
 
 ## Research candidates

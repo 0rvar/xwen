@@ -12,11 +12,9 @@
 //! dropdown cannot name it.
 //!
 //! The work runs on its own OS thread, `image-engine`, beside the language
-//! engine and independent of it: its own lazy load, its own idle unload on the
-//! same `--idle-unload` setting, one render at a time, a short bounded queue.
-//! The two engines do not know about each other's residency, so a language
-//! model and the image pipeline can both be resident inside one idle window;
-//! the image side is about 20 GB. Never 401, 402, 409 or 429 from here: the
+//! engine, with shared memory ownership and an independent idle timer. A
+//! waiting engine receives ownership after the resident model is unloaded.
+//! Never 401, 402, 409 or 429 from here: the
 //! ComfyUI client rewrites those four statuses into comfy.org login and credit
 //! messages before it reads the body.
 
@@ -99,6 +97,7 @@ pub(crate) struct RenderedImage {
 pub(crate) enum ImageError {
     Request(String),
     Render(String),
+    Unavailable(String),
 }
 
 #[derive(Default)]
@@ -131,6 +130,39 @@ pub(crate) enum ImageJob {
         kind: crate::zimage::preprocess::Kind,
         reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, ImageError>>,
     },
+}
+
+impl ImageJob {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Render { reply, .. } => reply.is_closed(),
+            Self::Preprocess { reply, .. } => reply.is_closed(),
+        }
+    }
+
+    fn fail(self, error: ImageError) {
+        match self {
+            Self::Render { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Preprocess { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    fn peak(&self) -> Result<u64> {
+        let (width, height, control, loras) = match self {
+            Self::Render { params, inputs, .. } => (
+                params.width,
+                params.height,
+                inputs.control.is_some(),
+                inputs.loras.len(),
+            ),
+            Self::Preprocess { image, .. } => (image.dim(2)?, image.dim(1)?, true, 0),
+        };
+        crate::memory::image_peak(width.try_into()?, height.try_into()?, control, loras)
+    }
 }
 
 /// The handler's end of the engine: the queue and the residency flag.
@@ -179,10 +211,20 @@ pub(crate) fn spawn(
         )));
     }
     let idle = settings.idle_unload;
+    let wait_timeout = settings.queue_timeout;
     let thread_resident = Arc::clone(&resident);
     let thread = std::thread::Builder::new()
         .name(IMAGE_ENGINE_THREAD.to_string())
-        .spawn(move || engine_loop(receiver, idle, thread_resident, shutdown, logger))
+        .spawn(move || {
+            engine_loop(
+                receiver,
+                idle,
+                wait_timeout,
+                thread_resident,
+                shutdown,
+                logger,
+            )
+        })
         .expect("spawning the image engine thread");
     (Handle { sender, resident }, thread)
 }
@@ -198,13 +240,21 @@ struct Loaded {
     control: Option<ControlIdentity>,
 }
 
+impl Drop for Loaded {
+    fn drop(&mut self) {
+        let _drain = crate::memory::DeviceDrain(self.encoder.device().clone());
+    }
+}
+
 impl Loaded {
     /// Open everything `xwen image` opens, from the cached snapshot.
     fn open(
         logger: &ServeLogger,
         loras: &[crate::zimage::lora::ResolvedLora],
         control: Option<&ControlIdentity>,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<Self, ImageError> {
+        check().map_err(|e| ImageError::Unavailable(e.to_string()))?;
         let index = crate::hub::cached_model(Model::ZImageTurbo).ok_or_else(|| {
             ImageError::Request(format!(
                 "{} is not in the Hugging Face cache: run `xwen fetch --model-size {}` on the \
@@ -236,6 +286,7 @@ impl Loaded {
                     .context("the encoder entry's config has no parent directory")?,
             );
             let device = crate::gguf::metal_device()?;
+            let _drain = crate::memory::DeviceDrain(device.clone());
 
             let started = Instant::now();
             let source = crate::CheckpointSource::open(&encoder_dir, &device, Some(encoder_entry))?;
@@ -251,14 +302,17 @@ impl Loaded {
                 .to_path_buf();
             let encoder = crate::XwenModel::load_encoder(source, spec.max_tokens)?;
             let encoder_s = started.elapsed();
+            check()?;
 
             let started = Instant::now();
-            let pipeline = ZImagePipeline::load_with_loras_and_control(
+            let pipeline = ZImagePipeline::load_cancellable(
                 root,
                 &device,
                 &adapters,
                 control.map(|c| c.path.as_path()),
+                check,
             )?;
+            check()?;
             let pipeline_s = started.elapsed();
             Ok((
                 Self {
@@ -289,7 +343,9 @@ impl Loaded {
         params: &ImageParams,
         inputs: &ImageInputs,
         logger: &ServeLogger,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<RenderedImage>> {
+        check()?;
         let rendered = crate::zimage::conditioning::prompt_ids(
             self.encoder_entry,
             &self.tokenizer_path,
@@ -302,6 +358,7 @@ impl Loaded {
             )));
         }
         let (cap_feats, _n_tokens) = self.encoder.encode(&rendered.ids, self.spec.layer)?;
+        check()?;
         // A drawn seed stays under 2^53: the seed goes back to the client as a
         // JSON number, and a JavaScript client rounds anything wider, so a
         // seed it echoed back would not reproduce the image it came with. A
@@ -309,6 +366,7 @@ impl Loaded {
         let first_seed = params.seed.unwrap_or_else(|| rand::random::<u64>() >> 11);
         let mut out = Vec::with_capacity(params.n as usize);
         for i in 0..params.n as u64 {
+            check()?;
             let seed = first_seed.wrapping_add(i);
             let started = Instant::now();
             let options = ImageOptions {
@@ -318,16 +376,14 @@ impl Loaded {
                 seed,
                 latents: None,
             };
-            let run = match (&inputs.edit, &inputs.control) {
-                (edit, Some(control)) => self.pipeline.generate_controlled(
-                    &cap_feats,
-                    &options,
-                    edit.as_ref(),
-                    &control.image,
-                )?,
-                (Some(edit), None) => self.pipeline.generate_edited(&cap_feats, &options, edit)?,
-                (None, None) => self.pipeline.generate(&cap_feats, &options)?,
-            };
+            let run = self.pipeline.generate_cancellable(
+                &cap_feats,
+                &options,
+                inputs.edit.as_ref(),
+                inputs.control.as_ref().map(|c| &c.image),
+                check,
+            )?;
+            check()?;
             let png = encode_png(&run.image)?;
             logger.log(ServeLog::HostLine(format!(
                 "xwen serve: image rendered {}x{} in {} steps, {:.1}s (seed {seed})",
@@ -365,63 +421,99 @@ fn classify_load_error(error: anyhow::Error) -> ImageError {
 fn engine_loop(
     jobs: crossbeam_channel::Receiver<ImageJob>,
     idle_unload: Option<Duration>,
+    wait_timeout: Duration,
     resident: Arc<AtomicBool>,
     shutdown: Arc<super::types::Cancel>,
     logger: ServeLogger,
 ) {
+    // Declared before model storage so unwinding drops GPU owners first.
+    let mut lease: Option<crate::memory::Lease> = None;
     let mut loaded: Option<Loaded> = None;
     let mut preprocessor = crate::zimage::preprocess::Preprocessor::new();
-    let mut preprocessed = false;
+    let mut last_finished = Instant::now();
     loop {
-        // The idle timer only matters while something is loaded, and it is
-        // measured from the moment the previous job returned.
-        let idle = idle_unload.filter(|_| loaded.is_some() || preprocessed);
+        let yielding = lease.as_ref().is_some_and(|held| held.should_yield());
+        let expired =
+            lease.is_some() && idle_unload.is_some_and(|idle| last_finished.elapsed() >= idle);
+        if yielding || expired {
+            unload_images(&mut loaded, &mut preprocessor, &resident);
+            lease = None;
+            logger.log(ServeLog::HostLine(format!(
+                "xwen serve: image resources unloaded ({})",
+                if yielding {
+                    "memory ownership requested or pressure"
+                } else {
+                    "idle"
+                }
+            )));
+        }
+        if shutdown.is_cancelled() {
+            break;
+        }
+        let job = match jobs.recv_timeout(Duration::from_millis(100)) {
+            Ok(job) => job,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        if job.is_closed() {
+            continue;
+        }
+        if let ImageJob::Render { inputs, .. } = &job {
+            if loaded.as_ref().is_some_and(|held| {
+                held.loras != inputs.loras
+                    || held.control.as_ref() != inputs.control.as_ref().map(|c| &c.checkpoint)
+            }) {
+                unload_images(&mut loaded, &mut preprocessor, &resident);
+            }
+        }
+        let peak = match job.peak() {
+            Ok(peak) => peak,
+            Err(e) => {
+                job.fail(ImageError::Request(e.to_string()));
+                continue;
+            }
+        };
         let waiting_since = Instant::now();
-        let job = match idle {
-            Some(window) => match jobs.recv_timeout(window) {
-                Ok(job) => job,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    loaded = None;
-                    preprocessor = crate::zimage::preprocess::Preprocessor::new();
-                    preprocessed = false;
-                    resident.store(false, Ordering::Relaxed);
-                    logger.log(ServeLog::HostLine(format!(
-                        "xwen serve: image pipeline unloaded after {:.0}s idle (configured {}s)",
-                        waiting_since.elapsed().as_secs_f64(),
-                        window.as_secs()
-                    )));
+        let check = || -> Result<()> {
+            anyhow::ensure!(!shutdown.is_cancelled(), "the server is shutting down");
+            anyhow::ensure!(!job.is_closed(), "the image client disconnected");
+            anyhow::ensure!(
+                waiting_since.elapsed() < wait_timeout,
+                "timed out waiting for image memory ownership; retry shortly"
+            );
+            crate::memory::check_runtime()
+        };
+        if lease.is_none() {
+            match crate::memory::acquire("images", &check) {
+                Ok(held) => lease = Some(held),
+                Err(e) => {
+                    job.fail(ImageError::Unavailable(e.to_string()));
                     continue;
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-            },
-            None => match jobs.recv() {
-                Ok(job) => job,
-                Err(_) => break,
-            },
-        };
-        if shutdown.is_cancelled() {
-            match job {
-                ImageJob::Render { reply, .. } => {
-                    let _ = reply.send(Err(ImageError::Render(
-                        "the server is shutting down".into(),
-                    )));
-                }
-                ImageJob::Preprocess { reply, .. } => {
-                    let _ = reply.send(Err(ImageError::Render(
-                        "the server is shutting down".into(),
-                    )));
-                }
             }
+        }
+        if let Err(e) = check().and_then(|_| {
+            crate::memory::admit_additional(
+                "image request",
+                image_allocation_reserve(peak, loaded.is_some()),
+            )
+        }) {
+            job.fail(ImageError::Unavailable(e.to_string()));
+            unload_images(&mut loaded, &mut preprocessor, &resident);
+            lease = None;
             continue;
         }
         let (params, mut inputs, reply) = match job {
             ImageJob::Preprocess { image, kind, reply } => {
-                preprocessed = true;
                 let result =
                     preprocess_on_worker(&mut preprocessor, &image, kind).and_then(|image| {
+                        crate::memory::check_runtime()
+                            .map_err(|e| ImageError::Unavailable(e.to_string()))?;
                         encode_png(&image).map_err(|e| ImageError::Render(format!("{e:#}")))
                     });
                 let _ = reply.send(result);
+                last_finished = Instant::now();
+                crate::memory::log_event("image preprocess finished", None);
                 continue;
             }
             ImageJob::Render {
@@ -430,55 +522,100 @@ fn engine_loop(
                 reply,
             } => (params, inputs, reply),
         };
-        if let Some(control) = &mut inputs.control {
-            preprocessed = true;
-            match preprocess_on_worker(&mut preprocessor, &control.image.image, control.preprocess)
-            {
-                Ok(image) => control.image.image = image,
-                Err(e) => {
-                    let _ = reply.send(Err(e));
-                    continue;
-                }
+        let check = || -> Result<()> {
+            anyhow::ensure!(!shutdown.is_cancelled(), "the server is shutting down");
+            anyhow::ensure!(!reply.is_closed(), "the image client disconnected");
+            crate::memory::check_runtime()
+        };
+        let result = (|| -> Result<Vec<RenderedImage>, ImageError> {
+            if let Some(control) = &mut inputs.control {
+                control.image.image = preprocess_on_worker(
+                    &mut preprocessor,
+                    &control.image.image,
+                    control.preprocess,
+                )?;
             }
-        }
-        if let Some(note) = &params.model_note {
+            check().map_err(|e| ImageError::Unavailable(e.to_string()))?;
+            if let Some(note) = &params.model_note {
+                logger.log(ServeLog::HostLine(format!(
+                    "xwen serve: images: model {note:?} served by {} (proxy path)",
+                    Model::ZImageTurbo.full_name()
+                )));
+            }
+            if loaded.is_none() {
+                let opened = Loaded::open(
+                    &logger,
+                    &inputs.loras,
+                    inputs.control.as_ref().map(|c| &c.checkpoint),
+                    &check,
+                )?;
+                crate::memory::log_event("image model loaded", Some(opened.encoder.device()));
+                loaded = Some(opened);
+                resident.store(true, Ordering::Relaxed);
+            }
             logger.log(ServeLog::HostLine(format!(
-                "xwen serve: images: model {note:?} served by {} (proxy path)",
-                Model::ZImageTurbo.full_name()
+                "xwen serve: image request {}x{}, {} steps, {} images, {} LoRAs, control {}",
+                params.width,
+                params.height,
+                params.steps,
+                params.n,
+                inputs.loras.len(),
+                inputs.control.is_some()
             )));
-        }
-        if loaded.as_ref().is_some_and(|held| {
-            held.loras != inputs.loras
-                || held.control.as_ref() != inputs.control.as_ref().map(|c| &c.checkpoint)
-        }) {
-            loaded = None;
-            resident.store(false, Ordering::Relaxed);
-        }
-        let result = match loaded.as_mut() {
-            Some(held) => Ok(held),
-            None => match Loaded::open(
-                &logger,
-                &inputs.loras,
-                inputs.control.as_ref().map(|c| &c.checkpoint),
-            ) {
-                Ok(opened) => {
-                    resident.store(true, Ordering::Relaxed);
-                    Ok(loaded.insert(opened))
+            let held = loaded.as_mut().expect("image model loaded");
+            held.render(&params, &inputs, &logger, &check).map_err(|e| {
+                if check().is_err() {
+                    ImageError::Unavailable(format!("{e:#}"))
+                } else {
+                    ImageError::Render(format!("{e:#}"))
                 }
-                Err(e) => Err(e),
-            },
-        }
-        .and_then(|held| {
-            held.render(&params, &inputs, &logger)
-                .map_err(|e| ImageError::Render(format!("{e:#}")))
-        });
-        // A client that hung up is the only reason this fails, and its answer
-        // has nowhere to go.
+            })
+        })();
+        let failed = result.is_err();
         let _ = reply.send(result);
+        last_finished = Instant::now();
+        crate::memory::log_event(
+            "image request finished",
+            loaded.as_ref().map(|held| held.encoder.device()),
+        );
+        if failed {
+            unload_images(&mut loaded, &mut preprocessor, &resident);
+            lease = None;
+        }
     }
-    // A pipeline dropped here unregisters its buffers on the way out.
-    drop(loaded);
+    unload_images(&mut loaded, &mut preprocessor, &resident);
+    drop(lease);
+}
+
+/// Only credit a lower bound on weights that remain allocated. Every request
+/// reserves its temporary working space again, even after an earlier warm render.
+fn image_allocation_reserve(peak: u64, loaded: bool) -> u64 {
+    peak.saturating_sub(if loaded { 16 * 1024 * 1024 * 1024 } else { 0 })
+}
+
+fn unload_images(
+    loaded: &mut Option<Loaded>,
+    preprocessor: &mut crate::zimage::preprocess::Preprocessor,
+    resident: &AtomicBool,
+) {
+    let device = loaded.as_ref().map(|held| held.encoder.device().clone());
+    if let Some(device) = &device {
+        // A synchronization failure means ownership cannot safely transfer.
+        if let Err(e) = device.synchronize() {
+            eprintln!("xwen: image device could not drain: {e}; terminating before another load");
+            std::process::abort();
+        }
+    }
+    *loaded = None;
+    *preprocessor = crate::zimage::preprocess::Preprocessor::new();
+    if let Some(device) = &device {
+        if let Err(e) = device.synchronize() {
+            eprintln!("xwen: image buffers could not drain: {e}; terminating before another load");
+            std::process::abort();
+        }
+    }
     resident.store(false, Ordering::Relaxed);
+    crate::memory::log_event("image resources released", device.as_ref());
 }
 
 /// The request body. Every field but `prompt` is optional and anything not
@@ -577,6 +714,8 @@ pub(crate) fn validate(
         }
     };
     ZImagePipeline::check_size(width, height).map_err(|e| bad_param("size", e.to_string()))?;
+    crate::memory::image_peak(width as u32, height as u32, false, 0)
+        .map_err(|e| bad_param("size", e.to_string()))?;
 
     let n = request.n.unwrap_or(1);
     if !(1..=MAX_N).contains(&n) {
@@ -699,6 +838,17 @@ pub(crate) async fn submit_image(
     inputs: ImageInputs,
 ) -> Response {
     let (width, height, steps) = (params.width, params.height, params.steps);
+    let envelope = (|| -> Result<u64> {
+        crate::memory::image_peak(
+            width.try_into()?,
+            height.try_into()?,
+            inputs.control.is_some(),
+            inputs.loras.len(),
+        )
+    })();
+    if let Err(e) = envelope {
+        return bad_param("size", e.to_string()).into_response();
+    }
 
     let (reply, answer) = tokio::sync::oneshot::channel();
     match state.images.sender.try_send(ImageJob::Render {
@@ -726,6 +876,11 @@ pub(crate) async fn submit_image(
     let images = match answer.await {
         Ok(Ok(images)) => images,
         Ok(Err(ImageError::Request(message))) => return bad_request(message).into_response(),
+        Ok(Err(ImageError::Unavailable(message))) => {
+            return server_error(StatusCode::SERVICE_UNAVAILABLE, message)
+                .with_header("retry-after", "5")
+                .into_response();
+        }
         Ok(Err(ImageError::Render(message))) => {
             return server_error(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
         }
@@ -763,6 +918,65 @@ pub(crate) async fn submit_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warm_renders_reserve_their_temporary_allocations_again() {
+        let gib = 1024 * 1024 * 1024;
+        let peak = crate::memory::image_peak(1024, 1024, false, 0).unwrap();
+        assert_eq!(image_allocation_reserve(peak, false), 40 * gib);
+        assert_eq!(image_allocation_reserve(peak, true), 24 * gib);
+    }
+    #[test]
+    fn image_worker_skips_disconnected_jobs_and_refuses_oversized_work_before_loading() {
+        let (send, receive) = crossbeam_channel::bounded(2);
+        let resident = Arc::new(AtomicBool::new(false));
+        let (closed_reply, closed_answer) = tokio::sync::oneshot::channel();
+        drop(closed_answer);
+        let params = validate(parse(r#"{"prompt":"test"}"#), false, None).unwrap();
+        let closed = ImageJob::Render {
+            params: params.clone(),
+            inputs: ImageInputs::default(),
+            reply: closed_reply,
+        };
+        assert!(closed.is_closed());
+        send.send(closed).unwrap();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        send.send(ImageJob::Render {
+            params: ImageParams {
+                width: 8192,
+                height: 8192,
+                ..params
+            },
+            inputs: ImageInputs::default(),
+            reply,
+        })
+        .unwrap();
+        drop(send);
+        engine_loop(
+            receive,
+            None,
+            Duration::from_secs(1),
+            Arc::clone(&resident),
+            Arc::new(super::super::types::Cancel::default()),
+            ServeLogger::discarding(),
+        );
+        assert!(
+            matches!(answer.blocking_recv().unwrap(), Err(ImageError::Request(message)) if message.contains("pixels"))
+        );
+        assert!(!resident.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn architecture_valid_images_above_the_memory_envelope_are_bad_requests() {
+        let err = validate(
+            parse(r#"{"prompt":"test","size":"1536x1024"}"#),
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(param(&err).as_deref(), Some("size"));
+        assert!(message(&err).contains("pixels"));
+    }
+
     #[test]
     fn adapter_load_faults_are_request_errors_and_device_faults_are_not() {
         let adapter = anyhow::Error::new(crate::zimage::lora::AdapterError("overflow".into()))
@@ -1050,6 +1264,11 @@ pub(crate) async fn submit_preprocess(
                 .into_response()
         }
         Ok(Err(ImageError::Request(message))) => bad_request(message).into_response(),
+        Ok(Err(ImageError::Unavailable(message))) => {
+            server_error(StatusCode::SERVICE_UNAVAILABLE, message)
+                .with_header("retry-after", "5")
+                .into_response()
+        }
         Ok(Err(ImageError::Render(message))) => {
             server_error(StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
         }

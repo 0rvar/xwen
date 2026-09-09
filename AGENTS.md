@@ -509,9 +509,12 @@ The seams, so a change lands in one place:
 - **`src/serve/images.rs`** is the whole serve surface for images (2026-09-07): `POST
   /v1/images/generations`, `/images/generations` and `/proxy/openai/images/generations`
   on one handler, and the `image-engine` thread beside the language engine with its own
-  lazy load and its own idle unload on `--idle-unload`. The two engines do not coordinate
-  residency, so both can be resident inside one idle window (fine at 20 GB plus 20 GB,
-  thrashes with Flash-Next); not taken now, with the reopen condition in the record. The
+  lazy load and its own idle unload on `--idle-unload`. As of 2026-09-09,
+  `src/memory.rs` coordinates residency across engines and updated Xwen processes.
+  Keep its lease until models, host slots, preprocessors and GPU buffers are dropped
+  and drained; a generation-only mutex leaves idle models resident. Ownership/pressure
+  unload must never create a fresh host snapshot. Image area is capped at 1024 squared
+  until larger peaks are measured. [Memory safety record](docs/records/memory-safety.md). The
   prompt rendering both `xwen image` and the route use is
   `zimage::conditioning::prompt_ids`, so a change to how the caption is rendered lands in
   one place. The `model` rule is split by path (full name or nothing on the first two,

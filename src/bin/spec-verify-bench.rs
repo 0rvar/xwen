@@ -106,6 +106,7 @@ struct RepTimes {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let _residency = xwen::memory::acquire("spec-verify-bench", &xwen::memory::check_runtime)?;
     // Checked before the model load: this bench holds a 20 GB checkpoint and the
     // GPU for the whole run, so a bad flag combination must not cost a load first.
     anyhow::ensure!(
@@ -116,6 +117,7 @@ fn main() -> Result<()> {
     anyhow::ensure!(args.reps >= 1, "--reps must be at least 1");
 
     let device = gguf::metal_device()?;
+    let _drain = xwen::memory::DeviceDrain(device.clone());
     let file = gguf::open(&args.model, &device)?;
     let _cfg = XwenConfig::from_gguf(&file.content)?;
     let mut model = XwenModel::load(

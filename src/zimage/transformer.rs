@@ -1437,7 +1437,17 @@ impl ZImageTransformer2DModel {
     /// that path has no reference comparison yet, so it is refused rather
     /// than run unverified.
     pub fn forward(&self, x: &Tensor, t: &Tensor, cap_feats: &Tensor) -> Result<Tensor> {
-        self.forward_inner(x, t, cap_feats, None)
+        self.forward_cancellable(x, t, cap_feats, &|| Ok(()))
+    }
+
+    pub fn forward_cancellable(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        self.forward_inner(x, t, cap_feats, None, check)
     }
 
     /// Evaluate the author Fun Union graph, including both noise-refiner skips.
@@ -1451,12 +1461,26 @@ impl ZImageTransformer2DModel {
         context: &Tensor,
         scale: f64,
     ) -> Result<Tensor> {
+        self.forward_controlled_cancellable(x, t, cap_feats, controlnet, context, scale, &|| Ok(()))
+    }
+
+    pub fn forward_controlled_cancellable(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        controlnet: &super::controlnet::ControlNet,
+        context: &Tensor,
+        scale: f64,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Tensor> {
+        check()?;
         if !scale.is_finite() || scale < 0.0 {
             candle_core::bail!("ControlNet scale must be finite and nonnegative");
         }
         super::controlnet::ControlNet::validate_context(context, x)?;
         let control = (scale != 0.0).then_some((controlnet, context, scale));
-        self.forward_inner(x, t, cap_feats, control)
+        self.forward_inner(x, t, cap_feats, control, check)
     }
 
     fn forward_inner(
@@ -1465,7 +1489,9 @@ impl ZImageTransformer2DModel {
         t: &Tensor,
         cap_feats: &Tensor,
         control: Option<(&super::controlnet::ControlNet, &Tensor, f64)>,
+        check: &dyn Fn() -> Result<()>,
     ) -> Result<Tensor> {
+        check()?;
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         if b != 1 || cap_feats.dim(0)? != 1 {
@@ -1550,7 +1576,7 @@ impl ZImageTransformer2DModel {
         profile::mark(&self.profiler, "rope.tables");
 
         let control_refiners = control
-            .map(|(net, context, _)| net.refine(context, &x, &x_cos, &x_sin, &adaln_input))
+            .map(|(net, context, _)| net.refine(context, &x, &x_cos, &x_sin, &adaln_input, check))
             .transpose()?;
 
         // 5. Noise refiner (image, modulated)
@@ -1559,6 +1585,7 @@ impl ZImageTransformer2DModel {
         // labels of their own.
         profile::set_phase(&self.profiler, "noise_refiner.");
         for (i, layer) in self.noise_refiner.iter().enumerate() {
+            check()?;
             x = layer.forward(&x, None, &x_cos, &x_sin, Some(&adaln_input))?;
             if let (Some(samples), Some((_, _, scale))) = (&control_refiners, control) {
                 x = (x + (&samples.residuals[i] * scale)?)?;
@@ -1568,6 +1595,7 @@ impl ZImageTransformer2DModel {
         // 6. Context refiner (caption, unmodulated)
         profile::set_phase(&self.profiler, "context_refiner.");
         for layer in &self.context_refiner {
+            check()?;
             cap = layer.forward(&cap, None, &cap_cos, &cap_sin, None)?;
         }
         profile::set_phase(&self.profiler, "");
@@ -1587,6 +1615,7 @@ impl ZImageTransformer2DModel {
                 &unified_cos,
                 &unified_sin,
                 &adaln_input,
+                check,
             )?),
             _ => None,
         };
@@ -1594,6 +1623,7 @@ impl ZImageTransformer2DModel {
 
         // 8. Main transformer layers
         for (i, layer) in self.layers.iter().enumerate() {
+            check()?;
             unified = layer.forward(
                 &unified,
                 None,
@@ -2086,6 +2116,22 @@ mod tests {
             attn_impl: AttnImpl::Flash,
             use_xwen_linear: true,
         }
+    }
+
+    #[test]
+    fn cancelled_transformer_stops_before_reading_input_shapes() {
+        let dev = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.use_xwen_linear = false;
+        cfg.attn_impl = AttnImpl::Basic;
+        let model = ZImageTransformer2DModel::new(&cfg, random_vb(&dev)).unwrap();
+        let scalar = Tensor::new(0f32, &dev).unwrap();
+        let error = model
+            .forward_cancellable(&scalar, &scalar, &scalar, &|| {
+                candle_core::bail!("request cancelled")
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "request cancelled");
     }
 
     #[test]
