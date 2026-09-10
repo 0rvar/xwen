@@ -1053,6 +1053,9 @@ fn engine_loop(
                     &format!("language loaded: {}", required.model.full_name()),
                     Some(&loaded.device),
                 );
+                logger.log(ServeLog::ModelContext {
+                    tokens: loaded.generator.max_ctx(),
+                });
                 logger.log(ServeLog::ModelLoaded {
                     elapsed: start.elapsed(),
                 });
@@ -2469,23 +2472,46 @@ fn prefill(
     // The same chunk as the generate path, so splitting a prefill to check for a
     // departed client costs no extra GPU passes.
     let chunk_len = engine.generator.prefill_chunk();
-    for (index, chunk) in tokens.chunks(chunk_len).enumerate() {
-        if let Some(reason) = abandon.reason() {
-            return Ok(Some(reason));
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    if let Some(reason) = abandon.reason() {
+        return Ok(Some(reason));
+    }
+    // Cache restoration belongs to dispatch, not prefill. Drain it before opening
+    // this span's clock, then allow all of the span's chunks to pipeline together.
+    engine.device.synchronize()?;
+    let started = Instant::now();
+    let outcome = (|| -> Result<Option<CancelReason>> {
+        for (index, chunk) in tokens.chunks(chunk_len).enumerate() {
+            if let Some(reason) = abandon.reason() {
+                return Ok(Some(reason));
+            }
+            let at = start_pos + index * chunk_len;
+            engine.generator.prefill_tokens(chunk, at)?;
+            trace.record.prefill_tokens += chunk.len();
+            // These are submitted chunks. GPU completion and its measured rate are
+            // reported separately at the span boundary.
+            abandon.logger.log(ServeLog::PrefillTick {
+                done: at + chunk.len(),
+                total,
+            });
         }
-        let at = start_pos + index * chunk_len;
-        let started = Instant::now();
-        engine.generator.prefill_tokens(chunk, at)?;
-        trace.record.prefill_secs += started.elapsed().as_secs_f64();
-        trace.record.prefill_tokens += chunk.len();
-        // Reported after the chunk lands rather than before it starts, so `done` is
-        // what the model has actually read.
-        abandon.logger.log(ServeLog::PrefillTick {
-            done: at + chunk.len(),
-            total,
+        Ok(None)
+    })();
+    // Close the GPU interval even for a cancelled or failed partial span, before
+    // snapshot readback or the first decode sample can absorb its outstanding work.
+    let drained = engine.device.synchronize();
+    trace.record.prefill_secs += started.elapsed().as_secs_f64();
+    if drained.is_ok() {
+        abandon.logger.log(ServeLog::PrefillMeasured {
+            tokens: trace.record.prefill_tokens,
+            secs: trace.record.prefill_secs,
         });
     }
-    Ok(None)
+    let outcome = outcome?;
+    drained?;
+    Ok(outcome)
 }
 
 /// Wind down a job abandoned mid-prefill without wasting the work: the chunks already
@@ -4883,6 +4909,28 @@ mod tests {
         assert_eq!(run.decode_tokens, 38);
         assert_eq!(run.thinking_tokens, Some(12));
         assert!(run.ok);
+    }
+
+    #[test]
+    fn a_cached_tail_records_only_forwarded_tokens_and_completed_prefill_time() {
+        let mut record = served_record();
+        record.prompt_tokens = 100_050;
+        record.cache_read = 100_000;
+        record.prefill_tokens = 50;
+        record.prefill_secs = 0.25;
+        let run = run_record(&record, false);
+        assert_eq!(run.cached_tokens, 100_000);
+        assert_eq!(run.prefill_tokens, 50);
+        assert_eq!(run.prefill_secs, 0.25);
+        assert_eq!(run.prefill_tokens as f64 / run.prefill_secs, 200.0);
+
+        record.abandoned = Some(CancelReason::ClientGone);
+        record.prefill_tokens = 20;
+        record.prefill_secs = 0.125;
+        let partial = run_record(&record, false);
+        assert!(!partial.ok);
+        assert_eq!(partial.prefill_tokens, 20);
+        assert_eq!(partial.prefill_secs, 0.125);
     }
 
     /// A batch is submitted on the native dialect but costs nothing like a

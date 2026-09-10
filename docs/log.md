@@ -4,6 +4,15 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-10 — Server activity includes diffusion and completed prefill timing
+
+The TUI leads with the resident model and current slot context. Queue and history
+use five wrapping columns for text, batch, image and preprocessing jobs. Prefill
+timing waits for GPU completion at existing span boundaries, preserving pipelining
+between chunks; batch rows omit their unreliable phase rates. Image events cover
+queueing through success, cancellation or failure. The 38 TUI tests pass, including
+80-column mixed activity. [Implementation, timing limits and verification](records/serve-activity.md).
+
 ## 2026-09-10 — Anthropic prompt usage no longer doubles the context count
 
 Messages responses and streaming starts report disjoint input, cache-read and

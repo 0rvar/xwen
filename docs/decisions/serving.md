@@ -497,3 +497,15 @@ That existing limitation needs measured completion counts if interrupted-request
 accounting becomes a client requirement. Cold, partial and full cache-hit regressions
 cover both response modes; the new sum assertion failed with 200 against 100 before
 the fix.
+
+**The dashboard reports resident state and completed inference work (2026-09-10).**
+The configured default does not identify the model currently held by either worker.
+The header therefore names residency first, with current language-slot context and
+the context limit reported on every load. Queue and history use five shared columns
+with statistics specific to text, batches, image rendering or preprocessing.
+Language prefill timing drains at existing snapshot/prompt boundaries so queued GPU
+work cannot spill into a later phase's clock; chunks remain pipelined within each
+span. Live throughput uses those completed measurements. Batch phase rates remain
+unreliable under shared generator accounting, so the table shows counts and total
+duration. Image events track accepted and rejected submissions through terminal
+cleanup, with phase times from completed runs. [Scope and limits](../records/serve-activity.md).

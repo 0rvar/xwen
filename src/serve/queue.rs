@@ -193,6 +193,12 @@ fn report(jobs: &[Queued], logger: &ServeLogger) {
                 id: queued.job.origin_id(),
                 prompt_tokens: queued.prompt_tokens,
                 queued_at: queued.submitted,
+                dialect: match &queued.job {
+                    Job::Generation(job) => job.origin.dialect,
+                    Job::Batch(job) => job.origin.dialect,
+                },
+                target: queued.job.model(),
+                estimated: matches!(&queued.job, Job::Batch(_)),
             })
             .collect(),
     ));

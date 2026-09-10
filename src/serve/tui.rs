@@ -16,7 +16,6 @@
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Stderr};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Once};
@@ -33,11 +32,13 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Gauge, List, ListItem, ListState, Paragraph, Row, Table};
 
 use super::QuitSignal;
 use super::config::ServeSettings;
-use super::log::{JobRecord, QueueEntry, ServeLog, SinkMessage, SlotSummary};
+use super::log::{
+    ImageActivity, ImageRecord, JobRecord, QueueEntry, ServeLog, SinkMessage, SlotSummary,
+};
 use super::types::{RequestOrigin, ResidentModel, StopKind};
 
 /// How long the loop parks before redrawing anyway. The uptime, the queue ages
@@ -105,26 +106,15 @@ pub struct Vitals {
     /// polling the truth cannot go stale between two events the way a folded
     /// copy can.
     pub resident: Arc<ResidentModel>,
-    /// The checkpoint's size on disk, or `None` if it could not be read.
-    pub model_bytes: Option<u64>,
+    /// The image worker's residency cell, polled with the language model cell.
+    pub image_resident: Arc<AtomicBool>,
     pub context_length: usize,
     pub port: u16,
-    /// Whether the checkpoint currently LOADED is speculating. Starts at
-    /// `draft_configured` — nothing is loaded yet, and a header that said "off"
-    /// on a drafting server would be wrong for the whole first request — and is
-    /// then driven by the engine's own drafter events, because which checkpoint
-    /// is resident decides this and a swap can change it.
+    /// Whether the resident checkpoint is speculating, driven by drafter events.
+    /// The header hides this value while no language model is loaded.
     pub draft: bool,
-    /// What the SETTINGS asked for OF THE DEFAULT CHECKPOINT, which is what the
-    /// cell falls back to whenever nothing is loaded (a swap, an idle unload).
-    /// Without it the cell would have to invent an answer for "no model
-    /// resident" — and inventing "off" there would read as a configuration
-    /// problem on a drafting server.
-    ///
-    /// Resolved against the default checkpoint rather than off the settings
-    /// alone because the settings' own default defers to the checkpoint: a
-    /// server on a checkpoint that does not draft unasked would otherwise
-    /// advertise speculation it will never do.
+    /// The default checkpoints resolved setting, restored between residencies
+    /// until the next loaded checkpoint reports its drafter state.
     pub draft_configured: bool,
     /// Whether the on-disk prefix cache is on, which is what decides whether the
     /// header carries a cell for it: a server that keeps nothing on disk has no
@@ -138,12 +128,13 @@ impl Vitals {
         settings: &ServeSettings,
         default_model: crate::hub::Model,
         resident: Arc<ResidentModel>,
+        image_resident: Arc<AtomicBool>,
     ) -> Self {
         let draft = settings.draft.is_on_for(default_model);
         Self {
             model_id,
             resident,
-            model_bytes: file_size(&settings.model),
+            image_resident,
             context_length: settings.context_length,
             port: settings.port,
             draft,
@@ -164,10 +155,6 @@ impl Vitals {
             target.model.full_name().to_string()
         })
     }
-}
-
-fn file_size(path: &Path) -> Option<u64> {
-    std::fs::metadata(path).ok().map(|meta| meta.len())
 }
 
 /// Facts about the machine the render loop wants but must not go and get: both
@@ -316,7 +303,19 @@ struct Live {
 #[derive(Debug, Clone)]
 struct Finished {
     at: SystemTime,
-    record: JobRecord,
+    record: FinishedRecord,
+}
+
+#[derive(Debug, Clone)]
+enum FinishedRecord {
+    Language(JobRecord),
+    Image(ImageRecord),
+}
+
+struct LiveImage {
+    activity: ImageActivity,
+    picked_at: Instant,
+    completed: usize,
 }
 
 /// Everything the dashboard knows, folded from the event stream.
@@ -328,6 +327,9 @@ struct Dashboard {
     address: Option<String>,
     live: Option<Live>,
     queue: Vec<QueueEntry>,
+    image_queue: Vec<ImageActivity>,
+    image_live: Option<LiveImage>,
+    configured_context: usize,
     slots: Vec<SlotSummary>,
     history: VecDeque<Finished>,
     logs: VecDeque<String>,
@@ -352,12 +354,15 @@ struct Disk {
 impl Dashboard {
     fn new(vitals: Vitals, started: Instant, environment: Arc<Environment>) -> Self {
         Self {
+            configured_context: vitals.context_length,
             vitals,
             started,
             environment,
             address: None,
             live: None,
             queue: Vec::new(),
+            image_queue: Vec::new(),
+            image_live: None,
             slots: Vec::new(),
             history: VecDeque::new(),
             logs: VecDeque::new(),
@@ -378,7 +383,7 @@ impl Dashboard {
         match event {
             // The checkpoint's own limit wins over the configured one, so the
             // header stops advertising a context the server will not serve.
-            ServeLog::ContextClamped { trained, .. } => self.vitals.context_length = trained,
+            ServeLog::ModelContext { tokens } => self.vitals.context_length = tokens,
             ServeLog::Listening { address, .. } => self.address = Some(address),
             // The drafting cell tracks what is LOADED, not what was configured:
             // speculation is per checkpoint (one may ship no sidecar while the
@@ -390,14 +395,15 @@ impl Dashboard {
             // `ModelLoaded`: that fires AFTER `EngineState::load` returns, while
             // `DrafterLoaded` fires from inside it, so a "clear on load" arm
             // runs last and pins the cell off on every drafting server. With
-            // nothing loaded the cell shows the configured intent, which is the
-            // honest answer before a checkpoint has been chosen.
+            // nothing loaded the header hides the drafting cell.
             ServeLog::DrafterLoaded { .. } => self.vitals.draft = true,
             ServeLog::NoDrafterAvailable { .. } | ServeLog::DraftDefaultOff { .. } => {
                 self.vitals.draft = false
             }
             ServeLog::CheckpointSwappingOut { .. } | ServeLog::IdleUnloaded { .. } => {
                 self.vitals.draft = self.vitals.draft_configured;
+                self.vitals.context_length = self.configured_context;
+                self.slots.clear();
             }
             ServeLog::JobPicked {
                 origin,
@@ -436,7 +442,14 @@ impl Dashboard {
                     let progress = live.prefill.get_or_insert_with(Progress::default);
                     progress.done = done;
                     progress.total = total;
-                    progress.rate.observe(at, done);
+                    progress.rate.last = Some((at, done));
+                }
+            }
+            ServeLog::PrefillMeasured { tokens, secs } => {
+                if let Some(live) = self.live.as_mut() {
+                    let progress = live.prefill.get_or_insert_with(Progress::default);
+                    progress.rate.value = (secs > 0.0 && tokens > 0).then(|| tokens as f64 / secs);
+                    progress.rate.last = Some((at, progress.done));
                 }
             }
             ServeLog::DecodeTick {
@@ -461,9 +474,51 @@ impl Dashboard {
                 }
                 self.history.push_front(Finished {
                     at: wall,
-                    record: *record,
+                    record: FinishedRecord::Language(*record),
                 });
                 self.live = None;
+            }
+            ServeLog::ImageQueued(activity) => self.image_queue.push(activity),
+            ServeLog::ImagePicked { id } => {
+                if let Some(index) = self.image_queue.iter().position(|job| job.id == id) {
+                    self.image_live = Some(LiveImage {
+                        activity: self.image_queue.remove(index),
+                        picked_at: at,
+                        completed: 0,
+                    });
+                }
+            }
+            ServeLog::ImageProgress {
+                id,
+                completed_images,
+            } => {
+                if let Some(live) = &mut self.image_live
+                    && live.activity.id == id
+                {
+                    live.completed = completed_images;
+                }
+            }
+            ServeLog::ImageDone(record) => {
+                self.image_queue.retain(|job| job.id != record.activity.id);
+                if self
+                    .image_live
+                    .as_ref()
+                    .is_some_and(|live| live.activity.id == record.activity.id)
+                {
+                    self.image_live = None;
+                }
+                if record.error.is_some() || record.cancelled {
+                    self.failed += 1;
+                } else {
+                    self.served += 1;
+                }
+                if self.history.len() == HISTORY_CAPACITY {
+                    self.history.pop_back();
+                }
+                self.history.push_front(Finished {
+                    at: wall,
+                    record: FinishedRecord::Image(*record),
+                });
             }
             ServeLog::SlotsSnapshot(slots) => self.slots = slots,
             ServeLog::QueueSnapshot(queue) => self.queue = queue,
@@ -571,11 +626,6 @@ fn commas(n: usize) -> String {
     out
 }
 
-/// A file size in the units a checkpoint is discussed in.
-fn giga(bytes: u64) -> String {
-    format!("{:.1}G", bytes as f64 / 1e9)
-}
-
 /// The disk tier's size in the binary units its own log lines use, so the header
 /// and the LOG pane never disagree about how big the store is.
 fn gibi(bytes: u64) -> String {
@@ -669,17 +719,6 @@ fn outcome(record: &JobRecord) -> String {
     }
 }
 
-/// The token arithmetic of one finished request: what the cache supplied, what
-/// was prefilled, and what came out.
-fn token_flow(record: &JobRecord) -> String {
-    format!(
-        "{}+{}→{}",
-        commas(record.cache_read),
-        commas(record.prefill_tokens),
-        commas(record.output_tokens)
-    )
-}
-
 /// One phase's cell — its wall time and its own rate — or a dash for a phase
 /// that never ran. Prefill and decode each get one of these; blending them
 /// into a single figure was tried and read as neither.
@@ -735,89 +774,94 @@ fn detail_cell(record: &JobRecord) -> String {
 // Drawing.
 // ---------------------------------------------------------------------------
 
-/// Below this width the QUEUE and SLOTS panes stack instead of sitting side by
-/// side: two four-column tables in forty characters each is unreadable.
-const SIDE_BY_SIDE_WIDTH: u16 = 96;
-
 fn draw(frame: &mut Frame, app: &mut Dashboard, now: Instant) {
-    let [header, live, middle, history, logs, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(5),
-        Constraint::Length(6),
-        Constraint::Percentage(30),
+    let pending = app.queue.len() + app.image_queue.len();
+    let [header, live, queue, slots, history, logs, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(if app.image_live.is_some() && app.live.is_some() {
+            7
+        } else {
+            5
+        }),
+        Constraint::Length(if pending == 0 { 3 } else { 5 }),
+        Constraint::Length(if app.slots.is_empty() { 0 } else { 3 }),
         Constraint::Fill(1),
+        Constraint::Length(3),
         Constraint::Length(1),
     ])
     .areas(frame.area());
-
     frame.render_widget(header_line(app, now), header);
     draw_live(frame, app, live, now);
-
-    let (queue_area, slots_area) = if middle.width >= SIDE_BY_SIDE_WIDTH {
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(45), Constraint::Fill(1)]).areas(middle);
-        (left, right)
-    } else {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)]).areas(middle);
-        (top, bottom)
-    };
-    draw_queue(frame, app, queue_area, now);
-    draw_slots(frame, app, slots_area);
+    draw_queue(frame, app, queue, now);
+    draw_slots(frame, app, slots);
     draw_history(frame, app, history);
     draw_logs(frame, app, logs);
     frame.render_widget(footer_line(app), footer);
 }
 
 fn header_line(app: &Dashboard, now: Instant) -> Paragraph<'static> {
-    let mut parts = vec![app.vitals.model_id.clone()];
-    if let Some(bytes) = app.vitals.model_bytes {
-        parts.push(giga(bytes));
+    let resident = app.vitals.resident_name();
+    let image_loaded = app.vitals.image_resident.load(Ordering::Acquire);
+    let model = match (&resident, image_loaded) {
+        (Some(name), true) => format!("loaded {name} · Z-Image-Turbo"),
+        (Some(name), false) => format!("loaded {name}"),
+        (None, true) => "loaded Z-Image-Turbo".to_string(),
+        (None, false) => "unloaded".to_string(),
+    };
+    let context = if resident.is_none() {
+        "ctx — · slot —".to_string()
+    } else {
+        let limit = commas(app.vitals.context_length);
+        match &app.live {
+            Some(live) => match live.cache.filter(|_| !live.estimated) {
+                Some(cache) => {
+                    let used = live.decode.map_or_else(
+                        || live.prefill.map_or(cache.resume, |progress| progress.done),
+                        |decode| live.prompt_tokens.saturating_add(decode.tokens_out),
+                    );
+                    format!("ctx {}/{limit} · slot {}", commas(used), cache.slot)
+                }
+                None => format!("ctx ?/{limit} · slot ?"),
+            },
+            None => match app.slots.iter().enumerate().find(|(_, slot)| slot.live) {
+                Some((id, slot)) => format!("ctx {}/{limit} · slot {id}", commas(slot.tokens)),
+                None => format!("ctx 0/{limit} · slot —"),
+            },
+        }
+    };
+    let mut details = vec![context];
+    if resident.is_some() {
+        details.push(format!(
+            "draft {}",
+            if app.vitals.draft { "ON" } else { "off" }
+        ));
     }
-    // The first cell names the FILE this server was started with and never
-    // changes; this one names what is in memory right now. On the ordinary
-    // single-checkpoint server the two agree and repeating the name would be
-    // noise, so it reads a bare `loaded` — the cell earns its width on an
-    // unloaded server and on a swap, which are the two states nothing outside
-    // the log used to report.
-    parts.push(match app.vitals.resident_name() {
-        Some(name) if name == app.vitals.model_id => "loaded".to_string(),
-        Some(name) => format!("loaded {name}"),
-        None => "unloaded".to_string(),
-    });
-    parts.push(format!(
-        "draft {}",
-        if app.vitals.draft { "ON" } else { "off" }
+    details.push(
+        app.address
+            .clone()
+            .unwrap_or_else(|| format!(":{}", app.vitals.port)),
+    );
+    if app.environment.power.load(Ordering::Relaxed) == 1 {
+        details.push("LPM".to_string());
+    }
+    details.push(format!(
+        "up {}",
+        uptime(now.saturating_duration_since(app.started))
     ));
-    parts.push(format!("ctx {}", commas(app.vitals.context_length)));
     if app.vitals.disk_cache {
-        parts.push(format!(
+        details.push(format!(
             "disk: {} segs {}",
             app.disk.segments,
             gibi(app.disk.bytes)
         ));
     }
-    parts.push(match &app.address {
-        Some(address) => address.clone(),
-        None => format!(":{}", app.vitals.port),
-    });
-    if app.environment.power.load(Ordering::Relaxed) == 1 {
-        parts.push("LPM".to_string());
-    }
-    parts.push(format!(
-        "up {}",
-        uptime(now.saturating_duration_since(app.started))
-    ));
-
-    let mut spans = vec![Span::styled(
-        format!(" {} ", parts.remove(0)),
-        Style::new().fg(Color::Cyan).bold(),
-    )];
-    for part in parts {
-        spans.push(Span::styled("· ", Style::new().dim()));
-        spans.push(Span::raw(format!("{part} ")));
-    }
-    Paragraph::new(Line::from(spans))
+    Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!(" {model}"),
+            Style::new().fg(Color::Cyan).bold(),
+        )),
+        Line::from(format!(" {}", details.join(" · "))),
+    ])
 }
 
 fn draw_live(frame: &mut Frame, app: &Dashboard, area: Rect, now: Instant) {
@@ -827,6 +871,40 @@ fn draw_live(frame: &mut Frame, app: &Dashboard, area: Rect, now: Instant) {
     if inner.height == 0 {
         return;
     }
+    let inner = if let Some(image) = &app.image_live {
+        let [image_area, remaining] =
+            Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!(
+                    "{} {} · {}x{} · {}/{} images · {}",
+                    if image.activity.preprocessing {
+                        "PREPROCESS"
+                    } else {
+                        "IMAGE"
+                    },
+                    image.activity.model,
+                    image.activity.width,
+                    image.activity.height,
+                    image.completed,
+                    image.activity.images,
+                    seconds(now.saturating_duration_since(image.picked_at))
+                )),
+                Line::from(if image.activity.preprocessing {
+                    "preparing control image".to_string()
+                } else {
+                    format!(
+                        "{} requested steps/image · awaiting image completion",
+                        image.activity.steps
+                    )
+                }),
+            ]),
+            image_area,
+        );
+        remaining
+    } else {
+        inner
+    };
     let [top, details, tail] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -835,6 +913,9 @@ fn draw_live(frame: &mut Frame, app: &Dashboard, area: Rect, now: Instant) {
     .areas(inner);
 
     let Some(live) = &app.live else {
+        if app.image_live.is_some() {
+            return;
+        }
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 "idle — waiting for a request",
@@ -972,34 +1053,128 @@ fn prefill_summary(live: &Live) -> Line<'static> {
     ))
 }
 
+/// Keep all five fields present; wrap within cells so long names and statistics
+/// remain readable on an ordinary eighty-column terminal.
+fn request_widths(width: u16) -> [Constraint; 5] {
+    let usable = width.saturating_sub(6);
+    let time = 8.min(usable / 6);
+    let api = 9.min(usable / 6);
+    let model = 22.min(usable / 3);
+    let outcome = 10.min(usable / 6);
+    [
+        Constraint::Length(time),
+        Constraint::Length(api),
+        Constraint::Length(model),
+        Constraint::Length(outcome),
+        Constraint::Length(usable.saturating_sub(time + api + model + outcome)),
+    ]
+}
+
+fn wrapped(text: &str, width: usize) -> String {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            for chunk in word.chars().collect::<Vec<_>>().chunks(width) {
+                if !line.is_empty() {
+                    if line.chars().count() + 1 + chunk.len() > width {
+                        lines.push(std::mem::take(&mut line));
+                    } else {
+                        line.push(' ');
+                    }
+                }
+                line.extend(chunk);
+            }
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+fn request_row(values: [String; 5], widths: &[Constraint; 5]) -> Row<'static> {
+    let cells: Vec<String> = values
+        .iter()
+        .zip(widths)
+        .map(|(text, width)| {
+            let Constraint::Length(width) = width else {
+                unreachable!()
+            };
+            wrapped(text, *width as usize)
+        })
+        .collect();
+    let height = cells
+        .iter()
+        .map(|cell| cell.lines().count())
+        .max()
+        .unwrap_or(1) as u16;
+    Row::new(cells.into_iter().map(Cell::from)).height(height)
+}
+
 fn draw_queue(frame: &mut Frame, app: &Dashboard, area: Rect, now: Instant) {
-    let title = format!(" QUEUE ({}) ", app.queue.len());
-    let rows: Vec<Row> = app
+    let widths = request_widths(area.width);
+    let mut pending = app
         .queue
         .iter()
         .map(|entry| {
-            Row::new(vec![
-                format!("#{}", entry.id),
-                format!("{} tok", commas(entry.prompt_tokens)),
-                // Aged at render rather than at snapshot: the snapshots only
-                // arrive when the queue changes, and an entry waiting out a
-                // five-minute prefill must not read "age 0.0s" for all of it.
-                format!(
-                    "age {}",
-                    seconds(now.saturating_duration_since(entry.queued_at))
-                ),
-            ])
+            (
+                entry.queued_at,
+                [
+                    seconds(now.saturating_duration_since(entry.queued_at)),
+                    entry.dialect.label().to_string(),
+                    if entry.target.served_file {
+                        app.vitals.model_id.clone()
+                    } else {
+                        entry.target.model.full_name().to_string()
+                    },
+                    format!("queued #{}", entry.id),
+                    format!(
+                        "prompt {}{} tok",
+                        if entry.estimated { "~" } else { "" },
+                        commas(entry.prompt_tokens)
+                    ),
+                ],
+            )
         })
-        .collect();
-    let widths = [
-        Constraint::Length(6),
-        Constraint::Fill(1),
-        Constraint::Length(12),
-    ];
+        .chain(app.image_queue.iter().map(|entry| {
+            (
+                entry.queued_at,
+                [
+                    seconds(now.saturating_duration_since(entry.queued_at)),
+                    if entry.preprocessing {
+                        "preprocess"
+                    } else {
+                        "images"
+                    }
+                    .to_string(),
+                    entry.model.clone(),
+                    format!("queued #{}", entry.id),
+                    format!(
+                        "{}x{} · {} images\n{} requested steps",
+                        entry.width, entry.height, entry.images, entry.steps
+                    ),
+                ],
+            )
+        }))
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|(at, _)| *at);
+    let rows = pending
+        .into_iter()
+        .map(|(_, values)| request_row(values, &widths));
     frame.render_widget(
         Table::new(rows, widths)
             .column_spacing(1)
-            .block(Block::bordered().title(title)),
+            .header(
+                Row::new(["elapsed", "api", "model", "outcome", "inference"])
+                    .style(Style::new().dim()),
+            )
+            .block(Block::bordered().title(format!(
+                " QUEUE ({}) ",
+                app.queue.len() + app.image_queue.len()
+            ))),
         area,
     );
 }
@@ -1045,56 +1220,100 @@ fn draw_slots(frame: &mut Frame, app: &Dashboard, area: Rect) {
     );
 }
 
+fn image_statistics(record: &ImageRecord) -> String {
+    let mut lines = vec![
+        format!(
+            "{}x{} · {}/{} images",
+            record.activity.width,
+            record.activity.height,
+            record.completed_images,
+            record.activity.images
+        ),
+        format!("elapsed {}", seconds(span(record.elapsed_secs))),
+    ];
+    if !record.activity.preprocessing {
+        lines.push(format!(
+            "{} steps · {} s/step",
+            record.executed_steps,
+            if record.executed_steps > 0 {
+                format!("{:.2}", record.denoise_secs / record.executed_steps as f64)
+            } else {
+                "—".to_string()
+            }
+        ));
+        lines.push(format!(
+            "enc {} · VAE {}",
+            seconds(span(record.encode_secs)),
+            seconds(span(record.vae_secs))
+        ));
+    }
+    lines.join("\n")
+}
+
+fn language_statistics(record: &JobRecord) -> String {
+    if let Some(batch) = &record.batch {
+        return format!(
+            "{}/{} items · {} failed\nforwarded {} · decoded {}\ntotal {}",
+            batch.items.saturating_sub(batch.failed),
+            batch.items,
+            batch.failed,
+            commas(batch.prefill_tokens),
+            commas(batch.decode_tokens),
+            seconds(span(batch.secs))
+        );
+    }
+    format!(
+        "cached {} · new {} · out {}\npf {}\ndec {}\n{}",
+        commas(record.cache_read),
+        commas(record.prefill_tokens),
+        commas(record.output_tokens),
+        prefill_cell(record),
+        decode_cell(record),
+        detail_cell(record)
+    )
+}
+
 fn draw_history(frame: &mut Frame, app: &Dashboard, area: Rect) {
     let offset = app.environment.utc_offset.load(Ordering::Relaxed);
-    let rows: Vec<Row> = app
-        .history
-        .iter()
-        .map(|finished| {
-            let record = &finished.record;
-            Row::new(vec![
-                clock(finished.at, offset),
+    let widths = request_widths(area.width);
+    let rows = app.history.iter().map(|finished| {
+        let (api, model, outcome, stats) = match &finished.record {
+            FinishedRecord::Language(record) => (
                 record.origin.dialect.label().to_string(),
-                // On a single-checkpoint server every row says the same thing;
-                // on one that swaps, this is the field that explains why two
-                // rows ran at different rates.
                 record.model.clone(),
-                token_flow(record),
                 outcome(record),
-                prefill_cell(record),
-                decode_cell(record),
-                detail_cell(record),
-            ])
-        })
-        .collect();
-    let widths = [
-        Constraint::Length(8),
-        Constraint::Length(9),
-        // Wide enough for the longest official name (`Qwen3.8-Flash-Next`);
-        // a longer custom file id is cut by the table rather than pushing the
-        // numbers off the pane.
-        Constraint::Length(18),
-        Constraint::Length(20),
-        Constraint::Length(13),
-        Constraint::Length(17),
-        Constraint::Length(17),
-        Constraint::Fill(1),
-    ];
+                language_statistics(record),
+            ),
+            FinishedRecord::Image(record) => (
+                if record.activity.preprocessing {
+                    "preprocess"
+                } else {
+                    "images"
+                }
+                .to_string(),
+                record.activity.model.clone(),
+                if record.cancelled {
+                    "cancelled"
+                } else if record.error.is_some() {
+                    "error"
+                } else {
+                    "done"
+                }
+                .to_string(),
+                image_statistics(record),
+            ),
+        };
+        request_row(
+            [clock(finished.at, offset), api, model, outcome, stats],
+            &widths,
+        )
+    });
     frame.render_widget(
         Table::new(rows, widths)
             .column_spacing(1)
             .header(
-                Row::new(vec![
-                    "time",
-                    "api",
-                    "model",
-                    "cached+new→out",
-                    "outcome",
-                    "prefill",
-                    "decode",
-                    "detail",
-                ])
-                .style(Style::new().dim()),
+                Row::new(["time", "api", "model", "outcome", "inference"])
+                    .style(Style::new().dim()),
             )
             .block(Block::bordered().title(" HISTORY ")),
         area,
@@ -1473,7 +1692,7 @@ mod tests {
         Vitals {
             model_id: "laguna-s-2.1-Q4_K_M".to_string(),
             resident,
-            model_bytes: Some(68_200_000_000),
+            image_resident: Arc::new(AtomicBool::new(false)),
             context_length: 262_144,
             port: 5241,
             draft: true,
@@ -1563,7 +1782,7 @@ mod tests {
         assert!(text.contains("slot 0"), "{text}");
         assert!(text.contains("client anthropic, streaming"), "{text}");
         assert!(text.contains("laguna-s-2.1-Q4_K_M"), "{text}");
-        assert!(text.contains("ctx 262,144"), "{text}");
+        assert!(text.contains("ctx 21,480/262,144"), "{text}");
         assert!(text.contains("draft ON"), "{text}");
     }
 
@@ -1672,7 +1891,7 @@ mod tests {
                 ServeLog::JobDone(Box::new(record())),
             ],
         );
-        assert!(text.contains("380+1,668→38"), "{text}");
+        assert!(text.contains("cached 380 · new 1,668 · out 38"), "{text}");
         assert!(text.contains("end_turn"), "{text}");
         assert!(text.contains("TTFT 6.6s"), "{text}");
         assert!(text.contains("anthropic"), "{text}");
@@ -1690,6 +1909,9 @@ mod tests {
             vec![
                 ServeLog::QueueSnapshot(vec![QueueEntry {
                     id: 12,
+                    dialect: Dialect::Anthropic,
+                    target: crate::serve::types::Target::served(crate::hub::Model::Qwen35BA3B),
+                    estimated: false,
                     prompt_tokens: 1204,
                     queued_at: Instant::now(),
                 }]),
@@ -2212,7 +2434,6 @@ mod tests {
         assert_eq!(commas(999), "999");
         assert_eq!(commas(34_112), "34,112");
         assert_eq!(commas(1_000_000), "1,000,000");
-        assert_eq!(giga(68_200_000_000), "68.2G");
         assert_eq!(mib(113_246_208), "108 MiB");
         assert_eq!(uptime(Duration::from_secs(12)), "12s");
         assert_eq!(uptime(Duration::from_secs(14 * 60)), "14m");
@@ -2307,6 +2528,9 @@ mod tests {
         app.apply(
             ServeLog::QueueSnapshot(vec![QueueEntry {
                 id: 4,
+                dialect: Dialect::Anthropic,
+                target: crate::serve::types::Target::served(crate::hub::Model::Qwen35BA3B),
+                estimated: false,
                 prompt_tokens: 33_900,
                 queued_at,
             }]),
@@ -2320,8 +2544,8 @@ mod tests {
                 .expect("the dashboard draws");
             rendered(&terminal)
         };
-        assert!(at(queued_at).contains("age 0.0s"));
-        assert!(at(queued_at + Duration::from_secs(41)).contains("age 41.0s"));
+        assert!(at(queued_at).contains("0.0s"));
+        assert!(at(queued_at + Duration::from_secs(41)).contains("41.0s"));
     }
 
     /// The NOW panel reports what was reused, which is what the wire calls
@@ -2491,6 +2715,9 @@ mod tests {
         app.apply(
             ServeLog::QueueSnapshot(vec![QueueEntry {
                 id: 3,
+                dialect: Dialect::Anthropic,
+                target: crate::serve::types::Target::served(crate::hub::Model::Qwen35BA3B),
+                estimated: false,
                 prompt_tokens: 12,
                 queued_at: Instant::now(),
             }]),
@@ -2504,5 +2731,494 @@ mod tests {
                 .draw(|f| draw(f, &mut app, Instant::now()))
                 .expect("the dashboard draws at any size");
         }
+    }
+    fn image_activity(id: u64, preprocessing: bool) -> ImageActivity {
+        ImageActivity {
+            id,
+            queued_at: Instant::now(),
+            model: if preprocessing {
+                "canny"
+            } else {
+                "Z-Image-Turbo"
+            }
+            .to_string(),
+            width: 1024,
+            height: 768,
+            steps: if preprocessing { 0 } else { 8 },
+            images: 2,
+            preprocessing,
+        }
+    }
+
+    fn image_record(id: u64, preprocessing: bool) -> ImageRecord {
+        ImageRecord {
+            activity: image_activity(id, preprocessing),
+            completed_images: 2,
+            elapsed_secs: 20.0,
+            encode_secs: 1.0,
+            denoise_secs: 16.0,
+            vae_secs: 3.0,
+            executed_steps: if preprocessing { 0 } else { 16 },
+            error: None,
+            cancelled: false,
+        }
+    }
+
+    fn pane(app: &mut Dashboard, width: u16, history: bool) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                if history {
+                    draw_history(f, app, f.area());
+                } else {
+                    draw_queue(f, app, f.area(), Instant::now());
+                }
+            })
+            .unwrap();
+        rendered(&terminal)
+    }
+
+    #[test]
+    fn measured_prefill_counts_exclude_cached_tokens_and_tick_arrival_jitter() {
+        for cached in [0, 900] {
+            let mut app = dashboard();
+            let now = Instant::now();
+            let wall = SystemTime::UNIX_EPOCH;
+            app.apply(
+                ServeLog::JobPicked {
+                    origin: origin(1),
+                    prompt_tokens: 1000,
+                    estimated: false,
+                    queue_wait: Duration::ZERO,
+                    deadline: None,
+                },
+                now,
+                wall,
+            );
+            app.apply(
+                ServeLog::JobCacheResolved {
+                    id: 1,
+                    cached,
+                    resume: cached,
+                    slot: 0,
+                },
+                now,
+                wall,
+            );
+            app.apply(
+                ServeLog::PrefillTick {
+                    done: cached + 50,
+                    total: 1000,
+                },
+                now,
+                wall,
+            );
+            app.apply(
+                ServeLog::PrefillTick {
+                    done: 1000,
+                    total: 1000,
+                },
+                now + Duration::from_millis(1),
+                wall,
+            );
+            assert!(
+                app.live
+                    .as_ref()
+                    .unwrap()
+                    .prefill
+                    .unwrap()
+                    .rate
+                    .value
+                    .is_none()
+            );
+            app.apply(
+                ServeLog::PrefillMeasured {
+                    tokens: 1000 - cached,
+                    secs: 2.0,
+                },
+                now,
+                wall,
+            );
+            assert_eq!(
+                app.live.as_ref().unwrap().prefill.unwrap().rate.value,
+                Some((1000 - cached) as f64 / 2.0)
+            );
+            let text = frame(&mut app, Vec::new());
+            assert!(
+                text.contains(if cached == 0 {
+                    "500.0 tok/s"
+                } else {
+                    "50.0 tok/s"
+                }),
+                "{text}"
+            );
+            let mut finished = record();
+            finished.cache_read = cached;
+            finished.prefill_tokens = 1000 - cached;
+            finished.prefill_secs = 2.0;
+            app.apply(ServeLog::JobDone(Box::new(finished)), now, wall);
+            let text = pane(&mut app, 80, true);
+            assert!(
+                text.contains(if cached == 0 { "500 t/s" } else { "50 t/s" }),
+                "{text}"
+            );
+            assert!(
+                text.contains("cached") && text.contains("new") && text.contains("out"),
+                "{text}"
+            );
+            assert!(text.contains("TTFT"), "{text}");
+        }
+    }
+
+    #[test]
+    fn header_context_tracks_progress_idle_slots_resolved_limits_and_unload() {
+        let mut app = dashboard();
+        frame(
+            &mut app,
+            vec![
+                ServeLog::ModelContext { tokens: 40960 },
+                ServeLog::SlotsSnapshot(vec![SlotSummary {
+                    live: true,
+                    tokens: 1234,
+                    snapshots: 1,
+                    image_bytes: 0,
+                    has_drafter: false,
+                    last_used: 1,
+                    agrees_to: 1234,
+                }]),
+            ],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        terminal
+            .draw(|f| f.render_widget(header_line(&app, Instant::now()), f.area()))
+            .unwrap();
+        let text = rendered(&terminal);
+        assert!(text.contains("loaded laguna-s-2.1-Q4_K_M"), "{text}");
+        assert!(text.contains("ctx 1,234/40,960 · slot 0"), "{text}");
+        app.vitals
+            .resident
+            .store(crate::serve::types::Target::official(
+                crate::hub::Model::Qwen3827B,
+            ));
+        frame(&mut app, vec![ServeLog::ModelContext { tokens: 262144 }]);
+        terminal
+            .draw(|f| f.render_widget(header_line(&app, Instant::now()), f.area()))
+            .unwrap();
+        let text = rendered(&terminal);
+        assert!(text.contains("loaded Qwen3.8-27B"), "{text}");
+        assert!(text.contains("/262,144"), "{text}");
+        app.vitals.resident.clear();
+        frame(
+            &mut app,
+            vec![ServeLog::IdleUnloaded {
+                elapsed: Duration::from_secs(60),
+                configured: None,
+            }],
+        );
+        assert!(app.slots.is_empty());
+        terminal
+            .draw(|f| f.render_widget(header_line(&app, Instant::now()), f.area()))
+            .unwrap();
+        let text = rendered(&terminal);
+        assert!(
+            text.contains("unloaded") && text.contains("ctx — · slot —"),
+            "{text}"
+        );
+        assert!(!text.contains("laguna") && !text.contains("Qwen"), "{text}");
+        app.vitals.image_resident.store(true, Ordering::Release);
+        terminal
+            .draw(|f| f.render_widget(header_line(&app, Instant::now()), f.area()))
+            .unwrap();
+        let text = rendered(&terminal);
+        assert!(
+            text.contains("loaded Z-Image-Turbo") && text.contains("ctx — · slot —"),
+            "{text}"
+        );
+        app.vitals.image_resident.store(false, Ordering::Release);
+        terminal
+            .draw(|f| f.render_widget(header_line(&app, Instant::now()), f.area()))
+            .unwrap();
+        assert!(rendered(&terminal).contains("unloaded"));
+    }
+
+    #[test]
+    fn image_work_survives_language_events_and_finishes_in_shared_history() {
+        let mut app = dashboard();
+        let text = frame(
+            &mut app,
+            vec![
+                ServeLog::ImageQueued(image_activity(1, false)),
+                ServeLog::ImagePicked { id: 1 },
+                ServeLog::ImageProgress {
+                    id: 1,
+                    completed_images: 1,
+                },
+                ServeLog::JobPicked {
+                    origin: origin(1),
+                    prompt_tokens: 20,
+                    estimated: false,
+                    queue_wait: Duration::ZERO,
+                    deadline: None,
+                },
+                ServeLog::JobDone(Box::new(record())),
+            ],
+        );
+        assert!(app.image_live.is_some());
+        assert!(
+            text.contains("IMAGE Z-Image-Turbo") && text.contains("1/2 images"),
+            "{text}"
+        );
+        frame(
+            &mut app,
+            vec![ServeLog::ImageDone(Box::new(image_record(1, false)))],
+        );
+        assert!(app.image_live.is_none() && app.image_queue.is_empty());
+        assert!(matches!(app.history[0].record, FinishedRecord::Image(_)));
+        assert!(matches!(app.history[1].record, FinishedRecord::Language(_)));
+        let text = pane(&mut app, 80, true);
+        for expected in [
+            "Z-Image-Turbo",
+            "1024x768",
+            "2/2 images",
+            "16 steps",
+            "1.00 s/step",
+            "enc 1.0s",
+            "VAE 3.0s",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
+
+    #[test]
+    fn image_and_preprocess_failures_remove_queued_or_active_work() {
+        for preprocessing in [false, true] {
+            for picked in [false, true] {
+                let mut app = dashboard();
+                frame(
+                    &mut app,
+                    vec![ServeLog::ImageQueued(image_activity(9, preprocessing))],
+                );
+                let text = pane(&mut app, 80, false);
+                assert!(
+                    text.contains(if preprocessing {
+                        "canny"
+                    } else {
+                        "Z-Image-Turbo"
+                    }),
+                    "{text}"
+                );
+                if picked {
+                    frame(&mut app, vec![ServeLog::ImagePicked { id: 9 }]);
+                }
+                let mut result = image_record(9, preprocessing);
+                result.error = Some("test failure".to_string());
+                result.completed_images = 0;
+                result.executed_steps = 0;
+                frame(&mut app, vec![ServeLog::ImageDone(Box::new(result))]);
+                assert!(app.image_queue.is_empty() && app.image_live.is_none());
+                let text = pane(&mut app, 80, true);
+                assert!(text.contains("error"), "{text}");
+                assert!(!text.contains("tok") && !text.contains("t/s"), "{text}");
+                if preprocessing {
+                    assert!(!text.contains("steps") && !text.contains("VAE"), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_history_uses_one_bounded_chronological_ring() {
+        let mut app = dashboard();
+        for id in 0..HISTORY_CAPACITY + 3 {
+            let event = if id % 2 == 0 {
+                ServeLog::ImageDone(Box::new(image_record(id as u64, true)))
+            } else {
+                ServeLog::JobDone(Box::new(record()))
+            };
+            app.apply(
+                event,
+                Instant::now(),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(id as u64),
+            );
+        }
+        assert_eq!(app.history.len(), HISTORY_CAPACITY);
+        for (newer, older) in app.history.iter().zip(app.history.iter().skip(1)) {
+            assert!(newer.at > older.at);
+        }
+    }
+    #[test]
+    fn representative_mixed_dashboard_is_readable_at_eighty_columns() {
+        let mut app = dashboard();
+        app.vitals.resident.clear();
+        frame(
+            &mut app,
+            vec![
+                ServeLog::JobDone(Box::new(record())),
+                ServeLog::ImageDone(Box::new(image_record(7, false))),
+                ServeLog::ImageResidency { loaded: true },
+                ServeLog::ImageQueued(image_activity(8, false)),
+                ServeLog::ImagePicked { id: 8 },
+                ServeLog::ImageProgress {
+                    id: 8,
+                    completed_images: 1,
+                },
+                ServeLog::QueueSnapshot(vec![QueueEntry {
+                    id: 9,
+                    dialect: Dialect::Anthropic,
+                    target: crate::serve::types::Target::official(crate::hub::Model::Qwen35BA3B),
+                    estimated: false,
+                    prompt_tokens: 2048,
+                    queued_at: Instant::now(),
+                }]),
+            ],
+        );
+        app.vitals.image_resident.store(true, Ordering::Release);
+        let mut previews = Vec::new();
+        for (width, height) in [(100, 35), (80, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| draw(f, &mut app, Instant::now()))
+                .unwrap();
+            let text = rendered(&terminal);
+            for expected in [
+                "loaded Z-Image-Turbo",
+                "ctx —",
+                "1/2 images",
+                "inference",
+                "cached",
+                "321 t/s",
+                "2/2 images",
+            ] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+            previews.push(format!("{width}x{height}\n{text}"));
+        }
+        if let Ok(path) = std::env::var("XWEN_TUI_TEST_PREVIEW") {
+            std::fs::write(path, previews.join("\n\n")).unwrap();
+        }
+    }
+    #[test]
+    fn header_polls_both_residencies_without_waiting_for_log_events() {
+        let mut app = dashboard();
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        let header = |app: &Dashboard, terminal: &mut Terminal<TestBackend>| {
+            terminal
+                .draw(|f| f.render_widget(header_line(app, Instant::now()), f.area()))
+                .unwrap();
+            rendered(terminal)
+        };
+        app.vitals.resident.clear();
+        app.vitals.image_resident.store(true, Ordering::Release);
+        assert!(header(&app, &mut terminal).contains("loaded Z-Image-Turbo"));
+        app.vitals.image_resident.store(false, Ordering::Release);
+        app.vitals
+            .resident
+            .store(crate::serve::types::Target::official(
+                crate::hub::Model::Qwen3827B,
+            ));
+        let text = header(&app, &mut terminal);
+        assert!(
+            text.contains("loaded Qwen3.8-27B") && !text.contains("Z-Image"),
+            "{text}"
+        );
+        // Delayed events cannot replace either worker's current residency cell.
+        frame(&mut app, vec![ServeLog::ImageResidency { loaded: true }]);
+        assert!(!header(&app, &mut terminal).contains("Z-Image"));
+        app.vitals.image_resident.store(true, Ordering::Release);
+        let text = header(&app, &mut terminal);
+        assert!(
+            text.contains("Qwen3.8-27B") && text.contains("Z-Image-Turbo"),
+            "{text}"
+        );
+        assert!(text.contains("ctx 0/262,144"), "{text}");
+    }
+
+    #[test]
+    fn an_unresolved_dispatch_does_not_borrow_the_previous_requests_slot() {
+        let mut app = dashboard();
+        frame(
+            &mut app,
+            vec![ServeLog::SlotsSnapshot(vec![SlotSummary {
+                live: true,
+                tokens: 1234,
+                snapshots: 1,
+                image_bytes: 0,
+                has_drafter: false,
+                last_used: 1,
+                agrees_to: 1234,
+            }])],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        let header = |app: &Dashboard, terminal: &mut Terminal<TestBackend>| {
+            terminal
+                .draw(|f| f.render_widget(header_line(app, Instant::now()), f.area()))
+                .unwrap();
+            rendered(terminal)
+        };
+        assert!(header(&app, &mut terminal).contains("ctx 1,234/262,144 · slot 0"));
+        frame(
+            &mut app,
+            vec![ServeLog::JobPicked {
+                origin: origin(2),
+                prompt_tokens: 4096,
+                estimated: false,
+                queue_wait: Duration::ZERO,
+                deadline: None,
+            }],
+        );
+        let text = header(&app, &mut terminal);
+        assert!(text.contains("ctx ?/262,144 · slot ?"), "{text}");
+        assert!(
+            !text.contains("1,234") && !text.contains("slot 0"),
+            "{text}"
+        );
+        frame(
+            &mut app,
+            vec![ServeLog::JobCacheResolved {
+                id: 2,
+                cached: 100,
+                resume: 100,
+                slot: 1,
+            }],
+        );
+        assert!(header(&app, &mut terminal).contains("ctx 100/262,144 · slot 1"));
+        frame(
+            &mut app,
+            vec![ServeLog::PrefillTick {
+                done: 512,
+                total: 4096,
+            }],
+        );
+        assert!(header(&app, &mut terminal).contains("ctx 512/262,144 · slot 1"));
+        frame(
+            &mut app,
+            vec![ServeLog::DecodeTick {
+                tokens_out: 12,
+                thinking: false,
+            }],
+        );
+        assert!(header(&app, &mut terminal).contains("ctx 4,108/262,144 · slot 1"));
+    }
+
+    #[test]
+    fn interrupted_image_records_report_cancelled_despite_the_error_detail() {
+        let mut app = dashboard();
+        let mut result = image_record(11, false);
+        result.cancelled = true;
+        result.error = Some("interrupted before completion".to_string());
+        frame(
+            &mut app,
+            vec![
+                ServeLog::ImageQueued(result.activity.clone()),
+                ServeLog::ImageDone(Box::new(result)),
+            ],
+        );
+        let text = pane(&mut app, 80, true);
+        assert!(
+            text.contains("cancelled") && !text.contains("error"),
+            "{text}"
+        );
+        assert!(app.image_queue.is_empty());
+        assert_eq!(app.failed, 1);
     }
 }

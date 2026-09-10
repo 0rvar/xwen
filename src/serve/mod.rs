@@ -29,7 +29,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -213,6 +213,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
     // at construction. Nothing is resident yet — the load is lazy, and the
     // first request is what pays for it.
     let resident = Arc::new(types::ResidentModel::new());
+    let image_resident = Arc::new(AtomicBool::new(false));
     // The sink outlives everything that logs: it is started before the first
     // line the server can produce, and the handle's `Drop` stops and joins it on
     // every way out of this function, error paths included. Which sink is the
@@ -224,6 +225,7 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
                 &settings,
                 default_target.model,
                 Arc::clone(&resident),
+                Arc::clone(&image_resident),
             ),
             quit.clone(),
         )
@@ -275,8 +277,12 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
         Arc::clone(&disk_pending),
         logger.clone(),
     );
-    let (image_handle, image_engine) =
-        images::spawn(&settings, Arc::clone(&shutdown), logger.clone());
+    let (image_handle, image_engine) = images::spawn(
+        &settings,
+        Arc::clone(&shutdown),
+        logger.clone(),
+        image_resident,
+    );
 
     let address = format!("{}:{}", settings.host, settings.port);
     let state = AppState {

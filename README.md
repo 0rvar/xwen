@@ -670,10 +670,18 @@ model resident at a time, always, and `idle_unload` applies to whichever is load
 `GET /health` says which one that is: `model_loaded` is the readiness bool it always
 was, and `model` names the resident checkpoint the same way `/v1/models` does, or is
 `null` before the first lazy load and after every unload. Both come from one read of one
-cell, so the pair cannot disagree. The dashboard reads the same cell: its header carries
-a `loaded`/`loaded <name>`/`unloaded` mark beside the served file's own id, and the
-HISTORY pane has a `model` column, so a row's rate can be read against the checkpoint
-that produced it.
+cell, so the pair cannot disagree. The dashboard leads with the currently loaded
+checkpoint, including Z-Image-Turbo, or `unloaded`. Its next line shows the current
+language slot's used context and resolved limit; diffusion has no language slot.
+Queue and history share five columns: time, API, model, outcome and inference
+statistics. Text rows show cached/new/output counts and measured rates; image rows
+show dimensions, completed images, executed steps and phase times. Batch rows show
+counts and total duration. Statistics wrap on narrower terminals.
+
+Prefill rates count only forwarded tokens and stop the timer after GPU completion.
+Live prefill rates update at snapshot or prompt boundaries; progress ticks between
+those boundaries carry no new throughput measurement. Image progress advances per
+completed image. [Activity display and timing limits](docs/records/serve-activity.md).
 
 **On the wire a checkpoint has exactly one name: its full name** (`Qwen3.6-27B`,
 `Qwen3.6-35B-A3B`, `Qwen3.8-27B`, `Qwen3.8-Flash-Next`, and since 2026-09-07 `Qwen3-4B`

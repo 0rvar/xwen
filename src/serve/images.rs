@@ -20,7 +20,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::config::ServeSettings;
-use super::log::{ServeLog, ServeLogger};
+use super::log::{ImageActivity, ImageRecord, ServeLog, ServeLogger};
 use super::openai::{bad_request, error};
 use super::{ApiError, AppState};
 use crate::hub::Model;
@@ -165,15 +165,153 @@ impl ImageJob {
     }
 }
 
+static IMAGE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The guard travels with the queued job, including failed sends and shutdown drains.
+struct ImageTrace {
+    record: ImageRecord,
+    logger: ServeLogger,
+    started: Option<Instant>,
+}
+
+impl ImageTrace {
+    fn new(job: &ImageJob, logger: ServeLogger) -> Self {
+        let (width, height, steps, images, preprocessing) = match job {
+            ImageJob::Render { params, .. } => (
+                params.width,
+                params.height,
+                params.steps,
+                params.n as usize,
+                false,
+            ),
+            ImageJob::Preprocess { image, .. } => (
+                image.dim(2).unwrap_or(0),
+                image.dim(1).unwrap_or(0),
+                0,
+                1,
+                true,
+            ),
+        };
+        let activity = ImageActivity {
+            id: IMAGE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            queued_at: Instant::now(),
+            model: if preprocessing {
+                "preprocess".into()
+            } else {
+                Model::ZImageTurbo.full_name().into()
+            },
+            width,
+            height,
+            steps,
+            images,
+            preprocessing,
+        };
+        logger.log(ServeLog::ImageQueued(activity.clone()));
+        Self {
+            record: ImageRecord {
+                activity,
+                completed_images: 0,
+                elapsed_secs: 0.0,
+                encode_secs: 0.0,
+                denoise_secs: 0.0,
+                vae_secs: 0.0,
+                executed_steps: 0,
+                error: Some("image request interrupted before completion".into()),
+                cancelled: true,
+            },
+            logger,
+            started: None,
+        }
+    }
+
+    fn picked(&mut self) {
+        self.started = Some(Instant::now());
+        self.logger.log(ServeLog::ImagePicked {
+            id: self.record.activity.id,
+        });
+    }
+
+    fn failed(&mut self, error: &ImageError, cancelled: bool) {
+        self.record.error = Some(match error {
+            ImageError::Request(message)
+            | ImageError::Render(message)
+            | ImageError::Unavailable(message) => message.clone(),
+        });
+        self.record.cancelled = cancelled;
+    }
+
+    fn finished<T>(&mut self, result: &Result<T, ImageError>, cancelled: bool) {
+        match result {
+            Ok(_) => {
+                self.record.error = None;
+                self.record.cancelled = cancelled;
+            }
+            Err(error) => self.failed(error, cancelled),
+        }
+    }
+
+    fn completed_image(&mut self) {
+        self.record.completed_images += 1;
+        self.logger.log(ServeLog::ImageProgress {
+            id: self.record.activity.id,
+            completed_images: self.record.completed_images,
+        });
+    }
+}
+
+impl Drop for ImageTrace {
+    fn drop(&mut self) {
+        self.record.elapsed_secs = self.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
+        self.logger
+            .log(ServeLog::ImageDone(Box::new(self.record.clone())));
+    }
+}
+
+struct QueuedImage {
+    job: ImageJob,
+    trace: ImageTrace,
+}
+
+impl QueuedImage {
+    fn new(job: ImageJob, logger: ServeLogger) -> Self {
+        let trace = ImageTrace::new(&job, logger);
+        Self { job, trace }
+    }
+}
+
 /// The handler's end of the engine: the queue and the residency flag.
 pub struct Handle {
-    sender: crossbeam_channel::Sender<ImageJob>,
+    sender: crossbeam_channel::Sender<QueuedImage>,
+    logger: ServeLogger,
     /// Whether the encoder and the pipeline are resident, set and cleared by
     /// the engine thread, read by `/health`.
     pub resident: Arc<AtomicBool>,
 }
 
 impl Handle {
+    fn try_send(&self, job: ImageJob) -> Result<(), crossbeam_channel::TrySendError<ImageJob>> {
+        match self
+            .sender
+            .try_send(QueuedImage::new(job, self.logger.clone()))
+        {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Full(mut queued)) => {
+                queued.trace.failed(
+                    &ImageError::Unavailable("the image queue is full".into()),
+                    false,
+                );
+                Err(crossbeam_channel::TrySendError::Full(queued.job))
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(mut queued)) => {
+                queued.trace.failed(
+                    &ImageError::Unavailable("the image engine is not running".into()),
+                    false,
+                );
+                Err(crossbeam_channel::TrySendError::Disconnected(queued.job))
+            }
+        }
+    }
+
     pub fn is_loaded(&self) -> bool {
         self.resident.load(Ordering::Relaxed)
     }
@@ -185,6 +323,7 @@ impl Handle {
         let (sender, _receiver) = crossbeam_channel::bounded(0);
         Self {
             sender,
+            logger: ServeLogger::discarding(),
             resident: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -198,9 +337,9 @@ pub(crate) fn spawn(
     settings: &ServeSettings,
     shutdown: Arc<super::types::Cancel>,
     logger: ServeLogger,
+    resident: Arc<AtomicBool>,
 ) -> (Handle, std::thread::JoinHandle<()>) {
-    let (sender, receiver) = crossbeam_channel::bounded::<ImageJob>(QUEUE_CAPACITY);
-    let resident = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = crossbeam_channel::bounded::<QueuedImage>(QUEUE_CAPACITY);
     // Said once at startup, because a step count nobody asked for in a request
     // is otherwise only visible in each render's own log line. The pipeline's
     // own default needs no announcement.
@@ -213,6 +352,7 @@ pub(crate) fn spawn(
     let idle = settings.idle_unload;
     let wait_timeout = settings.queue_timeout;
     let thread_resident = Arc::clone(&resident);
+    let handle_logger = logger.clone();
     let thread = std::thread::Builder::new()
         .name(IMAGE_ENGINE_THREAD.to_string())
         .spawn(move || {
@@ -226,7 +366,14 @@ pub(crate) fn spawn(
             )
         })
         .expect("spawning the image engine thread");
-    (Handle { sender, resident }, thread)
+    (
+        Handle {
+            sender,
+            resident,
+            logger: handle_logger,
+        },
+        thread,
+    )
 }
 
 /// The encoder, the pipeline and what they were opened from.
@@ -343,6 +490,7 @@ impl Loaded {
         params: &ImageParams,
         inputs: &ImageInputs,
         logger: &ServeLogger,
+        trace: &mut ImageTrace,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<RenderedImage>> {
         check()?;
@@ -357,7 +505,13 @@ impl Loaded {
                 rendered.ids.len()
             )));
         }
-        let (cap_feats, _n_tokens) = self.encoder.encode(&rendered.ids, self.spec.layer)?;
+        self.encoder.device().synchronize()?;
+        let encoding = Instant::now();
+        let encoded = self.encoder.encode(&rendered.ids, self.spec.layer);
+        let drained = self.encoder.device().synchronize();
+        trace.record.encode_secs += encoding.elapsed().as_secs_f64();
+        drained?;
+        let (cap_feats, _n_tokens) = encoded?;
         check()?;
         // A drawn seed stays under 2^53: the seed goes back to the client as a
         // JSON number, and a JavaScript client rounds anything wider, so a
@@ -383,6 +537,9 @@ impl Loaded {
                 inputs.control.as_ref().map(|c| &c.image),
                 check,
             )?;
+            trace.record.denoise_secs += run.timings.steps.iter().sum::<f64>();
+            trace.record.vae_secs += run.timings.vae_decode;
+            trace.record.executed_steps += run.timings.steps.len();
             check()?;
             let png = encode_png(&run.image)?;
             logger.log(ServeLog::HostLine(format!(
@@ -392,16 +549,18 @@ impl Loaded {
                 params.steps,
                 started.elapsed().as_secs_f64()
             )));
+            let control_map = inputs
+                .control
+                .as_ref()
+                .map(|c| encode_png(&c.image.image))
+                .transpose()?;
             out.push(RenderedImage {
                 png,
                 seed,
                 start_step: run.start_step,
-                control_map: inputs
-                    .control
-                    .as_ref()
-                    .map(|c| encode_png(&c.image.image))
-                    .transpose()?,
+                control_map,
             });
+            trace.completed_image();
         }
         Ok(out)
     }
@@ -419,7 +578,7 @@ fn classify_load_error(error: anyhow::Error) -> ImageError {
 }
 
 fn engine_loop(
-    jobs: crossbeam_channel::Receiver<ImageJob>,
+    jobs: crossbeam_channel::Receiver<QueuedImage>,
     idle_unload: Option<Duration>,
     wait_timeout: Duration,
     resident: Arc<AtomicBool>,
@@ -436,7 +595,7 @@ fn engine_loop(
         let expired =
             lease.is_some() && idle_unload.is_some_and(|idle| last_finished.elapsed() >= idle);
         if yielding || expired {
-            unload_images(&mut loaded, &mut preprocessor, &resident);
+            unload_images(&mut loaded, &mut preprocessor, &resident, &logger);
             lease = None;
             logger.log(ServeLog::HostLine(format!(
                 "xwen serve: image resources unloaded ({})",
@@ -450,7 +609,7 @@ fn engine_loop(
         if shutdown.is_cancelled() {
             break;
         }
-        let job = match jobs.recv_timeout(Duration::from_millis(100)) {
+        let QueuedImage { job, mut trace } = match jobs.recv_timeout(Duration::from_millis(100)) {
             Ok(job) => job,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -458,18 +617,21 @@ fn engine_loop(
         if job.is_closed() {
             continue;
         }
+        trace.picked();
         if let ImageJob::Render { inputs, .. } = &job {
             if loaded.as_ref().is_some_and(|held| {
                 held.loras != inputs.loras
                     || held.control.as_ref() != inputs.control.as_ref().map(|c| &c.checkpoint)
             }) {
-                unload_images(&mut loaded, &mut preprocessor, &resident);
+                unload_images(&mut loaded, &mut preprocessor, &resident, &logger);
             }
         }
         let peak = match job.peak() {
             Ok(peak) => peak,
             Err(e) => {
-                job.fail(ImageError::Request(e.to_string()));
+                let error = ImageError::Request(e.to_string());
+                trace.failed(&error, false);
+                job.fail(error);
                 continue;
             }
         };
@@ -487,7 +649,9 @@ fn engine_loop(
             match crate::memory::acquire("images", &check) {
                 Ok(held) => lease = Some(held),
                 Err(e) => {
-                    job.fail(ImageError::Unavailable(e.to_string()));
+                    let error = ImageError::Unavailable(e.to_string());
+                    trace.failed(&error, shutdown.is_cancelled() || job.is_closed());
+                    job.fail(error);
                     continue;
                 }
             }
@@ -498,8 +662,10 @@ fn engine_loop(
                 image_allocation_reserve(peak, loaded.is_some()),
             )
         }) {
-            job.fail(ImageError::Unavailable(e.to_string()));
-            unload_images(&mut loaded, &mut preprocessor, &resident);
+            let error = ImageError::Unavailable(e.to_string());
+            trace.failed(&error, shutdown.is_cancelled() || job.is_closed());
+            job.fail(error);
+            unload_images(&mut loaded, &mut preprocessor, &resident, &logger);
             lease = None;
             continue;
         }
@@ -511,6 +677,10 @@ fn engine_loop(
                             .map_err(|e| ImageError::Unavailable(e.to_string()))?;
                         encode_png(&image).map_err(|e| ImageError::Render(format!("{e:#}")))
                     });
+                trace.finished(&result, shutdown.is_cancelled() || reply.is_closed());
+                if result.is_ok() {
+                    trace.completed_image();
+                }
                 let _ = reply.send(result);
                 last_finished = Instant::now();
                 crate::memory::log_event("image preprocess finished", None);
@@ -552,6 +722,7 @@ fn engine_loop(
                 crate::memory::log_event("image model loaded", Some(opened.encoder.device()));
                 loaded = Some(opened);
                 resident.store(true, Ordering::Relaxed);
+                logger.log(ServeLog::ImageResidency { loaded: true });
             }
             logger.log(ServeLog::HostLine(format!(
                 "xwen serve: image request {}x{}, {} steps, {} images, {} LoRAs, control {}",
@@ -563,14 +734,16 @@ fn engine_loop(
                 inputs.control.is_some()
             )));
             let held = loaded.as_mut().expect("image model loaded");
-            held.render(&params, &inputs, &logger, &check).map_err(|e| {
-                if check().is_err() {
-                    ImageError::Unavailable(format!("{e:#}"))
-                } else {
-                    ImageError::Render(format!("{e:#}"))
-                }
-            })
+            held.render(&params, &inputs, &logger, &mut trace, &check)
+                .map_err(|e| {
+                    if check().is_err() {
+                        ImageError::Unavailable(format!("{e:#}"))
+                    } else {
+                        ImageError::Render(format!("{e:#}"))
+                    }
+                })
         })();
+        trace.finished(&result, shutdown.is_cancelled() || reply.is_closed());
         let failed = result.is_err();
         let _ = reply.send(result);
         last_finished = Instant::now();
@@ -579,11 +752,15 @@ fn engine_loop(
             loaded.as_ref().map(|held| held.encoder.device()),
         );
         if failed {
-            unload_images(&mut loaded, &mut preprocessor, &resident);
+            unload_images(&mut loaded, &mut preprocessor, &resident, &logger);
             lease = None;
         }
     }
-    unload_images(&mut loaded, &mut preprocessor, &resident);
+    // Pending requests must finish their telemetry before server handles are dropped.
+    for queued in jobs.try_iter() {
+        drop(queued);
+    }
+    unload_images(&mut loaded, &mut preprocessor, &resident, &logger);
     drop(lease);
 }
 
@@ -597,6 +774,7 @@ fn unload_images(
     loaded: &mut Option<Loaded>,
     preprocessor: &mut crate::zimage::preprocess::Preprocessor,
     resident: &AtomicBool,
+    logger: &ServeLogger,
 ) {
     let device = loaded.as_ref().map(|held| held.encoder.device().clone());
     if let Some(device) = &device {
@@ -614,7 +792,9 @@ fn unload_images(
             std::process::abort();
         }
     }
-    resident.store(false, Ordering::Relaxed);
+    if resident.swap(false, Ordering::Relaxed) {
+        logger.log(ServeLog::ImageResidency { loaded: false });
+    }
     crate::memory::log_event("image resources released", device.as_ref());
 }
 
@@ -851,7 +1031,7 @@ pub(crate) async fn submit_image(
     }
 
     let (reply, answer) = tokio::sync::oneshot::channel();
-    match state.images.sender.try_send(ImageJob::Render {
+    match state.images.try_send(ImageJob::Render {
         params,
         inputs,
         reply,
@@ -918,6 +1098,132 @@ pub(crate) async fn submit_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_image_job() -> (
+        ImageJob,
+        tokio::sync::oneshot::Receiver<Result<Vec<RenderedImage>, ImageError>>,
+    ) {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let params = validate(parse(r#"{"prompt":"test"}"#), false, None).unwrap();
+        (
+            ImageJob::Render {
+                params,
+                inputs: ImageInputs::default(),
+                reply,
+            },
+            answer,
+        )
+    }
+
+    #[test]
+    fn rejected_image_submissions_close_their_queue_entries() {
+        for disconnected in [false, true] {
+            let (logger, events) = super::super::log::collecting();
+            let (sender, receiver) = crossbeam_channel::bounded(0);
+            if disconnected {
+                drop(receiver);
+            }
+            let handle = Handle {
+                sender,
+                logger,
+                resident: Arc::new(AtomicBool::new(false)),
+            };
+            let (job, _answer) = test_image_job();
+            assert!(handle.try_send(job).is_err());
+            let events = events.drain();
+            assert_eq!(events.len(), 2);
+            let ServeLog::ImageQueued(activity) = &events[0] else {
+                panic!("queue event missing")
+            };
+            let ServeLog::ImageDone(record) = &events[1] else {
+                panic!("terminal event missing")
+            };
+            assert_eq!(record.activity.id, activity.id);
+            assert!(!record.cancelled);
+            assert_eq!(record.completed_images, 0);
+            assert!(record.error.as_ref().unwrap().contains(if disconnected {
+                "not running"
+            } else {
+                "full"
+            }));
+        }
+    }
+
+    #[test]
+    fn dropping_the_image_queue_finishes_every_accepted_job() {
+        let (logger, events) = super::super::log::collecting();
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        let handle = Handle {
+            sender,
+            logger,
+            resident: Arc::new(AtomicBool::new(false)),
+        };
+        let (first, _first_answer) = test_image_job();
+        let (second, _second_answer) = test_image_job();
+        handle.try_send(first).unwrap();
+        handle.try_send(second).unwrap();
+        drop(handle);
+        drop(receiver);
+        let events = events.drain();
+        let queued: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ServeLog::ImageQueued(a) => Some(a.id),
+                _ => None,
+            })
+            .collect();
+        let done: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ServeLog::ImageDone(r) => {
+                    assert!(r.cancelled);
+                    Some(r.activity.id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, done);
+        assert_eq!(done.len(), 2);
+    }
+
+    #[test]
+    fn image_failure_preserves_completed_work_and_phase_measurements() {
+        let (logger, events) = super::super::log::collecting();
+        let (job, _answer) = test_image_job();
+        let mut trace = ImageTrace::new(&job, logger);
+        trace.picked();
+        trace.record.encode_secs = 0.5;
+        trace.record.denoise_secs = 12.0;
+        trace.record.vae_secs = 2.0;
+        trace.record.executed_steps = 6;
+        trace.completed_image();
+        trace.failed(&ImageError::Render("second image failed".into()), false);
+        drop(trace);
+        let events = events.drain();
+        assert!(matches!(
+            &events[..],
+            [
+                ServeLog::ImageQueued(_),
+                ServeLog::ImagePicked { .. },
+                ServeLog::ImageProgress {
+                    completed_images: 1,
+                    ..
+                },
+                ServeLog::ImageDone(_)
+            ]
+        ));
+        let ServeLog::ImageDone(record) = &events[3] else {
+            unreachable!()
+        };
+        assert_eq!(record.completed_images, 1);
+        assert_eq!(record.executed_steps, 6);
+        assert_eq!(
+            record.encode_secs + record.denoise_secs + record.vae_secs,
+            14.5
+        );
+        assert_eq!(record.error.as_deref(), Some("second image failed"));
+        assert!(!record.cancelled);
+    }
+
     #[test]
     fn warm_renders_reserve_their_temporary_allocations_again() {
         let gib = 1024 * 1024 * 1024;
@@ -928,6 +1234,7 @@ mod tests {
     #[test]
     fn image_worker_skips_disconnected_jobs_and_refuses_oversized_work_before_loading() {
         let (send, receive) = crossbeam_channel::bounded(2);
+        let (logger, events) = super::super::log::collecting();
         let resident = Arc::new(AtomicBool::new(false));
         let (closed_reply, closed_answer) = tokio::sync::oneshot::channel();
         drop(closed_answer);
@@ -938,17 +1245,20 @@ mod tests {
             reply: closed_reply,
         };
         assert!(closed.is_closed());
-        send.send(closed).unwrap();
+        send.send(QueuedImage::new(closed, logger.clone())).unwrap();
         let (reply, answer) = tokio::sync::oneshot::channel();
-        send.send(ImageJob::Render {
-            params: ImageParams {
-                width: 8192,
-                height: 8192,
-                ..params
+        send.send(QueuedImage::new(
+            ImageJob::Render {
+                params: ImageParams {
+                    width: 8192,
+                    height: 8192,
+                    ..params
+                },
+                inputs: ImageInputs::default(),
+                reply,
             },
-            inputs: ImageInputs::default(),
-            reply,
-        })
+            logger.clone(),
+        ))
         .unwrap();
         drop(send);
         engine_loop(
@@ -957,8 +1267,20 @@ mod tests {
             Duration::from_secs(1),
             Arc::clone(&resident),
             Arc::new(super::super::types::Cancel::default()),
-            ServeLogger::discarding(),
+            logger,
         );
+        let records: Vec<_> = events
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                ServeLog::ImageDone(record) => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records[0].cancelled);
+        assert!(!records[1].cancelled);
+        assert!(records[1].error.as_ref().unwrap().contains("pixels"));
         assert!(
             matches!(answer.blocking_recv().unwrap(), Err(ImageError::Request(message)) if message.contains("pixels"))
         );
@@ -1249,7 +1571,6 @@ pub(crate) async fn submit_preprocess(
     let (reply, answer) = tokio::sync::oneshot::channel();
     if let Err(err) = state
         .images
-        .sender
         .try_send(ImageJob::Preprocess { image, kind, reply })
     {
         return server_error(

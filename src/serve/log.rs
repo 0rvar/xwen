@@ -203,14 +203,62 @@ pub struct QueueEntry {
     /// and an entry sitting behind a five-minute prefill would otherwise be
     /// shown at the age it had on arrival for the whole of that wait.
     pub queued_at: Instant,
+    pub dialect: super::types::Dialect,
+    pub target: super::types::Target,
+    pub estimated: bool,
+}
+
+/// One image-engine request, in a namespace separate from language request ids.
+#[derive(Debug, Clone)]
+pub struct ImageActivity {
+    pub id: u64,
+    pub queued_at: Instant,
+    pub model: String,
+    pub width: usize,
+    pub height: usize,
+    pub steps: usize,
+    pub images: usize,
+    pub preprocessing: bool,
+}
+
+/// Completed work, including partial results from a failed image request.
+#[derive(Debug, Clone)]
+pub struct ImageRecord {
+    pub activity: ImageActivity,
+    pub completed_images: usize,
+    pub elapsed_secs: f64,
+    pub encode_secs: f64,
+    pub denoise_secs: f64,
+    pub vae_secs: f64,
+    pub executed_steps: usize,
+    pub error: Option<String>,
+    pub cancelled: bool,
 }
 
 /// One thing worth saying about the running server.
 #[derive(Debug, Clone)]
 pub enum ServeLog {
+    ModelContext {
+        tokens: usize,
+    },
+    ImageQueued(ImageActivity),
+    ImagePicked {
+        id: u64,
+    },
+    ImageProgress {
+        id: u64,
+        completed_images: usize,
+    },
+    ImageDone(Box<ImageRecord>),
+    ImageResidency {
+        loaded: bool,
+    },
     /// The configured context length is larger than the checkpoint was converted
     /// with, so the smaller one is served.
-    ContextClamped { requested: usize, trained: usize },
+    ContextClamped {
+        requested: usize,
+        trained: usize,
+    },
     /// The listener is up.
     Listening {
         address: String,
@@ -218,9 +266,13 @@ pub enum ServeLog {
         openai: bool,
     },
     /// The checkpoint the first request will load.
-    ServingModel { path: PathBuf },
+    ServingModel {
+        path: PathBuf,
+    },
     /// The model finished its lazy load.
-    ModelLoaded { elapsed: Duration },
+    ModelLoaded {
+        elapsed: Duration,
+    },
     /// The next job needs the other checkpoint, so the resident one is being
     /// dropped (imaged out first when the disk tier serves it); the lazy load
     /// brings the named one in.
@@ -247,17 +299,24 @@ pub enum ServeLog {
     },
     /// The checkpoint a job needs ships no drafter sidecar, so it runs without
     /// speculative decoding however the drafter is configured.
-    NoDrafterAvailable { model: crate::hub::Model },
+    NoDrafterAvailable {
+        model: crate::hub::Model,
+    },
     /// The checkpoint a job needs SHIPS a drafter but does not attach one
     /// unasked, and nothing in the config asked. Distinct from
     /// `NoDrafterAvailable`, which is about a checkpoint with no sidecar to
     /// attach: this one is a policy an operator can reverse, so the line says
     /// how.
-    DraftDefaultOff { model: crate::hub::Model },
+    DraftDefaultOff {
+        model: crate::hub::Model,
+    },
     /// The batch runner reported progress: a shared prefill, or one item done.
     BatchProgress(crate::batch::BatchProgress),
     /// The speculative drafter finished loading, alongside the model.
-    DrafterLoaded { elapsed: Duration, draft_ctx: usize },
+    DrafterLoaded {
+        elapsed: Duration,
+        draft_ctx: usize,
+    },
     /// The idle timer elapsed and the model was dropped. `configured` is the
     /// window that was set, printed next to the span actually measured so a
     /// report of "it unloaded early" can be settled from the log.
@@ -266,9 +325,13 @@ pub enum ServeLog {
         configured: Option<Duration>,
     },
     /// The post-job cache reset failed, which costs the model.
-    CacheClearFailed { error: String },
+    CacheClearFailed {
+        error: String,
+    },
     /// A client stopped draining its event channel for the whole send deadline.
-    ClientStalled { after: Duration },
+    ClientStalled {
+        after: Duration,
+    },
     /// A requested thinking budget does not fit the reply the context leaves.
     /// `using` is `None` for a reply that will reason without a ceiling.
     ThinkBudgetClamped {
@@ -278,9 +341,14 @@ pub enum ServeLog {
     },
     /// The KV cache and the prefix cache's token history disagree about how much
     /// is cached, so the prompt is replayed from zero.
-    CacheLengthMismatch { cached: usize, expected: usize },
+    CacheLengthMismatch {
+        cached: usize,
+        expected: usize,
+    },
     /// What speculation did for one reply.
-    SpecReport { stats: SpecStats },
+    SpecReport {
+        stats: SpecStats,
+    },
     /// Tool spans this request could not take at face value: calls the engine had
     /// to close, finished values that were not the JSON their schema asked for,
     /// and spans that named no callable tool and went back to the client as text.
@@ -293,7 +361,9 @@ pub enum ServeLog {
     /// read. The text went to the client as answer text; it is logged because a
     /// model that frames calls it cannot fill in is a prompt or template
     /// problem, and the text is the only evidence of which.
-    ToolSpanDegraded { text: String },
+    ToolSpanDegraded {
+        text: String,
+    },
     /// A job was abandoned mid-decode by a gone client or a shutdown.
     AbandonedDuringDecode {
         reason: CancelReason,
@@ -353,11 +423,15 @@ pub enum ServeLog {
     },
     /// A stored segment was cut in two at `at` so that a conversation arriving with a
     /// different continuation shares everything before it.
-    DiskSegmentSplit { at: usize },
+    DiskSegmentSplit {
+        at: usize,
+    },
     /// A conversation's resume point at `at` was stored into the segment ending there,
     /// which had none — so everything that forks at that boundary from now on can
     /// resume from it instead of prefilling to it.
-    DiskBoundarySnapshotStored { at: usize },
+    DiskBoundarySnapshotStored {
+        at: usize,
+    },
     /// A chain of stored segments was read back into a cache slot, which resumes at
     /// `resume` of the `tokens` positions the chain covers.
     DiskChainHydrated {
@@ -368,10 +442,16 @@ pub enum ServeLog {
         ms: u64,
     },
     /// A stored segment was deleted.
-    DiskSegmentEvicted { reason: DiskEvictReason, bytes: u64 },
+    DiskSegmentEvicted {
+        reason: DiskEvictReason,
+        bytes: u64,
+    },
     /// The disk tier could not do something it was asked to. Perf-only: the
     /// engine never learns, and the worst outcome is a cache miss.
-    DiskCacheFailed { action: &'static str, error: String },
+    DiskCacheFailed {
+        action: &'static str,
+        error: String,
+    },
     /// A queued request outlived the queue timeout without reaching the model.
     QueuedRequestDropped {
         waited: Duration,
@@ -386,16 +466,24 @@ pub enum ServeLog {
         oldest_waited: Duration,
     },
     /// A response header the builders wrote could not be encoded.
-    InvalidHeaderDropped { name: &'static str, value: String },
+    InvalidHeaderDropped {
+        name: &'static str,
+        value: String,
+    },
     /// A shutdown signal could not be registered, so that one way of asking the
     /// server to stop is not available. The others still are.
-    SignalUnavailable { signal: &'static str, error: String },
+    SignalUnavailable {
+        signal: &'static str,
+        error: String,
+    },
     /// A shutdown signal arrived; in-flight requests are being waited on.
     ShutdownRequested,
     /// The serve loop returned and the engine is coming down.
     ShuttingDown,
     /// The shutdown grace period elapsed with connections still open.
-    ShutdownGraceExpired { grace: Duration },
+    ShutdownGraceExpired {
+        grace: Duration,
+    },
     /// A line from code that sits below the server — the model's resident-memory
     /// report at load — carried here rather than printed where it was produced,
     /// so that every line the process writes goes through one consumer. Already
@@ -441,11 +529,22 @@ pub enum ServeLog {
     /// Prefill progress, once per chunk. `done` counts the whole prompt,
     /// cache-read tokens included, so `done`/`total` is the bar a client's wait
     /// is measured against rather than the current span's share of it.
-    PrefillTick { done: usize, total: usize },
+    PrefillTick {
+        done: usize,
+        total: usize,
+    },
+    /// Cumulative prefill work after the GPU completed the span.
+    PrefillMeasured {
+        tokens: usize,
+        secs: f64,
+    },
     /// One decoded token. `tokens_out` counts every token this reply has
     /// produced, thinking included, and `thinking` says which side of the
     /// reasoning boundary this one fell.
-    DecodeTick { tokens_out: usize, thinking: bool },
+    DecodeTick {
+        tokens_out: usize,
+        thinking: bool,
+    },
     /// The cache slots, as they stand after something changed them.
     SlotsSnapshot(Vec<SlotSummary>),
     /// The waiting requests, as they stand after a push or a dequeue.
@@ -724,10 +823,17 @@ impl ServeLog {
             // Ticks, snapshots and per-request records are data for a consumer
             // that draws the server. Saying any of them on stderr would bury the
             // lines above under thousands of their own.
-            ServeLog::JobPicked { .. }
+            ServeLog::ModelContext { .. }
+            | ServeLog::ImageQueued(_)
+            | ServeLog::ImagePicked { .. }
+            | ServeLog::ImageProgress { .. }
+            | ServeLog::ImageDone(_)
+            | ServeLog::ImageResidency { .. }
+            | ServeLog::JobPicked { .. }
             | ServeLog::JobCacheResolved { .. }
             | ServeLog::JobDone(_)
             | ServeLog::PrefillTick { .. }
+            | ServeLog::PrefillMeasured { .. }
             | ServeLog::DecodeTick { .. }
             | ServeLog::SlotsSnapshot(_)
             | ServeLog::QueueSnapshot(_) => return None,
@@ -1508,6 +1614,12 @@ mod tests {
                 id: 8,
                 prompt_tokens: 1204,
                 queued_at: Instant::now(),
+                dialect: super::super::types::Dialect::OpenAi,
+                target: super::super::types::Target {
+                    model: crate::hub::Model::default(),
+                    served_file: true,
+                },
+                estimated: false,
             }]),
         ];
         for event in silent {
