@@ -701,6 +701,12 @@ An SDK's own model id (`gpt-4o`, `claude-…`) is therefore a 400 rather than a 
 answer from whichever checkpoint happened to be the default; point the client at a full
 name, or omit the field.
 
+Anthropic usage splits the prompt into disjoint buckets: `input_tokens` is zero,
+`cache_read_input_tokens` is the reused prefix, and `cache_creation_input_tokens` is
+the remainder prefilled into xwen's KV cache. Add all three for the prompt size.
+`/v1/messages/count_tokens` returns that full size directly. Streaming reports the
+split before prefill finishes, so an interrupted request can overstate cache creation.
+
 **A custom GGUF answers under its own id and no other.** If the served file is none of
 the official checkpoints, it is served as its architecture's checkpoint (a startup line
 says which) but reported and selected by its file name — and a request naming an

@@ -482,3 +482,18 @@ the runtime reserve cutoff. This changes the policy, not the memory accounting:
 no process-footprint credit or assumed reclaimable GGUF weight bytes are subtracted.
 Exclusive model ownership and image allowances remain required.
 [Evidence and regression](../records/memory-safety.md#normal-pressure-flash-next-regression).
+
+**Anthropic prompt usage uses disjoint cache buckets (2026-09-10).**
+The Messages API adds `input_tokens`, `cache_read_input_tokens` and
+`cache_creation_input_tokens` to obtain the full prompt count
+([Anthropic's definition](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#tracking-cache-performance)).
+Reporting the full prompt in `input_tokens` as well as its cache split doubled that
+sum. Both response modes now report zero in `input_tokens`, the reused prefix in
+cache reads, and the remainder in cache creation: xwen prefills that remainder into
+its local KV cache. Internal prompt totals, OpenAI usage and the token-count endpoint
+retain their existing meanings. Streaming announces the split before prefill, so
+interrupted requests can still report planned creation rather than completed work.
+That existing limitation needs measured completion counts if interrupted-request
+accounting becomes a client requirement. Cold, partial and full cache-hit regressions
+cover both response modes; the new sum assertion failed with 200 against 100 before
+the fix.

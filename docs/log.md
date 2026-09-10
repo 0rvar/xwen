@@ -4,6 +4,15 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-10 — Anthropic prompt usage no longer doubles the context count
+
+Messages responses and streaming starts report disjoint input, cache-read and
+cache-creation buckets. A 100-token prompt with 40 tokens reused now reports
+0 + 40 + 60, so Anthropic-native clients recover the actual prompt size. The new
+regression failed before the fix; all 61 Anthropic tests pass. Internal metrics and
+OpenAI totals keep their meanings.
+[Accounting policy and interruption limit](decisions/serving.md).
+
 ## 2026-09-09 — Image assistant stages complete batches from a left sidebar
 
 Chat pushes the workspace right and handles direct generation requests through a

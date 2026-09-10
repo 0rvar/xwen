@@ -865,12 +865,14 @@ fn tool_input(arguments: &str) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-/// Prompt-side usage. `input_tokens` is the whole prompt; the cache fields
-/// split it into the part served from the KV prefix cache and the part this
-/// request had to prefill.
+/// Anthropic's prompt-side usage buckets are disjoint. The engine supplies the
+/// whole prompt and the reused KV prefix; the remainder is assigned to cache
+/// creation because prefill writes it into the local KV cache. No tokens remain
+/// in the uncached `input_tokens` bucket. Streaming reports this split before
+/// prefill finishes, so creation is planned work if the request is interrupted.
 fn input_usage(input_tokens: usize, cached_tokens: usize) -> Value {
     json!({
-        "input_tokens": input_tokens,
+        "input_tokens": 0,
         "cache_read_input_tokens": cached_tokens,
         "cache_creation_input_tokens": input_tokens.saturating_sub(cached_tokens),
     })
@@ -1252,8 +1254,8 @@ pub(crate) async fn messages(
     }
 }
 
-/// The exact count a generation request would report as `input_tokens`: the
-/// same rendering and encoding the submit path performs, tools section included
+/// The full prompt count before splitting generation usage into cache buckets:
+/// the same rendering and encoding the submit path performs, tools section included
 /// — a tool list is often the larger half of a harness's prompt, and a count
 /// that omitted it would be wrong by exactly the part the caller is asking
 /// about.
@@ -2686,6 +2688,33 @@ mod tests {
     }
 
     #[test]
+    fn prompt_usage_buckets_are_disjoint_in_responses_and_streams() {
+        for cached_tokens in [0, 40, 100] {
+            let mut completion = completion("", "answer", StopKind::EndTurn);
+            completion.cached_tokens = cached_tokens;
+            let body = message_body("msg_1", "m", &completion);
+            let mut stream = MessageStream::new("msg_1".into(), "m".into());
+            let frames = encode_all(
+                &mut stream,
+                vec![EngineEvent::Start {
+                    input_tokens: completion.input_tokens,
+                    cached_tokens,
+                }],
+            );
+            let start = payload(&frames[0]);
+            for usage in [&body["usage"], &start["message"]["usage"]] {
+                let input = usage["input_tokens"].as_u64().unwrap();
+                let read = usage["cache_read_input_tokens"].as_u64().unwrap();
+                let creation = usage["cache_creation_input_tokens"].as_u64().unwrap();
+                assert_eq!(input + read + creation, completion.input_tokens as u64);
+                assert_eq!(input, 0);
+                assert_eq!(read, cached_tokens as u64);
+                assert_eq!(creation, (completion.input_tokens - cached_tokens) as u64);
+            }
+        }
+    }
+
+    #[test]
     fn the_response_body_carries_both_blocks_and_the_full_usage() {
         let body = message_body(
             "msg_1",
@@ -2702,7 +2731,7 @@ mod tests {
         assert_eq!(body["content"][1]["text"], "answer");
         assert_eq!(body["stop_reason"], "end_turn");
         assert_eq!(body["stop_sequence"], Value::Null);
-        assert_eq!(body["usage"]["input_tokens"], 100);
+        assert_eq!(body["usage"]["input_tokens"], 0);
         assert_eq!(body["usage"]["cache_read_input_tokens"], 40);
         assert_eq!(body["usage"]["cache_creation_input_tokens"], 60);
         assert_eq!(body["usage"]["output_tokens"], 25);
@@ -2804,7 +2833,7 @@ mod tests {
         assert_eq!(start["type"], "message_start");
         assert_eq!(start["message"]["id"], "msg_1");
         assert_eq!(start["message"]["model"], "claude-x");
-        assert_eq!(start["message"]["usage"]["input_tokens"], 100);
+        assert_eq!(start["message"]["usage"]["input_tokens"], 0);
         assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 40);
         assert_eq!(start["message"]["usage"]["output_tokens"], 1);
 
