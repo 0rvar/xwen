@@ -485,8 +485,9 @@ Exclusive model ownership and image allowances remain required.
 
 **Memory pressure is telemetry, never a trigger (2026-09-14).** The warning-pressure
 admission stop and the critical/headroom runtime cutoff above are refuted. On 2026-09-14 a
-single resident Flash-Next serving a 68,347-token prompt pushed system use to 129.25 GB
-of 128 GiB and the kernel reported warning; the runtime cutoff abandoned the prefill at
+single resident Flash-Next serving a 68,347-token prompt pushed system use to 120.4 GiB
+of 128 GiB (94%, physical RAM never reached) and the kernel reported warning; the
+112 GiB warning-reserve cutoff abandoned the prefill at
 51,144 tokens, dropped the model, and the client retried eleven times into the same wall,
 each retry a fresh 111 GB load and an 83-second prefill. That is an ordinary large prompt
 on this machine, which ran a 131k-token prefill on 2026-09-06 without incident. The

@@ -34,6 +34,8 @@ CLI commands can be interrupted normally while waiting. Metadata, fetching and s
 do not take ownership. Direct library callers must acquire and retain a lease themselves;
 older binaries and other applications do not participate.
 
+Superseded 2026-09-14 for the pressure rules: see
+[pressure is telemetry, not a trigger](#2026-09-14-pressure-is-telemetry-not-a-trigger).
 Admission samples physical RAM, anonymous/wired/compressor pages, process footprint
 and pressure. It adds projected new allocations to system usage. With normal native
 pressure, the ceiling is physical RAM; unknown pressure preserves max(16 GiB, 10% RAM).
@@ -52,6 +54,8 @@ on every request, crediting only a 16 GiB lower bound on retained model weights.
 Switching adapters releases the old pipeline
 before admitting and loading the replacement.
 
+Superseded 2026-09-14: see
+[pressure is telemetry, not a trigger](#2026-09-14-pressure-is-telemetry-not-a-trigger).
 The host monitor samples every 500 ms. Warning pressure stops new admissions and
 causes idle owners to unload. Critical pressure stops language work at its cancellation
 boundaries and image work between transformer blocks, denoising steps and VAE phases.
@@ -97,6 +101,8 @@ estimated host-cache growth produced the reported 114.9 GiB refusal. Process foo
 was 20,160,107,960 bytes, a different ledger that cannot be subtracted from system use.
 Other attempts refused the same load estimate with higher baseline system use.
 
+Superseded 2026-09-14 for the warning/critical rules: see
+[pressure is telemetry, not a trigger](#2026-09-14-pressure-is-telemetry-not-a-trigger).
 Normal pressure now permits admission up to physical RAM, and runtime cancellation
 uses the same ceiling. The 16 GiB/10% reserve remains the unknown-pressure fallback;
 warning and critical pressure still block admission. Critical pressure still cancels
@@ -144,11 +150,13 @@ allowing co-residency. No measured performance or image-footprint figure changed
 On 2026-09-14 between 09:14 and 09:42 an Anthropic-dialect client sent the same
 68,347-token prompt to a Flash-Next server twelve times and every attempt failed with
 `inference cancelled because of system memory pressure`. `memory.jsonl` for PID 87746
-shows what the guard saw: Flash-Next resident at 121-125 GB of system use on
-137,438,953,472 bytes of physical RAM, the prefill lifting the process footprint from
-22 GB to 30,208,332,568 bytes and system use to 129,254,375,424 bytes, at which point
-`kern.memorystatus_vm_pressure_level` read warning. Under warning the runtime budget
-kept the 16 GiB reserve, so system use exceeded it, `check_runtime` failed, the engine
+shows what the guard saw: Flash-Next resident at 112.7-116.4 GiB of system use on
+128 GiB of physical RAM, the prefill lifting the process footprint from 20.5 GiB to
+28.1 GiB (30,208,332,568 bytes) and system use to 120.4 GiB (129,254,375,424 bytes), at
+which point `kern.memorystatus_vm_pressure_level` read warning. Physical RAM was never
+reached: 120.4 GiB is 94% of 128 GiB, 7.6 GiB short of the arithmetic ceiling. What fired
+was the pressure-conditioned reserve: under warning the runtime budget dropped to 112 GiB,
+system use exceeded that, `check_runtime` failed, the engine
 abandoned the prefill at 51,144 tokens on eight attempts and 67,528 on three (the
 first, with 66,140 tokens cached, fell at 2,048 new), dropped the model to return
 memory, and each retry reloaded 111 GB and prefilled for 83 seconds back to the same

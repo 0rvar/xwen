@@ -600,7 +600,7 @@ fn engine_loop(
             logger.log(ServeLog::HostLine(format!(
                 "xwen serve: image resources unloaded ({})",
                 if yielding {
-                    "memory ownership requested or pressure"
+                    "memory ownership requested"
                 } else {
                     "idle"
                 }

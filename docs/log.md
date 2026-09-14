@@ -6,8 +6,9 @@ Superseded entries are marked in the headline, never deleted.
 
 ## 2026-09-14 — Memory pressure no longer cancels work or drops the model
 
-A lone Flash-Next serving a 68k-token prompt hit the kernel's warning level at 129 GB of
-128 GiB, and the runtime cutoff abandoned the prefill at 51,144 tokens, dropped the model,
+A lone Flash-Next serving a 68k-token prompt hit the kernel's warning level at 120.4 GiB
+of 128 GiB, physical RAM never reached, and the 112 GiB warning-reserve cutoff abandoned
+the prefill at 51,144 tokens, dropped the model,
 and let the client retry eleven times into the same wall. The pressure level is now
 recorded and never acted on; ownership, physical-RAM admission and the image reservations
 stay. `check_runtime` and `CancelReason::MemoryPressure` are gone.
