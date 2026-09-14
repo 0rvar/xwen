@@ -729,6 +729,10 @@ mod tests {
         *a.latest.lock().unwrap() = s;
         assert!(!lease.should_yield());
         drop(lease);
+        // A fresh owner acquires while the kernel still reports critical pressure.
+        let again = a.acquire("test", &|| Ok(())).unwrap();
+        assert!(!again.should_yield());
+        drop(again);
         fs::remove_dir_all(&a.directory).unwrap();
     }
     #[test]
