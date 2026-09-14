@@ -4,6 +4,16 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-14 — Memory pressure no longer cancels work or drops the model
+
+A lone Flash-Next serving a 68k-token prompt hit the kernel's warning level at 129 GB of
+128 GiB, and the runtime cutoff abandoned the prefill at 51,144 tokens, dropped the model,
+and let the client retry eleven times into the same wall. The pressure level is now
+recorded and never acted on; ownership, physical-RAM admission and the image reservations
+stay. `check_runtime` and `CancelReason::MemoryPressure` are gone.
+[Evidence and policy](records/memory-safety.md#2026-09-14-pressure-is-telemetry-not-a-trigger),
+[decision](decisions/serving.md).
+
 ## 2026-09-10 — Server activity includes diffusion and completed prefill timing
 
 The TUI leads with the resident model and current slot context. Queue and history

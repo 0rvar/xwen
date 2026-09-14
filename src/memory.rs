@@ -95,19 +95,15 @@ fn coordinator() -> &'static Arc<Coordinator> {
         let monitor = Arc::downgrade(&value);
         thread::spawn(move || {
             let mut previous_pressure = Pressure::Unknown;
-            let mut previous_stop_reason = None;
             let mut ticks = 0u32;
             while let Some(value) = monitor.upgrade() {
                 let snapshot = host_sample();
                 *value.latest.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
-                let stop_reason = runtime_stop_reason(&snapshot);
-                if stop_reason != previous_stop_reason {
-                    value.record(
-                        stop_reason.unwrap_or("runtime: memory headroom recovered"),
-                        &snapshot,
-                    );
+                // The kernel's pressure level is evidence for the next incident, not a
+                // trigger: nothing reads it to cancel, evict or refuse.
+                if snapshot.pressure != previous_pressure {
+                    value.record(&pressure_event(snapshot.pressure), &snapshot);
                 }
-                previous_stop_reason = stop_reason;
                 if snapshot.pressure != previous_pressure
                     || (value.managed.load(Ordering::Acquire) && ticks.is_multiple_of(10))
                 {
@@ -236,24 +232,18 @@ impl Coordinator {
         };
         while !try_lock(&intent, libc::LOCK_SH)? {
             cancel()?;
-            report_wait(&mut reported_wait, label, Pressure::Unknown);
+            report_wait(&mut reported_wait, label);
             thread::sleep(POLL);
         }
         loop {
             cancel()?;
-            let pressure = self
-                .latest
+            if self
+                .queue
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .pressure;
-            if !matches!(pressure, Pressure::Warning | Pressure::Critical)
-                && self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .1
-                    .front()
-                    == Some(&ticket)
+                .1
+                .front()
+                == Some(&ticket)
                 && Instant::now()
                     >= *self
                         .reacquire_after
@@ -295,7 +285,7 @@ impl Coordinator {
                     }
                 }
             }
-            report_wait(&mut reported_wait, label, pressure);
+            report_wait(&mut reported_wait, label);
             thread::sleep(POLL);
         }
     }
@@ -331,19 +321,19 @@ impl Coordinator {
     }
 }
 
-fn report_wait(reported: &mut bool, label: &str, pressure: Pressure) {
+fn report_wait(reported: &mut bool, label: &str) {
     if *reported {
         return;
     }
     *reported = true;
-    let reason = if matches!(pressure, Pressure::Warning | Pressure::Critical) {
-        format!("system memory pressure is {pressure:?}")
-    } else {
-        "another resident model owns the accelerator".to_owned()
-    };
     crate::host_log::host_line(format!(
-        "xwen: {label}: waiting for resident memory ownership ({reason})"
+        "xwen: {label}: waiting for resident memory ownership (another resident model owns \
+         the accelerator)"
     ));
+}
+
+fn pressure_event(pressure: Pressure) -> String {
+    format!("pressure: {}", format!("{pressure:?}").to_lowercase())
 }
 
 fn startup_entry() -> serde_json::Value {
@@ -397,15 +387,6 @@ impl Lease {
         if self.coordinator.waiters.load(Ordering::Acquire) > 0 {
             return true;
         }
-        let snapshot = self
-            .coordinator
-            .latest
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if snapshot.pressure == Pressure::Warning || runtime_stop_reason(&snapshot).is_some() {
-            return true;
-        }
-        drop(snapshot);
         match try_lock(&self.intent, libc::LOCK_EX) {
             Ok(true) => {
                 unsafe {
@@ -461,10 +442,11 @@ pub fn admit_additional(label: &str, additional_bytes: u64) -> Result<()> {
     admit(label, additional_bytes)
 }
 
-/// Admit a new allocation peak atop measured host use, up to physical RAM at normal
-/// pressure. Unknown pressure retains a reserve; warning and critical refuse admission.
-/// Existing allocations receive no footprint credit: Mach footprint and host resident
-/// accounting differ. Warm callers should pass only their additional allocation bound.
+/// Admit a new allocation peak atop measured host use, up to physical RAM. The kernel's
+/// pressure level is recorded and never consulted; only an unreadable level keeps a
+/// reserve, because then the counters beside it are suspect too. Existing allocations
+/// receive no footprint credit: Mach footprint and host resident accounting differ.
+/// Warm callers should pass only their additional allocation bound.
 pub fn admit(label: &str, projected_peak_bytes: u64) -> Result<()> {
     let snapshot = host_sample();
     *coordinator()
@@ -484,12 +466,6 @@ pub fn admit(label: &str, projected_peak_bytes: u64) -> Result<()> {
 }
 
 fn admit_snapshot(s: &Snapshot, projected: u64) -> Result<()> {
-    if matches!(s.pressure, Pressure::Warning | Pressure::Critical) {
-        bail!(
-            "system memory pressure is {:?}; wait for memory to recover",
-            s.pressure
-        );
-    }
     let physical = s
         .physical_bytes
         .context("cannot read physical RAM for memory admission")?;
@@ -514,36 +490,11 @@ fn admit_snapshot(s: &Snapshot, projected: u64) -> Result<()> {
     Ok(())
 }
 
-/// Cached host check; safe to call between decode steps without querying the kernel.
-pub fn check_runtime() -> Result<()> {
-    if let Some(c) = GLOBAL.get() {
-        let snapshot = c.latest.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(reason) = runtime_stop_reason(&snapshot) {
-            c.record(reason, &snapshot);
-            bail!("{reason}; stopping inference to preserve system memory headroom");
-        }
-    }
-    Ok(())
-}
-
-fn runtime_stop_reason(snapshot: &Snapshot) -> Option<&'static str> {
-    if snapshot.pressure == Pressure::Critical {
-        return Some("runtime: system memory pressure is critical");
-    }
-    if let (Some(physical), Some(used)) = (snapshot.physical_bytes, snapshot.system_used_bytes) {
-        let (budget, _) = system_budget(physical, snapshot.pressure);
-        if used >= budget {
-            return Some("runtime: system memory headroom exhausted");
-        }
-    }
-    None
-}
-
 fn system_budget(physical: u64, pressure: Pressure) -> (u64, u64) {
-    let reserve = if pressure == Pressure::Normal {
-        0
-    } else {
+    let reserve = if pressure == Pressure::Unknown {
         MIN_SYSTEM_RESERVE.max(physical.saturating_mul(SYSTEM_RESERVE_PERCENT) / 100)
+    } else {
+        0
     };
     (physical.saturating_sub(reserve), reserve)
 }
@@ -755,7 +706,30 @@ mod tests {
         s.system_used_bytes = Some(121_846_759_424);
         s.process_footprint_bytes = Some(20_160_107_960);
         assert!(admit_snapshot(&s, 1_551_679_488).is_ok());
-        assert!(runtime_stop_reason(&s).is_none());
+    }
+    /// 2026-09-14: a 68k-token Flash-Next prefill pushed system use to 129.25 GB of
+    /// 128 GiB and the kernel reported warning pressure. That is an ordinary large
+    /// prompt on this machine, so it is admitted, and an owner without waiters keeps
+    /// the model.
+    #[test]
+    fn warning_pressure_during_a_long_prefill_is_telemetry_only() {
+        let a = isolated();
+        let lease = a.acquire("test", &|| Ok(())).unwrap();
+        let mut s = snapshot();
+        s.physical_bytes = Some(137_438_953_472);
+        s.system_used_bytes = Some(129_254_375_424);
+        s.process_footprint_bytes = Some(30_208_332_568);
+        s.pressure = Pressure::Warning;
+        assert!(admit_snapshot(&s, 1_610_612_736).is_ok());
+        assert_eq!(system_budget(137_438_953_472, Pressure::Warning).1, 0);
+        *a.latest.lock().unwrap() = s.clone();
+        assert!(!lease.should_yield());
+        s.pressure = Pressure::Critical;
+        assert!(admit_snapshot(&s, 1_610_612_736).is_ok());
+        *a.latest.lock().unwrap() = s;
+        assert!(!lease.should_yield());
+        drop(lease);
+        fs::remove_dir_all(&a.directory).unwrap();
     }
     #[test]
     fn normal_pressure_uses_physical_limit_without_footprint_credit() {
@@ -769,12 +743,6 @@ mod tests {
         );
         s.process_footprint_bytes = Some(127 * GIB);
         assert!(admit_snapshot(&s, 99 * GIB).is_err());
-        s.system_used_bytes = Some(128 * GIB - 1);
-        assert!(runtime_stop_reason(&s).is_none());
-        s.system_used_bytes = Some(128 * GIB);
-        assert!(runtime_stop_reason(&s).is_some());
-        s.system_used_bytes = Some(128 * GIB + 1);
-        assert!(runtime_stop_reason(&s).is_some());
     }
     #[test]
     fn unknown_pressure_never_credits_process_footprint_and_keeps_reserve() {
@@ -787,9 +755,9 @@ mod tests {
         s.process_footprint_bytes = Some(127 * GIB);
         assert!(admit_snapshot(&s, 90 * GIB).is_err());
         s.pressure = Pressure::Warning;
-        assert!(admit_snapshot(&s, GIB).is_err());
+        assert!(admit_snapshot(&s, 98 * GIB).is_ok());
         s.pressure = Pressure::Critical;
-        assert!(admit_snapshot(&s, GIB).is_err());
+        assert!(admit_snapshot(&s, 98 * GIB).is_ok());
         s.pressure = Pressure::Unknown;
         assert!(admit_snapshot(&s, GIB).is_ok());
         s.physical_bytes = None;
@@ -834,28 +802,16 @@ mod tests {
         );
     }
     #[test]
-    fn runtime_budget_applies_without_pressure_notifications() {
-        let mut s = snapshot();
-        assert!(runtime_stop_reason(&s).is_none());
-        let physical = s.physical_bytes.unwrap();
-        let (budget, _) = system_budget(physical, Pressure::Unknown);
-        s.pressure = Pressure::Unknown;
-        s.system_used_bytes = Some(budget);
+    fn only_an_unreadable_pressure_level_keeps_a_reserve() {
+        let physical = 128 * GIB;
         assert_eq!(
-            runtime_stop_reason(&s),
-            Some("runtime: system memory headroom exhausted")
+            system_budget(physical, Pressure::Unknown),
+            (physical - 16 * GIB, 16 * GIB)
         );
-        s.pressure = Pressure::Normal;
-        assert!(runtime_stop_reason(&s).is_none());
-        s.pressure = Pressure::Warning;
-        assert!(runtime_stop_reason(&s).is_some());
-        s.system_used_bytes = Some(budget - 1);
-        assert!(runtime_stop_reason(&s).is_none());
-        s.pressure = Pressure::Critical;
-        assert_eq!(
-            runtime_stop_reason(&s),
-            Some("runtime: system memory pressure is critical")
-        );
+        for pressure in [Pressure::Normal, Pressure::Warning, Pressure::Critical] {
+            assert_eq!(system_budget(physical, pressure), (physical, 0));
+        }
+        assert_eq!(pressure_event(Pressure::Warning), "pressure: warning");
     }
     #[test]
     fn queued_local_waiter_precedes_former_owners_next_request() {
@@ -950,11 +906,13 @@ mod tests {
         fs::remove_dir_all(&a.directory).unwrap();
     }
     #[test]
-    fn pressure_yields_and_cancelled_admission_does_not_own() {
+    fn a_waiter_yields_and_cancelled_admission_does_not_own() {
         let a = isolated();
         let lease = a.acquire("test", &|| Ok(())).unwrap();
-        a.latest.lock().unwrap().pressure = Pressure::Warning;
+        assert!(!lease.should_yield());
+        a.waiters.fetch_add(1, Ordering::AcqRel);
         assert!(lease.should_yield());
+        a.waiters.fetch_sub(1, Ordering::AcqRel);
         drop(lease);
         assert!(a.acquire("test", &|| bail!("cancelled")).is_err());
         assert!(!a.owned.load(Ordering::Acquire));

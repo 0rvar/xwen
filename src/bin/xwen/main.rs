@@ -1720,7 +1720,7 @@ fn main() -> Result<()> {
                 | Cmd::Image { .. }
         )
     ) {
-        Some(xwen::memory::acquire("cli", &xwen::memory::check_runtime)?)
+        Some(xwen::memory::acquire("cli", &|| Ok(()))?)
     } else {
         None
     };

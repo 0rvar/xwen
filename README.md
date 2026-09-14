@@ -635,12 +635,11 @@ GPU buffers are released before the next load. This also covers `generate`, `cha
 can yield to a CLI command. Older binaries and other inference applications do not
 participate: stop older Xwen processes before using this build.
 
-Admission checks estimated allocation peaks against current system use. With normal
-macOS memory pressure, the ceiling is physical RAM; when pressure is unavailable,
-it reserves at least 16 GiB or 10% of RAM, whichever is larger. Warning pressure
-blocks new work and unloads idle models. Critical pressure cancels ongoing work at
-safe boundaries; reaching physical RAM does too, with the reserved-headroom limit
-used when pressure is unavailable or warning. Image disconnects cancel queued and running work; a submitted GPU
+Admission checks estimated allocation peaks against current system use, with physical
+RAM as the ceiling; when the kernel's pressure level is unreadable it reserves at least
+16 GiB or 10% of RAM, whichever is larger. The pressure level itself is recorded and
+never acted on (2026-09-14): a warning or critical reading cancels nothing, evicts
+nothing and refuses nothing. Image disconnects cancel queued and running work; a submitted GPU
 command must still finish. Image memory refusals return 503 with `Retry-After: 5`;
 unsupported image area returns 400. Switching engines discards warm conversation
 caches, so the next language request may need a full prefill.

@@ -433,7 +433,7 @@ fn check_residency_wait(
             reason.label()
         );
     }
-    crate::memory::check_runtime()
+    Ok(())
 }
 
 fn drain_before_release(device: &Device, logger: &ServeLogger) {
@@ -917,11 +917,9 @@ fn engine_loop(
                 continue;
             }
             // A normal idle unload may preserve the conversation on disk.
-            // Memory pressure and ownership transfers release it without a new copy.
+            // An ownership transfer releases it without a new copy.
             let held_disk = state.as_ref().map(|held| held.size).and_then(&disk_for);
-            if crate::memory::check_runtime().is_ok()
-                && !lease.as_ref().is_some_and(|held| held.should_yield())
-            {
+            if !lease.as_ref().is_some_and(|held| held.should_yield()) {
                 store_live_conversation(state.as_mut(), held_disk, &logger);
             }
             release_residency(&mut state, &mut lease, &resident, &logger);
@@ -993,9 +991,7 @@ fn engine_loop(
                 from: held,
                 to: required,
             });
-            if crate::memory::check_runtime().is_ok() {
-                store_live_conversation(state.as_mut(), disk_for(held), &logger);
-            }
+            store_live_conversation(state.as_mut(), disk_for(held), &logger);
             let device = state.as_ref().map(|held| held.device.clone());
             if let Some(device) = device.as_ref() {
                 drain_before_release(device, &logger);
@@ -1104,13 +1100,6 @@ fn engine_loop(
                 }
             },
         );
-        // An error response may wait on a stalled reader. Return memory first.
-        if crate::memory::check_runtime().is_err()
-            || trace.record.abandoned == Some(CancelReason::MemoryPressure)
-        {
-            release_residency(&mut state, &mut lease, &resident, &logger);
-            drop_model = true;
-        }
         match outcome {
             JobOutcome::Completed => {}
             JobOutcome::Failed(failure) => {
@@ -1137,8 +1126,6 @@ fn engine_loop(
                 drop_model |= model_lost;
             }
         }
-        drop_model |= crate::memory::check_runtime().is_err()
-            || trace.record.abandoned == Some(CancelReason::MemoryPressure);
         // Whatever happened, a job that did not reconcile its own writes left the KV
         // cache holding part of a prompt nothing has a token history for. That is the
         // one condition the reuse machinery cannot recover from, so it is also the
@@ -1199,9 +1186,7 @@ fn engine_loop(
     // whatever it still holds. Losing an image here costs the next server a
     // re-prefill, which is why the wait is bounded and never retried.
     let held_disk = state.as_ref().map(|held| held.size).and_then(&disk_for);
-    if crate::memory::check_runtime().is_ok()
-        && !lease.as_ref().is_some_and(|held| held.should_yield())
-    {
+    if !lease.as_ref().is_some_and(|held| held.should_yield()) {
         store_live_conversation(state.as_mut(), held_disk, &logger);
     }
     release_residency(&mut state, &mut lease, &resident, &logger);
@@ -1561,9 +1546,6 @@ impl<'a> Abandon<'a> {
         if self.shutdown.is_cancelled() {
             self.cancel.cancel(CancelReason::Shutdown);
         }
-        if crate::memory::check_runtime().is_err() {
-            self.cancel.cancel(CancelReason::MemoryPressure);
-        }
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -1593,15 +1575,10 @@ impl<'a> Abandon<'a> {
         })
     }
 
-    /// Shutdown and memory pressure must not leave allocations held behind a
-    /// stalled reader. Other cancellations retain their terminal-send budget.
+    /// Shutdown must not leave allocations held behind a stalled reader. Other
+    /// cancellations retain their terminal-send budget.
     fn shutdown_pending(&self) -> bool {
-        self.shutdown.is_cancelled()
-            || matches!(
-                self.cancel.reason(),
-                Some(CancelReason::Shutdown | CancelReason::MemoryPressure)
-            )
-            || crate::memory::check_runtime().is_err()
+        self.shutdown.is_cancelled() || self.cancel.reason() == Some(CancelReason::Shutdown)
     }
 
     /// Deliver one event, waiting out ordinary backpressure — except at shutdown,
@@ -1703,11 +1680,6 @@ fn run_batch_job(
         },
     )
     .map_err(JobFailure::from)?;
-
-    if abandon.reason() == Some(CancelReason::MemoryPressure) {
-        trace.record.abandoned = Some(CancelReason::MemoryPressure);
-        return Err(anyhow!("inference cancelled because of system memory pressure").into());
-    }
 
     // The trace reports measured totals where the estimate stood, in the
     // record's own arithmetic (`prompt = cache_read + prefill`): the summed
@@ -2127,7 +2099,6 @@ fn run_job(
             abandon_prefill(engine, &abandon, &opened, trace, reason, &prompt)?;
             return Ok(());
         }
-        crate::memory::check_runtime()?;
         let snapshot = Arc::new(engine.generator.take_cache_snapshot()?.to_host()?);
         let prefix = &mut engine.slots.live_slot()?.prefix;
         match stop.reason {
@@ -2185,16 +2156,6 @@ fn run_job(
         )
     };
 
-    if abandon.reason() == Some(CancelReason::MemoryPressure) {
-        trace.record.abandoned = Some(CancelReason::MemoryPressure);
-        if let Ok(outcome) = &outcome {
-            trace.record.output_tokens = outcome.tokens_out;
-            trace.record.thinking_tokens = outcome.thinking_tokens;
-            trace.record.decode_secs = outcome.decode_secs;
-        }
-        return Err(anyhow!("inference cancelled because of system memory pressure").into());
-    }
-
     // Reconcile before anything else, and against `cache_len` rather than the events
     // received: a decode that ends at its cap skips the feed-back forward for its last
     // token, and an EOG stop token is never cached at all.
@@ -2228,9 +2189,6 @@ fn run_job(
     );
     trace.record.abandoned = abandoned;
     match abandoned {
-        Some(CancelReason::MemoryPressure) => {
-            return Err(anyhow!("inference cancelled because of system memory pressure").into());
-        }
         Some(reason @ (CancelReason::ClientGone | CancelReason::Shutdown)) => {
             logger.log(ServeLog::AbandonedDuringDecode {
                 reason,
@@ -2526,13 +2484,8 @@ fn abandon_prefill(
     reason: CancelReason,
     prompt: &[u32],
 ) -> Result<()> {
-    let kept = if reason == CancelReason::MemoryPressure {
-        engine.generator.cache_len()
-    } else {
-        let kept = reconcile_partial_prefill(engine, prompt)?;
-        log_slots(&engine.slots, abandon.logger);
-        kept
-    };
+    let kept = reconcile_partial_prefill(engine, prompt)?;
+    log_slots(&engine.slots, abandon.logger);
     finish_abandoned_before_decode(
         abandon,
         opened,
@@ -2609,7 +2562,7 @@ fn finish_abandoned_before_decode(
             done,
             total,
         }),
-        CancelReason::ClientGone | CancelReason::Shutdown | CancelReason::MemoryPressure => {
+        CancelReason::ClientGone | CancelReason::Shutdown => {
             abandon.logger.log(ServeLog::AbandonedBeforeDecode {
                 reason,
                 phase,
@@ -2618,15 +2571,6 @@ fn finish_abandoned_before_decode(
                 kept,
             })
         }
-    }
-    if reason == CancelReason::MemoryPressure {
-        let message = "inference cancelled because of system memory pressure";
-        trace.record.error = Some(message.into());
-        abandon.send(EngineEvent::Error {
-            message: message.into(),
-            request_fault: false,
-        });
-        return;
     }
     if reason != CancelReason::ClientGone {
         trace.record.stop = Some(StopKind::MaxTokens);
@@ -2735,7 +2679,6 @@ fn page_out_live(
         return Ok(());
     }
     let started = Instant::now();
-    crate::memory::check_runtime()?;
     let image = Arc::new(engine.generator.export_full_kv()?);
     let rings = Arc::new(engine.generator.take_cache_snapshot()?.to_host()?);
     let planes = engine
@@ -4791,76 +4734,6 @@ mod tests {
         assert_eq!(cancel.reason(), Some(CancelReason::Shutdown));
     }
 
-    #[test]
-    fn memory_pressure_before_decode_sends_error_without_success() {
-        let shutdown = Cancel::default();
-        let cancel = Cancel::default();
-        cancel.cancel(CancelReason::MemoryPressure);
-        let (events, mut receiver) = tokio::sync::mpsc::channel(4);
-        let logger = test_logger();
-        let abandon = Abandon::new(&shutdown, &cancel, &events, &logger, Instant::now(), None);
-        let mut trace = JobTrace::new(
-            RequestOrigin {
-                id: 1,
-                dialect: super::super::types::Dialect::OpenAi,
-                streaming: true,
-                client: None,
-                session: None,
-                agent: None,
-            },
-            "test".into(),
-            3,
-            false,
-            Instant::now(),
-        );
-        finish_abandoned_before_decode(
-            &abandon,
-            &Cell::new(false),
-            &mut trace,
-            CancelReason::MemoryPressure,
-            JobPhase::Prefill,
-            0,
-            3,
-            0,
-        );
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(EngineEvent::Error {
-                request_fault: false,
-                ..
-            })
-        ));
-        assert!(receiver.try_recv().is_err());
-        assert_eq!(trace.record.abandoned, Some(CancelReason::MemoryPressure));
-        assert!(trace.record.stop.is_none());
-        assert!(
-            trace
-                .record
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("memory pressure")
-        );
-    }
-
-    #[test]
-    fn memory_pressure_does_not_wait_for_a_stalled_reader() {
-        let shutdown = Cancel::default();
-        let cancel = Cancel::default();
-        cancel.cancel(CancelReason::MemoryPressure);
-        let (events, _receiver) = tokio::sync::mpsc::channel(1);
-        events
-            .try_send(EngineEvent::Text("buffered".into()))
-            .unwrap();
-        let abandon = live_abandon(&shutdown, &cancel, &events);
-        let started = Instant::now();
-        assert!(!abandon.send(EngineEvent::Error {
-            message: "memory pressure".into(),
-            request_fault: false,
-        }));
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
     fn cache(capacity: usize) -> PrefixCache<usize> {
         PrefixCache::new(capacity)
     }
@@ -5090,7 +4963,6 @@ mod tests {
             CancelReason::ClientGone,
             CancelReason::Deadline,
             CancelReason::Shutdown,
-            CancelReason::MemoryPressure,
         ] {
             let record = JobRecord {
                 abandoned: Some(reason),

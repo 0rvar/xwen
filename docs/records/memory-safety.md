@@ -138,3 +138,38 @@ warm render peaks and post-unload readings before trying a control variant. Stop
 admission refusal or warning pressure; do not relax a guard to complete the experiment.
 This prices the 40/24/8 GiB allowances and is a prerequisite to raising image area or
 allowing co-residency. No measured performance or image-footprint figure changed here.
+
+## 2026-09-14: pressure is telemetry, not a trigger
+
+On 2026-09-14 between 09:14 and 09:42 an Anthropic-dialect client sent the same
+68,347-token prompt to a Flash-Next server twelve times and every attempt failed with
+`inference cancelled because of system memory pressure`. `memory.jsonl` for PID 87746
+shows what the guard saw: Flash-Next resident at 121-125 GB of system use on
+137,438,953,472 bytes of physical RAM, the prefill lifting the process footprint from
+22 GB to 30,208,332,568 bytes and system use to 129,254,375,424 bytes, at which point
+`kern.memorystatus_vm_pressure_level` read warning. Under warning the runtime budget
+kept the 16 GiB reserve, so system use exceeded it, `check_runtime` failed, the engine
+abandoned the prefill at 51,144 tokens on eight attempts and 67,528 on three (the
+first, with 66,140 tokens cached, fell at 2,048 new), dropped the model to return
+memory, and each retry reloaded 111 GB and prefilled for 83 seconds back to the same
+wall. Nothing else was running: no image job, no second process. The same
+prompt shape ran fine before `src/memory.rs` landed on 2026-09-09, and the 131,424-token
+prefill in docs/perf-state.md dates from 2026-09-06.
+
+The kernel's pressure level is now telemetry only. It never cancels in-flight work,
+never evicts an idle owner and never refuses admission; `check_runtime`,
+`runtime_stop_reason` and `CancelReason::MemoryPressure` are gone, and the cancellation
+closures the pipeline and the image engine run under check the client and shutdown
+alone. What stays is what the September 9 incident actually needed: one resident
+inference slot across engines and processes, with a waiter still making the owner
+yield after its current request; admission arithmetic against physical RAM
+(system use plus the projected allocation must fit), which is what refuses a second
+model beside the first; the image reservations; and the telemetry, which now records a
+`pressure: <level>` event on every transition so the next incident has the level beside
+the counters. An unreadable level (`Unknown`) still keeps the max(16 GiB, 10%) reserve,
+because then the counters beside it are suspect too.
+
+The regression `warning_pressure_during_a_long_prefill_is_telemetry_only` replays this
+incident's readings: a 1.6 GB KV growth is admitted under warning and critical, and an
+owner with no waiters does not yield. The two engine tests for the pressure error event
+were removed with the path that produced it.

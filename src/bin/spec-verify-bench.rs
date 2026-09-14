@@ -106,7 +106,7 @@ struct RepTimes {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let _residency = xwen::memory::acquire("spec-verify-bench", &xwen::memory::check_runtime)?;
+    let _residency = xwen::memory::acquire("spec-verify-bench", &|| Ok(()))?;
     // Checked before the model load: this bench holds a 20 GB checkpoint and the
     // GPU for the whole run, so a bad flag combination must not cost a load first.
     anyhow::ensure!(

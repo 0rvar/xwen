@@ -165,6 +165,12 @@ pub struct ZImagePipeline {
     profiler: Option<Arc<Profiler>>,
 }
 
+/// The check the plain entry points run under: a render that nothing external can
+/// interrupt. The serve engine passes its own, which watches the client and shutdown.
+fn never_cancelled() -> Result<()> {
+    Ok(())
+}
+
 impl ZImagePipeline {
     /// Open the pipeline at a repo snapshot root — the directory holding
     /// `model_index.json`, `transformer/`, `vae/` and `scheduler/`.
@@ -191,13 +197,7 @@ impl ZImagePipeline {
         loras: &super::lora::PreparedLoras,
         control_path: Option<&Path>,
     ) -> Result<Self> {
-        Self::load_cancellable(
-            root,
-            device,
-            loras,
-            control_path,
-            &crate::memory::check_runtime,
-        )
+        Self::load_cancellable(root, device, loras, control_path, &never_cancelled)
     }
 
     pub fn load_cancellable(
@@ -423,7 +423,7 @@ impl ZImagePipeline {
     /// Generate one image from `cap_feats`, the text encoder's `[T, 2560]`
     /// hidden state (any float dtype, any device).
     pub fn generate(&self, cap_feats: &Tensor, opts: &ImageOptions) -> Result<Rendered> {
-        self.generate_cancellable(cap_feats, opts, None, None, &crate::memory::check_runtime)
+        self.generate_cancellable(cap_feats, opts, None, None, &never_cancelled)
     }
 
     pub fn generate_edited(
@@ -432,13 +432,7 @@ impl ZImagePipeline {
         opts: &ImageOptions,
         edit: &ImageEdit,
     ) -> Result<Rendered> {
-        self.generate_cancellable(
-            cap_feats,
-            opts,
-            Some(edit),
-            None,
-            &crate::memory::check_runtime,
-        )
+        self.generate_cancellable(cap_feats, opts, Some(edit), None, &never_cancelled)
     }
 
     pub fn generate_controlled(
@@ -448,13 +442,7 @@ impl ZImagePipeline {
         edit: Option<&ImageEdit>,
         control: &ImageControl,
     ) -> Result<Rendered> {
-        self.generate_cancellable(
-            cap_feats,
-            opts,
-            edit,
-            Some(control),
-            &crate::memory::check_runtime,
-        )
+        self.generate_cancellable(cap_feats, opts, edit, Some(control), &never_cancelled)
     }
 
     /// Render with cooperative checks before submitting each substantial phase.
@@ -717,7 +705,6 @@ impl ZImagePipeline {
         context: &Tensor,
         scale: f64,
     ) -> Result<Tensor> {
-        crate::memory::check_runtime()?;
         ensure!(
             scale.is_finite() && (0.0..=1.0).contains(&scale),
             "invalid control scale"
@@ -738,10 +725,7 @@ impl ZImagePipeline {
             .context("load a ControlNet before requesting control")?;
         Ok(self
             .transformer
-            .forward_controlled_cancellable(&x, &t, &cap, controlnet, &context, scale, &|| {
-                crate::memory::check_runtime()
-                    .map_err(|error| candle_core::Error::Msg(format!("{error:#}")))
-            })?
+            .forward_controlled_cancellable(&x, &t, &cap, controlnet, &context, scale, &|| Ok(()))?
             .squeeze(2)?
             .to_dtype(DType::F32)?
             .neg()?)
@@ -750,7 +734,7 @@ impl ZImagePipeline {
     /// [`Self::velocity`] with the caption already batched and in the model
     /// dtype, which the step loop does once rather than per step.
     fn velocity_batched(&self, latents: &Tensor, cap_feats: &Tensor, t: f32) -> Result<Tensor> {
-        self.velocity_batched_cancellable(latents, cap_feats, t, &crate::memory::check_runtime)
+        self.velocity_batched_cancellable(latents, cap_feats, t, &never_cancelled)
     }
 
     fn velocity_batched_cancellable(
@@ -781,7 +765,7 @@ impl ZImagePipeline {
     /// u8 RGB on the CPU. The tail of [`Self::generate`], public so a
     /// reference latent can be decoded through this VAE alone.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
-        self.decode_cancellable(latents, &crate::memory::check_runtime)
+        self.decode_cancellable(latents, &never_cancelled)
     }
 
     pub fn decode_cancellable(
@@ -814,7 +798,6 @@ impl ZImagePipeline {
 
     /// Encode RGB8 source pixels with an explicit posterior draw for reference replay.
     pub fn encode_image(&self, image: &Tensor, posterior_noise: &Tensor) -> Result<Tensor> {
-        crate::memory::check_runtime()?;
         let (c, h, w) = image.dims3()?;
         ensure!(
             c == 3 && image.dtype() == DType::U8,
@@ -825,10 +808,7 @@ impl ZImagePipeline {
             .unsqueeze(0)?;
         Ok(self
             .vae
-            .encode_with_noise_cancellable(&pixels, posterior_noise, &|| {
-                crate::memory::check_runtime()
-                    .map_err(|error| candle_core::Error::Msg(format!("{error:#}")))
-            })?)
+            .encode_with_noise_cancellable(&pixels, posterior_noise, &|| Ok(()))?)
     }
 
     /// The author's ControlNet conditions on VAE posterior modes, with no random draw.
@@ -837,7 +817,7 @@ impl ZImagePipeline {
         control: &ImageControl,
         edit: Option<&ImageEdit>,
     ) -> Result<Tensor> {
-        self.control_context_cancellable(control, edit, &crate::memory::check_runtime)
+        self.control_context_cancellable(control, edit, &never_cancelled)
     }
 
     fn control_context_cancellable(

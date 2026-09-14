@@ -512,9 +512,10 @@ The seams, so a change lands in one place:
   lazy load and its own idle unload on `--idle-unload`. As of 2026-09-09,
   `src/memory.rs` coordinates residency across engines and updated Xwen processes.
   Keep its lease until models, host slots, preprocessors and GPU buffers are dropped
-  and drained; a generation-only mutex leaves idle models resident. Ownership/pressure
-  unload must never create a fresh host snapshot. Image area is capped at 1024 squared
-  until larger peaks are measured. [Memory safety record](docs/records/memory-safety.md). The
+  and drained; a generation-only mutex leaves idle models resident. An ownership
+  transfer must never create a fresh host snapshot, and the kernel's memory pressure level
+  is telemetry only (2026-09-14): nothing cancels, evicts or refuses on it. Image area is
+  capped at 1024 squared until larger peaks are measured. [Memory safety record](docs/records/memory-safety.md). The
   prompt rendering both `xwen image` and the route use is
   `zimage::conditioning::prompt_ids`, so a change to how the caption is rendered lands in
   one place. The `model` rule is split by path (full name or nothing on the first two,

@@ -757,7 +757,6 @@ impl XwenModel {
     /// caches, so callers feeding chunks must pass a monotonically increasing
     /// `pos`.
     fn run_stack(&mut self, tokens: &Tensor, pos: usize) -> Result<StackOutput> {
-        crate::memory::check_runtime()?;
         // qwen4exp is a second graph over the same blocks (D14): a 4-stream
         // residual carrier, a QSA overlay on the attention layers and a PLE
         // injection, none of which fit as a branch inside the loop below.

@@ -581,7 +581,7 @@ fn observed_delta_path(cfg: &xwen::XwenConfig) -> Result<&'static str> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let _residency = xwen::memory::acquire("logits-dump", &xwen::memory::check_runtime)?;
+    let _residency = xwen::memory::acquire("logits-dump", &|| Ok(()))?;
     let runner = expert_runner(&cli.moe_impl)?;
 
     let device = gguf::metal_device()?;

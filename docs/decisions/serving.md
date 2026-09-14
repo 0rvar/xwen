@@ -483,6 +483,20 @@ no process-footprint credit or assumed reclaimable GGUF weight bytes are subtrac
 Exclusive model ownership and image allowances remain required.
 [Evidence and regression](../records/memory-safety.md#normal-pressure-flash-next-regression).
 
+**Memory pressure is telemetry, never a trigger (2026-09-14).** The warning-pressure
+admission stop and the critical/headroom runtime cutoff above are refuted. On 2026-09-14 a
+single resident Flash-Next serving a 68,347-token prompt pushed system use to 129.25 GB
+of 128 GiB and the kernel reported warning; the runtime cutoff abandoned the prefill at
+51,144 tokens, dropped the model, and the client retried eleven times into the same wall,
+each retry a fresh 111 GB load and an 83-second prefill. That is an ordinary large prompt
+on this machine, which ran a 131k-token prefill on 2026-09-06 without incident. The
+kernel level is recorded in `memory.jsonl` on every transition and consulted by nothing;
+only an unreadable level keeps the 16 GiB/10% reserve. Ownership, physical-RAM admission
+arithmetic and the image reservations stay, because the September 9 hazard was two models
+resident at once and those are what prevent it. Reopen if a measured incident shows the
+kernel pressure level preceding a hang with a single model resident.
+[Evidence](../records/memory-safety.md#2026-09-14-pressure-is-telemetry-not-a-trigger).
+
 **Anthropic prompt usage uses disjoint cache buckets (2026-09-10).**
 The Messages API adds `input_tokens`, `cache_read_input_tokens` and
 `cache_creation_input_tokens` to obtain the full prompt count

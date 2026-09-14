@@ -643,7 +643,7 @@ fn engine_loop(
                 waiting_since.elapsed() < wait_timeout,
                 "timed out waiting for image memory ownership; retry shortly"
             );
-            crate::memory::check_runtime()
+            Ok(())
         };
         if lease.is_none() {
             match crate::memory::acquire("images", &check) {
@@ -673,8 +673,6 @@ fn engine_loop(
             ImageJob::Preprocess { image, kind, reply } => {
                 let result =
                     preprocess_on_worker(&mut preprocessor, &image, kind).and_then(|image| {
-                        crate::memory::check_runtime()
-                            .map_err(|e| ImageError::Unavailable(e.to_string()))?;
                         encode_png(&image).map_err(|e| ImageError::Render(format!("{e:#}")))
                     });
                 trace.finished(&result, shutdown.is_cancelled() || reply.is_closed());
@@ -695,7 +693,7 @@ fn engine_loop(
         let check = || -> Result<()> {
             anyhow::ensure!(!shutdown.is_cancelled(), "the server is shutting down");
             anyhow::ensure!(!reply.is_closed(), "the image client disconnected");
-            crate::memory::check_runtime()
+            Ok(())
         };
         let result = (|| -> Result<Vec<RenderedImage>, ImageError> {
             if let Some(control) = &mut inputs.control {
