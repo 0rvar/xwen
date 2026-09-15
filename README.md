@@ -735,14 +735,17 @@ Flash-Next is the exception: 111 GB is not something a stranger's request gets t
 so an uncached one is a 400 naming `xwen fetch` instead.
 
 Warm conversations are bounded by host RAM, not by a count: `--cache-budget <GiB>` /
-`[cache] budget_gib` (default 8; 0 for no bound) is what the paged-out images may add up
-to, and after every request the least recently used cold conversations are dropped until
-they fit — never the live one and never the one that just left the GPU cache, so a single
-image larger than the budget is kept. A Flash-Next image is 30 KiB per token plus a 113 MiB
-floor, so the default holds five or six agent sessions of 15-60k tokens or one at the full
-context. `--cache-slots` / `[cache] slots` (default 8) is only the hard cap on their
-number; 1 turns multi-conversation reuse off. `bun scripts/cache-hitrate.ts --model Flash`
-reads the hit rate off the metrics log, by how many other sessions ran in between.
+`[cache] budget_gib` (default 8) is what the warm images may add up to — every slot's
+snapshots, full-attention image and drafter planes, the live slot's retained ones
+included, a shared image counted once — and after every page-out the least recently used
+cold conversations are dropped until they fit. Never the live one and never the one that
+just left the GPU cache, so a single image larger than the budget is kept. A Flash-Next
+image is 30 KiB per token plus a 113 MiB floor, so the default holds five or six agent
+sessions of 15-60k tokens or one at the full context. `--cache-slots` / `[cache] slots`
+(default 8) is only the hard cap on their number; 1 turns multi-conversation reuse off. A
+budget of 0 means unbounded, and then the cap alone bounds the set: up to eight
+full-context images, about 64 GiB on Flash-Next. `bun scripts/cache-hitrate.ts --model
+Flash` reads the hit rate off the metrics log, by how many other sessions ran in between.
 
 Request bodies are capped at 100 MB (real cost is judged in tokens by the queue and
 `context_length`, not in bytes). `context_length` — default: the checkpoint's trained

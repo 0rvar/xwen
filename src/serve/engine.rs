@@ -2,7 +2,7 @@
 //! time by construction, maintains the KV prefix cache, and applies idle unload.
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
@@ -470,27 +470,32 @@ fn request_host_cache_growth(
     let per_slot = target_bytes
         .saturating_add(draft_bytes)
         .saturating_add(snapshot_bytes);
-    // The slot cap bounds the retained images only when no host budget does; under a
-    // budget the images are trimmed back to it after every dispatch, so the most that
-    // is ever held is the budget plus the one image a swap has in flight.
+    // The slot cap bounds the retained images only when no host budget does. Under a
+    // budget the trim after every page-out brings them back to it, but it spares two
+    // slots whatever their size, so the ceiling it enforces is the larger of the budget
+    // and two images, plus the one image a swap has in flight.
+    let at_cap = per_slot.saturating_mul(settings.cache_slots as u64);
     let projected = match settings.cache_budget_bytes() {
-        0 => per_slot.saturating_mul(settings.cache_slots as u64),
+        0 => at_cap,
         budget => per_slot
-            .saturating_mul(settings.cache_slots as u64)
-            .min(budget.saturating_add(per_slot)),
+            .saturating_mul(2)
+            .max(budget)
+            .saturating_add(per_slot)
+            .min(at_cap),
     };
     let held = engine
         .slots
-        .summary(
-            |rings| rings.byte_len(),
-            |image| image.byte_len(),
-            |planes| planes.byte_len(),
-        )
-        .iter()
-        .fold(0u64, |bytes, slot| {
-            bytes.saturating_add(slot.image_bytes as u64)
-        });
-    projected.saturating_sub(held)
+        .held_bytes(&measure_rings, &measure_image, &measure_planes);
+    let headroom = projected.saturating_sub(held);
+    // A request that pages the live conversation out allocates a fresh image of it
+    // before anything is trimmed, so it is never projected at less than one image:
+    // over-admitting by one is harmless now that admission waits rather than refuses.
+    let pages_out = !matches!(engine.slots.choose(job.prompt()), SlotChoice::Live { .. });
+    if pages_out {
+        headroom.max(per_slot)
+    } else {
+        headroom
+    }
 }
 
 /// Return allocations before allowing the next workload to acquire residency.
@@ -1234,7 +1239,7 @@ fn store_live_conversation(
         return;
     };
     let stored = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        page_out_live(engine, Some(disk), logger)
+        page_out_live(engine, Some(disk), logger, None)
     }));
     let error = match stored {
         Ok(Ok(())) => return,
@@ -1669,7 +1674,7 @@ fn run_batch_job(
     logger: &ServeLogger,
     trace: &mut JobTrace,
 ) -> Result<(), JobFailure> {
-    page_out_live(engine, disk, logger).map_err(JobFailure::from)?;
+    page_out_live(engine, disk, logger, None).map_err(JobFailure::from)?;
     // Set before the first runner call: the shared prefill mutates the cache
     // immediately, and a failure anywhere after it must cost the cache.
     engine.dirty = true;
@@ -1937,7 +1942,7 @@ fn run_job(
                 );
                 return Ok(());
             }
-            page_out_live(engine, disk, logger)?;
+            page_out_live(engine, disk, logger, Some(source))?;
             if let Some(reason) = abandon.reason() {
                 finish_abandoned_before_decode(
                     &abandon,
@@ -1989,7 +1994,7 @@ fn run_job(
                         );
                         return Ok(());
                     }
-                    page_out_live(engine, disk, logger)?;
+                    page_out_live(engine, disk, logger, Some(slot))?;
                     // Between the transfers the live conversation is safely imaged out and
                     // nothing owns the cache, so this exit leaves `dirty` for the caller to
                     // clear; every slot image survives that reset.
@@ -2025,7 +2030,7 @@ fn run_job(
                         );
                         return Ok(());
                     }
-                    page_out_live(engine, disk, logger)?;
+                    page_out_live(engine, disk, logger, None)?;
                     engine.generator.reset_cache()?;
                     engine.generator.reset_drafter()?;
                     engine.slots.start_fresh(slot);
@@ -2041,10 +2046,10 @@ fn run_job(
         }
     }
     engine.slots.touch_live()?;
-    // Whatever the dispatch imaged out or installed, the warm images are brought back
-    // under the host budget before the job runs, with the live slot and the one that
-    // just left the cache both spared.
-    trim_slots_to_budget(engine, disk, logger);
+    // A page-out enforces the budget as it happens; this covers a dispatch that installed
+    // a stored image without paging anything out, so the warm set is under budget before
+    // the job runs either way.
+    trim_slots_to_budget(engine, None, disk, logger);
     // One report for every arm above: whichever of them ran, the slots now stand as
     // this job will use them. The two paging transfers report their own state as well,
     // since each is hundreds of milliseconds nobody would otherwise see.
@@ -2687,6 +2692,7 @@ fn page_out_live(
     engine: &mut EngineState,
     disk: Option<&DiskCache>,
     logger: &ServeLogger,
+    spare: Option<usize>,
 ) -> Result<()> {
     let Some(live) = engine.slots.live else {
         return Ok(());
@@ -2733,6 +2739,10 @@ fn page_out_live(
             );
         }
     }
+    // The image just made is what can put the warm set over its host budget, so this is
+    // where the budget is enforced: the slot it went into is the newest cold one and is
+    // spared, as is whichever slot the caller is about to page in or fork off.
+    trim_slots_to_budget(engine, spare, disk, logger);
     Ok(())
 }
 
@@ -2798,7 +2808,7 @@ fn hydrate_slot(
         tier.set_unusable(candidate);
         return Ok(Hydration::Unavailable);
     }
-    page_out_live(engine, Some(tier), logger)?;
+    page_out_live(engine, Some(tier), logger, None)?;
     if let Some(reason) = abandon.reason() {
         return Ok(Hydration::Abandoned(reason));
     }
@@ -4221,6 +4231,10 @@ struct SlotManager<S, F, D> {
     clock: u64,
 }
 
+/// One host payload as the budget sees it: an allocation identity, unique per
+/// allocation and equal for every slot sharing it, and its size in bytes.
+type Measure = (usize, usize);
+
 /// A conversation taking a slot of its own at `pos`, sharing `source`'s image, instead of
 /// rewinding `source` in place and losing everything it held above the fork.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4274,15 +4288,27 @@ impl<S, F, D> SlotManager<S, F, D> {
         if self.history_at_risk(source, pos) < SNAPSHOT_MIN_GAIN {
             return None;
         }
-        let target = self.fresh_slot()?;
-        if target == FreshSlot::Evict(source) {
-            return None;
-        }
         Some(ForkPlan {
             source,
-            target,
+            target: self.fork_target(source)?,
             pos,
         })
+    }
+
+    /// Where a conversation forking off `source` goes: a slot of its own under the cap,
+    /// otherwise the least recently used cold slot that is neither `source` nor live. None
+    /// when `source` is the only slot that could be emptied, since evicting it to make room
+    /// for its own fork is the rewind the fork exists to avoid.
+    fn fork_target(&self, source: usize) -> Option<FreshSlot> {
+        if self.slots.len() < self.max_slots {
+            return Some(FreshSlot::New);
+        }
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| Some(*slot) != self.live && *slot != source)
+            .min_by_key(|(_, held)| held.last_used)
+            .map(|(slot, _)| FreshSlot::Evict(slot))
     }
 
     /// Which slot serves `prompt`, and what has to happen to the model's cache first.
@@ -4512,67 +4538,90 @@ impl<S, F, D> SlotManager<S, F, D> {
         held.prefix.tokens.len().saturating_sub(pos.max(imaged))
     }
 
-    /// Host bytes `slot` holds, measured by the caller's byte-length functions as
-    /// [`summary`] measures them: every snapshot, the full-attention image and the
-    /// drafter's planes.
-    fn slot_bytes(
-        &self,
+    /// Every host payload `slot` holds — its snapshots, its full-attention image and its
+    /// drafter's planes — as the caller's measuring functions see them: an allocation
+    /// identity and a byte count. The identity is what lets two slots sharing one
+    /// allocation (a fork and the conversation it forked off, whose images are one `Arc`)
+    /// be counted once.
+    fn slot_measures<'a>(
+        &'a self,
         slot: usize,
-        snapshot_bytes: &impl Fn(&S) -> usize,
-        full_bytes: &impl Fn(&F) -> usize,
-        draft_bytes: &impl Fn(&D) -> usize,
-    ) -> usize {
+        snapshot: &'a impl Fn(&S) -> Measure,
+        full: &'a impl Fn(&F) -> Measure,
+        draft: &'a impl Fn(&D) -> Measure,
+    ) -> impl Iterator<Item = Measure> + 'a {
         let held = &self.slots[slot];
         held.prefix
             .all_snapshots()
-            .map(|(_, snapshot)| snapshot_bytes(snapshot))
-            .sum::<usize>()
-            + held.full_kv.as_ref().map_or(0, |image| full_bytes(image))
-            + held
-                .draft_kv
-                .as_ref()
-                .map_or(0, |planes| draft_bytes(planes))
+            .map(move |(_, rings)| snapshot(rings))
+            .chain(held.full_kv.as_ref().map(full))
+            .chain(held.draft_kv.as_ref().map(draft))
+    }
+
+    /// Host bytes the slots hold between them, each allocation counted once however many
+    /// slots share it.
+    fn held_bytes(
+        &self,
+        snapshot: &impl Fn(&S) -> Measure,
+        full: &impl Fn(&F) -> Measure,
+        draft: &impl Fn(&D) -> Measure,
+    ) -> u64 {
+        let mut seen = HashSet::new();
+        (0..self.slots.len())
+            .flat_map(|slot| self.slot_measures(slot, snapshot, full, draft))
+            .filter(|(identity, _)| seen.insert(*identity))
+            .map(|(_, bytes)| bytes as u64)
+            .sum()
     }
 
     /// Empty the least recently used cold slots until the warm images fit the budget,
-    /// returning each emptied slot with the bytes it gave back.
+    /// returning each emptied slot with the bytes it alone gave back — an allocation a
+    /// remaining slot still shares is not freed and is not counted.
     ///
-    /// Two slots are never emptied: the live one, whose state is the model's cache, and
-    /// the most recently used cold one, which is the conversation that just left the cache
-    /// and the likeliest to come back. So the budget is a bound on everything BEYOND the
-    /// two-agents case, and a single image larger than the whole budget is kept rather
-    /// than thrown away for nothing. A budget of zero bounds nothing.
+    /// Three slots are never emptied: the live one, whose state is the model's cache; the
+    /// most recently used cold ones (a tie spares them all), which is the conversation
+    /// that just left the cache and the likeliest to come back; and `spare`, the slot the
+    /// dispatch in progress is about to page in or fork off. So the budget is a bound on
+    /// everything BEYOND the two-agents case, and a single image larger than the whole
+    /// budget is kept rather than thrown away for nothing. A budget of zero bounds
+    /// nothing.
     fn trim_to_budget(
         &mut self,
-        snapshot_bytes: impl Fn(&S) -> usize,
-        full_bytes: impl Fn(&F) -> usize,
-        draft_bytes: impl Fn(&D) -> usize,
+        spare: Option<usize>,
+        snapshot: impl Fn(&S) -> Measure,
+        full: impl Fn(&F) -> Measure,
+        draft: impl Fn(&D) -> Measure,
     ) -> Vec<(usize, usize)> {
         let mut evicted = Vec::new();
         if self.budget_bytes == 0 {
             return evicted;
         }
-        let bytes = |slots: &Self, slot: usize| {
-            slots.slot_bytes(slot, &snapshot_bytes, &full_bytes, &draft_bytes)
-        };
-        let mut held: u64 = (0..self.slots.len())
-            .map(|slot| bytes(self, slot) as u64)
-            .sum();
-        let kept = (0..self.slots.len())
+        let newest = (0..self.slots.len())
             .filter(|slot| Some(*slot) != self.live)
-            .max_by_key(|slot| self.slots[*slot].last_used);
+            .map(|slot| self.slots[slot].last_used)
+            .max();
+        let protected = |slots: &Self, slot: usize| {
+            Some(slot) == slots.live
+                || Some(slot) == spare
+                || Some(slots.slots[slot].last_used) == newest
+        };
+        let mut held = self.held_bytes(&snapshot, &full, &draft);
         while held > self.budget_bytes {
             let Some(victim) = (0..self.slots.len())
-                .filter(|slot| Some(*slot) != self.live && Some(*slot) != kept)
-                .filter(|slot| bytes(self, *slot) > 0)
+                .filter(|slot| !protected(self, *slot))
+                .filter(|slot| {
+                    self.slot_measures(*slot, &snapshot, &full, &draft)
+                        .next()
+                        .is_some()
+                })
                 .min_by_key(|slot| self.slots[*slot].last_used)
             else {
                 break;
             };
-            let freed = bytes(self, victim);
             self.empty(victim);
-            held = held.saturating_sub(freed as u64);
-            evicted.push((victim, freed));
+            let remaining = self.held_bytes(&snapshot, &full, &draft);
+            evicted.push((victim, held.saturating_sub(remaining) as usize));
+            held = remaining;
         }
         evicted
     }
@@ -4781,16 +4830,36 @@ fn log_slots(slots: &Slots, logger: &ServeLogger) {
     )));
 }
 
+/// The three payloads as the host budget measures them: the `Arc`'s allocation as the
+/// identity, so a fork and its source count their shared image once.
+fn measure_rings(rings: &Arc<HostSnapshot>) -> Measure {
+    (Arc::as_ptr(rings) as usize, rings.byte_len())
+}
+
+fn measure_image(image: &Arc<HostFullKv>) -> Measure {
+    (Arc::as_ptr(image) as usize, image.byte_len())
+}
+
+fn measure_planes(planes: &Arc<DrafterImage>) -> Measure {
+    (Arc::as_ptr(planes) as usize, planes.byte_len())
+}
+
 /// Empty the least recently used cold slots until the warm images fit the configured
 /// host budget, forgetting where each emptied conversation was stored on disk: a slot
-/// holding nothing is no longer a reason to keep a file alive.
-fn trim_slots_to_budget(engine: &mut EngineState, disk: Option<&DiskCache>, logger: &ServeLogger) {
+/// holding nothing is no longer a reason to keep a file alive. `spare` is the slot the
+/// dispatch in progress still needs, which the trim leaves alone.
+fn trim_slots_to_budget(
+    engine: &mut EngineState,
+    spare: Option<usize>,
+    disk: Option<&DiskCache>,
+    logger: &ServeLogger,
+) {
     let budget = engine.slots.budget_bytes;
-    for (slot, bytes) in engine.slots.trim_to_budget(
-        |rings| rings.byte_len(),
-        |image| image.byte_len(),
-        |planes| planes.byte_len(),
-    ) {
+    for (slot, bytes) in
+        engine
+            .slots
+            .trim_to_budget(spare, measure_rings, measure_image, measure_planes)
+    {
         if let Some(disk) = disk {
             disk.unlink(slot);
         }
@@ -5761,6 +5830,13 @@ mod tests {
     /// The page-out the engine performs before another slot takes the cache. The live
     /// conversation's cache length is what its own history says here: no model is involved.
     fn page_out_of_cache(slots: &mut TestSlots) {
+        page_out_sparing(slots, None);
+    }
+
+    /// [`page_out_of_cache`] followed by the budget trim the engine's page-out performs,
+    /// sparing `spare` as the dispatch does for the slot it is about to page in or fork
+    /// off.
+    fn page_out_sparing(slots: &mut TestSlots, spare: Option<usize>) {
         let Some(live) = slots.live else {
             return;
         };
@@ -5769,7 +5845,34 @@ mod tests {
             slots.abandon_live();
         } else {
             slots.page_out(pos, pos, pos, Some(pos));
+            slots.trim_to_budget(spare, measure_rings_t, measure_image_t, measure_planes_t);
         }
+    }
+
+    /// The stand-in payloads as the budget measures them: each is the position it covers,
+    /// so its bytes are that number, and its identity is that number too, offset per kind
+    /// so a snapshot and an image at the same position are not one allocation. Two slots
+    /// holding the same value of one kind therefore count as sharing an allocation, which
+    /// is exactly what a fork and its source do; unrelated slots in these tests are given
+    /// distinct lengths.
+    fn measure_rings_t(rings: &usize) -> Measure {
+        (*rings, *rings)
+    }
+
+    fn measure_image_t(image: &usize) -> Measure {
+        (1_000_000_000 + *image, *image)
+    }
+
+    fn measure_planes_t(planes: &usize) -> Measure {
+        (2_000_000_000 + *planes, *planes)
+    }
+
+    fn held(slots: &TestSlots) -> u64 {
+        slots.held_bytes(&measure_rings_t, &measure_image_t, &measure_planes_t)
+    }
+
+    fn trim(slots: &mut TestSlots) -> Vec<(usize, usize)> {
+        slots.trim_to_budget(None, measure_rings_t, measure_image_t, measure_planes_t)
     }
 
     /// Replay one job's dispatch against the slots with the model stood in for: apply the
@@ -5808,7 +5911,7 @@ mod tests {
             let inherited = slots
                 .fork_rings(source, pos)
                 .expect("the fork point is held");
-            page_out_of_cache(slots);
+            page_out_sparing(slots, Some(source));
             let slot = slots
                 .fork_from(source, target, pos, inherited)
                 .expect("the fork installs");
@@ -5821,7 +5924,7 @@ mod tests {
                     Resume::Cold => slots.restart_live().expect("a slot is live"),
                 },
                 SlotChoice::Swap { slot, restore } => {
-                    page_out_of_cache(slots);
+                    page_out_sparing(slots, Some(slot));
                     slots.page_in(slot, restore);
                 }
                 SlotChoice::Fresh { slot } => {
@@ -5831,7 +5934,7 @@ mod tests {
             }
         }
         slots.touch_live().expect("the dispatch leaves a slot live");
-        slots.trim_to_budget(|s| *s, |f| *f, |d| *d);
+        trim(slots);
         // The planner the engine itself runs, so what these tests see the slots collect is
         // what a real prefill would have stopped for. The stand-in payload is the position.
         let stops = plan_snapshot_stops(
@@ -6828,65 +6931,240 @@ mod tests {
     /// is kept and the two-agents case always survives.
     #[test]
     fn the_budget_empties_the_least_recently_used_cold_slots_first() {
-        // Payloads stand in for their own byte counts here; only the images are measured.
-        let trim = |slots: &mut TestSlots| slots.trim_to_budget(|_| 0, |f| *f, |_| 0);
-
-        let mut slots = budgeted(8, 4, 8);
-        let a = seed(&mut slots, &[1, 1, 1], &[]);
-        let b = seed(&mut slots, &[2, 2, 2], &[]);
-        assert_eq!(trim(&mut slots), vec![], "6 of 8 fits");
-        let c = seed(&mut slots, &[3, 3, 3], &[]);
-        // Nine over eight: the oldest goes, and the one that just left the cache stays.
-        assert_eq!(trim(&mut slots), vec![(a, 3)]);
+        // A seeded slot of length L holds a tail snapshot, an image and drafter planes all
+        // covering L, so it measures 3L; the lengths differ so nothing is shared.
+        let mut slots = budgeted(8, 4, 30);
+        let a = seed(&mut slots, &[1; 3], &[]);
+        let b = seed(&mut slots, &[2; 4], &[]);
+        assert_eq!(held(&slots), 21);
+        assert_eq!(trim(&mut slots), vec![], "21 of 30 fits");
+        let c = seed(&mut slots, &[3; 5], &[]);
+        // 36 over 30: the oldest goes, and the one that just left the cache stays.
+        assert_eq!(trim(&mut slots), vec![(a, 9)]);
+        assert_eq!(held(&slots), 27);
         assert!(slots.slots[a].prefix.tokens.is_empty());
         assert_eq!(slots.slots[a].full_kv, None);
         assert_eq!(slots.slots[a].last_used, 0, "first to be reused");
-        assert_eq!(slots.slots[b].full_kv, Some(3));
-        assert_eq!(slots.slots[c].full_kv, Some(3));
+        assert_eq!(slots.slots[b].full_kv, Some(4));
+        assert_eq!(slots.slots[c].full_kv, Some(5));
         // And an emptied slot is what the next fresh conversation lands in.
         assert_eq!(slots.fresh_slot(), Some(FreshSlot::New));
-        let mut full = budgeted(3, 4, 8);
-        let a = seed(&mut full, &[1, 1, 1], &[]);
-        seed(&mut full, &[2, 2, 2], &[]);
-        seed(&mut full, &[3, 3, 3], &[]);
-        assert_eq!(trim(&mut full), vec![(a, 3)]);
+        let mut full = budgeted(3, 4, 30);
+        let a = seed(&mut full, &[1; 3], &[]);
+        seed(&mut full, &[2; 4], &[]);
+        seed(&mut full, &[3; 5], &[]);
+        assert_eq!(trim(&mut full), vec![(a, 9)]);
         assert_eq!(full.fresh_slot(), Some(FreshSlot::Evict(a)));
 
         // A single image larger than the budget is kept: emptying it would leave nothing
         // to come back to.
-        let mut lone = budgeted(8, 4, 8);
-        let x = seed(&mut lone, &[1; 10], &[]);
+        let mut lone = budgeted(8, 4, 30);
+        let x = seed(&mut lone, &[1; 20], &[]);
+        assert_eq!(held(&lone), 60);
         assert_eq!(trim(&mut lone), vec![]);
-        assert_eq!(lone.slots[x].full_kv, Some(10));
+        assert_eq!(lone.slots[x].full_kv, Some(20));
 
         // The live slot is spared however much it holds, and so is the newest cold one:
         // when those two alone exceed the budget nothing else is emptied for it.
-        let mut held = budgeted(8, 4, 8);
-        let a = seed(&mut held, &[1, 1, 1], &[]);
-        let b = seed(&mut held, &[2, 2, 2], &[]);
-        let live_slot = start(&mut held);
-        live(&mut held).prefix.set_tokens(vec![9; 20]);
-        held.slots[live_slot].full_kv = Some(20);
-        assert_eq!(held.trim_to_budget(|_| 0, |f| *f, |_| 0), vec![(a, 3)]);
-        assert_eq!(held.trim_to_budget(|_| 0, |f| *f, |_| 0), vec![]);
-        assert_eq!(held.slots[b].full_kv, Some(3));
-        assert_eq!(held.slots[live_slot].full_kv, Some(20));
+        let mut two = budgeted(8, 4, 30);
+        let a = seed(&mut two, &[1; 3], &[]);
+        let b = seed(&mut two, &[2; 4], &[]);
+        let live_slot = start(&mut two);
+        live(&mut two).prefix.set_tokens(vec![9; 20]);
+        two.slots[live_slot].full_kv = Some(20);
+        assert_eq!(held(&two), 41);
+        assert_eq!(trim(&mut two), vec![(a, 9)]);
+        assert_eq!(
+            trim(&mut two),
+            vec![],
+            "32 over 30, and nothing left to empty"
+        );
+        assert_eq!(two.slots[b].full_kv, Some(4));
+        assert_eq!(two.slots[live_slot].full_kv, Some(20));
+
+        // The slot the dispatch is about to page in or fork off is spared too, so the
+        // eviction skips past it to the next oldest.
+        let mut sparing = budgeted(8, 4, 30);
+        let a = seed(&mut sparing, &[1; 3], &[]);
+        let b = seed(&mut sparing, &[2; 4], &[]);
+        let c = seed(&mut sparing, &[3; 5], &[]);
+        assert_eq!(
+            sparing.trim_to_budget(Some(a), measure_rings_t, measure_image_t, measure_planes_t),
+            vec![(b, 12)]
+        );
+        assert_eq!(sparing.slots[a].full_kv, Some(3));
+        assert_eq!(sparing.slots[c].full_kv, Some(5));
 
         // Snapshots count toward a slot's bytes like the images do.
-        let mut rings = budgeted(8, 4, 8);
+        let mut rings = budgeted(8, 4, 10);
         let a = seed(&mut rings, &[1, 1], &[1]);
-        let b = seed(&mut rings, &[2, 2], &[]);
-        // A holds a turn snapshot at 1 and the tail at 2, plus the image of 2: 5 bytes
-        // measured; B holds the tail at 2 and the image: 4.
-        assert_eq!(rings.trim_to_budget(|s| *s, |f| *f, |_| 0), vec![(a, 5)]);
-        assert_eq!(rings.slots[b].full_kv, Some(2));
+        let b = seed(&mut rings, &[2, 2, 2], &[]);
+        // A holds a turn snapshot at 1, the tail at 2, the image and the planes of 2: 7
+        // measured; B holds the tail, the image and the planes of 3: 9.
+        assert_eq!(held(&rings), 16);
+        assert_eq!(trim(&mut rings), vec![(a, 7)]);
+        assert_eq!(rings.slots[b].full_kv, Some(3));
 
         // No budget bounds nothing.
         let mut unbounded = manager(8, 4);
         seed(&mut unbounded, &[1; 100], &[]);
-        seed(&mut unbounded, &[2; 100], &[]);
-        seed(&mut unbounded, &[3; 100], &[]);
+        seed(&mut unbounded, &[2; 101], &[]);
+        seed(&mut unbounded, &[3; 102], &[]);
         assert_eq!(trim(&mut unbounded), vec![]);
+    }
+
+    /// A fork shares its source's image, planes and inherited rings — one `Arc` each in
+    /// the engine — so the budget counts the pair once, and emptying one of them frees only
+    /// what the other does not still hold. Counting them twice would put a freshly forked
+    /// pair over a budget everything fits in, and the slot emptied for it would be the very
+    /// conversation just forked off.
+    #[test]
+    fn a_fork_and_its_source_are_counted_once() {
+        let mut slots = budgeted(8, 4, 60);
+        // A: a turn snapshot at 5, the tail at 10, the image and the planes of 10: 35.
+        let a = seed(&mut slots, &[1; 10], &[5]);
+        assert_eq!(held(&slots), 35);
+        let inherited = slots.fork_rings(a, 5).expect("the fork point is held");
+        let c = slots
+            .fork_from(a, FreshSlot::New, 5, inherited)
+            .expect("the fork installs");
+        assert_eq!(slots.slots[c].full_kv, slots.slots[a].full_kv);
+        assert_eq!(held(&slots), 35, "the fork adds no allocation of its own");
+        let naive: usize = slots
+            .summary(|s| *s, |f| *f, |d| *d)
+            .iter()
+            .map(|slot| slot.image_bytes)
+            .sum();
+        assert_eq!(
+            naive,
+            35 + 25,
+            "per-slot totals double count the shared payloads"
+        );
+
+        // An unrelated conversation pages out: everything fits, nothing is emptied.
+        let b = seed(&mut slots, &[2; 7], &[]);
+        slots.page_in(c, 5);
+        assert_eq!(held(&slots), 56);
+        assert_eq!(trim(&mut slots), vec![]);
+        assert_eq!(slots.slots[a].full_kv, Some(10), "A is intact");
+
+        // Under a tighter budget A is the victim (C is live, B the newest cold), and what
+        // it frees is its tail snapshot alone: the image, the planes and the anchor ring
+        // live on in C.
+        slots.budget_bytes = 50;
+        assert_eq!(trim(&mut slots), vec![(a, 10)]);
+        assert_eq!(held(&slots), 46);
+        assert_eq!(slots.slots[b].full_kv, Some(7));
+        assert_eq!(slots.slots[c].full_kv, Some(10));
+    }
+
+    /// At the cap a fork goes into the least recently used cold slot that is neither its
+    /// source nor live, so a sibling of the OLDEST cold conversation still forks off it
+    /// rather than paging in over it; only when the source is the sole candidate is there
+    /// nowhere to fork to.
+    #[test]
+    fn a_fork_at_the_cap_evicts_the_oldest_slot_that_is_not_its_source() {
+        let gain = SNAPSHOT_MIN_GAIN;
+        let system: Vec<u32> = (0..2 * gain as u32).collect();
+        let anchor = system.len();
+        let mut long = system.clone();
+        long.extend((0..4 * gain as u32).map(|i| 100_000 + i));
+        let mut sibling = system.clone();
+        sibling.extend([1, 2, 3]);
+
+        let mut slots = manager(3, 4);
+        let a = seed(&mut slots, &long, &[anchor]);
+        let b = seed(&mut slots, &[7; 50], &[]);
+        let _ = start(&mut slots);
+        live(&mut slots).prefix.set_tokens(vec![8; 60]);
+        assert_eq!(
+            slots.fresh_slot(),
+            Some(FreshSlot::Evict(a)),
+            "A is the oldest"
+        );
+        let choice = slots.choose(&sibling);
+        assert_eq!(
+            choice,
+            SlotChoice::Swap {
+                slot: a,
+                restore: anchor
+            }
+        );
+        assert_eq!(
+            slots.fork_plan(choice),
+            Some(ForkPlan {
+                source: a,
+                target: FreshSlot::Evict(b),
+                pos: anchor
+            })
+        );
+        assert_eq!(slots.fork_target(a), Some(FreshSlot::Evict(b)));
+
+        let mut alone = manager(2, 4);
+        let a = seed(&mut alone, &long, &[anchor]);
+        let _ = start(&mut alone);
+        live(&mut alone).prefix.set_tokens(vec![8; 60]);
+        assert_eq!(alone.fork_target(a), None);
+        assert_eq!(alone.fork_plan(alone.choose(&sibling)), None);
+    }
+
+    /// Through the dispatch with a real budget: a sibling forking off a cold conversation
+    /// pages the live one out, and the trim that follows empties an unrelated older slot,
+    /// never the fork's source, which its owner then resumes at full length.
+    #[test]
+    fn the_trim_during_a_cold_fork_spares_the_source() {
+        let gain = SNAPSHOT_MIN_GAIN;
+        let system: Vec<u32> = (0..2 * gain as u32).collect();
+        let anchor = system.len();
+        let turn = |history: &[u32], mark: u32, len: usize| {
+            let mut prompt = history.to_vec();
+            prompt.extend((0..len as u32).map(|i| mark + i));
+            let boundary = prompt.len();
+            prompt.extend(TEST_HEADER);
+            (prompt, boundary)
+        };
+        let mut slots = budgeted(8, 4, 0);
+
+        // V, an unrelated conversation and the oldest; A, the long anchored one; U,
+        // unrelated and live when the sibling arrives.
+        let (v_prompt, boundary) = turn(&[1, 2, 3], 300_000, 7);
+        serve(&mut slots, &v_prompt, boundary, &[77]);
+        let v = slots.live.expect("V is live");
+        let (first, boundary) = turn(&system, 100_000, 4 * gain);
+        assert_eq!(
+            serve_with_anchor(&mut slots, &first, Some(anchor), boundary, &[77]),
+            0
+        );
+        let a = slots.live.expect("A is live");
+        let mut a_history = first.clone();
+        a_history.push(77);
+        let (u_prompt, boundary) = turn(&[4, 5, 6], 400_000, 9);
+        serve(&mut slots, &u_prompt, boundary, &[77]);
+        let u = slots.live.expect("U is live");
+        assert!(slots.slots[v].full_kv.is_some() && slots.slots[a].full_kv.is_some());
+
+        // A budget that U's page-out (three payloads of 15) will exceed by less than V holds.
+        let before = held(&slots);
+        let v_bytes: usize = slots.summary(|s| *s, |f| *f, |d| *d)[v].image_bytes;
+        slots.budget_bytes = before + 10;
+        assert!(v_bytes as u64 > 45 - 10);
+
+        // B forks off A: U pages out, the set goes over budget, V is emptied and A is not.
+        let (second, boundary) = turn(&system, 200_000, 3);
+        assert_eq!(
+            serve_with_anchor(&mut slots, &second, Some(anchor), boundary, &[88]),
+            anchor
+        );
+        assert!(slots.slots[v].prefix.tokens.is_empty(), "V was emptied");
+        assert_eq!(slots.slots[a].prefix.tokens, a_history, "A is intact");
+        assert!(slots.slots[u].full_kv.is_some(), "U, just paged out, stays");
+
+        // A's owner comes back to the whole conversation.
+        let (third, boundary) = turn(&a_history, 100_000, 3);
+        assert_eq!(
+            serve_with_anchor(&mut slots, &third, Some(anchor), boundary, &[77]),
+            a_history.len()
+        );
     }
 
     /// A failure demotes the slot back to cold with its drafter planes intact, untruncated:

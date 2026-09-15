@@ -762,15 +762,17 @@ struct ServeArgs {
     /// only caps their number (default 8). 1 keeps a single conversation warm.
     #[arg(long)]
     cache_slots: Option<usize>,
-    /// Host RAM the warm cache images may add up to, in GiB (default 8; 0 for
-    /// no bound). Images cost per cached token what the checkpoint's
-    /// full-attention layers cost — 30 KiB on Flash-Next, 20 KiB on the
-    /// 35B-A3B, 64 KiB on the 27B — plus one snapshot's DeltaNet state per
-    /// snapshot kept (113 / 62.8 / 149.6 MiB), plus drafter planes while
-    /// speculation is on. When the total goes over, the least recently used
-    /// cold conversations are dropped; the live one and the one that just
-    /// left the cache always stay, so one image larger than the budget is
-    /// kept rather than thrown away.
+    /// Host RAM the warm cache images may add up to, in GiB (default 8).
+    /// Images cost per cached token what the checkpoint's full-attention
+    /// layers cost — 30 KiB on Flash-Next, 20 KiB on the 35B-A3B, 64 KiB on
+    /// the 27B — plus one snapshot's DeltaNet state per snapshot kept
+    /// (113 / 62.8 / 149.6 MiB), plus drafter planes while speculation is
+    /// on. When the total goes over, the least recently used cold
+    /// conversations are dropped; the live one and the one that just left
+    /// the cache always stay, so one image larger than the budget is kept
+    /// rather than thrown away. 0 means unbounded: --cache-slots alone then
+    /// caps the set, at up to eight full-context images (about 64 GiB on
+    /// Flash-Next).
     #[arg(long, value_name = "GIB")]
     cache_budget: Option<u64>,
     /// Where the on-disk prefix cache keeps its images, under <DIR>/kv/

@@ -53,22 +53,37 @@ sessions were served between two turns of one session:
 | 4+ | 90 | 1% |
 
 Two slots serve two sessions and nothing more. The operative bound is now
-`--cache-budget` / `[cache] budget_gib`, default 8 GiB: after every dispatch the least
-recently used cold slots are emptied until the warm images fit, never the live slot and
-never the most recently used cold one, so one image larger than the budget is kept and the
-two-agents case always survives. `--cache-slots` stays as the hard cap on the count,
-default 8 (was 2). Second cause, fixed in the same change: the dispatch already forked a
+`--cache-budget` / `[cache] budget_gib`, default 8 GiB: after every page-out the least
+recently used cold slots are emptied until the warm images fit, never the live slot, never
+the most recently used cold one and never the slot the dispatch in progress is about to
+page in or fork off, so one image larger than the budget is kept and the two-agents case
+always survives. The images are measured by allocation, not by slot: a fork and the
+conversation it forked off share one `Arc` image and count once, and emptying one of them
+frees only what the other does not still hold. The budget bounds what the slots hold, not
+what the disk-tier writer may still retain in flight. `--cache-slots` stays as the hard cap
+on the count, default 8 (was 2); with the budget at 0 it is the only bound, up to eight
+full-context images. Second cause, fixed in the same change: the dispatch already forked a
 sibling off the LIVE slot instead of rewinding over it, but a sibling matching a COLD slot
 was served by a swap paging that slot in at the shared system block, which dropped
 everything the slot held above it — a 40k conversation overwritten to reuse 2k tokens.
 `SlotManager::fork_plan` now applies the same rule to both: whenever the history at stake
 is at least `SNAPSHOT_MIN_GAIN` and a slot other than the source is free or evictable, the
 arriving prompt gets a slot of its own sharing the source's image and pages in at the
-fork, which is the same transfer the swap would have made. The host-cache admission
-estimate is capped at the budget plus one image in flight instead of the slot count times
-an image. Reopen the count-only design if the trim is ever measured evicting a
-conversation that came back within a minute: that is the signal the budget is too small,
-not that a count would do better.
+fork, which is the same transfer the swap would have made. At the slot cap the fork
+evicts the least recently used cold conversation whole to preserve the matched one, which
+is the recency-correct choice and is what the byte budget makes rare. The host-cache
+admission estimate projects the ceiling the trim actually enforces — the larger of the
+budget and two images, since two slots are spared whatever their size, plus one image in
+flight, and never below one image for a request that pages the live conversation out —
+minus what the slots already hold, deduplicated the same way; on the dense 27B at 64
+KiB/token a full-context image is ~16 GiB, where the budget alone would understate.
+Known gap, pre-existing and not taken now: for the live slot `history_at_risk` discounts
+the history a retained image already covers, so a conversation paged back in and grown
+by fewer than `SNAPSHOT_MIN_GAIN` tokens is rewound over rather than forked off when a
+sibling arrives; reopen on an observed loss of a warm conversation to a sibling in the
+log. Reopen the count-only design if the trim is ever measured evicting a conversation
+that came back within a minute: that is the signal the budget is too small, not that a
+count would do better.
 
 **One server serves both checkpoints; `--model` is only the default (2026-08-11).**
 Every job (generation or batch) names the checkpoint it needs, and the engine's pickup
