@@ -503,9 +503,12 @@ admission reads lags a release: on 2026-09-15 the image engine dropped a 35.6 GB
 to switch LoRA sets and 15 ms later saw system use unchanged at 81.6 GiB while its own
 footprint was falling 2 GB per sample, so a 48 GiB image admission was refused ten times
 in 138 ms and four clients got 503s for memory the process had already returned. An
-over-budget reading now polls every 50 ms for up to 10 s, or until the caller's own
-cancellation (client gone, shutdown, the ownership wait timeout) says stop, and only then
-refuses with the wait named in the error. Unreadable counters still refuse at once. The
+over-budget reading now polls every 50 ms for up to 10 s and only then refuses with the
+wait named in the error. On the two serve engines the wait also ends on the request's own
+cancellation (client gone, shutdown, the job deadline, the ownership wait timeout); the
+model loaders, KV growth and the CLI image admission have no cancel and wait the full
+window. Unreadable counters, and a projection larger than the whole budget, which no
+release can heal, still refuse at once. The
 arithmetic and the ceiling are unchanged; what changed is that a refusal must survive
 the settle window. Reopen if a measured release takes longer than 10 s to be reflected in
 the counters. [Evidence](../records/memory-safety.md#2026-09-15-admission-waits-for-released-memory).

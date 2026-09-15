@@ -640,8 +640,9 @@ RAM as the ceiling; when the kernel's pressure level is unreadable it reserves a
 16 GiB or 10% of RAM, whichever is larger. The pressure level itself is recorded and
 never acted on (2026-09-14): a warning or critical reading cancels nothing, evicts
 nothing and refuses nothing. An over-budget reading is polled for up to 10 s before it
-is a refusal, because the counter lags a released model by up to seconds; the wait ends
-early when the request is cancelled or the server shuts down. Image disconnects cancel queued and running work; a submitted GPU
+is a refusal, because the counter lags a released model by up to seconds; on the serve
+engines the wait ends early when the request is cancelled or the server shuts down, while
+the loaders, KV growth and `xwen image` wait the full window. Image disconnects cancel queued and running work; a submitted GPU
 command must still finish. Image memory refusals return 503 with `Retry-After: 5`;
 unsupported image area returns 400. Switching engines discards warm conversation
 caches, so the next language request may need a full prefill.

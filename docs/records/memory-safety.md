@@ -213,7 +213,17 @@ never-cancelling closure, covering the model loaders and KV growth;
 `admit_additional_until` takes the cancel closure, and the image engine passes the check
 it already had (shutdown, client gone, the ownership wait timeout) while the language
 engine's host-cache growth admission stops on shutdown. The image engine's refusal
-branch, unload plus lease drop, is now reached only after the wait.
+branch, unload plus lease drop, is now reached only after the wait. The language engine's
+wait runs under the request's watchdog (`check_residency_wait`), so it also ends on the
+client hanging up and on the job deadline, with the same reason stamped on the trace.
+
+Two costs accepted with the wait. A KV growth mid-decode that is genuinely over budget
+now sleeps up to 10 s before the same error, and nothing in the process can free memory
+while that thread sleeps; the SSE keep-alive is 15 s and the job watchdog is looser, so
+the client sees a slower error and not a dropped stream. And in the genuinely
+over-budget case each queued image job waits its own window before its 503, where before
+they failed together in 138 ms. A projection larger than the whole budget skips the wait,
+no release being able to fit it.
 
 Tests script the sample sequence: two over-budget snapshots then one under admits and
 reserves with exactly one deferred event in the telemetry file; an always-over sequence

@@ -575,6 +575,16 @@ fn judge_snapshot(s: &Snapshot, projected: u64) -> Result<Verdict> {
     let future = used
         .checked_add(projected)
         .context("projected memory use overflows")?;
+    // A projection larger than the whole budget fits at no reading, so no release the
+    // counter has yet to absorb can heal it.
+    if projected > budget {
+        bail!(
+            "memory admission refused: projected allocation {:.1} GiB exceeds the whole {:.1} GiB budget ({:.1} GiB reserved)",
+            projected as f64 / GIB as f64,
+            budget as f64 / GIB as f64,
+            reserve as f64 / GIB as f64
+        );
+    }
     if future > budget {
         return Ok(Verdict::Refused(format!(
             "memory admission refused: projected system use {:.1} GiB exceeds {:.1} GiB budget ({:.1} GiB reserved)",
@@ -981,6 +991,64 @@ mod tests {
         );
         assert_eq!(samples.load(Ordering::SeqCst), 2);
         assert_eq!(a.reservation.load(Ordering::Acquire), 51_539_607_552);
+    }
+    #[test]
+    fn a_projection_larger_than_the_budget_is_refused_without_waiting() {
+        let a = isolated();
+        let events = telemetry_into(&a);
+        let samples = AtomicUsize::new(0);
+        let mut sample = || {
+            samples.fetch_add(1, Ordering::SeqCst);
+            snapshot()
+        };
+        let error = a
+            .admit_settling(
+                "test",
+                128 * GIB + 1,
+                &|| Ok(()),
+                &mut sample,
+                ADMISSION_SETTLE,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("exceeds the whole 128.0 GiB budget"),
+            "{error}"
+        );
+        assert!(!error.contains("after waiting"), "{error}");
+        assert_eq!(samples.load(Ordering::SeqCst), 1);
+        assert_eq!(a.reservation.load(Ordering::Acquire), 0);
+        assert!(
+            !fs::read_to_string(&events)
+                .unwrap()
+                .contains("admission deferred")
+        );
+        fs::remove_dir_all(&a.directory).unwrap();
+    }
+    #[test]
+    fn an_unreadable_counter_is_refused_without_waiting() {
+        let a = isolated();
+        let events = telemetry_into(&a);
+        let samples = AtomicUsize::new(0);
+        let mut sample = || {
+            samples.fetch_add(1, Ordering::SeqCst);
+            let mut s = snapshot();
+            s.physical_bytes = None;
+            s
+        };
+        let error = a
+            .admit_settling("test", GIB, &|| Ok(()), &mut sample, ADMISSION_SETTLE)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot read physical RAM"), "{error}");
+        assert_eq!(samples.load(Ordering::SeqCst), 1);
+        assert_eq!(a.reservation.load(Ordering::Acquire), 0);
+        assert!(
+            !fs::read_to_string(&events)
+                .unwrap()
+                .contains("admission deferred")
+        );
+        fs::remove_dir_all(&a.directory).unwrap();
     }
     #[test]
     fn admission_requires_counters_and_rejects_overflow() {

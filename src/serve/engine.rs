@@ -1074,12 +1074,20 @@ fn engine_loop(
                 // building the state and installing it can never leave `/health`
                 // claiming a model nobody holds.
                 resident.store(required);
+                // The admission wait shares the request's watchdog with the residency
+                // wait above: it ends on shutdown, on the client hanging up and on the
+                // job's deadline, and stamps the same reason on the trace.
                 crate::memory::admit_additional_until(
                     "request host cache growth (estimated)",
                     request_host_cache_growth(engine, &job, &settings, prompt_tokens),
                     &|| {
-                        anyhow::ensure!(!shutdown.is_cancelled(), "the server is shutting down");
-                        Ok(())
+                        check_residency_wait(
+                            job.cancel(),
+                            &shutdown,
+                            job.events().is_closed(),
+                            job.deadline(),
+                            Instant::now(),
+                        )
                     },
                 )
                 .map_err(JobFailure::from)?;
