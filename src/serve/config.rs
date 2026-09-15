@@ -54,7 +54,7 @@ pub const DEFAULT_CACHE_SNAPSHOTS: usize = 4;
 pub const DEFAULT_CACHE_SLOTS: usize = 8;
 /// Host RAM the warm images may add up to, in GiB, before the least recently
 /// used cold conversations are dropped; 0 for no bound. A Flash-Next image costs
-/// 30 KiB/token plus a 113 MiB DeltaNet floor, so 8 GiB is one conversation at
+/// 31.5 KiB/token (12 layers × 2688 B) plus a 113 MiB DeltaNet floor, so 8 GiB is one conversation at
 /// the full 262144 context or five to six agent sessions of 15-60k tokens — which
 /// is what a count of two could not express (2026-09-15; two slots gave a 96%
 /// hit rate with one other session interleaved and 1% with four).

@@ -483,13 +483,16 @@ fn request_host_cache_growth(
         engine.generator.drafter_max_ctx(),
         rows,
         outgoing,
+        disk_tier,
     )
 }
 
-/// The host allocations one dispatch can make: the incoming conversation's retained
-/// state at its horizon of `rows` (its image, its drafter planes and the snapshots it may
-/// keep, an upper bound), plus — when it pages the live conversation out — that
-/// conversation's image at its current length of `outgoing` tokens with the one tail
+/// The host allocations one dispatch can make. The incoming conversation allocates the
+/// snapshots it may keep at its horizon of `rows`; its image is made only by the LATER
+/// dispatch that pages it out, where it is counted as the outgoing term — except with a
+/// disk tier, where a hydration reads a whole stored image into host RAM, so the image
+/// at `rows` (with its drafter planes) is counted then. Paging the live conversation out
+/// allocates its image at its current length of `outgoing` tokens plus the one tail
 /// snapshot a page-out records. Sized per request rather than from the budget or the
 /// slot cap: the trim brings the warm set back under the budget after the page-out, so
 /// what the budget bounds is never what this dispatch is about to allocate.
@@ -499,6 +502,7 @@ fn host_cache_growth(
     drafter_max_ctx: Option<usize>,
     rows: usize,
     outgoing: Option<usize>,
+    disk_tier: bool,
 ) -> u64 {
     let image = |tokens: usize| -> u64 {
         let target = (tokens as u64).saturating_mul(model.kv_bytes_per_token() as u64);
@@ -509,8 +513,9 @@ fn host_cache_growth(
         target.saturating_add(draft)
     };
     let snapshot = model.snapshot_bytes() as u64;
-    let incoming = image(rows)
-        .saturating_add(snapshot.saturating_mul(snapshots_kept.saturating_add(2) as u64));
+    let incoming = snapshot
+        .saturating_mul(snapshots_kept.saturating_add(2) as u64)
+        .saturating_add(if disk_tier { image(rows) } else { 0 });
     let paged_out = outgoing.map_or(0, |tokens| image(tokens).saturating_add(snapshot));
     incoming.saturating_add(paged_out)
 }
@@ -4610,12 +4615,12 @@ impl<S, F, D> SlotManager<S, F, D> {
     /// returning each emptied slot with the bytes it alone gave back — an allocation a
     /// remaining slot still shares is not freed and is not counted.
     ///
-    /// Three slots are never emptied: the live one, whose state is the model's cache; the
-    /// most recently used cold ones (a tie spares them all), which is the conversation
-    /// that just left the cache and the likeliest to come back; and `spare`, the slot the
-    /// dispatch in progress is about to page in or fork off. So the budget is a bound on
-    /// everything BEYOND the two-agents case, and a single image larger than the whole
-    /// budget is kept rather than thrown away for nothing. A budget of zero bounds
+    /// At most three slots are never emptied: the live one, whose state is the model's
+    /// cache; the single most recently used cold one by `(last_used, index)`, which is the
+    /// conversation that just left the cache and the likeliest to come back; and `spare`,
+    /// the slot the dispatch in progress is paging in or forking off. So the budget is a
+    /// bound on everything BEYOND the two-agents case, and a single image larger than the
+    /// whole budget is kept rather than thrown away for nothing. A budget of zero bounds
     /// nothing.
     fn trim_to_budget(
         &mut self,
@@ -7126,14 +7131,20 @@ mod tests {
         let kv = model.kv_bytes_per_token() as u64;
         let snapshot = model.snapshot_bytes() as u64;
         let horizon = 262_144;
-        let extension = host_cache_growth(model, 4, None, horizon, None);
-        assert_eq!(extension, horizon as u64 * kv + 6 * snapshot);
-        let swapping = host_cache_growth(model, 4, None, horizon, Some(50_000));
+        // A plain extension on the warm path allocates only the snapshots it may keep:
+        // the incoming conversation's image is made by the dispatch that later pages it
+        // out.
+        let extension = host_cache_growth(model, 4, None, horizon, None, false);
+        assert_eq!(extension, 6 * snapshot);
+        let swapping = host_cache_growth(model, 4, None, horizon, Some(50_000), false);
         assert_eq!(swapping - extension, 50_000 * kv + snapshot);
         assert!(
-            swapping < 2 * extension,
-            "a 50k outgoing image is a fraction of a full one"
+            swapping < horizon as u64 * kv,
+            "a 50k outgoing image is a fraction of a full-context one"
         );
+        // With a disk tier a hydration can read a whole stored image at the horizon.
+        let hydrating = host_cache_growth(model, 4, None, horizon, Some(50_000), true);
+        assert_eq!(hydrating - swapping, horizon as u64 * kv);
         // Flash-Next ships no drafter, so its planes are a rate of zero.
         assert_eq!(model.draft_kv_bytes_per_token().unwrap_or(0), 0);
 
@@ -7146,9 +7157,13 @@ mod tests {
                 .expect("the 27B checkpoints ship a drafter") as u64;
             assert!(planes > 0);
             let draft_ctx = 4096;
-            let plain = host_cache_growth(model, 4, None, horizon, Some(2000));
-            let drafted = host_cache_growth(model, 4, Some(draft_ctx), horizon, Some(2000));
+            let plain = host_cache_growth(model, 4, None, horizon, Some(2000), true);
+            let drafted = host_cache_growth(model, 4, Some(draft_ctx), horizon, Some(2000), true);
             assert_eq!(drafted - plain, (draft_ctx as u64 + 2000) * planes);
+            // Without a tier only the outgoing term carries planes.
+            let warm = host_cache_growth(model, 4, Some(draft_ctx), horizon, Some(2000), false);
+            let warm_plain = host_cache_growth(model, 4, None, horizon, Some(2000), false);
+            assert_eq!(warm - warm_plain, 2000 * planes);
         }
     }
 

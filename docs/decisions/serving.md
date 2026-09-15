@@ -74,11 +74,14 @@ arriving prompt gets a slot of its own sharing the source's image and pages in a
 fork, which is the same transfer the swap would have made. At the slot cap the fork
 evicts the least recently used cold conversation whole to preserve the matched one, which
 is the recency-correct choice and is what the byte budget makes rare. The host-cache
-admission estimate is sized per request, from what THIS dispatch allocates: the incoming
-conversation's retained state at its horizon (image, drafter planes and the snapshots it
-may keep, an upper bound), plus, for every dispatch but a plain extension of the live
-conversation, the outgoing image at the live conversation's own length with its tail
-snapshot. Neither the budget nor the slot cap enters it and nothing resident is
+admission estimate is sized per request, from what THIS dispatch allocates: the snapshots
+the incoming conversation may keep at its horizon, its whole image at that horizon only
+when a disk tier is configured (a hydration reads a stored image into host RAM; on the
+warm path the image is made by the later dispatch that pages it out, where it is the
+outgoing term), plus, for every dispatch but a plain extension of the live conversation
+with no disk tier, the outgoing image at the live conversation's own length with its tail
+snapshot. On Flash-Next at 113-116 GiB resident that is the difference between clearing
+the 128 GiB ceiling by about 11.5 GiB and by about 4. Neither the budget nor the slot cap enters it and nothing resident is
 subtracted: a ceiling derived from the budget put a full-context Flash-Next request at
 24.6 GiB beside the resident 113-116 GiB and had it refused after the 10 s wait, for an
 allocation the dispatch never made.

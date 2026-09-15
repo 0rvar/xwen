@@ -10,7 +10,8 @@
 // displaces the warm slots just the same. `--model` only narrows which rows are scored.
 // The 0 and 1 rows are what a two-slot cache can serve; the 2+ rows are what more slots,
 // or a byte budget, buy. The file defaults to $XWEN_METRICS_FILE, then
-// ~/.local/state/xwen/metrics.jsonl, as src/metrics.rs resolves it.
+// $HOME/.local/state/xwen/metrics.jsonl — or metrics-<tag>.jsonl under $XWEN_METRICS_TAG,
+// the tag spelled as src/metrics.rs spells it — exactly as src/metrics.rs resolves it.
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 
@@ -44,10 +45,12 @@ if (flag("--file") === undefined && fileEnv?.toLowerCase() === "off") {
   console.error("XWEN_METRICS_FILE=off: metrics recording is disabled, so there is no log to read");
   process.exit(2);
 }
-const file =
-  flag("--file") ??
-  fileEnv ??
-  `${process.env.XDG_STATE_HOME ?? `${homedir()}/.local/state`}/xwen/metrics.jsonl`;
+// `sanitize_tag`: trimmed, then [A-Za-z0-9_-] survives and everything else is `_`; an
+// empty tag is no tag.
+const tag = process.env.XWEN_METRICS_TAG?.trim() || undefined;
+const fileName =
+  tag === undefined ? "metrics.jsonl" : `metrics-${tag.replace(/[^A-Za-z0-9_-]/g, "_")}.jsonl`;
+const file = flag("--file") ?? fileEnv ?? `${homedir()}/.local/state/xwen/${fileName}`;
 
 const rows: Row[] = readFileSync(file, "utf8")
   .trim()

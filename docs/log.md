@@ -12,7 +12,9 @@ scored Flash-Next requests). The operative bound is now a host byte budget,
 `--cache-budget` default 8 GiB, trimming the least recently used cold slots on every
 page-out and after each dispatch; the count cap goes 2 to 8. A sibling matching a cold slot at the shared system
 block forks off it as it already did off the live one, instead of a swap that overwrote
-the slot's whole history to reuse 2k tokens.
+the slot's whole history to reuse 2k tokens. The host-cache admission estimate is sized
+per request, so a full-context request is no longer refused for an allocation it never
+makes.
 [Decision](decisions/serving.md).
 
 ## 2026-09-15 — Memory admission waits up to 10 s for released memory
