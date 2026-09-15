@@ -4,6 +4,17 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-15 — Warm cache slots bounded by an 8 GiB host budget, siblings fork off cold slots
+
+Two slots gave a 96% prefix-cache hit rate with one other session interleaved and 1% with
+four, on Orvar's three-to-five parallel agent sessions (`scripts/cache-hitrate.ts`, 309
+scored Flash-Next requests). The operative bound is now a host byte budget,
+`--cache-budget` default 8 GiB, trimming the least recently used cold slots after each
+dispatch; the count cap goes 2 to 8. A sibling matching a cold slot at the shared system
+block forks off it as it already did off the live one, instead of a swap that overwrote
+the slot's whole history to reuse 2k tokens.
+[Decision](decisions/serving.md).
+
 ## 2026-09-15 — Memory admission waits up to 10 s for released memory
 
 Switching image LoRA sets dropped the pipeline and asked for 48 GiB 15 ms later; the host

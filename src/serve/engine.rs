@@ -467,10 +467,18 @@ fn request_host_cache_growth(
         (rows.min(max_ctx) as u64)
             .saturating_mul(model.draft_kv_bytes_per_token().unwrap_or(0) as u64)
     });
-    let projected = target_bytes
+    let per_slot = target_bytes
         .saturating_add(draft_bytes)
-        .saturating_add(snapshot_bytes)
-        .saturating_mul(settings.cache_slots as u64);
+        .saturating_add(snapshot_bytes);
+    // The slot cap bounds the retained images only when no host budget does; under a
+    // budget the images are trimmed back to it after every dispatch, so the most that
+    // is ever held is the budget plus the one image a swap has in flight.
+    let projected = match settings.cache_budget_bytes() {
+        0 => per_slot.saturating_mul(settings.cache_slots as u64),
+        budget => per_slot
+            .saturating_mul(settings.cache_slots as u64)
+            .min(budget.saturating_add(per_slot)),
+    };
     let held = engine
         .slots
         .summary(
@@ -666,7 +674,11 @@ impl EngineState {
         Ok(Self {
             generator,
             device,
-            slots: Slots::new(settings.cache_slots, settings.cache_snapshots),
+            slots: Slots::new(
+                settings.cache_slots,
+                settings.cache_snapshots,
+                settings.cache_budget_bytes(),
+            ),
             size,
             dirty: false,
         })
@@ -1885,41 +1897,84 @@ fn run_job(
     // which is what lets the decode below speculate: Extend touches neither, Restore
     // rewinds both, a restart clears both, and a swap carries both in the slot image.
     if !hydrated {
-        match choice {
-            SlotChoice::Live { plan } => match plan {
-                Resume::Extend { .. } => {}
-                // A fork: this prompt shares a prefix of the live conversation and
-                // diverges from it. Rewinding in place hands the slot to the arriving
-                // prompt, which reconciles its own history into it at the end — so the
-                // conversation that was live loses everything above the fork, in host RAM
-                // and on disk both, having never been imaged. Imaging it first costs one
-                // page-out (~270 ms for a 1.3 GiB slot) and is what lets the writer store
-                // it and a later request come back to it; the arriving prompt is then
-                // served by paging that same image back in at the fork, which is the
-                // ordinary swap the machinery already performs.
-                Resume::Restore { pos }
-                    if engine.slots.live_history_at_risk(pos) >= SNAPSHOT_MIN_GAIN
-                        && engine.slots.fresh_slot().is_some() =>
-                {
-                    let source = engine
-                        .slots
-                        .live
-                        .ok_or_else(|| anyhow!("a rewind was planned with no live slot"))?;
-                    let target = engine
-                        .slots
-                        .fresh_slot()
-                        .ok_or_else(|| anyhow!("a fork was planned with nowhere to put it"))?;
-                    // Taken from the ring as the CHOICE saw it, before the page-out below
-                    // touches it. Its tail snapshot goes through `record`, which evicts the
-                    // oldest entry of a full ring — and the fork point is the newest
-                    // snapshot at or below the shared prefix, which for a client returning
-                    // to an old branch of a long conversation is exactly that oldest entry.
-                    // Reading the ring afterwards would hand the new slot a resume point
-                    // the page-out had just thrown away.
-                    let inherited = engine.slots.fork_rings(source, pos)?;
-                    // The same two checks the swap arm makes, for the same reasons: this
-                    // is now a page-out and a page-in, and a job nobody waits for should
-                    // pay neither.
+        // A fork: this prompt shares a prefix of a warm conversation and diverges from
+        // it. Taking that slot over at the fork — a rewind of the live slot, or a swap
+        // paging a cold one in below its end — hands it to the arriving prompt, which
+        // reconciles its own history into it at the end, so the conversation that held
+        // it loses everything above the fork, in host RAM and on disk both. Instead the
+        // arriving prompt gets a slot of its own sharing the source's image: for the live
+        // slot that costs one page-out (~270 ms for a 1.3 GiB slot), which is also what
+        // lets the writer store it; for a cold slot it costs nothing the swap would not
+        // have paid, since the page-in at the fork is the same transfer either way.
+        if let Some(ForkPlan {
+            source,
+            target,
+            pos,
+        }) = engine.slots.fork_plan(choice)
+        {
+            // Taken from the ring as the CHOICE saw it, before the page-out below
+            // touches it. Its tail snapshot goes through `record`, which evicts the
+            // oldest entry of a full ring — and the fork point is the newest
+            // snapshot at or below the shared prefix, which for a client returning
+            // to an old branch of a long conversation is exactly that oldest entry.
+            // Reading the ring afterwards would hand the new slot a resume point
+            // the page-out had just thrown away.
+            let inherited = engine.slots.fork_rings(source, pos)?;
+            // The same two checks the swap arm makes, for the same reasons: this
+            // is now a page-out and a page-in, and a job nobody waits for should
+            // pay neither.
+            if let Some(reason) = abandon.reason() {
+                engine.dirty = false;
+                finish_abandoned_before_decode(
+                    &abandon,
+                    &opened,
+                    trace,
+                    reason,
+                    JobPhase::Dispatch,
+                    0,
+                    prompt_len,
+                    pos,
+                );
+                return Ok(());
+            }
+            page_out_live(engine, disk, logger)?;
+            if let Some(reason) = abandon.reason() {
+                finish_abandoned_before_decode(
+                    &abandon,
+                    &opened,
+                    trace,
+                    reason,
+                    JobPhase::Dispatch,
+                    0,
+                    prompt_len,
+                    pos,
+                );
+                return Ok(());
+            }
+            // The fork gets a slot of its own rather than the one it forked off, so
+            // both conversations stay warm and matchable. Nothing is copied: the
+            // images are `Arc`s, so the two slots share one set of rows and rings.
+            let slot = engine.slots.fork_from(source, target, pos, inherited)?;
+            // The slot may have been another conversation's a moment ago, and that
+            // conversation's stored chain must stop counting as one a warm slot
+            // would come back from — the same reason the fresh arm below unlinks.
+            if let Some(disk) = disk {
+                disk.unlink(slot);
+            }
+            page_in(engine, slot, pos, logger)?;
+            dispatched = SlotChoice::Swap { slot, restore: pos };
+        } else {
+            match choice {
+                SlotChoice::Live { plan } => match plan {
+                    Resume::Extend { .. } => {}
+                    Resume::Restore { pos } => restore_live(engine, pos)?,
+                    Resume::Cold => restart_live(engine, disk)?,
+                },
+                SlotChoice::Swap { slot, restore } => {
+                    // The two transfers below move hundreds of MiB each, so a job already
+                    // abandoned is checked for before paying either. Here nothing has been
+                    // written: the cache still agrees with the live slot's history, so the
+                    // exit clears `dirty` and costs nobody anything.
                     if let Some(reason) = abandon.reason() {
                         engine.dirty = false;
                         finish_abandoned_before_decode(
@@ -1930,11 +1985,14 @@ fn run_job(
                             JobPhase::Dispatch,
                             0,
                             prompt_len,
-                            pos,
+                            restore,
                         );
                         return Ok(());
                     }
                     page_out_live(engine, disk, logger)?;
+                    // Between the transfers the live conversation is safely imaged out and
+                    // nothing owns the cache, so this exit leaves `dirty` for the caller to
+                    // clear; every slot image survives that reset.
                     if let Some(reason) = abandon.reason() {
                         finish_abandoned_before_decode(
                             &abandon,
@@ -1944,96 +2002,49 @@ fn run_job(
                             JobPhase::Dispatch,
                             0,
                             prompt_len,
-                            pos,
+                            restore,
                         );
                         return Ok(());
                     }
-                    // The fork gets a slot of its own rather than the one it forked off, so
-                    // both conversations stay warm and matchable. Nothing is copied: the
-                    // images are `Arc`s, so the two slots share one set of rows and rings.
-                    let slot = engine.slots.fork_from(source, target, pos, inherited)?;
-                    // The slot may have been another conversation's a moment ago, and that
-                    // conversation's stored chain must stop counting as one a warm slot
-                    // would come back from — the same reason the fresh arm below unlinks.
-                    if let Some(disk) = disk {
-                        disk.unlink(slot);
+                    page_in(engine, slot, restore, logger)?;
+                }
+                SlotChoice::Fresh { slot } => {
+                    // Same as the swap arm's first check: the page-out is the expensive part,
+                    // and nothing has been written yet.
+                    if let Some(reason) = abandon.reason() {
+                        engine.dirty = false;
+                        finish_abandoned_before_decode(
+                            &abandon,
+                            &opened,
+                            trace,
+                            reason,
+                            JobPhase::Dispatch,
+                            0,
+                            prompt_len,
+                            0,
+                        );
+                        return Ok(());
                     }
-                    page_in(engine, slot, pos, logger)?;
-                    dispatched = SlotChoice::Swap { slot, restore: pos };
-                }
-                Resume::Restore { pos } => restore_live(engine, pos)?,
-                Resume::Cold => restart_live(engine, disk)?,
-            },
-            SlotChoice::Swap { slot, restore } => {
-                // The two transfers below move hundreds of MiB each, so a job already
-                // abandoned is checked for before paying either. Here nothing has been
-                // written: the cache still agrees with the live slot's history, so the
-                // exit clears `dirty` and costs nobody anything.
-                if let Some(reason) = abandon.reason() {
-                    engine.dirty = false;
-                    finish_abandoned_before_decode(
-                        &abandon,
-                        &opened,
-                        trace,
-                        reason,
-                        JobPhase::Dispatch,
-                        0,
-                        prompt_len,
-                        restore,
-                    );
-                    return Ok(());
-                }
-                page_out_live(engine, disk, logger)?;
-                // Between the transfers the live conversation is safely imaged out and
-                // nothing owns the cache, so this exit leaves `dirty` for the caller to
-                // clear; every slot image survives that reset.
-                if let Some(reason) = abandon.reason() {
-                    finish_abandoned_before_decode(
-                        &abandon,
-                        &opened,
-                        trace,
-                        reason,
-                        JobPhase::Dispatch,
-                        0,
-                        prompt_len,
-                        restore,
-                    );
-                    return Ok(());
-                }
-                page_in(engine, slot, restore, logger)?;
-            }
-            SlotChoice::Fresh { slot } => {
-                // Same as the swap arm's first check: the page-out is the expensive part,
-                // and nothing has been written yet.
-                if let Some(reason) = abandon.reason() {
-                    engine.dirty = false;
-                    finish_abandoned_before_decode(
-                        &abandon,
-                        &opened,
-                        trace,
-                        reason,
-                        JobPhase::Dispatch,
-                        0,
-                        prompt_len,
-                        0,
-                    );
-                    return Ok(());
-                }
-                page_out_live(engine, disk, logger)?;
-                engine.generator.reset_cache()?;
-                engine.generator.reset_drafter()?;
-                engine.slots.start_fresh(slot);
-                // The slot this conversation lands in may have been holding another
-                // one, linked to its own stored image. That link is not this
-                // conversation's, and left behind it would keep a file safe from
-                // eviction on behalf of a conversation no slot holds any more.
-                if let (Some(live), Some(disk)) = (engine.slots.live, disk) {
-                    disk.unlink(live);
+                    page_out_live(engine, disk, logger)?;
+                    engine.generator.reset_cache()?;
+                    engine.generator.reset_drafter()?;
+                    engine.slots.start_fresh(slot);
+                    // The slot this conversation lands in may have been holding another
+                    // one, linked to its own stored image. That link is not this
+                    // conversation's, and left behind it would keep a file safe from
+                    // eviction on behalf of a conversation no slot holds any more.
+                    if let (Some(live), Some(disk)) = (engine.slots.live, disk) {
+                        disk.unlink(live);
+                    }
                 }
             }
         }
     }
     engine.slots.touch_live()?;
+    // Whatever the dispatch imaged out or installed, the warm images are brought back
+    // under the host budget before the job runs, with the live slot and the one that
+    // just left the cache both spared.
+    trim_slots_to_budget(engine, disk, logger);
     // One report for every arm above: whichever of them ran, the slots now stand as
     // this job will use them. The two paging transfers report their own state as well,
     // since each is hundreds of milliseconds nobody would otherwise see.
@@ -4198,10 +4209,25 @@ struct SlotManager<S, F, D> {
     live: Option<usize>,
     /// How many conversations may be warm at once, at least 1.
     max_slots: usize,
+    /// Host bytes the warm images may add up to before the least recently used cold
+    /// slots are emptied, zero for no bound. This is the operative limit on how many
+    /// conversations stay warm: `max_slots` is the hard cap above it, and an image is a
+    /// few hundred MiB for a short agent session against ~8 GB at the full context, so a
+    /// count alone is either too small for the one or too large for the other.
+    budget_bytes: u64,
     /// Turn-boundary snapshots each slot keeps.
     snapshots: usize,
     /// Bumped once per job, so `last_used` orders the slots by recency.
     clock: u64,
+}
+
+/// A conversation taking a slot of its own at `pos`, sharing `source`'s image, instead of
+/// rewinding `source` in place and losing everything it held above the fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForkPlan {
+    source: usize,
+    target: FreshSlot,
+    pos: usize,
 }
 
 /// The slots as the engine holds them: host-resident snapshots, full-attention images
@@ -4214,14 +4240,49 @@ struct SlotManager<S, F, D> {
 type Slots = SlotManager<Arc<HostSnapshot>, Arc<HostFullKv>, Arc<DrafterImage>>;
 
 impl<S, F, D> SlotManager<S, F, D> {
-    fn new(max_slots: usize, snapshots: usize) -> Self {
+    fn new(max_slots: usize, snapshots: usize, budget_bytes: u64) -> Self {
         Self {
             slots: Vec::new(),
             live: None,
             max_slots: max_slots.max(1),
+            budget_bytes,
             snapshots,
             clock: 0,
         }
+    }
+
+    /// Whether `choice` should fork instead: give the arriving prompt a slot of its own,
+    /// sharing the chosen slot's image, rather than rewind that slot to the fork point.
+    ///
+    /// A rewind hands the slot to the arriving prompt, which reconciles its OWN history
+    /// into it when it finishes, so the conversation that held the slot loses everything
+    /// above the fork — the whole of a 40k-token session when a sibling arrives sharing
+    /// only its 2k-token system block. Forking keeps both warm at the cost of a slot, and
+    /// of nothing else: the images are `Arc`s and the fork pages in at the same position
+    /// the rewind would have. It is taken whenever the history at stake is worth a
+    /// page-out, the same floor the snapshot planner uses, and there is a slot to fork
+    /// into that is not the source itself (evicting the source to make room for its own
+    /// fork is just the rewind with extra steps).
+    fn fork_plan(&self, choice: SlotChoice) -> Option<ForkPlan> {
+        let (source, pos) = match choice {
+            SlotChoice::Live {
+                plan: Resume::Restore { pos },
+            } => (self.live?, pos),
+            SlotChoice::Swap { slot, restore } => (slot, restore),
+            SlotChoice::Live { .. } | SlotChoice::Fresh { .. } => return None,
+        };
+        if self.history_at_risk(source, pos) < SNAPSHOT_MIN_GAIN {
+            return None;
+        }
+        let target = self.fresh_slot()?;
+        if target == FreshSlot::Evict(source) {
+            return None;
+        }
+        Some(ForkPlan {
+            source,
+            target,
+            pos,
+        })
     }
 
     /// Which slot serves `prompt`, and what has to happen to the model's cache first.
@@ -4423,31 +4484,108 @@ impl<S, F, D> SlotManager<S, F, D> {
             .unwrap_or(0)
     }
 
-    /// How much of the live conversation a rewind to `pos` would destroy outright: the
-    /// history it holds past the fork, less whatever a retained image already covers.
+    /// How much of `slot`'s conversation is destroyed outright when the arriving prompt
+    /// takes it over at `pos`.
     ///
-    /// A rewind keeps the slot and hands it to the arriving prompt, which reconciles its
-    /// OWN history into it when it finishes — so everything the live conversation held
-    /// above the fork is gone, from host RAM and from the disk writer alike, unless an
-    /// image was made of it first. Below the fork nothing is lost: those tokens are the
-    /// prefix the arriving prompt shares, and a later request for the old conversation
-    /// still matches them.
+    /// Taking a slot over — a rewind of the live one, a page-in of a cold one below its
+    /// end — hands it to the arriving prompt, which reconciles its OWN history into it
+    /// when it finishes: everything the conversation held above the fork is gone, from
+    /// host RAM and from the disk writer alike. Below the fork nothing is lost: those
+    /// tokens are the prefix the arriving prompt shares, and a later request for the old
+    /// conversation still matches them. For the live slot the part a retained image
+    /// already covers is not at stake either; a cold slot's image is what the resume
+    /// reads, not a copy of what it loses, so all of its history above the fork counts.
     ///
-    /// Zero when nothing is live, when the fork is at or past the end of what the slot
-    /// holds (an extension destroys nothing), or when a retained image already reaches
-    /// that far.
-    fn live_history_at_risk(&self, pos: usize) -> usize {
-        let Some(live) = self.live else {
+    /// Zero when the fork is at or past the end of what the slot holds: an extension
+    /// destroys nothing.
+    fn history_at_risk(&self, slot: usize, pos: usize) -> usize {
+        let Some(held) = self.slots.get(slot) else {
             return 0;
         };
-        let slot = &self.slots[live];
-        // `image_agrees_to` only means anything while an image backs it.
-        let imaged = if slot.full_kv.is_some() {
-            slot.image_agrees_to
+        // `image_agrees_to` only means anything while the slot is live and an image backs
+        // it; a cold slot's image is what the resume reads, not a copy of what it loses.
+        let imaged = if Some(slot) == self.live && held.full_kv.is_some() {
+            held.image_agrees_to
         } else {
             0
         };
-        slot.prefix.tokens.len().saturating_sub(pos.max(imaged))
+        held.prefix.tokens.len().saturating_sub(pos.max(imaged))
+    }
+
+    /// Host bytes `slot` holds, measured by the caller's byte-length functions as
+    /// [`summary`] measures them: every snapshot, the full-attention image and the
+    /// drafter's planes.
+    fn slot_bytes(
+        &self,
+        slot: usize,
+        snapshot_bytes: &impl Fn(&S) -> usize,
+        full_bytes: &impl Fn(&F) -> usize,
+        draft_bytes: &impl Fn(&D) -> usize,
+    ) -> usize {
+        let held = &self.slots[slot];
+        held.prefix
+            .all_snapshots()
+            .map(|(_, snapshot)| snapshot_bytes(snapshot))
+            .sum::<usize>()
+            + held.full_kv.as_ref().map_or(0, |image| full_bytes(image))
+            + held
+                .draft_kv
+                .as_ref()
+                .map_or(0, |planes| draft_bytes(planes))
+    }
+
+    /// Empty the least recently used cold slots until the warm images fit the budget,
+    /// returning each emptied slot with the bytes it gave back.
+    ///
+    /// Two slots are never emptied: the live one, whose state is the model's cache, and
+    /// the most recently used cold one, which is the conversation that just left the cache
+    /// and the likeliest to come back. So the budget is a bound on everything BEYOND the
+    /// two-agents case, and a single image larger than the whole budget is kept rather
+    /// than thrown away for nothing. A budget of zero bounds nothing.
+    fn trim_to_budget(
+        &mut self,
+        snapshot_bytes: impl Fn(&S) -> usize,
+        full_bytes: impl Fn(&F) -> usize,
+        draft_bytes: impl Fn(&D) -> usize,
+    ) -> Vec<(usize, usize)> {
+        let mut evicted = Vec::new();
+        if self.budget_bytes == 0 {
+            return evicted;
+        }
+        let bytes = |slots: &Self, slot: usize| {
+            slots.slot_bytes(slot, &snapshot_bytes, &full_bytes, &draft_bytes)
+        };
+        let mut held: u64 = (0..self.slots.len())
+            .map(|slot| bytes(self, slot) as u64)
+            .sum();
+        let kept = (0..self.slots.len())
+            .filter(|slot| Some(*slot) != self.live)
+            .max_by_key(|slot| self.slots[*slot].last_used);
+        while held > self.budget_bytes {
+            let Some(victim) = (0..self.slots.len())
+                .filter(|slot| Some(*slot) != self.live && Some(*slot) != kept)
+                .filter(|slot| bytes(self, *slot) > 0)
+                .min_by_key(|slot| self.slots[*slot].last_used)
+            else {
+                break;
+            };
+            let freed = bytes(self, victim);
+            self.empty(victim);
+            held = held.saturating_sub(freed as u64);
+            evicted.push((victim, freed));
+        }
+        evicted
+    }
+
+    /// Leave `slot` holding nothing, as a failed job's abandonment does, so it is the first
+    /// one a fresh conversation reuses.
+    fn empty(&mut self, slot: usize) {
+        let held = &mut self.slots[slot];
+        held.prefix.clear();
+        held.full_kv = None;
+        held.draft_kv = None;
+        held.image_agrees_to = 0;
+        held.last_used = 0;
     }
 
     /// The ring entries a conversation forking off `source` at `pos` inherits.
@@ -4641,6 +4779,28 @@ fn log_slots(slots: &Slots, logger: &ServeLogger) {
         |image| image.byte_len(),
         |planes| planes.byte_len(),
     )));
+}
+
+/// Empty the least recently used cold slots until the warm images fit the configured
+/// host budget, forgetting where each emptied conversation was stored on disk: a slot
+/// holding nothing is no longer a reason to keep a file alive.
+fn trim_slots_to_budget(engine: &mut EngineState, disk: Option<&DiskCache>, logger: &ServeLogger) {
+    let budget = engine.slots.budget_bytes;
+    for (slot, bytes) in engine.slots.trim_to_budget(
+        |rings| rings.byte_len(),
+        |image| image.byte_len(),
+        |planes| planes.byte_len(),
+    ) {
+        if let Some(disk) = disk {
+            disk.unlink(slot);
+        }
+        logger.log(ServeLog::HostLine(format!(
+            "xwen serve: cache slot {slot} emptied ({:.0} MiB) to keep warm images under the \
+             {:.1} GiB host budget",
+            bytes as f64 / (1024.0 * 1024.0),
+            budget as f64 / (1u64 << 30) as f64
+        )));
+    }
 }
 
 /// Whether drafter planes of `kind` covering `covered` positions can back a conversation
@@ -5563,7 +5723,13 @@ mod tests {
     type TestSlots = SlotManager<usize, usize, usize>;
 
     fn manager(max_slots: usize, snapshots: usize) -> TestSlots {
-        SlotManager::new(max_slots, snapshots)
+        SlotManager::new(max_slots, snapshots, 0)
+    }
+
+    /// A manager whose warm images are bounded by `budget` bytes, measured by the
+    /// stand-in payloads' values.
+    fn budgeted(max_slots: usize, snapshots: usize, budget: u64) -> TestSlots {
+        SlotManager::new(max_slots, snapshots, budget)
     }
 
     /// A paged-out slot holding `tokens`, with a turn-boundary snapshot at each of
@@ -5629,41 +5795,43 @@ mod tests {
         // Read before the dispatch, as the engine does: a fresh conversation can
         // overwrite the slot that shared the most of this prompt.
         let shared_anywhere = slots.deepest_shared(prompt);
-        match choice {
-            SlotChoice::Live { plan } => match plan {
-                Resume::Extend { .. } => {}
-                // The dispatch's own rule: a fork that would destroy unimaged history
-                // images the conversation it forks off and takes a slot of its own,
-                // rather than rewinding over it.
-                Resume::Restore { pos }
-                    if slots.live_history_at_risk(pos) >= SNAPSHOT_MIN_GAIN
-                        && slots.fresh_slot().is_some() =>
-                {
-                    let source = slots.live.expect("a slot is live");
-                    let target = slots.fresh_slot().expect("room for the fork");
-                    // Captured before the page-out, exactly as the dispatch does.
-                    let inherited = slots
-                        .fork_rings(source, pos)
-                        .expect("the fork point is held");
+        // The dispatch's own rule: a fork that would destroy a warm conversation's
+        // history takes a slot of its own, sharing the source's image, rather than
+        // rewinding or paging in over it.
+        if let Some(ForkPlan {
+            source,
+            target,
+            pos,
+        }) = slots.fork_plan(choice)
+        {
+            // Captured before the page-out, exactly as the dispatch does.
+            let inherited = slots
+                .fork_rings(source, pos)
+                .expect("the fork point is held");
+            page_out_of_cache(slots);
+            let slot = slots
+                .fork_from(source, target, pos, inherited)
+                .expect("the fork installs");
+            slots.page_in(slot, pos);
+        } else {
+            match choice {
+                SlotChoice::Live { plan } => match plan {
+                    Resume::Extend { .. } => {}
+                    Resume::Restore { pos } => slots.rewind_live(pos).expect("a slot is live"),
+                    Resume::Cold => slots.restart_live().expect("a slot is live"),
+                },
+                SlotChoice::Swap { slot, restore } => {
                     page_out_of_cache(slots);
-                    let slot = slots
-                        .fork_from(source, target, pos, inherited)
-                        .expect("the fork installs");
-                    slots.page_in(slot, pos);
+                    slots.page_in(slot, restore);
                 }
-                Resume::Restore { pos } => slots.rewind_live(pos).expect("a slot is live"),
-                Resume::Cold => slots.restart_live().expect("a slot is live"),
-            },
-            SlotChoice::Swap { slot, restore } => {
-                page_out_of_cache(slots);
-                slots.page_in(slot, restore);
-            }
-            SlotChoice::Fresh { slot } => {
-                page_out_of_cache(slots);
-                slots.start_fresh(slot);
+                SlotChoice::Fresh { slot } => {
+                    page_out_of_cache(slots);
+                    slots.start_fresh(slot);
+                }
             }
         }
         slots.touch_live().expect("the dispatch leaves a slot live");
+        slots.trim_to_budget(|s| *s, |f| *f, |d| *d);
         // The planner the engine itself runs, so what these tests see the slots collect is
         // what a real prefill would have stopped for. The stand-in payload is the position.
         let stops = plan_snapshot_stops(
@@ -6441,7 +6609,7 @@ mod tests {
         let slot = seed(&mut slots, &tokens, &[fork]);
         slots.page_in(slot, tokens.len());
         assert_eq!(slots.slots[slot].image_agrees_to, tokens.len());
-        assert_eq!(slots.live_history_at_risk(fork), 0, "nothing is unimaged");
+        assert_eq!(slots.history_at_risk(slot, fork), 0, "nothing is unimaged");
 
         // A fork rewinds in place, keeping the image it already has.
         let image = slots.slots[slot].full_kv;
@@ -6461,21 +6629,264 @@ mod tests {
     fn a_fork_that_destroys_little_rewinds_in_place() {
         let mut slots = manager(4, 4);
         let tokens: Vec<u32> = (0..SNAPSHOT_MIN_GAIN as u32 + 8).collect();
-        let _ = start(&mut slots);
+        let slot = start(&mut slots);
         live(&mut slots).prefix.push(8, 8);
         live(&mut slots).prefix.set_tokens(tokens.clone());
 
         // A fork right below the end: only the handful of tokens above it would go.
         let near_end = tokens.len() - 8;
-        assert_eq!(slots.live_history_at_risk(near_end), 8);
+        assert_eq!(slots.history_at_risk(slot, near_end), 8);
+        assert_eq!(
+            slots.fork_plan(SlotChoice::Live {
+                plan: Resume::Restore { pos: near_end }
+            }),
+            None
+        );
         // A fork at the very start would take the lot, and is worth imaging.
-        assert_eq!(slots.live_history_at_risk(8), tokens.len() - 8);
-        assert!(slots.live_history_at_risk(8) >= SNAPSHOT_MIN_GAIN);
+        assert_eq!(slots.history_at_risk(slot, 8), tokens.len() - 8);
+        assert!(slots.history_at_risk(slot, 8) >= SNAPSHOT_MIN_GAIN);
+        assert_eq!(
+            slots.fork_plan(SlotChoice::Live {
+                plan: Resume::Restore { pos: 8 }
+            }),
+            Some(ForkPlan {
+                source: slot,
+                target: FreshSlot::New,
+                pos: 8
+            })
+        );
         // An extension destroys nothing at all.
-        assert_eq!(slots.live_history_at_risk(tokens.len()), 0);
-        // And with nothing live there is nothing to weigh.
+        assert_eq!(slots.history_at_risk(slot, tokens.len()), 0);
+        // And an emptied slot has nothing to weigh.
         slots.abandon_live();
-        assert_eq!(slots.live_history_at_risk(0), 0);
+        assert_eq!(slots.history_at_risk(slot, 0), 0);
+    }
+
+    /// A conversation sharing only the system block with a warm one — the shape every
+    /// sibling agent session arrives in — forks off it instead of taking its slot: the
+    /// live slot when that is the best match, and a cold slot too, where the swap the
+    /// choice names would page it in at the anchor and lose everything above it.
+    #[test]
+    fn a_sibling_sharing_the_system_block_forks_off_a_cold_slot_too() {
+        let gain = SNAPSHOT_MIN_GAIN;
+        let system: Vec<u32> = (0..2 * gain as u32).collect();
+        let anchor = system.len();
+        let long = |mark: u32| -> Vec<u32> {
+            let mut tokens = system.clone();
+            tokens.extend((0..4 * gain as u32).map(|i| mark + i));
+            tokens
+        };
+        let mut sibling = system.clone();
+        sibling.extend([1, 2, 3]);
+
+        // Two long conversations sharing the system block, A cold and B live.
+        let mut slots = manager(8, 4);
+        let a = seed(&mut slots, &long(100_000), &[anchor]);
+        let b = start(&mut slots);
+        live(&mut slots).prefix.set_anchor(anchor, anchor);
+        live(&mut slots).prefix.set_tokens(long(200_000));
+
+        // The live slot wins the tie, and the plan is a rewind of it — which forks.
+        let choice = slots.choose(&sibling);
+        assert_eq!(
+            choice,
+            SlotChoice::Live {
+                plan: Resume::Restore { pos: anchor }
+            }
+        );
+        assert_eq!(
+            slots.fork_plan(choice),
+            Some(ForkPlan {
+                source: b,
+                target: FreshSlot::New,
+                pos: anchor
+            })
+        );
+
+        // With an unrelated conversation live, the best match is the cold one, and the
+        // swap that would take it over at the anchor forks off it instead.
+        page_out_of_cache(&mut slots);
+        let _other = start(&mut slots);
+        live(&mut slots).prefix.set_tokens(vec![7, 7, 7]);
+        let choice = slots.choose(&sibling);
+        assert_eq!(
+            choice,
+            SlotChoice::Swap {
+                slot: b,
+                restore: anchor
+            },
+            "the more recently used of the two cold matches"
+        );
+        assert_eq!(
+            slots.fork_plan(choice),
+            Some(ForkPlan {
+                source: b,
+                target: FreshSlot::New,
+                pos: anchor
+            })
+        );
+        assert!(slots.history_at_risk(b, anchor) >= SNAPSHOT_MIN_GAIN);
+
+        // At the cap the fork evicts the least recently used cold slot, which is A.
+        let mut capped = manager(3, 4);
+        let a2 = seed(&mut capped, &long(100_000), &[anchor]);
+        let b2 = seed(&mut capped, &long(200_000), &[anchor]);
+        let _ = start(&mut capped);
+        live(&mut capped).prefix.set_tokens(vec![7, 7, 7]);
+        assert_eq!(
+            capped.fork_plan(capped.choose(&sibling)),
+            Some(ForkPlan {
+                source: b2,
+                target: FreshSlot::Evict(a2),
+                pos: anchor
+            })
+        );
+
+        // When the only slot to evict is the source itself, forking would be the swap
+        // with extra steps, so the swap stands.
+        let mut tight = manager(2, 4);
+        let _ = seed(&mut tight, &long(200_000), &[anchor]);
+        let _ = start(&mut tight);
+        live(&mut tight).prefix.set_tokens(vec![7, 7, 7]);
+        assert!(matches!(tight.choose(&sibling), SlotChoice::Swap { .. }));
+        assert_eq!(tight.fork_plan(tight.choose(&sibling)), None);
+
+        // A conversation coming back to its own slot at its full length forks nothing.
+        let mut own = long(100_000);
+        own.push(9);
+        let returning = slots.choose(&own);
+        assert_eq!(
+            returning,
+            SlotChoice::Swap {
+                slot: a,
+                restore: long(100_000).len()
+            }
+        );
+        assert_eq!(slots.fork_plan(returning), None);
+        assert_eq!(
+            slots.fork_plan(SlotChoice::Fresh {
+                slot: FreshSlot::New
+            }),
+            None
+        );
+    }
+
+    /// The end-to-end shape of three agent sessions: a session that arrives while an
+    /// unrelated conversation is live, sharing the system block with a cold one, resumes
+    /// at the block AND leaves that cold conversation intact, so its owner's next turn
+    /// resumes at everything it had. Before the cold fork the swap took the slot over,
+    /// and the owner came back to a conversation that had been overwritten.
+    #[test]
+    fn a_new_session_leaves_the_cold_conversation_it_forked_off_intact() {
+        let gain = SNAPSHOT_MIN_GAIN;
+        let system: Vec<u32> = (0..2 * gain as u32).collect();
+        let anchor = system.len();
+        let turn = |history: &[u32], mark: u32, len: usize| {
+            let mut prompt = history.to_vec();
+            prompt.extend((0..len as u32).map(|i| mark + i));
+            let boundary = prompt.len();
+            prompt.extend(TEST_HEADER);
+            (prompt, boundary)
+        };
+        let mut slots = manager(8, 4);
+
+        // A's long first turn, then an unrelated conversation takes the cache.
+        let (first, boundary) = turn(&system, 100_000, 4 * gain);
+        assert_eq!(
+            serve_with_anchor(&mut slots, &first, Some(anchor), boundary, &[77]),
+            0
+        );
+        let a = slots.live.expect("A is live");
+        let mut a_history = first.clone();
+        a_history.push(77);
+        let (other, other_boundary) = (vec![1, 2, 3, 9001, 9002], 3);
+        serve(&mut slots, &other, other_boundary, &[77]);
+
+        // B arrives sharing the system block: it resumes at the block, off A's image.
+        let (second, boundary) = turn(&system, 200_000, 3);
+        assert_eq!(
+            serve_with_anchor(&mut slots, &second, Some(anchor), boundary, &[88]),
+            anchor
+        );
+        assert_ne!(slots.live, Some(a), "B took a slot of its own");
+        assert_eq!(
+            slots.slots[a].prefix.tokens, a_history,
+            "A's conversation is untouched"
+        );
+
+        // A's next turn resumes at its whole history.
+        let (third, boundary) = turn(&a_history, 100_000, 3);
+        assert_eq!(
+            serve_with_anchor(&mut slots, &third, Some(anchor), boundary, &[77]),
+            a_history.len()
+        );
+        assert_eq!(slots.live, Some(a));
+    }
+
+    /// The host budget empties the least recently used cold slots, never the live one and
+    /// never the most recently used cold one, so one image larger than the whole budget
+    /// is kept and the two-agents case always survives.
+    #[test]
+    fn the_budget_empties_the_least_recently_used_cold_slots_first() {
+        // Payloads stand in for their own byte counts here; only the images are measured.
+        let trim = |slots: &mut TestSlots| slots.trim_to_budget(|_| 0, |f| *f, |_| 0);
+
+        let mut slots = budgeted(8, 4, 8);
+        let a = seed(&mut slots, &[1, 1, 1], &[]);
+        let b = seed(&mut slots, &[2, 2, 2], &[]);
+        assert_eq!(trim(&mut slots), vec![], "6 of 8 fits");
+        let c = seed(&mut slots, &[3, 3, 3], &[]);
+        // Nine over eight: the oldest goes, and the one that just left the cache stays.
+        assert_eq!(trim(&mut slots), vec![(a, 3)]);
+        assert!(slots.slots[a].prefix.tokens.is_empty());
+        assert_eq!(slots.slots[a].full_kv, None);
+        assert_eq!(slots.slots[a].last_used, 0, "first to be reused");
+        assert_eq!(slots.slots[b].full_kv, Some(3));
+        assert_eq!(slots.slots[c].full_kv, Some(3));
+        // And an emptied slot is what the next fresh conversation lands in.
+        assert_eq!(slots.fresh_slot(), Some(FreshSlot::New));
+        let mut full = budgeted(3, 4, 8);
+        let a = seed(&mut full, &[1, 1, 1], &[]);
+        seed(&mut full, &[2, 2, 2], &[]);
+        seed(&mut full, &[3, 3, 3], &[]);
+        assert_eq!(trim(&mut full), vec![(a, 3)]);
+        assert_eq!(full.fresh_slot(), Some(FreshSlot::Evict(a)));
+
+        // A single image larger than the budget is kept: emptying it would leave nothing
+        // to come back to.
+        let mut lone = budgeted(8, 4, 8);
+        let x = seed(&mut lone, &[1; 10], &[]);
+        assert_eq!(trim(&mut lone), vec![]);
+        assert_eq!(lone.slots[x].full_kv, Some(10));
+
+        // The live slot is spared however much it holds, and so is the newest cold one:
+        // when those two alone exceed the budget nothing else is emptied for it.
+        let mut held = budgeted(8, 4, 8);
+        let a = seed(&mut held, &[1, 1, 1], &[]);
+        let b = seed(&mut held, &[2, 2, 2], &[]);
+        let live_slot = start(&mut held);
+        live(&mut held).prefix.set_tokens(vec![9; 20]);
+        held.slots[live_slot].full_kv = Some(20);
+        assert_eq!(held.trim_to_budget(|_| 0, |f| *f, |_| 0), vec![(a, 3)]);
+        assert_eq!(held.trim_to_budget(|_| 0, |f| *f, |_| 0), vec![]);
+        assert_eq!(held.slots[b].full_kv, Some(3));
+        assert_eq!(held.slots[live_slot].full_kv, Some(20));
+
+        // Snapshots count toward a slot's bytes like the images do.
+        let mut rings = budgeted(8, 4, 8);
+        let a = seed(&mut rings, &[1, 1], &[1]);
+        let b = seed(&mut rings, &[2, 2], &[]);
+        // A holds a turn snapshot at 1 and the tail at 2, plus the image of 2: 5 bytes
+        // measured; B holds the tail at 2 and the image: 4.
+        assert_eq!(rings.trim_to_budget(|s| *s, |f| *f, |_| 0), vec![(a, 5)]);
+        assert_eq!(rings.slots[b].full_kv, Some(2));
+
+        // No budget bounds nothing.
+        let mut unbounded = manager(8, 4);
+        seed(&mut unbounded, &[1; 100], &[]);
+        seed(&mut unbounded, &[2; 100], &[]);
+        seed(&mut unbounded, &[3; 100], &[]);
+        assert_eq!(trim(&mut unbounded), vec![]);
     }
 
     /// A failure demotes the slot back to cold with its drafter planes intact, untruncated:

@@ -756,20 +756,23 @@ struct ServeArgs {
     /// KV snapshots kept for turn-boundary prefix reuse.
     #[arg(long)]
     cache_snapshots: Option<usize>,
-    /// Conversations kept warm at once, so clients talking in turn stop
-    /// evicting each other. One lives in the GPU cache and the rest are
-    /// host-RAM images, uncapped and costing per cached token what the
-    /// checkpoint's full-attention layers cost — 20 KiB on the 35B-A3B, 64 KiB
-    /// on the 27B — plus one snapshot's DeltaNet state per snapshot kept
-    /// (62.8 / 149.6 MiB). The live one holds an image too, so budget
-    /// N x (--ctx x per-token + snapshots x per-snapshot), plus
-    /// min(--draft-ctx, --ctx) x 4-48 KiB of drafter planes per slot (4 on the
-    /// 3.8's MTP head, 40-48 on the DFlash sidecars) while
-    /// speculation is on, plus one slot's images again while a swap is in
-    /// flight. Lower this or --ctx if that does not fit. 1 keeps a single
-    /// conversation warm.
+    /// Hard cap on conversations kept warm at once, so clients talking in turn
+    /// stop evicting each other. One lives in the GPU cache and the rest are
+    /// host-RAM images; --cache-budget is what bounds their total size, this
+    /// only caps their number (default 8). 1 keeps a single conversation warm.
     #[arg(long)]
     cache_slots: Option<usize>,
+    /// Host RAM the warm cache images may add up to, in GiB (default 8; 0 for
+    /// no bound). Images cost per cached token what the checkpoint's
+    /// full-attention layers cost — 30 KiB on Flash-Next, 20 KiB on the
+    /// 35B-A3B, 64 KiB on the 27B — plus one snapshot's DeltaNet state per
+    /// snapshot kept (113 / 62.8 / 149.6 MiB), plus drafter planes while
+    /// speculation is on. When the total goes over, the least recently used
+    /// cold conversations are dropped; the live one and the one that just
+    /// left the cache always stay, so one image larger than the budget is
+    /// kept rather than thrown away.
+    #[arg(long, value_name = "GIB")]
+    cache_budget: Option<u64>,
     /// Where the on-disk prefix cache keeps its images, under <DIR>/kv/
     /// (default: ~/.cache/xwen).
     #[arg(long, value_name = "DIR")]
@@ -871,6 +874,7 @@ impl ServeArgs {
             reasoning_effort: self.reasoning_effort.clone(),
             cache_snapshots: self.cache_snapshots,
             cache_slots: self.cache_slots,
+            cache_budget: self.cache_budget,
             cache_dir: self.cache_dir.clone(),
             // Naming a drafter is itself a request for one, so an explicit
             // --draft beats a config file that set `enabled = false` (clap

@@ -734,6 +734,16 @@ bar goes to raw stderr, so under `--tui` it draws over the dashboard (TODO.md).
 Flash-Next is the exception: 111 GB is not something a stranger's request gets to start,
 so an uncached one is a 400 naming `xwen fetch` instead.
 
+Warm conversations are bounded by host RAM, not by a count: `--cache-budget <GiB>` /
+`[cache] budget_gib` (default 8; 0 for no bound) is what the paged-out images may add up
+to, and after every request the least recently used cold conversations are dropped until
+they fit — never the live one and never the one that just left the GPU cache, so a single
+image larger than the budget is kept. A Flash-Next image is 30 KiB per token plus a 113 MiB
+floor, so the default holds five or six agent sessions of 15-60k tokens or one at the full
+context. `--cache-slots` / `[cache] slots` (default 8) is only the hard cap on their
+number; 1 turns multi-conversation reuse off. `bun scripts/cache-hitrate.ts --model Flash`
+reads the hit rate off the metrics log, by how many other sessions ran in between.
+
 Request bodies are capped at 100 MB (real cost is judged in tokens by the queue and
 `context_length`, not in bytes). `context_length` — default: the checkpoint's trained
 256k window — is a ceiling, not an allocation: the KV cache starts at 8k positions and

@@ -46,14 +46,19 @@ pub const DEFAULT_THINKING_FORCE: bool = true;
 /// `thinking.budget_tokens` / `reasoning_effort` always wins.
 pub const DEFAULT_THINKING_BUDGET: usize = 4096;
 pub const DEFAULT_CACHE_SNAPSHOTS: usize = 4;
-/// Conversations kept warm at once. One of them occupies the GPU cache; the rest
-/// are host-RAM images the engine pages back in when their conversation returns.
-/// 1 reproduces the single-sequence behaviour where a switch evicts whoever was
-/// speaking. Two by default (2026-08-30, was four): the default checkpoint is
-/// Flash-Next, whose images cost 30 KiB/token plus a 113 MiB DeltaNet floor —
-/// ~8 GB per conversation at its 262144 context — and one host image beside
-/// the live conversation covers the usual two-agents case.
-pub const DEFAULT_CACHE_SLOTS: usize = 2;
+/// The hard cap on conversations kept warm at once. One of them occupies the GPU
+/// cache; the rest are host-RAM images the engine pages back in when their
+/// conversation returns. 1 reproduces the single-sequence behaviour where a
+/// switch evicts whoever was speaking. The operative bound is the host budget
+/// below: this cap only matters when the budget is 0 or the images are tiny.
+pub const DEFAULT_CACHE_SLOTS: usize = 8;
+/// Host RAM the warm images may add up to, in GiB, before the least recently
+/// used cold conversations are dropped; 0 for no bound. A Flash-Next image costs
+/// 30 KiB/token plus a 113 MiB DeltaNet floor, so 8 GiB is one conversation at
+/// the full 262144 context or five to six agent sessions of 15-60k tokens — which
+/// is what a count of two could not express (2026-09-15; two slots gave a 96%
+/// hit rate with one other session interleaved and 1% with four).
+pub const DEFAULT_CACHE_BUDGET_GIB: u64 = 8;
 /// The on-disk prefix cache is opt-in (`--disk-cache` / `disk_cache = true`;
 /// was on by default until 2026-08-30): a restart resuming without re-prefill
 /// is worth having, but at Flash-Next image sizes it writes gigabytes per
@@ -391,6 +396,7 @@ pub struct ImageToml {
 pub struct CacheToml {
     pub snapshots: Option<usize>,
     pub slots: Option<usize>,
+    pub budget_gib: Option<u64>,
 }
 
 /// The symbolic drafter path meaning "each checkpoint's own official sidecar" —
@@ -517,6 +523,7 @@ pub struct CliOverrides {
     pub reasoning_effort: Option<String>,
     pub cache_snapshots: Option<usize>,
     pub cache_slots: Option<usize>,
+    pub cache_budget: Option<u64>,
     pub draft: Option<PathBuf>,
     /// `--no-draft`: present means an explicit `false`.
     pub draft_enabled: Option<bool>,
@@ -595,8 +602,10 @@ pub struct ServeSettings {
     /// for both modes, as the others do.
     pub presence_penalty: Option<f64>,
     pub cache_snapshots: usize,
-    /// Conversations kept warm at once, at least 1.
+    /// The hard cap on conversations kept warm at once, at least 1.
     pub cache_slots: usize,
+    /// Host RAM the warm images may add up to, in GiB; 0 bounds nothing.
+    pub cache_budget_gib: u64,
     /// How this server speculates. Speculation is opt-out PER CHECKPOINT, so
     /// the resolved default is [`DraftMode::Default`] — which sidecar that is,
     /// and whether the checkpoint attaches one unasked at all, depends on the
@@ -625,6 +634,13 @@ pub struct ServeSettings {
     /// `num_inference_steps` always wins; this exists for the clients that
     /// cannot send one, ComfyUI's stock OpenAI image node among them.
     pub image_steps: Option<usize>,
+}
+
+impl ServeSettings {
+    /// The host budget for warm cache images in bytes, zero for no bound.
+    pub fn cache_budget_bytes(&self) -> u64 {
+        self.cache_budget_gib.saturating_mul(1 << 30)
+    }
 }
 
 /// Read a config file. A missing file resolves to defaults, so the common case
@@ -1012,6 +1028,15 @@ pub fn resolve(
             cli.cache_slots,
             file.cache.slots,
             DEFAULT_CACHE_SLOTS,
+            origin,
+            &mut warnings,
+        ),
+        cache_budget_gib: pick(
+            "cache-budget",
+            "cache.budget_gib",
+            cli.cache_budget,
+            file.cache.budget_gib,
+            DEFAULT_CACHE_BUDGET_GIB,
             origin,
             &mut warnings,
         ),
@@ -2351,6 +2376,40 @@ mod tests {
         let (settings, warnings) = resolve(&ServeToml::default(), None, &cli).unwrap();
         assert_eq!(settings.cache_slots, 1);
         assert!(warnings.is_empty());
+    }
+
+    /// The host budget for warm images follows the same precedence, and zero is a
+    /// legal value meaning no bound rather than a refused one: the slot cap still
+    /// bounds the count then.
+    #[test]
+    fn cache_budget_follows_the_usual_precedence_and_zero_means_unbounded() {
+        let (defaults, _) = resolve(&ServeToml::default(), None, &model_only()).unwrap();
+        assert_eq!(defaults.cache_budget_gib, DEFAULT_CACHE_BUDGET_GIB);
+        assert_eq!(
+            defaults.cache_budget_bytes(),
+            DEFAULT_CACHE_BUDGET_GIB * (1 << 30)
+        );
+
+        let file: ServeToml = toml::from_str("[cache]\nbudget_gib = 24\n").unwrap();
+        let (from_file, warnings) =
+            resolve(&file, Some(Path::new("/etc/serve.toml")), &model_only()).unwrap();
+        assert_eq!(from_file.cache_budget_gib, 24);
+        assert!(warnings.is_empty());
+
+        let cli = CliOverrides {
+            cache_budget: Some(0),
+            ..model_only()
+        };
+        let (merged, warnings) = resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
+        assert_eq!(merged.cache_budget_gib, 0);
+        assert_eq!(merged.cache_budget_bytes(), 0);
+        assert_eq!(
+            warnings,
+            vec![
+                "warning: --cache-budget 0 overrides config cache.budget_gib = 24 (/etc/serve.toml)"
+                    .to_string()
+            ]
+        );
     }
 
     /// The slot count follows the same CLI-over-file-over-default precedence as

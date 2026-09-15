@@ -24,6 +24,8 @@ blocks in user turns itself). The renderer stays template-faithful and chat.rs's
 refusal remains as the backstop for the direct chat surface.
 
 **Two cache slots and an opt-in disk tier (2026-08-30; were four and on-by-default).**
+Superseded 2026-09-15 on the slot count: see "A host byte budget bounds the warm
+conversations" below; the disk-tier half stands.
 Both defaults were set when the default checkpoint's image was a few MB of DeltaNet
 state plus 4 KiB/token. The default is now Flash-Next: 30 KiB/token (2 KV heads at 256
 in f16 plus the QSA indexer's f32 key row, over 12 layers) and a 113 MiB DeltaNet floor,
@@ -34,6 +36,39 @@ host image beside the live conversation (the two-agents case); `--disk-cache` /
 `disk_cache = true` turns the tier on for anyone who wants restarts to resume. The
 `--cache-slots` / `[cache] slots` and `--no-disk-cache` surfaces are unchanged.
 `/xwen/v1/*` (2026-07-28).
+
+**A host byte budget bounds the warm conversations, and a sibling forks off a cold slot
+instead of taking it over (2026-09-15; the count was 2).** The two-slot default was sized
+for the ~8 GB full-context image; Orvar's agent sessions are 15-60k tokens, 0.5-1.8 GB
+each, and he runs three to five at once. `scripts/cache-hitrate.ts` over
+`metrics.jsonl` (646 Flash-Next rows, 309 scored) gives the hit rate by how many other
+sessions were served between two turns of one session:
+
+| other sessions between | requests | hit (≥50% of the previous turn) |
+|---|---|---|
+| 0 | 97 | 99% |
+| 1 | 26 | 96% |
+| 2 | 56 | 38% |
+| 3 | 40 | 35% |
+| 4+ | 90 | 1% |
+
+Two slots serve two sessions and nothing more. The operative bound is now
+`--cache-budget` / `[cache] budget_gib`, default 8 GiB: after every dispatch the least
+recently used cold slots are emptied until the warm images fit, never the live slot and
+never the most recently used cold one, so one image larger than the budget is kept and the
+two-agents case always survives. `--cache-slots` stays as the hard cap on the count,
+default 8 (was 2). Second cause, fixed in the same change: the dispatch already forked a
+sibling off the LIVE slot instead of rewinding over it, but a sibling matching a COLD slot
+was served by a swap paging that slot in at the shared system block, which dropped
+everything the slot held above it — a 40k conversation overwritten to reuse 2k tokens.
+`SlotManager::fork_plan` now applies the same rule to both: whenever the history at stake
+is at least `SNAPSHOT_MIN_GAIN` and a slot other than the source is free or evictable, the
+arriving prompt gets a slot of its own sharing the source's image and pages in at the
+fork, which is the same transfer the swap would have made. The host-cache admission
+estimate is capped at the budget plus one image in flight instead of the slot count times
+an image. Reopen the count-only design if the trim is ever measured evicting a
+conversation that came back within a minute: that is the signal the budget is too small,
+not that a count would do better.
 
 **One server serves both checkpoints; `--model` is only the default (2026-08-11).**
 Every job (generation or batch) names the checkpoint it needs, and the engine's pickup

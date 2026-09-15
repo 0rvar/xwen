@@ -1658,6 +1658,7 @@ pub(crate) mod testutil {
             presence_penalty: None,
             cache_snapshots: config::DEFAULT_CACHE_SNAPSHOTS,
             cache_slots: config::DEFAULT_CACHE_SLOTS,
+            cache_budget_gib: config::DEFAULT_CACHE_BUDGET_GIB,
             // No disk tier for a handler test: nothing here reaches the engine, and
             // a test that touched the owner's real cache directory would be a bug.
             cache_dir: None,

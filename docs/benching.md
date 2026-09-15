@@ -162,3 +162,12 @@ was worth +10.3% once its threadgroup count changed.
 
 Anonymous RSS lies under mmap, because the weights are file-backed. Judge memory by
 footprint (`footprint <pid>`), not RSS.
+
+## Prefix-cache hit rate
+
+`bun scripts/cache-hitrate.ts [--model <substring>]` reads `~/.local/state/xwen/metrics.jsonl`
+and tables, for every request whose session's previous request succeeded at 5000+ tokens,
+whether it reused at least half of that previous turn, bucketed by how many OTHER sessions
+the server served in between. It is the instrument that sized the cache budget
+(decisions/serving.md "A host byte budget bounds the warm conversations"); the 0 and 1
+rows are what any two-slot cache serves, the 2+ rows are what the budget buys.
