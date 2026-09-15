@@ -220,7 +220,10 @@ client hanging up and on the job deadline, with the same reason stamped on the t
 Two costs accepted with the wait. A KV growth mid-decode that is genuinely over budget
 now sleeps up to 10 s before the same error, and nothing in the process can free memory
 while that thread sleeps; the SSE keep-alive is 15 s and the job watchdog is looser, so
-the client sees a slower error and not a dropped stream. And in the genuinely
+the client sees a slower error and not a dropped stream. KV growth doubles the capacity
+each time, so a cold long-context request that is genuinely over budget can stack several
+such waits, the load, the host-cache growth and up to about five growths, each its own
+10 s, before the request fails. And in the genuinely
 over-budget case each queued image job waits its own window before its 503, where before
 they failed together in 138 ms. A projection larger than the whole budget skips the wait,
 no release being able to fit it.

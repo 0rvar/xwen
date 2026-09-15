@@ -358,9 +358,19 @@ impl Coordinator {
         let started = Instant::now();
         let mut deferred = false;
         loop {
+            // Asked before the sample so a client that left during the sleep is not
+            // admitted on the reading that finally fits.
+            cancel()?;
             let snapshot = sample();
             *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
-            let refusal = match judge_snapshot(&snapshot, projected)? {
+            let verdict = match judge_snapshot(&snapshot, projected) {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    self.record_admission(label, &snapshot, projected, false);
+                    return Err(error);
+                }
+            };
+            let refusal = match verdict {
                 Verdict::Admitted => {
                     let _ =
                         self.reservation
@@ -376,7 +386,6 @@ impl Coordinator {
                 deferred = true;
                 self.record_deferred(label, &snapshot, projected);
             }
-            cancel()?;
             let waited = started.elapsed();
             if waited >= settle {
                 self.record_admission(label, &snapshot, projected, false);
@@ -941,11 +950,20 @@ mod tests {
         fs::remove_dir_all(&a.directory).unwrap();
     }
     #[test]
+    /// Refused once, then the client leaves during the sleep, then a sample that would
+    /// have fitted: the wait ends with the caller's error and nothing is reserved.
     fn a_cancelled_caller_stops_waiting_with_its_own_error() {
         let a = isolated();
         let mut over = snapshot();
         over.system_used_bytes = Some(100 * GIB);
-        let mut sample = scripted(vec![over]);
+        let mut under = snapshot();
+        under.system_used_bytes = Some(60 * GIB);
+        let samples = AtomicUsize::new(0);
+        let mut scripted_samples = scripted(vec![over, under]);
+        let mut sample = || {
+            samples.fetch_add(1, Ordering::SeqCst);
+            scripted_samples()
+        };
         let polls = AtomicUsize::new(0);
         let cancel = || {
             if polls.fetch_add(1, Ordering::SeqCst) == 1 {
@@ -959,6 +977,31 @@ mod tests {
             .to_string();
         assert_eq!(error, "the image client disconnected");
         assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(samples.load(Ordering::SeqCst), 1);
+        assert_eq!(a.reservation.load(Ordering::Acquire), 0);
+    }
+    /// Lower bounds only: with always-over samples and a positive window the loop must
+    /// sleep through at least the window and sample more than once.
+    #[test]
+    fn the_settle_window_is_actually_waited_out() {
+        let a = isolated();
+        let mut over = snapshot();
+        over.system_used_bytes = Some(100 * GIB);
+        let samples = AtomicUsize::new(0);
+        let mut scripted_samples = scripted(vec![over]);
+        let mut sample = || {
+            samples.fetch_add(1, Ordering::SeqCst);
+            scripted_samples()
+        };
+        let settle = Duration::from_millis(120);
+        let started = Instant::now();
+        let error = a
+            .admit_settling("test", 40 * GIB, &|| Ok(()), &mut sample, settle)
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() >= settle);
+        assert!(samples.load(Ordering::SeqCst) >= 2);
+        assert!(error.contains("after waiting"), "{error}");
         assert_eq!(a.reservation.load(Ordering::Acquire), 0);
     }
     /// 2026-09-15: the image engine released a 35.6 GB pipeline and 15 ms later the host
@@ -1043,11 +1086,9 @@ mod tests {
         assert!(error.contains("cannot read physical RAM"), "{error}");
         assert_eq!(samples.load(Ordering::SeqCst), 1);
         assert_eq!(a.reservation.load(Ordering::Acquire), 0);
-        assert!(
-            !fs::read_to_string(&events)
-                .unwrap()
-                .contains("admission deferred")
-        );
+        let log = fs::read_to_string(&events).unwrap();
+        assert!(!log.contains("admission deferred"));
+        assert_eq!(log.matches("\"accepted\":false").count(), 1);
         fs::remove_dir_all(&a.directory).unwrap();
     }
     #[test]
