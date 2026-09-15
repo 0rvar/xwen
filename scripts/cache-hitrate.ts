@@ -36,9 +36,10 @@ const flag = (name: string): string | undefined => {
   return value;
 };
 const model = flag("--model") ?? "";
-// As src/metrics.rs reads it: an empty variable is unset, and `off` means nothing was
-// recorded, so there is nothing to read.
-const fileEnv = process.env.XWEN_METRICS_FILE?.trim() || undefined;
+// As src/metrics.rs reads it: exactly the empty string is unset, and `off` in any case,
+// untrimmed, means nothing was recorded, so there is nothing to read.
+const rawEnv = process.env.XWEN_METRICS_FILE;
+const fileEnv = rawEnv === undefined || rawEnv === "" ? undefined : rawEnv;
 if (flag("--file") === undefined && fileEnv?.toLowerCase() === "off") {
   console.error("XWEN_METRICS_FILE=off: metrics recording is disabled, so there is no log to read");
   process.exit(2);

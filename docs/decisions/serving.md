@@ -82,6 +82,8 @@ snapshot. Neither the budget nor the slot cap enters it and nothing resident is
 subtracted: a ceiling derived from the budget put a full-context Flash-Next request at
 24.6 GiB beside the resident 113-116 GiB and had it refused after the 10 s wait, for an
 allocation the dispatch never made.
+The slot tests drive a helper that mirrors the dispatch arm by arm, so the production
+wiring of the fork's spare through the two trims is pinned by reading, not by a test.
 Known gap, pre-existing and not taken now: for the live slot `history_at_risk` discounts
 the history a retained image already covers, so a conversation paged back in and grown
 by fewer than `SNAPSHOT_MIN_GAIN` tokens is rewound over rather than forked off when a

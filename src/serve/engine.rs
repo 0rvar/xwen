@@ -454,21 +454,28 @@ fn request_host_cache_growth(
     job: &Job,
     settings: &ServeSettings,
     prompt_tokens: usize,
+    disk_tier: bool,
 ) -> u64 {
     let rows = prompt_tokens
         .max(job.prompt().len())
         .saturating_add(job.max_tokens())
         .min(engine.generator.max_ctx());
     // Every dispatch but a plain extension of the live conversation may page it out: a
-    // swap and a fresh start do, and a rewind does through the fork arm.
-    let outgoing = match engine.slots.choose(job.prompt()) {
+    // swap and a fresh start do, a rewind does through the fork arm, and with a disk
+    // tier a stored image can win over the extension and page it out too.
+    let extends_live = matches!(
+        engine.slots.choose(job.prompt()),
         SlotChoice::Live {
             plan: Resume::Extend { .. },
-        } => None,
-        _ => engine
+        }
+    );
+    let outgoing = if extends_live && !disk_tier {
+        None
+    } else {
+        engine
             .slots
             .live
-            .map(|live| engine.slots.slots[live].prefix.tokens.len()),
+            .map(|live| engine.slots.slots[live].prefix.tokens.len())
     };
     host_cache_growth(
         engine.size.model,
@@ -1106,7 +1113,13 @@ fn engine_loop(
                 // job's deadline, and stamps the same reason on the trace.
                 crate::memory::admit_additional_until(
                     "request host cache growth (estimated)",
-                    request_host_cache_growth(engine, &job, &settings, prompt_tokens),
+                    request_host_cache_growth(
+                        engine,
+                        &job,
+                        &settings,
+                        prompt_tokens,
+                        disk_for(required).is_some(),
+                    ),
                     &|| {
                         check_residency_wait(
                             job.cancel(),
@@ -7121,10 +7134,22 @@ mod tests {
             swapping < 2 * extension,
             "a 50k outgoing image is a fraction of a full one"
         );
-        // Drafter planes follow the drafter's own context on both terms.
-        let drafted = host_cache_growth(model, 4, Some(4096), horizon, Some(50_000));
-        let planes = model.draft_kv_bytes_per_token().unwrap_or(0) as u64;
-        assert_eq!(drafted - swapping, 2 * 4096 * planes);
+        // Flash-Next ships no drafter, so its planes are a rate of zero.
+        assert_eq!(model.draft_kv_bytes_per_token().unwrap_or(0), 0);
+
+        // Drafter planes follow the drafter's own context on both terms: the incoming
+        // horizon above it is clamped to it, the outgoing length below it is not. Both
+        // drafter kinds, DFlash on the 3.6 27B and MTP on the 3.8 27B.
+        for model in [hub::Model::Qwen27B, hub::Model::Qwen3827B] {
+            let planes = model
+                .draft_kv_bytes_per_token()
+                .expect("the 27B checkpoints ship a drafter") as u64;
+            assert!(planes > 0);
+            let draft_ctx = 4096;
+            let plain = host_cache_growth(model, 4, None, horizon, Some(2000));
+            let drafted = host_cache_growth(model, 4, Some(draft_ctx), horizon, Some(2000));
+            assert_eq!(drafted - plain, (draft_ctx as u64 + 2000) * planes);
+        }
     }
 
     /// At the cap a fork goes into the least recently used cold slot that is neither its
