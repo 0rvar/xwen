@@ -181,3 +181,43 @@ The regression `warning_pressure_during_a_long_prefill_is_telemetry_only` replay
 incident's readings: a 1.6 GB KV growth is admitted under warning and critical, and an
 owner with no waiters does not yield. The two engine tests for the pressure error event
 were removed with the path that produced it.
+
+## 2026-09-15: admission waits for released memory
+
+`memory.jsonl` for PID 79225 on 2026-09-15 shows an image request finishing at
+timestamp 1789488474452 with system use at 87,656,136,704 bytes (81.6 GiB), process
+footprint 43.5 GB and 35.6 GB allocated on the Metal device. The next queued image job
+carried a different LoRA set, so the image engine released the pipeline: at 474619, 167
+ms later, Metal allocation read 1.9 MB and the footprint 33.6 GB, yet system use still
+read 87,656,136,704. Fifteen milliseconds after that the engine ran
+`admit_additional("image request", 51,539,607,552)`: 81.6 + 48.0 GiB projected against
+128 GiB, refused. The engine's refusal branch unloaded, dropped the lease, and the next
+job re-acquired and asked the same question of the same stale counter. Ten refusals
+follow at a 15 ms cadence, 474634 through 474772, every one with system use frozen at
+87,656,136,704 while the footprint in the same samples fell 31.4, 29.0, 27.2, 25.0,
+23.2, 20.5, 17.5, 15.8, 14.0, 12.3 GB: the process had let go, the kernel was reclaiming,
+and the host counter had not caught up. The clients saw HTTP 503 within 138 ms of the
+release. Earlier in the same log the language server's lease release at 450653 read
+system use 74.5 GB and the image engine's acquisition 506 ms later read 50.1 GB, the same
+lag on a bigger release. Orvar hit the same wall by hand switching from Flash-Next back
+to images.
+
+Admission is now a wait, not a snapshot. `Coordinator::admit_settling` samples, publishes
+the snapshot as `latest`, and admits on the arithmetic as before; over budget it records
+one `admission deferred` event, asks the caller's cancel closure, and if less than
+`ADMISSION_SETTLE` (10 s) has elapsed sleeps the 50 ms poll and samples again. Past the
+settle window it records the refusal as before and returns the existing sentence with
+"after waiting N.Ns for released memory to return" appended. Unreadable counters and an
+overflow are not retried. `admit` and `admit_additional` keep their signatures with a
+never-cancelling closure, covering the model loaders and KV growth;
+`admit_additional_until` takes the cancel closure, and the image engine passes the check
+it already had (shutdown, client gone, the ownership wait timeout) while the language
+engine's host-cache growth admission stops on shutdown. The image engine's refusal
+branch, unload plus lease drop, is now reached only after the wait.
+
+Tests script the sample sequence: two over-budget snapshots then one under admits and
+reserves with exactly one deferred event in the telemetry file; an always-over sequence
+with a zero settle window returns the "after waiting" error and no reservation; a cancel
+closure failing on the second poll returns that error unchanged; and the incident's
+numbers, 87,656,136,704 then 51,100,000,000 bytes used against 51,539,607,552 projected on
+137,438,953,472 physical, admit on the second sample.

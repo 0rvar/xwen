@@ -498,6 +498,18 @@ resident at once and those are what prevent it. Reopen if a measured incident sh
 kernel pressure level preceding a hang with a single model resident.
 [Evidence](../records/memory-safety.md#2026-09-14-pressure-is-telemetry-not-a-trigger).
 
+**Admission is a bounded wait, not a snapshot refusal (2026-09-15).** The host counter
+admission reads lags a release: on 2026-09-15 the image engine dropped a 35.6 GB pipeline
+to switch LoRA sets and 15 ms later saw system use unchanged at 81.6 GiB while its own
+footprint was falling 2 GB per sample, so a 48 GiB image admission was refused ten times
+in 138 ms and four clients got 503s for memory the process had already returned. An
+over-budget reading now polls every 50 ms for up to 10 s, or until the caller's own
+cancellation (client gone, shutdown, the ownership wait timeout) says stop, and only then
+refuses with the wait named in the error. Unreadable counters still refuse at once. The
+arithmetic and the ceiling are unchanged; what changed is that a refusal must survive
+the settle window. Reopen if a measured release takes longer than 10 s to be reflected in
+the counters. [Evidence](../records/memory-safety.md#2026-09-15-admission-waits-for-released-memory).
+
 **Anthropic prompt usage uses disjoint cache buckets (2026-09-10).**
 The Messages API adds `input_tokens`, `cache_read_input_tokens` and
 `cache_creation_input_tokens` to obtain the full prompt count

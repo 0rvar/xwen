@@ -1074,9 +1074,13 @@ fn engine_loop(
                 // building the state and installing it can never leave `/health`
                 // claiming a model nobody holds.
                 resident.store(required);
-                crate::memory::admit_additional(
+                crate::memory::admit_additional_until(
                     "request host cache growth (estimated)",
                     request_host_cache_growth(engine, &job, &settings, prompt_tokens),
+                    &|| {
+                        anyhow::ensure!(!shutdown.is_cancelled(), "the server is shutting down");
+                        Ok(())
+                    },
                 )
                 .map_err(JobFailure::from)?;
                 match job {

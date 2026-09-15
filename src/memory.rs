@@ -24,6 +24,10 @@ const GIB: u64 = 1 << 30;
 const MIN_SYSTEM_RESERVE: u64 = 16 * GIB;
 const SYSTEM_RESERVE_PERCENT: u64 = 10;
 const POLL: Duration = Duration::from_millis(50);
+/// How long an over-budget admission waits for released memory to show up in the host
+/// counters before it refuses. The kernel reclaims a dropped Metal allocation over
+/// hundreds of milliseconds and a 35B unload has taken over a second to be reflected.
+const ADMISSION_SETTLE: Duration = Duration::from_secs(10);
 
 unsafe extern "C" {
     fn mach_port_deallocate(
@@ -305,6 +309,22 @@ impl Coordinator {
     }
 
     fn record_admission(&self, label: &str, snapshot: &Snapshot, projected: u64, accepted: bool) {
+        self.record_projected("admission", label, snapshot, projected, Some(accepted));
+    }
+
+    /// One event per admission that found the counters over budget and chose to wait.
+    fn record_deferred(&self, label: &str, snapshot: &Snapshot, projected: u64) {
+        self.record_projected("admission deferred", label, snapshot, projected, None);
+    }
+
+    fn record_projected(
+        &self,
+        event: &str,
+        label: &str,
+        snapshot: &Snapshot,
+        projected: u64,
+        accepted: Option<bool>,
+    ) {
         if let Some(file) = self
             .telemetry
             .lock()
@@ -313,10 +333,59 @@ impl Coordinator {
         {
             write_telemetry(
                 file,
-                &serde_json::json!({"event":"admission", "label":label,
+                &serde_json::json!({"event":event, "label":label,
                 "pid":std::process::id(), "projected_bytes":projected, "accepted":accepted,
                 "reservation_bytes":self.reservation.load(Ordering::Acquire), "memory":snapshot}),
             );
+        }
+    }
+
+    /// Admit `projected` new bytes atop measured host use, waiting out a counter that
+    /// has not yet absorbed a release. Every poll samples afresh and publishes the
+    /// snapshot as `latest`. The first over-budget sample records one deferred event;
+    /// after that the loop asks `cancel` before each wait, so a caller that has lost its
+    /// client or is shutting down stops here with its own error, and once `settle` has
+    /// elapsed the refusal is recorded and returned. Unreadable counters are not a
+    /// condition that time heals and return at once.
+    fn admit_settling(
+        &self,
+        label: &str,
+        projected: u64,
+        cancel: &dyn Fn() -> Result<()>,
+        sample: &mut dyn FnMut() -> Snapshot,
+        settle: Duration,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let mut deferred = false;
+        loop {
+            let snapshot = sample();
+            *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
+            let refusal = match judge_snapshot(&snapshot, projected)? {
+                Verdict::Admitted => {
+                    let _ =
+                        self.reservation
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                Some(n.saturating_add(projected))
+                            });
+                    self.record_admission(label, &snapshot, projected, true);
+                    return Ok(());
+                }
+                Verdict::Refused(message) => message,
+            };
+            if !deferred {
+                deferred = true;
+                self.record_deferred(label, &snapshot, projected);
+            }
+            cancel()?;
+            let waited = started.elapsed();
+            if waited >= settle {
+                self.record_admission(label, &snapshot, projected, false);
+                bail!(
+                    "{refusal} after waiting {:.1}s for released memory to return",
+                    waited.as_secs_f64()
+                );
+            }
+            thread::sleep(POLL);
         }
     }
 }
@@ -442,30 +511,57 @@ pub fn admit_additional(label: &str, additional_bytes: u64) -> Result<()> {
     admit(label, additional_bytes)
 }
 
+/// [`admit_additional`] for a caller with something to lose while waiting: `cancel` is
+/// asked before every poll and its error is returned unchanged.
+pub fn admit_additional_until(
+    label: &str,
+    additional_bytes: u64,
+    cancel: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    coordinator().admit_settling(
+        label,
+        additional_bytes,
+        cancel,
+        &mut host_sample,
+        ADMISSION_SETTLE,
+    )
+}
+
 /// Admit a new allocation peak atop measured host use, up to physical RAM. The kernel's
 /// pressure level is recorded and never consulted; only an unreadable level keeps a
 /// reserve, because then the counters beside it are suspect too. Existing allocations
 /// receive no footprint credit: Mach footprint and host resident accounting differ.
 /// Warm callers should pass only their additional allocation bound.
+/// A refusal is a wait first: the host counter lags a release by up to seconds, so an
+/// over-budget reading is polled for [`ADMISSION_SETTLE`] before it becomes an error.
 pub fn admit(label: &str, projected_peak_bytes: u64) -> Result<()> {
-    let snapshot = host_sample();
-    *coordinator()
-        .latest
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = snapshot.clone();
-    let result = admit_snapshot(&snapshot, projected_peak_bytes);
-    if result.is_ok() {
-        let _ = coordinator()
-            .reservation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                Some(n.saturating_add(projected_peak_bytes))
-            });
-    }
-    coordinator().record_admission(label, &snapshot, projected_peak_bytes, result.is_ok());
-    result
+    coordinator().admit_settling(
+        label,
+        projected_peak_bytes,
+        &|| Ok(()),
+        &mut host_sample,
+        ADMISSION_SETTLE,
+    )
 }
 
+enum Verdict {
+    Admitted,
+    /// The refusal sentence, without the wait it may yet acquire.
+    Refused(String),
+}
+
+/// The single-sample verdict as an error, the shape the arithmetic tests read.
+#[cfg(test)]
 fn admit_snapshot(s: &Snapshot, projected: u64) -> Result<()> {
+    match judge_snapshot(s, projected)? {
+        Verdict::Admitted => Ok(()),
+        Verdict::Refused(message) => bail!(message),
+    }
+}
+
+/// The arithmetic alone. `Err` is a counter that could not be read or an overflow, which
+/// no amount of waiting changes; `Refused` is a budget the next sample may fit.
+fn judge_snapshot(s: &Snapshot, projected: u64) -> Result<Verdict> {
     let physical = s
         .physical_bytes
         .context("cannot read physical RAM for memory admission")?;
@@ -480,14 +576,14 @@ fn admit_snapshot(s: &Snapshot, projected: u64) -> Result<()> {
         .checked_add(projected)
         .context("projected memory use overflows")?;
     if future > budget {
-        bail!(
+        return Ok(Verdict::Refused(format!(
             "memory admission refused: projected system use {:.1} GiB exceeds {:.1} GiB budget ({:.1} GiB reserved)",
             future as f64 / GIB as f64,
             budget as f64 / GIB as f64,
             reserve as f64 / GIB as f64
-        );
+        )));
     }
-    Ok(())
+    Ok(Verdict::Admitted)
 }
 
 fn system_budget(physical: u64, pressure: Pressure) -> (u64, u64) {
@@ -766,6 +862,125 @@ mod tests {
         assert!(admit_snapshot(&s, GIB).is_ok());
         s.physical_bytes = None;
         assert!(admit_snapshot(&s, GIB).is_err());
+    }
+    /// Feeds `admit_settling` a scripted sequence of snapshots, the last one repeating.
+    fn scripted(snapshots: Vec<Snapshot>) -> impl FnMut() -> Snapshot {
+        let mut queue = VecDeque::from(snapshots);
+        move || {
+            if queue.len() > 1 {
+                queue.pop_front().unwrap()
+            } else {
+                queue.front().unwrap().clone()
+            }
+        }
+    }
+    fn telemetry_into(c: &Coordinator) -> PathBuf {
+        secure_directory(&c.directory).unwrap();
+        let path = c.directory.join("events");
+        *c.telemetry.lock().unwrap() = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap(),
+        );
+        path
+    }
+    #[test]
+    fn a_stale_counter_defers_admission_until_the_release_shows() {
+        let a = isolated();
+        let events = telemetry_into(&a);
+        let mut over = snapshot();
+        over.system_used_bytes = Some(100 * GIB);
+        let mut under = snapshot();
+        under.system_used_bytes = Some(60 * GIB);
+        let mut sample = scripted(vec![over.clone(), over, under]);
+        assert!(
+            a.admit_settling("test", 40 * GIB, &|| Ok(()), &mut sample, ADMISSION_SETTLE)
+                .is_ok()
+        );
+        assert_eq!(a.reservation.load(Ordering::Acquire), 40 * GIB);
+        assert_eq!(a.latest.lock().unwrap().system_used_bytes, Some(60 * GIB));
+        let log = fs::read_to_string(&events).unwrap();
+        assert_eq!(log.matches("\"admission deferred\"").count(), 1);
+        assert_eq!(log.matches("\"accepted\":true").count(), 1);
+        assert_eq!(log.matches("\"accepted\":false").count(), 0);
+        fs::remove_dir_all(&a.directory).unwrap();
+    }
+    #[test]
+    fn a_refusal_that_outlasts_the_settle_window_names_the_wait() {
+        let a = isolated();
+        let events = telemetry_into(&a);
+        let mut over = snapshot();
+        over.system_used_bytes = Some(100 * GIB);
+        let mut sample = scripted(vec![over]);
+        let error = a
+            .admit_settling("test", 40 * GIB, &|| Ok(()), &mut sample, Duration::ZERO)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("memory admission refused"), "{error}");
+        assert!(
+            error.contains("after waiting") && error.contains("released memory to return"),
+            "{error}"
+        );
+        assert_eq!(a.reservation.load(Ordering::Acquire), 0);
+        let log = fs::read_to_string(&events).unwrap();
+        assert_eq!(log.matches("\"admission deferred\"").count(), 1);
+        assert_eq!(log.matches("\"accepted\":false").count(), 1);
+        fs::remove_dir_all(&a.directory).unwrap();
+    }
+    #[test]
+    fn a_cancelled_caller_stops_waiting_with_its_own_error() {
+        let a = isolated();
+        let mut over = snapshot();
+        over.system_used_bytes = Some(100 * GIB);
+        let mut sample = scripted(vec![over]);
+        let polls = AtomicUsize::new(0);
+        let cancel = || {
+            if polls.fetch_add(1, Ordering::SeqCst) == 1 {
+                bail!("the image client disconnected")
+            }
+            Ok(())
+        };
+        let error = a
+            .admit_settling("test", 40 * GIB, &cancel, &mut sample, ADMISSION_SETTLE)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "the image client disconnected");
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(a.reservation.load(Ordering::Acquire), 0);
+    }
+    /// 2026-09-15: the image engine released a 35.6 GB pipeline and 15 ms later the host
+    /// counter still read the pre-release figure, so a 48 GiB image admission was refused
+    /// ten times in 138 ms. The second sample here is the counter once it caught up.
+    #[test]
+    fn the_lora_switch_admission_lands_once_the_counter_catches_up() {
+        let a = isolated();
+        let mut stale = snapshot();
+        stale.physical_bytes = Some(137_438_953_472);
+        stale.system_used_bytes = Some(87_656_136_704);
+        stale.process_footprint_bytes = Some(31_449_534_808);
+        let mut settled = stale.clone();
+        settled.system_used_bytes = Some(51_100_000_000);
+        let samples = AtomicUsize::new(0);
+        let mut sample = scripted(vec![stale, settled]);
+        let mut counted = || {
+            samples.fetch_add(1, Ordering::SeqCst);
+            sample()
+        };
+        assert!(
+            a.admit_settling(
+                "image request",
+                51_539_607_552,
+                &|| Ok(()),
+                &mut counted,
+                ADMISSION_SETTLE
+            )
+            .is_ok()
+        );
+        assert_eq!(samples.load(Ordering::SeqCst), 2);
+        assert_eq!(a.reservation.load(Ordering::Acquire), 51_539_607_552);
     }
     #[test]
     fn admission_requires_counters_and_rejects_overflow() {

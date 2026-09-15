@@ -514,8 +514,10 @@ The seams, so a change lands in one place:
   Keep its lease until models, host slots, preprocessors and GPU buffers are dropped
   and drained; a generation-only mutex leaves idle models resident. An ownership
   transfer must never create a fresh host snapshot, and the kernel's memory pressure level
-  is telemetry only (2026-09-14): nothing cancels, evicts or refuses on it. Image area is
-  capped at 1024 squared until larger peaks are measured. [Memory safety record](docs/records/memory-safety.md). The
+  is telemetry only (2026-09-14): nothing cancels, evicts or refuses on it. An over-budget
+  admission waits up to 10 s for the host counter to absorb a release before it refuses
+  (2026-09-15), bounded by the caller's cancel closure. Image area is capped at 1024
+  squared until larger peaks are measured. [Memory safety record](docs/records/memory-safety.md). The
   prompt rendering both `xwen image` and the route use is
   `zimage::conditioning::prompt_ids`, so a change to how the caption is rendered lands in
   one place. The `model` rule is split by path (full name or nothing on the first two,

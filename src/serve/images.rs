@@ -657,9 +657,10 @@ fn engine_loop(
             }
         }
         if let Err(e) = check().and_then(|_| {
-            crate::memory::admit_additional(
+            crate::memory::admit_additional_until(
                 "image request",
                 image_allocation_reserve(peak, loaded.is_some()),
+                &check,
             )
         }) {
             let error = ImageError::Unavailable(e.to_string());

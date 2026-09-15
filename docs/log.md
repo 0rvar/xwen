@@ -4,6 +4,16 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-15 — Memory admission waits up to 10 s for released memory
+
+Switching image LoRA sets dropped the pipeline and asked for 48 GiB 15 ms later; the host
+counter had not absorbed the release, so ten admissions were refused in 138 ms and clients
+got 503s for memory already returned. An over-budget admission now polls for up to 10 s,
+bounded by the caller's cancellation, before it refuses; one `admission deferred` event
+marks each wait in `memory.jsonl`.
+[Timeline](records/memory-safety.md#2026-09-15-admission-waits-for-released-memory),
+[decision](decisions/serving.md).
+
 ## 2026-09-14 — Memory pressure no longer cancels work or drops the model
 
 A lone Flash-Next serving a 68k-token prompt hit the kernel's warning level at 120.4 GiB
