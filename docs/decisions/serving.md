@@ -53,11 +53,13 @@ sessions were served between two turns of one session:
 | 4+ | 90 | 1% |
 
 Two slots serve two sessions and nothing more. The operative bound is now
-`--cache-budget` / `[cache] budget_gib`, default 8 GiB: after every page-out the least
-recently used cold slots are emptied until the warm images fit, never the live slot, never
-the most recently used cold one and never the slot the dispatch in progress is about to
-page in or fork off, so one image larger than the budget is kept and the two-agents case
-always survives. The images are measured by allocation, not by slot: a fork and the
+`--cache-budget` / `[cache] budget_gib`, default 8 GiB: the least recently used cold slots
+are emptied until the warm images fit, at two points — inside every page-out, and again at
+the end of the dispatch for an image installed without one — and at both, never the live
+slot, never the single most recently used cold one (a tie on the clock goes to the highest
+index, so the trim can never find everything protected) and never the slot the dispatch is
+paging in or forking off, the fork's source included after the fork has landed. So one
+image larger than the budget is kept and the two-agents case always survives. The images are measured by allocation, not by slot: a fork and the
 conversation it forked off share one `Arc` image and count once, and emptying one of them
 frees only what the other does not still hold. The budget bounds what the slots hold, not
 what the disk-tier writer may still retain in flight. `--cache-slots` stays as the hard cap
@@ -72,11 +74,14 @@ arriving prompt gets a slot of its own sharing the source's image and pages in a
 fork, which is the same transfer the swap would have made. At the slot cap the fork
 evicts the least recently used cold conversation whole to preserve the matched one, which
 is the recency-correct choice and is what the byte budget makes rare. The host-cache
-admission estimate projects the ceiling the trim actually enforces — the larger of the
-budget and two images, since two slots are spared whatever their size, plus one image in
-flight, and never below one image for a request that pages the live conversation out —
-minus what the slots already hold, deduplicated the same way; on the dense 27B at 64
-KiB/token a full-context image is ~16 GiB, where the budget alone would understate.
+admission estimate is sized per request, from what THIS dispatch allocates: the incoming
+conversation's retained state at its horizon (image, drafter planes and the snapshots it
+may keep, an upper bound), plus, for every dispatch but a plain extension of the live
+conversation, the outgoing image at the live conversation's own length with its tail
+snapshot. Neither the budget nor the slot cap enters it and nothing resident is
+subtracted: a ceiling derived from the budget put a full-context Flash-Next request at
+24.6 GiB beside the resident 113-116 GiB and had it refused after the 10 s wait, for an
+allocation the dispatch never made.
 Known gap, pre-existing and not taken now: for the live slot `history_at_risk` discounts
 the history a retained image already covers, so a conversation paged back in and grown
 by fewer than `SNAPSHOT_MIN_GAIN` tokens is rewound over rather than forked off when a
