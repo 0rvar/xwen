@@ -845,6 +845,13 @@ struct ServeArgs {
     /// among them.
     #[arg(long, value_name = "STEPS")]
     image_steps: Option<usize>,
+    /// Prompt tokens per prefill forward. Unset, the width adapts to the
+    /// conversation: the architecture's fitted chunk up to 48k tokens of
+    /// context, halved for each doubling past it, so a forward's GPU
+    /// transients stay inside the working set the weights and the KV cache
+    /// leave. A value pins one width at every position; 0 means unset.
+    #[arg(long, value_name = "TOKENS")]
+    prefill_chunk: Option<usize>,
 }
 
 impl ServeArgs {
@@ -854,6 +861,7 @@ impl ServeArgs {
             host: self.host.clone(),
             port: self.port,
             context_length: self.ctx,
+            prefill_chunk: self.prefill_chunk,
             idle_unload: self.idle_unload.clone(),
             anthropic: self.no_anthropic.then_some(false),
             openai: self.no_openai.then_some(false),

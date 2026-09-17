@@ -224,6 +224,15 @@ impl QsaIndexer {
         Ok(me)
     }
 
+    /// The token budget selection spends. A cache at or below it selects the
+    /// whole causal prefix (`QsaSelection::Dense`) and the layer attends over
+    /// the caller's hoisted mask; above it the indexer supplies a mask or a
+    /// column union of its own and the caller's is not read at all. Public so
+    /// the stack can tell the two regimes apart before it builds that mask.
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
     /// The MQA assumption is load-bearing everywhere below (`k_proj`'s output
     /// IS the key vector, with no head axis to split), so it is checked once
     /// here rather than discovered as a wrong answer: a file with a wider

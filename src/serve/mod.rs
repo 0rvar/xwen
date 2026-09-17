@@ -242,6 +242,24 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
         logger.log(ServeLog::HostLine(warning));
     }
 
+    // Pinned before the first load, the width being read by every forward from
+    // then on. A pin says the same thing at every position, so it is worth one
+    // line: it opts out of the tapering that keeps a deep prefill's transients
+    // inside the GPU working set.
+    if let Some(chunk) = settings.prefill_chunk {
+        let effective = crate::ops::set_prefill_chunk(chunk);
+        match effective {
+            Some(effective) if effective != chunk => logger.log(ServeLog::HostLine(format!(
+                "xwen serve: XWEN_PREFILL_CHUNK={effective} outranks prefill_chunk {chunk}; \
+                 prefilling {effective} tokens per forward at every position"
+            ))),
+            _ => logger.log(ServeLog::HostLine(format!(
+                "xwen serve: prefilling {chunk} tokens per forward at every position, \
+                 instead of narrowing the chunk as the context grows"
+            ))),
+        }
+    }
+
     // Before binding anything: a bad model path or an unreadable tokenizer is a
     // startup error, not a surprise on the first request.
     if let Some(warning) = unidentified {
@@ -1644,6 +1662,7 @@ pub(crate) mod testutil {
             host: config::DEFAULT_HOST.to_string(),
             port: config::DEFAULT_PORT,
             context_length: config::DEFAULT_CONTEXT_LENGTH,
+            prefill_chunk: None,
             idle_unload: Some(Duration::from_secs(300)),
             anthropic: true,
             openai: true,

@@ -451,6 +451,28 @@ pub fn extra_state_bytes(cfg: &XwenConfig, max_ctx: usize) -> u64 {
     indexer + ple
 }
 
+/// Whether a prefill forward at `(pos, seq)` has a reader for the hoisted
+/// causal mask, given one entry per FULL-ATTENTION layer: `None` for a layer
+/// with no indexer, `Some(budget)` for a QSA layer.
+///
+/// A layer without an indexer always attends densely over the caller's mask. A
+/// QSA layer reads it only while the whole cache fits its token budget, where
+/// selection is the causal prefix itself (`QsaSelection::Dense`); above the
+/// budget it attends over its own per-query mask or over the tile route's
+/// column union, and the caller's mask reaches neither. The linear layers never
+/// take a mask at all, so a stack whose every full-attention layer is above
+/// budget reads none of it.
+pub fn causal_mask_has_reader(
+    per_full_attn_budget: impl IntoIterator<Item = Option<usize>>,
+    pos: usize,
+    seq: usize,
+) -> bool {
+    per_full_attn_budget.into_iter().any(|budget| match budget {
+        None => true,
+        Some(budget) => pos + seq <= budget,
+    })
+}
+
 /// Run the qwen4exp stack over `tokens` at absolute position `pos` and return
 /// `(h, taps, spec_taps)` — the same triple [`XwenModel::run_stack`] returns,
 /// so `forward` and `forward_all_logits` are shared unchanged.
@@ -538,11 +560,28 @@ pub fn run_stack_hc(
     // (pos, seq) shared by every attention layer. A QSA layer that selects
     // above budget REPLACES it with the indexer's own mask inside `AttnBlock`
     // (the selected set is already causal); one that is below budget uses it.
+    //
+    // Built only when some full-attention layer will read it
+    // (`causal_mask_has_reader`). The mask is three planes that grow with
+    // absolute position — f32 `[seq, pos + seq]`, its u8 predicate and the f16
+    // sdpa copy, 1.75 GiB together at a 2048-token chunk 92k tokens in — and
+    // they stay resident across every layer of the forward, so a forward where
+    // no layer can consume them is worth not allocating.
     let full_mask = if seq > 1 {
-        let n_head = (0..model.cfg.n_layer)
-            .find(|&il| model.cfg.is_full_attn(il))
-            .map(|il| model.cfg.n_head(il));
-        match n_head {
+        let parts = model
+            .qwen4exp
+            .as_ref()
+            .context("run_stack_hc on a model with no qwen4exp parts")?;
+        let mut n_head = None;
+        let mut budgets = Vec::new();
+        for il in 0..model.cfg.n_layer {
+            if !model.cfg.is_full_attn(il) {
+                continue;
+            }
+            n_head = n_head.or_else(|| Some(model.cfg.n_head(il)));
+            budgets.push(parts.layers[il].indexer.as_ref().map(QsaIndexer::budget));
+        }
+        match n_head.filter(|_| causal_mask_has_reader(budgets, pos, seq)) {
             Some(n) => model.build_prefill_mask(n, seq, pos)?,
             None => None,
         }
@@ -1293,5 +1332,32 @@ mod tests {
         for dir in [dir, other_dir, third_dir] {
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+    /// The hoisted causal mask is built only for a forward some full-attention
+    /// layer can read: below the indexer's budget, where selection IS the causal
+    /// prefix, or on a layer carrying no indexer at all. Above budget every QSA
+    /// layer brings its own mask or its own column union, and the hoisted one
+    /// would be allocated, held across the whole stack and read by nobody.
+    #[test]
+    fn the_hoisted_mask_is_built_only_where_a_layer_can_read_it() {
+        const BUDGET: usize = 2048;
+        let shipped = || [Some(BUDGET); 12];
+
+        // The whole chunk inside the budget: every layer selects densely.
+        assert!(causal_mask_has_reader(shipped(), 0, 1500));
+        // Exactly at the budget is still inside it — selection is `<=`.
+        assert!(causal_mask_has_reader(shipped(), 1048, 1000));
+        // One token past, and every layer replaces the mask with its own.
+        assert!(!causal_mask_has_reader(shipped(), 1048, 1001));
+        assert!(!causal_mask_has_reader(shipped(), 91_000, 2048));
+
+        // A full-attention layer with no indexer always attends densely over the
+        // caller's mask, so one of them keeps the mask alive at any depth.
+        let mixed = [Some(BUDGET), None, Some(BUDGET)];
+        assert!(causal_mask_has_reader(mixed, 91_000, 2048));
+        assert!(causal_mask_has_reader([None], 1_000_000, 2048));
+
+        // No full-attention layer at all: nothing takes a mask.
+        assert!(!causal_mask_has_reader([], 0, 1500));
     }
 }

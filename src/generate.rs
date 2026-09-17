@@ -1906,6 +1906,14 @@ impl Generator {
         self.model.prefill_chunk()
     }
 
+    /// The prefill chunk this generator's model runs at absolute position `pos`
+    /// (`XwenModel::prefill_chunk_at`), so a caller splitting a long prefill
+    /// itself narrows at the same positions rather than handing over spans this
+    /// would only re-split.
+    pub fn prefill_chunk_at(&self, pos: usize) -> usize {
+        self.model.prefill_chunk_at(pos)
+    }
+
     pub fn prefill_tokens(&mut self, tokens: &[u32], start_pos: usize) -> Result<()> {
         ensure!(!tokens.is_empty(), "prefill_tokens: nothing to prefill");
         let max_ctx = self.model.max_ctx();
@@ -1924,7 +1932,15 @@ impl Generator {
         let device = model.device().clone();
         model.set_phase(Phase::Prefill);
         let mut pos = start_pos;
-        for chunk in tokens.chunks(model.prefill_chunk()) {
+        // Chunk width is asked for at each chunk's own start position, not once
+        // for the span: deep in a conversation the width tapers with the cache
+        // length (`XwenModel::prefill_chunk_at`), so a span that crosses a tier
+        // boundary narrows inside itself.
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let end = (offset + model.prefill_chunk_at(pos)).min(tokens.len());
+            let chunk = &tokens[offset..end];
+            offset = end;
             let input = Tensor::new(chunk, &device)?;
             *last_logits = Some(model.forward(&input, pos)?);
             // Drain both hidden-state channels unconditionally: either one left

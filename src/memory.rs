@@ -29,6 +29,29 @@ const POLL: Duration = Duration::from_millis(50);
 /// hundreds of milliseconds and a 35B unload has taken over a second to be reflected.
 const ADMISSION_SETTLE: Duration = Duration::from_secs(10);
 
+/// GPU working set one prefill forward's transients take, per chunk token per
+/// cache token. Everything a prefill allocates that is neither a weight plane
+/// nor a cache plane is this product: the hoisted mask (f32 scores, its u8
+/// predicate and an f16 sdpa copy), the score tile, and on the sparse-tile
+/// route the gathered key and value columns. Candle's pool rounds each
+/// allocation up to a power of two and holds it until a wait prunes it, so the
+/// peak counts more of them than one forward strictly needs.
+///
+/// Calibrated 2026-09-17 on Qwen3.8-Flash-Next: about 18 GB measured for a
+/// 2048-token chunk over a 92k-token cache, which is 96 bytes per element of
+/// the product. An estimate for a headroom line and an admission term, never a
+/// measured peak for a given run.
+pub const TRANSIENT_BYTES_PER_CHUNK_CONTEXT_TOKEN: u64 = 96;
+
+/// What a prefill forward of `chunk` tokens over an `n_kv`-token cache is
+/// expected to ask of the GPU working set on top of everything resident
+/// ([`TRANSIENT_BYTES_PER_CHUNK_CONTEXT_TOKEN`]).
+pub fn prefill_transient_bytes(chunk: usize, n_kv: usize) -> u64 {
+    TRANSIENT_BYTES_PER_CHUNK_CONTEXT_TOKEN
+        .saturating_mul(chunk as u64)
+        .saturating_mul(n_kv as u64)
+}
+
 unsafe extern "C" {
     fn mach_port_deallocate(
         task: libc::mach_port_t,

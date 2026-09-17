@@ -686,6 +686,15 @@ impl XwenModel {
         crate::ops::prefill_chunk_override().unwrap_or(self.cfg.arch.prefill_chunk_default())
     }
 
+    /// Prompt tokens for the prefill forward that starts at absolute position
+    /// `pos`: the architecture's context tiering (`Arch::prefill_chunk_at`)
+    /// unless a width is pinned, in which case that width is used at every
+    /// position. A caller that re-chunks a span asks again at each chunk's own
+    /// start, so a span that crosses a tier boundary narrows inside itself.
+    pub fn prefill_chunk_at(&self, pos: usize) -> usize {
+        crate::ops::prefill_chunk_override().unwrap_or(self.cfg.arch.prefill_chunk_at(pos))
+    }
+
     /// Identity of the checkpoint this model was loaded from — what a persisted
     /// cache image is stamped with and validated against.
     pub fn checkpoint_id(&self) -> crate::gguf::CheckpointId {
@@ -1693,6 +1702,12 @@ fn gguf_weight_bytes(gguf: &GgufFile) -> (u64, u64) {
 /// Admission estimate, not a measured peak. PLE is demand-paged: reserve a
 /// working window, then monitor actual pressure as pages are touched. Scratch
 /// covers dequantized planes and prefill temporaries beside persistent state.
+///
+/// The prefill term is the widest forward this load can reach: the chunk the
+/// tiering picks at `max_ctx` over a full cache
+/// (`memory::prefill_transient_bytes`). It is floored at the 8 GiB that covered
+/// dequantized planes and short-context prefills before context made the
+/// transients the larger term, so a small window admits exactly as it did.
 fn language_peak_bytes(
     weights: u64,
     ple: u64,
@@ -1709,11 +1724,16 @@ fn language_peak_bytes(
         * ((cfg.conv_kernel as u64).saturating_sub(1) * cfg.conv_dim() as u64
             + cfg.linear_v_heads as u64 * hd * hd)
         + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx);
+    // A pinned chunk is used at every position, so it is what this load would
+    // run at max_ctx; otherwise the tiering's narrowest width applies there.
+    let chunk =
+        crate::ops::prefill_chunk_override().unwrap_or_else(|| cfg.arch.prefill_chunk_at(max_ctx));
+    let scratch = crate::memory::prefill_transient_bytes(chunk, max_ctx).max(8 * GIB);
     weights
         .saturating_add(ple.min(4 * GIB))
         .saturating_add(kv_bytes(cfg, slots))
         .saturating_add(state)
-        .saturating_add(8 * GIB)
+        .saturating_add(scratch)
 }
 
 /// The resident-memory lines of `warn_if_over_budget`, over an already-summed

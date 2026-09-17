@@ -331,6 +331,8 @@ pub struct ServeToml {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub context_length: Option<usize>,
+    /// Prompt tokens per prefill forward; 0 or absent adapts to the cache length.
+    pub prefill_chunk: Option<usize>,
     pub idle_unload: Option<String>,
     pub anthropic: Option<bool>,
     pub openai: Option<bool>,
@@ -492,6 +494,7 @@ pub struct CliOverrides {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub context_length: Option<usize>,
+    pub prefill_chunk: Option<usize>,
     /// Raw text; parsed during the merge so errors name the flag.
     pub idle_unload: Option<String>,
     pub anthropic: Option<bool>,
@@ -541,6 +544,11 @@ pub struct ServeSettings {
     pub host: String,
     pub port: u16,
     pub context_length: usize,
+    /// Prompt tokens per prefill forward, at every position. `None` — which is
+    /// what an absent or zero setting resolves to — leaves the width to the
+    /// architecture's own tiering, which narrows it as the cache lengthens
+    /// (`Arch::prefill_chunk_at`). `XWEN_PREFILL_CHUNK` outranks this.
+    pub prefill_chunk: Option<usize>,
     /// `None` keeps the model loaded forever.
     pub idle_unload: Option<Duration>,
     pub anthropic: bool,
@@ -804,6 +812,16 @@ pub fn resolve(
             origin,
             &mut warnings,
         ),
+        // Absent stays absent, meaning the architecture's context tiering.
+        prefill_chunk: pick_opt(
+            "prefill-chunk",
+            "prefill_chunk",
+            cli.prefill_chunk,
+            file.prefill_chunk,
+            origin,
+            &mut warnings,
+        )
+        .filter(|&n| n > 0),
         idle_unload: pick(
             "idle-unload",
             "idle_unload",
@@ -1212,6 +1230,19 @@ pub fn resolve(
         settings.draft_pause_margin
     );
 
+    // A pinned chunk is a width every prefill forward runs at, so it has to be
+    // one the attention path can take: at least one token, and no wider than the
+    // context, past which no forward could ever be that long anyway.
+    if let Some(chunk) = settings.prefill_chunk {
+        ensure!(
+            chunk <= settings.context_length,
+            "prefill_chunk {chunk} is wider than context_length {} (no prefill forward \
+             can be longer than the window it fills); leave it unset to let the chunk \
+             narrow with the context instead",
+            settings.context_length
+        );
+    }
+
     // The same range the images route enforces on a request's own step count.
     // Refused at startup rather than clamped per render, so an operator learns
     // about it before the first image instead of from a 400 a client sent no
@@ -1388,6 +1419,7 @@ pub fn init_template() -> String {
     let host = DEFAULT_HOST;
     let port = DEFAULT_PORT;
     let ctx = DEFAULT_CONTEXT_LENGTH;
+    let sparse_min_kv = crate::ops::QSA_SPARSE_MIN_KV_DEFAULT;
     // Cache sizes are a property of the checkpoint, not of the server, so they
     // are derived from the model this template quotes rather than restated here.
     let kv_bytes_per_token = TEMPLATE_MODEL.kv_bytes_per_token();
@@ -1498,6 +1530,17 @@ port = {port}
 # served at its own limit whatever is set here. Decode speed depends on the
 # tokens a conversation actually uses, not on what was allocated.
 context_length = {ctx}
+
+# Prompt tokens per prefill forward. Commented out, the width adapts to the
+# conversation: the architecture's fitted chunk (2048 on the MoE checkpoints,
+# 512 on the dense ones) up to {sparse_min_kv} tokens of context, then halved for each
+# doubling past it, down to 512. A forward's GPU transients — the attention
+# mask, the score tile, the sparse route's gathered columns — are all
+# proportional to the chunk times the cache length, while what the weights and
+# the KV cache leave of the GPU working set is fixed, so a constant chunk is
+# what runs out of room deep in a long conversation. Setting a value pins one
+# width at every position, which is worth doing only to measure something.
+# prefill_chunk = 2048
 
 # Drop the model after this long without a request, returning the GPU-resident
 # weights (19-37 GB depending on checkpoint and quant) and whatever the KV
@@ -1894,6 +1937,51 @@ mod tests {
         // Unresolved too: absent means the image pipeline's own step count, and
         // that number belongs to the pipeline rather than to the server.
         assert_eq!(s.image_steps, None);
+        // Absent means the architecture's own chunk, narrowing as the context
+        // grows; the server pins a width only when told to.
+        assert_eq!(s.prefill_chunk, None);
+    }
+
+    /// The prefill chunk: absent means the architecture's context tiering, zero
+    /// says the same thing rather than pinning a zero-token forward, a flag
+    /// beats a config file with a warning naming both, and a width past the
+    /// context is a startup error rather than a forward nothing could run.
+    #[test]
+    fn the_prefill_chunk_is_optional_and_zero_means_adaptive() {
+        let file: ServeToml = toml::from_str("prefill_chunk = 2048\n").unwrap();
+        let (from_file, warnings) =
+            resolve(&file, Some(Path::new("/etc/serve.toml")), &model_only()).unwrap();
+        assert_eq!(from_file.prefill_chunk, Some(2048));
+        assert!(warnings.is_empty());
+
+        let zero: ServeToml = toml::from_str("prefill_chunk = 0\n").unwrap();
+        let (adaptive, _) = resolve(&zero, None, &model_only()).unwrap();
+        assert_eq!(adaptive.prefill_chunk, None);
+
+        let cli = CliOverrides {
+            prefill_chunk: Some(512),
+            ..model_only()
+        };
+        let (merged, warnings) = resolve(&file, Some(Path::new("/etc/serve.toml")), &cli).unwrap();
+        assert_eq!(merged.prefill_chunk, Some(512));
+        assert_eq!(
+            warnings,
+            vec![
+                "warning: --prefill-chunk 512 overrides config prefill_chunk = 2048 \
+                 (/etc/serve.toml)"
+                    .to_string()
+            ]
+        );
+
+        let cli = CliOverrides {
+            prefill_chunk: Some(DEFAULT_CONTEXT_LENGTH + 1),
+            ..model_only()
+        };
+        let err = resolve(&ServeToml::default(), None, &cli).unwrap_err();
+        assert!(
+            err.to_string().contains("is wider than context_length"),
+            "{err:#}"
+        );
     }
 
     /// The images route's step default: absent means the pipeline's own count,

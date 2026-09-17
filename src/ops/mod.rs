@@ -524,13 +524,24 @@ pub fn host_mask() -> bool {
     *V.get_or_init(|| std::env::var_os("XWEN_HOST_MASK").is_some())
 }
 
-/// `XWEN_PREFILL_CHUNK=<usize>` overrides the prefill chunk — how many prompt
-/// tokens every prefill path (`generate`/`chat`/`batch`, serve, the ppl pass)
-/// feeds the model per forward. The default is per architecture
-/// (`Arch::prefill_chunk_default`, read through `XwenModel::prefill_chunk`);
-/// this is the A/B knob over it. Cached (read once); unset, unparseable or
-/// zero means "no override".
+/// The prefill chunk pinned for this process — how many prompt tokens every
+/// prefill path (`generate`/`chat`/`batch`, serve, the ppl pass) feeds the
+/// model per forward, at every position. `None` leaves the width to the
+/// architecture: its fitted default (`Arch::prefill_chunk_default`, read
+/// through `XwenModel::prefill_chunk`) or the context tiering over it
+/// (`Arch::prefill_chunk_at`, read through `XwenModel::prefill_chunk_at`).
+///
+/// Two ways to pin it, and `XWEN_PREFILL_CHUNK` wins: the env var is the A/B
+/// knob a bench run reaches for, and it would be worth nothing if a config file
+/// on the machine could quietly outrank it. `set_prefill_chunk` is the
+/// configured one (`serve --prefill-chunk`).
 pub fn prefill_chunk_override() -> Option<usize> {
+    prefill_chunk_env().or_else(|| PREFILL_CHUNK_SET.get().copied())
+}
+
+/// `XWEN_PREFILL_CHUNK=<usize>`. Cached (read once); unset, unparseable or zero
+/// means "no override".
+fn prefill_chunk_env() -> Option<usize> {
     static V: OnceLock<Option<usize>> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("XWEN_PREFILL_CHUNK")
@@ -538,6 +549,23 @@ pub fn prefill_chunk_override() -> Option<usize> {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
     })
+}
+
+static PREFILL_CHUNK_SET: OnceLock<usize> = OnceLock::new();
+
+/// Pin the prefill chunk from configuration, before any model is loaded. Zero
+/// is "no pin" and is ignored, as is a second call: the width one forward ran
+/// at has to be the width the next one runs at, every cache image and every
+/// measured rate being read across forwards.
+///
+/// Returns what the process will actually use, which is `XWEN_PREFILL_CHUNK`
+/// when that is set — the caller says so rather than reporting a width that
+/// did not take.
+pub fn set_prefill_chunk(tokens: usize) -> Option<usize> {
+    if tokens > 0 {
+        let _ = PREFILL_CHUNK_SET.set(tokens);
+    }
+    prefill_chunk_override()
 }
 
 /// Largest token count routed to the vendored small-batch mat-vec

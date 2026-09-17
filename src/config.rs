@@ -105,6 +105,11 @@ pub enum ZGate {
 /// moe.rs's candle-chain fallback applies the same value.
 pub const MOE_SUM_FLOOR: f32 = 6.103515625e-5;
 
+/// The narrowest prefill chunk [`Arch::prefill_chunk_at`] will taper to. It is
+/// the dense architectures' own fitted width, so a chunk at the floor is one
+/// this machine has measured rather than a width nothing has run.
+pub const MIN_PREFILL_CHUNK: usize = 512;
+
 impl Arch {
     /// The GGUF `general.architecture` string this variant is parsed from, which
     /// is also the prefix every other metadata key carries.
@@ -140,6 +145,36 @@ impl Arch {
             Arch::Dense | Arch::Qwen3 => 512,
             Arch::Moe | Arch::Qwen4Exp => 2048,
         }
+    }
+
+    /// The prefill chunk for a forward that starts at absolute position `pos`:
+    /// the fitted default up to [`ops::QSA_SPARSE_MIN_KV_DEFAULT`], then halved
+    /// for each doubling of the cache past it, down to
+    /// [`MIN_PREFILL_CHUNK`].
+    ///
+    /// A chunk's attention transients — the mask planes, the score tile, and on
+    /// the sparse route the gathered key and value columns — are all
+    /// `chunk x n_kv`, so a constant chunk makes the peak grow linearly with
+    /// the conversation while the space left over for it does not: the weights
+    /// and the KV cache hold their share of the Metal working set whatever the
+    /// position is. Halving the chunk per doubling keeps that product flat, at
+    /// the fitted chunk's prefill rate up to the threshold, where the sparse
+    /// route takes over and the per-forward overhead the wide chunk amortizes
+    /// is the smaller term anyway.
+    ///
+    /// Tied to the sparse gate because the two describe the same crossover from
+    /// one side each: past it attention stops reading the whole prefix, and
+    /// past it a chunk's transients stop fitting beside everything resident.
+    /// `XWEN_PREFILL_CHUNK` and `--prefill-chunk` pin a width instead
+    /// (`XwenModel::prefill_chunk_at`).
+    pub fn prefill_chunk_at(&self, pos: usize) -> usize {
+        let mut chunk = self.prefill_chunk_default();
+        let mut ceiling = crate::ops::QSA_SPARSE_MIN_KV_DEFAULT;
+        while pos > ceiling && chunk > MIN_PREFILL_CHUNK {
+            chunk /= 2;
+            ceiling = ceiling.saturating_mul(2);
+        }
+        chunk.max(MIN_PREFILL_CHUNK)
     }
 
     /// The checkpoint to assume for this architecture when nothing else
@@ -1763,5 +1798,49 @@ mod tests {
         assert!(err.contains("qwen3"), "{err}");
         assert!(err.contains("safetensors"), "{err}");
         assert!(err.contains("qwen3-4b"), "{err}");
+    }
+    /// The prefill chunk holds the fitted width through the short-context
+    /// regime and halves once per doubling of the cache past the sparse gate,
+    /// down to the floor. What it keeps flat is the product the transients are
+    /// proportional to: chunk times cache length.
+    #[test]
+    fn the_prefill_chunk_halves_once_per_doubling_past_the_sparse_gate() {
+        let gate = crate::ops::QSA_SPARSE_MIN_KV_DEFAULT;
+        assert_eq!(gate, 49152, "the tiering's boundaries are quoted from this");
+
+        for &pos in &[0, 1, 8192, 49151, gate] {
+            assert_eq!(
+                Arch::Qwen4Exp.prefill_chunk_at(pos),
+                2048,
+                "at {pos} the fitted chunk still fits"
+            );
+        }
+        for &pos in &[gate + 1, 65536, 2 * gate] {
+            assert_eq!(Arch::Qwen4Exp.prefill_chunk_at(pos), 1024, "at {pos}");
+        }
+        for &pos in &[2 * gate + 1, 131072, 262144, usize::MAX] {
+            assert_eq!(
+                Arch::Qwen4Exp.prefill_chunk_at(pos),
+                MIN_PREFILL_CHUNK,
+                "at {pos} the chunk is at the floor"
+            );
+        }
+
+        // The dense architectures start at the floor, so context changes nothing.
+        for arch in [Arch::Dense, Arch::Qwen3] {
+            for &pos in &[0, gate, 262144] {
+                assert_eq!(arch.prefill_chunk_at(pos), MIN_PREFILL_CHUNK);
+            }
+        }
+
+        // A narrowing is never a widening: the width is monotonically
+        // non-increasing in position, which is what lets a span re-ask for it at
+        // each chunk without a chunk ever growing mid-prompt.
+        let mut previous = Arch::Moe.prefill_chunk_at(0);
+        for pos in (0..300_000).step_by(1024) {
+            let now = Arch::Moe.prefill_chunk_at(pos);
+            assert!(now <= previous, "chunk widened at {pos}");
+            previous = now;
+        }
     }
 }

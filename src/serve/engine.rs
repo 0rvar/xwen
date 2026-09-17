@@ -1301,6 +1301,11 @@ struct JobTrace {
     /// RAN: one that failed before the runner returned has no summary and would
     /// otherwise be reported as the native generation it is not.
     batch_job: bool,
+    /// Whether the GPU working-set headroom line has been said for this request.
+    /// A prompt is prefilled in one span per snapshot stop, and the free working
+    /// set the spans report is the same number each time; saying it once keeps
+    /// the log readable for the request it describes.
+    headroom_reported: bool,
     record: JobRecord,
 }
 
@@ -1316,6 +1321,7 @@ impl JobTrace {
             picked,
             first_sent: Cell::new(None),
             batch_job,
+            headroom_reported: false,
             record: JobRecord {
                 origin,
                 model,
@@ -2474,6 +2480,58 @@ fn plan_snapshot_stops<S>(
     stops
 }
 
+/// Say once per request when a prefill span's transients are estimated past the
+/// GPU working set that is free for them.
+///
+/// The working set is the device's own `recommendedMaxWorkingSetSize` — 107.5
+/// GiB on this machine — and the weights, the KV cache and the recurrent state
+/// hold their share of it for as long as the model is resident, whatever a
+/// prefill is doing. What is left is what a forward's transients have, and those
+/// grow with the chunk times the cache length
+/// (`memory::prefill_transient_bytes`). Over the line the run does not refuse:
+/// the estimate is an estimate, the tapering chunk is the mitigation, and what a
+/// refusal would cost is a conversation that would have finished. What it buys
+/// is the evidence in serve.log for the case where the drain at the end of the
+/// span returns a Metal out-of-memory instead, which names no sizes of its own.
+fn report_prefill_headroom(
+    engine: &EngineState,
+    abandon: &Abandon,
+    span_len: usize,
+    start_pos: usize,
+    trace: &mut JobTrace,
+) {
+    if trace.headroom_reported {
+        return;
+    }
+    let snapshot = crate::memory::sample("prefill", Some(&engine.device));
+    let (Some(allocated), Some(recommended)) = (
+        snapshot.metal_allocated_bytes,
+        snapshot.metal_recommended_bytes,
+    ) else {
+        return;
+    };
+    // The span's widest forward: the chunk is widest at the span's start and the
+    // cache longest at its end, so their product bounds every forward in it.
+    let chunk = engine.generator.prefill_chunk_at(start_pos);
+    let n_kv = start_pos + span_len;
+    let estimate = crate::memory::prefill_transient_bytes(chunk, n_kv);
+    let free = recommended.saturating_sub(allocated);
+    if estimate <= free {
+        return;
+    }
+    trace.headroom_reported = true;
+    let gb = |bytes: u64| bytes as f64 / 1e9;
+    abandon.logger.log(ServeLog::HostLine(format!(
+        "xwen serve: prefilling to {n_kv} tokens at chunk {chunk} estimates {:.1} GB of GPU \
+         transients against {:.1} GB free working set ({:.1} GB allocated of {:.1} GB \
+         recommended); an out-of-memory from here surfaces at the drain that closes the span",
+        gb(estimate),
+        gb(free),
+        gb(allocated),
+        gb(recommended),
+    )));
+}
+
 /// Prefill one span of the prompt, checking between chunks whether anyone still wants it.
 /// A 100k-token prompt is a minute of GPU time, and running it to completion for a job
 /// nobody is waiting on is a minute the next request waits for nothing.
@@ -2494,27 +2552,42 @@ fn prefill(
     total: usize,
     trace: &mut JobTrace,
 ) -> Result<Option<CancelReason>> {
-    // The same chunk as the generate path, so splitting a prefill to check for a
-    // departed client costs no extra GPU passes.
-    let chunk_len = engine.generator.prefill_chunk();
     if tokens.is_empty() {
         return Ok(None);
     }
     if let Some(reason) = abandon.reason() {
         return Ok(Some(reason));
     }
+    report_prefill_headroom(engine, abandon, tokens.len(), start_pos, trace);
     // Cache restoration belongs to dispatch, not prefill. Drain it before opening
-    // this span's clock, then allow all of the span's chunks to pipeline together.
+    // this span's clock, then allow the span's chunks to pipeline together — up to
+    // the point where one chunk's transients are too large to hold two of them.
     engine.device.synchronize()?;
     let started = Instant::now();
     let outcome = (|| -> Result<Option<CancelReason>> {
-        for (index, chunk) in tokens.chunks(chunk_len).enumerate() {
+        let mut offset = 0usize;
+        while offset < tokens.len() {
             if let Some(reason) = abandon.reason() {
                 return Ok(Some(reason));
             }
-            let at = start_pos + index * chunk_len;
+            let at = start_pos + offset;
+            // The same chunk as the generate path, so splitting a prefill to check
+            // for a departed client costs no extra GPU passes. Asked per chunk
+            // because the width tapers with the cache length.
+            let end = (offset + engine.generator.prefill_chunk_at(at)).min(tokens.len());
+            let chunk = &tokens[offset..end];
+            offset = end;
             engine.generator.prefill_tokens(chunk, at)?;
             trace.record.prefill_tokens += chunk.len();
+            // Pooled buffers count against the GPU working set until a wait prunes
+            // them, and pipelined chunks hold two forwards' worth at once. Deep in
+            // a conversation one forward's transients are a large enough share of
+            // the working set that the pair does not fit beside the weights and the
+            // cache, so each chunk is drained before the next is enqueued; nearer
+            // the front they pipeline.
+            if at >= crate::ops::QSA_SPARSE_MIN_KV_DEFAULT {
+                engine.device.synchronize()?;
+            }
             // These are submitted chunks. GPU completion and its measured rate are
             // reported separately at the span boundary.
             abandon.logger.log(ServeLog::PrefillTick {
