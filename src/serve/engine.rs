@@ -2495,8 +2495,10 @@ fn plan_snapshot_stops<S>(
 /// absence is the meaningful half. Over the line the run does not refuse:
 /// the estimate is an estimate, the tapering chunk is the mitigation, and what a
 /// refusal would cost is a conversation that would have finished. What it buys
-/// is the evidence in serve.log for the case where the drain at the end of the
-/// span returns a Metal out-of-memory instead, which names no sizes of its own.
+/// is the evidence in serve.log for the case where a drain returns a Metal
+/// out-of-memory instead, which names no sizes of its own. Which drain that is
+/// depends on the position: the one closing the span, or, once the chunks stop
+/// pipelining, the one between two of them.
 fn report_prefill_headroom(
     engine: &EngineState,
     abandon: &Abandon,
@@ -2514,25 +2516,38 @@ fn report_prefill_headroom(
     ) else {
         return;
     };
-    // The span's widest forward: the chunk is widest at the span's start and the
-    // cache longest at its end, so their product bounds every forward in it.
-    let chunk = engine.generator.prefill_chunk_at(start_pos);
+    // The span's most expensive forward, over the very widths the span will be
+    // fed in: widths taper in steps while the cache grows continuously, so it is
+    // neither the first chunk nor the last one in general.
+    let mut pos = start_pos;
+    let mut estimate = 0u64;
+    let mut chunk = 0usize;
+    for width in engine.generator.prefill_span_chunks(start_pos, span_len) {
+        pos += width;
+        let bytes = crate::memory::prefill_transient_bytes(width, pos);
+        if bytes > estimate {
+            estimate = bytes;
+            chunk = width;
+        }
+    }
     let n_kv = start_pos + span_len;
-    let estimate = crate::memory::prefill_transient_bytes(chunk, n_kv);
     let free = recommended.saturating_sub(allocated);
     if estimate <= free {
         return;
     }
     trace.headroom_reported = true;
-    let gb = |bytes: u64| bytes as f64 / 1e9;
+    // GiB, the unit `recommendedMaxWorkingSetSize` is quoted in everywhere else
+    // (107.5 GiB on this machine), so a log line and the docs compare directly.
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     abandon.logger.log(ServeLog::HostLine(format!(
-        "xwen serve: prefilling to {n_kv} tokens at chunk {chunk} estimates {:.1} GB of GPU \
-         transients against {:.1} GB free working set ({:.1} GB allocated of {:.1} GB \
-         recommended); an out-of-memory from here surfaces at the drain that closes the span",
-        gb(estimate),
-        gb(free),
-        gb(allocated),
-        gb(recommended),
+        "xwen serve: prefilling to {n_kv} tokens at chunk {chunk} estimates {:.1} GiB of GPU \
+         transients against {:.1} GiB free working set ({:.1} GiB allocated of {:.1} GiB \
+         recommended); an out-of-memory from here surfaces at the next drain, not at the \
+         allocation",
+        gib(estimate),
+        gib(free),
+        gib(allocated),
+        gib(recommended),
     )));
 }
 
@@ -2569,30 +2584,28 @@ fn prefill(
     engine.device.synchronize()?;
     let started = Instant::now();
     let outcome = (|| -> Result<Option<CancelReason>> {
+        // The same widths the generate path feeds, so splitting a prefill to check
+        // for a departed client costs no extra GPU passes.
+        let widths = engine
+            .generator
+            .prefill_span_chunks(start_pos, tokens.len());
         let mut offset = 0usize;
-        while offset < tokens.len() {
+        for width in widths {
             if let Some(reason) = abandon.reason() {
                 return Ok(Some(reason));
             }
             let at = start_pos + offset;
-            // The same chunk as the generate path, so splitting a prefill to check
-            // for a departed client costs no extra GPU passes. Asked per chunk
-            // because the width tapers with the cache length.
-            let end = (offset + engine.generator.prefill_chunk_at(at)).min(tokens.len());
-            let chunk = &tokens[offset..end];
-            offset = end;
+            let chunk = &tokens[offset..offset + width];
+            offset += width;
             engine.generator.prefill_tokens(chunk, at)?;
             trace.record.prefill_tokens += chunk.len();
-            // Pooled buffers count against the GPU working set until a wait prunes
-            // them, and pipelined chunks hold two forwards' worth at once. Deep in
-            // a conversation one forward's transients are a large enough share of
-            // the working set that the pair does not fit beside the weights and the
-            // cache, so each chunk is drained before the next is enqueued; nearer
-            // the front they pipeline. The shipped constant rather than
-            // `ops::qsa_sparse_min_kv()`, for the reason `Arch::prefill_chunk_at`
-            // gives: an A/B on the sparse route is not a request to change how
-            // much memory a forward holds.
-            if at >= crate::ops::QSA_SPARSE_MIN_KV_DEFAULT {
+            // Where one chunk's transients are a large share of the free working
+            // set, two pipelined forwards hold more of it than is there. The model
+            // owns that judgement, arch and position both
+            // (`prefill_drains_between_chunks`); everywhere else the chunks
+            // pipeline. This is where a deep span's out-of-memory surfaces, and
+            // the measured-rate log below is guarded on it.
+            if engine.generator.prefill_drains_between_chunks(at) {
                 engine.device.synchronize()?;
             }
             // These are submitted chunks. GPU completion and its measured rate are
@@ -2608,7 +2621,12 @@ fn prefill(
     // snapshot readback or the first decode sample can absorb its outstanding work.
     let drained = engine.device.synchronize();
     trace.record.prefill_secs += started.elapsed().as_secs_f64();
-    if drained.is_ok() {
+    // A cancelled span reports: its tokens really were prefilled and timed. A
+    // FAILED one does not, and either drain can be the one that fails — the
+    // between-chunk drain surfaces inside the closure and leaves this one with
+    // nothing outstanding to fail on, so a rate here would be a figure for work
+    // that did not finish.
+    if outcome.is_ok() && drained.is_ok() {
         abandon.logger.log(ServeLog::PrefillMeasured {
             tokens: trace.record.prefill_tokens,
             secs: trace.record.prefill_secs,

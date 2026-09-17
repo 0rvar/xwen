@@ -294,11 +294,11 @@ priced, not their rank ([the record](docs/records/zimage-perf.md), "The power en
 
 ## Prefill performance
 
-- [ ] [small] **The tiered prefill chunk is unverified and the >49k rows are stale.** The
-   chunk halves past 49,152 positions (2026-09-17), so `flashnext-replay.ts` owes a run at
-   a position past the boundary, and the 65596 and 131424 rows in perf-state.md were both
-   measured at 2048 and beside 77 GB of weights instead of today's 93.2. Needs a window
-   with no server resident. [Record](docs/records/gpu-working-set.md).
+- [ ] [small] **Flash-Next's tiered prefill chunk is unverified and its >49k rows are
+   stale.** Its chunk halves past 49,152 positions (2026-09-17), so `flashnext-replay.ts`
+   owes a run at a position past the boundary, and its 65596 and 131424 rows in
+   perf-state.md were measured at 2048 beside 77 GB of weights against today's 93.2. Needs
+   a window with no server resident. [Record](docs/records/gpu-working-set.md).
   From: A deep prefill runs out of GPU working set (2026-09-17).
 
 - [ ] [measured] **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (amortized

@@ -436,7 +436,10 @@ the cache past `QSA_SPARSE_MIN_KV_DEFAULT` (2048 to 49,152, then 1024, then the 
 above 98,304), asked per chunk rather than per span, and only ever narrowing. That holds
 the product flat while there is width to give up and then lets it grow at a quarter of the
 slope — 12.9 GB at the end of a 262,144-token window — so it is headroom bought and not a
-bound. The boundary is the shipped constant and not `qsa_sparse_min_kv()`, whose env var
+bound. It is `qwen4exp` ONLY (`Arch::tapers_prefill_chunk`), and the 35B-A3B is the reason
+the gate exists rather than the 2048 being tapered wherever it is fitted: same chunk, 20.4
+GB of weights, no indexer and no gathers, a 17 GB peak measured at 131k with the set mostly
+free, and a declared tok/s target that a narrower chunk would cost for headroom it has. The boundary is the shipped constant and not `qsa_sparse_min_kv()`, whose env var
 is an A/B on the route rather than a request to change what a forward holds. The one-shot
 CLI paths keep the constant chunk, so the bench figures stay comparable
 (`records/gpu-working-set.md` "Not taken now"). The mask is worth its own lever: `AttnBlock` reads the hoisted one only
@@ -456,7 +459,11 @@ finished. The same constant replaces `language_peak_bytes`'s flat 8 GiB of scrat
 the widest forward the load can reach, which a window walk finds because the peak is the
 last wide chunk before a tier boundary and not the narrow one at `max_ctx`; floored at the
 old value, and 12.0 GiB at the default window, so a full-window load asks admission for
-4 GiB more than it did. Not verified: the tiering
+4 GiB more than it did. Arch-gated for a second reason there: admission REFUSES, so the
+96 bytes calibrated on the sparse route stay off the checkpoints whose real transient is a
+gigabyte. Two smaller things the same shape: the drain gate and the taper share one
+predicate so they cannot come apart, and a span that FAILS no longer logs a prefill rate,
+the between-chunk drain being a way for it to fail that did not exist before. Not verified: the tiering
 changes which forwards run, and `flashnext-replay.ts` could not run beside a resident
 server — owed, and the arithmetic per forward is unchanged by construction
 ([record](../records/gpu-working-set.md), 2026-09-17).

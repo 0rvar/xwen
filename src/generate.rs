@@ -1900,18 +1900,18 @@ impl Generator {
     /// position. The taps are drained either way, so a dropped chunk's taps never
     /// accumulate into the next one, and the target's tokens and logits are
     /// unaffected.
-    /// The prefill chunk this generator's model runs (`XwenModel::prefill_chunk`),
-    /// so a caller splitting a prefill itself chunks at the same boundary.
-    pub fn prefill_chunk(&self) -> usize {
-        self.model.prefill_chunk()
+    /// The chunk widths this generator's model feeds a span of `len` tokens
+    /// starting at `start` in (`XwenModel::prefill_span_chunks`), so a caller
+    /// splitting a long prefill itself narrows at the same positions rather than
+    /// handing over spans this would only re-split.
+    pub fn prefill_span_chunks(&self, start: usize, len: usize) -> Vec<usize> {
+        self.model.prefill_span_chunks(start, len)
     }
 
-    /// The prefill chunk this generator's model runs at absolute position `pos`
-    /// (`XwenModel::prefill_chunk_at`), so a caller splitting a long prefill
-    /// itself narrows at the same positions rather than handing over spans this
-    /// would only re-split.
-    pub fn prefill_chunk_at(&self, pos: usize) -> usize {
-        self.model.prefill_chunk_at(pos)
+    /// Whether a caller feeding a span chunk by chunk should drain the device
+    /// after the chunk starting at `pos` (`XwenModel::prefill_drains_between_chunks`).
+    pub fn prefill_drains_between_chunks(&self, pos: usize) -> bool {
+        self.model.prefill_drains_between_chunks(pos)
     }
 
     pub fn prefill_tokens(&mut self, tokens: &[u32], start_pos: usize) -> Result<()> {
@@ -1932,15 +1932,10 @@ impl Generator {
         let device = model.device().clone();
         model.set_phase(Phase::Prefill);
         let mut pos = start_pos;
-        // Chunk width is asked for at each chunk's own start position, not once
-        // for the span: deep in a conversation the width tapers with the cache
-        // length (`XwenModel::prefill_chunk_at`), so a span that crosses a tier
-        // boundary narrows inside itself.
         let mut offset = 0usize;
-        while offset < tokens.len() {
-            let end = (offset + model.prefill_chunk_at(pos)).min(tokens.len());
-            let chunk = &tokens[offset..end];
-            offset = end;
+        for width in model.prefill_span_chunks(start_pos, tokens.len()) {
+            let chunk = &tokens[offset..offset + width];
+            offset += width;
             let input = Tensor::new(chunk, &device)?;
             *last_logits = Some(model.forward(&input, pos)?);
             // Drain both hidden-state channels unconditionally: either one left

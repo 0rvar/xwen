@@ -695,6 +695,28 @@ impl XwenModel {
         crate::ops::prefill_chunk_override().unwrap_or(self.cfg.arch.prefill_chunk_at(pos))
     }
 
+    /// The chunk widths a prefill span of `len` tokens starting at `start` is
+    /// fed in ([`crate::config::prefill_span_chunks`] over this model's own
+    /// width), so a caller that splits a span itself hands over chunks this
+    /// would not re-split.
+    pub fn prefill_span_chunks(&self, start: usize, len: usize) -> Vec<usize> {
+        crate::config::prefill_span_chunks(|pos| self.prefill_chunk_at(pos), start, len)
+    }
+
+    /// Whether a caller feeding a span chunk by chunk should drain the device
+    /// after a chunk that starts at `pos` instead of letting the next one
+    /// pipeline behind it.
+    ///
+    /// Pooled buffers count against the GPU working set until a wait prunes
+    /// them, so two pipelined forwards hold two chunks' transients at once. That
+    /// is worth bounding exactly where one chunk's transients are already a
+    /// large share of what is free, which is the same architecture and the same
+    /// crossover the chunk taper keys on ([`crate::config::Arch::prefill_chunk_at`]);
+    /// everywhere else the pipelining is free and is kept.
+    pub fn prefill_drains_between_chunks(&self, pos: usize) -> bool {
+        self.cfg.arch.tapers_prefill_chunk() && pos >= crate::ops::QSA_SPARSE_MIN_KV_DEFAULT
+    }
+
     /// Identity of the checkpoint this model was loaded from — what a persisted
     /// cache image is stamped with and validated against.
     pub fn checkpoint_id(&self) -> crate::gguf::CheckpointId {
@@ -1703,13 +1725,19 @@ fn gguf_weight_bytes(gguf: &GgufFile) -> (u64, u64) {
 /// working window, then monitor actual pressure as pages are touched. Scratch
 /// covers dequantized planes and prefill temporaries beside persistent state.
 ///
-/// The prefill term is the widest forward this load can reach, which is the
-/// largest `chunk x cache length` any chunk of a full-window walk takes
-/// ([`peak_prefill_transient_bytes`]) and NOT the width at `max_ctx`: the last
-/// wide chunk before a tier boundary beats the narrow one at the end. It is
-/// floored at the 8 GiB that covered dequantized planes and short-context
-/// prefills before context made the transients the larger term, so a small
-/// window admits exactly as it did.
+/// The prefill term is the flat 8 GiB that has always covered dequantized
+/// planes and short-context prefills, except on the architecture whose
+/// transients outgrow it (`Arch::tapers_prefill_chunk`), where it is the widest
+/// forward the load can reach: the largest `chunk x cache length` any chunk of a
+/// full-window walk takes ([`peak_prefill_transient_bytes`]), and NOT the width
+/// at `max_ctx` — the last wide chunk before a tier boundary beats the narrow
+/// one at the end. The 8 GiB stays the floor there too.
+///
+/// Arch-gated because this estimate REFUSES: 96 bytes per element is calibrated
+/// on Flash-Next's sparse route, where a forward gathers key and value columns
+/// beside the mask planes every architecture pays, and applying it to a
+/// checkpoint whose real transient is about a gigabyte would deny admission for
+/// memory nothing asks for.
 fn language_peak_bytes(
     weights: u64,
     ple: u64,
@@ -1726,7 +1754,11 @@ fn language_peak_bytes(
         * ((cfg.conv_kernel as u64).saturating_sub(1) * cfg.conv_dim() as u64
             + cfg.linear_v_heads as u64 * hd * hd)
         + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx);
-    let scratch = peak_prefill_transient_bytes(cfg.arch, max_ctx).max(8 * GIB);
+    let scratch = if cfg.arch.tapers_prefill_chunk() {
+        peak_prefill_transient_bytes(cfg.arch, max_ctx).max(8 * GIB)
+    } else {
+        8 * GIB
+    };
     weights
         .saturating_add(ple.min(4 * GIB))
         .saturating_add(kv_bytes(cfg, slots))
@@ -1747,10 +1779,11 @@ fn peak_prefill_transient_bytes(arch: crate::config::Arch, max_ctx: usize) -> u6
     let pinned = crate::ops::prefill_chunk_override();
     let mut pos = 0usize;
     let mut peak = 0u64;
-    while pos < max_ctx {
-        let chunk = pinned
-            .unwrap_or_else(|| arch.prefill_chunk_at(pos))
-            .clamp(1, max_ctx - pos);
+    for chunk in crate::config::prefill_span_chunks(
+        |at| pinned.unwrap_or_else(|| arch.prefill_chunk_at(at)),
+        0,
+        max_ctx,
+    ) {
         pos += chunk;
         peak = peak.max(crate::memory::prefill_transient_bytes(chunk, pos));
     }
@@ -1965,5 +1998,14 @@ mod tests {
             peak_prefill_transient_bytes(Arch::Qwen4Exp, 100),
             per * 100 * 100
         );
+
+        // An architecture that does not taper feeds a constant chunk, so its
+        // last forward is its widest — and `language_peak_bytes` does not apply
+        // this term to it at all, the 96 bytes being Flash-Next's sparse route.
+        assert_eq!(
+            peak_prefill_transient_bytes(Arch::Moe, 262_144),
+            per * 2048 * 262_144
+        );
+        assert!(!Arch::Moe.tapers_prefill_chunk());
     }
 }

@@ -14,8 +14,9 @@ process footprint going 25 to 43 GB during each attempt, and system use 120 to 1
 137.
 
 Nothing was leaking. The prefill asked the GPU for more than was left, the error surfaced
-at `engine.device.synchronize()` rather than at the allocation, and the three levers below
-bound what it asks for.
+at a `synchronize()` rather than at the allocation — the one closing the span then, and
+since the third lever below a between-chunk one deep in a conversation — and the three
+levers bound what it asks for.
 
 ## The accounting
 
@@ -50,22 +51,31 @@ headroom a run today does not.
 
 ## Three levers
 
-**The chunk tapers with the context.** `Arch::prefill_chunk_at(pos)` holds the fitted
-width up to `ops::QSA_SPARSE_MIN_KV_DEFAULT` (49,152, the sparse gate) and halves it for
-each doubling past that, floored at 512:
+**The chunk tapers with the context, on Flash-Next alone.**
+`Arch::prefill_chunk_at(pos)` holds the fitted width up to
+`ops::QSA_SPARSE_MIN_KV_DEFAULT` (49,152, the sparse gate) and halves it for each doubling
+past that, floored at 512:
 
-| cache position | Flash-Next / 35B-A3B | dense 27B / Qwen3-4B |
-| --- | --- | --- |
-| 0 to 49,152 | 2048 | 512 |
-| 49,153 to 98,304 | 1024 | 512 |
-| above 98,304 | 512 | 512 |
+| cache position | Flash-Next | 35B-A3B | dense 27B / Qwen3-4B |
+| --- | --- | --- | --- |
+| 0 to 49,152 | 2048 | 2048 | 512 |
+| 49,153 to 98,304 | 1024 | 2048 | 512 |
+| above 98,304 | 512 | 2048 | 512 |
 
-That holds chunk times cache length flat while there is width left to give up, and it
-costs the fitted prefill rate only past the point where the sparse route has already taken
-over from dense attention. Past the floor the product grows again at a quarter of the
-slope: at the default 262,144 window a 512-token chunk at the end of the walk is 12.9 GB
-against the ~17 GB above. This buys headroom, it does not bound the transients, and a
-window much past 262k would need a lever this arc does not have.
+`Arch::tapers_prefill_chunk()` is what gates that, and it is `qwen4exp` only. The 35B-A3B
+shares the fitted 2048 and none of the reason for narrowing it: 20.4 GB of weights against
+Flash-Next's 93.2, no indexer, no gathered key and value columns, and a 17 GB peak
+measured at 131k tokens with most of the working set free
+([perf-state.md](../perf-state.md)). It is also a declared tok/s target, so a narrower
+chunk there would cost prefill rate to buy headroom it already has. The dense
+architectures are at the floor at every position anyway.
+
+On Flash-Next the taper holds chunk times cache length flat while there is width left to
+give up, and it costs the fitted prefill rate only past the point where the sparse route
+has already taken over from dense attention. Past the floor the product grows again at a
+quarter of the slope: at the default 262,144 window a 512-token chunk at the end of the
+walk is 12.9 GB against the ~17 GB above. This buys headroom, it does not bound the
+transients, and a window much past 262k would need a lever this arc does not have.
 
 Serve's span loop and `Generator::prefill_tokens` both ask for the width at each chunk's
 own start position, so a span that crosses a boundary narrows inside itself. The width is
@@ -85,9 +95,14 @@ change is inert by construction, the mask being discarded in exactly the cases i
 not built for, and the existing `force_dense_qsa` equivalence tests pin the arm that still
 reads it.
 
-**Chunks stop pipelining past the gate.** Above 49,152 the span loop drains the device
-between chunks, so the pool holds one chunk's garbage instead of two. Below it the chunks
-pipeline as before. This is not a claim that syncing is faster: `decisions.md`
+**Chunks stop pipelining past the gate.** Above 49,152, and on the same architecture the
+taper gates on, the span loop drains the device between chunks, so the pool holds one
+chunk's garbage instead of two. Everywhere else the chunks pipeline as before.
+`XwenModel::prefill_drains_between_chunks` owns both halves of that judgement, so the
+drain and the taper cannot come apart. It is also where a deep span's out-of-memory now
+surfaces, which is why the measured-rate log is guarded on the span having succeeded: a
+failed span reported a prefill rate for work that did not finish. This is not a claim that
+syncing is faster: `decisions.md`
 "Chunk-boundary device syncs and command-buffer batching granularity are both REFUTED as
 levers on the 27B prefill residual" priced the sync at +9.2 µs/token at 925 tokens and
 +2.4 at 4k, a fixed price per chunk, and found nothing length-dependent behind it. The
@@ -99,23 +114,29 @@ Serve samples `currentAllocatedSize` and `recommendedMaxWorkingSetSize` before e
 prefill span and estimates the span's transients at 96 bytes per (chunk token x cache
 token), which is the 18 GB measured at 2048 x 92k divided out
 (`memory::TRANSIENT_BYTES_PER_CHUNK_CONTEXT_TOKEN`). Over the free working set it says so
-once per request, naming the allocated and recommended sizes, the estimate and the chunk.
+once per request, naming the allocated and recommended sizes, the estimate and the chunk,
+in GiB so the line and this page quote the same unit.
 It does not refuse: the estimate is an estimate, the tapering chunk is the mitigation, and
 a refusal would cost a conversation that would have finished. The point is that
 `~/.local/state/xwen/serve.log` carries the sizes when the drain returns an
 out-of-memory that names none of its own.
 
-The same constant sizes the admission estimate. `language_peak_bytes` carried a flat 8 GiB
-of scratch, which covered dequantized planes and short-context prefills and was written
-before context made the transients the larger term. It is now the widest forward the load
-can reach, and that is not the width at `max_ctx`: widths step down while the cache grows
-continuously, so the peak is the last wide chunk before a tier boundary. At a 65,536
-window the 2048-wide chunk ending at 51,200 takes 10.1 GB where the 1024-wide chunk ending
-at 65,536 takes 6.4, and `peak_prefill_transient_bytes` walks the window to find it. The
-old 8 GiB is the floor, so a short window admits exactly as it did. At the default 262,144
-window the term is 12.0 GiB, so a full-window language load now needs 4 GiB more to be
-admitted than it did — which is worth knowing where the image engine's 40 GiB envelope
-shares the coordinator.
+The same constant sizes the admission estimate, for Flash-Next and for nothing else.
+`language_peak_bytes` carried a flat 8 GiB of scratch, which covered dequantized planes
+and short-context prefills and was written before context made the transients the larger
+term. On the tapering architecture it is now the widest forward the load can reach, and
+that is not the width at `max_ctx`: widths step down while the cache grows continuously,
+so the peak is the last wide chunk before a tier boundary. At a 65,536 window the
+2048-wide chunk ending at 51,200 takes 10.1 GB where the 1024-wide chunk ending at 65,536
+takes 6.4, and `peak_prefill_transient_bytes` walks the window to find it. The old 8 GiB
+is the floor, so a short window admits exactly as it did. At the default 262,144 window
+the term is 12.0 GiB, so a full-window Flash-Next load now needs 4 GiB more to be admitted
+than it did — worth knowing where the image engine's 40 GiB envelope shares the
+coordinator.
+
+Everything else keeps the flat 8 GiB. This estimate REFUSES, and 96 bytes per element is
+calibrated on the sparse route's gathers; applied to a checkpoint whose real transient is
+about a gigabyte it would deny admission for memory nothing asks for.
 
 ## Verification owed
 

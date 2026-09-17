@@ -110,6 +110,32 @@ pub const MOE_SUM_FLOOR: f32 = 6.103515625e-5;
 /// this machine has measured rather than a width nothing has run.
 pub const MIN_PREFILL_CHUNK: usize = 512;
 
+/// The chunk widths a prefill span of `len` tokens starting at absolute
+/// position `start` is fed in, in order and summing to `len`.
+///
+/// `chunk_at` answers, for a position, what one forward there may take: usually
+/// [`Arch::prefill_chunk_at`], or a pinned width that answers the same at every
+/// position. It is asked at each chunk's OWN start, so a span that crosses a
+/// tier boundary narrows inside itself, and the last chunk is whatever is left.
+/// Every prefill loop in the tree goes through this, so the width a span is fed
+/// in cannot differ between the surface that splits it and the one that runs it.
+pub fn prefill_span_chunks(
+    chunk_at: impl Fn(usize) -> usize,
+    start: usize,
+    len: usize,
+) -> Vec<usize> {
+    let mut widths = Vec::new();
+    let mut done = 0usize;
+    while done < len {
+        // A width of zero would not terminate, and one past the end would
+        // overrun the span: the tail chunk is the remainder.
+        let width = chunk_at(start + done).clamp(1, len - done);
+        widths.push(width);
+        done += width;
+    }
+    widths
+}
+
 impl Arch {
     /// The GGUF `general.architecture` string this variant is parsed from, which
     /// is also the prefix every other metadata key carries.
@@ -147,10 +173,25 @@ impl Arch {
         }
     }
 
+    /// Whether this architecture's prefill chunk narrows as the cache grows.
+    ///
+    /// `qwen4exp` alone. It is the architecture whose long-context prefill runs
+    /// out of GPU working set: 93.2 GB of its weights are resident against a
+    /// 107.5 GiB set, and above the indexer budget its sparse route gathers key
+    /// and value columns on top of the mask planes every architecture pays
+    /// (records/gpu-working-set.md). The 35B-A3B has the same fitted chunk and
+    /// none of that: 20.4 GB of weights, no indexer, no gathers, and a 17 GB
+    /// peak at 131k tokens measured with room to spare (perf-state.md). It is
+    /// also a declared tok/s target, so a narrower chunk there would cost
+    /// prefill rate to buy headroom it already has.
+    pub fn tapers_prefill_chunk(&self) -> bool {
+        matches!(self, Arch::Qwen4Exp)
+    }
+
     /// The prefill chunk for a forward that starts at absolute position `pos`:
-    /// the fitted default up to [`ops::QSA_SPARSE_MIN_KV_DEFAULT`], then halved
-    /// for each doubling of the cache past it, down to
-    /// [`MIN_PREFILL_CHUNK`].
+    /// the fitted default, then — on an architecture that tapers
+    /// ([`Arch::tapers_prefill_chunk`]) — halved for each doubling of the cache
+    /// past [`ops::QSA_SPARSE_MIN_KV_DEFAULT`], down to [`MIN_PREFILL_CHUNK`].
     ///
     /// A chunk's attention transients — the mask planes, the score tile, and on
     /// the sparse route the gathered key and value columns — are all
@@ -158,21 +199,24 @@ impl Arch {
     /// the conversation while the space left over for it does not: the weights
     /// and the KV cache hold their share of the Metal working set whatever the
     /// position is. Halving the chunk per doubling holds that product flat while
-    /// there is width to give up, at the fitted chunk's prefill rate up to the
-    /// threshold, where the sparse route takes over and the per-forward overhead
-    /// the wide chunk amortizes is the smaller term anyway. Past the floor it
-    /// grows again, at a quarter of the slope: this buys headroom, it does not
-    /// bound the transients.
+    /// there is width to give up, and on Flash-Next it costs prefill rate only
+    /// past the point where the sparse route has taken over from dense
+    /// attention. Past the floor the product grows again, at a quarter of the
+    /// slope: this buys headroom, it does not bound the transients.
     ///
     /// The boundary is the sparse gate's SHIPPED constant and deliberately not
-    /// `ops::qsa_sparse_min_kv()`, which the env var moves: the two describe the
-    /// same crossover from one side each — past it attention stops reading the
-    /// whole prefix, and past it a chunk's transients stop fitting beside
-    /// everything resident — but an A/B on the route is not a request to change
-    /// how much memory a forward takes. `XWEN_PREFILL_CHUNK` and
-    /// `--prefill-chunk` pin a width instead (`XwenModel::prefill_chunk_at`).
+    /// `ops::qsa_sparse_min_kv()`, which the env var moves: on Flash-Next the
+    /// two describe the same crossover from one side each — past it attention
+    /// stops reading the whole prefix, and past it a chunk's transients stop
+    /// fitting beside everything resident — but an A/B on the route is not a
+    /// request to change how much memory a forward takes. `XWEN_PREFILL_CHUNK`
+    /// and `--prefill-chunk` pin a width instead
+    /// (`XwenModel::prefill_chunk_at`).
     pub fn prefill_chunk_at(&self, pos: usize) -> usize {
         let mut chunk = self.prefill_chunk_default();
+        if !self.tapers_prefill_chunk() {
+            return chunk;
+        }
         let mut ceiling = crate::ops::QSA_SPARSE_MIN_KV_DEFAULT;
         while pos > ceiling && chunk > MIN_PREFILL_CHUNK {
             chunk /= 2;
@@ -1837,14 +1881,66 @@ mod tests {
             }
         }
 
+        // The 35B-A3B shares the fitted 2048 and does NOT taper: no indexer, no
+        // gathered columns, 20.4 GB of weights, and a tok/s target to protect.
+        assert!(!Arch::Moe.tapers_prefill_chunk());
+        assert!(Arch::Qwen4Exp.tapers_prefill_chunk());
+        for &pos in &[0, gate, 98_304, 262_144] {
+            assert_eq!(Arch::Moe.prefill_chunk_at(pos), 2048, "at {pos}");
+        }
+
         // A narrowing is never a widening: the width is monotonically
         // non-increasing in position, which is what lets a span re-ask for it at
         // each chunk without a chunk ever growing mid-prompt.
-        let mut previous = Arch::Moe.prefill_chunk_at(0);
+        let mut previous = Arch::Qwen4Exp.prefill_chunk_at(0);
         for pos in (0..300_000).step_by(1024) {
-            let now = Arch::Moe.prefill_chunk_at(pos);
+            let now = Arch::Qwen4Exp.prefill_chunk_at(pos);
             assert!(now <= previous, "chunk widened at {pos}");
             previous = now;
         }
+    }
+    /// Every prefill loop feeds a span through `prefill_span_chunks`, so the
+    /// sequence it produces is the one the GPU actually sees: each width asked
+    /// for at its own chunk's start, the tail whatever is left, and the widths
+    /// summing to the span.
+    #[test]
+    fn a_span_narrows_inside_itself_at_the_tier_boundaries() {
+        let arch = Arch::Qwen4Exp;
+        let at = |pos: usize| arch.prefill_chunk_at(pos);
+        let gate = crate::ops::QSA_SPARSE_MIN_KV_DEFAULT;
+
+        // A span that crosses the first boundary: 2048 while the START of a
+        // chunk is at or below the gate, 1024 once a start is past it.
+        let widths = prefill_span_chunks(at, gate - 1024, 4096);
+        assert_eq!(widths, vec![2048, 1024, 1024]);
+
+        // A chunk starting exactly ON the gate is still the wide one — the tier
+        // test is `pos > gate` — so this span does not narrow at all.
+        assert_eq!(prefill_span_chunks(at, gate - 2048, 4096), vec![2048, 2048]);
+
+        // And the second boundary, from 1024 down to the floor.
+        let widths = prefill_span_chunks(at, 97_792, 2048);
+        assert_eq!(widths, vec![1024, 512, 512]);
+
+        // A short span is one chunk, however wide the tier is.
+        assert_eq!(prefill_span_chunks(at, 0, 7), vec![7]);
+        assert_eq!(prefill_span_chunks(at, 200_000, 100), vec![100]);
+        // Nothing to prefill is no forwards.
+        assert!(prefill_span_chunks(at, 0, 0).is_empty());
+
+        // The widths always sum to the span and never exceed the tier's width.
+        for &(start, len) in &[(0usize, 5000usize), (gate, 9000), (120_000, 3000)] {
+            let widths = prefill_span_chunks(at, start, len);
+            assert_eq!(widths.iter().sum::<usize>(), len, "{start}+{len}");
+            let mut pos = start;
+            for w in widths {
+                assert!(w <= at(pos), "{start}+{len}: {w} at {pos}");
+                pos += w;
+            }
+        }
+
+        // A pinned width is used at every position, boundaries and all.
+        let pinned = prefill_span_chunks(|_| 2048, gate - 1024, 5120);
+        assert_eq!(pinned, vec![2048, 2048, 1024]);
     }
 }

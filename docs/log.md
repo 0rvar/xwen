@@ -15,7 +15,9 @@ tokens in, against 16.9 GB of room. The chunk now halves per doubling of the cac
 the sparse gate, 2048 to 49,152 then 1024 then 512, asked at each chunk's own position;
 the hoisted causal mask is built only where a full-attention layer can read it, which
 above the indexer's budget is nowhere, saving 1.75 GiB a forward held across 48 layers;
-and past the gate the span loop drains between chunks. Serve logs the free working set
+and past the gate the span loop drains between chunks. All of it is Flash-Next only: the
+35B-A3B shares the fitted 2048 with 20.4 GB of weights, no gathers and a tok/s target, so
+it keeps the constant chunk and the pipelining. Serve logs the free working set
 against an estimate when a span looks too big, and does not refuse. `--prefill-chunk` /
 `prefill_chunk` pins one width. Numerics unverified for the tiering: the replay harness
 cannot run beside a resident server.
