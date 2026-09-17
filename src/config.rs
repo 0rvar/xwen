@@ -157,16 +157,20 @@ impl Arch {
     /// `chunk x n_kv`, so a constant chunk makes the peak grow linearly with
     /// the conversation while the space left over for it does not: the weights
     /// and the KV cache hold their share of the Metal working set whatever the
-    /// position is. Halving the chunk per doubling keeps that product flat, at
-    /// the fitted chunk's prefill rate up to the threshold, where the sparse
-    /// route takes over and the per-forward overhead the wide chunk amortizes
-    /// is the smaller term anyway.
+    /// position is. Halving the chunk per doubling holds that product flat while
+    /// there is width to give up, at the fitted chunk's prefill rate up to the
+    /// threshold, where the sparse route takes over and the per-forward overhead
+    /// the wide chunk amortizes is the smaller term anyway. Past the floor it
+    /// grows again, at a quarter of the slope: this buys headroom, it does not
+    /// bound the transients.
     ///
-    /// Tied to the sparse gate because the two describe the same crossover from
-    /// one side each: past it attention stops reading the whole prefix, and
-    /// past it a chunk's transients stop fitting beside everything resident.
-    /// `XWEN_PREFILL_CHUNK` and `--prefill-chunk` pin a width instead
-    /// (`XwenModel::prefill_chunk_at`).
+    /// The boundary is the sparse gate's SHIPPED constant and deliberately not
+    /// `ops::qsa_sparse_min_kv()`, which the env var moves: the two describe the
+    /// same crossover from one side each — past it attention stops reading the
+    /// whole prefix, and past it a chunk's transients stop fitting beside
+    /// everything resident — but an A/B on the route is not a request to change
+    /// how much memory a forward takes. `XWEN_PREFILL_CHUNK` and
+    /// `--prefill-chunk` pin a width instead (`XwenModel::prefill_chunk_at`).
     pub fn prefill_chunk_at(&self, pos: usize) -> usize {
         let mut chunk = self.prefill_chunk_default();
         let mut ceiling = crate::ops::QSA_SPARSE_MIN_KV_DEFAULT;

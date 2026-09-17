@@ -427,14 +427,19 @@ prompt cannot separate them). Hence a per-architecture default rather than one n
 is not built above the indexer budget, and the GPU working set is logged rather than
 enforced.** Two serve sessions resuming 85k- and 47k-token conversations failed every time
 with `kIOGPUCommandBufferCallbackErrorOutOfMemory` at the drain closing the prefill span.
-The device's `recommendedMaxWorkingSetSize` is 107.5 GiB, the default file wires 93.2 GB
-of weights, the KV cache and the QSA indexer planes take 5.2 more, and a forward's
+The device's `recommendedMaxWorkingSetSize` is 107.5 GiB, the default checkpoint measured
+93.2 GB resident, the KV cache and the QSA indexer planes take 5.2 more, and a forward's
 transients — the mask planes, the score tile, the sparse route's gathered columns — are
 all proportional to the chunk times the cache length, about 18 GB at 2048 x 92k against
-16.9 GB of room. So `Arch::prefill_chunk_at(pos)` halves the fitted chunk per doubling of
+~17 GB of room. So `Arch::prefill_chunk_at(pos)` halves the fitted chunk per doubling of
 the cache past `QSA_SPARSE_MIN_KV_DEFAULT` (2048 to 49,152, then 1024, then the 512 floor
-above 98,304), asked per chunk rather than per span, which keeps that product flat and
-only ever narrows. The mask is worth its own lever: `AttnBlock` reads the hoisted one only
+above 98,304), asked per chunk rather than per span, and only ever narrowing. That holds
+the product flat while there is width to give up and then lets it grow at a quarter of the
+slope — 12.9 GB at the end of a 262,144-token window — so it is headroom bought and not a
+bound. The boundary is the shipped constant and not `qsa_sparse_min_kv()`, whose env var
+is an A/B on the route rather than a request to change what a forward holds. The one-shot
+CLI paths keep the constant chunk, so the bench figures stay comparable
+(`records/gpu-working-set.md` "Not taken now"). The mask is worth its own lever: `AttnBlock` reads the hoisted one only
 when the indexer returns `Dense`, so above the 2048-token budget 1.75 GiB of planes at a
 2048 x 92k forward were allocated, held across 48 layers and read by nobody, and
 `causal_mask_has_reader` now builds it only where a full-attention layer can take it
@@ -448,7 +453,10 @@ per (chunk token x cache token), calibrated on the 18 GB above, and says one lin
 request when the estimate exceeds the free working set; it does not refuse, because the
 estimate rests on one calibration point and a refusal costs a conversation that would have
 finished. The same constant replaces `language_peak_bytes`'s flat 8 GiB of scratch with
-the widest forward the load can reach, floored at the old value. Not verified: the tiering
+the widest forward the load can reach, which a window walk finds because the peak is the
+last wide chunk before a tier boundary and not the narrow one at `max_ctx`; floored at the
+old value, and 12.0 GiB at the default window, so a full-window load asks admission for
+4 GiB more than it did. Not verified: the tiering
 changes which forwards run, and `flashnext-replay.ts` could not run beside a resident
 server — owed, and the arithmetic per forward is unchanged by construction
 ([record](../records/gpu-working-set.md), 2026-09-17).

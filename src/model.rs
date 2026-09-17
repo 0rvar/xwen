@@ -1703,11 +1703,13 @@ fn gguf_weight_bytes(gguf: &GgufFile) -> (u64, u64) {
 /// working window, then monitor actual pressure as pages are touched. Scratch
 /// covers dequantized planes and prefill temporaries beside persistent state.
 ///
-/// The prefill term is the widest forward this load can reach: the chunk the
-/// tiering picks at `max_ctx` over a full cache
-/// (`memory::prefill_transient_bytes`). It is floored at the 8 GiB that covered
-/// dequantized planes and short-context prefills before context made the
-/// transients the larger term, so a small window admits exactly as it did.
+/// The prefill term is the widest forward this load can reach, which is the
+/// largest `chunk x cache length` any chunk of a full-window walk takes
+/// ([`peak_prefill_transient_bytes`]) and NOT the width at `max_ctx`: the last
+/// wide chunk before a tier boundary beats the narrow one at the end. It is
+/// floored at the 8 GiB that covered dequantized planes and short-context
+/// prefills before context made the transients the larger term, so a small
+/// window admits exactly as it did.
 fn language_peak_bytes(
     weights: u64,
     ple: u64,
@@ -1724,16 +1726,35 @@ fn language_peak_bytes(
         * ((cfg.conv_kernel as u64).saturating_sub(1) * cfg.conv_dim() as u64
             + cfg.linear_v_heads as u64 * hd * hd)
         + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx);
-    // A pinned chunk is used at every position, so it is what this load would
-    // run at max_ctx; otherwise the tiering's narrowest width applies there.
-    let chunk =
-        crate::ops::prefill_chunk_override().unwrap_or_else(|| cfg.arch.prefill_chunk_at(max_ctx));
-    let scratch = crate::memory::prefill_transient_bytes(chunk, max_ctx).max(8 * GIB);
+    let scratch = peak_prefill_transient_bytes(cfg.arch, max_ctx).max(8 * GIB);
     weights
         .saturating_add(ple.min(4 * GIB))
         .saturating_add(kv_bytes(cfg, slots))
         .saturating_add(state)
         .saturating_add(scratch)
+}
+
+/// The largest transient a prefill forward on this config can take, over a walk
+/// that fills the whole window: each chunk is asked for at its own start
+/// position and priced at `chunk x cache length`, and the peak is the maximum.
+///
+/// The peak is NOT the last chunk. Widths taper in steps while the cache grows
+/// continuously, so the widest forward is the last one before a tier boundary:
+/// at a 65,536 window the 2048-wide chunk ending at 51,200 takes 10.1 GB where
+/// the 1024-wide chunk ending at 65,536 takes 6.4. A pinned chunk is used at
+/// every position and makes the last forward the peak after all.
+fn peak_prefill_transient_bytes(arch: crate::config::Arch, max_ctx: usize) -> u64 {
+    let pinned = crate::ops::prefill_chunk_override();
+    let mut pos = 0usize;
+    let mut peak = 0u64;
+    while pos < max_ctx {
+        let chunk = pinned
+            .unwrap_or_else(|| arch.prefill_chunk_at(pos))
+            .clamp(1, max_ctx - pos);
+        pos += chunk;
+        peak = peak.max(crate::memory::prefill_transient_bytes(chunk, pos));
+    }
+    peak
 }
 
 /// The resident-memory lines of `warn_if_over_budget`, over an already-summed
@@ -1914,5 +1935,35 @@ mod tests {
         let ordered = order_spec_taps(&cfg, captured);
         let got: Vec<usize> = ordered.iter().map(|t| first(t) as usize).collect();
         assert_eq!(got, vec![2, 2]);
+    }
+    /// The admission scratch is the widest forward a full-window walk takes, and
+    /// that is the last chunk before a tier boundary rather than the last chunk
+    /// of the window: the width steps down while the cache keeps growing.
+    #[test]
+    fn the_admission_peak_is_the_widest_forward_and_not_the_last_one() {
+        use crate::config::Arch;
+        let per = crate::memory::TRANSIENT_BYTES_PER_CHUNK_CONTEXT_TOKEN;
+
+        // A 64k window ends inside the 1024 tier, and the 2048-wide chunk that
+        // ends at 51,200 is half again larger than anything after it.
+        assert_eq!(
+            peak_prefill_transient_bytes(Arch::Qwen4Exp, 65536),
+            per * 2048 * 51_200
+        );
+        // At the default window the floor tier runs long enough to win.
+        assert_eq!(
+            peak_prefill_transient_bytes(Arch::Qwen4Exp, 262_144),
+            per * 512 * 262_144
+        );
+        // A window inside the first tier is one flat walk.
+        assert_eq!(
+            peak_prefill_transient_bytes(Arch::Qwen4Exp, 8192),
+            per * 2048 * 8192
+        );
+        // A window shorter than one chunk is that one short forward.
+        assert_eq!(
+            peak_prefill_transient_bytes(Arch::Qwen4Exp, 100),
+            per * 100 * 100
+        );
     }
 }

@@ -579,7 +579,17 @@ pub fn run_stack_hc(
                 continue;
             }
             n_head = n_head.or_else(|| Some(model.cfg.n_head(il)));
-            budgets.push(parts.layers[il].indexer.as_ref().map(QsaIndexer::budget));
+            // Keyed on the PAIR, which is what the layer's own selection below
+            // is keyed on: a layer holding an indexer without its cache runs
+            // dense and reads the mask. The two are built together, so the
+            // difference is unreachable — and it is the difference between a
+            // mask and no mask at all, which would let a query see its future
+            // with nothing to raise.
+            let selects = parts.layers[il]
+                .indexer
+                .as_ref()
+                .zip(parts.layers[il].indexer_cache.as_ref());
+            budgets.push(selects.map(|(idx, _)| idx.budget()));
         }
         match n_head.filter(|_| causal_mask_has_reader(budgets, pos, seq)) {
             Some(n) => model.build_prefill_mask(n, seq, pos)?,

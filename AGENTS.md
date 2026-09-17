@@ -610,8 +610,9 @@ bar, which is the shape a reference arm's test should have.
   runtime. Diagnose with `otool -l target/release/xwen | grep -A4 LC_BUILD_VERSION`.
 - Never report first-forward prefill as steady-state; state the power mode next to
   every number.
-- The Metal working set is 107.5 GiB and Flash-Next's weights wire 86.8 of it, so what a
-  prefill forward's transients have left is under 17 GB. Those transients scale with the
+- The Metal working set is 107.5 GiB and Flash-Next measured 93.2 GB of it resident (the
+  file is 111.33 GB, but its 28.80 GB PLE table is mapped and never uploaded), so what a
+  prefill forward's transients have left is about 17 GB. Those transients scale with the
   chunk TIMES the cache length, not with the chunk, which is why a 2048-token chunk that
   is fine at 4k tokens is ~18 GB at 92k and fails. It fails as
   `kIOGPUCommandBufferCallbackErrorOutOfMemory` at the next `synchronize()`, so the error

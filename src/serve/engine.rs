@@ -2488,7 +2488,11 @@ fn plan_snapshot_stops<S>(
 /// hold their share of it for as long as the model is resident, whatever a
 /// prefill is doing. What is left is what a forward's transients have, and those
 /// grow with the chunk times the cache length
-/// (`memory::prefill_transient_bytes`). Over the line the run does not refuse:
+/// (`memory::prefill_transient_bytes`). The free figure is conservative in the
+/// direction of saying something: `currentAllocatedSize` counts the pooled
+/// buffers an earlier span left behind, which the next wait prunes and which the
+/// estimate then counts again, so the line fires on some spans that do fit. Its
+/// absence is the meaningful half. Over the line the run does not refuse:
 /// the estimate is an estimate, the tapering chunk is the mitigation, and what a
 /// refusal would cost is a conversation that would have finished. What it buys
 /// is the evidence in serve.log for the case where the drain at the end of the
@@ -2584,7 +2588,10 @@ fn prefill(
             // a conversation one forward's transients are a large enough share of
             // the working set that the pair does not fit beside the weights and the
             // cache, so each chunk is drained before the next is enqueued; nearer
-            // the front they pipeline.
+            // the front they pipeline. The shipped constant rather than
+            // `ops::qsa_sparse_min_kv()`, for the reason `Arch::prefill_chunk_at`
+            // gives: an A/B on the sparse route is not a request to change how
+            // much memory a forward holds.
             if at >= crate::ops::QSA_SPARSE_MIN_KV_DEFAULT {
                 engine.device.synchronize()?;
             }
