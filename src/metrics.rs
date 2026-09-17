@@ -139,6 +139,36 @@ pub struct RunRecord {
     /// this field is averaging over two different things.
     #[serde(default = "default_true")]
     pub ok: bool,
+    /// The failure the run was answered with, for a run that failed, cut to
+    /// [`ERROR_MAX_CHARS`] by [`short_error`].
+    ///
+    /// Absent whenever there is no failure to name, which is not the same as
+    /// `ok`: a run a client walked away from, or one a deadline or a shutdown
+    /// cut, is `ok: false` and was never told anything. Never any part of the
+    /// prompt or the reply — this is the message, and the history is not a
+    /// transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// How much of a failure message a record keeps. Long enough for a message with
+/// a cause chain behind it, short enough that a loop failing every request
+/// cannot turn the history into the thing filling the disk.
+pub const ERROR_MAX_CHARS: usize = 500;
+
+/// A failure message as a record carries it: trimmed, and cut to
+/// [`ERROR_MAX_CHARS`] with an ellipsis when it was longer. Cut by CHARACTERS
+/// rather than bytes, because a message carries whatever text the failure had
+/// in it and a byte cut lands inside a multibyte one.
+pub fn short_error(message: &str) -> String {
+    let message = message.trim();
+    if message.chars().count() <= ERROR_MAX_CHARS {
+        return message.to_string();
+    }
+    // One character is spent on the ellipsis itself.
+    let mut out: String = message.chars().take(ERROR_MAX_CHARS - 1).collect();
+    out.push('\u{2026}');
+    out
 }
 
 impl RunRecord {
@@ -165,6 +195,7 @@ impl RunRecord {
             agent: None,
             tag: tag_from_env(),
             ok: true,
+            error: None,
         }
     }
 }
@@ -1370,6 +1401,49 @@ mod tests {
         assert!(line.contains(r#""tag":"bench""#));
         let back: RunRecord = serde_json::from_str(&line).expect("a record parses");
         assert_eq!(rec, back);
+    }
+
+    /// A failed run says why in the history, and a run with nothing to say
+    /// carries no field at all: a reader looking for the failures greps for the
+    /// key rather than filtering on `ok` and finding an empty string.
+    #[test]
+    fn a_failure_message_is_recorded_and_a_clean_run_carries_none() {
+        let mut rec = run(1_757_030_400, "serve:openai", "Qwen3.6-27B");
+        let clean = serde_json::to_string(&rec).expect("a record serializes");
+        assert!(
+            !clean.contains("error"),
+            "a clean run names no failure: {clean}"
+        );
+
+        rec.ok = false;
+        rec.error = Some(short_error(
+            "loading the checkpoint failed: No space left on device (os error 28)",
+        ));
+        let line = serde_json::to_string(&rec).expect("a record serializes");
+        assert!(line.contains(
+            r#""error":"loading the checkpoint failed: No space left on device (os error 28)""#
+        ));
+        let back: RunRecord = serde_json::from_str(&line).expect("a record parses");
+        assert_eq!(rec, back);
+    }
+
+    /// A message long enough to bloat the history is cut, and cut on a
+    /// character boundary: a failure can carry any text at all, and a byte cut
+    /// would leave a record that no longer parses as JSON.
+    #[test]
+    fn a_long_failure_message_is_cut_to_length() {
+        assert_eq!(short_error("  timed out  "), "timed out");
+        let short = "e".repeat(ERROR_MAX_CHARS);
+        assert_eq!(short_error(&short), short);
+
+        let long = "é".repeat(ERROR_MAX_CHARS * 3);
+        let cut = short_error(&long);
+        assert_eq!(cut.chars().count(), ERROR_MAX_CHARS);
+        assert!(cut.ends_with('…'));
+        assert_eq!(
+            cut.chars().filter(|ch| *ch == 'é').count(),
+            ERROR_MAX_CHARS - 1
+        );
     }
 
     /// The tag comes from the environment at the moment the record is stamped,

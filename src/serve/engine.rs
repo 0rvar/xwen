@@ -1377,6 +1377,11 @@ fn run_record(record: &JobRecord, batch_job: bool) -> crate::metrics::RunRecord 
     // wherever it was interrupted, and reporting it alongside completed runs
     // would quietly drag their averages down.
     run.ok = record.error.is_none() && record.abandoned.is_none() && !every_item_failed;
+    // The failure the client was sent, so that a loop of them can be read back
+    // out of the history rather than only off a dashboard nobody was watching.
+    // A run with no failure to name carries none: an abandoned one was never
+    // told anything, and a batch's per-item errors are in its response.
+    run.error = record.error.as_deref().map(crate::metrics::short_error);
     match record.batch {
         Some(batch) => {
             run.prompt_tokens = record.prompt_tokens;
@@ -5060,6 +5065,34 @@ mod tests {
         assert_eq!(run.decode_tokens, 38);
         assert_eq!(run.thinking_tokens, Some(12));
         assert!(run.ok);
+    }
+
+    /// A failed request records the failure it was answered with, so a loop of
+    /// them can be read back out of the history. A request nobody was told
+    /// anything about records none: an abandoned one is owed no terminal event.
+    #[test]
+    fn a_failed_request_records_its_failure_and_a_clean_one_records_none() {
+        assert_eq!(run_record(&served_record(), false).error, None);
+
+        let mut record = served_record();
+        record.stop = None;
+        record.error = Some("loading the checkpoint failed: No space left on device".to_string());
+        let run = run_record(&record, false);
+        assert!(!run.ok);
+        assert_eq!(
+            run.error.as_deref(),
+            Some("loading the checkpoint failed: No space left on device")
+        );
+
+        record.error = Some("x".repeat(crate::metrics::ERROR_MAX_CHARS + 50));
+        let cut = run_record(&record, false).error.expect("a failure");
+        assert_eq!(cut.chars().count(), crate::metrics::ERROR_MAX_CHARS);
+
+        let mut abandoned = served_record();
+        abandoned.abandoned = Some(CancelReason::ClientGone);
+        let run = run_record(&abandoned, false);
+        assert!(!run.ok, "a request cut short did not reach its own end");
+        assert_eq!(run.error, None, "nothing was sent, so nothing is recorded");
     }
 
     #[test]

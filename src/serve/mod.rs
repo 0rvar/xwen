@@ -18,6 +18,7 @@ pub mod engine;
 mod image_control;
 pub mod images;
 pub mod log;
+pub(crate) mod logfile;
 pub(crate) mod native;
 pub mod openai;
 pub mod queue;
@@ -233,6 +234,13 @@ pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Resu
         log::spawn_stderr_sink()
     };
     log::set_global(logger.clone());
+    // The persistent log is opened here and nowhere else: a server outlives the
+    // frame its lines were drawn in, and every other surface owns the terminal
+    // it printed them to. A log that cannot be opened is one line and not a
+    // startup error — a server that serves is worth more than its log.
+    if let Some(warning) = logfile::install() {
+        logger.log(ServeLog::HostLine(warning));
+    }
 
     // Before binding anything: a bad model path or an unreadable tokenizer is a
     // startup error, not a surprise on the first request.

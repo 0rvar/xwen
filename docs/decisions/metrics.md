@@ -283,3 +283,35 @@ had of which conversation they belonged to. The mistake worth naming is setting 
 bound at what the ids were assumed to need (a uuid is 36) instead of comfortably above
 what they are; 256 is still nowhere near a size that costs anything, and the file is
 still the one place a client's own bytes land unfiltered (2026-09-07).
+
+**A failed record carries the message, cut to 500 characters, and never the prompt.**
+`ok: false` said that a run did not reach its own end and nothing said why, so a loop of
+failing requests left the history able to prove only that it happened: the message went to
+the client and to the dashboard's LOG pane, and the pane is a frame. The record now carries
+`error` when there is a failure to name. It is the message and no part of the prompt or
+the reply, because the history is not a transcript and is the one file an operator hands
+someone else. It is absent rather than empty when there is nothing to name, which is the
+distinction `ok` cannot make: an abandoned run, a deadline and a shutdown are all
+`ok: false` and none of them was told anything, so the failures are found by the key and
+not by filtering on `ok`. 500 characters holds a message with a cause chain behind it and
+keeps a request-per-second failure loop from turning the history into the thing filling
+the disk; the cut is by characters, a byte cut inside a multibyte one leaving a line that
+no longer parses. The schema stays at `v: 1`: a reader ignores fields it does not know and
+an absent optional is already the normal case, so an added optional field is not a
+version bump (2026-09-17).
+
+**`serve` keeps its operational lines in a bounded `serve.log`, and only `serve` does.**
+The lines the server reports are the other half of what an incident leaves behind, and on
+a `--tui` run they exist only in a frame that is about to be redrawn. Every line that
+renders — exactly the set the LOG pane holds, which is why the copy is taken in
+`ServeLogger::log` rather than in either sink, and why the events carrying data rather
+than words write nothing — is appended to
+`$HOME/.local/state/xwen/serve.log` with a UTC stamp, one row per entry. It sits beside
+the history, in the state directory, for the same reason the history does. Three things
+it does differently. It is BOUNDED, at 16 MiB, truncated in place rather than rotated so
+that a `tail -f` survives the wrap: a log of what happened is worth its most recent
+megabytes, and a server left running for a month must not fill a disk. It is opened by
+`serve` alone, every other surface owning the terminal it printed its lines to, which is
+what makes the append a no-op rather than a policy elsewhere. And a write that fails is
+one line for the life of the process and never a failed request, the rule metrics already
+followed (2026-09-17).

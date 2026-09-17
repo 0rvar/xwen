@@ -899,7 +899,30 @@ pub struct ServeLogger {
 
 impl ServeLogger {
     pub fn log(&self, event: ServeLog) {
+        // Every line the server says goes to the persistent log as well as to
+        // whichever sink is drawing it, so that a failure an operator reads at
+        // the time can still be read afterwards. Here rather than in either
+        // sink: one funnel for every producer, and both sinks copy the same
+        // lines. The set written is exactly the set that renders a line, which
+        // is what the dashboard's LOG pane holds — the events carrying data
+        // rather than words render nothing, and a decode tick per token would
+        // fill the cap in minutes. The render is skipped outright when no log is
+        // installed, which is every surface but `serve`.
+        let failed = if super::logfile::logging() {
+            event
+                .render()
+                .and_then(|line| super::logfile::append_warning(&line))
+        } else {
+            None
+        };
         let _ = self.tx.send(SinkMessage::Event(event));
+        // Reported through the sink and never back through the append, which
+        // has just failed and would only fail again.
+        if let Some(warning) = failed {
+            let _ = self
+                .tx
+                .send(SinkMessage::Event(ServeLog::HostLine(warning)));
+        }
     }
 
     /// Wait — for at most [`FLUSH_TIMEOUT`] — until everything logged so far has

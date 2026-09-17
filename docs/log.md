@@ -4,6 +4,18 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-17 — A failed request says why in the history, and serve keeps a log on disk
+
+An hour went into a failure loop that left nothing to read afterwards: the message reached
+the client and the dashboard's LOG pane and stopped there. A failed metrics row now
+carries `error`, the message the client was answered with, cut to 500 characters and
+holding no part of the prompt; it is absent rather than empty for a run nobody was told
+anything about, and the schema stays at `v: 1`. `xwen serve` also writes every line it
+reports to `~/.local/state/xwen/serve.log`, UTC-stamped, one row per entry, bounded at
+16 MiB by truncating in place; `XWEN_SERVE_LOG` names a path or `off`, and no other
+surface writes it.
+[Decision](decisions/metrics.md).
+
 ## 2026-09-15 — Warm cache slots bounded by an 8 GiB host budget, siblings fork off cold slots
 
 Two slots gave a 96% prefix-cache hit rate with one other session interleaved and 1% with

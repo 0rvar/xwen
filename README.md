@@ -794,6 +794,12 @@ accepted positions, batch item count, the client, session and agent ids, and the
 Readers ignore fields they do not recognize, so an older xwen still reads a newer one's
 history.
 
+A failed run also carries `error`, the message the client was answered with, cut to 500
+characters. It is the message and never any part of the prompt or the reply. It is absent
+whenever there is nothing to name, which is not the same as `ok: false`: a run a client
+walked away from, or one a deadline or a shutdown cut, reached no end and was told
+nothing either, so grep for the key rather than filtering on `ok` to find the failures.
+
 An absent optional means not measured, which is not the same as zero. `thinking_tokens`
 is the one to know: serve always measures it and writes it, 0 included, while `generate`
 and `chat` count thinking only when a think budget is in effect, so a thinking run with
@@ -805,6 +811,17 @@ GGUF's own file stem when it identifies as nothing. Every surface spells it the 
 way, `generate`, `chat` and `batch` included, so `--by model` never splits one file
 across two names. A batch response's own `model` field answers a different question,
 naming the checkpoint the run replies as, and is unchanged.
+
+`xwen serve` also writes `$HOME/.local/state/xwen/serve.log`: every operational line it
+reports — the same lines the dashboard's LOG pane shows — each with a UTC timestamp in
+front of it and each on one row. It is what a failure loop can still be read out of once
+the frame it was drawn in is gone. `XWEN_SERVE_LOG=<path>` writes somewhere else and
+`XWEN_SERVE_LOG=off`, in any casing, writes nothing, the same way `XWEN_METRICS_FILE`
+reads. Only `serve` writes it; a `generate` or `chat` run owns the terminal it printed
+its lines to. Unlike the history it is bounded: at 16 MiB it starts again in the same
+file, so a `tail -f` on it keeps reading, and collect it promptly after an incident. A
+write that fails prints one warning for the life of the process and never fails a
+request.
 
 `xwen stats` reports over the file.
 `--by day|week|month|model|surface|client|session|agent|all`
