@@ -4,6 +4,23 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-17 — The prefill chunk narrows with the context, and a dead mask stops being built
+
+Two sessions resuming 85k- and 47k-token conversations failed every time with
+`kIOGPUCommandBufferCallbackErrorOutOfMemory`, at the drain that closes the prefill span,
+with no output. The device's working set is 107.5 GiB, the default file wires 93.2 GB of
+weights, the KV cache and the QSA indexer planes take 5.2 more, and a forward's transients
+scale with the chunk times the cache length: about 18 GB at the shipped 2048 chunk 92k
+tokens in, against 16.9 GB of room. The chunk now halves per doubling of the cache past
+the sparse gate, 2048 to 49,152 then 1024 then 512, asked at each chunk's own position;
+the hoisted causal mask is built only where a full-attention layer can read it, which
+above the indexer's budget is nowhere, saving 1.75 GiB a forward held across 48 layers;
+and past the gate the span loop drains between chunks. Serve logs the free working set
+against an estimate when a span looks too big, and does not refuse. `--prefill-chunk` /
+`prefill_chunk` pins one width. Numerics unverified for the tiering: the replay harness
+cannot run beside a resident server.
+[Record](records/gpu-working-set.md), [decision](decisions/kernel-policy.md).
+
 ## 2026-09-17 — A failed request says why in the history, and serve keeps a log on disk
 
 An hour went into a failure loop that left nothing to read afterwards: the message reached

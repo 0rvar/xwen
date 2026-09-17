@@ -3171,6 +3171,10 @@ blocks use of the feature; item (a) is the one with a known trigger.
 
 [Opened 2026-09-08, evening, by the envelope reading (7011914, d2b1f80, 7a2a01a; log.md "The Z-Image plateau is a hardware clock limiter"), which turned the image ledger into an energy budget (records/zimage-perf.md "The energy budget of a step"). Nothing has closed under it yet; its open item is the joules instrument in TODO.md "Image generation".]
 
+## A deep prefill runs out of GPU working set (2026-09-17)
+
+[Opened 2026-09-17 by the working-set arc (log.md "The prefill chunk narrows with the context, and a dead mask stops being built"; records/gpu-working-set.md). Nothing has closed under it yet; its open item is the owed replay run and the stale >49k prefill rows, in TODO.md "Prefill performance".]
+
 ## Retired: Image generation
 
 [Retired 2026-09-08: its basis was the profiler's buffer-pool eviction and not the f32 store. The bf16 store was built on the branch `zimage-ffn` (5e7a6ea), is bit-exact, and measured parity within 5% with an unstable sign; the f32-store gemm runs 37-45 TFLOP/s isolated, w2's own class, and bandwidth caps the lever at ~0.2 s per image (decisions.md "The bf16 SwiGLU store is REFUTED"). A half intermediate for w2 is disqualified by a measured activation max of 284,507 against f16's 65,504. Reopen if a future MPP release adds a converting cooperative-tensor store or documents the tile lane layout so a vectorized epilogue can skip the index math, or with a per-row scaled activation folded into w2's gemm, which is a different arc.]

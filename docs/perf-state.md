@@ -64,6 +64,12 @@ Notes on individual rows:
 - **The dense 27B keeps chunk 512.** It reads 5-6% slower at 2048 (650/599 vs 608/571,
   2026-08-30); the MoE checkpoints use 2048. `XWEN_PREFILL_CHUNK` overrides, and the rule
   is `Arch::prefill_chunk_default` (decisions.md "The prefill chunk is per architecture").
+- **The Flash-Next prefill rows were measured beside 77 GB of weights, and the current
+  default file wires 93.2** (2026-09-17). The 131424 row's 31.0 GB peak had 16 GB of GPU
+  working set that a run today does not. Since the same day the chunk narrows with the
+  cache past 49,152 positions — 2048, then 1024, then 512 above 98,304 — so the 131424 row
+  is no longer the shape that produced it, and its prefill rate at the narrower chunk is
+  unmeasured (records/gpu-working-set.md). Every row above 49k is due a retake.
 - **The router-gemv session of 2026-09-06 reported Flash-Next prefill unchanged at 1171**
   without restating the prompt length; the length-tagged prefill rows above are the ones
   to quote.

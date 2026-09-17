@@ -423,6 +423,36 @@ prompt cannot separate them). Hence a per-architecture default rather than one n
 2048 where there are experts, 512 where there are none, 1024 the MoE fallback if the
 +2 GB ever matters (2026-08-30).
 
+**The prefill chunk narrows with the context past the sparse gate, the hoisted causal mask
+is not built above the indexer budget, and the GPU working set is logged rather than
+enforced.** Two serve sessions resuming 85k- and 47k-token conversations failed every time
+with `kIOGPUCommandBufferCallbackErrorOutOfMemory` at the drain closing the prefill span.
+The device's `recommendedMaxWorkingSetSize` is 107.5 GiB, the default file wires 93.2 GB
+of weights, the KV cache and the QSA indexer planes take 5.2 more, and a forward's
+transients — the mask planes, the score tile, the sparse route's gathered columns — are
+all proportional to the chunk times the cache length, about 18 GB at 2048 x 92k against
+16.9 GB of room. So `Arch::prefill_chunk_at(pos)` halves the fitted chunk per doubling of
+the cache past `QSA_SPARSE_MIN_KV_DEFAULT` (2048 to 49,152, then 1024, then the 512 floor
+above 98,304), asked per chunk rather than per span, which keeps that product flat and
+only ever narrows. The mask is worth its own lever: `AttnBlock` reads the hoisted one only
+when the indexer returns `Dense`, so above the 2048-token budget 1.75 GiB of planes at a
+2048 x 92k forward were allocated, held across 48 layers and read by nobody, and
+`causal_mask_has_reader` now builds it only where a full-attention layer can take it
+(inert by construction — the planes were discarded unread). Past the same gate the span
+loop also drains between chunks so the pool holds one chunk's garbage instead of two,
+which is a residency bound and not a speed claim: "Chunk-boundary device syncs and
+command-buffer batching granularity are both REFUTED as levers on the 27B prefill
+residual" priced that sync at +9.2 µs/token at 925 tokens and +2.4 at 4k, a fixed price
+per chunk, and that refutation stands. Serve estimates the span's transients at 96 bytes
+per (chunk token x cache token), calibrated on the 18 GB above, and says one line per
+request when the estimate exceeds the free working set; it does not refuse, because the
+estimate rests on one calibration point and a refusal costs a conversation that would have
+finished. The same constant replaces `language_peak_bytes`'s flat 8 GiB of scratch with
+the widest forward the load can reach, floored at the old value. Not verified: the tiering
+changes which forwards run, and `flashnext-replay.ts` could not run beside a resident
+server — owed, and the arithmetic per forward is unchanged by construction
+([record](../records/gpu-working-set.md), 2026-09-17).
+
 **mm_id tiles: the pass-2 grid is a work list, and the token tile is 64 wide when
 experts average ≥ 24 rows.** The vendored two-pass `mm_id` launched pass 2 on ggml's
 `(t/32, n_out/64, n_expert)` grid — sized for one expert owning every row — so at the

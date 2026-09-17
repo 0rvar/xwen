@@ -610,6 +610,13 @@ bar, which is the shape a reference arm's test should have.
   runtime. Diagnose with `otool -l target/release/xwen | grep -A4 LC_BUILD_VERSION`.
 - Never report first-forward prefill as steady-state; state the power mode next to
   every number.
+- The Metal working set is 107.5 GiB and Flash-Next's weights wire 86.8 of it, so what a
+  prefill forward's transients have left is under 17 GB. Those transients scale with the
+  chunk TIMES the cache length, not with the chunk, which is why a 2048-token chunk that
+  is fine at 4k tokens is ~18 GB at 92k and fails. It fails as
+  `kIOGPUCommandBufferCallbackErrorOutOfMemory` at the next `synchronize()`, so the error
+  points at the drain and not at whatever allocated too much
+  ([record](docs/records/gpu-working-set.md)).
 - Qwen-specific: the tokenizer has no BOS and chat stops on TWO eos ids — a gen loop
   that only checks 248044 runs through turn boundaries and looks like "the model won't
   stop", which is a config bug, not a sampling bug.

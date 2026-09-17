@@ -757,6 +757,15 @@ context the file was actually converted with, with a line saying so — a blesse
 checkpoint's 262144 leaves both defaults untouched, and one converted smaller is run
 inside its own window rather than past its rope table.
 
+`--prefill-chunk <tokens>` / `prefill_chunk` is how many prompt tokens go into one prefill
+forward. Unset, the width follows the conversation: the architecture's fitted chunk (2048
+on the MoE checkpoints, 512 on the dense ones) up to 49,152 tokens of context, halved for
+each doubling past that, down to 512. A forward's GPU transients are proportional to the
+chunk times the cache length while the room left for them by the weights and the KV cache
+is fixed, so a constant chunk is what runs out of working set deep in a long conversation.
+Setting a value pins one width at every position, which is worth doing to measure
+something and not much else; `XWEN_PREFILL_CHUNK` outranks it.
+
 `queue_timeout` follows from `context_length` rather than being a flat number: the
 default covers two maximal prefills at the slowest rate this machine has been measured
 at, which is 2640 s at the default 262144 and never less than 300. It is said once at

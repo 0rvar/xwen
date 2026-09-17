@@ -171,6 +171,12 @@ near-tie, and the replay above is the quantified form of that check.
   per-layer operands, which should have fit; it did not, and the cause was not chased.
   Reopen if any production path ever forwards more than 2048 tokens at once on a QSA
   layer, or if the replay harness gets a >2048-token fixture and hits this.
+  **Closed 2026-09-17**, from the other end: serve hit the same error at the shipped 2048
+  chunk 92k tokens into a conversation, and the accounting is in
+  [A deep prefill runs out of GPU working set](gpu-working-set.md). The 8191-token forward
+  was not short of room for its own operands; it was short of what the weights, the KV
+  cache and the indexer planes leave, and the transients scale with the chunk times the
+  cache length rather than with the chunk alone.
 - **The 35B's attention is dense and the probe put it at 77-81% of its 128k prefill.**
   That is the flash-at-head-dim-256 ledger item, now with a number.
 - **f16 mask straight from the mask kernel** (from the device-mask record) is moot on
