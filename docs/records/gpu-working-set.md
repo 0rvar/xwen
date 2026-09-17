@@ -41,12 +41,12 @@ A prefill forward's transients are the mask planes, the score tile, and on the s
 route the gathered key and value columns. All three are proportional to the chunk times
 the cache length, and candle's pool rounds each allocation up to a power of two and holds
 it until a wait prunes it. At the shipped 2048-token chunk 92k tokens in, that measures
-about 18 GB. Against 16.9 GB of room it does not fit, and it fits less every turn the
+about 18 GB. Against ~17 GB of room it does not fit, and it fits less every turn the
 conversation grows.
 
 The 131k prefill in [perf-state.md](../perf-state.md) peaked at 31.0 GB of footprint and
-ran fine on 2026-09-06. It ran beside 77 GB of weights. The current default file wires
-93.2, which is 16 GB of the headroom that measurement had.
+ran fine on 2026-09-06. It ran beside 77 GB of weights, so that measurement had 16 GB of
+headroom a run today does not.
 
 ## Three levers
 
