@@ -138,24 +138,36 @@ Everything else keeps the flat 8 GiB. This estimate REFUSES, and 96 bytes per el
 calibrated on the sparse route's gathers; applied to a checkpoint whose real transient is
 about a gigabyte it would deny admission for memory nothing asks for.
 
-## Verification owed
+## Verification
 
 The mask guard needs none. It is provably inert: the planes it stops building were
 discarded unread in exactly those cases, and the tests covering the case where they are
 read are unchanged.
 
-The chunk tiering changes which forwards run, so greedy output at a fixed seed has to be
-checked equal across the tier boundary, and it has not been.
-`bun scripts/flashnext-replay.ts` is the check ([parity.md](../parity.md)), and it could
-not run in this session: the live `xwen serve` held Flash-Next, and one large model
-process at a time is the rule on this machine. Owed at the next window, with the fixture
-prefilled at a position past 49,152 so the boundary is actually crossed. The arithmetic
-per forward is unchanged by construction, the chunk being a batching decision, so what the
-replay would catch is a chunk-width dependence nobody has claimed exists.
+The chunk tiering changes which forwards run, so greedy output at a fixed seed had to be
+checked equal across a tier boundary. **Done, 2026-09-17**, once the server was down, on
+the installed binary at d072534 — the same Flash-Next chunk sequence 0cda436 produces.
+A prompt of 290,000 bytes of this repo's docs plus one instruction, 87,173 tokens, run
+twice at `--no-think --top-k 1 --max-tokens 48 --max-ctx 131072 --seed 42 --no-draft`:
+arm A pinned at `XWEN_PREFILL_CHUNK=2048`, arm B adaptive, so the span ran 2048-wide below
+49,152 and 1024-wide above it (the KV cache grew to 131,072 positions). **The 48 greedy
+output tokens are byte-identical between the arms.** That is the check the tiering owed:
+the arithmetic per forward is unchanged by construction, the chunk being a batching
+decision, and a chunk-width dependence would have shown here.
 
-Nothing here was benched. The three levers are memory bounds; whether the narrower chunk
-costs prefill rate above 49k is unmeasured, and the 2026-08-30 fit that chose 2048 was run
-at 3.8k tokens, where none of this applies.
+Prefill took 277.5 s pinned against 232.8 s adaptive (314 against 374 tok/s), decode 1.07
+against 1.10 s for the 48 tokens. One run each, unpinned power state (`pmset -g` said
+`lowpowermode 0`), so that is an observation and not a figure: it is deliberately not in
+[perf-state.md](../perf-state.md), and a retake owes the discipline in
+[benching.md](../benching.md) — pinned binary, interleaved arms, repetitions.
+
+What the A/B does not cover: `bun scripts/flashnext-replay.ts` ([parity.md](../parity.md))
+is the standing check for this checkpoint and its committed fixtures still do not reach
+past 49,152, so the replay itself has never crossed a boundary. That is the remaining gap
+if anyone wants the harness rather than a hand-run pair to cover it.
+
+Nothing else here was benched. The three levers are memory bounds, and the 2026-08-30 fit
+that chose 2048 was run at 3.8k tokens, where none of this applies.
 
 ## Not taken now
 

@@ -19,8 +19,10 @@ and past the gate the span loop drains between chunks. All of it is Flash-Next o
 35B-A3B shares the fitted 2048 with 20.4 GB of weights, no gathers and a tok/s target, so
 it keeps the constant chunk and the pipelining. Serve logs the free working set
 against an estimate when a span looks too big, and does not refuse. `--prefill-chunk` /
-`prefill_chunk` pins one width. Numerics unverified for the tiering: the replay harness
-cannot run beside a resident server.
+`prefill_chunk` pins one width. All of it is Flash-Next only, the 35B-A3B sharing the
+fitted chunk and none of the pressure. Verified the same evening by a pinned-against-
+adaptive A/B over an 87,173-token prompt: 48 greedy tokens byte-identical across the
+boundary.
 [Record](records/gpu-working-set.md), [decision](decisions/kernel-policy.md).
 
 ## 2026-09-17 — A failed request says why in the history, and serve keeps a log on disk
