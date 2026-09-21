@@ -668,6 +668,28 @@ pub fn image_peak(width: u32, height: u32, control: bool, loras: usize) -> Resul
         .context("image memory estimate overflow")
 }
 
+/// Qwen-Image 2.1's admission envelope: the pipeline's own estimate
+/// (`QwenImagePipeline::peak_bytes`), under the same pixel cap as
+/// [`image_peak`]. The cap is not a limit of the model, whose native size is
+/// 2048x2048: it is where the measured peaks stop, and a larger run is admitted
+/// once its peak has been read rather than estimated.
+pub fn qwen_image_peak(width: u32, height: u32) -> Result<u64> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .context("image pixel count overflow")?;
+    if width == 0 || height == 0 {
+        bail!("an image has nonzero dimensions");
+    }
+    if pixels > 1024 * 1024 {
+        bail!(
+            "{width}x{height} is {pixels} pixels, and memory admission takes Qwen-Image 2.1 up to \
+             1,048,576: the peak of a larger run has not been measured on this model, which is \
+             the reason for the cap and not a limit of the model"
+        );
+    }
+    crate::qwen_image::pipeline::QwenImagePipeline::peak_bytes(width as usize, height as usize)
+}
+
 fn sysctl_value<T: Copy>(name: &CStr) -> Option<T> {
     let mut value = std::mem::MaybeUninit::<T>::uninit();
     let mut size = std::mem::size_of::<T>();

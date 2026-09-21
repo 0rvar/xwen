@@ -878,7 +878,8 @@ impl ZImagePipeline {
     }
 }
 
-/// Encode a `[3, H, W]` u8 tensor as an RGB8 PNG at `path`.
+/// Encode a `[3, H, W]` u8 tensor as an RGB8 PNG at `path`, or a `[4, H, W]`
+/// one as RGBA8 ([`encode_png`] picks by channel count).
 ///
 /// Written to a sibling temporary file and renamed into place, so a failure
 /// anywhere in the encode leaves whatever was at `path` untouched. Creating
@@ -954,11 +955,17 @@ pub fn write_png(image: &Tensor, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Encode a `[3, H, W]` u8 tensor as RGB8 PNG bytes, the form an HTTP
-/// response wants and [`write_png`] writes.
+/// Encode a `[3, H, W]` u8 tensor as RGB8 PNG bytes, or a `[4, H, W]` one as
+/// RGBA8: the form an HTTP response wants and [`write_png`] writes. The channel
+/// count is the whole selection, so a pipeline that decodes an alpha plane
+/// decides whether to keep it before it gets here.
 pub fn encode_png(image: &Tensor) -> Result<Vec<u8>> {
-    let (c, h, w) = image.dims3().context("the image is [3, H, W]")?;
-    ensure!(c == 3, "the image has {c} channels, PNG RGB needs 3");
+    let (c, h, w) = image.dims3().context("the image is [C, H, W]")?;
+    let color = match c {
+        3 => png::ColorType::Rgb,
+        4 => png::ColorType::Rgba,
+        _ => bail!("the image has {c} channels, and a PNG here is RGB (3) or RGBA (4)"),
+    };
     // Channel-last, interleaved, as PNG wants it.
     let pixels: Vec<u8> = image
         .permute((1, 2, 0))?
@@ -967,7 +974,7 @@ pub fn encode_png(image: &Tensor) -> Result<Vec<u8>> {
         .to_vec1::<u8>()?;
     let mut bytes = Vec::with_capacity(pixels.len() / 2);
     let mut encoder = png::Encoder::new(&mut bytes, w as u32, h as u32);
-    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_color(color);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()?;
     writer.write_image_data(&pixels)?;
@@ -1165,6 +1172,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The channel count picks the PNG colour type, and the pixels come back
+    /// as they went in: three channels as RGB8, four as RGBA8 with the alpha
+    /// plane intact, anything else refused.
+    #[test]
+    fn a_png_round_trips_as_rgb_or_rgba_by_channel_count() {
+        for channels in [3usize, 4] {
+            let (h, w) = (5usize, 7usize);
+            let values: Vec<u8> = (0..channels * h * w)
+                .map(|i| (i * 37 % 256) as u8)
+                .collect();
+            let image = Tensor::from_vec(values.clone(), (channels, h, w), &Device::Cpu).unwrap();
+            let bytes = encode_png(&image).unwrap();
+
+            let decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+            let mut reader = decoder.read_info().unwrap();
+            let mut pixels = vec![0u8; channels * h * w];
+            let info = reader.next_frame(&mut pixels).unwrap();
+            let expected = if channels == 3 {
+                png::ColorType::Rgb
+            } else {
+                png::ColorType::Rgba
+            };
+            assert_eq!(info.color_type, expected);
+            assert_eq!((info.width, info.height), (w as u32, h as u32));
+            for c in 0..channels {
+                for y in 0..h {
+                    for x in 0..w {
+                        assert_eq!(
+                            pixels[(y * w + x) * channels + c],
+                            values[(c * h + y) * w + x],
+                            "channel {c} at ({x}, {y}) of a {channels}-channel image"
+                        );
+                    }
+                }
+            }
+        }
+        for channels in [1usize, 2, 5] {
+            let image = Tensor::zeros((channels, 4, 4), DType::U8, &Device::Cpu).unwrap();
+            let err = encode_png(&image).unwrap_err();
+            assert!(format!("{err:#}").contains("channels"), "{err:#}");
+        }
     }
 
     /// A failed PNG write leaves the previous image at that path alone.

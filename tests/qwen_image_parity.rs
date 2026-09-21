@@ -363,14 +363,14 @@ fn grade_case(pipeline: &QwenImagePipeline, dir: &Path) -> Result<Vec<String>> {
         velocity_in_run.max_rel
     );
     let final_spread = Spread::between(&rendered.final_latents, &ref_final)?;
-    let image_psnr = psnr_db(&rendered.image, &ref_image)?;
+    let image_psnr = psnr_db(&rendered.rgb()?, &ref_image)?;
     let out = std::env::temp_dir().join(format!("xwen-qwen-image-parity-{}.png", meta.case));
     write_png(&rendered.image, &out)?;
     let steps = &rendered.timings.steps;
     eprintln!(
         "  final latent after {} steps ({} arm): cosine {:.6} mean rel {:.4} (reference bf16 \
          arm: {:.6} / {:.4}); image PSNR {:.2} dB (reference bf16 arm: {:.2} dB); alpha strays \
-         {:.4} from opaque; wrote {}",
+         {:.4} from opaque (min {}, {} clear pixels); wrote {}",
         meta.steps,
         pipeline.cache_arm().label(),
         final_spread.cosine,
@@ -380,6 +380,8 @@ fn grade_case(pipeline: &QwenImagePipeline, dir: &Path) -> Result<Vec<String>> {
         image_psnr,
         meta.bf16_vs_fp32.image_psnr_db,
         rendered.alpha_max_distance_from_opaque,
+        rendered.alpha_min,
+        rendered.clear_pixels,
         out.display()
     );
     eprintln!(
@@ -392,7 +394,7 @@ fn grade_case(pipeline: &QwenImagePipeline, dir: &Path) -> Result<Vec<String>> {
 
     // The VAE alone: the reference latent through this decoder.
     let vae_only = pipeline.decode_latents(&ref_final)?;
-    let vae_psnr = psnr_db(&vae_only.image, &ref_image)?;
+    let vae_psnr = psnr_db(&vae_only.rgb()?, &ref_image)?;
     eprintln!(
         "  VAE alone (reference latent through this decoder): PSNR {vae_psnr:.2} dB, bar >= \
          {VAE_PSNR_MIN_DB}"

@@ -413,8 +413,16 @@ impl Module for ResidualBlock {
             Some(conv) => conv.forward(xs)?,
             None => xs.clone(),
         };
-        let x = self.conv1.forward(&self.norm1.forward(xs)?.silu()?)?;
-        let x = self.conv2.forward(&self.norm2.forward(&x)?.silu()?)?;
+        // Around each convolution, so the norm's full-size temporaries are
+        // gone before a column buffer nine times an activation is made, and
+        // the two column buffers are never both held.
+        let x = self.norm1.forward(xs)?.silu()?;
+        drain(&x)?;
+        let x = self.conv1.forward(&x)?;
+        drain(&x)?;
+        let x = self.norm2.forward(&x)?.silu()?;
+        drain(&x)?;
+        let x = self.conv2.forward(&x)?;
         x + h
     }
 }
@@ -700,10 +708,27 @@ impl Module for Encoder {
         let mut x = self.conv_in.forward(xs)?;
         for block in &self.down_blocks {
             x = block.forward(&x)?;
+            drain(&x)?;
         }
         let x = self.mid_block.forward(&x)?;
+        drain(&x)?;
         self.conv_out.forward(&self.norm_out.forward(&x)?.silu()?)
     }
+}
+
+/// Wait for the work queued behind `x` and let the device give back every
+/// buffer nothing references any more.
+///
+/// Candle's Metal backend pools its buffers and returns the unreferenced ones
+/// only when the device is synchronized, so a pass that never synchronizes
+/// keeps every intermediate it ever made: a 1024x1024 decode held 57 GB of them
+/// at its end. The widest stages are where that matters, a single 288-channel
+/// activation at 1024x1024 being 1.2 GB and the convolution's column buffer
+/// nine times that, so the wait sits after every residual block of the decoder
+/// and after every stage of the encoder. It changes when memory is returned
+/// and nothing about what is computed. A no-op off Metal.
+fn drain(x: &Tensor) -> Result<()> {
+    x.device().synchronize()
 }
 
 // ==================== Decoder ====================
@@ -747,6 +772,7 @@ impl Module for UpBlock {
         let mut x = xs.clone();
         for resnet in &self.resnets {
             x = resnet.forward(&x)?;
+            drain(&x)?;
         }
         match &self.upsampler {
             Some((conv, shortcut)) => {
@@ -754,7 +780,9 @@ impl Module for UpBlock {
                 // `nearest-exact` and `nearest` pick the same source pixel at
                 // an integer factor of 2.
                 let x = conv.forward(&x.upsample_nearest2d(2 * h, 2 * w)?)?;
-                x + shortcut.forward(xs)?
+                let x = (x + shortcut.forward(xs)?)?;
+                drain(&x)?;
+                Ok(x)
             }
             None => Ok(x),
         }
@@ -799,10 +827,13 @@ impl Decoder {
 impl Module for Decoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut x = self.mid_block.forward(&self.conv_in.forward(xs)?)?;
+        drain(&x)?;
         for block in &self.up_blocks {
             x = block.forward(&x)?;
         }
-        self.conv_out.forward(&self.norm_out.forward(&x)?.silu()?)
+        let x = self.norm_out.forward(&x)?.silu()?;
+        drain(&x)?;
+        self.conv_out.forward(&x)
     }
 }
 

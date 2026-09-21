@@ -873,9 +873,10 @@ pub(crate) fn validate(
         return Err(bad_param(
             "model",
             format!(
-                "{} is not served yet: its image pipeline is not implemented; this route serves \
-                 {full_name}",
-                Model::QwenImage21.full_name()
+                "{} is not served by this route yet, which serves {full_name}; it runs on the \
+                 command line (`xwen image --model {}`)",
+                Model::QwenImage21.full_name(),
+                Model::QwenImage21
             ),
         ));
     }

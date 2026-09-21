@@ -518,20 +518,247 @@ fn encode_text_finds_the_encoder_by_either_spelling_of_a_snapshot() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// `xwen image` names a registered pipeline it cannot run yet, rather than
-/// loading it through another model's pipeline, and does so before any fetch.
+/// `xwen image --model qwen-image-2.1` runs that pipeline and not Z-Image's.
+/// Against an empty cache the first thing it needs from the machine is its OWN
+/// tokenizer, `processor/tokenizer.json` of `Qwen/Qwen-Image-2.1`, a path no
+/// other pipeline has, read before any weight so the prompt is checked first.
+///
+/// No weight can load here. The run does try the hub, and `past_the_gate` points
+/// it at a loopback port nothing listens on, so that attempt is refused on this
+/// machine. Memory admission runs before the fetch, as it does on Z-Image's
+/// path, so the size asked for is the smallest that makes a picture: admission
+/// is not what this test is about.
 #[test]
-fn image_refuses_a_pipeline_it_does_not_implement() {
-    let out = xwen()
-        .args(["image", "--model", "qwen-image-2.1", "--prompt", "hi"])
-        .output()
-        .expect("running xwen image");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "it must refuse\n{stderr}");
-    assert!(stderr.contains("Qwen-Image-2.1"), "{stderr}");
-    assert!(stderr.contains("not implemented"), "{stderr}");
-    assert!(stderr.contains("xwen encode-text"), "{stderr}");
-    assert!(!stderr.contains("downloading"), "{stderr}");
+fn image_runs_the_qwen_image_pipeline() {
+    let (stdout, stderr, ok) = past_the_gate(
+        &[
+            "image",
+            "--model",
+            "qwen-image-2.1",
+            "--prompt",
+            "hi",
+            "--width",
+            "256",
+            "--height",
+            "256",
+        ],
+        None,
+    );
+    assert_reached_the_fetch(
+        "image --model qwen-image-2.1",
+        "Qwen/Qwen-Image-2.1/processor/tokenizer.json",
+        &stdout,
+        &stderr,
+        ok,
+    );
+    assert!(!stderr.contains("Z-Image"), "{stderr}");
+}
+
+/// A `[rows, 4096]` caption file of zeros, for the runs that inject one.
+fn caption_file(label: &str, rows: usize) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("xwen-gates-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cap = dir.join("cap.safetensors");
+    let zeros = candle_core::Tensor::zeros(
+        (rows, 4096),
+        candle_core::DType::F32,
+        &candle_core::Device::Cpu,
+    )
+    .unwrap();
+    candle_core::safetensors::save(
+        &std::collections::HashMap::from([("cap_feats".to_string(), zeros)]),
+        &cap,
+    )
+    .unwrap();
+    (dir, cap)
+}
+
+fn image_with_caption(cap: &std::path::Path) -> (String, bool) {
+    let (stdout, stderr, ok) = past_the_gate(
+        &[
+            "image",
+            "--model",
+            "qwen-image-2.1",
+            "--prompt",
+            "ignored",
+            "--width",
+            "256",
+            "--height",
+            "256",
+            "--cap-feats",
+            cap.to_str().unwrap(),
+        ],
+        None,
+    );
+    (format!("{stderr}{stdout}"), ok)
+}
+
+/// With the caption injected, the text encoder is neither loaded nor FETCHED:
+/// against an empty cache the run announces the pipeline's own files and fails
+/// on the first of them, never naming a file of the encoder's.
+#[test]
+fn an_injected_caption_fetches_no_encoder_file() {
+    let (dir, cap) = caption_file("cap", 4);
+    let (both, ok) = image_with_caption(&cap);
+    assert_reached_the_fetch(
+        "image --cap-feats",
+        "Qwen/Qwen-Image-2.1/model_index.json",
+        &both,
+        "",
+        ok,
+    );
+    assert!(both.contains("the text encoder is not fetched"), "{both}");
+    for encoders in ["text_encoder/", "processor/"] {
+        assert!(!both.contains(encoders), "{encoders} was named: {both}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A caption too long for the rope beside the image is refused from the file
+/// alone, before the pipeline is resolved.
+#[test]
+fn an_injected_caption_past_the_rope_is_refused_before_any_fetch() {
+    let (dir, cap) = caption_file("longcap", 8192);
+    let (both, ok) = image_with_caption(&cap);
+    assert!(!ok, "{both}");
+    assert!(both.contains("rope"), "{both}");
+    assert!(!both.contains("is not in the Hugging Face cache"), "{both}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A prompt past the encoder entry's token limit is refused with the tokenizer
+/// alone in hand. The snapshot root here holds a `model_index.json` and the
+/// tokenizer and nothing else, so a run that got as far as opening a weight
+/// would fail on a missing file instead of on the prompt. The tokenizer is the
+/// cached one: without it this test has nothing to tokenize with, and says so
+/// (or fails, under `XWEN_REQUIRE_HF_CACHE=1`).
+#[test]
+fn an_overlong_prompt_is_refused_before_any_weight_is_resolved() {
+    let Some(tokenizer) = xwen::hub::cached_file("Qwen/Qwen-Image-2.1", "processor/tokenizer.json")
+    else {
+        let note = "SKIPPED an_overlong_prompt_is_refused_before_any_weight_is_resolved: \
+                    Qwen/Qwen-Image-2.1/processor/tokenizer.json is not cached (xwen fetch \
+                    --model qwen-image-2.1)";
+        assert!(
+            std::env::var_os("XWEN_REQUIRE_HF_CACHE").is_none(),
+            "{note}"
+        );
+        eprintln!("{note}");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("xwen-gates-longprompt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("processor")).unwrap();
+    std::fs::write(
+        root.join("model_index.json"),
+        r#"{"_class_name": "QwenImage21Pipeline"}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        std::fs::canonicalize(tokenizer).unwrap(),
+        root.join("processor/tokenizer.json"),
+    )
+    .unwrap();
+    let prompt = "harbour ".repeat(5000);
+    let (stdout, stderr, ok) = past_the_gate(
+        &[
+            "image",
+            "--model",
+            root.to_str().unwrap(),
+            "--prompt",
+            &prompt,
+            "--width",
+            "256",
+            "--height",
+            "256",
+        ],
+        None,
+    );
+    let both = format!("{stderr}{stdout}");
+    assert!(!ok, "{both}");
+    assert!(both.contains("4096"), "the limit must be named: {both}");
+    assert!(both.contains("tokens"), "{both}");
+    for later in ["text_encoder", "transformer", "config.json"] {
+        assert!(!both.contains(later), "got as far as {later}: {both}");
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// What Qwen-Image 2.1 cannot do is refused before anything is fetched or
+/// loaded, in a sentence that names the model and the flag: img2img, masks,
+/// ControlNet and LoRA are Z-Image's, a side that is no multiple of 32 is not a
+/// size this model has, and a run past the measured pixel cap says the cap is
+/// about measurement and not the model.
+#[test]
+fn image_refuses_what_qwen_image_lacks_before_any_fetch() {
+    let cases: [(&[&str], &[&str]); 6] = [
+        (
+            &["--init", "/nonexistent.png"],
+            &["--init", "Z-Image-Turbo"],
+        ),
+        (&["--lora", "some-adapter"], &["--lora", "Z-Image-Turbo"]),
+        (
+            &["--control", "/nonexistent.png", "--control-scale", "0.5"],
+            &["--control", "--control-scale", "Z-Image-Turbo"],
+        ),
+        (
+            &["--width", "1000", "--height", "1000"],
+            &["multiples of 32"],
+        ),
+        // A size Z-Image's rule takes (multiples of 16, 96 cells) and this
+        // model's does not: the refusal is this arm's own.
+        (&["--width", "48", "--height", "512"], &["multiples of 32"]),
+        (
+            &["--width", "2048", "--height", "2048"],
+            &["has not been measured", "not a limit of the model"],
+        ),
+    ];
+    for (extra, wanted) in cases {
+        let mut args = vec!["image", "--model", "qwen-image-2.1", "--prompt", "hi"];
+        args.extend_from_slice(extra);
+        let (stdout, stderr, ok) = past_the_gate(&args, None);
+        let both = format!("{stderr}{stdout}");
+        assert!(!ok, "{extra:?} must be refused: {both}");
+        for text in wanted {
+            assert!(
+                both.contains(text),
+                "{extra:?} must mention {text:?}: {both}"
+            );
+        }
+        assert!(
+            !both.contains("is not in the Hugging Face cache"),
+            "{extra:?} must be refused before the fetch: {both}"
+        );
+    }
+}
+
+/// An entry that is no pipeline is told which entries are, every one of them,
+/// and an encoder entry is pointed at the command that runs it.
+#[test]
+fn image_names_every_pipeline_when_it_refuses_an_entry() {
+    for (alias, encoder) in [
+        ("qwen-image-2.1-encoder", true),
+        ("zimage-turbo-encoder", true),
+        ("27b", false),
+    ] {
+        let (stdout, stderr, ok) =
+            past_the_gate(&["image", "--model", alias, "--prompt", "hi"], None);
+        let both = format!("{stderr}{stdout}");
+        assert!(!ok, "{alias} is not a pipeline: {both}");
+        for text in ["--model zimage-turbo", "--model qwen-image-2.1"] {
+            assert!(both.contains(text), "{alias}: must offer {text}: {both}");
+        }
+        assert_eq!(
+            both.contains(&format!("xwen encode-text --model {alias}")),
+            encoder,
+            "{alias}: {both}"
+        );
+        assert!(
+            !both.contains("is not in the Hugging Face cache"),
+            "{alias} must be refused before the fetch: {both}"
+        );
+    }
 }
 
 /// `--model` is the one flag that names a checkpoint, and it reads a value as a

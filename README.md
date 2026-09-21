@@ -203,11 +203,14 @@ the measured verification numbers, `docs/zimage.md` has the encoder role and the
 corruption.
 
 **One entry is not a language model at all** (2026-09-07): the Z-Image-Turbo diffusion
-pipeline, which is what `xwen image` runs.
+pipeline, which is what `xwen image` runs. Qwen-Image 2.1 joined it on 2026-09-21, on the
+CLI only so far (its section is below).
 
 | Full name | Repo | `--model` | Role |
 | --- | --- | --- | --- |
 | `Z-Image-Turbo` | `Tongyi-MAI/Z-Image-Turbo`, whole repo | `zimage-turbo` / `z-image-turbo` | text-to-image, `xwen image` and the images route |
+| `Qwen-Image-2.1` | `Qwen/Qwen-Image-2.1`, whole repo | `qwen-image-2.1` | text-to-image, `xwen image` only |
+| `Qwen-Image-2.1-text-encoder` | `Qwen/Qwen-Image-2.1`, `text_encoder/` | `qwen-image-2.1-encoder` | encode-only, `xwen encode-text` |
 
 Fifteen files, **32.9 GB** in total: the transformer is 24.6 GB of fp32 safetensors in
 three shards, cast to bf16 at load so it is 12.3 GB resident; the VAE is 168 MB; the text
@@ -260,6 +263,41 @@ transformer is graded against a diffusers fp32 dump (`tests/zimage_parity.rs`,
 docs/parity.md).
 `docs/zimage.md` is the architecture and the traps, `docs/records/zimage-pipeline.md` the
 arcs, `docs/perf-state.md` the timings and their conditions.
+
+`xwen image --model qwen-image-2.1` runs Qwen-Image 2.1, a 7.12 B single-stream
+transformer with a Qwen3-VL-8B text encoder and an RGBA VAE. The weights are under the
+Qwen Research License, which is non-commercial and binds the weights, not the images made
+with them. xwen fetches them from the hub and redistributes nothing.
+
+```
+xwen fetch --model qwen-image-2.1
+xwen image --model qwen-image-2.1 --prompt "a fisherman mending nets at golden hour" -o out.png
+```
+
+The fetch is 15 files and **33.1 GB**: 14.2 GB of bf16 transformer in two shards, a 1.35 GB
+f32 VAE, and the 17.5 GB text encoder, which ships as the whole vision-language model
+though only its text stack is read. `--steps` defaults to 40 here, which is what the
+reference pipeline samples with, against 8 on Z-Image. Both sides must be multiples of 32
+and the default is 1024x1024. Memory admission caps the area at 1,048,576 pixels as it
+does for Z-Image. The model is native at 2048x2048, and the cap stays until the peak of a
+larger run has been measured. The encoder is loaded, run once and released before the
+transformer loads, so the two are never resident together. `--latents`, `--cap-feats` and
+`--dump` work as they do for Z-Image, with a `[1, 64, H/16, W/16]` latent and `[T, 4096]`
+caption features. `--init`, `--mask`, `--control` and `--lora` are Z-Image mechanisms and
+are refused for this model before anything loads. Reference images and editing are not
+wired yet, and neither is the serve images route, which still answers Z-Image only.
+
+The decoder draws an alpha plane. The PNG is RGBA when at least 10 pixels are clear
+(alpha 8 or under), which is what the model card's transparency prompt produces ("This is
+an RGBA image with transparency. ... The image has alpha channel and the background is
+transparent."). Any other image is written as RGB: an ordinary prompt leaves the alpha
+plane at 250-255, close to opaque and not worth handing to a viewer as translucency. The
+run prints the lowest alpha and the clear-pixel count so the choice is visible.
+
+The transformer, the VAE and the encoder are graded against diffusers fp32 dumps
+(`tests/qwen_image_parity.rs`, `tests/qwen_image_encoder.rs`). No timing is published yet.
+`XWEN_QWEN_IMAGE_ATTN=basic`, `XWEN_QWEN_IMAGE_LINEAR=candle` and
+`XWEN_QWEN_IMAGE_CACHE=off` are the bisect arms.
 
 Image controls use the same pipeline and image-engine queue. An init image selects
 img2img; adding a white-repaint mask selects inpainting. Strength defaults to 0.6

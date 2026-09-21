@@ -570,25 +570,30 @@ enum Cmd {
         #[arg(long)]
         verbose: bool,
     },
-    /// Generate an image with Z-Image-Turbo: encode the prompt with its text
+    /// Generate an image with Z-Image-Turbo (the default) or Qwen-Image 2.1
+    /// (`--model qwen-image-2.1`): encode the prompt with the pipeline's text
     /// encoder (the same render and hidden state `encode-text` produces), run
     /// the diffusion transformer for `--steps` flow-matching steps from seeded
-    /// noise, decode with the VAE and write a PNG. Runs the whole pipeline on
-    /// the Metal device with the encoder kept resident.
+    /// noise, decode with the VAE and write a PNG, all on the Metal device.
+    /// Z-Image keeps its encoder resident; Qwen-Image 2.1 frees its 15 GB
+    /// encoder before the transformer loads.
     Image {
         /// The prompt text.
         #[arg(long)]
         prompt: String,
-        /// Output width in pixels: a multiple of 16 whose cell count with the
-        /// height is a multiple of 32 (1024x1024, 1024x768, 512x512, ...).
+        /// Output width in pixels. Z-Image: a multiple of 16 whose cell count
+        /// with the height is a multiple of 32 (1024x1024, 1024x768, 512x512,
+        /// ...). Qwen-Image 2.1: a multiple of 32. Both default to 1024x1024.
         #[arg(long)]
         width: Option<usize>,
         /// Output height in pixels (same rule as --width).
         #[arg(long)]
         height: Option<usize>,
-        /// Denoising steps. 8 is what the Turbo release is fitted for.
-        #[arg(long, default_value_t = xwen::zimage::pipeline::DEFAULT_STEPS)]
-        steps: usize,
+        /// Denoising steps. The default is the pipeline's own: 8 on Z-Image,
+        /// which is what the Turbo release is fitted for, and 40 on Qwen-Image
+        /// 2.1, which is what its reference pipeline samples with.
+        #[arg(long)]
+        steps: Option<usize>,
         /// Noise seed; a random one is drawn and printed when omitted. A seed
         /// here is xwen's own draw, unrelated to a torch seed.
         #[arg(long)]
@@ -597,27 +602,28 @@ enum Cmd {
         #[arg(short, long, default_value = "out.png")]
         out: PathBuf,
         /// The text-to-image checkpoint, by registry name (zimage-turbo, the
-        /// default and the only one `xwen image` runs) or by path: a snapshot
-        /// root, the directory holding `model_index.json`, `transformer/`,
-        /// `vae/`, `text_encoder/` and `tokenizer/`. A directory named like an
-        /// alias is reachable as `./name`.
+        /// default, or qwen-image-2.1) or by path: a snapshot root, the
+        /// directory holding `model_index.json`, `transformer/`, `vae/` and
+        /// `text_encoder/`, whose `model_index.json` says which pipeline it is.
+        /// A directory named like an alias is reachable as `./name`.
         #[arg(short, long, value_name = "NAME|PATH")]
         model: Option<ModelRef>,
-        /// A safetensors file whose `latents` tensor, `[1, 16, H/8, W/8]` f32,
-        /// replaces the seeded noise — for comparing against a reference run
-        /// that started from the same latent.
+        /// A safetensors file whose `latents` tensor, `[1, 16, H/8, W/8]` f32
+        /// (`[1, 64, H/16, W/16]` on Qwen-Image 2.1), replaces the seeded
+        /// noise — for comparing against a reference run that started from the
+        /// same latent.
         #[arg(long)]
         latents: Option<PathBuf>,
-        /// A safetensors file whose `cap_feats` tensor, `[T, 2560]`, replaces
-        /// the text encoder's output; the encoder is not loaded and the prompt
+        /// A safetensors file whose `cap_feats` tensor, `[T, 2560]` (`[T, 4096]`
+        /// on Qwen-Image 2.1), replaces the text encoder's output; the encoder is not loaded and the prompt
         /// is ignored. With `--latents` this makes the run a pure transformer
         /// comparison against a reference that read the same two files.
         #[arg(long)]
         cap_feats: Option<PathBuf>,
         /// A directory to write the run's step-0 velocity
         /// (`velocity0.safetensors`, key `velocity`) and final latent
-        /// (`latents-final.safetensors`, key `latents`) into, both
-        /// `[1, 16, H/8, W/8]` f32, for grading against a reference dump.
+        /// (`latents-final.safetensors`, key `latents`) into, both f32 in the
+        /// shape `--latents` takes, for grading against a reference dump.
         #[arg(long)]
         dump: Option<PathBuf>,
         #[command(flatten)]
@@ -2509,7 +2515,7 @@ struct ImageArgs {
     width: Option<usize>,
     height: Option<usize>,
     controls: ImageControlArgs,
-    steps: usize,
+    steps: Option<usize>,
     seed: Option<u64>,
     out: PathBuf,
     model: Option<ModelRef>,
@@ -2518,7 +2524,358 @@ struct ImageArgs {
     dump: Option<PathBuf>,
 }
 
-/// `xwen image`: Z-Image-Turbo, prompt to PNG.
+/// The files of a diffusion entry that its PIPELINE loads: what the entry
+/// lists minus what its text encoder's entry lists. A run whose caption came in
+/// as a file opens none of the encoder's, and must not fetch them.
+fn pipeline_files(size: Model) -> Vec<&'static str> {
+    let encoder = size.text_encoder().map(Model::files).unwrap_or(&[]);
+    size.files()
+        .iter()
+        .copied()
+        .filter(|file| !encoder.contains(file))
+        .collect()
+}
+
+/// The snapshot root of the cached pipeline `size`, fetching what is missing:
+/// the whole entry, or with `with_encoder` false only [`pipeline_files`].
+fn resolve_pipeline_root(size: Model, with_encoder: bool) -> Result<PathBuf> {
+    let index = if with_encoder {
+        resolve_model(None, size)?
+    } else {
+        let files = pipeline_files(size);
+        let missing = files
+            .iter()
+            .filter(|file| xwen::hub::cached_file(size.repo(), file).is_none())
+            .count();
+        if missing > 0 {
+            eprintln!(
+                "xwen: {} ({missing} of its {} pipeline files) is not in the Hugging Face cache; \
+                 downloading (resumes in place; the text encoder is not fetched, the caption \
+                 being injected)",
+                size.repo(),
+                files.len()
+            );
+        }
+        let mut first = None;
+        for file in files {
+            let path = xwen::hub::ensure_file(size.repo(), file)?;
+            first.get_or_insert(path);
+        }
+        first.context("the pipeline entry lists no file of its own")?
+    };
+    Ok(index
+        .parent()
+        .context("the cached model_index.json has no parent directory")?
+        .to_path_buf())
+}
+
+/// Why `xwen image` does not run `size`, naming what it does run. The
+/// pipelines are read off the registry, the entries that name a text encoder,
+/// so a new one is offered here without this sentence being edited. An entry
+/// that IS such an encoder is pointed at the command that runs it.
+fn not_an_image_pipeline(size: Model) -> String {
+    let pipelines: Vec<String> = xwen::hub::MODELS
+        .into_iter()
+        .filter(|entry| entry.text_encoder().is_some())
+        .map(|entry| format!("{} (--model {entry})", entry.full_name()))
+        .collect();
+    let owner = xwen::hub::MODELS
+        .into_iter()
+        .find(|entry| entry.text_encoder() == Some(size));
+    let encoder_note = match owner {
+        Some(owner) => format!(
+            "; it is the text encoder of {}, and `xwen encode-text --model {size}` runs it \
+             alone",
+            owner.full_name()
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{} is not a text-to-image checkpoint; `xwen image` runs {}{encoder_note}",
+        size.full_name(),
+        pipelines.join(" and ")
+    )
+}
+
+/// The flags of `xwen image` that Qwen-Image 2.1 has no counterpart for, as the
+/// user typed them. Img2img, masks, ControlNet and LoRA are Z-Image mechanisms:
+/// their weights and their latent space are that model's.
+fn flags_qwen_image_lacks(controls: &ImageControlArgs) -> Vec<&'static str> {
+    let ImageControlArgs {
+        init,
+        strength,
+        mask,
+        mask_blur,
+        loras,
+        control,
+        control_type,
+        control_scale,
+        control_window,
+    } = controls;
+    [
+        (init.is_some(), "--init"),
+        (strength.is_some(), "--strength"),
+        (mask.is_some(), "--mask"),
+        (mask_blur.is_some(), "--mask-blur"),
+        (!loras.is_empty(), "--lora"),
+        (control.is_some(), "--control"),
+        (control_type.is_some(), "--control-type"),
+        (control_scale.is_some(), "--control-scale"),
+        (control_window.is_some(), "--control-window"),
+    ]
+    .into_iter()
+    .filter_map(|(given, flag)| given.then_some(flag))
+    .collect()
+}
+
+/// `xwen image --model qwen-image-2.1`: prompt to PNG through
+/// `qwen_image::QwenImagePipeline`.
+///
+/// The text encoder is the pipeline entry's `text_encoder()`, opened as its own
+/// registry entry and read before the final norm as its spec says, the prompt
+/// rendered by `qwen_image::conditioning` and the system turn's rows dropped.
+/// Unlike Z-Image's, this encoder does NOT stay resident: it is 15 GB beside a
+/// 14 GB transformer, its one forward is over before the first denoising step,
+/// and so it is dropped and the device drained before the transformer loads.
+fn run_qwen_image(args: ImageArgs, root: Option<PathBuf>) -> Result<()> {
+    use xwen::qwen_image::pipeline::{DEFAULT_STEPS, ImageOptions, QwenImagePipeline, write_png};
+
+    let size = Model::QwenImage21;
+    let encoder_entry = size
+        .text_encoder()
+        .context("the Qwen-Image 2.1 entry names no text encoder")?;
+    let spec = encoder_entry
+        .encoder_spec()
+        .context("the pipeline's text encoder entry carries no encoder spec")?;
+    // Everything the run can be wrong about is checked before a byte loads.
+    let lacking = flags_qwen_image_lacks(&args.controls);
+    ensure!(
+        lacking.is_empty(),
+        "{} takes a prompt and nothing else: {} {} Z-Image-Turbo's (--model {})",
+        size.full_name(),
+        lacking.join(", "),
+        if lacking.len() == 1 { "is" } else { "are" },
+        Model::ZImageTurbo
+    );
+    xwen::qwen_image::transformer::Arms::from_env()?;
+    xwen::qwen_image::vae::VaeImpl::from_env()?;
+    xwen::qwen_image::pipeline::CacheArm::from_env()?;
+    if args.cap_feats.is_none() {
+        xwen::qwen3::AttnImpl::from_env()?;
+    }
+    let (width, height) = match (args.width, args.height) {
+        (Some(w), Some(h)) => (w, h),
+        (None, None) => (1024, 1024),
+        _ => anyhow::bail!("--width and --height must be supplied together"),
+    };
+    QwenImagePipeline::check_size(width, height)?;
+    let steps = args.steps.unwrap_or(DEFAULT_STEPS);
+    ensure!(steps >= 1, "--steps must be at least 1");
+    let peak = xwen::memory::qwen_image_peak(u32::try_from(width)?, u32::try_from(height)?)?;
+    xwen::memory::admit("cli image", peak)?;
+    let latents = match &args.latents {
+        Some(path) => Some(QwenImagePipeline::read_latents(path, width, height)?),
+        None => None,
+    };
+    let injected_cap = match &args.cap_feats {
+        Some(path) => {
+            let cap = QwenImagePipeline::read_cap_feats(path)?;
+            QwenImagePipeline::check_layout(cap.dim(0)?, width, height)?;
+            Some(cap)
+        }
+        None => None,
+    };
+    if let Some(dir) = &args.dump {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating the dump directory {}", dir.display()))?;
+    }
+
+    // The prompt is rendered from the tokenizer alone, a few megabytes, before
+    // any weight is resolved: one that is too long, or that overruns the rope
+    // beside this image, is refused for the price of that one file.
+    let prompt = match &injected_cap {
+        Some(_) => None,
+        None => {
+            let relative = encoder_entry
+                .safetensors_tokenizer()
+                .context("the encoder entry names no tokenizer")?;
+            let tokenizer_path = match &root {
+                Some(root) => root.join(relative),
+                None => {
+                    if xwen::hub::cached_file(size.repo(), relative).is_none() {
+                        eprintln!(
+                            "xwen: {}/{relative} is not in the Hugging Face cache; downloading \
+                             (11 MB, read before the weights so the prompt is checked first)",
+                            size.repo()
+                        );
+                    }
+                    xwen::hub::ensure_file(size.repo(), relative)?
+                }
+            };
+            let (_text, ids, dropped) =
+                encoder_prompt_ids(encoder_entry, &tokenizer_path, args.prompt.clone())?;
+            QwenImagePipeline::check_layout(ids.len() - dropped, width, height)?;
+            Some((ids, dropped))
+        }
+    };
+
+    let root = match root {
+        Some(root) => root,
+        None => resolve_pipeline_root(size, prompt.is_some())?,
+    };
+    let encoder_dir = root.join(
+        Path::new(encoder_entry.file())
+            .parent()
+            .context("the encoder entry's config has no parent directory")?,
+    );
+
+    let device = gguf::metal_device()?;
+    let _drain = xwen::memory::DeviceDrain(device.clone());
+    let total_start = std::time::Instant::now();
+    // What Metal has allocated for this process, in GB: the figure that shows
+    // the encoder really left before the transformer arrived.
+    let held = |device: &candle_core::Device| {
+        xwen::memory::sample("", Some(device))
+            .metal_allocated_bytes
+            .unwrap_or(0) as f64
+            / 1e9
+    };
+
+    let cap_feats = match injected_cap {
+        Some(cap) => {
+            let (t, dim) = cap.dims2()?;
+            eprintln!(
+                "xwen: caption features from {} ({t} tokens x {dim}, {:?}); the prompt is ignored",
+                args.cap_feats.as_deref().unwrap_or(Path::new("")).display(),
+                cap.dtype()
+            );
+            cap
+        }
+        None => {
+            let load_start = std::time::Instant::now();
+            let (ids, dropped) = prompt.context("the prompt was rendered before the load")?;
+            let source = CheckpointSource::open(&encoder_dir, &device, Some(encoder_entry))?;
+            let mut encoder = xwen::model::XwenModel::load_encoder(source, spec.max_tokens)?;
+            eprintln!(
+                "xwen: text encoder loaded in {:.1}s",
+                load_start.elapsed().as_secs_f64()
+            );
+            let encode_start = std::time::Instant::now();
+            let (hidden, n_tokens) = encoder.encode_spec(&ids, &spec)?;
+            let n_tokens = n_tokens - dropped;
+            // Onto the CPU, so nothing of the encoder's is referenced from the
+            // device once it goes: the rows are a few hundred kilobytes.
+            let cap_feats = hidden
+                .narrow(0, dropped, n_tokens)?
+                .to_device(&candle_core::Device::Cpu)?
+                .contiguous()?;
+            eprintln!(
+                "xwen: {n_tokens} prompt tokens encoded in {:.0}ms ({dropped} system rows dropped)",
+                encode_start.elapsed().as_secs_f64() * 1000.0
+            );
+            xwen::memory::log_event("cli Qwen-Image 2.1 encoder resident", Some(&device));
+            // Drained before the drop, a buffer freed under work still queued
+            // against it being the one way this goes wrong.
+            device.synchronize()?;
+            let before = held(&device);
+            drop(hidden);
+            drop(encoder);
+            device.synchronize()?;
+            eprintln!(
+                "xwen: text encoder released, the device holds {:.1} GB (was {before:.1})",
+                held(&device)
+            );
+            xwen::memory::log_event("cli Qwen-Image 2.1 encoder released", Some(&device));
+            cap_feats
+        }
+    };
+
+    let load_start = std::time::Instant::now();
+    let pipeline = QwenImagePipeline::load(&root, &device)?;
+    xwen::memory::log_event("cli Qwen-Image 2.1 loaded", Some(&device));
+    device.synchronize()?;
+    eprintln!(
+        "xwen: transformer and VAE loaded in {:.1}s, the device holds {:.1} GB",
+        load_start.elapsed().as_secs_f64(),
+        held(&device)
+    );
+
+    let seed = args.seed.unwrap_or_else(rand::random::<u64>);
+    let noise_source = match &args.latents {
+        Some(path) => format!("latents from {}", path.display()),
+        None => format!("seed {seed}"),
+    };
+    eprintln!("xwen: {noise_source}");
+
+    let opts = ImageOptions {
+        width,
+        height,
+        steps,
+        seed,
+        latents,
+    };
+    let rendered = pipeline.generate(&cap_feats, &opts)?;
+    xwen::memory::log_event(
+        &format!("cli image finished: {width}x{height}, {steps} steps"),
+        Some(&device),
+    );
+    let timings = &rendered.timings;
+    for (i, secs) in timings.steps.iter().enumerate() {
+        eprintln!("xwen: step {}/{steps} {:.2}s", i + 1, secs);
+    }
+    eprintln!(
+        "xwen: VAE decode {:.2}s, the device holds {:.1} GB",
+        timings.vae_decode,
+        held(&device)
+    );
+    let channels = rendered.image.dim(0)?;
+    eprintln!(
+        "xwen: alpha min {} of 255, {} clear pixels (alpha <= {}); written as {} ({} clear \
+         pixels keep the alpha plane)",
+        rendered.alpha_min,
+        rendered.clear_pixels,
+        xwen::qwen_image::pipeline::CLEAR_ALPHA_MAX,
+        if channels == 4 { "RGBA" } else { "RGB" },
+        xwen::qwen_image::pipeline::CLEAR_PIXELS_MIN
+    );
+    write_png(&rendered.image, &args.out)?;
+    if let Some(dir) = &args.dump {
+        let cpu = |t: &candle_core::Tensor| t.to_device(&candle_core::Device::Cpu);
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([(
+                "velocity".to_string(),
+                cpu(rendered
+                    .velocity0
+                    .as_ref()
+                    .context("no velocity: no denoising step ran")?)?,
+            )]),
+            dir.join("velocity0.safetensors"),
+        )?;
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([(
+                "latents".to_string(),
+                cpu(&rendered.final_latents)?,
+            )]),
+            dir.join("latents-final.safetensors"),
+        )?;
+        eprintln!(
+            "xwen: velocity0 and final latents written under {}",
+            dir.display()
+        );
+    }
+    println!(
+        "{}x{}, {} steps, {noise_source}, written to {} ({:.1}s total)",
+        width,
+        height,
+        steps,
+        args.out.display(),
+        total_start.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// `xwen image`: prompt to PNG. This is Z-Image-Turbo's run; Qwen-Image 2.1
+/// branches off into [`run_qwen_image`] as soon as the pipeline is known.
 ///
 /// The text encoder is opened as its OWN registry entry — the pipeline entry's
 /// `text_encoder()` — through `CheckpointSource` and `XwenModel::load_encoder`,
@@ -2547,21 +2904,13 @@ fn run_image(args: ImageArgs) -> Result<()> {
     // Everything below is Z-Image's pipeline: its transformer, its scheduler,
     // its VAE. Another pipeline's entry must not fall through into it, where it
     // would fail deep inside a load, or worse, half succeed.
-    ensure!(
-        size != Model::QwenImage21,
-        "{} is registered and fetchable, but its image pipeline is not implemented yet: only \
-         its text encoder runs (`xwen encode-text --model {}`)",
-        size.full_name(),
-        Model::QwenImage21Encoder
-    );
-    let encoder_entry = size.text_encoder().with_context(|| {
-        format!(
-            "{} is not a text-to-image checkpoint; `xwen image` runs {} (--model {})",
-            size.full_name(),
-            Model::ZImageTurbo.full_name(),
-            Model::ZImageTurbo
-        )
-    })?;
+    if size == Model::QwenImage21 {
+        return run_qwen_image(args, root);
+    }
+    let steps = args.steps.unwrap_or(xwen::zimage::pipeline::DEFAULT_STEPS);
+    let encoder_entry = size
+        .text_encoder()
+        .with_context(|| not_an_image_pipeline(size))?;
     let spec = encoder_entry
         .encoder_spec()
         .context("the pipeline's text encoder entry carries no encoder spec")?;
@@ -2574,6 +2923,9 @@ fn run_image(args: ImageArgs) -> Result<()> {
     xwen::zimage::AttnImpl::from_env()?;
     xwen::zimage::LinearImpl::from_env()?;
     xwen::zimage::VaeImpl::from_env()?;
+    if args.cap_feats.is_none() {
+        xwen::qwen3::AttnImpl::from_env()?;
+    }
     ensure!(
         args.controls.init.is_none() || args.latents.is_none(),
         "--init conflicts with --latents; injected edit noise is a library parity instrument"
@@ -2690,7 +3042,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
         .as_ref()
         .map(|_| xwen::zimage::controlnet::cached_default())
         .transpose()?;
-    ensure!(args.steps >= 1, "--steps must be at least 1");
+    ensure!(steps >= 1, "--steps must be at least 1");
     let latents = match &args.latents {
         Some(path) => Some(ZImagePipeline::read_latents(path, width, height)?),
         None => None,
@@ -2706,13 +3058,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
 
     let root = match root {
         Some(root) => root,
-        None => {
-            let index = resolve_model(None, size)?;
-            index
-                .parent()
-                .context("the cached model_index.json has no parent directory")?
-                .to_path_buf()
-        }
+        None => resolve_pipeline_root(size, injected_cap.is_none())?,
     };
     ensure!(
         root.join("model_index.json").is_file(),
@@ -2807,7 +3153,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
     let opts = ImageOptions {
         width,
         height,
-        steps: args.steps,
+        steps,
         seed,
         latents,
     };
@@ -2819,16 +3165,16 @@ fn run_image(args: ImageArgs) -> Result<()> {
         (None, None) => pipeline.generate(&cap_feats, &opts)?,
     };
     xwen::memory::log_event(
-        &format!("cli image finished: {width}x{height}, {} steps", args.steps),
+        &format!("cli image finished: {width}x{height}, {steps} steps"),
         Some(&device),
     );
     eprintln!(
-        "xwen: schedule starts at step {} of {}",
-        rendered.start_step, args.steps
+        "xwen: schedule starts at step {} of {steps}",
+        rendered.start_step
     );
     let timings = &rendered.timings;
     for (i, secs) in timings.steps.iter().enumerate() {
-        eprintln!("xwen: step {}/{} {:.2}s", i + 1, args.steps, secs);
+        eprintln!("xwen: step {}/{steps} {:.2}s", i + 1, secs);
     }
     eprintln!("xwen: VAE decode {:.2}s", timings.vae_decode);
     write_png(&rendered.image, &args.out)?;
@@ -2860,7 +3206,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
         "{}x{}, {} steps, {noise_source}, written to {} ({:.1}s total)",
         width,
         height,
-        args.steps,
+        steps,
         args.out.display(),
         total_start.elapsed().as_secs_f64()
     );
@@ -2872,6 +3218,42 @@ mod tests {
     use super::*;
     use xwen::batch::{BatchStats, FinishReason, ItemResponse, Usage};
     use xwen::chat::ChatDialect;
+
+    /// A run with an injected caption fetches the pipeline's own files and
+    /// none of its text encoder's, tokenizer included, on every diffusion entry.
+    #[test]
+    fn an_injected_caption_needs_none_of_the_encoders_files() {
+        let pipelines: Vec<Model> = xwen::hub::MODELS
+            .into_iter()
+            .filter(|entry| entry.text_encoder().is_some())
+            .collect();
+        assert!(pipelines.contains(&Model::ZImageTurbo));
+        assert!(pipelines.contains(&Model::QwenImage21));
+        for size in pipelines {
+            let files = pipeline_files(size);
+            assert_eq!(files.first(), Some(&"model_index.json"), "{size}");
+            for prefix in ["transformer/", "vae/", "scheduler/"] {
+                assert!(
+                    files.iter().any(|f| f.starts_with(prefix)),
+                    "{size}: {prefix}"
+                );
+            }
+            for file in &files {
+                assert!(
+                    !["text_encoder/", "processor/", "tokenizer/"]
+                        .iter()
+                        .any(|prefix| file.starts_with(prefix)),
+                    "{size}: {file} is the encoder's"
+                );
+            }
+            let encoder = size.text_encoder().unwrap();
+            assert_eq!(
+                files.len() + encoder.files().len(),
+                size.files().len(),
+                "{size}"
+            );
+        }
+    }
 
     #[test]
     fn fetch_model_accepts_registry_names_and_aliases() {

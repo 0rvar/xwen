@@ -99,13 +99,17 @@ pub struct ImageOptions {
 /// parity gate grades.
 #[derive(Debug, Clone)]
 pub struct Rendered {
-    /// `[3, H, W]` u8 RGB on the CPU. The decoder emits RGBA; the alpha plane
-    /// is measured and dropped.
+    /// u8 on the CPU: `[3, H, W]` RGB, or `[4, H, W]` RGBA when the decoded
+    /// alpha plane holds a transparent region ([`keeps_alpha`]).
     pub image: Tensor,
     /// How far the decoded alpha plane strays from opaque, as the largest
     /// `1 - alpha` over the image with alpha in `[0, 1]`. A text-to-image run
     /// without the transparency prompt is expected to read near zero.
     pub alpha_max_distance_from_opaque: f32,
+    /// The lowest alpha byte of the decoded image, 255 being opaque.
+    pub alpha_min: u8,
+    /// How many pixels are clear: alpha at or under [`CLEAR_ALPHA_MAX`].
+    pub clear_pixels: usize,
     pub timings: Timings,
     /// The transformer's output at the first sigma, `(1, 64, H/16, W/16)`
     /// f32, as the Euler step consumes it. None when no step runs.
@@ -119,9 +123,53 @@ pub struct Rendered {
 /// A decoded image split into what is written and what is reported.
 #[derive(Debug, Clone)]
 pub struct Decoded {
-    /// `[3, H, W]` u8 RGB on the CPU.
+    /// u8 on the CPU, `[3, H, W]` RGB or `[4, H, W]` RGBA ([`keeps_alpha`]).
     pub image: Tensor,
     pub alpha_max_distance_from_opaque: f32,
+    pub alpha_min: u8,
+    pub clear_pixels: usize,
+}
+
+impl Decoded {
+    /// The RGB planes alone, `[3, H, W]`, whichever form the image took: what
+    /// a comparison against an RGB reference reads.
+    pub fn rgb(&self) -> Result<Tensor> {
+        Ok(self.image.narrow(0, 0, 3)?.contiguous()?)
+    }
+}
+
+impl Rendered {
+    /// The RGB planes alone, `[3, H, W]`, whichever form the image took.
+    pub fn rgb(&self) -> Result<Tensor> {
+        Ok(self.image.narrow(0, 0, 3)?.contiguous()?)
+    }
+}
+
+/// An alpha byte at or under this is a clear pixel.
+pub const CLEAR_ALPHA_MAX: u8 = 8;
+
+/// This many clear pixels make a transparent region, and an image with one
+/// keeps its alpha plane.
+pub const CLEAR_PIXELS_MIN: usize = 10;
+
+/// Whether an image with this alpha plane is written as RGBA: at least
+/// [`CLEAR_PIXELS_MIN`] pixels at or under [`CLEAR_ALPHA_MAX`]. Everything else
+/// is written as RGB with the plane dropped.
+///
+/// The decoder always emits an alpha plane, and on a prompt that asks for no
+/// transparency it is only NEARLY opaque: the reference's fp32 render of an
+/// ordinary prompt reads 252 to 255, with about 17% of its pixels at 254. So
+/// "any pixel short of opaque" would fire on every image and hand every caller
+/// a faintly translucent PNG. A clear pixel is one the model drew as
+/// background, which no amount of that noise produces, and asking for ten of
+/// them keeps a stray one from deciding the format. An image that is
+/// translucent throughout and clear nowhere is written as RGB.
+pub fn keeps_alpha(alpha: &[u8]) -> bool {
+    clear_pixels(alpha) >= CLEAR_PIXELS_MIN
+}
+
+fn clear_pixels(alpha: &[u8]) -> usize {
+    alpha.iter().filter(|&&a| a <= CLEAR_ALPHA_MAX).count()
 }
 
 /// The transformer, the VAE and the scheduler config, resident on one device.
@@ -274,6 +322,19 @@ impl QwenImagePipeline {
         Ok(())
     }
 
+    /// Whether a caption of `text_len` rows and a `width x height` image fit
+    /// the rope together, by the rule the forward enforces
+    /// ([`Layout::positions`]) and before anything is loaded: the text takes the
+    /// first positions and the image's frame comes after them, so a caption can
+    /// be too long for an image that alone would fit.
+    pub fn check_layout(text_len: usize, width: usize, height: usize) -> Result<()> {
+        Self::check_size(width, height)?;
+        ensure!(text_len > 0, "the caption has no tokens");
+        let (lat_h, lat_w) = Self::latent_size(width, height);
+        Layout::text_to_image(text_len, lat_h, lat_w)?.positions()?;
+        Ok(())
+    }
+
     /// `(latent_h, latent_w)` for a `width x height` that passed
     /// [`Self::check_size`].
     pub fn latent_size(width: usize, height: usize) -> (usize, usize) {
@@ -287,18 +348,30 @@ impl QwenImagePipeline {
         h * w
     }
 
-    /// An ESTIMATE of the device bytes one run holds at its peak, the encoder
-    /// excluded: no run has been measured. 36 GiB covers the bf16 transformer
-    /// (14.2 GB), the f32 VAE (1.35 GB) and a 1024x1024 step's transients
-    /// with headroom; the per-megapixel term is the decoder's widest f32
-    /// activations, which scale with pixels and dominate at the native
-    /// 2048x2048. A caller admitting a run uses this until a measured peak
-    /// replaces it.
+    /// The bytes one run holds at its peak, the encoder excluded (it is gone
+    /// before the transformer loads): `PEAK_BASE + PEAK_PER_MEGAPIXEL * pixels`,
+    /// a line through two measured runs with 15% on top.
+    ///
+    /// Measured 2026-09-21 as the kernel's `phys_footprint_peak` of `xwen
+    /// image`, 40 steps, the VAE on the candle arm: 25 GiB at 512x512
+    /// ([`MEASURED_PEAK_512`]) and 56 GiB at 1024x1024
+    /// ([`MEASURED_PEAK_1024`]). Both peaks are the VAE DECODE, not the
+    /// denoising loop, which held 19 and 27 GiB: candle's convolution builds a
+    /// column buffer nine times its input, 10.9 GB for one 288-channel
+    /// 1024x1024 layer, and the buffer pool rounds that up. The decode already
+    /// returns its buffers between layers, so what is left is one layer's
+    /// worth, and it scales with pixels. A decoder that forms no column buffer
+    /// moves both constants, which is when they are measured again.
     pub fn peak_bytes(width: usize, height: usize) -> Result<u64> {
         Self::check_size(width, height)?;
-        const GIB: u64 = 1 << 30;
-        let megapixels = ((width * height) as u64).div_ceil(1 << 20);
-        Ok(36 * GIB + 10 * GIB * megapixels)
+        let pixels = (width as u64)
+            .checked_mul(height as u64)
+            .context("image pixel count overflow")?;
+        pixels
+            .checked_mul(PEAK_PER_MEGAPIXEL)
+            .map(|scaled| scaled >> 20)
+            .and_then(|scaled| scaled.checked_add(PEAK_BASE))
+            .context("image memory estimate overflow")
     }
 
     /// Read an injected latent from a safetensors file holding it under
@@ -444,6 +517,8 @@ impl QwenImagePipeline {
         Ok(Rendered {
             image: decoded.image,
             alpha_max_distance_from_opaque: decoded.alpha_max_distance_from_opaque,
+            alpha_min: decoded.alpha_min,
+            clear_pixels: decoded.clear_pixels,
             timings,
             velocity0,
             final_latents,
@@ -520,15 +595,27 @@ impl QwenImagePipeline {
     }
 }
 
+const GIB: u64 = 1 << 30;
+
+/// The measured peaks [`QwenImagePipeline::peak_bytes`] is fitted to.
+pub const MEASURED_PEAK_512: u64 = 25 * GIB;
+pub const MEASURED_PEAK_1024: u64 = 56 * GIB;
+
+/// The fit through those two points is 14.7 GiB plus 41.3 GiB per megapixel
+/// (1,048,576 pixels); these are that line with 15% on top, rounded up.
+const PEAK_BASE: u64 = 17 * GIB;
+const PEAK_PER_MEGAPIXEL: u64 = 48 * GIB;
+
 /// The latent channels and the caption width of the shipped checkpoint, which
 /// the file readers check against before any config is open. The loaded
 /// configs stay the authority for what runs.
 const LATENT_CHANNELS: usize = 64;
 const CAPTION_DIM: usize = 4096;
 
-/// The decoder's `[1, 4, H, W]` RGBA in `[-1, 1]` as u8 RGB on the CPU plus
-/// the alpha plane's distance from opaque. A decoder with no alpha plane is
-/// RGB and opaque by definition.
+/// The decoder's `[1, 4, H, W]` RGBA in `[-1, 1]` as u8 on the CPU, RGB or RGBA
+/// as [`keeps_alpha`] decides over the quantised alpha plane, plus what that
+/// plane measured. A decoder with no alpha plane is RGB and opaque by
+/// definition.
 fn split_rgba(image: &Tensor) -> Result<Decoded> {
     let (b, c, _, _) = image.dims4()?;
     ensure!(
@@ -537,7 +624,18 @@ fn split_rgba(image: &Tensor) -> Result<Decoded> {
         image.shape()
     );
     let bytes = postprocess_image(image)?;
-    let rgb = bytes.narrow(1, 0, 3)?.squeeze(0)?.to_device(&Device::Cpu)?;
+    let bytes = bytes.squeeze(0)?.to_device(&Device::Cpu)?;
+    let (alpha_min, clear, keep) = if c == 4 {
+        let alpha = bytes.narrow(0, 3, 1)?.flatten_all()?.to_vec1::<u8>()?;
+        (
+            alpha.iter().copied().min().unwrap_or(u8::MAX),
+            clear_pixels(&alpha),
+            keeps_alpha(&alpha),
+        )
+    } else {
+        (u8::MAX, 0, false)
+    };
+    let written = if keep { bytes } else { bytes.narrow(0, 0, 3)? };
     let alpha_max_distance_from_opaque = if c == 4 {
         let alpha = ((image.narrow(1, 3, 1)?.to_dtype(DType::F32)? / 2.0)? + 0.5)?;
         let lowest = alpha.flatten_all()?.min(0)?.to_scalar::<f32>()?;
@@ -546,8 +644,10 @@ fn split_rgba(image: &Tensor) -> Result<Decoded> {
         0.0
     };
     Ok(Decoded {
-        image: rgb.contiguous()?,
+        image: written.contiguous()?,
         alpha_max_distance_from_opaque,
+        alpha_min,
+        clear_pixels: clear,
     })
 }
 
@@ -674,6 +774,23 @@ mod tests {
             QwenImagePipeline::peak_bytes(2048, 2048).unwrap()
                 > QwenImagePipeline::peak_bytes(1024, 1024).unwrap()
         );
+        // A caption and an image share the rope: the text takes the first
+        // positions, so one that alone would fit is refused beside an image
+        // whose frame it pushes past the end, and before anything allocates.
+        assert!(QwenImagePipeline::check_layout(73, 1024, 1024).is_ok());
+        assert!(QwenImagePipeline::check_layout(8191, 1024, 1024).is_ok());
+        assert!(QwenImagePipeline::check_layout(8192, 1024, 1024).is_err());
+        assert!(QwenImagePipeline::check_layout(usize::MAX, 1024, 1024).is_err());
+        assert!(QwenImagePipeline::check_layout(0, 1024, 1024).is_err());
+        assert!(QwenImagePipeline::check_layout(73, 1000, 1024).is_err());
+        // The estimate covers both measured runs with its margin.
+        for (side, measured) in [(512, MEASURED_PEAK_512), (1024, MEASURED_PEAK_1024)] {
+            let estimate = QwenImagePipeline::peak_bytes(side, side).unwrap();
+            assert!(
+                estimate as f64 >= measured as f64 * 1.15,
+                "{side}x{side}: {estimate} against a measured {measured}"
+            );
+        }
     }
 
     #[test]
@@ -694,7 +811,15 @@ mod tests {
         let b = full.generate(&cap, &options()).unwrap();
         assert_eq!(a.timings.steps.len(), 3);
         assert_eq!(a.final_latents.dims(), [1, 3, 2, 4]);
-        assert_eq!(a.image.dims(), [3, 32, 64]);
+        // A random decoder's alpha plane lands wherever it lands, so the form
+        // follows the rule and the RGB planes are there either way.
+        let channels = if a.clear_pixels >= CLEAR_PIXELS_MIN {
+            4
+        } else {
+            3
+        };
+        assert_eq!(a.image.dims(), [channels, 32, 64]);
+        assert_eq!(a.rgb().unwrap().dims(), [3, 32, 64]);
         let (x, y) = (floats(&a.final_latents), floats(&b.final_latents));
         let diff = x
             .iter()
@@ -759,6 +884,83 @@ mod tests {
         assert_eq!(
             split_rgba(&rgb).unwrap().alpha_max_distance_from_opaque,
             0.0
+        );
+    }
+
+    /// The alpha plane is kept from the tenth clear pixel on, and a pixel is
+    /// clear through alpha 8 and not at 9.
+    #[test]
+    fn ten_clear_pixels_keep_the_alpha_plane() {
+        let plane = |clear: usize, value: u8| {
+            let mut alpha = vec![254u8; 64];
+            alpha[..clear].fill(value);
+            alpha
+        };
+        assert!(!keeps_alpha(&plane(CLEAR_PIXELS_MIN - 1, 0)));
+        assert!(keeps_alpha(&plane(CLEAR_PIXELS_MIN, 0)));
+        assert!(keeps_alpha(&plane(CLEAR_PIXELS_MIN, CLEAR_ALPHA_MAX)));
+        assert!(!keeps_alpha(&plane(CLEAR_PIXELS_MIN, CLEAR_ALPHA_MAX + 1)));
+        // The noise floor of an ordinary render keeps nothing, however much
+        // of the image sits one step short of opaque.
+        assert!(!keeps_alpha(&[252, 253, 254, 254, 254, 255].repeat(1000)));
+        assert!(!keeps_alpha(&[]));
+    }
+
+    /// A decode with a clear region comes out as four channels with the alpha
+    /// bytes intact; one without comes out as three, and both report what the
+    /// plane held.
+    #[test]
+    fn a_clear_region_makes_the_image_rgba() {
+        let (h, w) = (4usize, 4usize);
+        let plane = |v: f32| Tensor::full(v, (1, 1, h, w), &Device::Cpu).unwrap();
+        let alpha_plane = |clear: usize| {
+            let mut alpha = vec![1.0f32; h * w];
+            alpha[..clear].fill(-1.0);
+            Tensor::from_vec(alpha, (1, 1, h, w), &Device::Cpu).unwrap()
+        };
+        let decode = |clear: usize| {
+            let rgba = Tensor::cat(
+                &[plane(-1.0), plane(0.0), plane(1.0), alpha_plane(clear)],
+                1,
+            )
+            .unwrap();
+            split_rgba(&rgba).unwrap()
+        };
+
+        let kept = decode(CLEAR_PIXELS_MIN);
+        assert_eq!(kept.image.dims(), [4, h, w]);
+        assert_eq!(kept.clear_pixels, CLEAR_PIXELS_MIN);
+        assert_eq!(kept.alpha_min, 0);
+        let alpha = kept
+            .image
+            .narrow(0, 3, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<u8>()
+            .unwrap();
+        assert!(alpha[..CLEAR_PIXELS_MIN].iter().all(|&a| a == 0));
+        assert!(alpha[CLEAR_PIXELS_MIN..].iter().all(|&a| a == 255));
+        assert_eq!(kept.rgb().unwrap().dims(), [3, h, w]);
+
+        let dropped = decode(CLEAR_PIXELS_MIN - 1);
+        assert_eq!(dropped.image.dims(), [3, h, w]);
+        assert_eq!(dropped.clear_pixels, CLEAR_PIXELS_MIN - 1);
+        assert_eq!(dropped.alpha_min, 0);
+        assert_eq!(
+            dropped
+                .rgb()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap(),
+            kept.rgb()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<u8>()
+                .unwrap()
         );
     }
 }
