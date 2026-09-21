@@ -39,13 +39,17 @@ committed ("Sources").
   reference images"; the pipeline enforces no count; ComfyUI's node exposes 16 autogrow
   slots (`image_1`..`image_16`) with a template note of 10. So 10 is a vendor-stated
   trained limit, not a code assertion, and the engine's cap is a config constant.
-- **License: Qwen Research License Agreement, non-commercial only.** LICENSE section 1.i
-  defines Non-Commercial as "for research or evaluation purposes only"; 2.a grants the
-  license "FOR NON-COMMERCIAL PURPOSES ONLY"; 2.b routes commercial use to a separate
-  license from `model-business@notice.qwencloud.com`. Qwen-Image 1.0 was Apache-2.0.
-  **This is a decision for the repo owner before Phase 0, not for the implementing
-  engineer**: whether a non-commercial checkpoint belongs in the registry, and under
-  what README note.
+- **License: Qwen Research License Agreement, and it binds the weights, not the images.**
+  LICENSE section 1.i defines Non-Commercial as "for research or evaluation purposes
+  only"; 2.a grants the license "FOR NON-COMMERCIAL PURPOSES ONLY"; 2.b routes commercial
+  use to a separate license from `model-business@notice.qwencloud.com`. Qwen-Image 1.0 was
+  Apache-2.0. What the clause covers is the Materials, meaning the model: selling it, or
+  selling access to it, needs the commercial license. Outputs are not Materials: Qwen's
+  own clarification on 2026-09-21 (@QwenDevs, quoting @Alibaba_Qwen: "Outputs are not
+  part of the licensed Materials. Users retain the rights to images and other content
+  they generate using the model"). xwen fetches the weights from the hub at run time,
+  redistributes nothing and sells nothing, so nothing here is gated on it; the registry
+  entry carries a one-line README note naming the license, as the only visible trace.
 - **Lineage.** 2025-08-04 Qwen-Image, a 20B MMDiT (60 dual-stream blocks, dim 3072,
   Apache-2.0), then Edit, Edit-2509, Layered, Edit-2511, 2512; 2026-02-10 Qwen-Image 2.0,
   API-only **[unverified: snippet]**; 2026-09-20 2.1, the first open weights of 2.x.
@@ -731,7 +735,7 @@ Two bisect arms per stage, as Z-Image has, so a bar can be attributed.
 
 Each phase is an arc with its own record, closed by its gate.
 - **Phase 0, references and pins.** Entry: the registry entry sketch and the `uv` env.
-  Prerequisites: the license decision, egress to `huggingface.co`, one fetch. Work: list
+  Prerequisites: egress to `huggingface.co`, one fetch. Work: list
   the HF tree, read shard hashes and safetensors dtypes, confirm the four mirrored
   configs, pin diffusers and transformers, run the four dumps at 1024x1024 with a fixed
   seed. Gate: fixtures committed with `meta.json` carrying the reference's own spread.
@@ -816,8 +820,7 @@ decisions.md "The transformer runs bf16 end to end"); the chat sidebar's tool fo
 - The size rule for T2I: multiples of 32 px per the reference's floor, against the 16 px
   the latent stride alone suggests; the doc takes 32.
 - The rope extent: 2048 latent tokens per side by the table's negative rows; confirm.
-- The license decision (non-commercial), before Phase 0; and whether a 1024x1024 default
-  is served where the native size is 2048x2048.
+- Whether a 1024x1024 default is served where the native size is 2048x2048.
 - The doc drift at docs/decisions/zimage.md:36-38 (four `Format::Diffusion` fields
   described, one in the code).
 - How `EncoderSpec` expresses "depth 36, pre-norm" against a convention that norms there.
