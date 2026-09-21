@@ -296,7 +296,7 @@ pub(super) fn missing_vocabulary(family: VocabFamily) -> anyhow::Error {
     let names: Vec<String> = hub::MODELS
         .into_iter()
         .filter(|model| model.vocab_family() == family && model.safetensors_tokenizer().is_some())
-        .map(|model| format!("xwen fetch --model-size {model}"))
+        .map(|model| format!("xwen fetch --model {model}"))
         .collect();
     anyhow::anyhow!(
         "no tokenizer for the {family:?} vocabulary is on this machine, and one is not \
@@ -498,7 +498,7 @@ mod tests {
             seen.len(),
             2,
             "a second Qwen3-family tokenizer.json to compare against",
-            "xwen fetch --model-size qwen3-4b and --model-size qwen3-4b-instruct-2507",
+            "xwen fetch --model qwen3-4b and --model qwen3-4b-instruct-2507",
         ) {
             return;
         }
@@ -673,10 +673,7 @@ mod tests {
     fn a_family_with_no_tokenizer_says_so() {
         let error = missing_vocabulary(VocabFamily::Qwen3).to_string();
         assert!(error.contains("no tokenizer"), "{error}");
-        assert!(
-            error.contains("xwen fetch --model-size qwen3-4b"),
-            "{error}"
-        );
+        assert!(error.contains("xwen fetch --model qwen3-4b"), "{error}");
         // Never the embedded one under another family's name.
         let vocabs = Vocabularies::hub_only();
         let embedded = vocabs.for_family(VocabFamily::Qwen36).unwrap();

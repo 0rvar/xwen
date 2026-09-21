@@ -69,7 +69,7 @@ fn snapshot_root() -> Result<PathBuf> {
     }
     let index = xwen::hub::cached_model(Model::ZImageTurbo).context(
         "Z-Image-Turbo is not in the Hugging Face cache: run \
-         `xwen fetch --model-size zimage-turbo`, or point $XWEN_ZIMAGE_DIR at a snapshot root",
+         `xwen fetch --model zimage-turbo`, or point $XWEN_ZIMAGE_DIR at a snapshot root",
     )?;
     Ok(index
         .parent()

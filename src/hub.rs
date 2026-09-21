@@ -853,8 +853,8 @@ impl Model {
     ///
     /// This is the cross-check a safetensors set gets in place of the name one:
     /// a directory says nothing about which release it is, but the two `qwen3`
-    /// releases in this registry disagree here, so `--model-size` naming one of
-    /// them against a directory carrying the other's theta is refused
+    /// releases in this registry disagree here, so a `xwen batch` payload naming one
+    /// of them against a directory carrying the other's theta is refused
     /// ([`crate::XwenConfig::identify`]).
     pub const fn safetensors_rope_theta(self) -> Option<f32> {
         match self {
@@ -883,7 +883,7 @@ impl Model {
     /// Z-Image text encoder, whose configs are byte-identical, and the tie goes
     /// to the base model: it is the language model, it is what an unpacked copy
     /// of these weights most likely is, and the encoder entry is reachable by
-    /// naming it (`--model-size zimage-turbo`) where the LM is what silence
+    /// naming it (`--model zimage-turbo-encoder`) where the LM is what silence
     /// gets. A theta neither release uses answers `None`.
     pub fn by_safetensors_rope_theta(theta: f32) -> Option<Model> {
         [Model::Qwen34B, Model::Qwen34BInstruct2507]
@@ -1197,7 +1197,7 @@ impl Model {
 
     /// The checkpoint the cache-moving surfaces run when nothing named one:
     /// [`Model::default`] when they can run it, and otherwise the best one they
-    /// can. Both `xwen serve` (no `--model`/`--model-size`, no config `model`)
+    /// can. Both `xwen serve` (no `--model`, no config `model`)
     /// and `xwen batch` (no `"model"` in the payload) resolve their zero-flag
     /// default through here, so the two cannot drift into answering with
     /// different checkpoints.
@@ -1473,9 +1473,8 @@ impl Model {
     /// So the only thing that can honestly say "these are the official
     /// weights" is provenance: this directory is the one the hub cache holds
     /// for that entry. Anything else identifies as nothing, runs under its own
-    /// directory name as [`crate::Identity::Assumed`], and can still be pinned
-    /// with `--model-size` — which is exactly the shape of the GGUF rule, for
-    /// the same reason.
+    /// directory name as [`crate::Identity::Assumed`] — which is exactly the
+    /// shape of the GGUF rule, for the same reason.
     ///
     /// Provenance is measured against the entry's REPO directory, not against
     /// whichever snapshot `refs/main` currently points at. A cache holds every
@@ -1726,8 +1725,8 @@ impl Model {
     }
 }
 
-/// The CLI's short alias for the checkpoint — what `--model-size` takes and
-/// what a log line names it by. The APIs speak [`Model::full_name`] instead.
+/// The CLI's short alias for the checkpoint — what `--model` takes and what a
+/// log line names it by. The APIs speak [`Model::full_name`] instead.
 impl std::fmt::Display for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -1747,7 +1746,7 @@ impl std::fmt::Display for Model {
 }
 
 /// The CLI spelling: the short aliases above, plus each checkpoint's full name,
-/// so anything a `/v1/models` listing shows also works as a `--model-size`. The
+/// so anything a `/v1/models` listing shows also works as a `--model`. The
 /// bare `27b`/`35b` keep meaning the 3.6 checkpoints they always did.
 impl std::str::FromStr for Model {
     type Err = String;
@@ -1756,24 +1755,106 @@ impl std::str::FromStr for Model {
         if let Some(model) = Model::from_api_name(s) {
             return Ok(model);
         }
-        match s.trim().to_ascii_lowercase().as_str() {
-            "27" | "27b" => Ok(Model::Qwen27B),
-            "35" | "35b" | "35b-a3b" => Ok(Model::Qwen35BA3B),
-            "35b-uncensored" => Ok(Model::Qwen35BA3BUncensored),
-            "38" | "3.8" | "3.8-27b" => Ok(Model::Qwen3827B),
-            "flash-next" | "3.8-flash-next" => Ok(Model::Qwen38FlashNext),
-            "qwen3-4b" | "4b" => Ok(Model::Qwen34B),
-            "qwen3-4b-instruct-2507" | "4b-instruct" => Ok(Model::Qwen34BInstruct2507),
-            "zimage-turbo-encoder" | "z-image-turbo-encoder" => Ok(Model::ZImageTurboEncoder),
-            "zimage-turbo" | "z-image-turbo" => Ok(Model::ZImageTurbo),
-            "qwen-image-2.1-encoder" => Ok(Model::QwenImage21Encoder),
-            "qwen-image-2.1" => Ok(Model::QwenImage21),
-            other => Err(format!(
-                "unknown model {other:?} (expected 27b, 35b, 35b-uncensored, 3.8-27b, flash-next, qwen3-4b, \
-                 qwen3-4b-instruct-2507, zimage-turbo-encoder, zimage-turbo, qwen-image-2.1-encoder \
-                 or qwen-image-2.1)"
-            )),
+        let spelled = s.trim().to_ascii_lowercase();
+        ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == spelled)
+            .map(|(_, model)| *model)
+            .ok_or_else(|| format!("unknown model {spelled:?} (expected {})", alias_list()))
+    }
+}
+
+/// Every short spelling [`Model`]'s `FromStr` answers to, lowercase. The first
+/// one listed for a checkpoint is its canonical alias, the one `Display` writes.
+/// `scripts/hf.ts` carries the same table for the bun scripts' `--model`, and a
+/// test here reads that file so the two cannot drift.
+pub const ALIASES: &[(&str, Model)] = &[
+    ("27b", Model::Qwen27B),
+    ("27", Model::Qwen27B),
+    ("35b", Model::Qwen35BA3B),
+    ("35", Model::Qwen35BA3B),
+    ("35b-a3b", Model::Qwen35BA3B),
+    ("35b-uncensored", Model::Qwen35BA3BUncensored),
+    ("3.8-27b", Model::Qwen3827B),
+    ("38", Model::Qwen3827B),
+    ("3.8", Model::Qwen3827B),
+    ("flash-next", Model::Qwen38FlashNext),
+    ("3.8-flash-next", Model::Qwen38FlashNext),
+    ("qwen3-4b", Model::Qwen34B),
+    ("4b", Model::Qwen34B),
+    ("qwen3-4b-instruct-2507", Model::Qwen34BInstruct2507),
+    ("4b-instruct", Model::Qwen34BInstruct2507),
+    ("zimage-turbo-encoder", Model::ZImageTurboEncoder),
+    ("z-image-turbo-encoder", Model::ZImageTurboEncoder),
+    ("zimage-turbo", Model::ZImageTurbo),
+    ("z-image-turbo", Model::ZImageTurbo),
+    ("qwen-image-2.1-encoder", Model::QwenImage21Encoder),
+    ("qwen-image-2.1", Model::QwenImage21),
+];
+
+/// The aliases [`Model`]'s `FromStr` answers to, one per checkpoint, in
+/// registry order: what an error lists when a `--model` value is no checkpoint.
+fn alias_list() -> String {
+    MODELS
+        .iter()
+        .map(|model| model.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What `--model` (and `xwen serve`'s config `model` key) names: a registry
+/// checkpoint by alias or full name, or a checkpoint on disk by path.
+///
+/// One value, read in that order. A name the registry knows is the registry's,
+/// fetched into the Hugging Face cache on first use; anything else is a path,
+/// and a path that does not exist is an error that says both readings failed,
+/// because a typo in an alias and a typo in a path look the same from here. A
+/// file or directory that happens to be NAMED like an alias is still reachable,
+/// as `./27b`: the registry has no name with a path separator in it.
+///
+/// A path carries no registry entry with it. The checkpoint at the path says
+/// what it is ([`crate::config::XwenConfig::identify`]), and nothing on the
+/// command line can say otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRef {
+    Registry(Model),
+    Path(PathBuf),
+}
+
+impl ModelRef {
+    /// The registry checkpoint this names, when it names one.
+    pub fn registry(&self) -> Option<Model> {
+        match self {
+            ModelRef::Registry(model) => Some(*model),
+            ModelRef::Path(_) => None,
         }
+    }
+
+    /// The path this names, when it names one.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            ModelRef::Registry(_) => None,
+            ModelRef::Path(path) => Some(path),
+        }
+    }
+}
+
+impl std::str::FromStr for ModelRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(model) = s.parse::<Model>() {
+            return Ok(ModelRef::Registry(model));
+        }
+        let path = PathBuf::from(s);
+        if path.exists() {
+            return Ok(ModelRef::Path(path));
+        }
+        Err(format!(
+            "{s:?} is not a checkpoint name (aliases: {}; full names work too) and no such file \
+             or directory exists",
+            alias_list()
+        ))
     }
 }
 
@@ -1810,6 +1891,14 @@ fn hyphenate(s: &str) -> String {
 /// path in `blobs/` whose parent is the same for every checkpoint in the cache.
 pub fn canonical_checkpoint_dir(path: &Path) -> Option<PathBuf> {
     let dir = if path.is_dir() { path } else { path.parent()? };
+    // A bare file name has an EMPTY parent, which is the working directory and
+    // not "no directory": `--model config.json` from inside a cached snapshot
+    // names that snapshot as much as its absolute path does.
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
     std::fs::canonicalize(dir).ok()
 }
 
@@ -2049,6 +2138,96 @@ fn download_lora_url(source: &str, destination: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The alias table is what `Display` and the bun scripts both lean on: every
+    /// checkpoint's canonical alias is its first entry, and `scripts/hf.ts` spells
+    /// every alias and every full name, so a script's `--model` takes what the
+    /// binary's does.
+    #[test]
+    fn the_alias_table_matches_display_and_the_scripts() {
+        for model in MODELS {
+            let first = ALIASES.iter().find(|(_, m)| *m == model).unwrap().0;
+            assert_eq!(first, model.to_string(), "{model:?}");
+        }
+        let script =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/hf.ts"))
+                .unwrap();
+        let table = script
+            .split("export const SPELLINGS")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("scripts/hf.ts declares SPELLINGS");
+        for (alias, model) in ALIASES {
+            let row = format!("\"{alias}\": \"{model}\"");
+            assert!(table.contains(&row), "scripts/hf.ts SPELLINGS lacks {row}");
+        }
+        for model in MODELS {
+            let row = format!(
+                "\"{}\": \"{model}\"",
+                model.full_name().to_ascii_lowercase()
+            );
+            assert!(table.contains(&row), "scripts/hf.ts SPELLINGS lacks {row}");
+        }
+    }
+
+    /// A bare file name names its own directory: its parent is empty, which is
+    /// the working directory, and identity by provenance has to see that
+    /// directory or a run started inside a cached snapshot identifies as nothing.
+    #[test]
+    fn a_bare_file_name_resolves_to_the_working_directory() {
+        let here = std::fs::canonicalize(".").unwrap();
+        assert_eq!(
+            canonical_checkpoint_dir(Path::new("Cargo.toml")),
+            Some(here.clone())
+        );
+        assert_eq!(
+            canonical_checkpoint_dir(Path::new("./Cargo.toml")),
+            Some(here)
+        );
+    }
+
+    /// `--model` reads a value as a registry name first and a path second, and
+    /// a value that is neither fails saying so for both readings, because a
+    /// typo in an alias and a typo in a path are the same string from here.
+    #[test]
+    fn a_model_ref_is_a_name_first_and_a_path_second() {
+        for model in MODELS {
+            assert_eq!(
+                model.to_string().parse::<ModelRef>().unwrap(),
+                ModelRef::Registry(model),
+                "the alias"
+            );
+            assert_eq!(
+                model.full_name().parse::<ModelRef>().unwrap(),
+                ModelRef::Registry(model),
+                "the full name"
+            );
+        }
+
+        // A directory named like an alias is the alias bare and the directory
+        // behind a path separator, which no registry name contains.
+        let dir = scratch("model_ref");
+        let shadow = dir.join("27b");
+        std::fs::create_dir_all(&shadow).unwrap();
+        let spelled = shadow.to_string_lossy().to_string();
+        assert_eq!(
+            spelled.parse::<ModelRef>().unwrap(),
+            ModelRef::Path(shadow.clone())
+        );
+        assert_eq!(spelled.parse::<ModelRef>().unwrap().registry(), None);
+        assert_eq!(
+            "27b".parse::<ModelRef>().unwrap(),
+            ModelRef::Registry(Model::Qwen27B)
+        );
+
+        let missing = dir.join("no-such.gguf").to_string_lossy().to_string();
+        let err = missing.parse::<ModelRef>().unwrap_err();
+        assert!(err.contains("not a checkpoint name"), "{err}");
+        assert!(err.contains("no such file or directory"), "{err}");
+        for model in MODELS {
+            assert!(err.contains(&model.to_string()), "{err} omits {model}");
+        }
+    }
 
     #[test]
     fn uncensored_registry_and_identity() {
@@ -2663,8 +2842,8 @@ mod tests {
     /// other directory identifies as nothing and runs under its own name.
     ///
     /// The `Assumed` fallback is then the one config value that separates the
-    /// releases, `rope_theta` — which is also the cross-check `--model-size`
-    /// gets in place of the name one.
+    /// releases, `rope_theta` — which is also the cross-check a selection gets in
+    /// place of the name one.
     #[test]
     fn a_safetensors_directory_identifies_by_provenance_then_by_rope_theta() {
         use crate::config::{Identity, RopeKind};
@@ -2688,18 +2867,18 @@ mod tests {
             None
         );
 
-        // The release cross-check. `--model-size` naming a release whose theta
+        // The release cross-check. A selection naming a release whose theta
         // the directory does not carry is refused, both ways round.
         let base = qwen3_config_at(1e6);
         let instruct = qwen3_config_at(5e6);
         assert!(
             instruct
-                .identify(&scratch, Some(Model::Qwen34B), "--model-size")
+                .identify(&scratch, Some(Model::Qwen34B), "the payload")
                 .is_err(),
             "a 5e6 directory is not the base release"
         );
         assert!(
-            base.identify(&scratch, Some(Model::Qwen34BInstruct2507), "--model-size")
+            base.identify(&scratch, Some(Model::Qwen34BInstruct2507), "the payload")
                 .is_err(),
             "a 1e6 directory is not Instruct-2507"
         );
@@ -2707,12 +2886,12 @@ mod tests {
         // unidentified 1e6 directory is allowed — that is the case where the
         // flag settles what the files cannot.
         assert_eq!(
-            base.identify(&scratch, Some(Model::ZImageTurboEncoder), "--model-size")
+            base.identify(&scratch, Some(Model::ZImageTurboEncoder), "the payload")
                 .unwrap(),
             Identity::Official(Model::ZImageTurboEncoder)
         );
         assert_eq!(
-            base.identify(&scratch, Some(Model::Qwen34B), "--model-size")
+            base.identify(&scratch, Some(Model::Qwen34B), "the payload")
                 .unwrap(),
             Identity::Official(Model::Qwen34B)
         );
@@ -2720,11 +2899,11 @@ mod tests {
         // With no flag, theta alone decides, and the base model wins the 1e6
         // tie it shares with the encoder.
         assert_eq!(
-            base.identify(&scratch, None, "--model-size").unwrap(),
+            base.identify(&scratch, None, "the payload").unwrap(),
             Identity::Assumed(Model::Qwen34B)
         );
         assert_eq!(
-            instruct.identify(&scratch, None, "--model-size").unwrap(),
+            instruct.identify(&scratch, None, "the payload").unwrap(),
             Identity::Assumed(Model::Qwen34BInstruct2507)
         );
         assert_eq!(Model::by_safetensors_rope_theta(1e6), Some(Model::Qwen34B));
@@ -2737,7 +2916,7 @@ mod tests {
         assert_eq!(Model::by_safetensors_rope_theta(1e4), None);
         assert_eq!(
             qwen3_config_at(1e4)
-                .identify(&scratch, None, "--model-size")
+                .identify(&scratch, None, "the payload")
                 .unwrap(),
             Identity::Assumed(Model::Qwen34B)
         );
@@ -2745,7 +2924,7 @@ mod tests {
         // The architecture still narrows first: a qwen3 selection against a
         // GGUF architecture is the same error it has always been.
         assert!(
-            base.identify(&scratch, Some(Model::Qwen27B), "--model-size")
+            base.identify(&scratch, Some(Model::Qwen27B), "the payload")
                 .is_err()
         );
         assert!(matches!(base.rope(), RopeKind::Plain { n_rot: 128, .. }));
@@ -2824,7 +3003,7 @@ mod tests {
         assert_eq!(identify(encoder.parent().unwrap()), None);
 
         // A whole PIPELINE snapshot — all fifteen files, the encoder's six
-        // among them — which is the state `xwen fetch --model-size
+        // among them — which is the state `xwen fetch --model
         // zimage-turbo` leaves behind and the one an operator actually has.
         //
         // Its root identifies as NOTHING, and that is load-bearing twice
@@ -3400,7 +3579,7 @@ mod tests {
     fn model_names_round_trip_through_the_cli_spelling() {
         for model in MODELS {
             assert_eq!(model.to_string().parse::<Model>().unwrap(), model);
-            // A name a `/v1/models` listing shows is also a `--model-size`.
+            // A name a `/v1/models` listing shows is also a `--model`.
             assert_eq!(model.full_name().parse::<Model>().unwrap(), model);
         }
         assert_eq!("35B-A3B".parse::<Model>().unwrap(), Model::Qwen35BA3B);

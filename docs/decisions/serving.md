@@ -181,6 +181,37 @@ failed `EngineState::load`'s own arch/identity checks on every request — a 500
 request for a mistake that was fully knowable at startup. Those load-time checks remain
 as a backstop for the case they can still catch: a file replaced under a running server.
 
+**`--model` is the one flag that names a checkpoint, and a path is no longer pinned to an
+entry (2026-09-21).** This supersedes the paragraph above on every surface but `xwen
+batch`. `--model-size` is removed. `--model` takes a registry alias or full name, or a
+path, read in that order (`hub::ModelRef`): a directory named like an alias is `./27b`, and
+a value that is neither fails with both readings and the alias list. `serve.toml`'s
+`model` key reads the same way. The owner found two flags for one idea annoying, and had
+believed the second was already gone. Three things the pair could do went with it. A GGUF
+that identifies as nothing can no longer be told which checkpoint it is, so it runs as its
+architecture's default under its own file name, with the startup line saying so. A copy
+of the Z-Image text encoder outside the hub cache can no longer be given that entry's
+zero-run allowlist, so it is refused for the corruption it has. And the three
+disagreement errors (architecture, `general.name`, `rope_theta`) have no second opinion
+to fire on. The evidence that this costs nothing today: every GGUF on the machine
+identifies itself as an official checkpoint, there is no GGUF outside the Hugging Face
+cache, and the encoder directories are all cached copies. What made dropping the
+allowlist pin safe is that provenance now grants it: `CheckpointSource::open` gives a
+directory that is an entry's own cached snapshot that entry's tokenizer path and its
+allowlist, which is the same directory the alias resolves to, so `--model
+<cached text_encoder dir>` opens as `--model zimage-turbo-encoder` does. Batch keeps the
+cross-check, because there a name and a path still arrive together, the payload's
+`"model"` beside `--model <path>`: `XwenConfig::identify` keeps its `selected` parameter
+for that one caller, every other caller passes `None`, and a `--model <alias>` that
+contradicts the payload is the same startup error. Reopen when a real file identifies as
+nothing and has to run as a specific entry. The sketch is `--model 27b=/path/x.gguf`: one
+flag still, the `alias=` prefix being the old cross-check, settling and allowlisting as
+`--model-size` did. Not taken now: the provenance check canonicalizes the cache's own
+`snapshots` directory, so someone who can write inside the Hugging Face cache could
+symlink it outward and extend an entry's allowlist to a directory elsewhere. That is not
+a boundary worth defending, because anyone who can write there can replace the weights
+themselves. Reopen if the cache ever becomes shared or untrusted.
+
 **A job names a FILE, not just a checkpoint (2026-08-14, review round).** `Target` is a
 checkpoint plus "is this the served file". The distinction only exists on a server whose
 GGUF identifies as none of the official checkpoints, and there it is the whole ballgame:

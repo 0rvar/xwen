@@ -136,3 +136,13 @@ repository downloader. The existing `fetch` command still includes a drafter whe
 one exists. Image Studio's prompt generator and assistant chat query `/v1/models`
 for each request, prefer this entry when listed, and otherwise request the regular
 `Qwen3.6-35B-A3B`. The server default stays Flash-Next.
+
+**One flag names the checkpoint: `--model <alias | full name | path>` (2026-09-21).**
+`--model-size` is removed from every subcommand, `logits-dump` and the scripts, and
+`$XWEN_MODEL_SIZE` with it; `$XWEN_MODEL` takes the same alias-or-path value the flag
+does. A value is a registry name first and a path second. `xwen fetch --model <alias>`
+refuses a path, `xwen encode-text --model` takes a pipeline alias or a diffusion snapshot
+root and encodes with the text encoder inside it, and `xwen image --model <snapshot>`
+reads the pipeline class off `model_index.json`. Per-surface defaults are unchanged. What
+was dropped, the evidence and the reopen condition are in
+[serving.md](serving.md), the 2026-09-21 paragraph.

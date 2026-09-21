@@ -404,7 +404,7 @@ impl Loaded {
         check().map_err(|e| ImageError::Unavailable(e.to_string()))?;
         let index = crate::hub::cached_model(Model::ZImageTurbo).ok_or_else(|| {
             ImageError::Request(format!(
-                "{} is not in the Hugging Face cache: run `xwen fetch --model-size {}` on the \
+                "{} is not in the Hugging Face cache: run `xwen fetch --model {}` on the \
                  server first",
                 Model::ZImageTurbo.full_name(),
                 Model::ZImageTurbo

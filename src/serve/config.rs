@@ -1509,7 +1509,8 @@ pub fn init_template() -> String {
 # (`xwen fetch` prefetches). That default is Qwen3.6-35B-A3B, not xwen's overall
 # default: the server cannot run Qwen3.8-Flash-Next until its recurrent state
 # rides in a cache image, so it serves the best checkpoint it can and says so at
-# startup. `--model-size` picks another.
+# startup. Takes what --model takes: a registry name ("27b", "Qwen3.6-27B") or
+# a path to a GGUF or a safetensors directory.
 # model = "/path/to/Qwen3.6-35B-A3B-Q4_K_M.gguf"
 
 # Address to bind. Loopback keeps the server off the network; "0.0.0.0" accepts

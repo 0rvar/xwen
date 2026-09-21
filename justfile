@@ -9,7 +9,7 @@ oracle:
 # The full parity cycle for one checkpoint. `just parity` gates the 35B-A3B,
 # `just parity 27b` the dense 27B.
 parity size="35b":
-    bun scripts/parity-gate.ts --model-size {{size}}
+    bun scripts/parity-gate.ts --model {{size}}
 
 # Install the xwen binary. --locked is load-bearing: `cargo install` ignores
 # Cargo.lock by default, and a re-resolved metal/objc2 crate set has produced

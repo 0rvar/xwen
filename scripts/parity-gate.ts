@@ -21,7 +21,7 @@
  *   bun scripts/parity-gate.ts \
  *     [--tiers strict,mm,decode,ppl] \
  *     [--fixtures code-short,text-mixed,long-mixed] \
- *     [--model-size 27b|35b | --model FILE.gguf] \
+ *     [--model 27b|35b|FILE.gguf] \
  *     [--regen-ref] [--regen-ppl-ref] [--parity-dir DIR] \
  *     [--sdpa-f32] [--attn-mm-classic] [--flash-classic] \
  *     [--expect-attn-decode f16|q8]
@@ -45,9 +45,10 @@
  * Defaults: all tiers; fixtures per tier (strict/mm force code-short; decode
  * uses all three; ppl has no fixture axis).
  *
- * Model: --model-size 27b|35b picks an official checkpoint from the hub cache
- * (default 35b, matching the CLI); --model <gguf> / $XWEN_MODEL name a file
- * directly and are mutually exclusive with --model-size. EVERY run is namespaced
+ * Model: --model reads a value the way the binary does, a checkpoint alias
+ * first (27b|35b, an official checkpoint from the hub cache; default 35b) and
+ * otherwise a path to a GGUF; $XWEN_MODEL is the same value off the command
+ * line. EVERY run is namespaced
  * by the checkpoint basename: the parity dir defaults to
  * /tmp/xwen-parity-<basename> and the frozen ppl reference to
  * tests/fixtures/reference-ppl-<basename>.json. The two official checkpoints are
@@ -64,7 +65,7 @@
 
 import { openSync, closeSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, join, dirname, basename } from "node:path";
-import { officialModel, CHECKPOINTS, type ModelSize } from "./hf";
+import { modelPath, rejectUnknownFlags, resolveModelRef, type ModelRef } from "./hf";
 
 const ROOT = resolve(import.meta.dir, "..");
 // Model under test: --model / $XWEN_MODEL override the official default,
@@ -98,8 +99,8 @@ const PPL_MAX_CTX = 5120; // corpus is 4218 Qwen tokens (no BOS), over the 4096 
 
 interface Opts {
   model: string;
-  /** True when the model came from the hub resolver (`--model-size`, or its
-   *  default) rather than an explicit `--model` / `$XWEN_MODEL` path. Only a
+  /** True when the model came from the hub resolver (a `--model` alias, or the
+   *  default) rather than a `--model` / `$XWEN_MODEL` path. Only a
    *  filename otherwise, which proves nothing about contents. */
   isOfficial: boolean;
   pplFixture: string;
@@ -128,6 +129,10 @@ interface Opts {
 }
 
 function parseArgs(argv: string[]): Opts {
+  rejectUnknownFlags("parity-gate", argv, [
+    "model", "tiers", "fixtures", "regen-ref", "regen-ppl-ref", "sdpa-f32", "attn-mm-classic",
+    "flash-classic", "expect-attn-decode", "parity-dir",
+  ]);
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
@@ -147,26 +152,20 @@ function parseArgs(argv: string[]): Opts {
     return items;
   };
 
-  const explicit = typeof flags.model === "string"
-    ? resolve(String(flags.model))
-    : (process.env.XWEN_MODEL ? resolve(process.env.XWEN_MODEL) : null);
-  const size = (() => {
-    const v = flags["model-size"];
-    if (v === undefined) return undefined;
-    const s = String(v).toLowerCase();
-    if (!(s in CHECKPOINTS)) {
-      die(`--model-size must be one of ${Object.keys(CHECKPOINTS).join("|")}, got ${JSON.stringify(String(v))}`);
+  const ref: ModelRef = (() => {
+    try {
+      // The 35B is pinned rather than deferred to the binary's default: this
+      // gate cannot run it (there is no llama.cpp oracle for the qwen4exp
+      // graph, and its harness panics), so it names its own.
+      return resolveModelRef(typeof flags.model === "string" ? String(flags.model) : undefined, "35b");
+    } catch (e) {
+      return die(`--model: ${(e as Error).message}`);
     }
-    return s as ModelSize;
   })();
-  if (explicit && size) die("--model and --model-size are mutually exclusive");
-  // officialModel() throws with fetch instructions when the cache is empty —
-  // only reached when no explicit model was named, so a --model run never
-  // requires the official file to be present.
-  // The 35B is pinned rather than deferred to hf.ts's default: this gate cannot
-  // run xwen's default checkpoint (there is no llama.cpp oracle for the qwen4exp
-  // graph, and its harness panics), so it must name a size of its own.
-  const model = explicit ?? officialModel(size ?? "35b");
+  // modelPath() throws with fetch instructions when the cache is empty — only
+  // for an alias, so a --model <path> run never requires the official file to
+  // be present.
+  const model = ref.kind === "path" ? resolve(ref.path) : modelPath(ref);
   // EVERY run is suffixed by the checkpoint's basename — there are two official
   // checkpoints (27B dense, 35B-A3B MoE) with different weights, different
   // architectures and therefore different floors, so nothing may share a parity
@@ -178,7 +177,7 @@ function parseArgs(argv: string[]): Opts {
 
   return {
     model,
-    isOfficial: explicit === null,
+    isOfficial: ref.kind === "registry",
     pplFixture: join(ROOT, `tests/fixtures/reference-ppl${modelTag}.json`),
     tiers: csv(flags.tiers, ALL_TIERS, "tier") as Tier[],
     fixtures: csv(flags.fixtures, ALL_FIXTURES, "fixture"),

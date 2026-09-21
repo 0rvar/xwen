@@ -199,14 +199,11 @@ impl QuitSignal {
 
 /// Assemble the runtime, the router and the inference worker, and serve until
 /// shutdown.
-/// `selected` is an explicit `--model-size`, which names the checkpoint a GGUF
-/// holds when the file itself does not say — and is a startup error when it
-/// contradicts a file that does. `None` leaves the identity to the file.
-pub fn run(settings: ServeSettings, selected: Option<crate::hub::Model>) -> Result<()> {
+pub fn run(settings: ServeSettings) -> Result<()> {
     // Read before anything is built: the checkpoint's identity decides the model
     // id every dialect echoes, which the dashboard is constructed around.
     let cfg = engine::read_startup_config(&settings)?;
-    let (default_target, unidentified) = engine::identify_checkpoint(&settings, &cfg, selected)?;
+    let (default_target, unidentified) = engine::identify_checkpoint(&settings, &cfg)?;
     let model_id = model_id(&settings, &default_target);
     let quit = QuitSignal::default();
     // Built before the logger: the dashboard's header reads this cell once a
@@ -573,7 +570,7 @@ pub(crate) fn unselectable_model_message(model: crate::hub::Model) -> String {
 pub(crate) fn uncached_model_message(model: crate::hub::Model) -> String {
     format!(
         "model {:?} is not in the Hugging Face cache, and at {} it is not downloaded \
-         to satisfy a request; fetch it first with `xwen fetch --model-size {model}`",
+         to satisfy a request; fetch it first with `xwen fetch --model {model}`",
         model.full_name(),
         model.size(),
     )
@@ -2131,7 +2128,7 @@ mod tests {
         let err =
             resolve_requested_model_with(Some("Qwen3.8-Flash-Next"), served, served_id, &uncached)
                 .unwrap_err();
-        assert!(err.contains("--model-size flash-next"), "{err}");
+        assert!(err.contains("--model flash-next"), "{err}");
         assert!(!err.contains("xwen chat"), "{err}");
     }
 
@@ -2158,7 +2155,7 @@ mod tests {
         assert!(!ids.iter().any(|id| id == "Qwen3.6-27B"), "{ids:?}");
         let err = resolve_requested_model_with(Some("Qwen3.6-27B"), served, served_id, &uncached)
             .unwrap_err();
-        assert!(err.contains("xwen fetch --model-size 27b"), "{err}");
+        assert!(err.contains("xwen fetch --model 27b"), "{err}");
         assert!(err.contains("Qwen3.6-27B"), "{err}");
         // Its neighbours are unaffected by the same predicate.
         assert!(ids.iter().any(|id| id == "Qwen3.6-35B-A3B"), "{ids:?}");

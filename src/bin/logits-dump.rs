@@ -43,7 +43,7 @@ use serde_json::{Value, json};
 
 use xwen::checkpoint::CheckpointSource;
 use xwen::gguf;
-use xwen::hub::Model;
+use xwen::hub::ModelRef;
 use xwen::model::XwenModel;
 use xwen::ops::ExpertRunner;
 use xwen::tokenizer::LagunaTokenizer;
@@ -59,18 +59,13 @@ const LAST_ROW_CAP: usize = 16384;
     about = "Dump Qwen 3.6 logits + taps as JSON for parity checks"
 )]
 struct Cli {
-    /// Model GGUF, or the Hugging Face safetensors directory of a checkpoint
-    /// stored that way. Optional only together with --model-size, which then
-    /// names the official checkpoint to take from the Hugging Face cache.
-    #[arg(short, long, required_unless_present = "model_size")]
-    model: Option<PathBuf>,
-
-    /// Which official checkpoint this is (the cross-check every surface
-    /// applies to a --model path, and the whole answer when --model is
-    /// omitted). Needed for a safetensors entry whose loader tolerates
-    /// documented zero-filled planes.
-    #[arg(long)]
-    model_size: Option<Model>,
+    /// The checkpoint, by registry name (an alias such as `27b`, or a full
+    /// name; taken from the Hugging Face cache, fetched on first use) or by
+    /// path: a GGUF, or the Hugging Face safetensors directory of a checkpoint
+    /// stored that way. A file or directory named like an alias is reachable
+    /// as `./name`.
+    #[arg(short, long, value_name = "NAME|PATH")]
+    model: ModelRef,
 
     /// Per-position logits for the whole prompt, in the oracle tool's format
     /// (scripts/llama-logits-all.cpp): raw little-endian f32 `[n_tokens,
@@ -171,10 +166,9 @@ impl Cli {
     /// checkpoint named (`main` resolves that to a path before loading, but
     /// the dump keeps what the run was asked for).
     fn model_label(&self) -> String {
-        match (&self.model, self.model_size) {
-            (Some(path), _) => path.display().to_string(),
-            (None, Some(size)) => size.full_name().to_string(),
-            (None, None) => String::new(),
+        match &self.model {
+            ModelRef::Path(path) => path.display().to_string(),
+            ModelRef::Registry(named) => named.full_name().to_string(),
         }
     }
 }
@@ -587,18 +581,16 @@ fn main() -> Result<()> {
     let device = gguf::metal_device()?;
     let _drain = xwen::memory::DeviceDrain(device.clone());
     // The path decides what it is (a GGUF, a safetensors directory), exactly
-    // as on every other surface; --model-size is the cross-check and the
-    // source of a documented zero-run allowlist.
-    let path = match (&cli.model, cli.model_size) {
-        (Some(path), _) => path.clone(),
-        (None, Some(size)) => xwen::hub::ensure_model(size)?,
-        (None, None) => anyhow::bail!("pass --model <path> or --model-size <checkpoint>"),
+    // as on every other surface; a registry name resolves to the registry's
+    // own file and carries its entry's documented zero-run allowlist.
+    let named = cli.model.registry();
+    let path = match &cli.model {
+        ModelRef::Path(path) => path.clone(),
+        ModelRef::Registry(named) => xwen::hub::ensure_model(*named)?,
     };
-    let source = CheckpointSource::open(&path, &device, cli.model_size)?;
+    let source = CheckpointSource::open(&path, &device, named)?;
     let cfg = source.config()?;
-    // The same cross-check every surface applies: a --model-size that
-    // contradicts what the file says it is fails here, before the load.
-    source.identify(&cfg, cli.model_size, "--model-size")?;
+    source.identify(&cfg, named, "--model")?;
     // The checkpoint's own tokenizer, when it ships one (a safetensors set);
     // captured before the load consumes the source.
     let checkpoint_tokenizer = source.tokenizer_path().map(std::path::Path::to_path_buf);
@@ -1122,7 +1114,7 @@ fn run_all_positions(
         "layout": "[n_tokens, n_vocab] row-major little-endian",
         "backend": "xwen-metal",
         "model_path": model_path.display().to_string(),
-        "model_size": cli.model_size.map(|m| m.full_name()),
+        "model_name": cli.model.registry().map(|m| m.full_name()),
         "checkpoint_id": format!("{}:{}", checkpoint.dir_name(), checkpoint.file_len()),
         "ids_path": ids_path.display().to_string(),
         "prefill_chunk": chunk,

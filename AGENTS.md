@@ -102,7 +102,7 @@ Rules for keeping it that way:
   lands) are frozen correctness oracles. Never "optimize" them.
 - Any change touching model math re-runs the parity gate (docs/parity.md) before it
   ships. The harness is live: `bun scripts/parity-gate.ts` for the 35B,
-  `--model-size 27b` for the dense file.
+  `--model 27b` for the dense file.
 
 ## Ground truth, in order of authority
 
@@ -246,15 +246,21 @@ edited ref costs a full re-download.
   (`XwenConfig::checkpoint` / `Model::identify`): `general.name` first, then the file
   name, each matched as an exact full name or a whole full name found inside it (never a
   bare "3.6"/"3.8" — that would make someone's 14B finetune the official 27B); a name
-  matching two checkpoints identifies as neither. `--model-size` is a CROSS-CHECK, not an
-  override: it must agree with a file that identifies itself (disagreement is a startup
-  error) and only settles a file that identifies as nothing. A file that still says
-  nothing runs as `Arch::model()` with a logged warning, under its own file name.
+  matching two checkpoints identifies as neither. **`--model` is the ONE flag that names a
+  checkpoint as of 2026-09-21** (`hub::ModelRef`): a registry alias or full name, else a
+  path, read in that order, so a directory named like an alias is `./27b` and a value that
+  is neither errors with both readings. `--model-size` is gone, and with it pinning a path
+  to an entry: a path is whatever its file says, and a file that says nothing runs as
+  `Arch::model()` with a logged warning, under its own file name (decisions/serving.md,
+  the 2026-09-21 paragraph, has the reopen condition and the `alias=path` sketch).
   That rule is `XwenConfig::identify` (returning `Identity::Official`/`::Assumed`) and it
   applies on EVERY surface as of 2026-08-30, not just serve: `--model <gguf>` on
   `generate`/`chat`/`batch` reads the file too, because the checkpoint decides the chat
-  dialect, the drafter and the label. On batch the payload's `"model"` is the
-  cross-check, there being no size flag there. `serve::engine::identify_checkpoint` is
+  dialect, the drafter and the label. Batch is the one surface where a name and a path can
+  still arrive together, the payload's `"model"` beside `--model <path>`, so it is the one
+  caller that passes `identify` a selection: the payload must agree with a file that
+  identifies itself (disagreement on arch, name or `rope_theta` is a startup error) and
+  settles one that identifies as nothing. `serve::engine::identify_checkpoint` is
   now only the mapping onto `Target` plus the startup log.
   Qwen3.8's tokenizer.json is NOT
   byte-identical to 3.6's — it adds seven audio/TTS specials at 248070-248076 over an
@@ -310,7 +316,8 @@ Traps, each of which has already cost someone time:
   `zimage-turbo-encoder` as of 2026-09-07; `zimage-turbo` names the full diffusion
   pipeline now (see below). The loader
   refuses any zero run past 4096 elements unless the REGISTRY ENTRY allowlists that
-  tensor by name, so a bare directory is refused and only the documented entry passes.
+  tensor by name, so a bare directory outside the hub cache is refused and only the
+  documented entry passes, named by alias or recognised by provenance.
   Never widen the allowlist to make a load succeed, and never point an LM surface at
   that copy: `Qwen/Qwen3-4B` is the faithful one.
 - **NFC.** Every Qwen tokenizer.json declares an NFC normalizer that the HF runtime
@@ -330,8 +337,10 @@ Traps, each of which has already cost someone time:
   DIRECTORY and never a file, hub cache files being symlinks into shared blobs. Failing
   that it is `Assumed`, with `rope_theta` picking the release (5e6 Instruct-2507, else
   base, which wins the tie with Z-Image). There is no name inside the set, so the
-  `general.name` passes are unreachable here. `--model-size` stays a cross-check and a
-  disagreement is a startup error.
+  `general.name` passes are unreachable here. Provenance is also what grants an unnamed
+  directory its entry's tokenizer path and zero-run allowlist (`CheckpointSource::open`),
+  so the cached Z-Image `text_encoder/` opens by path as it does by alias, and a copy
+  outside the cache is refused for its corrupt planes.
 - **Thinking on the Qwen3 dialect is MODEL-opened, not prompt-seeded.** A prompt's
   reasoning state is `chat::ThinkingEntry` (Answer / Seeded / ModelOpens), and
   `ChatDialect::model_opens_thinking()` is true for Qwen3 alone: the template writes no
@@ -570,7 +579,7 @@ for the full history; xwen inherits the conclusion, not the retelling.
 
 docs/parity.md owns tiers, floors, taps, and runbook — don't restate them, re-read
 them. The harness is live as of 2026-07-28 (P7): `bun scripts/parity-gate.ts`
-(add `--model-size 27b` for the dense file) runs the whole Track-B cycle and exits
+(add `--model 27b` for the dense file) runs the whole Track-B cycle and exits
 nonzero on any failure. It needs the oracle built once —
 `bash scripts/build-llamacpp.sh` against the pinned clone in `reference/llama.cpp`.
 `cargo test --release` (ops tests need a Metal device) still covers the

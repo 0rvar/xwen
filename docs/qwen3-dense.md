@@ -169,8 +169,10 @@ directory is that registry entry's own cached HF snapshot, compared after canoni
 the directory (never a file inside it, since hub cache files are symlinks into a shared
 blob store). Otherwise it is `Assumed` under its own directory name, with `rope_theta`
 choosing the release: 5e6 is Instruct-2507, 1e6 is the base model, which wins the tie it
-shares with the byte-identical Z-Image config. `--model-size` stays a cross-check, so
-naming the wrong release for a directory is a startup error rather than an override.
+shares with the byte-identical Z-Image config. As of 2026-09-21 nothing on the command
+line names a release for a directory (`--model` takes a name or a path, never both), so
+the `rope_theta` cross-check is reachable only from a `xwen batch` payload, where naming
+the wrong release for a directory is still a startup error rather than an override.
 There is no name inside a safetensors set to read, so the GGUF `general.name` passes are
 never reached on this architecture.
 

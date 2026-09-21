@@ -85,7 +85,7 @@ pub(crate) fn checkpoint_or_skip(model: Model) -> Option<PathBuf> {
     or_skip(
         hub::cached_model(model),
         model.full_name(),
-        &format!("xwen fetch --model-size {model}"),
+        &format!("xwen fetch --model {model}"),
     )
 }
 
@@ -96,7 +96,7 @@ pub(crate) fn cached_file_or_skip(model: Model, file: &str) -> Option<PathBuf> {
     or_skip(
         hub::cached_file(model.repo(), file),
         &format!("{}/{file}", model.repo()),
-        &format!("xwen fetch --model-size {model}"),
+        &format!("xwen fetch --model {model}"),
     )
 }
 
@@ -158,7 +158,7 @@ mod tests {
         // Absent and required: a panic naming the file and the command, so the
         // person reading a CI failure knows what to do about it.
         let panic = std::panic::catch_unwind(|| {
-            or_skip_when(None, "the 27B", "xwen fetch --model-size 27b", true)
+            or_skip_when(None, "the 27B", "xwen fetch --model 27b", true)
         })
         .expect_err("a required checkpoint that is absent must fail the test");
         let message = panic
@@ -166,7 +166,7 @@ mod tests {
             .map(String::as_str)
             .unwrap_or_default();
         assert!(message.contains("the 27B"), "{message}");
-        assert!(message.contains("xwen fetch --model-size 27b"), "{message}");
+        assert!(message.contains("xwen fetch --model 27b"), "{message}");
         assert!(message.contains(REQUIRE_HF_CACHE), "{message}");
     }
 

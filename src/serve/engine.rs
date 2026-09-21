@@ -177,11 +177,9 @@ const ASSISTANT_CLOSE: &str = "</assistant>";
 /// What the served GGUF is: the target every request for this server's own model
 /// id runs on, plus a warning when the file named no official checkpoint.
 ///
-/// The file is the authority. An explicit `--model-size` is a tie-break for a
-/// file that identifies as NOTHING, not an override of one that does — a flag
-/// that contradicts the file is a startup error naming both sides, because the
-/// alternative is a server that starts fine and 500s every request at load. It
-/// must also agree with the architecture, which no name can change.
+/// The file is the authority, and the only one: `--model <name>` resolves to
+/// the registry's own file, and `--model <path>` names a file that says what it
+/// is or runs as its architecture's default under its own file name.
 ///
 /// The returned target is `Target::official` when the file is one of the
 /// checkpoints and `Target::served` when it is not: only the second answers to a
@@ -194,9 +192,8 @@ const ASSISTANT_CLOSE: &str = "</assistant>";
 pub fn identify_checkpoint(
     settings: &ServeSettings,
     cfg: &XwenConfig,
-    selected: Option<hub::Model>,
 ) -> Result<(Target, Option<ServeLog>)> {
-    match cfg.identify(&settings.model, selected, "--model-size")? {
+    match cfg.identify(&settings.model, None, "--model")? {
         Identity::Official(model) => Ok((Target::official(model), None)),
         Identity::Assumed(assumed) => Ok((
             Target::served(assumed),
@@ -644,9 +641,8 @@ impl EngineState {
     ) -> Result<Self> {
         let (model_path, draft_path) = checkpoint_paths(settings, size, default_target, logger)?;
         let cfg = read_config(&model_path)?;
-        // A backstop, not the contract: startup already refused a `--model-size`
-        // that contradicts the served file, and every other path here resolved
-        // its file FROM the checkpoint. What is left to catch is a file that
+        // A backstop, not the contract: every path here resolved its file FROM
+        // the checkpoint. What is left to catch is a file that
         // changed under a running server, so the message names both sides.
         ensure!(
             cfg.arch == size.model.arch(),

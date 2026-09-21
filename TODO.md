@@ -708,7 +708,7 @@ priced, not their rank ([the record](docs/records/zimage-perf.md), "The power en
   From: Deferred from the batch + scored-classification arc (2026-08-09).
 
 - [ ] [small] **No parity-gate or retune arm for Qwen3.8-27B.** `scripts/parity-gate.ts` accepts
-  `--model-size 3.8-27b` and would run it (nothing about the gate is 3.6-specific), but
+  `--model 3.8-27b` and would run it (nothing about the gate is 3.6-specific), but
   it has never been run against 3.8 and the floors in docs/parity.md were fitted on the
   3.6 files — so a first run's numbers are unvalidated, not a gate. `retune-draft.ts`
   deliberately excludes 3.8 (`draftingSizes()`, and `SHIPPED_P_MIN` has no arm for it):
@@ -774,7 +774,7 @@ priced, not their rank ([the record](docs/records/zimage-perf.md), "The power en
   a fresh held-out corpus for flash-next and re-derive `PPL_NLL_DELTA_MAX`
   against it. (Part of what "experimental" means for this checkpoint — see the
   archived P4 ledger for the full set.)
-  Folded in 2026-09-06: `parity-gate.ts --model-size flash-next` is spellable through
+  Folded in 2026-09-06: `parity-gate.ts --model flash-next` is spellable through
   `scripts/hf.ts` and fails deep rather than at argument validation, and that entry's
   `shards` key is dead; gate the accepted set on fixture existence when the harness is
   made to run here.

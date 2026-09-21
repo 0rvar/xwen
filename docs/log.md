@@ -4,6 +4,18 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-21 — `--model-size` removed: `--model` takes an alias, a full name or a path
+
+One flag names a checkpoint on every subcommand, `logits-dump` and the scripts:
+`--model 27b`, `--model Qwen3.6-27B` or `--model /path/x.gguf`, read as a name first and
+a path second, with `./name` for a directory named like an alias. `serve.toml`'s `model`
+key and `$XWEN_MODEL` read the same way, and `$XWEN_MODEL_SIZE` is gone. Pinning a path
+to an entry went with the second flag: an unidentified GGUF runs as its architecture's
+default, and an encoder directory outside the hub cache is refused. A cached one now
+gets its entry's zero-run allowlist by provenance, so it opens by path as it does by
+alias. Batch keeps the payload-against-file cross-check. Decision, evidence and the
+reopen condition: [decisions/serving.md](decisions/serving.md), the 2026-09-21 paragraph.
+
 ## 2026-09-21 — Qwen-Image 2.1 researched and planned, no code
 
 Qwen-Image 2.1 shipped on 2026-09-20 (Qwen Research License, non-commercial): a 7.12 B

@@ -51,6 +51,7 @@
 import { mkdirSync, writeFileSync, statSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { DRAFT_PROMPTS } from "./lib/draft-prompts";
+import { rejectUnknownFlags } from "./hf";
 
 const repo = dirname(import.meta.dir);
 const args = process.argv.slice(2);
@@ -59,6 +60,15 @@ const opt = (n: string, d: string) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : d;
 };
 
+rejectUnknownFlags("spec-equivalence", args, [
+  "models", "modes", "n", "out-dir", "p-min", "presence-penalty", "seed", "temp",
+]);
+// A sweep over official checkpoints by alias: $XWEN_MODEL names one model for
+// the single-model scripts and would be silently ignored here, so say so.
+if (process.env.XWEN_MODEL && !args.includes("--models")) {
+  console.error("spec-equivalence: $XWEN_MODEL is set, and this sweep does not read it: pass --models <aliases>, or unset it");
+  process.exit(2);
+}
 const models = opt("models", "27b,35b,3.8-27b").split(",");
 const modes = opt("modes", "greedy,sampled").split(",");
 const nTokens = opt("n", "128");
@@ -154,7 +164,7 @@ function generate(model: string, prompt: string, extra: string[], file: string):
     [
       join(repo, "target/release/xwen"),
       "generate",
-      "--model-size", model,
+      "--model", model,
       "--prompt", prompt,
       "-n", nTokens,
       "--seed", seed,

@@ -28,7 +28,7 @@
 import { $ } from "bun";
 import { mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { officialModel } from "./hf";
+import { modelPath, rejectUnknownFlags, resolveModelRef } from "./hf";
 
 const repo = dirname(import.meta.dir);
 const fixtures = join(repo, "tests/fixtures/bench-prompts");
@@ -46,6 +46,16 @@ function opt(name: string, dflt: string): string {
 // worktree under /tmp — because a coding agent's `cargo build` in the main tree
 // swaps target/release/xwen and its kernels under a running harness. The default
 // is the main tree's binary only so an ad-hoc run still works.
+rejectUnknownFlags("bench", args, ["bin", "out-dir", "expect-mode", "only", "gate", "model"]);
+// `--model`, else $XWEN_MODEL, else the binary's own default: a name or a path.
+const benchModel = (() => {
+  try {
+    return modelPath(resolveModelRef(opt("model", ""), "flash-next"));
+  } catch (e) {
+    console.error(`bench: --model: ${(e as Error).message}`);
+    process.exit(2);
+  }
+})();
 const bin = opt("bin", join(repo, "target/release/xwen"));
 const outDir = opt("out-dir", "/tmp/xwen-bench");
 const expectMode = opt("expect-mode", "lpm");
@@ -125,7 +135,7 @@ for (const b of benches.filter((b) => only.includes(b.name))) {
       bin,
       "generate",
       "--model",
-      process.env.XWEN_MODEL ?? officialModel(),
+      benchModel,
       // Speculation is opt-out and would corrupt the plain-decode numbers this
       // harness anchors against fork llama-bench.
       "--no-draft",

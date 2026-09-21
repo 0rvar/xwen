@@ -13,7 +13,7 @@ use xwen::config::Identity;
 use xwen::dflash::DflashDrafter;
 use xwen::generate::{Generator, SpecParams};
 use xwen::gguf;
-use xwen::hub::Model;
+use xwen::hub::{Model, ModelRef};
 use xwen::metrics::{self, RunRecord};
 use xwen::mtp::MtpDrafter;
 use xwen::ops::ExpertRunner;
@@ -51,39 +51,37 @@ struct Cli {
     serve: ServeArgs,
 }
 
-/// Which official checkpoint to run.
+/// Which checkpoint to run.
 #[derive(Parser)]
 struct ModelArgs {
-    /// Which official checkpoint to run: Qwen3.8-Flash-Next (`flash-next`,
-    /// the default on every surface, still EXPERIMENTAL and without a
-    /// drafter), the dense Qwen3.6-27B, the Qwen3.6-35B-A3B MoE, or the dense
-    /// Qwen3.8-27B, or the dense Qwen3-4B pair — `qwen3-4b` (hybrid thinking)
-    /// and `qwen3-4b-instruct-2507` (no thinking) — which run on every surface.
-    /// `zimage-turbo-encoder` is the Z-Image text encoder: `xwen encode-text` only, and
-    /// refused by generate, chat, serve and batch, because its weights are not a
-    /// working language model.
-    /// Each checkpoint's full name works here too. A `--model` path (a GGUF, or
-    /// a safetensors directory) overrides the target outright, and then the
-    /// CHECKPOINT says which one it is: this flag is the cross-check (it must
-    /// agree, or startup fails) and the tie-break for a custom file that names
-    /// no release — on every surface alike.
-    #[arg(
-        long,
-        value_name = "27b|35b|35b-uncensored|3.8-27b|flash-next|qwen3-4b|qwen3-4b-instruct-2507|zimage-turbo-encoder|zimage-turbo|qwen-image-2.1-encoder|qwen-image-2.1"
-    )]
-    model_size: Option<Model>,
+    /// The checkpoint: a registry name, or a path. Names are the aliases
+    /// `flash-next` (Qwen3.8-Flash-Next, EXPERIMENTAL and without a drafter),
+    /// `27b`, `35b`, `35b-uncensored`, `3.8-27b`, `qwen3-4b` (hybrid thinking) and
+    /// `qwen3-4b-instruct-2507` (no thinking), plus `zimage-turbo-encoder` and
+    /// `qwen-image-2.1-encoder` (text encoders: `xwen encode-text` only) and
+    /// `zimage-turbo` and `qwen-image-2.1` (diffusion pipelines: `xwen image`).
+    /// Each checkpoint's full name works too. A named checkpoint is ensured in
+    /// the Hugging Face cache, downloaded on first use and cached forever after.
+    /// Anything else is a path, to a GGUF or to a safetensors directory, and then
+    /// the CHECKPOINT says which one it is. A file or directory named like an
+    /// alias is reachable as `./name`.
+    #[arg(short, long, value_name = "NAME|PATH")]
+    model: Option<ModelRef>,
 }
 
 impl ModelArgs {
-    /// The selected checkpoint, or [`Model::default`] when the flag was
-    /// omitted — for `fetch` and `inspect`, which name a file to act on and
-    /// never load a graph. The commands that RUN one go through
-    /// `one_shot_checkpoint` (which reads a `--model` file's own identity) or,
-    /// for serve, through `identify_checkpoint`; both want
-    /// [`Model::default_servable`] rather than the plain default wherever the
-    /// surface moves cache state.
-    fn size(&self) -> Model {
-        self.model_size.unwrap_or_default()
+    /// The registry checkpoint `--model` named, when it named one. `None` for
+    /// a path as much as for silence: a path's identity is the file's to state.
+    fn named(&self) -> Option<Model> {
+        self.model.as_ref().and_then(ModelRef::registry)
+    }
+
+    /// The path `--model` named, when it named one.
+    fn path(&self) -> Option<PathBuf> {
+        self.model
+            .as_ref()
+            .and_then(ModelRef::path)
+            .map(Path::to_path_buf)
     }
 }
 
@@ -175,8 +173,7 @@ impl ThinkArgs {
     ///
     /// A supplied `--reasoning-effort` on a checkpoint whose template has no
     /// such parameter is refused rather than ignored — the flag would change
-    /// nothing, and this repo's flags cross-check instead of shrugging (the
-    /// `--model-size` rule). Unset, the default level renders nothing on 3.6
+    /// nothing, and this repo's flags cross-check instead of shrugging. Unset, the default level renders nothing on 3.6
     /// anyway, so there is nothing to refuse.
     fn chat_options(&self, size: Model) -> Result<ChatOptions> {
         let mut opts = ChatOptions::for_dialect(size.chat_dialect());
@@ -309,9 +306,9 @@ enum Cmd {
     /// Ensure the official model + drafter sidecar are in the Hugging Face
     /// cache (idempotent: anything already cached is not touched), then print
     /// their paths. Every command does this lazily for whatever it needs; this
-    /// just prefetches. With no --model-size that is the default checkpoint,
-    /// Qwen3.8-Flash-Next: four shards and 111 GB, so name a size for anything
-    /// smaller.
+    /// just prefetches. With no --model that is the default checkpoint,
+    /// Qwen3.8-Flash-Next: four shards and 111 GB, so name one for anything
+    /// smaller. Takes a registry name only: a path is already on disk.
     Fetch {
         #[command(flatten)]
         select: ModelArgs,
@@ -383,23 +380,11 @@ enum Cmd {
     },
     /// Dump GGUF metadata and tensor listing.
     Inspect {
-        /// Model GGUF, or the Hugging Face safetensors directory of a
-        /// checkpoint stored that way (default: the checkpoint --model-size
-        /// names, ensured in the Hugging Face cache — downloaded on first use,
-        /// cached forever after).
-        #[arg(short, long)]
-        model: Option<PathBuf>,
         #[command(flatten)]
         select: ModelArgs,
     },
     /// One-shot generation from a prompt.
     Generate {
-        /// Model GGUF, or the Hugging Face safetensors directory of a
-        /// checkpoint stored that way (default: the checkpoint --model-size
-        /// names, ensured in the Hugging Face cache — downloaded on first use,
-        /// cached forever after).
-        #[arg(short, long)]
-        model: Option<PathBuf>,
         #[command(flatten)]
         select: ModelArgs,
         #[arg(short, long)]
@@ -452,12 +437,6 @@ enum Cmd {
     },
     /// Interactive chat REPL.
     Chat {
-        /// Model GGUF, or the Hugging Face safetensors directory of a
-        /// checkpoint stored that way (default: the checkpoint --model-size
-        /// names, ensured in the Hugging Face cache — downloaded on first use,
-        /// cached forever after).
-        #[arg(short, long)]
-        model: Option<PathBuf>,
         #[command(flatten)]
         select: ModelArgs,
         /// Custom tokenizer.json (default: the checkpoint tokenizer embedded
@@ -523,13 +502,14 @@ enum Cmd {
     /// prefill takes a different MoE matmul kernel than one long prefill does,
     /// which flips the occasional near-tie (see the batch module's docs).
     Batch {
-        /// Model GGUF, or the Hugging Face safetensors directory of a
-        /// checkpoint stored that way (default: the checkpoint the payload
-        /// names, ensured in the Hugging Face cache — downloaded on first use,
-        /// cached forever after). Given one, the checkpoint decides what it is
-        /// and the payload's `model` becomes the cross-check.
-        #[arg(short, long)]
-        model: Option<PathBuf>,
+        /// The checkpoint, by registry name or by path (a GGUF, or a safetensors
+        /// directory). Default: the checkpoint the payload names, ensured in the
+        /// Hugging Face cache, downloaded on first use and cached forever after.
+        /// The payload's `model` is the cross-check either way: it must agree
+        /// with the name given here, or with what the file at the path says it
+        /// is. A file or directory named like an alias is reachable as `./name`.
+        #[arg(short, long, value_name = "NAME|PATH")]
+        model: Option<ModelRef>,
         /// Custom tokenizer.json (default: the checkpoint tokenizer embedded
         /// in the binary).
         #[arg(long)]
@@ -552,22 +532,18 @@ enum Cmd {
     /// layers up to the requested hidden state and write `hidden` [T, hidden]
     /// bf16 plus `input_ids` [T] i64 to a safetensors file.
     EncodeText {
-        /// Hugging Face safetensors directory of a Qwen3 checkpoint (default:
-        /// the checkpoint --model-size names, ensured in the Hugging Face
-        /// cache — downloaded on first use, cached forever after).
-        #[arg(short, long)]
-        model: Option<PathBuf>,
-        /// Which Qwen3 checkpoint to encode with: zimage-turbo-encoder (the Z-Image
-        /// text encoder; the default here, unlike every other command),
-        /// qwen-image-2.1-encoder (the Qwen-Image 2.1 text encoder), qwen3-4b or
-        /// qwen3-4b-instruct-2507. `zimage-turbo` and `qwen-image-2.1`, the whole
-        /// diffusion pipelines, are accepted and encode with their text encoder.
-        /// A GGUF checkpoint has no hidden-state encoder.
-        #[arg(
-            long,
-            value_name = "zimage-turbo-encoder|zimage-turbo|qwen-image-2.1-encoder|qwen-image-2.1|qwen3-4b|qwen3-4b-instruct-2507"
-        )]
-        model_size: Option<Model>,
+        /// The Qwen3 checkpoint to encode with, by registry name or by path.
+        /// Names: zimage-turbo-encoder (the Z-Image text encoder; the default
+        /// here, unlike every other command), qwen-image-2.1-encoder (the
+        /// Qwen-Image 2.1 text encoder), qwen3-4b or qwen3-4b-instruct-2507, each
+        /// ensured in the Hugging Face cache. `zimage-turbo` and
+        /// `qwen-image-2.1`, the whole diffusion pipelines, encode with their
+        /// text encoder. A path is a Hugging Face safetensors directory, or a
+        /// diffusion snapshot root, which means the `text_encoder/` inside it; a
+        /// directory named like an alias is reachable as `./name`. A GGUF
+        /// checkpoint has no hidden-state encoder.
+        #[arg(short, long, value_name = "NAME|PATH")]
+        model: Option<ModelRef>,
         /// The HF `hidden_states` index to return: 0 is the embedding output,
         /// N the residual after layer N-1 (before the final norm), and 36 the
         /// output of the whole stack: normed, except on qwen-image-2.1-encoder,
@@ -620,14 +596,13 @@ enum Cmd {
         /// The PNG to write.
         #[arg(short, long, default_value = "out.png")]
         out: PathBuf,
-        /// A Z-Image-Turbo snapshot root (the directory holding
-        /// `model_index.json`, `transformer/`, `vae/`, `text_encoder/` and
-        /// `tokenizer/`) instead of the cached official checkpoint.
-        #[arg(short, long)]
-        model: Option<PathBuf>,
-        /// Which checkpoint: zimage-turbo, the only text-to-image one.
-        #[arg(long, value_name = "zimage-turbo")]
-        model_size: Option<Model>,
+        /// The text-to-image checkpoint, by registry name (zimage-turbo, the
+        /// default and the only one `xwen image` runs) or by path: a snapshot
+        /// root, the directory holding `model_index.json`, `transformer/`,
+        /// `vae/`, `text_encoder/` and `tokenizer/`. A directory named like an
+        /// alias is reachable as `./name`.
+        #[arg(short, long, value_name = "NAME|PATH")]
+        model: Option<ModelRef>,
         /// A safetensors file whose `latents` tensor, `[1, 16, H/8, W/8]` f32,
         /// replaces the seeded noise — for comparing against a reference run
         /// that started from the same latent.
@@ -663,11 +638,8 @@ struct ServeArgs {
     /// to overwrite an existing file.
     #[arg(long)]
     init: bool,
-    /// Model GGUF, or safetensors directory, to serve (default: the config
-    /// file's `model`, else the server's default checkpoint from the Hugging
-    /// Face cache).
-    #[arg(short, long)]
-    model: Option<PathBuf>,
+    /// The checkpoint to serve (default: the config file's `model`, else the
+    /// server's default checkpoint from the Hugging Face cache).
     #[command(flatten)]
     select: ModelArgs,
     /// Address to bind.
@@ -861,7 +833,7 @@ struct ServeArgs {
 impl ServeArgs {
     fn overrides(&self) -> CliOverrides {
         CliOverrides {
-            model: self.model.clone(),
+            model: self.select.path(),
             host: self.host.clone(),
             port: self.port,
             context_length: self.ctx,
@@ -940,24 +912,17 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     let source = file.as_ref().map(|_| path.as_path());
     let file = file.unwrap_or_else(ServeToml::default);
 
-    let selected = args.select.model_size;
+    let mut file = file;
     let mut overrides = args.overrides();
-    // Neither the CLI nor the config named a model: serve the hub-cached
-    // official checkpoint. Injected into the CLI side of the merge (rather than
-    // inside `resolve`) so config resolution itself stays pure and testable.
-    if overrides.model.is_none() && file.model.is_none() {
-        // The zero-flag checkpoint goes through `default_servable` rather than
-        // `default`, because this surface moves cache state and that is the
-        // question the rule answers. The two agree today; the indirection is
-        // what keeps them agreeing on purpose rather than by coincidence.
-        let size = selected.unwrap_or_else(Model::default_servable);
-        // BEFORE `resolve_model`, which fetches. A checkpoint this build cannot
-        // serve must be refused while the refusal is still free: downloading
-        // 8 GB, starting the server, listing the model and then dying on the
-        // first request is the worst possible order to learn it in.
-        ensure_servable(size)?;
-        overrides.model = Some(resolve_model(None, size)?);
-    }
+    // BEFORE `resolve_model`, which fetches. A checkpoint this build cannot
+    // serve must be refused while the refusal is still free: downloading 8 GB,
+    // starting the server, listing the model and then dying on the first
+    // request is the worst possible order to learn it in.
+    (overrides.model, file.model) =
+        serve_model_sides(args.select.model.as_ref(), file.model.as_deref(), |size| {
+            ensure_servable(size)?;
+            resolve_model(None, size)
+        })?;
 
     let (settings, warnings) = xwen::serve::config::resolve(&file, source, &overrides)?;
     for warning in &warnings {
@@ -972,11 +937,10 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     // The served CHECKPOINT decides which one this is, not the name: it settles
     // the chat dialect, the drafter and the label. Read once here and reused by
     // the drafter prefetch below.
-    let served_cfg = CheckpointSource::open(&settings.model, &candle_core::Device::Cpu, selected)?
+    let served_cfg = CheckpointSource::open(&settings.model, &candle_core::Device::Cpu, None)?
         .config()
         .with_context(|| format!("reading {}", settings.model.display()))?;
-    let (served_target, _) =
-        xwen::serve::engine::identify_checkpoint(&settings, &served_cfg, selected)?;
+    let (served_target, _) = xwen::serve::engine::identify_checkpoint(&settings, &served_cfg)?;
     // The second gate, and it catches a different case from the first: a
     // `--model` path whose IDENTITY is a checkpoint this build cannot serve.
     // A safetensors directory nobody named resolves to `Assumed(Qwen3-4B)`, so
@@ -1003,8 +967,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             // the same call the server itself uses a moment later: identifying
             // it here by any other rule would mean prefetching for one
             // checkpoint and serving another, and would report a checkpoint the
-            // server is about to refuse (a `--model-size` that contradicts the
-            // file is an error, raised here rather than after the notice).
+            // server is about to refuse.
             let served = served_target.model;
             // `--draft official` is a request by name and cannot be honored for
             // a checkpoint that ships no sidecar; the opt-out default asked for
@@ -1024,7 +987,58 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         }
     }
 
-    xwen::serve::run(settings, selected)
+    xwen::serve::run(settings)
+}
+
+/// The two sides of serve's `model` merge, `(--model, the config's model)`, each
+/// as the PATH the merge compares and the server opens.
+///
+/// The config's `model` reads exactly as `--model` does, a registry name or a
+/// path, and only the flag's silence lets it speak. A registry name on the side
+/// that decides goes through `resolve` (the servable gate, then the hub). The
+/// config's side is resolved the same way when the flag decides and both name
+/// the SAME checkpoint, so the merge sees two equal paths and does not report an
+/// override that is not one; a config naming something else stays as written,
+/// and the merge's warning quotes it. Nothing named on either side is the
+/// servable default, on the flag's side.
+///
+/// Done here rather than inside `config::resolve` so that stays pure: no hub, no
+/// disk.
+fn serve_model_sides(
+    flag: Option<&ModelRef>,
+    configured: Option<&Path>,
+    resolve: impl Fn(Model) -> Result<PathBuf>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let parsed = configured.map(|value| value.to_string_lossy().parse::<ModelRef>());
+    match flag {
+        Some(flag) => {
+            let path = match flag {
+                ModelRef::Registry(size) => resolve(*size)?,
+                ModelRef::Path(path) => path.clone(),
+            };
+            // An unreadable config value is not an error here: the flag
+            // overrides it, and the merge says so quoting it as written.
+            let same = matches!(
+                (&parsed, flag),
+                (Some(Ok(ModelRef::Registry(theirs))), ModelRef::Registry(ours)) if theirs == ours
+            );
+            let configured = if same {
+                Some(path.clone())
+            } else {
+                configured.map(Path::to_path_buf)
+            };
+            Ok((Some(path), configured))
+        }
+        None => match parsed {
+            // `default_servable` rather than `default`, because this surface
+            // moves cache state and that is the question the rule answers.
+            None => Ok((Some(resolve(Model::default_servable())?), None)),
+            Some(parsed) => match parsed.map_err(|e| anyhow::anyhow!("config model: {e}"))? {
+                ModelRef::Registry(size) => Ok((None, Some(resolve(size)?))),
+                ModelRef::Path(path) => Ok((None, Some(path))),
+            },
+        },
+    }
 }
 
 /// Which checkpoint a one-shot run (`generate`, `chat`, `batch`) is against.
@@ -1036,17 +1050,17 @@ fn run_serve(args: ServeArgs) -> Result<()> {
 /// serves (`XwenConfig::identify`), so a custom GGUF is not one checkpoint on
 /// one surface and another on the next.
 ///
-/// `selected` is a cross-check, not an override: it must agree with a file that
-/// identifies itself, and settles one that identifies as nothing. It is what the
-/// run named, `selector` is what to call that in an error, and `default` is what
-/// a run that named nothing gets when there is also no file to read. All three
-/// differ per command — `--model-size` and the plain default on `generate` and
-/// `chat`, the payload's `"model"` and the servable default on `batch` — which
-/// is why none of them is inlined here.
+/// `selected` is the registry checkpoint the run named: `--model <name>` on
+/// `generate` and `chat`, where a path and a name are one flag and so never
+/// arrive together, and the payload's `"model"` on `batch`, where they can.
+/// There it is a cross-check, not an override: it must agree with a file that
+/// identifies itself, and settles one that identifies as nothing. `selector` is
+/// what to call it in an error, and `default` is what a run that named nothing
+/// gets when there is also no file to read.
 ///
 /// Metadata only: a second cheap open of a file the loader is about to mmap
-/// anyway, done BEFORE the load so a contradicting flag fails in milliseconds
-/// rather than after 20 GB (111 on the default) is resident.
+/// anyway, done BEFORE the load so a contradicting payload fails in
+/// milliseconds rather than after 20 GB (111 on the default) is resident.
 fn one_shot_checkpoint(
     model: Option<&Path>,
     selected: Option<Model>,
@@ -1067,10 +1081,9 @@ fn one_shot_checkpoint(
         Identity::Assumed(assumed) => {
             // Said out loud because it decides the chat template dialect and the
             // drafter, and on the dense architecture the two 27B releases are a
-            // coin-flip — the operator is the only one who can break that tie.
+            // coin-flip the file did not settle.
             eprintln!(
-                "xwen: {} names no official checkpoint; running it as {} \
-                 (pass {selector} to name it)",
+                "xwen: {} names no official checkpoint; running it as {}",
                 path.display(),
                 assumed.full_name()
             );
@@ -1302,7 +1315,7 @@ fn ensure_drafter(size: Model) -> Result<Option<PathBuf>> {
 /// anyhow's stderr message. Per-item failures never reach this: they ride the
 /// response as an `error` on their own item.
 fn run_batch(
-    model: Option<PathBuf>,
+    model: Option<ModelRef>,
     tokenizer: Option<PathBuf>,
     moe_impl: &str,
     max_ctx: usize,
@@ -1501,7 +1514,7 @@ fn batch_run_record(response: &BatchResponse, label: &str) -> RunRecord {
 /// differ: the response is labelled with the checkpoint the run answers AS,
 /// while a custom GGUF is recorded under its own file name.
 fn batch_request(
-    model: Option<PathBuf>,
+    model: Option<ModelRef>,
     tokenizer: Option<PathBuf>,
     moe_impl: &str,
     max_ctx: usize,
@@ -1518,16 +1531,29 @@ fn batch_request(
         !request.items.is_empty(),
         "batch: the request holds no items"
     );
-    // The payload names the checkpoint; `-m` still overrides the FILE, and when
-    // it is given that file's own identity is what the run is against — the
-    // payload's name (or its absence) is only the cross-check, exactly as
-    // `--model-size` is for the other commands.
-    //
+    // The payload names the checkpoint. `--model <path>` still overrides the
+    // FILE, and then that file's own identity is what the run is against, the
+    // payload's name (or its absence) being only the cross-check. `--model
+    // <name>` is what a payload that names nothing runs, and one that names
+    // something else is the same contradiction.
     let named = request
         .model
         .is_some()
         .then(|| request.model())
         .transpose()?;
+    let flagged = model.as_ref().and_then(ModelRef::registry);
+    if let (Some(named), Some(flagged)) = (named, flagged) {
+        ensure!(
+            named == flagged,
+            "{named} (from the request's \"model\" field) contradicts --model {flagged}; drop \
+             one or make them agree"
+        );
+    }
+    let named = named.or(flagged);
+    let model = model
+        .as_ref()
+        .and_then(ModelRef::path)
+        .map(Path::to_path_buf);
     // `default_servable` rather than `default`, because batch moves cache state
     // and that is the question the rule answers. The two agree today.
     let checkpoint = one_shot_checkpoint(
@@ -1747,7 +1773,16 @@ fn main() -> Result<()> {
         // top level.
         None => run_serve(cli.serve),
         Some(Cmd::Fetch { select }) => {
-            let size = select.size();
+            // Fetch is the registry's surface: a path is already on disk, and
+            // quietly fetching the default beside it would be the wrong answer.
+            if let Some(path) = select.path() {
+                bail!(
+                    "xwen fetch takes a checkpoint name, and {} is a path: there is nothing \
+                     to fetch for a checkpoint that is already on disk",
+                    path.display()
+                );
+            }
+            let size = select.named().unwrap_or_default();
             let model = resolve_model(None, size)?;
             println!("model    {}", model.display());
             match ensure_drafter(size)? {
@@ -1795,12 +1830,9 @@ fn main() -> Result<()> {
             };
             run_stats(&query, json)
         }
-        Some(Cmd::Inspect { model, select }) => {
-            // `select.model_size`, not `select.size()`: the Option is what
-            // `identify` needs. Defaulting it here would tell the cross-check
-            // that every run named a checkpoint, and a `--model` pointing at
-            // something else would then be a contradiction that never fired.
-            let selected = select.model_size;
+        Some(Cmd::Inspect { select }) => {
+            let model = select.path();
+            let selected = select.named();
             // Ahead of `resolve_model`, which fetches. A diffusion entry's
             // first file is `model_index.json`, so without this the run
             // downloaded 32.9 GB and then handed a JSON index to the GGUF
@@ -1808,21 +1840,17 @@ fn main() -> Result<()> {
             // Z-Image text encoder is unservable and inspecting it is exactly
             // what someone wants — so the gate is the format, and the sentence
             // is the entry's own.
-            let requested = select.size();
+            let requested = selected.unwrap_or_default();
             ensure!(
                 !requested.is_diffusion(),
                 "{}",
                 requested.not_servable_message()
             );
-            let path = resolve_model(model, select.size())?;
+            let path = resolve_model(model, requested)?;
             let device = candle_core::Device::Cpu;
             let source = CheckpointSource::open(&path, &device, selected)?;
             let cfg = source.config()?;
-            // Inspect applies the selected entry's zero-run allowlist when it
-            // opens, so it has to apply that entry's cross-check too — otherwise
-            // `--model <instruct dir> --model-size qwen3-4b` is a contradiction
-            // every other surface refuses and this one describes.
-            let identity = source.identify(&cfg, selected, "--model-size")?;
+            let identity = source.identify(&cfg, selected, "--model")?;
             // The tensor listing is a GGUF rendering of a GGUF file table; a
             // safetensors set has its own and no describer yet, so it prints
             // what a set knows about itself instead.
@@ -1847,7 +1875,6 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::Generate {
-            model,
             select,
             prompt,
             tokenizer,
@@ -1903,10 +1930,11 @@ fn main() -> Result<()> {
             // Read before the template knobs are resolved: with `--model` the
             // FILE decides which checkpoint this is, and the dialect, the
             // drafter and the effort preamble all key off that answer.
+            let model = select.path();
             let checkpoint = one_shot_checkpoint(
                 model.as_deref(),
-                select.model_size,
-                "--model-size",
+                select.named(),
+                "--model",
                 Model::default(),
             )?;
             let size = checkpoint.model;
@@ -2107,7 +2135,6 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::Chat {
-            model,
             select,
             tokenizer,
             max_tokens,
@@ -2123,10 +2150,11 @@ fn main() -> Result<()> {
         }) => {
             // Validated before the 20 GB load, like every startup cross-check.
             think.check_think_budgets(min_think, max_think)?;
+            let model = select.path();
             let checkpoint = one_shot_checkpoint(
                 model.as_deref(),
-                select.model_size,
-                "--model-size",
+                select.named(),
+                "--model",
                 Model::default(),
             )?;
             let size = checkpoint.model;
@@ -2164,23 +2192,13 @@ fn main() -> Result<()> {
         Some(Cmd::Serve(args)) => run_serve(args),
         Some(Cmd::EncodeText {
             model,
-            model_size,
             layer,
             prompt,
             prompt_file,
             output,
             max_ctx,
             verbose,
-        }) => run_encode_text(
-            model,
-            model_size,
-            layer,
-            prompt,
-            prompt_file,
-            &output,
-            max_ctx,
-            verbose,
-        ),
+        }) => run_encode_text(model, layer, prompt, prompt_file, &output, max_ctx, verbose),
         Some(Cmd::Image {
             prompt,
             width,
@@ -2189,7 +2207,6 @@ fn main() -> Result<()> {
             seed,
             out,
             model,
-            model_size,
             latents,
             cap_feats,
             dump,
@@ -2202,12 +2219,32 @@ fn main() -> Result<()> {
             seed,
             out,
             model,
-            model_size,
             latents,
             cap_feats,
             dump,
             controls,
         }),
+    }
+}
+
+/// Which registry pipeline the snapshot at `root` holds, read off the
+/// `_class_name` its `model_index.json` declares. A snapshot is a directory of
+/// component directories with no name of its own, and the pipeline class is the
+/// one thing in it that says which graph the components belong to.
+fn pipeline_at(root: &Path) -> Result<Model> {
+    let index = root.join("model_index.json");
+    let text =
+        std::fs::read_to_string(&index).with_context(|| format!("reading {}", index.display()))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", index.display()))?;
+    match parsed.get("_class_name").and_then(|name| name.as_str()) {
+        Some("ZImagePipeline") => Ok(Model::ZImageTurbo),
+        Some("QwenImage21Pipeline") => Ok(Model::QwenImage21),
+        other => bail!(
+            "{} declares the pipeline class {other:?}, which is none this build knows \
+             (ZImagePipeline, QwenImage21Pipeline)",
+            index.display()
+        ),
     }
 }
 
@@ -2228,8 +2265,7 @@ fn main() -> Result<()> {
 /// the planes.
 #[allow(clippy::too_many_arguments)]
 fn run_encode_text(
-    model: Option<PathBuf>,
-    model_size: Option<Model>,
+    model: Option<ModelRef>,
     layer: Option<usize>,
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
@@ -2246,42 +2282,49 @@ fn run_encode_text(
         }
         (Some(_), Some(_)) => bail!("--prompt and --prompt-file are mutually exclusive"),
     };
-    // `--model-size zimage-turbo` (or `qwen-image-2.1`) names a whole diffusion
-    // pipeline, and the part of it that encodes is its text encoder entry — the
-    // same repo, one subdirectory down. Both aliases therefore encode, and
-    // the remap happens here rather than being a second name for the encoder
-    // entry, because `xwen image` wants the pipeline under that alias.
-    let (model_size, model) = match model_size {
-        Some(pipeline) if pipeline.is_diffusion() => {
+    // A whole diffusion pipeline, named or pointed at, means the part of it
+    // that encodes: its text encoder entry, the same repo one subdirectory
+    // down. The remap happens here rather than being a second name for the
+    // encoder entry, because `xwen image` wants the pipeline under that alias.
+    let (named, model) = match model {
+        Some(ModelRef::Registry(pipeline)) if pipeline.is_diffusion() => {
             let encoder = pipeline
                 .text_encoder()
                 .with_context(|| format!("{} names no text encoder", pipeline.full_name()))?;
-            let subdir = Path::new(encoder.file()).parent().unwrap_or(Path::new(""));
-            // A snapshot the operator named holds the encoder inside it;
-            // anything else is passed through as given. Either spelling of the
-            // snapshot counts — the directory or its `model_index.json`, which
-            // is what `xwen fetch` prints — and the rule is
-            // `checkpoint::diffusion_snapshot_root`'s, the same one the loader
-            // refuses that path by. Written twice they drift, and the drift is
-            // this command accepting a shape the loader then refuses.
-            let model = match model
-                .as_deref()
-                .and_then(xwen::checkpoint::diffusion_snapshot_root)
-            {
-                Some(root) => Some(root.join(subdir)),
-                None => model,
-            };
-            (Some(encoder), model)
+            (Some(encoder), None)
         }
-        other => (other, model),
+        Some(ModelRef::Registry(named)) => (Some(named), None),
+        // Either spelling of a snapshot counts, the directory or its
+        // `model_index.json`, which is what `xwen fetch` prints, and the rule is
+        // `checkpoint::diffusion_snapshot_root`'s, the same one the loader
+        // refuses that path by. Written twice they drift, and the drift is this
+        // command accepting a shape the loader then refuses. Every pipeline in
+        // the registry keeps its encoder in the same place, so the first one
+        // whose subdirectory is there answers for a snapshot nobody named.
+        Some(ModelRef::Path(path)) => match xwen::checkpoint::diffusion_snapshot_root(&path) {
+            Some(root) => {
+                let inside = xwen::hub::MODELS
+                    .iter()
+                    .filter_map(|pipeline| pipeline.text_encoder())
+                    .filter_map(|encoder| Path::new(encoder.file()).parent())
+                    .map(|subdir| root.join(subdir))
+                    .find(|dir| dir.is_dir())
+                    .with_context(|| {
+                        format!("{} holds no text encoder directory", root.display())
+                    })?;
+                (None, Some(inside))
+            }
+            None => (None, Some(path)),
+        },
+        None => (None, None),
     };
     // Unlike every other command, the zero-flag default is the encoder entry:
     // encoding is what that checkpoint is for, and the global default
     // (Flash-Next, a GGUF) has no hidden-state encoder at all.
     let checkpoint = one_shot_checkpoint(
         model.as_deref(),
-        model_size,
-        "--model-size",
+        named,
+        "--model",
         Model::ZImageTurboEncoder,
     )?;
     let size = checkpoint.model;
@@ -2291,14 +2334,14 @@ fn run_encode_text(
     ensure!(
         !size.is_diffusion(),
         "{} is a text-to-image pipeline rather than a language model; its text encoder is \
-         --model-size {}, and `xwen image` runs the pipeline itself",
+         --model {}, and `xwen image` runs the pipeline itself",
         size.full_name(),
         Model::ZImageTurboEncoder
     );
     ensure!(
         size.is_safetensors(),
         "{} is a GGUF checkpoint; the hidden-state encoder runs the Qwen3 dense safetensors \
-         checkpoints only (--model-size zimage-turbo-encoder, qwen-image-2.1-encoder, qwen3-4b \
+         checkpoints only (--model zimage-turbo-encoder, qwen-image-2.1-encoder, qwen3-4b \
          or qwen3-4b-instruct-2507)",
         size.full_name()
     );
@@ -2469,8 +2512,7 @@ struct ImageArgs {
     steps: usize,
     seed: Option<u64>,
     out: PathBuf,
-    model: Option<PathBuf>,
-    model_size: Option<Model>,
+    model: Option<ModelRef>,
     latents: Option<PathBuf>,
     cap_feats: Option<PathBuf>,
     dump: Option<PathBuf>,
@@ -2487,20 +2529,34 @@ struct ImageArgs {
 fn run_image(args: ImageArgs) -> Result<()> {
     use xwen::zimage::pipeline::{ImageOptions, ZImagePipeline, write_png};
 
-    let size = args.model_size.unwrap_or(Model::ZImageTurbo);
+    // A name is the registry's; a path is a snapshot root, and its
+    // `model_index.json` says which pipeline it holds.
+    let (size, root) = match &args.model {
+        None => (Model::ZImageTurbo, None),
+        Some(ModelRef::Registry(named)) => (*named, None),
+        Some(ModelRef::Path(path)) => {
+            let root = xwen::checkpoint::diffusion_snapshot_root(path).with_context(|| {
+                format!(
+                    "{} is not a diffusion snapshot root (no model_index.json in it)",
+                    path.display()
+                )
+            })?;
+            (pipeline_at(&root)?, Some(root))
+        }
+    };
     // Everything below is Z-Image's pipeline: its transformer, its scheduler,
     // its VAE. Another pipeline's entry must not fall through into it, where it
     // would fail deep inside a load, or worse, half succeed.
     ensure!(
         size != Model::QwenImage21,
         "{} is registered and fetchable, but its image pipeline is not implemented yet: only \
-         its text encoder runs (`xwen encode-text --model-size {}`)",
+         its text encoder runs (`xwen encode-text --model {}`)",
         size.full_name(),
         Model::QwenImage21Encoder
     );
     let encoder_entry = size.text_encoder().with_context(|| {
         format!(
-            "{} is not a text-to-image checkpoint; `xwen image` runs {} (--model-size {})",
+            "{} is not a text-to-image checkpoint; `xwen image` runs {} (--model {})",
             size.full_name(),
             Model::ZImageTurbo.full_name(),
             Model::ZImageTurbo
@@ -2648,7 +2704,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
             .with_context(|| format!("creating the dump directory {}", dir.display()))?;
     }
 
-    let root = match args.model {
+    let root = match root {
         Some(root) => root,
         None => {
             let index = resolve_model(None, size)?;
@@ -3000,6 +3056,50 @@ mod tests {
         );
     }
 
+    /// `--model 27b` over a config that also says `model = "27b"` is not an
+    /// override, and the merge must not be handed two spellings of one
+    /// checkpoint to call different. A config naming something else IS
+    /// overridden and stays as written for the warning to quote.
+    #[test]
+    fn a_flag_and_a_config_naming_one_checkpoint_resolve_to_one_path() {
+        let resolve = |size: Model| Ok(PathBuf::from(format!("/hub/{size}.gguf")));
+        let flag = ModelRef::Registry(Model::Qwen27B);
+
+        for spelling in ["27b", "Qwen3.6-27B"] {
+            let (cli, file) =
+                serve_model_sides(Some(&flag), Some(Path::new(spelling)), resolve).unwrap();
+            assert_eq!(cli, Some(PathBuf::from("/hub/27b.gguf")));
+            assert_eq!(file, cli, "{spelling} names the same checkpoint");
+        }
+        let (cli, file) = serve_model_sides(Some(&flag), Some(Path::new("35b")), resolve).unwrap();
+        assert_eq!(cli, Some(PathBuf::from("/hub/27b.gguf")));
+        assert_eq!(file, Some(PathBuf::from("35b")));
+
+        // The flag silent: the config decides, by name or by path, and a value
+        // that is neither is an error naming the key.
+        let (cli, file) = serve_model_sides(None, Some(Path::new("35b")), resolve).unwrap();
+        assert_eq!((cli, file), (None, Some(PathBuf::from("/hub/35b.gguf"))));
+        let (cli, file) = serve_model_sides(None, Some(Path::new("/")), resolve).unwrap();
+        assert_eq!((cli, file), (None, Some(PathBuf::from("/"))));
+        let err = serve_model_sides(None, Some(Path::new("/no/such.gguf")), resolve)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config model"), "{err}");
+        // Overridden, the same unreadable value is only quoted.
+        assert!(serve_model_sides(Some(&flag), Some(Path::new("/no/such.gguf")), resolve).is_ok());
+
+        // Nothing named anywhere is the servable default, on the flag's side.
+        let (cli, file) = serve_model_sides(None, None, resolve).unwrap();
+        assert_eq!(
+            cli,
+            Some(PathBuf::from(format!(
+                "/hub/{}.gguf",
+                Model::default_servable()
+            )))
+        );
+        assert_eq!(file, None);
+    }
+
     /// With no `--model` file there is nothing to identify, so a one-shot runs
     /// what it was told to — and what "told to nothing" means differs per
     /// command, which is the whole reason the fallback is a parameter:
@@ -3011,9 +3111,8 @@ mod tests {
     /// re-tested here.
     #[test]
     fn without_a_file_a_one_shot_runs_what_it_was_told_to() {
-        let resolved = |selected, default| {
-            one_shot_checkpoint(None, selected, "--model-size", default).unwrap()
-        };
+        let resolved =
+            |selected, default| one_shot_checkpoint(None, selected, "--model", default).unwrap();
         assert_eq!(resolved(None, Model::default()).model, Model::default());
         assert_eq!(
             resolved(None, Model::default_servable()).model,

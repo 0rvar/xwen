@@ -71,8 +71,8 @@ pub enum Arch {
 /// claim official weights ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Identity {
-    /// The file names an official checkpoint — or `--model-size` named one and
-    /// the file did not contradict it.
+    /// The file names an official checkpoint — or a `xwen batch` payload named
+    /// one and the file did not contradict it.
     Official(crate::hub::Model),
     /// Nothing names a checkpoint, so the architecture's registry entry is
     /// assumed. Callers say so out loud: it decides the chat dialect and the
@@ -438,9 +438,11 @@ impl XwenConfig {
     /// anything. A file that still says nothing falls back to the architecture's
     /// registry entry as [`Identity::Assumed`], which every caller reports.
     ///
-    /// `selector` is where that selection came from, for the error to name: it is
-    /// `--model-size` on every surface but `xwen batch`, which has no size flag
-    /// and takes the checkpoint from its payload instead.
+    /// Exactly one surface has a selection to make beside a file: `xwen batch`,
+    /// whose payload names a checkpoint while `--model <path>` names the file.
+    /// Every other surface names ONE thing with `--model`, a registry entry or a
+    /// path, and passes `None` here, so a path is whatever its file says.
+    /// `selector` is where the selection came from, for the error to name.
     pub fn identify(
         &self,
         path: &std::path::Path,
@@ -467,8 +469,8 @@ impl XwenConfig {
             }
             // A safetensors set has no name to contradict, so the release
             // cross-check falls to the one config value that separates the
-            // `qwen3` releases. Without this a `--model-size
-            // qwen3-4b-instruct-2507` pointed at an unpacked base model would
+            // `qwen3` releases. Without this a payload naming
+            // `Qwen3-4B-Instruct-2507` over an unpacked base model would
             // be honored silently and run at the wrong context length under the
             // wrong chat dialect.
             if let Some(expected) = selected.safetensors_rope_theta()
@@ -544,7 +546,7 @@ impl XwenConfig {
             "qwen3" => bail!(
                 "this is a qwen3 (Qwen3-4B) GGUF, which this build does not read: point \
                  --model at the Hugging Face safetensors directory instead (or use \
-                 --model-size qwen3-4b / qwen3-4b-instruct-2507 / zimage-turbo-encoder)"
+                 --model qwen3-4b / qwen3-4b-instruct-2507 / zimage-turbo-encoder)"
             ),
             other => bail!(
                 "expected a Qwen GGUF (architecture \"qwen35\", \"qwen35moe\" or \"qwen4exp\"), \
@@ -1280,7 +1282,7 @@ mod tests {
     }
 
     /// A file someone points `--model` at decides which checkpoint it is, with
-    /// no `--model-size` in sight — and a custom conversion that names no
+    /// nothing else named — and a custom conversion that names no
     /// release still lands on its own ARCHITECTURE's checkpoint, not on whatever
     /// the CLI's compile-time default happens to be.
     ///
@@ -1293,7 +1295,7 @@ mod tests {
         let path = std::path::Path::new("/models/my-finetune-Q4_K_M.gguf");
         assert_eq!(
             named(Arch::Moe, Some("Qwen3.6-35B-A3B"))
-                .identify(path, None, "--model-size")
+                .identify(path, None, "the payload")
                 .unwrap(),
             Identity::Official(crate::hub::Model::Qwen35BA3B)
         );
@@ -1301,7 +1303,7 @@ mod tests {
         // assumed, and `Assumed` is what makes every caller say so.
         assert_eq!(
             named(Arch::Moe, Some("my-finetune"))
-                .identify(path, None, "--model-size")
+                .identify(path, None, "the payload")
                 .unwrap(),
             Identity::Assumed(crate::hub::Model::Qwen35BA3B)
         );
@@ -1311,14 +1313,14 @@ mod tests {
                 .identify(
                     std::path::Path::new("/models/Qwen3.6-35B-A3B-Q4_K_M.gguf"),
                     None,
-                    "--model-size",
+                    "the payload",
                 )
                 .unwrap(),
             Identity::Official(crate::hub::Model::Qwen35BA3B)
         );
     }
 
-    /// `--model-size` is a cross-check, never an override: it settles a file
+    /// A selection is a cross-check, never an override: it settles a file
     /// that says nothing, and contradicting one that does is a startup error
     /// naming both sides rather than a silent reinterpretation of the weights.
     #[test]
@@ -1329,12 +1331,12 @@ mod tests {
         // Right architecture, wrong release — the case the architecture check
         // cannot catch, since the two 27B releases share the dense graph.
         let err = named(Arch::Dense, Some("Qwen3.6-27B"))
-            .identify(path, Some(crate::hub::Model::Qwen3827B), "--model-size")
+            .identify(path, Some(crate::hub::Model::Qwen3827B), "the payload")
             .unwrap_err()
             .to_string();
         assert!(err.contains("Qwen3.6-27B"), "{err}");
         assert!(err.contains("3.8-27b"), "{err}");
-        assert!(err.contains("--model-size"), "{err}");
+        assert!(err.contains("the payload"), "{err}");
 
         // Where the selection came from is the CALLER's word, because batch has
         // no size flag and takes its checkpoint from the payload.
@@ -1351,7 +1353,7 @@ mod tests {
         // Wrong architecture, which no name can change: caught before the
         // release check, and naming the two architectures.
         let err = named(Arch::Dense, None)
-            .identify(path, Some(crate::hub::Model::Qwen35BA3B), "--model-size")
+            .identify(path, Some(crate::hub::Model::Qwen35BA3B), "the payload")
             .unwrap_err()
             .to_string();
         assert!(err.contains("qwen35moe") && err.contains("qwen35"), "{err}");
@@ -1360,13 +1362,13 @@ mod tests {
         // selection decides anything.
         assert_eq!(
             named(Arch::Dense, Some("my-finetune"))
-                .identify(path, Some(crate::hub::Model::Qwen3827B), "--model-size")
+                .identify(path, Some(crate::hub::Model::Qwen3827B), "the payload")
                 .unwrap(),
             Identity::Official(crate::hub::Model::Qwen3827B)
         );
         // Agreeing with the file is not a contradiction.
         assert_eq!(
-            moe.identify(path, Some(crate::hub::Model::Qwen35BA3B), "--model-size")
+            moe.identify(path, Some(crate::hub::Model::Qwen35BA3B), "the payload")
                 .unwrap(),
             Identity::Official(crate::hub::Model::Qwen35BA3B)
         );

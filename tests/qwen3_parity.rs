@@ -32,7 +32,7 @@
 //!   snapshot, and a cache miss is an error naming `xwen fetch`; this test never
 //!   downloads 8 GB behind the runner's back.
 //! - `XWEN_QWEN3_ENTRY` — the registry checkpoint the directory is, as a
-//!   `--model-size` alias. Defaults to `qwen3-4b`; the entry decides where the
+//!   `--model` alias. Defaults to `qwen3-4b`; the entry decides where the
 //!   loader looks for the tokenizer and which planes may be zero-filled.
 //! - `XWEN_QWEN3_PARITY_ONLY` — comma-separated manifest indices, to run a
 //!   subset (`0,8,11` is the three cheapest prompts).
@@ -769,7 +769,7 @@ fn resolve_checkpoint(entry: xwen::hub::Model) -> Result<PathBuf> {
     }
     xwen::hub::cached_model(entry).with_context(|| {
         format!(
-            "{entry} is not in the Hugging Face cache. Run `xwen fetch --model-size {entry}`, \
+            "{entry} is not in the Hugging Face cache. Run `xwen fetch --model {entry}`, \
              or point XWEN_QWEN3_DIR at a safetensors directory."
         )
     })

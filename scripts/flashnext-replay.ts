@@ -42,6 +42,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { modelPath, rejectUnknownFlags, resolveModelRef } from "./hf";
 
 const root = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const args = process.argv.slice(2);
@@ -55,6 +56,7 @@ const fail = (msg: string): never => {
   process.exit(2);
 };
 
+rejectUnknownFlags("flashnext-replay", args, ["dir", "steps", "port", "control", "model", "rebuild-oracle"]);
 const dir = opt("dir", "/tmp/xwen-flashnext-replay");
 const steps = Number(opt("steps", "64"));
 const port = Number(opt("port", "18099"));
@@ -70,21 +72,22 @@ const oracleBin = join(root, "reference/llama.cpp/build/bin/llama-server");
 if (!existsSync(bin)) fail(`${bin} missing; cargo build --release --bin logits-dump`);
 if (!existsSync(oracleBin)) fail(`${oracleBin} missing; bash scripts/build-llamacpp.sh`);
 
-function flashNextModel(): string {
-  const hub =
-    process.env.HF_HUB_CACHE ??
-    (process.env.HF_HOME ? join(process.env.HF_HOME, "hub") : join(process.env.HOME!, ".cache/huggingface/hub"));
-  const snaps = join(hub, "models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots");
-  if (!existsSync(snaps)) fail(`Flash-Next is not in the HF cache (${snaps}); run xwen fetch --model-size flash-next`);
-  for (const snap of readdirSync(snaps)) {
-    const d = join(snaps, snap, "UD-Q4_K_XL");
-    if (!existsSync(d)) continue;
-    const shard = readdirSync(d).find((f) => f.endsWith("00001-of-00004.gguf"));
-    if (shard) return join(d, shard);
+// `--model`, else $XWEN_MODEL, else the cached Flash-Next. Both consumers below
+// (logits-dump and llama-server's `-m`) get a PATH: llama-server knows no
+// aliases. The fixtures and the oracle cache are Flash-Next's, so another
+// registry checkpoint is refused by name; a path is the operator's word that the
+// file is a Flash-Next build.
+const model = (() => {
+  try {
+    const ref = resolveModelRef(opt("model", ""), "flash-next");
+    if (ref.kind === "registry" && ref.size !== "flash-next") {
+      return fail(`this replay grades Qwen3.8-Flash-Next only, not ${ref.size}; pass --model flash-next or a path to a Flash-Next GGUF`);
+    }
+    return modelPath(ref);
+  } catch (e) {
+    return fail((e as Error).message);
   }
-  return fail("no UD-Q4_K_XL first shard under the Flash-Next snapshot");
-}
-const model = opt("model", "") || flashNextModel();
+})();
 
 // Every arm runs on a clean environment: no inherited kernel switch, no profiler.
 const baseEnv: Record<string, string> = {};

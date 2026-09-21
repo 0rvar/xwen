@@ -25,6 +25,7 @@ they belong to; a new topic gets a new file and a line here.
   - Diffusion image transformers are in scope, held to correctness bars first, and their…
 - [Defaults and CLI surface](decisions/defaults-and-cli.md)
   - The uncensored 35B is a cache-only registry entry (2026-09-09).
+  - One flag names the checkpoint: `--model <alias | full name | path>` (2026-09-21).
   - Default checkpoints are ggml-org's Q4_K_M files.
   - Qwen3.8-27B is a registry entry, not a port (2026-08-14).
   - Sampling defaults follow generation_config.json: temp 1.0, top_p 0.95, top_k 20.
@@ -130,6 +131,7 @@ they belong to; a new topic gets a new file and a line here.
   - On the wire a checkpoint has exactly one name — its full name — and an unknown one…
   - The GGUF names itself; the architecture is only a fallback (2026-08-14).
   - `--model-size` is a tie-break, not an override (2026-08-14, review round).
+  - `--model` is the one flag that names a checkpoint, and a path is no longer pinned to an…
   - A job names a FILE, not just a checkpoint (2026-08-14, review round).
   - The disk tier stays bound to the default checkpoint.
   - Speculation is decided per checkpoint, not per process (2026-08-14, review round).

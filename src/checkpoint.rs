@@ -64,27 +64,24 @@ impl CheckpointSource {
     /// safetensors set opened at that directory. Anything else is tried as a
     /// GGUF, which is what it has always been.
     ///
-    /// `entry` is the registry checkpoint the caller believes this is, when it
-    /// knows one. It supplies the two things a safetensors set cannot work out
-    /// for itself: where the tokenizer is (the Z-Image encoder's sits in a
-    /// sibling directory, not its own) and which planes are allowed to be
-    /// zero-filled. Passing `None` is safe — the loader allows no zero runs —
-    /// but it means a Z-Image directory opened without naming it is refused for
-    /// the corruption it really has.
+    /// `entry` is the registry checkpoint the caller named, when it named one
+    /// (`--model <alias>` resolves to a path AND an entry). It supplies the two
+    /// things a safetensors set cannot work out for itself: where the tokenizer
+    /// is (the Z-Image encoder's sits in a sibling directory, Qwen-Image 2.1's
+    /// under `processor/`) and which planes are allowed to be zero-filled.
     ///
-    /// The tokenizer does not depend on being told: a directory that is an
-    /// entry's own cached snapshot gets that entry's tokenizer path whether or
-    /// not the caller named it, because every surface identifies the directory
-    /// only AFTER it has opened, and a layout the loader's own search does not
-    /// know (Qwen-Image 2.1 keeps its tokenizer under `processor/`) would
-    /// otherwise fail to open at all unless `--model-size` was passed. The
-    /// zero-run allowlist stays the caller's alone.
+    /// A caller that has only a path passes `None`, and then PROVENANCE answers
+    /// both: a directory that is an entry's own cached snapshot is that entry,
+    /// the same directory naming it by alias resolves to, so it gets that
+    /// entry's tokenizer path and its allowlist. A directory anywhere else is
+    /// nobody's entry: the loader allows it no zero runs, so a copy of the
+    /// Z-Image encoder outside the Hugging Face cache is refused for the
+    /// corruption it really has.
     pub fn open(path: &Path, device: &Device, entry: Option<Model>) -> Result<Self> {
         if let Some(dir) = safetensors_dir(path)? {
-            let tokenizer = registry_tokenizer(
-                entry.or_else(|| Model::identify(crate::config::Arch::Qwen3, None, Some(&dir))),
-                &dir,
-            );
+            let entry =
+                entry.or_else(|| Model::identify(crate::config::Arch::Qwen3, None, Some(&dir)));
+            let tokenizer = registry_tokenizer(entry, &dir);
             let allow = entry
                 .map(Model::safetensors_allowed_zero_runs)
                 .unwrap_or(&[]);
@@ -415,8 +412,15 @@ fn ensure_index_lists(dir: &Path, shard: &str) -> Result<()> {
 /// whose tokenizer is `tokenizer/tokenizer.json`, one level up. Both roots are
 /// tried, and `None` — no registry entry, or neither path on disk — leaves the
 /// loader to its own search, which knows the same two layouts.
+///
+/// Resolved against the CANONICAL directory, the one provenance was decided
+/// on. A symlink to a cached `text_encoder/` identifies as that entry, and its
+/// tokenizer is the entry's, beside the real directory: the link's own parent
+/// is somewhere else entirely, and a `tokenizer/` that happened to sit there
+/// would be another checkpoint's vocabulary loaded without an error.
 fn registry_tokenizer(entry: Option<Model>, dir: &Path) -> Option<PathBuf> {
     let relative = entry?.safetensors_tokenizer()?;
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut roots = vec![dir.to_path_buf()];
     if let Some(parent) = dir.parent() {
         roots.push(parent.to_path_buf());
@@ -685,6 +689,10 @@ mod tests {
     fn the_registry_tokenizer_resolves_against_both_roots() {
         let root = std::env::temp_dir().join(format!("xwen_tok_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Canonical, because the answers are: the temp directory is itself
+        // behind a symlink on macOS.
+        let root = std::fs::canonicalize(&root).unwrap();
         let encoder = root.join("text_encoder");
         std::fs::create_dir_all(&encoder).unwrap();
         std::fs::create_dir_all(root.join("tokenizer")).unwrap();
@@ -732,6 +740,22 @@ mod tests {
         assert_eq!(identified, Some(Model::QwenImage21Encoder));
         assert_eq!(
             registry_tokenizer(None.or(identified), &cached),
+            Some(snapshot.join("processor/tokenizer.json"))
+        );
+
+        // A symlink to that directory is the same checkpoint, and its tokenizer
+        // is beside the REAL directory. The link sits next to a `processor/` of
+        // its own holding some other vocabulary, which is what resolving
+        // against the link's parent would have picked up without an error.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("processor")).unwrap();
+        std::fs::write(elsewhere.join("processor/tokenizer.json"), b"{\"other\":1}").unwrap();
+        let link = elsewhere.join("enc");
+        std::os::unix::fs::symlink(&cached, &link).unwrap();
+        let identified = Model::identify_cached_dir_in(&cache, &link);
+        assert_eq!(identified, Some(Model::QwenImage21Encoder));
+        assert_eq!(
+            registry_tokenizer(identified, &link),
             Some(snapshot.join("processor/tokenizer.json"))
         );
 

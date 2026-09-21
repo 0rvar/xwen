@@ -77,10 +77,10 @@
  * Usage:
  *   bun scripts/retune-draft.ts                          # every drafting model, both stages, 3 reps
  *   bun scripts/retune-draft.ts --dry-run                # print the run matrix, run nothing
- *   bun scripts/retune-draft.ts --model-size 27b --stage 1
+ *   bun scripts/retune-draft.ts --model 27b --stage 1
  *   bun scripts/retune-draft.ts --reps 5 --p-min-grid 0.2,0.3,0.4
  *   bun scripts/retune-draft.ts --margin-grid 0.8,1.0,1.2 --timeout 600
- *   bun scripts/retune-draft.ts --model-size 3.8-27b --p-min-grid 0.3,0.5,0.7 --depth-grid 2,3,4
+ *   bun scripts/retune-draft.ts --model 3.8-27b --p-min-grid 0.3,0.5,0.7 --depth-grid 2,3,4
  *
  * Wall time: one run is ~128 greedy tokens plus a model load. Without a depth
  * grid one model's two stages are 5 arms x 2 prompts x 3 reps x 2 stages = 60
@@ -244,10 +244,11 @@ function parseArgs(argv: string[]): Opts {
   }
 
   const known = new Set([
-    "model-size", "reps", "stage", "p-min-grid", "margin-grid", "depth-grid", "dry-run", "binary",
+    "model", "reps", "stage", "p-min-grid", "margin-grid", "depth-grid", "dry-run", "binary",
     "timeout",
   ]);
   for (const k of Object.keys(flags)) {
+    if (k === "model-size") die("--model-size was removed; --model takes the same alias (or both)");
     if (!known.has(k)) die(`unknown flag --${k} (valid: ${[...known].map((f) => `--${f}`).join(", ")})`);
   }
 
@@ -283,7 +284,12 @@ function parseArgs(argv: string[]): Opts {
     return items;
   })(flags["depth-grid"]);
 
-  const sizeArg = flags["model-size"] === undefined ? "both" : String(flags["model-size"]).toLowerCase();
+  // A sweep over official checkpoints: $XWEN_MODEL names one model for the
+  // single-model scripts and would be silently ignored here, so say so.
+  if (flags["model"] === undefined && process.env.XWEN_MODEL) {
+    die("$XWEN_MODEL is set, and this sweep does not read it: pass --model <alias>|both, or unset it");
+  }
+  const sizeArg = flags["model"] === undefined ? "both" : String(flags["model"]).toLowerCase();
   // `both` means the checkpoints that can speculate at all — a release with no
   // sidecar has no floor to fit and no drafted arm to fit it against. That is
   // what keeps xwen's default checkpoint (flash-next, which ships none) out of
@@ -293,7 +299,7 @@ function parseArgs(argv: string[]): Opts {
       ? draftingSizes()
       : sizeArg in CHECKPOINTS
         ? [sizeArg as ModelSize]
-        : die(`--model-size must be ${Object.keys(CHECKPOINTS).join("|")}|both, got ${JSON.stringify(sizeArg)}`);
+        : die(`--model must be ${Object.keys(CHECKPOINTS).join("|")}|both, got ${JSON.stringify(sizeArg)}`);
   // 27b first when both are requested: it is the slower checkpoint, so a sweep
   // that has to be interrupted has produced the expensive half already.
   sizes.sort((a, b) => (a === "27b" ? -1 : b === "27b" ? 1 : 0));
@@ -427,7 +433,7 @@ function cellKey(stage: 1 | 2, size: ModelSize, prompt: string, arm: Arm): strin
 function argsFor(size: ModelSize, prompt: string, arm: Arm): string[] {
   return [
     "generate",
-    "--model-size", size,
+    "--model", size,
     "--prompt", DRAFT_PROMPTS[prompt],
     "-n", String(N_TOKENS),
     "--temp", "0",
@@ -1321,7 +1327,7 @@ async function main(): Promise<void> {
     if (!officialDrafter(size)) {
       die(
         `the drafter sidecar for ${size} is not in the Hugging Face cache ` +
-          `(${drafter}); run \`xwen fetch --model-size ${size}\`. ` +
+          `(${drafter}); run \`xwen fetch --model ${size}\`. ` +
           `Every drafted arm needs it.`,
       );
     }

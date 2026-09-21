@@ -63,7 +63,7 @@ reveal the application log, which includes Rust and frontend errors.
 Five GGUF checkpoints, Q4_K_M except Flash-Next's UD-Q4_K_XL, resolved through the HF
 cache:
 
-| Full name | Repo | `--model-size` | Drafter |
+| Full name | Repo | `--model` | Drafter |
 | --- | --- | --- | --- |
 | `Qwen3.8-Flash-Next` **(experimental)** | `unsloth/Qwen3.8-Flash-Next-GGUF`, UD-Q4_K_XL, 4 shards | `flash-next` / `3.8-flash-next` (default) | none |
 | `Qwen3.6-27B` | `ggml-org/Qwen3.6-27B-GGUF` | `27b` | DFlash block drafter, 3.5 GB |
@@ -79,18 +79,18 @@ on the server's disk. Requests never download it. Fetch it explicitly:
 
 ```bash
 xwen fetch-model Qwen3.6-35B-A3B-uncensored
-xwen generate --model-size 35b-uncensored --prompt "Hello" --no-think
+xwen generate --model 35b-uncensored --prompt "Hello" --no-think
 ```
 
 `fetch-model <model>` accepts any registry full name or CLI alias and downloads
 the model's files through the same Hugging Face cache downloader as `fetch-lora`.
-It fetches no drafter; `fetch --model-size <alias>` retains its model-and-drafter behavior.
+It fetches no drafter; `fetch --model <alias>` retains its model-and-drafter behavior.
 
 **Flash-Next is the default (2026-08-30), so a zero-flag first run downloads 111 GB**
 across four shards — the notice naming the size prints before the fetch starts, and it
 resumes in place. `xwen fetch` prefetches it; `bun scripts/hf-fetch.ts
 unsloth/Qwen3.8-Flash-Next-GGUF <shard>... --jobs 2` does the same with parallel,
-verified, resumable downloads. Pass `--model-size 35b` (or `27b`, `3.8-27b`) for a
+verified, resumable downloads. Pass `--model 35b` (or `27b`, `3.8-27b`) for a
 ~20 GB checkpoint instead.
 
 **CLI and server surfaces default to Flash-Next as of 2026-08-30**, `xwen serve` and `xwen batch`
@@ -163,7 +163,7 @@ three qwen35 checkpoints speculate. Flash-Next does not (below).
 Three more are dense Qwen3-4B in HF BF16 safetensors rather than GGUF, a second
 architecture and a second vocabulary (2026-09-07):
 
-| Full name | Repo | `--model-size` | Role |
+| Full name | Repo | `--model` | Role |
 | --- | --- | --- | --- |
 | `Qwen3-4B` | `Qwen/Qwen3-4B` | `qwen3-4b` / `4b` | full LM, hybrid thinking |
 | `Qwen3-4B-Instruct-2507` | `Qwen/Qwen3-4B-Instruct-2507` | `qwen3-4b-instruct-2507` / `4b-instruct` | full LM, no thinking mode |
@@ -179,7 +179,7 @@ process. The wire batch route is `POST /xwen/v1/batch`, as for every other check
 **The encoder entry runs `encode-text` and nothing else**, and every other surface
 refuses it with one sentence saying why: its copy of the weights has a corrupted
 last-layer MLP, which the hidden state Z-Image reads never touches and generation would
-run straight through. Point `--model-size qwen3-4b` at the faithful copy if you want the
+run straight through. Pass `--model qwen3-4b` for the faithful copy if you want the
 4B as a language model.
 
 None of the three is auto-fetched, so `xwen fetch` is what puts one in the cache and an
@@ -190,7 +190,7 @@ correctness target rather than a throughput one, and the figures and their condi
 in `docs/perf-state.md`.
 
 ```
-xwen encode-text --model-size zimage-turbo-encoder --prompt "a cat on a windowsill" \
+xwen encode-text --model zimage-turbo-encoder --prompt "a cat on a windowsill" \
   --output /tmp/enc.safetensors --verbose
 ```
 
@@ -205,7 +205,7 @@ corruption.
 **One entry is not a language model at all** (2026-09-07): the Z-Image-Turbo diffusion
 pipeline, which is what `xwen image` runs.
 
-| Full name | Repo | `--model-size` | Role |
+| Full name | Repo | `--model` | Role |
 | --- | --- | --- | --- |
 | `Z-Image-Turbo` | `Tongyi-MAI/Z-Image-Turbo`, whole repo | `zimage-turbo` / `z-image-turbo` | text-to-image, `xwen image` and the images route |
 
@@ -218,7 +218,7 @@ text-to-image pipeline, and it is never listed by `/v1/models`. What serves it i
 /v1/images/generations` (below, under Serve).
 
 ```
-xwen fetch --model-size zimage-turbo
+xwen fetch --model zimage-turbo
 xwen image --prompt "a red bicycle against a white brick wall, golden hour" -o out.png
 xwen fetch-lora midnight888/nsfwzimageturbo
 ```
@@ -343,10 +343,14 @@ transparent-repaint convention; the native endpoint and CLI use white-repaint
 masks. Edits use strength 1.0 with a mask and 0.6 without one; variations use
 0.6. The GUI and CFG phase remain outside this implementation.
 
-**`--model <path>` takes a safetensors directory** on every one-shot subcommand, not
-only `serve`: a directory, a `config.json` inside one or a `*.safetensors` inside one all
-resolve to the same set. The file decides which checkpoint it is, and `--model-size`
-stays a cross-check that errors on disagreement rather than an override.
+**`--model` is the one flag that names a checkpoint (2026-09-21)**, on every
+subcommand: a registry alias or full name (`--model 27b`, `--model Qwen3.6-27B`), or a
+path. A value is read as a name first and a path second, so a file or directory named
+like an alias is reachable as `./27b`, and a value that is neither fails saying so for
+both readings. A path may be a GGUF or a safetensors directory (a directory, a
+`config.json` inside one or a `*.safetensors` inside one all resolve to the same set),
+and then the file decides which checkpoint it is. Nothing on the command line can say
+otherwise. `serve.toml`'s `model` key takes the same values.
 
 ## Thinking, effort and sampling
 
@@ -612,7 +616,7 @@ through one server is a deliberate exercise of the checkpoint swap.
 --init` writes a commented config template; every setting is also a flag.
 
 **Images (2026-09-07).** `POST /v1/images/generations` renders through Z-Image-Turbo in
-the OpenAI images shape, when the checkpoint is in the cache (`xwen fetch --model-size
+the OpenAI images shape, when the checkpoint is in the cache (`xwen fetch --model
 zimage-turbo`; an uncached one is a 400 naming that command). The same handler answers
 `/images/generations` and `/proxy/openai/images/generations`. It runs on its own thread
 beside the language engine, loads on the first request and unloads after `idle_unload`
@@ -664,7 +668,7 @@ ComfyUI on another machine needs nothing installed: start it with `--comfy-api-b
 http://<this mac>:8080` and its stock OpenAI image node renders here (`docs/zimage.md`
 "Serving"). Run without an `api_key` for that: the node sends none and would get a 403.
 
-**One server serves every checkpoint (2026-08-11).** `--model`/`--model-size` picks the
+**One server serves every checkpoint (2026-08-11).** `--model` picks the
 DEFAULT checkpoint; any request may name another one and the engine lazy-loads it,
 imaging the live conversation out first (the same path an idle unload takes) — one
 model resident at a time, always, and `idle_unload` applies to whichever is loaded.
@@ -721,9 +725,7 @@ split before prefill finishes, so an interrupted request can overstate cache cre
 the official checkpoints, it is served as its architecture's checkpoint (a startup line
 says which) but reported and selected by its file name — and a request naming an
 official checkpoint gets that checkpoint's real hub file, downloading it if need be,
-rather than these weights under an official name. `--model-size` names the checkpoint a
-file that says nothing about itself holds; a flag that contradicts a file that DOES say
-is a startup error rather than a server that 500s every request.
+rather than these weights under an official name.
 
 Swapping costs a full model load (~3 s warm) plus losing the outgoing checkpoint's warm
 KV slots, so interleaving checkpoints request-by-request is legal but slow. The on-disk
@@ -952,7 +954,7 @@ upstream llama.cpp on the identical GGUF, so it needs the oracle built once:
 just init                                     # fetch the llama.cpp submodule (pinned)
 bash scripts/build-llamacpp.sh
 bun scripts/parity-gate.ts                    # 35B-A3B, all tiers
-bun scripts/parity-gate.ts --model-size 27b   # 27b dense
+bun scripts/parity-gate.ts --model 27b        # 27b dense
 ```
 
 `docs/parity.md` is the runbook: tiers, floors, tap mapping, and the pinned oracle

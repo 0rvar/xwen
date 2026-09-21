@@ -290,9 +290,8 @@ pub enum ServeLog {
     /// Nothing in the served GGUF names one of the official checkpoints — no
     /// `general.name`, no release in the file name — so its architecture's
     /// checkpoint is assumed for everything that needs an identity (the hub repo
-    /// a swap fetches from, the sidecar). Only a custom conversion gets here;
-    /// `--model-size` settles it outright, and the APIs keep reporting the file
-    /// under its own name either way.
+    /// a swap fetches from, the sidecar). Only a custom conversion gets here,
+    /// and the APIs keep reporting the file under its own name.
     CheckpointUnidentified {
         path: PathBuf,
         assumed: crate::hub::Model,
@@ -582,8 +581,7 @@ impl ServeLog {
                  resumes in place)"
             ),
             ServeLog::CheckpointUnidentified { path, assumed } => format!(
-                "xwen serve: {} names no official checkpoint; running it as {} \
-                 (pass --model-size to name it)",
+                "xwen serve: {} names no official checkpoint; running it as {}",
                 path.display(),
                 assumed.full_name()
             ),

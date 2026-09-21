@@ -1,7 +1,7 @@
 //! Startup refusals, exercised through the real binary.
 //!
 //! These are ORDERING tests, and ordering is the one thing a unit test on a
-//! predicate cannot see. `xwen serve --model-size <an unrunnable checkpoint>`
+//! predicate cannot see. `xwen serve --model <an unrunnable checkpoint>`
 //! used to identify it, download eight gigabytes, start the server, list the
 //! model on `/v1/models` and only then die on the first request — with every
 //! individual predicate answering correctly the whole way down. What was wrong
@@ -51,7 +51,7 @@ fn xwen() -> Command {
     cmd
 }
 
-/// `xwen serve --model-size <a checkpoint this build cannot run>` fails at
+/// `xwen serve --model <a checkpoint this build cannot run>` fails at
 /// startup, names the checkpoint and says why.
 #[test]
 fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
@@ -65,13 +65,13 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
         let out = xwen()
             .args(["serve", "--config"])
             .arg(&config)
-            .args(["--model-size", alias])
+            .args(["--model", alias])
             .output()
             .expect("running xwen serve");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             !out.status.success(),
-            "serve --model-size {alias} started; it must refuse\n{stderr}"
+            "serve --model {alias} started; it must refuse\n{stderr}"
         );
         assert!(stderr.contains("cannot be run"), "{alias}: {stderr}");
         assert!(stderr.contains(expected), "{alias}: {stderr}");
@@ -93,7 +93,7 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
 ///
 /// `generate` and `chat` do not move cache state the way serve and batch do,
 /// but they run the graph, and the pipeline entry has no graph to run: without
-/// the gate `generate --model-size zimage-turbo` would try to open a
+/// the gate `generate --model zimage-turbo` would try to open a
 /// `model_index.json` as a checkpoint after a 32.9 GB download.
 #[test]
 fn the_one_shot_surfaces_refuse_every_image_entry() {
@@ -106,14 +106,14 @@ fn the_one_shot_surfaces_refuse_every_image_entry() {
         // `chat` takes no `--prompt`; it reads a REPL it never gets to.
         for (subcommand, extra) in [("generate", vec!["--prompt", "hi"]), ("chat", Vec::new())] {
             let out = xwen()
-                .args([subcommand, "--model-size", alias])
+                .args([subcommand, "--model", alias])
                 .args(&extra)
                 .output()
                 .unwrap_or_else(|e| panic!("running xwen {subcommand}: {e}"));
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
                 !out.status.success(),
-                "{subcommand} --model-size {alias} ran; it must refuse\n{stderr}"
+                "{subcommand} --model {alias} ran; it must refuse\n{stderr}"
             );
             assert!(
                 stderr.contains("cannot be run"),
@@ -253,7 +253,7 @@ fn assert_reached_the_fetch(what: &str, repo: &str, stdout: &str, stderr: &str, 
 /// fell over somewhere earlier for a reason of its own.
 ///
 /// Both cache-moving surfaces, because both apply the gate and the two resolve
-/// their checkpoint by different routes: serve from `--model-size`, batch from
+/// their checkpoint by different routes: serve from `--model`, batch from
 /// the payload.
 #[test]
 fn a_runnable_checkpoint_gets_past_the_gate() {
@@ -263,7 +263,7 @@ fn a_runnable_checkpoint_gets_past_the_gate() {
             "serve",
             "--config",
             config.to_str().unwrap(),
-            "--model-size",
+            "--model",
             "35b",
             "--port",
             "0",
@@ -271,7 +271,7 @@ fn a_runnable_checkpoint_gets_past_the_gate() {
         None,
     );
     assert_reached_the_fetch(
-        "serve --model-size 35b",
+        "serve --model 35b",
         "ggml-org/Qwen3.6-35B-A3B-GGUF",
         &stdout,
         &stderr,
@@ -310,7 +310,7 @@ fn encode_text_takes_either_z_image_alias() {
         let (stdout, stderr, ok) = past_the_gate(
             &[
                 "encode-text",
-                "--model-size",
+                "--model",
                 alias,
                 "--prompt",
                 "hi",
@@ -329,7 +329,7 @@ fn encode_text_takes_either_z_image_alias() {
             "{alias} was refused as a pipeline: {both}"
         );
         assert_reached_the_fetch(
-            &format!("encode-text --model-size {alias}"),
+            &format!("encode-text --model {alias}"),
             "Tongyi-MAI/Z-Image-Turbo",
             &stdout,
             &stderr,
@@ -362,7 +362,7 @@ fn the_qwen3_language_models_are_no_longer_refused_at_startup() {
                 "serve",
                 "--config",
                 config.to_str().unwrap(),
-                "--model-size",
+                "--model",
                 alias,
                 "--port",
                 "0",
@@ -401,7 +401,7 @@ fn fake_snapshot(label: &str) -> std::path::PathBuf {
 /// snapshot path before it parses.
 ///
 /// Two failures met here, and they were the same bug at two distances from it.
-/// `inspect --model-size zimage-turbo` resolved the entry first, which for a
+/// `inspect --model zimage-turbo` resolved the entry first, which for a
 /// `Format::Diffusion` entry means downloading 32.9 GB and being handed
 /// `model_index.json` — whereupon the loader, seeing neither a `config.json`
 /// nor a `.safetensors`, tried it as a GGUF and died on the magic number. So
@@ -412,7 +412,7 @@ fn fake_snapshot(label: &str) -> std::path::PathBuf {
 /// encoder is unservable and inspecting it is exactly what someone wants.
 #[test]
 fn inspect_refuses_the_diffusion_entry_before_fetching_and_its_snapshot_before_parsing() {
-    let (stdout, stderr, ok) = past_the_gate(&["inspect", "--model-size", "zimage-turbo"], None);
+    let (stdout, stderr, ok) = past_the_gate(&["inspect", "--model", "zimage-turbo"], None);
     let both = format!("{stderr}{stdout}");
     assert!(!ok, "inspect on the pipeline entry succeeded: {both}");
     assert!(both.contains("cannot be run"), "{both}");
@@ -424,7 +424,7 @@ fn inspect_refuses_the_diffusion_entry_before_fetching_and_its_snapshot_before_p
     );
 
     // The path an operator who already has the snapshot would type, in both
-    // spellings, with no `--model-size` to gate on.
+    // spellings, with no registry name to gate on.
     let dir = fake_snapshot("inspect");
     for path in [dir.clone(), dir.join("model_index.json")] {
         let (stdout, stderr, ok) =
@@ -441,28 +441,22 @@ fn inspect_refuses_the_diffusion_entry_before_fetching_and_its_snapshot_before_p
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The three language surfaces refuse a diffusion snapshot handed to `--model`,
-/// and say what it is rather than what a GGUF parser makes of it.
+/// The language surfaces refuse a diffusion snapshot handed to `--model`, and
+/// say what it is rather than what a GGUF parser makes of it. `encode-text` is
+/// not one of them: a snapshot there means the text encoder inside it
+/// (`encode_text_finds_the_encoder_by_either_spelling_of_a_snapshot`).
 ///
-/// `--model-size zimage-turbo` was already refused on these
+/// The NAME `--model zimage-turbo` was already refused on these
 /// (`the_one_shot_surfaces_refuse_both_z_image_entries`); this is the other
 /// route in, which reaches `one_shot_checkpoint` BEFORE any servable gate
-/// because with `--model` the file is what decides the checkpoint.
+/// because with a `--model` path the file is what decides the checkpoint.
 #[test]
 fn the_language_surfaces_refuse_a_diffusion_snapshot_path() {
     let dir = fake_snapshot("surfaces");
     for path in [dir.clone(), dir.join("model_index.json")] {
-        for (subcommand, extra) in [
-            ("generate", vec!["--prompt", "hi"]),
-            ("chat", Vec::new()),
-            ("encode-text", vec!["--prompt", "hi"]),
-        ] {
+        for (subcommand, extra) in [("generate", vec!["--prompt", "hi"]), ("chat", Vec::new())] {
             let mut args = vec![subcommand, "--model", path.to_str().unwrap()];
             args.extend(&extra);
-            let out = std::env::temp_dir().join(format!("xwen-gates-{subcommand}.safetensors"));
-            if subcommand == "encode-text" {
-                args.extend(["-o", out.to_str().unwrap()]);
-            }
             let (stdout, stderr, ok) = past_the_gate(&args, None);
             let both = format!("{stderr}{stdout}");
             assert!(!ok, "{subcommand} on {} succeeded: {both}", path.display());
@@ -499,8 +493,6 @@ fn encode_text_finds_the_encoder_by_either_spelling_of_a_snapshot() {
         let (stdout, stderr, ok) = past_the_gate(
             &[
                 "encode-text",
-                "--model-size",
-                "zimage-turbo",
                 "--model",
                 path.to_str().unwrap(),
                 "--prompt",
@@ -531,7 +523,7 @@ fn encode_text_finds_the_encoder_by_either_spelling_of_a_snapshot() {
 #[test]
 fn image_refuses_a_pipeline_it_does_not_implement() {
     let out = xwen()
-        .args(["image", "--model-size", "qwen-image-2.1", "--prompt", "hi"])
+        .args(["image", "--model", "qwen-image-2.1", "--prompt", "hi"])
         .output()
         .expect("running xwen image");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -540,4 +532,147 @@ fn image_refuses_a_pipeline_it_does_not_implement() {
     assert!(stderr.contains("not implemented"), "{stderr}");
     assert!(stderr.contains("xwen encode-text"), "{stderr}");
     assert!(!stderr.contains("downloading"), "{stderr}");
+}
+
+/// `--model` is the one flag that names a checkpoint, and it reads a value as a
+/// registry name first and a path second. `inspect` is the surface these run
+/// on because it resolves the flag and then stops at the first thing that needs
+/// the machine, which here is the fetch.
+#[test]
+fn model_takes_an_alias_and_a_full_name() {
+    for (spelling, repo) in [
+        ("35b", "ggml-org/Qwen3.6-35B-A3B-GGUF"),
+        ("Qwen3.6-35B-A3B", "ggml-org/Qwen3.6-35B-A3B-GGUF"),
+        ("qwen3.8-27b", "ggml-org/Qwen3.8-27B-GGUF"),
+    ] {
+        let (stdout, stderr, ok) = past_the_gate(&["inspect", "--model", spelling], None);
+        assert_reached_the_fetch(
+            &format!("inspect --model {spelling}"),
+            repo,
+            &stdout,
+            &stderr,
+            ok,
+        );
+    }
+}
+
+/// A value that is neither a checkpoint name nor something on disk fails at
+/// argument parsing, saying both readings failed and listing the aliases: a
+/// typo in an alias and a typo in a path are the same string from here.
+#[test]
+fn a_model_that_is_neither_a_name_nor_a_path_says_so_for_both() {
+    for subcommand in ["generate", "inspect", "fetch", "encode-text", "image"] {
+        let out = xwen()
+            .args([subcommand, "--model", "no-such-checkpoint-27"])
+            .output()
+            .expect("running xwen");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{subcommand} accepted it\n{stderr}");
+        assert!(stderr.contains("not a checkpoint name"), "{stderr}");
+        assert!(stderr.contains("no such file or directory"), "{stderr}");
+        assert!(stderr.contains("flash-next"), "{stderr}");
+    }
+}
+
+/// A directory NAMED like an alias is the alias when spelled bare and the
+/// directory behind a `./`, which no registry name contains. The proof is
+/// which refusal comes back: the bare name reaches the registry's fetch, and the
+/// path is opened and found to hold no checkpoint.
+#[test]
+fn a_dot_slash_path_is_a_path_even_when_it_is_named_like_an_alias() {
+    let parent = std::env::temp_dir().join(format!("xwen_cli_gates_shadow_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir_all(parent.join("35b")).unwrap();
+
+    let run = |value: &str| {
+        let out = xwen()
+            .current_dir(&parent)
+            .env("HF_HUB_CACHE", parent.join("empty-cache"))
+            .env("HF_ENDPOINT", "http://127.0.0.1:1")
+            .args(["inspect", "--model", value])
+            .output()
+            .expect("running xwen inspect");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        )
+    };
+    let named = run("35b");
+    assert!(named.contains("ggml-org/Qwen3.6-35B-A3B-GGUF"), "{named}");
+    let pathed = run("./35b");
+    assert!(
+        !pathed.contains("ggml-org/Qwen3.6-35B-A3B-GGUF"),
+        "{pathed}"
+    );
+    assert!(pathed.contains("35b"), "{pathed}");
+
+    std::fs::remove_dir_all(&parent).unwrap();
+}
+
+/// `xwen fetch` is the registry's surface: a path names something already on
+/// disk, and fetching the default beside it would be the wrong answer.
+#[test]
+fn fetch_refuses_a_path() {
+    let dir = fake_snapshot("fetch");
+    let out = xwen()
+        .args(["fetch", "--model", dir.to_str().unwrap()])
+        .output()
+        .expect("running xwen fetch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("takes a checkpoint name"), "{stderr}");
+    assert!(!stderr.contains("downloading"), "{stderr}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The old second flag is gone rather than deprecated: there is one way to name
+/// a checkpoint, and a script still passing the other learns it at once.
+#[test]
+fn model_size_is_not_a_flag() {
+    for subcommand in [
+        "generate",
+        "chat",
+        "batch",
+        "serve",
+        "inspect",
+        "fetch",
+        "encode-text",
+        "image",
+    ] {
+        let out = xwen()
+            .args([subcommand, "--model-size", "27b"])
+            .output()
+            .expect("running xwen");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{subcommand} accepted it\n{stderr}");
+        assert!(stderr.contains("unexpected argument"), "{stderr}");
+        assert!(stderr.contains("--model-size"), "{stderr}");
+    }
+}
+
+/// The parity harness's dump binary names its checkpoint the same one way, and
+/// it is the binary the scripts shell out to, so a stale flag there would grade
+/// whatever the scripts fell back to.
+#[test]
+fn logits_dump_takes_model_and_not_model_size() {
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_logits-dump"))
+            .args(args)
+            .output()
+            .expect("running logits-dump");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, stderr) = run(&["--model-size", "27b"]);
+    assert!(!ok, "{stderr}");
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
+    assert!(stderr.contains("--model-size"), "{stderr}");
+
+    let (ok, stderr) = run(&["--model", "no-such-checkpoint-27"]);
+    assert!(!ok, "{stderr}");
+    assert!(stderr.contains("not a checkpoint name"), "{stderr}");
+    assert!(stderr.contains("no such file or directory"), "{stderr}");
 }

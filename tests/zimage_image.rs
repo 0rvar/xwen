@@ -9,7 +9,7 @@
 //!
 //! `XWEN_ZIMAGE_DIR` may point at a snapshot root (the directory holding
 //! `model_index.json`); otherwise the registry entry's cached snapshot is
-//! used, and the test says to run `xwen fetch --model-size zimage-turbo` when
+//! used, and the test says to run `xwen fetch --model zimage-turbo` when
 //! it is absent. The PNG lands in `$TMPDIR/xwen-zimage-test.png` for a look.
 
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ fn snapshot_root() -> Result<PathBuf> {
     }
     let index = xwen::hub::cached_model(Model::ZImageTurbo).context(
         "Z-Image-Turbo is not in the Hugging Face cache: run \
-         `xwen fetch --model-size zimage-turbo`, or point $XWEN_ZIMAGE_DIR at a snapshot root",
+         `xwen fetch --model zimage-turbo`, or point $XWEN_ZIMAGE_DIR at a snapshot root",
     )?;
     Ok(index
         .parent()

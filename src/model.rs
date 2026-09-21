@@ -327,7 +327,7 @@ impl XwenModel {
             }
             crate::checkpoint::CheckpointSource::Gguf(gguf) => bail!(
                 "{} is a GGUF checkpoint; the hidden-state encoder runs the Qwen3 dense \
-                 safetensors checkpoints only (--model-size zimage-turbo-encoder, \
+                 safetensors checkpoints only (--model zimage-turbo-encoder, \
                  qwen-image-2.1-encoder, qwen3-4b or qwen3-4b-instruct-2507)",
                 gguf.checkpoint_path().display()
             ),

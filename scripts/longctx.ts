@@ -27,14 +27,14 @@
 //
 // Usage:
 //   bun scripts/longctx.ts --bin /tmp/xwen-longctx/target/release/xwen \
-//     --model-size flash-next --tokens 8192,32768,65536,131072 --reps 2
-//   bun scripts/longctx.ts --model-size 35b --tokens 4096,8192 --draft-ctx 32768
+//     --model flash-next --tokens 8192,32768,65536,131072 --reps 2
+//   bun scripts/longctx.ts --model 35b --tokens 4096,8192 --draft-ctx 32768
 //   bun scripts/longctx.ts ... -- --moe-impl fused      # extra generate args
 //
 // Flags:
 //   --bin PATH         binary to measure (default target/release/xwen)
-//   --model-size SIZE  27b|35b|3.8-27b|flash-next (default: flash-next)
-//   --model PATH       an explicit GGUF, overriding --model-size
+//   --model NAME|PATH  27b|35b|3.8-27b|flash-next, or an explicit GGUF
+//                      (default: flash-next)
 //   --tokens CSV       prompt lengths (default 8192,32768,65536,131072)
 //   --reps N           repetitions per cell (default 2); the row prints the median
 //   --n N              decode tokens per run (default 192)
@@ -53,7 +53,7 @@
 
 import { existsSync, mkdirSync, readFileSync, appendFileSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
-import { officialModel, type ModelSize } from "./hf";
+import { modelPath as resolveModelPath, rejectUnknownFlags, resolveModelRef } from "./hf";
 
 const repo = dirname(import.meta.dir);
 const work = "/tmp/longctx";
@@ -78,8 +78,29 @@ function opt(name: string, dflt: string): string {
 // `target/release/xwen`, so a `--bin` pointing at a worktree build makes THIS
 // harness look like a running model process to every other bench on the machine.
 const bin = opt("bin", process.env.XWEN_LONGCTX_BIN ?? join(repo, "target/release/xwen"));
-const size = opt("model-size", "flash-next") as ModelSize;
-const modelPath = opt("model", "") || officialModel(size);
+rejectUnknownFlags("longctx", args, [
+  "bin", "model", "tokens", "reps", "n", "raw", "min-think", "no-draft", "draft-ctx", "warmup",
+  "timeout-min", "label", "out", "out-dir", "prompts-only",
+]);
+const modelRef = (() => {
+  try {
+    return resolveModelRef(opt("model", ""), "flash-next");
+  } catch (e) {
+    console.error(`longctx: --model: ${(e as Error).message}`);
+    process.exit(2);
+  }
+})();
+// What a run is filed under: the alias, or a path's file name.
+const size =
+  modelRef.kind === "registry" ? modelRef.size : basename(modelRef.path).replace(/\.gguf$/, "");
+const modelPath = (() => {
+  try {
+    return resolveModelPath(modelRef);
+  } catch (e) {
+    console.error(`longctx: --model: ${(e as Error).message}`);
+    process.exit(2);
+  }
+})();
 const tokenTargets = opt("tokens", "8192,32768,65536,131072")
   .split(",")
   .map((t) => Number(t.trim()))

@@ -260,7 +260,7 @@ were latent in the inherited Laguna version and each silently corrupted the walk
 ## Runbook
 
 Prerequisites: the oracle is built (above) and the checkpoint is in the Hugging Face
-cache (`xwen fetch --model-size 27b|35b`, or `bun scripts/hf.ts model 27b` to print
+cache (`xwen fetch --model 27b|35b`, or `bun scripts/hf.ts model 27b` to print
 the path).
 
 **The one-command path: `scripts/parity-gate.ts`.** It produces the Reference dumps,
@@ -268,7 +268,7 @@ produces the Fused candidate dumps, and runs every tiered gate:
 
 ```bash
 bun scripts/parity-gate.ts                                   # 35B, all tiers
-bun scripts/parity-gate.ts --model-size 27b                  # 27B dense
+bun scripts/parity-gate.ts --model 27b                       # 27B dense
 bun scripts/parity-gate.ts --tiers strict,mm                 # just the full-logit gates
 bun scripts/parity-gate.ts --tiers decode --fixtures long-mixed
 bun scripts/parity-gate.ts --regen-ref                       # rebuild the Reference dumps too
@@ -277,9 +277,9 @@ bun scripts/parity-gate.ts --tiers ppl --regen-ppl-ref       # re-freeze the com
 
 Flags: `--tiers strict,mm,decode,ppl` (default all); `--fixtures
 code-short,text-mixed,long-mixed` (default all; strict/mm always grade code-short,
-decode grades all three, ppl has no fixture axis); `--model-size 27b|35b` (default
-`35b`, matching the CLI) or `--model <path>` / `$XWEN_MODEL` for a file not in the
-hub (mutually exclusive); `--regen-ref`; `--regen-ppl-ref`; `--parity-dir DIR`;
+decode grades all three, ppl has no fixture axis); `--model 27b|35b` (default
+`35b`) or `--model <path>` for a file not in the hub, `$XWEN_MODEL` being the same
+value off the command line; `--regen-ref`; `--regen-ppl-ref`; `--parity-dir DIR`;
 the experiment hooks `--sdpa-f32` / `--attn-mm-classic` / `--flash-classic`; and
 `--expect-attn-decode f16|q8` (default `q8` — both ggml-org Q4_K_M files store
 attention weights q8_0).
@@ -908,7 +908,7 @@ subset, prompts 8, 11 and 10 being 1, 8 and 16 tokens:
 | --- | --- |
 | `XWEN_QWEN3_PARITY_DIR` | required, the oracle directory (manifest plus `prompt-N.f32` and `.json`) |
 | `XWEN_QWEN3_DIR` | a safetensors directory, or the `config.json` in one. Unset resolves the cached `Qwen/Qwen3-4B` OFFLINE; a cache miss errors naming `xwen fetch` and never downloads |
-| `XWEN_QWEN3_ENTRY` | registry entry as a `--model-size` alias, default `qwen3-4b`; it is what tells the loader where the tokenizer is and which planes may be zero-filled |
+| `XWEN_QWEN3_ENTRY` | registry entry as a `--model` alias, default `qwen3-4b`; it is what tells the loader where the tokenizer is and which planes may be zero-filled |
 | `XWEN_QWEN3_PARITY_ONLY` | comma-separated manifest indices |
 | `XWEN_QWEN3_PARITY_VERIFY_SHA=1` | re-hash each `.f32` against the manifest digest, off by default (reads several GB) |
 | `XWEN_QWEN3_PARITY_CHUNK` | prefill chunk, default 512; changes peak host allocation only |
