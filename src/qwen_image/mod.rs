@@ -5,3 +5,4 @@
 //! from candle, which has no module for this model.
 
 pub mod conditioning;
+pub mod vae;
