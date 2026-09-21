@@ -17,12 +17,20 @@ the tables, the review rounds, where the plan was wrong, and what was not taken.
 | 4dcca19 | the pipeline, `scripts/qwen-image-ref-dump.py`, the parity gate and its fixture |
 | 9c1186d | the encoder gate's bars, set from the reference's own spread |
 | 5ea0d43 | `xwen image --model qwen-image-2.1`, the RGBA rule, the decode drains, measured admission |
+| 3ccb17b | the images routes serve the model: one resident pipeline, plan before evict, `GET /v1/images/models` |
+| 1e028be | the VAE decodes on the direct conv by default, `ops::channel_l2_norm`, per-arm admission |
 
 Plan phases 0, 1 and 2 are done. Phase 3 is half done: the VAE runs on the candle arm and
 passes its gate, and the direct-conv arm is not built. Phase 4's memory half is done for
 1 MP and its serve half is not. Phases 5 (editing) and 6 (the GUI) are untouched, though
 the layout, the rope walk, the MRoPE tables, the VAE encoder and the prompt renderer are
 shaped for Phase 5.
+
+Added the same evening, after 3ccb17b and 1e028be: Phase 3 is complete, the direct-conv
+arm being the default, and Phase 4's serve half is done. What Phase 4 still owes is the
+time-per-image figure and measured peaks past 1 MP. The two units are recorded below
+under "The serve route" and "The direct-conv VAE arm", and the paragraph above stands as
+it was written at 5ea0d43.
 
 0585bcc, the same day, removed `--model-size` in favour of one `--model` flag. It is its
 own arc with its own log entry and decision paragraph (decisions/serving.md), and it is
@@ -207,6 +215,93 @@ then 18.85 at 1024x1024, and 3.64 against 4.73 then 4.64 at 512x512, with the st
 same runs moving by 10% either way, so the cost of the drains is not separable from noise
 and may be more than 5%.
 
+## The direct-conv VAE arm
+
+1e028be. Every timing here is low power mode (`pmset -g` read `lowpowermode         1`)
+on an unpinned build, so these are observations. Peaks are the kernel's
+`phys_footprint_peak` for `xwen image`, one render each; `footprint` printed whole "GB"
+and they are taken as binary.
+
+| size | arm | decode | process peak | step-phase peak | VAE alone | image |
+| --- | --- | --- | --- | --- | --- | --- |
+| 512x512 | candle | 4.4 to 4.8 s | 25 GiB, at the decode | 18 GiB | 91.07 dB | 57.30 dB |
+| 512x512 | xwen | 1.14 to 1.23 s | 19 GiB, at the step phase | 19 GiB | 91.07 dB | 57.30 dB |
+| 1024x1024 | candle | 17.9 to 20.1 s | 55 GiB, at the decode | 27 GiB | | |
+| 1024x1024 | xwen | 4.5 to 5.4 s | 28 GiB, at the step phase | 28 GiB | | |
+
+The parity gate is green on both arms with velocity cosine 1.000000 and both brackets
+outside. A mid-session run with direct convs and candle's norm chain read VAE alone
+91.29 dB. One direct-arm sample at 1024x1024, 10.8 s, shared the GPU with the serve
+agent's gate tests and is discarded. A decode alone on the xwen arm, VAE weights only:
+3.83 s and 12 GiB at 1024x1024, 22.07 s and 42 GiB at 2048x2048.
+
+The microbench's attribution at 1024x1024 (`tests/qwen_image_microbench.rs`):
+
+| arm | convs | norms | SiLUs | attention | total |
+| --- | --- | --- | --- | --- | --- |
+| candle | 16.1 s | 2.39 s | 0.10 s | 0.02 s | 18.6 s |
+| xwen | 4.29 s | 0.14 s (fused) | folded | 0.02 s | 4.45 s |
+
+Before the norm kernel existed the candle norm chain was 1739 of 5370 ms of a direct
+decode, 32%, which is what priced it. Conv throughput: direct 3 to 5 TFLOP/s, candle 0.5
+to 2.7, candle's `conv_out` 0.02. The two largest rows, candle against direct: the
+288-channel upsample conv into 1024x1024, 1740 ms against 402, with candle's 10.9 GB
+column buffer; and the 288 to 144 conv at 1024x1024, 1475 ms against 249. At 2048x2048 on
+the direct arm: convs 16.1 s, norms 0.65 s, attention 0.35 s, 2% of the total, over a
+1.07 GB score matrix.
+
+Drain policies on the xwen arm at 1024x1024, three to four runs each, in a slower
+session than the table above:
+
+| policy | decode | peak |
+| --- | --- | --- |
+| per convolution, as in 5ea0d43 | 6.67 s | 28 GiB |
+| per stage (kept) | 6.41 s | 28 GiB |
+| none | 6.24 s | 36 GiB |
+
+One render on the new default arm was looked at before the commit: 768x768, 40 steps,
+seed 7, a lighthouse at dusk, sharp and coherent with no seams or channel artefacts;
+steps 2.4 to 2.6 s, decode 2.52 s, 120 s total, the device at 18.0 GB after the decode,
+alpha min 253 with 0 clear pixels, written as RGB.
+
+Projection, not a run: a 2048x2048 decode needs about 41 GiB of transients, about 56 GiB
+with the 15.7 GiB pipeline resident, and the step phase there extrapolates linearly to
+about 64 GiB. Nothing was rendered at 2048x2048.
+
+## The serve route
+
+3ccb17b. One `xwen serve` on a spare port with an empty config, low power mode, unpinned,
+and for the first check the binary included the VAE agent's unstaged `vae.rs` edits, which
+were in the tree when it was built. `/health` before any request read every field false
+or null, and the language model was never loaded.
+
+| request | wall | what happened |
+| --- | --- | --- |
+| Qwen-Image 2.1, 512x512, 40 steps, cold | 57.1 s | encoder load 4.0 s, transformer and VAE load 5.3 s, render 47.2 s; RGB, alpha min 252 |
+| the transparency prompt | | RGBA, PNG colour type 6, 154,539 clear pixels |
+| 8 steps: Qwen-Image 2.1, cold | 14.5 s | encoder and pipeline loaded |
+| 8 steps: Qwen-Image 2.1, warm | 12.2 s | encoder 2.0 s over the resident pipeline, no pipeline load |
+| 8 steps: Z-Image | 20.0 s | "image resources unloaded (Z-Image-Turbo requested)", then a 6.2 s load |
+| 8 steps: Qwen-Image 2.1 again | 24.0 s | "unloaded (Qwen-Image-2.1 requested)" |
+
+`/health` named the right `image_model` after each. The per-request encoder load cost 2.0
+to 4.2 s across all runs. Footprint: the first request for this model peaked at 20 GB,
+the model held 17 to 19 GB resident, and the process peak was 48 GB, which was Z-Image's
+load (below). After the review fixes, with Z-Image resident: Z-Image cold 43.4 s, then a
+10,022-token prompt for this model a 400 in 0.21 s with `/health` still naming Z-Image and
+no unload in the log, then Z-Image again warm in 10.2 s.
+
+The contention episode. The VAE agent's repeated `xwen image` runs were asking the memory
+coordinator for ownership while the serve checks ran, so each serve request unloaded
+afterwards with "memory ownership requested" and one waited 225 s for its turn. The
+coordinator did what it is for. The sequences above are from quiet windows.
+
+Z-Image's own load, seen in passing and predating this arc: `footprint` polled every 2 s
+around a 512x512 load read 11, 32, 46 and then a steady 27 GB, with
+`phys_footprint_peak` at 48 GB, against `image_peak`'s flat 40 GiB. The moment is the
+load, the encoder plus the fp32 to bf16 transformer cast, before any step. A 2 s sampler,
+not a traced peak. It is a ledger item (TODO.md "Image generation").
+
 ## The review rounds
 
 Two outside models per unit. What each found that was real:
@@ -241,6 +336,32 @@ Two outside models per unit. What each found that was real:
   overlong prompt, an oversized injected caption); a flaky `clear_pixels == 0` assertion;
   a dispatch gate that could not tell the two pipelines apart; a serve refusal that said
   the pipeline was not implemented after it was. All fixed.
+- **Serve route.** Five from one reviewer and two from the other, three of them found by
+  both. The swap ran before the prompt was looked at, so an over-length prompt for this
+  model evicted a healthy Z-Image and then returned its 400, and admission could 503 the
+  same invalid request first (fixed by `plan()`). The full-cache check ran on every
+  request, so a resident pipeline began refusing when a cache file disappeared (now on a
+  load only). An interruption during the encoder phase was a 500 (now a 503). The models
+  listing reported Z-Image's intrinsic step default under `--image-steps`. The activity
+  record and the TUI header named Z-Image whatever ran. Every failure out of the prompt
+  renderer was a 400, a broken tokenizer included (now typed). The swap test asserted the
+  decision function alone; the order is now tested at the decision level through
+  closures, the engine loop itself having no seam because `Loaded` holds real models.
+  Found correct by both: no window with two pipelines resident, the lease held through
+  drop and drain, the encoder released on both arms, no serve code assuming three
+  channels. Peak memory and the panic path were not runtime-tested by either.
+- **Direct-conv VAE arm.** No production-math error from either, the folds, the offset
+  binding, the bound on `n`, the clamp on the norm and the three shortcut kinds all read
+  as correct. Two verification gaps from one: the arms-differ test reduced with candle's
+  `.max(0)`, whose CPU fold skips a NaN after element 0 (the helper now asserts finite
+  operands, the fix the transformer's helper got), and the documented microbench command
+  selected both ignored tests, which the harness ran in parallel on one GPU (now a
+  process-wide mutex). One from the other: the test for "the encoder stays on candle"
+  asserted a field the encoder never set (now a walk over every conv and norm, with
+  counts). Both raised the env-read arm against the resolved arm under-admitting off
+  Metal (fixed, `loaded_peak_bytes`). Two coverage items added on top: the norm kernel
+  had no test for a nonzero-offset view, a strided input, or values at the 1e-12 floor,
+  and now has all three.
 
 ## Where the plan was wrong
 
@@ -300,3 +421,21 @@ shard counts were right.
   synthetic root by path.
 - **A message cosmetic**: tensor names in `Qwen3Parts::new` errors still say
   `model.layers.N` for a VL set.
+- **A kernel for the VAE's mid-block attention.** 0.02 s of a 4.45 s decode at 1024x1024
+  and 2% at 2048x2048, over a 1.07 GB score matrix. Reopen if it passes about 10% of a
+  decode or its score matrix ever sets the peak.
+- **Lifting the 1 MP cap.** A decode alone at 2048x2048 reads 22.07 s and 42 GiB on the
+  xwen arm, which fits. The step phase there is a linear extrapolation to about 64 GiB
+  and unmeasured, so the cap stays. Reopen by measuring the step phase at 2048x2048
+  behind an override of the cap, then re-fitting `peak_bytes`; it is a ledger item.
+- **Keeping the text encoder warm on serve.** 2.0 to 4.2 s a request against 15.7 GB
+  resident. `KEEP_QWEN_IMAGE_ENCODER` is the seam. Reopen when someone renders many small
+  images in a row.
+- **Route-level tests over HTTP.** `n > 1` and 1024x1024 for this model were not run on
+  the route, and the native render route and the multipart refusals are tested at the
+  `prepare` level. Reopen with the first report from a real client.
+- **The 34 GiB encode-phase admission figure** is sized from the weight sets, over one
+  27 GB sample from a two-second sampler, a lower bound. Reopen with a traced peak of the
+  encode phase on serve.
+- **A guard type for the encoder on the panic path.** Drop order frees it today and no
+  test holds that. Reopen if the engine thread ever gains a catch or `loaded` moves.

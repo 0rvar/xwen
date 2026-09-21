@@ -137,6 +137,18 @@ peak and the gate on the native size. Four more items from the arc are area item
 "Image generation": the 2048x2048 size, the owed time-per-image figure, editing and the
 GUI. The next promotion has to demote something.]
 
+[Amended 2026-09-21, evening, after the serve route and the direct-conv VAE arm (log.md
+"Qwen-Image 2.1 is served, and its VAE decodes on the direct conv"): both Front items from
+the morning shipped (3ccb17b, 1e028be) and moved to the archive whole. ONE item is promoted
+into the gap of two, the time-per-image figure, which was waiting on the direct-conv arm so
+as not to be quoted twice and is now the next actionable step for the model; it is a
+`[small]` chore and ranks last, below every lever. The Front is nine and the tenth place is
+left empty on purpose. Considered for it and not promoted: the 2048x2048 size, which is
+unpriced until its step phase is measured and is the figure item's natural successor, and
+the Z-Image load transient, a measured admission gap of about 8 GB that has not yet failed
+a run. Editing (plan Phase 5) is the owner's next feature and is an arc to open, not a
+lever to rank.]
+
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
 2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
 3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
@@ -145,8 +157,7 @@ GUI. The next promotion has to demote something.]
 6. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
 7. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
 8. **Joules per byte and per FLOP on this machine, read under the power script** (Image generation, measured, an instrument): a 1024x1024 step is 65 J at the 35 W plateau and the split between its ~59 TFLOP and ~110-120 GB of traffic is the one number that prices every remaining image row; an hour, and it decides whether the q/k/v chain fusion is worth 4% or 10%
-9. **Serve Qwen-Image 2.1 on the images route** (Image generation, measured): the owner is waiting on it; the CLI renders as of 5ea0d43 and the route still refuses the model, and its 65 GiB admission peak at 1024x1024 has to be planned beside a resident language model
-10. **A direct-conv arm for the Qwen-Image 2.1 VAE decode** (Image generation, measured): the decode is 18.6 to 21.2 s of a render and the whole memory peak, 55 to 56 GiB against a 27 GiB step phase, one im2col buffer of 10.9 GB being what draining cannot remove; it also gates the native 2048x2048 size
+9. **A time-per-image figure for Qwen-Image 2.1** (Image generation, small): perf-state.md has the section and no figure, every timing so far being low power mode on an unpinned build; the owner is rendering with the model, the direct-conv arm it waited on landed in 1e028be, and an hour with a pinned binary settles how much of the 5.3-6.1 s a step at 1024x1024 is the power mode
 
 ## Decode performance
 
@@ -922,63 +933,50 @@ GUI. The next promotion has to demote something.]
   [next experiment](docs/records/memory-safety.md#next-experiment).
   From: Deferred from the Z-Image-Turbo pipeline arc (2026-09-07, Arc A).
 
-- [ ] [measured] **Serve Qwen-Image 2.1 on the images route.**
-  The owner is waiting on it: the CLI renders as of 5ea0d43 and `POST /v1/images/generations`
-  still refuses the model by name, on all three paths. What the route needs, from the plan's
-  "Pipeline, registry, memory, serve": the `model` rule as a lookup over the image-capable
-  entries and the envelope echoing it (`src/serve/images.rs`, the constant compare and the
-  hard-coded `Model::ZImageTurbo.full_name()`), per-model validation (steps default 40,
-  multiples of 32, the flags this model lacks refused as the CLI refuses them,
-  `guidance_scale` still a 400), the image engine loading either pipeline with the encoder
-  released before the transformer as `run_qwen_image` does, and `ImageJob::peak` reading
-  `memory::qwen_image_peak`: 65 GiB at 1024x1024, which beside a resident Flash-Next (93 GB of
-  a 107.5 GiB working set) means the route waits or refuses, so test that path. The RGBA rule
-  reaches the wire with it: check every consumer that assumes three channels, Image Studio's
-  result check among them. Entry point `src/serve/images.rs`; prerequisite none; risk, the
-  idle-unload and lease order with two pipelines in one engine thread (2026-09-21).
-  [Reference](docs/qwen-image.md), [record](docs/records/qwen-image-t2i.md).
+- [ ] [measured] **Z-Image's load peaks above the flat 40 GiB it is admitted on.**
+  Seen in passing on 2026-09-21 while the images route was being checked, and it predates
+  that arc: `footprint` polled every 2 s around a 512x512 Z-Image load on `xwen serve` read
+  11, 32, 46 and then a steady 27 GB, with the process's `phys_footprint_peak` at 48 GB,
+  against `memory::image_peak`'s flat 40 GiB. The moment is the LOAD, the encoder plus the
+  fp32 to bf16 transformer cast, before any step; the render afterwards sat at 27 GB. So
+  admission under-states a cold request by about 8 GB, from a 2 s sampler and not a traced
+  peak. Next step: trace the load with the sampler at 0.1 s, cold, at 512x512 and
+  1024x1024, and either drain between the cast and the encoder load or raise the cold
+  figure; the isolated traces the memory-safety record asks for are the same runs.
+  [Memory safety record](docs/records/memory-safety.md), [record](docs/records/qwen-image-t2i.md).
   From: Deferred from the Qwen-Image 2.1 text-to-image arc (2026-09-21).
 
-- [ ] [measured] **A direct-conv arm for the Qwen-Image 2.1 VAE decode.**
-  The decode is the largest single stage and the whole memory peak: 18.6 to 21.2 s of a
-  240 to 268 s render at 1024x1024 (low power mode, unpinned, an observation) and 55 to
-  56 GiB against a 27 GiB step phase, what is left after draining being one layer's im2col
-  column buffer, 10.9 GB for the 288-channel conv. `ops::conv2d_direct` allocates no column
-  buffer and ran Z-Image's decoder at 10 to 11 TFLOP/s against candle's 1.2 to 4.4; every
-  decoder conv here passes its contract (kernel 1 or 3, `c_in % 8 == 0`, f32, stride 1; c_in
-  in {64, 1152, 576, 288, 144}). What does not transfer is the norm fold: `group_norm_fold`
-  returns a per-channel `(scale, shift)` and this VAE's norm is a per-PIXEL factor times a
-  per-channel gamma, so the statistics pass and the fold shape are new. Entry point
-  `src/qwen_image/vae.rs`, whose `Conv` wrapper takes the arm and whose
-  `XWEN_QWEN_IMAGE_VAE` refuses `xwen` by name today; price it first in the
-  `tests/zimage_microbench.rs` shape; gate, 60 dB on both arms (the candle arm reads 91.07)
-  and `peak_bytes` re-fitted from new measurements. The encoder's strided convs and its
-  `conv_in` 4 to 96 stay on candle (2026-09-21).
-  [Reference](docs/qwen-image.md), [record](docs/records/qwen-image-t2i.md).
-  From: Deferred from the Qwen-Image 2.1 text-to-image arc (2026-09-21).
-
-- [ ] [unpriced] **The native 2048x2048 size, behind the 1 MP cap.**
+- [ ] [measured] **The native 2048x2048 size, behind the 1 MP cap.**
   `memory::qwen_image_peak` refuses past 1,048,576 pixels because no peak is measured there,
   not because the model cannot: 2048x2048 is its native size, 16384 tokens, `mu` 1.312903.
-  The fitted line says 209 GiB at 4 MP, which does not fit a 107.5 GiB working set, so the
-  candle-arm decode cannot serve it and this waits on the direct-conv item above. Then
-  measure the step phase and the decode apart at 1536x1536 and 2048x2048, and only if the
-  untiled decode still does not fit, tile it: vLLM-Omni's 512 px tiles at 384 stride with
-  linear blends read 47.7 dB against untiled where diffusers' 256/192 default read 39.6, and
-  they note banding at 2048 px and up. The mid-block attention also materialises an
-  HW x HW f32 score matrix, 64 MB at 1024x1024 and about 1 GB at 2048x2048 (2026-09-21).
-  [Plan](docs/qwen-image-2.1-plan.md), [record](docs/records/qwen-image-t2i.md).
+  2026-09-21, evening: the direct-conv arm landed (1e028be) and a decode ALONE at 2048x2048
+  reads 22.07 s and 42 GiB on it, VAE weights only, about 56 GiB with the pipeline resident,
+  so the untiled decode fits the 107.5 GiB working set and tiling is not needed for it. What
+  is unmeasured is the STEP PHASE: 19 and 28 GiB at 512x512 and 1024x1024 extrapolate
+  linearly to about 64 GiB at 4 MP, and attention over 16384 tokens is the term a line would
+  miss. Next step: an env override of the cap for the CLI alone (a test-only seam in
+  `memory::qwen_image_peak`, refused on serve), one render at 1536x1536 and one at
+  2048x2048 with `phys_footprint_peak` sampled each second, step phase and decode read
+  apart; then re-fit `peak_bytes` on the xwen arm through the new points and lift the cap
+  to what was measured. Prerequisite: nothing else on the GPU, and the time-per-image
+  figure first so the step time at 1024x1024 is known. Risk: `flash_attn_tensor` at K 16384
+  has not been run, and the candle arm's fit says 209 GiB there, so the cap stays per arm.
+  [Reference](docs/qwen-image.md), [record](docs/records/qwen-image-t2i.md).
   From: Deferred from the Qwen-Image 2.1 text-to-image arc (2026-09-21).
 
 - [ ] [small] **A time-per-image figure for Qwen-Image 2.1.**
   perf-state.md has a section for it and no figure: every timing on 2026-09-21 was an
-  unpinned build with `pmset -g` reading `lowpowermode         1`. Build a detached
-  worktree under /tmp, state the `pmset -g` line, nothing else on the GPU, 1024x1024 at 40
-  steps, warm, a step as a range with its ramp and the decode quoted apart. The plan derived
-  1.6 s cold rising to 2.3 to 2.6 s a step from the Z-Image figure, and the low-power
-  observation was 5.3 to 6.1 s, so the first thing the figure settles is how much of that
-  gap is the power mode. Best taken after the direct-conv arm, or it is quoted twice
-  (2026-09-21).
+  unpinned build with `pmset -g` reading `lowpowermode         1`. Unblocked the same
+  evening, the direct-conv arm it waited on being the default as of 1e028be. Protocol
+  (docs/benching.md): a detached worktree of master under /tmp, `cargo build --release`
+  there, that binary by path; NOT low power mode, the `pmset -g` line quoted verbatim beside
+  the numbers; nothing else on the GPU and no test suite alongside; warm. Read 512x512 and
+  1024x1024 at 40 steps, a step quoted as a range with its ramp (first step, the plateau,
+  the last step, as the Z-Image figure is quoted), the VAE decode apart, and encoder load,
+  encode and pipeline load as their own lines. The plan derived 1.6 s cold rising to 2.3 to
+  2.6 s a step at 1024x1024 and the low-power observation was 5.3 to 6.1 s, so the first
+  thing it settles is how much of that gap is the power mode. Then the perf-state section
+  gets its row and this item closes (2026-09-21).
   [Figures](docs/perf-state.md), [record](docs/records/qwen-image-t2i.md).
   From: Deferred from the Qwen-Image 2.1 text-to-image arc (2026-09-21).
 
@@ -1001,7 +999,10 @@ GUI. The next promotion has to demote something.]
   controls, fed by a listing of image-capable models that does not exist yet
   (`GET /v1/images/models` is the plan's choice, `/v1/models` being what chat clients read).
   Blocked on the serve route above for text-to-image and on Phase 5's HTTP contract for
-  editing; client work with no correctness bar (2026-09-21).
+  editing; client work with no correctness bar (2026-09-21). Evening: the route and the
+  listing shipped (3ccb17b), so the picker and per-model controls are unblocked; the
+  reference list and "Edit" mode still wait on Phase 5. RGBA results reach Studio now:
+  check its canvas and mask code for three-channel assumptions first.
   [Plan](docs/qwen-image-2.1-plan.md), [record](docs/records/image-studio.md).
   From: Deferred from the Qwen-Image 2.1 text-to-image arc (2026-09-21).
 

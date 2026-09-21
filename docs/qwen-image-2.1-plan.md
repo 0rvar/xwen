@@ -12,6 +12,16 @@ facts it marked unverified that are now settled are under "Resolved" at the end 
 questions". The reference is [qwen-image.md](qwen-image.md) and the decisions are in
 [decisions/qwen-image.md](decisions/qwen-image.md).
 
+**Status, 2026-09-21, evening (1e028be).** Phase 3 is complete: the direct-conv arm is the
+VAE's default, with the per-pixel norm in its own kernel, and the decoder and encoder both
+exist (1e028be). Phase 4's serve half is complete: the images routes render the model,
+one pipeline resident at a time, with `GET /v1/images/models` beside them (3ccb17b). What
+Phase 4 still owes is the perf-state figure, which needs a pinned binary out of low power
+mode, and measured peaks past 1 MP: a decode alone at 2048x2048 reads 42 GiB and fits, the
+step phase there is unmeasured, and the cap stays. Phases 5 (editing) and 6 (Image Studio)
+are open; Phase 6's picker is unblocked by the listing. The status block above stands as
+written at 5ea0d43.
+
 Working doc, opened 2026-09-21. Research only: no code was written for it and none is
 planned in it. It is the substance an engineer implements from later; when an arc ships,
 its decisions migrate to a new topic file `docs/decisions/qwen-image.md` (and a line in

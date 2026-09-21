@@ -474,7 +474,9 @@ figures. What is owed: a pinned binary, the `pmset -g` line verbatim, nothing el
 GPU, 1024x1024 at 40 steps, a step quoted as a range with its ramp and never as a mean
 (decisions.md "A Z-Image step is quoted at steady state"), and the VAE decode quoted
 apart from the steps, it being the largest single stage on the candle arm. The item is in
-[TODO.md](../TODO.md) "Image generation".
+[TODO.md](../TODO.md) "Image generation". 2026-09-21, evening: the VAE's default arm is
+now the direct conv (1e028be), so the figure is owed on that arm, at 512x512 and
+1024x1024, and the item is on the Front.
 
 ## History
 

@@ -4,6 +4,24 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-21 — Qwen-Image 2.1 is served, and its VAE decodes on the direct conv
+
+Two units the same evening. The images routes serve the model by full name (3ccb17b): one
+image pipeline resident at a time, a request planned before anything is evicted or
+admitted, so a 10,022-token prompt is a 400 in 0.21 s with Z-Image still resident and
+still warm, the encoder loaded per request for 2.0 to 4.2 s, and `GET /v1/images/models`
+listing the cached pipelines with their defaults. The VAE decoder runs on
+`ops::conv2d_direct` by default (1e028be), with its per-pixel norm in a new kernel,
+`ops::channel_l2_norm`, because the microbench priced the norm chain at 32% of a direct
+decode. In low power mode on an unpinned build, so observations: the 1024x1024 decode
+17.9 to 20.1 s down to 4.5 to 5.4 s, and the process peak 55 GiB down to 28 GiB, which is
+the step phase and no longer the decode. Parity is unchanged on both arms, VAE alone
+91.07 dB. Admission is priced per arm, 33 GiB at 1024x1024. A decode alone at 2048x2048
+reads 22 s and 42 GiB, so the native size fits as far as the decode goes; the 1 MP cap
+stays until its step phase is measured. Still no time-per-image figure, which is now the
+next step. [Record](records/qwen-image-t2i.md), [architecture](qwen-image.md),
+[decisions](decisions/qwen-image.md).
+
 ## 2026-09-21 — Qwen-Image 2.1 renders from `xwen image`, graded against diffusers
 
 `xwen image --model qwen-image-2.1` renders a PNG (ca71309 to 5ea0d43): the Qwen3-VL-8B

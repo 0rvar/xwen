@@ -153,3 +153,111 @@ a second image model would be the surprise. What did change is what is fetched a
 of encoder shards it never opened (Z-Image had the same flaw and got the same fix), and
 the tokenizer alone is resolved before the weights so an overlong prompt is refused
 first (2026-09-21).
+
+**The VAE decodes on the direct conv by default, and candle's chain is the bisect arm.**
+`XWEN_QWEN_IMAGE_VAE=xwen` runs every decoder conv through `ops::conv2d_direct`, which
+builds no column buffer, with the bias, the SiLU after a norm, the residual add, the
+attention's `proj` plus `xs` add and the upsampler's nearest 2x plus its `DupUp3D`
+shortcut folded into the dispatch. It became the default on three grounds read the same
+day: the 60 dB gate holds on both arms at the same figures (VAE alone 91.07 dB, image
+57.30 dB, velocity cosine 1.000000), it is faster at both sizes, and it is lower-peak at
+both. Low power mode and an unpinned build, so observations:
+
+| size | arm | decode | process peak |
+| --- | --- | --- | --- |
+| 512x512 | candle | 4.4 to 4.8 s | 25 GiB, at the decode |
+| 512x512 | xwen | 1.14 to 1.23 s | 19 GiB, at the step phase |
+| 1024x1024 | candle | 17.9 to 20.1 s | 55 GiB, at the decode |
+| 1024x1024 | xwen | 4.5 to 5.4 s | 28 GiB, at the step phase |
+
+`VaeImpl::SHIPPED` names the default once. The encoder and `quant_conv` stay on candle
+under either arm, text-to-image never running them and their strided convs never
+qualifying, and a test that walks the structure holds that, the first version of it
+having asserted a field the encoder never set (2026-09-21, 1e028be).
+
+**The per-pixel norm got a kernel because the microbench priced it, and the mid-block
+attention did not get one for the same reason.** With the convs direct, candle's norm
+chain was 1739 of 5370 ms of a 1024x1024 decode, 32%, so `ops::channel_l2_norm` does
+`x / max(||x||, 1e-12) * gamma` in one dispatch, one thread per pixel, and the fused
+norms now read 0.14 s of a 4.45 s decode. It could not be a fold: `group_norm_fold`
+hands the conv a `(scale, shift)` per `[B, C]`, and this norm is a per-pixel factor times
+a per-channel gamma. It is not bitwise against the chain, the accumulation order being
+different, and the tests bound it at 2e-6 of scale. Attention is 0.02 s at 1024x1024 and
+2% of a 2048x2048 decode with a 1.07 GB score matrix, so it stays on candle. Reopen it if
+attention passes about 10% of a decode or its score matrix ever sets the peak
+(2026-09-21).
+
+**Drains are per stage on the xwen arm and per convolution on the candle arm.** Priced on
+the xwen arm at 1024x1024 over three to four runs each: per convolution 6.67 s and
+28 GiB, per stage 6.41 s and 28 GiB, none 6.24 s and 36 GiB. Per stage costs about 3%
+over none and keeps the decode under the step phase, which is what lets the step phase
+set the admission figure; per convolution cost about 7% for nothing more. The candle
+arm keeps the finer placement from 5ea0d43, its peak being the decode either way
+(2026-09-21).
+
+**Admission is priced per VAE arm, and a loaded pipeline re-prices from the arm it
+resolved.** On the xwen arm the line runs through 19 GiB at 512x512 and 28 GiB at
+1024x1024, both the step phase, 16 GiB plus 12 per megapixel, and with 15% on top
+`peak_bytes` is 19 GiB plus 14 per megapixel: 22.5 and 33 GiB. The candle arm keeps 17
+plus 48, 29 and 65 GiB. The estimate used to read the env and nothing else, while the VAE
+resolves its arm from the device, so asking for `xwen` off Metal would have been admitted
+on the small figure and run candle's column buffers. Two outside reviews raised it
+independently. Now the pre-load function resolves the arm as the loader does, and
+`loaded_peak_bytes` prices from `resolved_arm()`: the CLI admits again after the load if
+that is larger, and serve refuses a render priced above what it was admitted on. Every
+surface that loads this pipeline creates a Metal device, so neither guard can fire today
+and neither was exercised at run time (2026-09-21).
+
+**Serve holds one image pipeline at a time and plans a request before it evicts
+anything.** Two resident pipelines would be 15.7 GB each before any transient, so a
+request for the other one unloads the resident one first, through the unload idle-unload
+already uses, with the lease held across drop and drain. The first version swapped before
+it looked at the prompt, and both outside reviews found what that costs: an over-length
+prompt for this model returned its 400 having already thrown away a healthy Z-Image, and
+admission could 503 the same invalid request first. `plan()` now runs the cache check and
+renders and layout-checks the prompt from the tokenizer alone before any unload or
+admission, and carries the validated ids into the encode. Checked end to end with Z-Image
+resident: a 10,022-token prompt for this model was a 400 in 0.21 s, `/health` still named
+Z-Image, the log showed no unload, and the next Z-Image request ran warm in 10.2 s
+against 43.4 s cold. The cache is asked only on a load or a replace, a resident pipeline
+otherwise starting to refuse when a cache file disappears after it loaded (2026-09-21,
+3ccb17b).
+
+**The text encoder loads per request on serve and is not kept warm.** Kept, it is
+15.7 GB on top of a 15.7 GB pipeline for as long as the pipeline is resident. Loaded per
+request it cost 2.0 to 4.2 s across every run observed, against renders of tens of
+seconds. `KEEP_QWEN_IMAGE_ENCODER` is the seam, together with the 34 GiB encode-phase
+admission figure, which is sized from the weight sets over one lower-bound sample and is
+an estimate. Reopen when someone renders many small images in a row and the two to four
+seconds show (2026-09-21).
+
+**`--image-steps` is Z-Image's alone.** It is the operator's default for a distilled
+eight-step model, and applied to this one it would produce an unfinished render and
+call it a default. This model stays at 40, and `GET /v1/images/models` reports each
+pipeline's `default_steps` as a request naming none would get it, so Z-Image's follows
+the flag (2026-09-21).
+
+**Image models are listed on `GET /v1/images/models`, not on `/v1/models`.** `/v1/models`
+is what chat clients and the Image Studio chat sidebar read, and an id listed there that
+every chat route refuses is a broken promise. The images listing sits under
+`is_images_path`, so a missing key is a 403 like the rest, lists cached pipelines only so
+every listed id renders without a fetch, and carries what a picker needs: default and
+maximum steps, the size rule, the pixel cap, `max_references` (0 for both today) and
+which controls exist (2026-09-21).
+
+**`negative_prompt` and `guidance_scale` are 400s on both pipelines.** Z-Image's reason
+is distillation. This model's is that it is served without classifier-free guidance, the
+way its model card samples it, so either field would be silently ignored, which is the
+thing the route refuses to do. True CFG is two forwards a step with a prefix cache each
+and is not built (2026-09-21).
+
+**Request faults are classed by whose fault they are.** 400 is the client's: an unknown
+model, a refused field, a size, an uncached model naming the fetch, an over-length prompt
+and a layout refusal. The first version folded every failure out of the prompt renderer
+into a 400, a missing or corrupt tokenizer file included, so `conditioning` gained a
+typed `PromptTooLong` whose text is the old sentence and everything else out of it is a
+500. An interruption during the encoder phase is a 503 like one during the render, where
+it was a 500. A PANIC during the encode is not handled by a guard: the engine thread
+unwinds, `loaded` drops before the lease because it is declared after it, and its
+`DeviceDrain` synchronizes or aborts. That relies on declaration order and has no test
+(2026-09-21).

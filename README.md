@@ -296,8 +296,11 @@ run prints the lowest alpha and the clear-pixel count so the choice is visible.
 
 The transformer, the VAE and the encoder are graded against diffusers fp32 dumps
 (`tests/qwen_image_parity.rs`, `tests/qwen_image_encoder.rs`). No timing is published yet.
-`XWEN_QWEN_IMAGE_ATTN=basic`, `XWEN_QWEN_IMAGE_LINEAR=candle` and
-`XWEN_QWEN_IMAGE_CACHE=off` are the bisect arms.
+`XWEN_QWEN_IMAGE_ATTN=basic`, `XWEN_QWEN_IMAGE_LINEAR=candle`,
+`XWEN_QWEN_IMAGE_CACHE=off` and `XWEN_QWEN_IMAGE_VAE=candle` are the bisect arms. The VAE
+decodes on xwen's direct conv kernel by default (`xwen`), which builds no im2col buffer;
+`candle` is the slower arm it is checked against, and it peaks about twice as high at
+1024x1024.
 
 Image controls use the same pipeline and image-engine queue. An init image selects
 img2img; adding a white-repaint mask selects inpainting. Strength defaults to 0.6

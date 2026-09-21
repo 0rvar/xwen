@@ -3179,6 +3179,45 @@ blocks use of the feature; item (a) is the one with a known trigger.
 
 [Opened 2026-09-21 by the arc that took Qwen-Image 2.1 from the plan to a graded render (ca71309 to 5ea0d43; log.md "Qwen-Image 2.1 renders from `xwen image`"; records/qwen-image-t2i.md). Nothing has closed under it yet; its open items are in TODO.md "Image generation": the serve route, the direct-conv VAE arm, the 2048x2048 size, the time-per-image figure, editing and the GUI.]
 
+[Shipped 2026-09-21, evening (3ccb17b): the images routes serve the model by full name, one image pipeline resident at a time, a request planned before anything is evicted or admitted, the encoder loaded per request, `GET /v1/images/models` listing the cached pipelines. Admission on the route is the larger of the render's peak and a 34 GiB encode phase, and the 65 GiB this item quotes became 33 GiB the same evening with the direct-conv arm. Not run over HTTP: `n > 1`, 1024x1024, the native render route and the multipart refusals; those are record lines (records/qwen-image-t2i.md "Not taken now"). Image Studio's result check was not opened. Text as it stood in TODO.md.]
+
+- [x] [measured] **Serve Qwen-Image 2.1 on the images route.**
+  The owner is waiting on it: the CLI renders as of 5ea0d43 and `POST /v1/images/generations`
+  still refuses the model by name, on all three paths. What the route needs, from the plan's
+  "Pipeline, registry, memory, serve": the `model` rule as a lookup over the image-capable
+  entries and the envelope echoing it (`src/serve/images.rs`, the constant compare and the
+  hard-coded `Model::ZImageTurbo.full_name()`), per-model validation (steps default 40,
+  multiples of 32, the flags this model lacks refused as the CLI refuses them,
+  `guidance_scale` still a 400), the image engine loading either pipeline with the encoder
+  released before the transformer as `run_qwen_image` does, and `ImageJob::peak` reading
+  `memory::qwen_image_peak`: 65 GiB at 1024x1024, which beside a resident Flash-Next (93 GB of
+  a 107.5 GiB working set) means the route waits or refuses, so test that path. The RGBA rule
+  reaches the wire with it: check every consumer that assumes three channels, Image Studio's
+  result check among them. Entry point `src/serve/images.rs`; prerequisite none; risk, the
+  idle-unload and lease order with two pipelines in one engine thread (2026-09-21).
+  [Reference](qwen-image.md), [record](records/qwen-image-t2i.md).
+  From: Deferred from the Qwen-Image 2.1 text-to-image arc (2026-09-21).
+
+[Shipped 2026-09-21, evening (1e028be): the xwen arm is the default, every decoder conv on `ops::conv2d_direct` with the norm in its own kernel `ops::channel_l2_norm`, the per-pixel norm not fitting the GroupNorm fold as this item said. Low power, unpinned: the decode 17.9-20.1 s to 4.5-5.4 s at 1024x1024 and the process peak 55 GiB to 28 GiB, now the step phase; 60 dB held on both arms at 91.07 dB; `peak_bytes` re-fitted per arm, 33 GiB at 1024x1024. It was priced in its own `tests/qwen_image_microbench.rs`. Its open remainder is the 2048x2048 item in TODO.md "Image generation". Text as it stood in TODO.md.]
+
+- [x] [measured] **A direct-conv arm for the Qwen-Image 2.1 VAE decode.**
+  The decode is the largest single stage and the whole memory peak: 18.6 to 21.2 s of a
+  240 to 268 s render at 1024x1024 (low power mode, unpinned, an observation) and 55 to
+  56 GiB against a 27 GiB step phase, what is left after draining being one layer's im2col
+  column buffer, 10.9 GB for the 288-channel conv. `ops::conv2d_direct` allocates no column
+  buffer and ran Z-Image's decoder at 10 to 11 TFLOP/s against candle's 1.2 to 4.4; every
+  decoder conv here passes its contract (kernel 1 or 3, `c_in % 8 == 0`, f32, stride 1; c_in
+  in {64, 1152, 576, 288, 144}). What does not transfer is the norm fold: `group_norm_fold`
+  returns a per-channel `(scale, shift)` and this VAE's norm is a per-PIXEL factor times a
+  per-channel gamma, so the statistics pass and the fold shape are new. Entry point
+  `src/qwen_image/vae.rs`, whose `Conv` wrapper takes the arm and whose
+  `XWEN_QWEN_IMAGE_VAE` refuses `xwen` by name today; price it first in the
+  `tests/zimage_microbench.rs` shape; gate, 60 dB on both arms (the candle arm reads 91.07)
+  and `peak_bytes` re-fitted from new measurements. The encoder's strided convs and its
+  `conv_in` 4 to 96 stay on candle (2026-09-21).
+  [Reference](qwen-image.md), [record](records/qwen-image-t2i.md).
+  From: Deferred from the Qwen-Image 2.1 text-to-image arc (2026-09-21).
+
 ## Retired: Image generation
 
 [Retired 2026-09-08: its basis was the profiler's buffer-pool eviction and not the f32 store. The bf16 store was built on the branch `zimage-ffn` (5e7a6ea), is bit-exact, and measured parity within 5% with an unstable sign; the f32-store gemm runs 37-45 TFLOP/s isolated, w2's own class, and bandwidth caps the lever at ~0.2 s per image (decisions.md "The bf16 SwiGLU store is REFUTED"). A half intermediate for w2 is disqualified by a measured activation max of 284,507 against f16's 65,504. Reopen if a future MPP release adds a converting cooperative-tensor store or documents the tile lane layout so a vectorized epilogue can skip the index math, or with a per-row scaled activation folded into w2's gemm, which is a different arc.]

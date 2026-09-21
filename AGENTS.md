@@ -574,11 +574,11 @@ deliberate deferral until a second consumer exists.
 
 ## Qwen-Image 2.1 (diffusion, written from diffusers)
 
-The second image pipeline, text-to-image as of 2026-09-21 (5ea0d43):
+The second image pipeline, text-to-image as of 2026-09-21 (1e028be):
 `xwen image --model qwen-image-2.1` renders, `xwen encode-text --model
-qwen-image-2.1-encoder` runs the encoder alone, and **serve refuses the model** on every
-images path until its route lands (TODO.md Front). Editing with reference images is
-shaped for and not wired. [docs/qwen-image.md](docs/qwen-image.md) is the architecture
+qwen-image-2.1-encoder` runs the encoder alone, and **serve renders it on the images
+routes** by full name (3ccb17b); the multipart edits and variations routes refuse it.
+Editing with reference images is shaped for and not wired. [docs/qwen-image.md](docs/qwen-image.md) is the architecture
 and the full trap list, [docs/decisions/qwen-image.md](docs/decisions/qwen-image.md) the
 decisions, [docs/records/qwen-image-t2i.md](docs/records/qwen-image-t2i.md) the arc, and
 [docs/qwen-image-2.1-plan.md](docs/qwen-image-2.1-plan.md) the research, which the files
@@ -600,7 +600,8 @@ The seams, so a change lands in one place:
   having no module for this model. It reuses the Z-Image seams unedited
   (`zimage::linear::Projection` on an f32 stream, `ops::flash_attn_tensor`,
   `ops::rope_pair`, `ops::gated_residual`, `ops::silu_mul`, `seeded_noise`,
-  `encode_png`) and no kernel was written for it. `transformer.rs` owns the layout, the
+  `encode_png`, `ops::conv2d_direct`), and the one kernel written for it is the VAE's
+  norm, `ops::channel_l2_norm`. `transformer.rs` owns the layout, the
   rope walk, the segmented attention and the prefix cache; `scheduler.rs` the
   dynamic-shift grid, its own file and NOT an arm in the vendored Z-Image scheduler;
   `vae.rs` the decoder and the encoder; `pipeline.rs` the loop, the size rule, the RGBA
@@ -629,13 +630,38 @@ The seams, so a change lands in one place:
   pixels at 254, and a transparent background sits at alpha 1, not 0, on the reference
   too. `encode_png` picks RGB8 or RGBA8 by channel count; a new consumer of
   `Rendered.image` must not assume three channels.
-- **`peak_bytes` is fitted to measurement**: 17 GiB plus 48 GiB per megapixel, from a
-  decode that peaks at 25 GiB (512x512) and 55 to 56 GiB (1024x1024) against a 27 GiB step
-  phase. The decode syncs between convolutions because that is what evicts candle's pool
-  (71 GiB without); what is left is one im2col buffer, which is what the direct-conv arm
-  removes. `memory::qwen_image_peak` keeps the 1 MP cap because 2048x2048 is unmeasured,
-  not because the model cannot. Re-fit the constants when the decode changes; a unit test
-  holds the estimate above the measured ones.
+- **The VAE decodes on the direct conv by default** (`XWEN_QWEN_IMAGE_VAE`: `xwen`,
+  `VaeImpl::SHIPPED`; `candle` is the bisect arm), 1e028be. Every decoder conv goes through
+  `ops::conv2d_direct` with the bias, SiLU, residual, attention add and upsample-plus-
+  shortcut folded in; the norm is `ops::channel_l2_norm`, its own kernel because a
+  per-PIXEL factor times a per-channel gamma does not fit the GroupNorm fold, bounded on
+  an explicit `n`, NOT bitwise against the chain (2e-6 of scale). The encoder and
+  `quant_conv` stay on candle, and a test that walks the structure holds both halves.
+  Low power, unpinned: the 1024x1024 decode 17.9-20.1 s to 4.5-5.4 s and the process peak
+  55 GiB to 28 GiB, which is now the STEP PHASE. Drains are per stage on this arm (3% for
+  8 GiB) and per convolution on candle's, where they are what evicts the pool (71 GiB
+  without). `tests/qwen_image_microbench.rs` holds two ignored tests behind one `GPU`
+  mutex; run one with `--exact`, the pair having once voided a run by sharing the device.
+- **`peak_bytes` is fitted to measurement, per VAE arm**: 19 GiB plus 14 per megapixel on
+  xwen (33 GiB at 1024x1024), 17 plus 48 on candle (65 GiB). The pre-load function
+  resolves the arm as the loader does (`VaeImpl::resolve`), and a loaded pipeline prices
+  from `loaded_peak_bytes`, so a candle fallback is never admitted on xwen's figure.
+  `memory::qwen_image_peak` keeps the 1 MP cap because the 2048x2048 STEP PHASE is
+  unmeasured (a decode alone there reads 42 GiB and fits), not because the model cannot.
+  Re-fit the constants when either phase changes; a unit test holds the estimate above
+  the measured ones.
+- **Serve holds ONE image pipeline at a time and plans before it evicts** (3ccb17b,
+  `src/serve/images.rs`, a `Pipeline` enum owning every per-model rule). `plan()` runs
+  the cache check and renders and layout-checks the prompt from the tokenizer alone
+  BEFORE any unload or admission, so an invalid request for one pipeline never evicts the
+  other; keep new request faults on that side of the swap. The encoder loads per request
+  and is released before the render (`KEEP_QWEN_IMAGE_ENCODER` is the seam); admission is
+  `memory::qwen_image_serve_peak`, the render's peak or a 34 GiB encode phase, an
+  estimate. On the SHARED surface: `model` selects a pipeline by full name and absent
+  means Z-Image, `--image-steps` is Z-Image's alone, `/health` gained `image_model`,
+  and `GET /v1/images/models` (three prefixes, 403 rule) lists the cached pipelines with
+  their defaults while `/v1/models` stays language-only. 400 is the client's fault, a
+  broken tokenizer is a 500, an interruption a 503.
 
 Traps that are silent, the short list (all of them in docs/qwen-image.md): the hidden
 state is PRE-norm; the prompt is a raw template and the first 14 rows are dropped after
@@ -897,4 +923,6 @@ above). Two things it changed on the shared surface: `/health` gained
 403 rather than 401 on the three images paths (`images::is_images_path`), because the
 ComfyUI client turns a 401 into a comfy.org login prompt before reading the body. The
 routes are registered inside the OpenAI-dialect block and ABOVE the body-limit layer, like
-every other body-taking route.
+every other body-taking route. As of 2026-09-21 the same routes serve a second pipeline,
+Qwen-Image 2.1, one resident at a time, and `/health` names it in `image_model`; the
+rules are in the Qwen-Image 2.1 section above.

@@ -9,9 +9,11 @@ the research that preceded the code in [qwen-image-2.1-plan.md](qwen-image-2.1-p
 Where that plan and this file disagree, this file was written after the shipped files
 were open and the plan was not.
 
-State as of 2026-09-21 (5ea0d43): text-to-image renders from the CLI,
-`xwen image --model qwen-image-2.1`, and `xwen encode-text --model qwen-image-2.1-encoder`
-runs the encoder alone. The serve images route refuses the model. Editing with reference
+State as of 2026-09-21 (1e028be): text-to-image renders from the CLI,
+`xwen image --model qwen-image-2.1`, and from `xwen serve` on the images routes
+(3ccb17b, "Serve" below), and `xwen encode-text --model qwen-image-2.1-encoder` runs the
+encoder alone. The VAE decodes on the direct conv by default (1e028be). The multipart
+edits and variations routes refuse the model. Editing with reference
 images is designed for and not wired: the layout, the rope walk and the prompt renderer
 take reference blocks, and nothing feeds them. The module is written from diffusers at
 `6256aa7666cedd47443adc8f82da9a10e110b09c` (`transformer_qwenimage21.py`,
@@ -186,7 +188,7 @@ is fed `sigma` and its output is used as is: `x += (sigma_next - sigma) * v`, no
 
 ## The VAE
 
-`src/qwen_image/vae.rs`, f32 end to end, candle convs. `decode` takes the NORMALISED
+`src/qwen_image/vae.rs`, f32 end to end, in two arms (below). `decode` takes the NORMALISED
 latent `[B, 64, h, w]`, applies `z * std + mean` per channel itself (the reference does
 that in the pipeline), and returns `[B, 4, 16h, 16w]` clamped to [-1, 1]. `encode` is the
 mirror: the posterior MEAN, the first 64 of 128 channels after `quant_conv`, normalised.
@@ -221,12 +223,76 @@ Each closed form is tested bit for bit against a literal transcription of the re
 `view/permute/view` on a 5-D tensor. A port from the docstrings reconstructs a plausible
 image and is wrong on five stages.
 
-The decode is where the memory goes. With no sync inside it candle's buffer pool keeps
-every conv intermediate alive, 71 GiB at 1024x1024. `device.synchronize()`, which on
-Metal is what evicts the pool, now runs between convolutions, which takes the peak to
-55 to 56 GiB with byte-identical PNGs. What is left is one layer's im2col column buffer,
-10.9 GB for the 288-channel conv at 1024x1024. `XWEN_QWEN_IMAGE_VAE` accepts `candle`
-only and refuses `xwen` and `direct` by name until the direct-conv arm exists.
+**Two arms, `XWEN_QWEN_IMAGE_VAE`.** `xwen` is the default as of 1e028be
+(`VaeImpl::SHIPPED`, named once) and `candle` is the bisect arm. `VaeImpl::resolve` is
+the one rule for which arm runs: the xwen kernels are Metal-only, so anywhere else every
+layer is candle's chain, and `QwenImageVae::resolved_arm()` reports what was resolved. The
+ENCODER and `quant_conv` run candle under either arm: its strided convs and its `conv_in`
+4 to 96 can never take the direct kernel, and text-to-image never runs it. A test walks
+the structure on Metal and holds all 46 decoder-side convs direct and all 36 decoder
+norms fused, and nothing on the encoder side either, more than ten of whose convs would
+qualify by shape.
+
+On the xwen arm every decoder conv goes through `ops::conv2d_direct`, which builds no
+column buffer, `conv_out` 144 to 4 and the 1x1s included. Folded into the dispatch with no
+new kernel: the bias in the store, the SiLU that follows a norm read inside the conv, the
+residual add in `conv2`'s store, the attention's `proj` plus `xs` add, and the upsampler's
+nearest 2x together with its `DupUp3D` shortcut add, the shortcut taken from the block's
+PRE-upsample input as the reference takes it. The norm does NOT fit the GroupNorm fold
+the Z-Image decoder uses: `group_norm_fold` returns a `(scale, shift)` per `[B, C]`, and
+this norm is a per-PIXEL factor times a per-channel gamma. So it has its own kernel,
+`ops::channel_l2_norm` (`src/ops/channel_l2_norm.metal`), one thread per pixel, bounded
+on an explicit `n` and never on `threads_per_grid`, contiguous operands required with
+their storage offsets honoured. It is not bitwise against candle's chain and its tests
+bound it at 2e-6 of scale, with a nonzero-offset view, a strided input refused by name,
+and pixels on both sides of the 1e-12 floor. The two arms differ by a nonzero amount
+under 1e-4 of scale on a tiny decoder, which the test asserts both ways, and the
+comparison refuses a NaN.
+
+What the arm bought, in low power mode on an unpinned build, so observations and not
+figures (`phys_footprint_peak`, one render each):
+
+| size | arm | decode | process peak | VAE alone | image |
+| --- | --- | --- | --- | --- | --- |
+| 512x512 | candle | 4.4 to 4.8 s | 25 GiB, at the decode | 91.07 dB | 57.30 dB |
+| 512x512 | xwen | 1.14 to 1.23 s | 19 GiB, at the step phase | 91.07 dB | 57.30 dB |
+| 1024x1024 | candle | 17.9 to 20.1 s | 55 GiB, at the decode | | |
+| 1024x1024 | xwen | 4.5 to 5.4 s | 28 GiB, at the step phase | | |
+
+On the candle arm the decode is where the memory goes. With no sync inside it candle's
+buffer pool keeps every conv intermediate alive, 71 GiB at 1024x1024.
+`device.synchronize()`, which on Metal is what evicts the pool, runs between
+convolutions there, which takes the peak to 55 to 56 GiB with byte-identical PNGs, and
+what is left is one layer's im2col column buffer, 10.9 GB for the 288-channel conv at
+1024x1024. On the xwen arm the drains are per STAGE, priced at 1024x1024 over three to
+four runs each:
+
+| drains on the xwen arm | decode | peak |
+| --- | --- | --- |
+| per convolution | 6.67 s | 28 GiB |
+| per stage (kept) | 6.41 s | 28 GiB |
+| none | 6.24 s | 36 GiB |
+
+About 3% over no drains for 8 GiB, and the decode stays under the step phase. Those
+three rows were read in a session of their own and run slower than the table above, so
+they compare with each other and with nothing else.
+
+A decode ALONE at 2048x2048 on the xwen arm, VAE weights only, reads 22.07 s and 42 GiB
+(3.83 s and 12 GiB at 1024x1024), so the untiled native size fits the 107.5 GiB working
+set as far as the decode goes. The 1 MP cap stays: no 2048x2048 render was run, and the
+step phase there is a linear extrapolation to about 64 GiB that nobody has measured.
+Attention is 2% of that decode with a 1.07 GB score matrix, and has no kernel.
+
+`tests/qwen_image_microbench.rs` is the ignored bench that priced the arm, two tests
+under one process-wide `GPU` mutex so they cannot share the device whatever the thread
+count (a first run matched both with one filter and its numbers were void). Run one:
+`cargo test --release --test qwen_image_microbench -- --ignored --nocapture --exact
+qwen_image_vae_microbench`. At 1024x1024 the candle arm attributes 16.1 s to convs, 2.39 s
+to norms, 0.10 s to SiLUs and 0.02 s to attention of 18.6 s; the xwen arm 4.29 s to convs,
+0.14 s to the fused norms and 0.02 s to attention of 4.45 s. Before the norm kernel the
+candle norm chain was 1739 of 5370 ms, 32% of a direct decode, which is what priced it.
+Direct convs run 3 to 5 TFLOP/s against candle's 0.5 to 2.7 (0.02 on `conv_out`), the
+largest row being the 288-channel upsample conv into 1024x1024, 1740 ms against 402.
 
 ## The pipeline
 
@@ -254,12 +320,21 @@ ordinary prompt's alpha is 252 to 255 with a sixth of the pixels at 254. A trans
 background sits at alpha 1, not 0, on the reference and on xwen alike, which is why the
 cutoff is 8. The histograms are in [the record](records/qwen-image-t2i.md).
 
-**Memory admission is fitted, not guessed.** `peak_bytes = 17 GiB + 48 GiB per
-megapixel`, the line through the two measured decode peaks (25 GiB at 512x512, 56 GiB at
-1024x1024) with 15% on top: 29 GiB and 65 GiB. The step phase peaks at 18 to 19 and
-27 GiB. `memory::qwen_image_peak` wraps it under a 1,048,576-pixel cap whose message says
-the cap is about measurement and not a model limit. The encoder is released before the
-transformer loads, and the run prints the device at 0.0 GB after the drop, 15.7 before.
+**Memory admission is fitted, not guessed, and it is per VAE arm** (1e028be). On the xwen
+arm `peak_bytes = 19 GiB + 14 GiB per megapixel`: the line through the two measured
+peaks, 19 GiB at 512x512 and 28 GiB at 1024x1024 (16 plus 12 per megapixel), both of them
+the STEP PHASE, with 15% on top, which is 22.5 GiB and 33 GiB. On the candle arm it is
+`17 GiB + 48 GiB per megapixel`, through the decode peaks of 25 and 56 GiB, which is 29
+and 65 GiB. `peak_bytes(w, h)` is the pre-load estimate and resolves the env arm the way
+the loader does (`VaeImpl::resolve` over `metal_is_available()`), so a build without Metal
+prices the candle arm. A loaded pipeline answers for itself through `loaded_peak_bytes`,
+from the arm its VAE resolved: the CLI admits again after the load if that figure is
+larger, and serve refuses a render the loaded pipeline prices above what the request was
+admitted on. Neither can fire on a Metal device and neither was exercised at run time.
+`memory::qwen_image_peak` wraps the estimate under a 1,048,576-pixel cap whose message
+says the cap is about measurement and not a model limit. The encoder is released before
+the transformer loads, and the run prints the device at 0.0 GB after the drop, 15.7
+before.
 
 ## The CLI
 
@@ -272,6 +347,70 @@ and `XWEN_QWEN3_ATTN`, the size, the step count, admission, an overlong prompt (
 tokenizer alone is resolved first), and the shape of an injected file. `--cap-feats`
 skips the encoder and fetches none of its files. `--latents` and `--dump` work as they do
 for Z-Image.
+
+## Serve
+
+`src/serve/images.rs`, as of 3ccb17b. The images routes serve two pipelines and a
+`Pipeline` enum owns every per-model rule as an exhaustive match; a test holds
+`Pipeline::ALL` equal to the registry entries that have a `text_encoder()`, so a third
+pipeline cannot be registered and missed.
+
+- `model` selects by FULL name on every images path (`select_pipeline`). Absent or empty
+  is Z-Image-Turbo, `Qwen-Image-2.1` is this model, aliases are refused as everywhere on
+  the wire. On `/proxy/openai/images/generations` any other string is served by Z-Image
+  and logged; on the two canonical paths it is a 400. The envelope's `model` names the
+  pipeline that rendered. `POST /v1/images/render` takes the same optional `model`.
+- Per model: steps default 40 here against 8, and `--image-steps` is Z-Image's ALONE,
+  eight steps being an unfinished render of this model; both sides multiples of 32; the
+  1 MP cap. `init_image`, `strength`, `mask`, `mask_blur`, `control` and `loras` are 400s
+  naming the model, refused before any input is decoded, and the multipart edits and
+  variations routes refuse the model before the image is decoded. `negative_prompt` and
+  `guidance_scale` are 400s on both pipelines, this one's sentence saying it is served
+  without classifier-free guidance, the way its model card samples it.
+- ONE image pipeline is resident at a time (`Loaded` is an enum of the two). A request is
+  PLANNED before anything is evicted or admitted (`plan()`, pure, its cache check and its
+  prompt renderer passed as closures): the cache is asked only when the request loads or
+  replaces a pipeline, the prompt is rendered and `check_layout`ed from the tokenizer
+  alone, and only then does `unload_first` run the existing unload (drain, drop, drain)
+  with the lease held across it. The validated ids are carried into the encode. A warm
+  Z-Image request checks nothing on disk, and a warm request for this model checks only
+  what it reopens, the encoder's files and the tokenizer.
+- The text encoder loads PER REQUEST and is released before the render, 2.0 to 4.2 s each
+  time across every run observed. `KEEP_QWEN_IMAGE_ENCODER` (false) is the seam for
+  keeping it, together with the admission figure. Admission is
+  `memory::qwen_image_serve_peak`, the larger of the render's peak and
+  `QWEN_IMAGE_SERVE_ENCODE_PEAK`, 34 GiB, the resident pipeline with the encoder loaded on
+  top of it. That figure is sized from the weight sets with one 27 GB sample from a
+  two-second sampler under it, a lower bound, and on the xwen VAE arm it is the envelope
+  at every size under the cap. The warm credit is 14 GiB (Z-Image's is 16).
+- Status classes. 400: an unknown model, a refused field, the size and cap messages, an
+  uncached model (naming `xwen fetch --model qwen-image-2.1`), an over-length prompt
+  (`conditioning::PromptTooLong`, the CLI's sentence) and a layout refusal. 500: any
+  other tokenizer failure, a broken file not being the client's fault. 503: a full queue,
+  and an interruption during the encoder phase as during the render. Never 401, 402, 409
+  or 429, as for Z-Image. A panic during the encode unwinds the engine thread, and what
+  frees the encoder then is drop order: `loaded` is declared after the lease and drops
+  first, running its `DeviceDrain`. That path has no guard type of its own and no test.
+- `GET /v1/images/models`, with `/images/models` and `/proxy/openai/images/models`, under
+  `is_images_path` so a missing key is a 403. It lists the CACHED pipelines only, so
+  every listed id renders without a fetch, and `/v1/models` stays language-only:
+
+  ```json
+  {"object":"list","data":[{"id":"Qwen-Image-2.1","object":"model","default":false,
+   "default_steps":40,"max_steps":50,"default_size":"1024x1024","size_multiple":32,
+   "size_rule":"both sides multiples of 32","max_pixels":1048576,"max_references":0,
+   "controls":{"init_image":false,"mask":false,"control":false,"loras":false}}]}
+  ```
+
+  Z-Image's `default_steps` follows `--image-steps` when the operator set it.
+- `/health` gained `image_model`, the resident pipeline's full name or null, and
+  `image_model_loaded` is derived from it. The TUI header and the activity record name
+  the pipeline that ran.
+- The RGBA rule applies on the route as on the CLI, `encode_png` taking whatever the
+  pipeline returns: the transparency prompt came back as PNG colour type 6.
+
+Not run over HTTP: `n > 1` and 1024x1024 for this model, and the native render route and
+the multipart refusals, which are tested at the `prepare` level.
 
 ## Traps, each of which runs and produces a plausible result
 
@@ -355,7 +494,8 @@ once to bf16), `velocity0-fp32`, `latents-final-fp32`, `image-fp32.png` (RGBA) a
 gate holds the sigma grid and `mu` to 1e-6, the step-0 velocity to cosine 0.998 and mean
 relative error 0.04 with both wrong graphs asserted OUTSIDE, the run's first velocity
 equal to the standalone forward, and the VAE alone to 60 dB, RGB against RGB. It reports
-the final latent and the image PSNR after 40 steps. As of 5ea0d43: velocity cosine
+the final latent and the image PSNR after 40 steps. As of 5ea0d43, and unchanged at
+1e028be on both VAE arms (`XWEN_QWEN_IMAGE_VAE=candle` selects the other): velocity cosine
 1.000000 and mean relative error 0.0006 (the reference's bf16 arm 0.999948 and 0.0075),
 brackets at 0.9825 and 0.9874, VAE alone 91.07 dB, final latent 0.999999, image 57.30 dB
 where the reference's bf16 arm gets 35.58.
@@ -366,10 +506,14 @@ where the reference's bf16 arm gets 35.58.
 
 | switch | arms |
 | --- | --- |
-| `XWEN_QWEN_IMAGE_LINEAR` | `xwen` (default, the tensor gemm) / `candle` |
-| `XWEN_QWEN_IMAGE_ATTN` | `tensor` (default, segments on the Metal-4 kernel) / `basic` (dense f32 under the explicit mask) |
-| `XWEN_QWEN_IMAGE_VAE` | `candle` (the only arm) |
-| `XWEN_QWEN_IMAGE_CACHE` | `on` (default, the prefix K/V kept) / `off` (the full sequence every step) |
+| `XWEN_QWEN_IMAGE_LINEAR` | `xwen` (default, the tensor gemm; alias `tensor`) / `candle` |
+| `XWEN_QWEN_IMAGE_ATTN` | `tensor` (default, segments on the Metal-4 kernel; alias `xwen`) / `basic` (dense f32 under the explicit mask) |
+| `XWEN_QWEN_IMAGE_VAE` | `xwen` (default, the direct conv and the fused norm; alias `direct`) / `candle` (im2col, the bisect arm) |
+| `XWEN_QWEN_IMAGE_CACHE` | `on` (default, the prefix K/V kept; alias `prefix`) / `off` (the full sequence every step; alias `full`) |
+
+Spellings read off the parse functions (`LinearImpl::parse`, `AttnArm::parse`,
+`VaeImpl::parse`, `CacheArm::parse`). The first three trim and ignore case; the cache
+switch matches exactly. An empty value is the default on all four.
 
 A typo in any of them is a load error. The candle linear arm runs bf16 activations and
 differs from the tensor arm by about 2.8% of scale on random tiny weights, which is the
