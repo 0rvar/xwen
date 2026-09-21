@@ -1,5 +1,17 @@
 # Qwen-Image 2.1 on xwen: research and plan
 
+**Status, 2026-09-21 (5ea0d43).** Phases 0, 1 and 2 are done: the references and pins, the
+encoder (ca71309, bars 9c1186d), the transformer and scheduler (19e5c55) and the pipeline
+with its parity gate (4dcca19). Phase 3 is half done, the VAE on the candle arm (7b69170)
+passing its 60 dB gate and the direct-conv arm not built. Phase 4 has its memory half for
+1 MP and the CLI (5ea0d43) and not its serve half or its figure. Phases 5 and 6 are
+untouched. This doc is kept as it was written; the files and the reference source
+corrected it in nine places, listed in
+[records/qwen-image-t2i.md](records/qwen-image-t2i.md#where-the-plan-was-wrong), and the
+facts it marked unverified that are now settled are under "Resolved" at the end of "Open
+questions". The reference is [qwen-image.md](qwen-image.md) and the decisions are in
+[decisions/qwen-image.md](decisions/qwen-image.md).
+
 Working doc, opened 2026-09-21. Research only: no code was written for it and none is
 planned in it. It is the substance an engineer implements from later; when an arc ships,
 its decisions migrate to a new topic file `docs/decisions/qwen-image.md` (and a line in
@@ -840,6 +852,34 @@ decisions.md "The transformer runs bf16 end to end"); the chat sidebar's tool fo
   measured at Phase 4 before the native size is served.
 - The two-base-pointer K/V read in `flash_t.metal` that would remove the per-step
   `[prefix ; target]` copy: whether the copy costs anything on Metal is unpriced.
+
+**Resolved, 2026-09-21**, each read off the shipped files or measured by a gate
+([the record](records/qwen-image-t2i.md)):
+
+- The file tree, shard counts and sizes: two transformer shards, 14,230,249,472 bytes,
+  bf16; four text-encoder shards, 17,534,247,392 bytes; the repo 33,134,949,212 bytes. The
+  VAE is ONE F32 file of 1,350,989,512 bytes, not bf16 and not about 0.25 GB.
+- The transformer, scheduler and preprocessor configs equal the mirrored values.
+  `preprocessor_config.json`: mean and std 0.5, `shortest_edge` 65536, `longest_edge`
+  16,777,216, so a 1024x1024 reference does not shrink.
+- `processor/tokenizer.json` is byte-identical to `Qwen/Qwen3-4B`'s, and the byte-compare
+  test covers it: `VocabFamily::Qwen3` holds.
+- The drop index is 14 on the shipped file; the neon prompt is 45 tokens, 31 kept.
+- Text-only MRoPE is plain NEoX: the reference's ids are equal on all three axes, and the
+  encoder reads cosine 0.99997 or better on the plain table.
+- `hidden_states[-1]` is normed without the hook on transformers 5.17, and "depth 36,
+  pre-norm" is `EncoderSpec::final_norm`.
+- The VAE's norm form is confirmed by the VAE-alone gate at 91.07 dB.
+- The size rule is multiples of 32, refused and not floored; the rope extent is 2048
+  latent tokens a side, positions `[-1024, 8192)`.
+- The doc drift in decisions/zimage.md has a dated correction appended.
+- `<imageN>` is plain text to the tokenizer; the renderer writes the markup itself.
+
+Still open: whether the `text_encoder/` values equal standalone Qwen3-VL-8B-Instruct; the
+absence of an official distilled variant; the 1024x1024 default against the native
+2048x2048 (the 1 MP cap decides it for now); the untiled 2048x2048 decode peak (the
+1024x1024 one is 55 to 56 GiB); whether image models get a listing of their own on serve;
+the two-base-pointer K/V read; and everything about the vision tower, which is Phase 5's.
 
 ## Sources
 

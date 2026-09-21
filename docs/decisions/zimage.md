@@ -687,3 +687,12 @@ including manual or previously queued work. It remains held through the single b
 commit, then releases without changing a manual pause. Chat holds also keep the
 workspace, session and server fixed. The assistant sidebar sits in the layout so the
 controls and gallery remain usable.
+
+**Correction, 2026-09-21: `Format::Diffusion` has ONE field, and the paragraph above that
+names four describes a shape that never shipped.** "The pipeline is a new registry entry
+naming every file in the repo" writes the variant as `Format::Diffusion { text_encoder,
+transformer_config, vae_config, scheduler_config }`. The code is `Format::Diffusion {
+text_encoder: Model }` and its doc comment states the rule: the layout lives in the
+loader, the entry owns only which files a fetch pulls, `model_index.json` first. The rest
+of that paragraph stands. The drift was found by the research for the second diffusion
+entry, which follows the code: [qwen-image.md](qwen-image.md) (2026-09-21).

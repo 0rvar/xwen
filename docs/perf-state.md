@@ -463,6 +463,19 @@ list: it is a footprint lever here and cannot move a step (decisions.md "The tra
 runs bf16 end to end"). The lever ranking itself lives in
 [records/zimage-perf.md](records/zimage-perf.md).
 
+## Qwen-Image 2.1, a time per image and not a tok/s target
+
+Kept apart for the reason Z-Image is, and on the same terms (decisions.md "Diffusion image
+transformers are in scope, held to correctness bars first"). **There is no figure yet.**
+The model renders and is graded as of 2026-09-21 (5ea0d43), and every timing taken that
+day was on an unpinned dev-tree build with `pmset -g` reading `lowpowermode         1`, so
+those are observations in [records/qwen-image-t2i.md](records/qwen-image-t2i.md) and not
+figures. What is owed: a pinned binary, the `pmset -g` line verbatim, nothing else on the
+GPU, 1024x1024 at 40 steps, a step quoted as a range with its ramp and never as a mean
+(decisions.md "A Z-Image step is quoted at steady state"), and the VAE decode quoted
+apart from the steps, it being the largest single stage on the candle arm. The item is in
+[TODO.md](../TODO.md) "Image generation".
+
 ## History
 
 Narrative, protocol and the tables that produced these figures live in the log and its

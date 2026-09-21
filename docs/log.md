@@ -4,6 +4,24 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-21 — Qwen-Image 2.1 renders from `xwen image`, graded against diffusers
+
+`xwen image --model qwen-image-2.1` renders a PNG (ca71309 to 5ea0d43): the Qwen3-VL-8B
+text tower through the dense Qwen3 loader, read before its final norm, a 32-block
+single-stream transformer with block-causal attention run as segments and the text K/V
+kept across its 40 steps, and a one-frame RGBA VAE, all in a new `src/qwen_image/` written
+from diffusers. Against diffusers fp32 at 512x512: step-0 velocity cosine 1.000000 and
+mean relative error 0.0006 where the reference's own bf16 arm reads 0.999948 and 0.0075,
+both wrong graphs outside the bar at 0.9825 and 0.9874, the VAE alone 91.07 dB, the
+40-step image 57.30 dB against the bf16 arm's 35.58. The encoder reads minimum cosine
+0.99997 over 12 prompts, with its bars reset from the reference's spread after kept row 0
+turned out to carry a massive activation. The image comes back RGBA only when at least 10
+pixels have alpha at most 8. The decode peaked at 71 GiB against a guessed 46, so it now
+drains between convolutions (55 to 56 GiB) and admission is fitted to the measurements.
+No time-per-image figure: the machine was in low power mode and the binary unpinned.
+Serve still refuses the model. [Record](records/qwen-image-t2i.md),
+[architecture](qwen-image.md), [decisions](decisions/qwen-image.md).
+
 ## 2026-09-21 — `--model-size` removed: `--model` takes an alias, a full name or a path
 
 One flag names a checkpoint on every subcommand, `logits-dump` and the scripts:

@@ -21,7 +21,9 @@ one that owns it:
   and the whole Z-Image-Turbo pipeline (the encoder role it came in for, then the
   diffusion transformer, the VAE, the scheduler and their traps), the way
   `docs/qwen4exp-port.md` is Flash-Next's port: per-architecture reference, not a rule
-  and not a timeline.
+  and not a timeline. **`docs/qwen-image.md`** is the same for Qwen-Image 2.1, and
+  `docs/qwen-image-2.1-plan.md` is the research that preceded it, kept as written with a
+  status block and a "Resolved" list: where the two disagree the reference is right.
 - **`docs/perf-state.md`** is the current figures, and it is their single source.
 - **`docs/benching.md`** is how to measure anything on this machine.
 - **`TODO.md`** is the backlog and the open ledger: a ranked **Front** of at most ten
@@ -361,9 +363,11 @@ Traps, each of which has already cost someone time:
   scans all 8 GB on every open (~1.4 s in dev), which every routed caller now pays,
   `encode-text` and `logits-dump` included; it is the first thing to fix when
   `servable()` flips.
-- **The Python exception.** `scripts/zimage-ref-dump.py` is the only Python in the repo,
-  run by hand under `uv` in a throwaway venv, never in CI. It exists because the encoder
-  has no ONNX export and there is no bun path to torch. It is not a precedent.
+- **The Python exception.** `scripts/zimage-ref-dump.py` and, since 2026-09-21,
+  `scripts/qwen-image-ref-dump.py` are the only Python in the repo, both run by hand under
+  `uv` in a throwaway venv, never in CI. They exist because the encoders have no ONNX
+  export and there is no bun path to torch. Two scripts of one kind, one per diffusion
+  pipeline, are still not a precedent for anything else.
 - **A GGUF whose arch string is `qwen3` is refused**, pointing at the safetensors
   directory. Safetensors is the form this architecture ships in here.
 - **Serve carries TWO vocabularies and they follow the request's target**, not the
@@ -567,6 +571,95 @@ expect: there
 is no `CheckpointSource` arm for diffusion weights; `ZImagePipeline::load` goes through
 candle's `VarBuilder` directly, casting fp32 to bf16 one tensor at a time, which is a
 deliberate deferral until a second consumer exists.
+
+## Qwen-Image 2.1 (diffusion, written from diffusers)
+
+The second image pipeline, text-to-image as of 2026-09-21 (5ea0d43):
+`xwen image --model qwen-image-2.1` renders, `xwen encode-text --model
+qwen-image-2.1-encoder` runs the encoder alone, and **serve refuses the model** on every
+images path until its route lands (TODO.md Front). Editing with reference images is
+shaped for and not wired. [docs/qwen-image.md](docs/qwen-image.md) is the architecture
+and the full trap list, [docs/decisions/qwen-image.md](docs/decisions/qwen-image.md) the
+decisions, [docs/records/qwen-image-t2i.md](docs/records/qwen-image-t2i.md) the arc, and
+[docs/qwen-image-2.1-plan.md](docs/qwen-image-2.1-plan.md) the research, which the files
+corrected in nine places.
+
+Shape: `Qwen/Qwen-Image-2.1`, 33.1 GB, Qwen Research License (non-commercial, binds the
+weights and not the outputs). A 7.12 B single-stream DiT, 32 blocks, dim 4096 = 32 heads
+of 128, SwiGLU 12288, ONE shared modulation, bf16 on disk (14.2 GB); the FULL
+Qwen3-VL-8B under `text_encoder/` (17.5 GB, of which the text tower is loaded); a
+one-frame RGBA VAE that is **F32 on disk, 1.35 GB**; 64 latent channels at 16x, patch 1,
+so 1024x1024 is 4096 tokens and the native 2048x2048 is 16384; 40 flow-match Euler steps
+with a dynamic exponential shift, no guidance. Aliases `qwen-image-2.1` (the pipeline,
+`Format::Diffusion`) and `qwen-image-2.1-encoder` (encode-only); neither is servable,
+listed or auto-fetched by serve, and the CLI fetches with a notice as it does for Z-Image.
+
+The seams, so a change lands in one place:
+
+- **`src/qwen_image/` is written from diffusers at `6256aa7`, not vendored**, candle
+  having no module for this model. It reuses the Z-Image seams unedited
+  (`zimage::linear::Projection` on an f32 stream, `ops::flash_attn_tensor`,
+  `ops::rope_pair`, `ops::gated_residual`, `ops::silu_mul`, `seeded_noise`,
+  `encode_png`) and no kernel was written for it. `transformer.rs` owns the layout, the
+  rope walk, the segmented attention and the prefix cache; `scheduler.rs` the
+  dynamic-shift grid, its own file and NOT an arm in the vendored Z-Image scheduler;
+  `vae.rs` the decoder and the encoder; `pipeline.rs` the loop, the size rule, the RGBA
+  rule and `peak_bytes`; `conditioning.rs` the prompt.
+- **The encoder is the dense Qwen3 loader, extended**, not a second implementation:
+  `qwen3_vl` with its nested `text_config`, the `model.language_model.` prefix,
+  `model.visual.*` and the untied head left out of routing, MRoPE accepted only as
+  interleaved sections. Text-only MRoPE is plain NEoX, measured. An untied set is refused
+  on every language path; `load_encoder` alone accepts it.
+- **`EncoderSpec::final_norm` and `XwenModel::encode_spec`** are how "depth 36, BEFORE
+  the final norm" is said. The repo's index 36 norms, and transformers 5.17 returns the
+  normed state without the pipeline's hook; the normed state reads cosine 0.62 against the
+  right one. Every spec-driven caller goes through `encode_spec`; never reach for bare
+  `encode` with a spec in hand.
+- **The sequence is an ordered list of segments with the target LAST**, and with
+  reference images their latent rows sit INSIDE the text stream, each `<|image_pad|>`
+  slot expanded four-fold, not after it. Attention is block-causal and runs as segments:
+  one call per prefix segment, causal for text alone, one for the target over every key.
+  `XWEN_QWEN_IMAGE_ATTN=basic` is the dense-mask arm.
+- **The prefix K/V is kept from step 0** (diffusers' `use_kv_cache`, which the reference
+  sample is produced under), so a later step runs the target rows alone.
+  `XWEN_QWEN_IMAGE_CACHE=off` is the same math and therefore a bisect arm, never a
+  wrong-graph bracket.
+- **`keeps_alpha` owns the output form**: RGBA only when at least 10 pixels have alpha at
+  most 8, RGB otherwise. An ordinary prompt's alpha is 252 to 255 with a sixth of the
+  pixels at 254, and a transparent background sits at alpha 1, not 0, on the reference
+  too. `encode_png` picks RGB8 or RGBA8 by channel count; a new consumer of
+  `Rendered.image` must not assume three channels.
+- **`peak_bytes` is fitted to measurement**: 17 GiB plus 48 GiB per megapixel, from a
+  decode that peaks at 25 GiB (512x512) and 55 to 56 GiB (1024x1024) against a 27 GiB step
+  phase. The decode syncs between convolutions because that is what evicts candle's pool
+  (71 GiB without); what is left is one im2col buffer, which is what the direct-conv arm
+  removes. `memory::qwen_image_peak` keeps the 1 MP cap because 2048x2048 is unmeasured,
+  not because the model cannot. Re-fit the constants when the decode changes; a unit test
+  holds the estimate above the measured ones.
+
+Traps that are silent, the short list (all of them in docs/qwen-image.md): the hidden
+state is PRE-norm; the prompt is a raw template and the first 14 rows are dropped after
+encoding; literal special-token text in a prompt stays text, on purpose; TEXT first and
+the output is the target SUFFIX, where Z-Image is image first; `t` is `sigma` and the
+velocity is NOT negated, where Z-Image feeds `1 - sigma` and negates; text rows read the
+`t = 0` modulation row in every block and the final norm; `txt_in`'s norm stores
+`w - 1`, the only such norm; rope is interleaved-pair here and NEoX in the encoder, with
+centred NEGATIVE h and w ids and f32 angles; the VAE's norm is an L2 norm over channels,
+five of its nine shortcut stages are neither pools nor upsamples at one frame, 12
+`time_conv` tensors are dead, and it denormalises the latent INSIDE `decode`; the noise
+is unscaled and `mu` comes from the target's token count.
+
+Both gates are `#[ignore]`d and FAIL rather than skip when a fixture or the weights are
+missing. `tests/qwen_image_encoder.rs` (needs `XWEN_QWEN_IMAGE_REF_DIR`, the dump's out
+dir) holds cosine 0.9999 on every row, relative error 0.03 past kept row 0 with 99% of
+rows inside 0.01, and 0.05 on kept row 0, which carries a massive activation inside the
+stack; a non-ignored test pins every constant between the reference's own bf16 spread and
+the normed wrong graph, so never move one without re-reading `reference.json`.
+`tests/qwen_image_parity.rs` grades the step-0 velocity at Z-Image's bars (cosine 0.998,
+mean relative error 0.04) with two wrong graphs asserted outside, and the VAE alone at
+60 dB. It reads cosine 1.000000 and 0.0006, brackets 0.9825 and 0.9874, VAE 91.07 dB and
+a 40-step image at 57.30 dB. The dump commands are in docs/qwen-image.md. **There is no
+time-per-image figure**: every timing so far was unpinned and in low power mode.
 
 ## The candle situation
 
