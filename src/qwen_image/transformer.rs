@@ -70,6 +70,10 @@ const ROPE_THETA: f32 = 10000.0;
 const ROPE_MAX_POSITION: usize = 8192;
 const ROPE_MAX_NEGATIVE: usize = 1024;
 
+/// The longest image side, in latent tokens, whose centred positions
+/// `[-(side - side/2), side/2)` stay inside the rope.
+pub const MAX_IMAGE_SIDE: usize = 2 * ROPE_MAX_NEGATIVE;
+
 /// Latent tokens per vision-language image slot, a 2x2 group.
 const TOKENS_PER_SLOT: usize = 4;
 
@@ -306,7 +310,7 @@ impl Segment {
     pub fn len(&self) -> usize {
         match *self {
             Self::Text { len } => len,
-            Self::Image { height, width } => height * width,
+            Self::Image { height, width } => height.saturating_mul(width),
         }
     }
 
@@ -531,8 +535,37 @@ impl Layout {
     /// or past 8192, or an image side centring below -1024. The counter itself
     /// is not bounded, so a trailing image may advance it past the table as
     /// long as its own frame is inside, which is what the reference accepts.
+    ///
+    /// Every bound is checked before anything is allocated, so a layout of
+    /// absurd extents is an error and never an allocation.
     pub fn positions(&self) -> Result<Vec<[i64; 3]>> {
-        let mut out = Vec::with_capacity(self.len());
+        let mut total = 0usize;
+        for segment in &self.segments {
+            if let Segment::Image { height, width } = *segment
+                && let Some(side) = [height, width].into_iter().find(|&s| s > MAX_IMAGE_SIDE)
+            {
+                candle_core::bail!(
+                    "qwen-image rope: an image side of {side} latent tokens centres past \
+                     -{ROPE_MAX_NEGATIVE}, the rope's lowest position"
+                );
+            }
+            // Bounded sides make an image at most MAX_IMAGE_SIDE squared; a
+            // text run past the table is refused below, and here only has to
+            // not overflow.
+            total = total.saturating_add(segment.len());
+        }
+        let text: usize = self
+            .segments
+            .iter()
+            .filter(|s| matches!(s, Segment::Text { .. }))
+            .fold(0usize, |n, s| n.saturating_add(s.len()));
+        if text > ROPE_MAX_POSITION {
+            candle_core::bail!(
+                "qwen-image rope: {text} text tokens, past the {ROPE_MAX_POSITION} positions the \
+                 rope holds"
+            );
+        }
+        let mut out = Vec::with_capacity(total);
         let mut position = 0usize;
         for segment in &self.segments {
             match *segment {
@@ -550,14 +583,6 @@ impl Layout {
                     position += len;
                 }
                 Segment::Image { height, width } => {
-                    for side in [height, width] {
-                        if side - side / 2 > ROPE_MAX_NEGATIVE {
-                            candle_core::bail!(
-                                "qwen-image rope: an image side of {side} latent tokens centres \
-                                 past -{ROPE_MAX_NEGATIVE}, the rope's lowest position"
-                            );
-                        }
-                    }
                     if position >= ROPE_MAX_POSITION {
                         candle_core::bail!(
                             "qwen-image rope: an image block sits at frame {position}, past the \
@@ -1810,6 +1835,19 @@ pub(crate) mod tests {
 
     #[test]
     fn rope_refuses_a_layout_past_the_table() {
+        // Extents no allocation could hold are refused before one is tried.
+        for (text, h, w) in [
+            (1, usize::MAX, usize::MAX),
+            (usize::MAX, 2, 2),
+            (1, 2, usize::MAX),
+        ] {
+            assert!(
+                Layout::text_to_image(text, h, w)
+                    .unwrap()
+                    .positions()
+                    .is_err()
+            );
+        }
         let tall = Layout::text_to_image(1, 2 * ROPE_MAX_NEGATIVE + 2, 1).unwrap();
         assert!(
             tall.positions()
@@ -2047,7 +2085,7 @@ pub(crate) mod tests {
     #[test]
     fn the_shipped_index_names_exactly_the_loaders_tensors() {
         const REPO: &str = "Qwen/Qwen-Image-2.1";
-        const FETCH: &str = "xwen fetch --model-size qwen-image-2.1";
+        const FETCH: &str = "xwen fetch --model qwen-image-2.1";
         let Some(index) = crate::test_support::repo_file_or_skip(
             REPO,
             "transformer/diffusion_pytorch_model.safetensors.index.json",

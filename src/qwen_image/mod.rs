@@ -5,6 +5,7 @@
 //! from candle, which has no module for this model.
 
 pub mod conditioning;
+pub mod pipeline;
 pub mod scheduler;
 pub mod transformer;
 pub mod vae;
