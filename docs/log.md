@@ -4,6 +4,23 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-09-21 — Qwen-Image 2.1 researched and planned, no code
+
+Qwen-Image 2.1 shipped on 2026-09-20 (Qwen Research License, non-commercial): a 7.12 B
+single-stream DiT, 32 blocks of dim 4096, one shared modulation, block-causal attention
+with the text prefix modulated at t=0 so its K/V is kept across all 40 guidance-free
+steps, a 64-channel RGBA VAE at 16x, Qwen3-VL-8B as the encoder read before its final
+norm, and editing over up to ten reference images tagged `<imageN>` in the prompt. A
+research session mapped it against the Z-Image seams: the gemm, the head-dim-128 tensor
+attention kernel (independent query and key lengths), rope, the gated residual and the
+scale fold reuse as-is; the text tower is the dense Qwen3 graph wider (same tokenizer
+file); the scheduler's dynamic shift, the size rule, the flat 40 GiB image peak, the
+route's model rule and the guidance 400s generalise; the VAE, the vision tower with
+DeepStack, real three-axis MRoPE, the clean condition rows and the GUI's reference list
+are new. Cost is derived at ~1.2x a Z-Image step at 1024x1024 and unmeasured. Six phases,
+each with its gate, in [the plan](qwen-image-2.1-plan.md); nothing in TODO.md yet, the
+promotion being the first act of the arc.
+
 ## 2026-09-17 — The prefill chunk narrows with the context, and a dead mask stops being built
 
 Two sessions resuming 85k- and 47k-token conversations failed every time with
