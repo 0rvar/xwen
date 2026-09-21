@@ -343,7 +343,8 @@ the image API's authentication policy and does not load models or wait for a ren
 `POST /v1/images/render` is the native JSON endpoint. `model` is a pipeline's full name
 as on the OpenAI routes, and absent means Z-Image-Turbo; with `Qwen-Image-2.1` the
 request is a prompt, a size, `steps`, `seed` and `n`, and `init_image`, `strength`,
-`mask`, `mask_blur`, `control` and `loras` are each a 400 naming the field. Image strings accept local
+`mask`, `mask_blur`, `control` and a non-empty `loras` are each a 400 naming the field
+(`"loras": []` is accepted). Image strings accept local
 server paths, plain base64 or image data URLs. Unknown fields, including nested
 fields, return 400. The response has a `data` array with `b64_json`, `seed`,
 `start_step` and, for control requests, `control_map`. `n` can request up to four
@@ -682,8 +683,9 @@ the three generations paths, or on `/v1/images/render`, renders with Qwen-Image 
 `Z-Image-Turbo` or no `model` renders with Z-Image-Turbo as before, and the response's
 `model` names whichever did. Its defaults are its own: 40 steps (`--image-steps` is
 Z-Image's eight-step figure and does not apply to it), both sides multiples of 32, the same
-1,048,576-pixel cap. A negative prompt or a guidance scale is a 400 here too, the route
-serving it without classifier-free guidance; a prompt past 4096 tokens is a 400; an
+1,048,576-pixel cap. A non-blank negative prompt or a non-zero guidance scale is a 400 here
+too, the route serving it without classifier-free guidance (a blank one and a scale of 0
+pass, as they do for Z-Image); a prompt past 4096 tokens is a 400; an
 uncached checkpoint is a 400 naming `xwen fetch --model qwen-image-2.1`. The PNG is RGBA
 when the render has a transparent region, by the same rule as `xwen image`. Only one
 pipeline is resident: a request for the other one unloads the resident one first, through

@@ -28,8 +28,8 @@ and it binds the weights, not the images made with them.
 
 | part | files | on disk |
 | --- | --- | --- |
-| `transformer/` | two shards, bf16, 297 tensors | 14,230,249,472 bytes (9.97 + 4.26 GB) |
-| `text_encoder/` | four shards, bf16, the FULL Qwen3-VL-8B (8,767,123,696 parameters) | 17,534,247,392 bytes |
+| `transformer/` | two shards, bf16, 297 tensors | shard files 14,230,284,408 bytes (9.97 + 4.26 GB); the index's `total_size`, tensor payload alone, is 14,230,249,472 |
+| `text_encoder/` | four shards, bf16, the FULL Qwen3-VL-8B (8,767,123,696 parameters) | shard files 17,534,339,488 bytes; the index's `total_size` is 17,534,247,392 |
 | `vae/` | one file, **F32**, 238 tensors | 1,350,989,512 bytes |
 | `processor/` | `tokenizer.json`, byte-identical to `Qwen/Qwen3-4B`'s, plus the vision preprocessor config | MB |
 | `scheduler/`, `model_index.json` | configs | KB |
@@ -144,15 +144,17 @@ arm.** The rule is `allowed = (q >= kv) OR same_image_block`. One call per prefi
 over keys `[0, end)`, a causal triangle for a text segment only, and one call for the
 target over all keys. On Metal an image segment is `ops::flash_attn_tensor` with
 `q = [32, N, 128]` f32 and `k, v = [32, K, 128]` f16, and a text segment is an explicit
-f32 chain, being tens of tokens. `XWEN_QWEN_IMAGE_ATTN=basic` is one dense f32 attention
-under the explicit mask, which is the off-Metal path and the bisect arm, and the CPU
-tests hold the two equal to 1e-4 for text-to-image and for a layout with two adjacent
-reference images.
+f32 chain, being tens of tokens. Off Metal the default is still this segmented arm, every
+segment running the explicit f32 chain in place of the kernel. `XWEN_QWEN_IMAGE_ATTN=basic`
+is one dense f32 attention under the explicit mask, the bisect arm, chosen only by naming
+it and never as a fallback, and the CPU tests hold the two equal to 1e-4 for text-to-image
+and for a layout with two adjacent reference images.
 
 **The prefix K/V is kept across steps**, which is diffusers' `use_kv_cache=True` and the
 mode the reference sample is produced under. Text and reference rows are modulated from a
-fixed `t = 0` row in every block and in the final norm, and they attend only to
-themselves, so they are identical at every step. `forward_prefill` runs the whole
+fixed `t = 0` row in every block, and they attend only to themselves, so they are
+identical at every step. No final-norm op runs on them: `final_layer` takes the target
+stream alone, with the real timestep's row. `forward_prefill` runs the whole
 sequence at step 0 and returns a `PrefixCache` of each block's post-QK-norm, post-rope K
 and V (f16 head-major on the tensor arm, copied so the cache does not pin the prefill's
 tensors) plus the target's rope rows. `forward_cached` then runs ONLY the target rows: no
@@ -166,9 +168,15 @@ by one; an image block takes `frame = position` for all its rows, `h` in
 it sits, then `position += max(H, W)`. The angle is a float32 inverse frequency times the
 index, as the reference computes it, because an f64 table drifts from the reference at
 large positions; the cos and sin of that f32 angle are rounded once from f64. The table
-covers `[0, 8192)` and `[-1024, 0)`. `positions()` bounds the positions actually WRITTEN
-(a frame or text position at 8192 is refused, an image side past 2048 latent tokens is
-refused) before it allocates, and `MAX_IMAGE_SIDE` is what `check_size` reads.
+covers `[0, 8192)` and `[-1024, 0)`. `positions()` bounds the positions actually WRITTEN:
+a frame or text position at 8192 is refused, and an image side past 2048 latent tokens is
+refused. Two of those checks run by arithmetic BEFORE `Vec::with_capacity`, every image
+side against `MAX_IMAGE_SIDE` and the total text length against the 8192 positions, with
+the element count summed by saturating adds; the per-position checks (where a text run or
+an image frame lands once the counter has advanced) run after it, inside the walk. What
+that guarantees is that an absurd size is an error and neither a capacity-overflow panic
+nor a huge allocation, not that nothing is allocated before every refusal.
+`MAX_IMAGE_SIDE` is what `check_size` reads.
 
 `GraphVariant::{FullyBidirectional, RealTimestepForText}` are the two wrong graphs the
 parity gate asserts fall outside its bar.
@@ -244,8 +252,9 @@ this norm is a per-PIXEL factor times a per-channel gamma. So it has its own ker
 `ops::channel_l2_norm` (`src/ops/channel_l2_norm.metal`), one thread per pixel, bounded
 on an explicit `n` and never on `threads_per_grid`, contiguous operands required with
 their storage offsets honoured. It is not bitwise against candle's chain and its tests
-bound it at 2e-6 of scale, with a nonzero-offset view, a strided input refused by name,
-and pixels on both sides of the 1e-12 floor. The two arms differ by a nonzero amount
+bound the chain comparisons at 2e-6 of scale, a nonzero-offset view among them, with a
+strided input refused by name. The floor test, pixels on both sides of 1e-12, is graded
+against the form computed in f64 at 1e-5 relative. The two arms differ by a nonzero amount
 under 1e-4 of scale on a tiny decoder, which the test asserts both ways, and the
 comparison refuses a NaN.
 
@@ -362,19 +371,28 @@ pipeline cannot be registered and missed.
   pipeline that rendered. `POST /v1/images/render` takes the same optional `model`.
 - Per model: steps default 40 here against 8, and `--image-steps` is Z-Image's ALONE,
   eight steps being an unfinished render of this model; both sides multiples of 32; the
-  1 MP cap. `init_image`, `strength`, `mask`, `mask_blur`, `control` and `loras` are 400s
-  naming the model, refused before any input is decoded, and the multipart edits and
-  variations routes refuse the model before the image is decoded. `negative_prompt` and
-  `guidance_scale` are 400s on both pipelines, this one's sentence saying it is served
-  without classifier-free guidance, the way its model card samples it.
+  1 MP cap. On the native `POST /v1/images/render`, `init_image`, `strength`, `mask`,
+  `mask_blur`, `control` and a NON-EMPTY `loras` (`"loras": []` passes) are 400s naming
+  the model, refused before any input is decoded, and the multipart edits and variations
+  routes refuse the model before the image is decoded. The OpenAI generations route is
+  different: its body has no such fields and it accepts and drops what it does not know,
+  which is that route's existing rule, so an `init_image` sent there is silently ignored
+  and not refused. `negative_prompt` and `guidance_scale` are 400s on both pipelines when
+  they would change the result, this one's sentence saying it is served without
+  classifier-free guidance, the way its model card samples it; a blank negative prompt
+  and a `guidance_scale` of 0 are accepted.
 - ONE image pipeline is resident at a time (`Loaded` is an enum of the two). A request is
   PLANNED before anything is evicted or admitted (`plan()`, pure, its cache check and its
   prompt renderer passed as closures): the cache is asked only when the request loads or
   replaces a pipeline, the prompt is rendered and `check_layout`ed from the tokenizer
   alone, and only then does `unload_first` run the existing unload (drain, drop, drain)
   with the lease held across it. The validated ids are carried into the encode. A warm
-  Z-Image request checks nothing on disk, and a warm request for this model checks only
-  what it reopens, the encoder's files and the tokenizer.
+  Z-Image request skips the cache-completeness check and still reopens its tokenizer, as
+  it always did (`zimage::conditioning::prompt_ids` loads it per call); a warm request
+  for this model checks what it reopens, the encoder's files and the tokenizer. What the
+  plan cannot see it cannot refuse first: a fault only the LOAD discovers still evicts.
+  A Z-Image request carrying a structurally valid LoRA whose dimensions do not match
+  unloads a resident Qwen-Image pipeline and then fails in `ZImageLoaded::open`.
 - The text encoder loads PER REQUEST and is released before the render, 2.0 to 4.2 s each
   time across every run observed. `KEEP_QWEN_IMAGE_ENCODER` (false) is the seam for
   keeping it, together with the admission figure. Admission is
@@ -385,8 +403,10 @@ pipeline cannot be registered and missed.
   at every size under the cap. The warm credit is 14 GiB (Z-Image's is 16).
 - Status classes. 400: an unknown model, a refused field, the size and cap messages, an
   uncached model (naming `xwen fetch --model qwen-image-2.1`), an over-length prompt
-  (`conditioning::PromptTooLong`, the CLI's sentence) and a layout refusal. 500: any
-  other tokenizer failure, a broken file not being the client's fault. 503: a full queue,
+  (`conditioning::PromptTooLong`, the CLI's sentence) and a layout refusal. A tokenizer
+  MISSING from the cache is that same uncached 400. 500: a tokenizer file that resolved
+  and then failed to open or parse, or any other failure out of the renderer, a broken
+  file not being the client's fault. 503: a full queue,
   and an interruption during the encoder phase as during the render. Never 401, 402, 409
   or 429, as for Z-Image. A panic during the encode unwinds the engine thread, and what
   frees the encoder then is drop order: `loaded` is declared after the lease and drops
@@ -421,8 +441,9 @@ the multipart refusals, which are tested at the `prepare` level.
 - The sequence is TEXT FIRST and the output is the target SUFFIX. Z-Image is image first
   and a prefix narrow.
 - `t` is `sigma` and the velocity is used as is. Z-Image feeds `1 - sigma` and negates.
-- Text and reference rows read the `t = 0` modulation row, in every block and in the
-  final norm. Modulating them from the real `t` reads cosine 0.9874 at step 0.
+- Text and reference rows read the `t = 0` modulation row in every block. The final
+  layer runs on the target rows alone, with the real `t`. Modulating the prefix from the
+  real `t` reads cosine 0.9874 at step 0.
 - Attention is block-causal. Fully bidirectional attention reads cosine 0.9825.
 - `txt_in`'s norm weight is stored as `w - 1`. It is the only such norm in the model.
 - Rope is interleaved-pair in the transformer and NEoX in the encoder, the h and w ids
@@ -459,9 +480,14 @@ $P scripts/qwen-image-ref-dump.py --stage transformer --dtype fp32 \
 Measured with torch 2.14.0, transformers 5.17.0 and diffusers 0.41.0.dev0. `tokens` needs
 no weights. The encoder stages run on the CPU (fp32 eager about a minute, bf16 about four
 and a half), the transformer stages on mps (165 s fp32, 48 s bf16 at 512x512), the
-encoder freed before the transformer loads. Every weight stage asserts three things: its
-own path equals the pipeline's method bit for bit on one prompt, the text position ids
-are equal on all three MRoPE axes, and the normed state differs from the pre-norm one.
+encoder freed before the transformer loads. The two ENCODER weight stages (`fp32`,
+`bf16`) assert, on the check prompt, that their own path equals the pipeline's method bit
+for bit and that the text position ids are equal on all three MRoPE axes and an `arange`,
+and on every prompt that the hook took (`hidden_states[-1]` equals the final norm's
+input). The distance between the normed and the pre-norm state is RECORDED
+(`normed_vs_prenorm`) and not asserted; `finalize` asserts only that a normed dump exists
+for the bracket. The transformer stages run none of those checks; they assert the
+scheduler config, the input shapes and one forward per step.
 
 **The encoder gate**, `tests/qwen_image_encoder.rs`:
 
@@ -476,8 +502,8 @@ reference's own spread); the arrays, about 50 MB, stay in the out dir. String, i
 drop are compared first. Every kept row must hold cosine 0.9999. Rows past kept row 0
 must hold max relative error 0.03 and 99% of them 0.01; kept row 0 has its own bar, 0.05,
 because it carries a massive activation inside the stack. A non-ignored test holds every
-constant between the reference's bf16 spread and the normed wrong graph, read from
-`reference.json`. xwen reads minimum cosine 0.99997 and 99.67% of rows inside 0.01.
+PER-ROW bar between the reference's bf16 spread and the normed wrong graph, read from
+`reference.json`; the 99% share (`TYPICAL_SHARE`) is checked by the ignored gate alone. xwen reads minimum cosine 0.99997 and 99.67% of rows inside 0.01.
 `XWEN_QWEN_IMAGE_ONLY` selects prompts and `XWEN_QWEN_IMAGE_DUMP_DIR` writes xwen's rows.
 
 **The parity gate**, `tests/qwen_image_parity.rs`, reading the snapshot root from

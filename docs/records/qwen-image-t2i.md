@@ -439,3 +439,11 @@ shard counts were right.
   encode phase on serve.
 - **A guard type for the encoder on the panic path.** Drop order frees it today and no
   test holds that. Reopen if the engine thread ever gains a catch or `loaded` moves.
+- **Refusing a bad LoRA before the swap.** `plan()` refuses what it can see (an uncached
+  model, the prompt's length and layout, the per-model field rules) before anything is
+  evicted; a fault only the load discovers still evicts first. The known case: a Z-Image
+  request whose LoRA is a well-formed safetensors file of the wrong dimensions unloads a
+  resident Qwen-Image pipeline and then fails in `ZImageLoaded::open`, the shapes being
+  checked against the transformer's in `src/zimage/lora.rs`. Sketch: read the LoRA's
+  safetensors header in the plan and check its dimensions against the pipeline config.
+  Reopen when a bad LoRA costs someone a reload.

@@ -70,8 +70,9 @@ the shipped arm.** `(q >= kv) OR same_image_block` decomposes into one call per 
 segment over keys `[0, end)`, causal for text alone, and one call for the target over
 every key, which is what diffusers' non-flex processor does. `ops::flash_attn_tensor`
 takes independent query and key extents, so the target call is the shipped kernel
-unedited. The dense-mask arm exists as the off-Metal path and the bisect arm, and the CPU
-tests hold the two equal to 1e-4 with zero and with two reference blocks. The sequence is
+unedited. Off Metal the segmented arm stays the default and runs the explicit f32 chain
+per segment; the dense-mask arm is the bisect arm, chosen only by name, and the CPU tests
+hold the two equal to 1e-4 with zero and with two reference blocks. The sequence is
 an ordered segment list because the reference puts reference-image rows INSIDE the text
 stream, not after it (2026-09-21).
 
@@ -105,7 +106,8 @@ relative error 0.03, under the MEDIAN row of torch's bf16 arm (0.034) and 13 tim
 the wrong graph's best row (0.404), and 99% of rows must still hold 0.01, which xwen does
 at 99.67%. The six rows that miss 0.01 are function words and the literal `<think>`, and
 they are the rows torch's bf16 arm is worst on too. A non-ignored test asserts each
-constant against `reference.json`, so a bar cannot leave its bracket. The
+per-row bar against `reference.json`, so none of them can leave its bracket; the 99%
+share is checked by the ignored gate alone. The
 massive-activation figures came from a one-off torch probe and are not reproduced by the
 script (2026-09-21).
 
@@ -220,8 +222,11 @@ admission, and carries the validated ids into the encode. Checked end to end wit
 resident: a 10,022-token prompt for this model was a 400 in 0.21 s, `/health` still named
 Z-Image, the log showed no unload, and the next Z-Image request ran warm in 10.2 s
 against 43.4 s cold. The cache is asked only on a load or a replace, a resident pipeline
-otherwise starting to refuse when a cache file disappears after it loaded (2026-09-21,
-3ccb17b).
+otherwise starting to refuse when a cache file disappears after it loaded. The plan
+refuses what it can SEE before evicting: an uncached model, the prompt's length and
+layout, the per-model field rules. A fault only the load discovers still evicts first, a
+LoRA whose dimensions do not match the transformer being the known case
+([the record](../records/qwen-image-t2i.md), "Not taken now") (2026-09-21, 3ccb17b).
 
 **The text encoder loads per request on serve and is not kept warm.** Kept, it is
 15.7 GB on top of a 15.7 GB pipeline for as long as the pipeline is resident. Loaded per
@@ -245,8 +250,9 @@ every listed id renders without a fetch, and carries what a picker needs: defaul
 maximum steps, the size rule, the pixel cap, `max_references` (0 for both today) and
 which controls exist (2026-09-21).
 
-**`negative_prompt` and `guidance_scale` are 400s on both pipelines.** Z-Image's reason
-is distillation. This model's is that it is served without classifier-free guidance, the
+**`negative_prompt` and `guidance_scale` are 400s on both pipelines.** Only when they
+would change the result: a blank negative prompt and a `guidance_scale` of 0 are
+accepted, as they were for Z-Image. Z-Image's reason is distillation. This model's is that it is served without classifier-free guidance, the
 way its model card samples it, so either field would be silently ignored, which is the
 thing the route refuses to do. True CFG is two forwards a step with a prefix cache each
 and is not built (2026-09-21).
@@ -254,9 +260,11 @@ and is not built (2026-09-21).
 **Request faults are classed by whose fault they are.** 400 is the client's: an unknown
 model, a refused field, a size, an uncached model naming the fetch, an over-length prompt
 and a layout refusal. The first version folded every failure out of the prompt renderer
-into a 400, a missing or corrupt tokenizer file included, so `conditioning` gained a
-typed `PromptTooLong` whose text is the old sentence and everything else out of it is a
-500. An interruption during the encoder phase is a 503 like one during the render, where
+into a 400, a corrupt tokenizer file included, so `conditioning` gained a typed
+`PromptTooLong` whose text is the old sentence and everything else out of the renderer
+is a 500. A tokenizer MISSING from the cache never reaches the renderer: it is the
+uncached 400 naming the fetch, and only a file that resolved and then failed to open or
+parse is a 500. An interruption during the encoder phase is a 503 like one during the render, where
 it was a 500. A PANIC during the encode is not handled by a guard: the engine thread
 unwinds, `loaded` drops before the lease because it is declared after it, and its
 `DeviceDrain` synchronizes or aborts. That relies on declaration order and has no test

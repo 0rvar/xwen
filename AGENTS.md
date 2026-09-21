@@ -591,8 +591,10 @@ Qwen3-VL-8B under `text_encoder/` (17.5 GB, of which the text tower is loaded); 
 one-frame RGBA VAE that is **F32 on disk, 1.35 GB**; 64 latent channels at 16x, patch 1,
 so 1024x1024 is 4096 tokens and the native 2048x2048 is 16384; 40 flow-match Euler steps
 with a dynamic exponential shift, no guidance. Aliases `qwen-image-2.1` (the pipeline,
-`Format::Diffusion`) and `qwen-image-2.1-encoder` (encode-only); neither is servable,
-listed or auto-fetched by serve, and the CLI fetches with a notice as it does for Z-Image.
+`Format::Diffusion`) and `qwen-image-2.1-encoder` (encode-only); neither is servable
+as a language model, listed on `/v1/models` or auto-fetched by serve (a cached
+`Qwen-Image-2.1` IS listed on `/v1/images/models`), and the CLI fetches with a notice as
+it does for Z-Image.
 
 The seams, so a change lands in one place:
 
@@ -653,8 +655,11 @@ The seams, so a change lands in one place:
 - **Serve holds ONE image pipeline at a time and plans before it evicts** (3ccb17b,
   `src/serve/images.rs`, a `Pipeline` enum owning every per-model rule). `plan()` runs
   the cache check and renders and layout-checks the prompt from the tokenizer alone
-  BEFORE any unload or admission, so an invalid request for one pipeline never evicts the
-  other; keep new request faults on that side of the swap. The encoder loads per request
+  BEFORE any unload or admission, so a fault the plan can SEE (uncached, prompt length,
+  layout, the per-model field rules) never evicts the other pipeline; keep new request
+  faults on that side of the swap. A fault only the LOAD discovers still evicts first: a
+  Z-Image request with a well-formed LoRA of the wrong dimensions unloads a resident
+  Qwen-Image pipeline and then fails in `ZImageLoaded::open`. The encoder loads per request
   and is released before the render (`KEEP_QWEN_IMAGE_ENCODER` is the seam); admission is
   `memory::qwen_image_serve_peak`, the render's peak or a 34 GiB encode phase, an
   estimate. On the SHARED surface: `model` selects a pipeline by full name and absent
@@ -668,7 +673,8 @@ state is PRE-norm; the prompt is a raw template and the first 14 rows are droppe
 encoding; literal special-token text in a prompt stays text, on purpose; TEXT first and
 the output is the target SUFFIX, where Z-Image is image first; `t` is `sigma` and the
 velocity is NOT negated, where Z-Image feeds `1 - sigma` and negates; text rows read the
-`t = 0` modulation row in every block and the final norm; `txt_in`'s norm stores
+`t = 0` modulation row in every block, and the final layer runs on the target rows alone
+with the real `t`; `txt_in`'s norm stores
 `w - 1`, the only such norm; rope is interleaved-pair here and NEoX in the encoder, with
 centred NEGATIVE h and w ids and f32 angles; the VAE's norm is an L2 norm over channels,
 five of its nine shortcut stages are neither pools nor upsamples at one frame, 12
@@ -679,8 +685,9 @@ Both gates are `#[ignore]`d and FAIL rather than skip when a fixture or the weig
 missing. `tests/qwen_image_encoder.rs` (needs `XWEN_QWEN_IMAGE_REF_DIR`, the dump's out
 dir) holds cosine 0.9999 on every row, relative error 0.03 past kept row 0 with 99% of
 rows inside 0.01, and 0.05 on kept row 0, which carries a massive activation inside the
-stack; a non-ignored test pins every constant between the reference's own bf16 spread and
-the normed wrong graph, so never move one without re-reading `reference.json`.
+stack; a non-ignored test pins every per-row bar between the reference's own bf16 spread
+and the normed wrong graph (the 99% share is the ignored gate's alone), so never move one
+without re-reading `reference.json`.
 `tests/qwen_image_parity.rs` grades the step-0 velocity at Z-Image's bars (cosine 0.998,
 mean relative error 0.04) with two wrong graphs asserted outside, and the VAE alone at
 60 dB. It reads cosine 1.000000 and 0.0006, brackets 0.9825 and 0.9874, VAE 91.07 dB and
