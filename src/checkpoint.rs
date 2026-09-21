@@ -68,12 +68,23 @@ impl CheckpointSource {
     /// knows one. It supplies the two things a safetensors set cannot work out
     /// for itself: where the tokenizer is (the Z-Image encoder's sits in a
     /// sibling directory, not its own) and which planes are allowed to be
-    /// zero-filled. Passing `None` is safe — the loader searches for the
-    /// tokenizer and allows no zero runs — but it means a Z-Image directory
-    /// opened without naming it is refused for the corruption it really has.
+    /// zero-filled. Passing `None` is safe — the loader allows no zero runs —
+    /// but it means a Z-Image directory opened without naming it is refused for
+    /// the corruption it really has.
+    ///
+    /// The tokenizer does not depend on being told: a directory that is an
+    /// entry's own cached snapshot gets that entry's tokenizer path whether or
+    /// not the caller named it, because every surface identifies the directory
+    /// only AFTER it has opened, and a layout the loader's own search does not
+    /// know (Qwen-Image 2.1 keeps its tokenizer under `processor/`) would
+    /// otherwise fail to open at all unless `--model-size` was passed. The
+    /// zero-run allowlist stays the caller's alone.
     pub fn open(path: &Path, device: &Device, entry: Option<Model>) -> Result<Self> {
         if let Some(dir) = safetensors_dir(path)? {
-            let tokenizer = registry_tokenizer(entry, &dir);
+            let tokenizer = registry_tokenizer(
+                entry.or_else(|| Model::identify(crate::config::Arch::Qwen3, None, Some(&dir))),
+                &dir,
+            );
             let allow = entry
                 .map(Model::safetensors_allowed_zero_runs)
                 .unwrap_or(&[]);
@@ -690,6 +701,38 @@ mod tests {
         assert_eq!(
             registry_tokenizer(Some(Model::ZImageTurboEncoder), &encoder),
             Some(sibling)
+        );
+
+        // The `Qwen3VLProcessor` layout Qwen-Image 2.1 has: the same one level
+        // up, under `processor/`. The Z-Image sibling beside it is not this
+        // entry's and is not what it resolves to.
+        assert_eq!(
+            registry_tokenizer(Some(Model::QwenImage21Encoder), &encoder),
+            None
+        );
+        std::fs::create_dir_all(root.join("processor")).unwrap();
+        let processor = root.join("processor/tokenizer.json");
+        std::fs::write(&processor, b"{}").unwrap();
+        assert_eq!(
+            registry_tokenizer(Some(Model::QwenImage21Encoder), &encoder),
+            Some(processor)
+        );
+
+        // Which is what an unnamed open of that entry's cached snapshot
+        // resolves, provenance standing in for the name.
+        let cache = root.join("cache");
+        let snapshot = cache.join("models--Qwen--Qwen-Image-2.1/snapshots/abc123");
+        for file in Model::QwenImage21Encoder.files() {
+            let path = snapshot.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"{}").unwrap();
+        }
+        let cached = snapshot.join("text_encoder");
+        let identified = Model::identify_cached_dir_in(&cache, &cached);
+        assert_eq!(identified, Some(Model::QwenImage21Encoder));
+        assert_eq!(
+            registry_tokenizer(None.or(identified), &cached),
+            Some(snapshot.join("processor/tokenizer.json"))
         );
 
         // The flat layout the two language models have: the tokenizer sits in

@@ -99,6 +99,29 @@ pub enum Model {
     /// the VAE are opened by [`crate::zimage`] directly, which is why this
     /// entry's [`Format`] is neither a GGUF nor a Qwen3 safetensors set.
     ZImageTurbo,
+    /// The Qwen-Image 2.1 text encoder — `Qwen/Qwen-Image-2.1`'s
+    /// `text_encoder/` directory, a whole Qwen3-VL-8B (`qwen3_vl`) of which
+    /// this entry runs the language model alone: the dense `qwen3` graph at
+    /// hidden 4096, under the tensor prefix `model.language_model.`, with a
+    /// vision tower beside it that text-to-image conditioning never evaluates.
+    ///
+    /// ENCODE-ONLY, for a different reason than [`Model::ZImageTurboEncoder`]:
+    /// the weights are intact, but the checkpoint's LM head is untied and this
+    /// stack holds one vocabulary plane for both ends, so generating from it
+    /// would read the embedding where the head belongs. The pipeline conditions
+    /// on the residual after ALL 36 layers and BEFORE the final norm
+    /// ([`EncoderSpec::final_norm`]), which no head is involved in.
+    QwenImage21Encoder,
+    /// Qwen-Image 2.1, the whole image pipeline: `Qwen/Qwen-Image-2.1` at its
+    /// snapshot ROOT — the 7B single-stream diffusion transformer
+    /// (`transformer/`), its VAE (`vae/`), the flow-match scheduler config, and
+    /// the `text_encoder/` and `processor/` files the encoder entry names,
+    /// listed again so that fetching this entry fetches everything an image
+    /// needs. Its conditioning encoder is [`Model::QwenImage21Encoder`].
+    ///
+    /// Released under the Qwen Research License (non-commercial), which binds
+    /// the weights and not the images made with them.
+    QwenImage21,
 }
 
 /// Which tokenizer vocabulary a checkpoint speaks — see
@@ -112,7 +135,9 @@ pub enum VocabFamily {
     ///
     /// One `tokenizer.json`, shared by all three `qwen3` releases: the file is
     /// sha256-identical in `Qwen/Qwen3-4B`, `Qwen/Qwen3-4B-Instruct-2507` and
-    /// `Tongyi-MAI/Z-Image-Turbo`. `serve::vocab::Vocabularies` relies on it —
+    /// `Tongyi-MAI/Z-Image-Turbo` — and in `Qwen/Qwen-Image-2.1`'s `processor/`,
+    /// whose Qwen3-VL encoder adds no vocabulary: the vision specials are among
+    /// this file's added tokens already. `serve::vocab::Vocabularies` relies on it —
     /// asked for this family it answers with whichever release happens to be
     /// cached — and would encode one release's conversation with another's ids
     /// if it stopped being true, silently.
@@ -148,7 +173,7 @@ impl VocabFamily {
 
 /// Every checkpoint this build knows, in the order surfaces that enumerate them
 /// (`/v1/models`, an unknown-model error's list of valid names) print them.
-pub const MODELS: [Model; 9] = [
+pub const MODELS: [Model; 11] = [
     Model::Qwen27B,
     Model::Qwen35BA3B,
     Model::Qwen35BA3BUncensored,
@@ -158,6 +183,8 @@ pub const MODELS: [Model; 9] = [
     Model::Qwen34BInstruct2507,
     Model::ZImageTurboEncoder,
     Model::ZImageTurbo,
+    Model::QwenImage21Encoder,
+    Model::QwenImage21,
 ];
 
 /// The hub coordinates of one checkpoint: the repo, the Q4_K_M target (the
@@ -221,9 +248,10 @@ pub enum Format {
     },
     /// A diffusion pipeline repo at its snapshot root: a text encoder that is
     /// its own registry entry, plus a transformer, a VAE and a scheduler
-    /// config that [`crate::zimage`] opens straight from their
-    /// diffusers-format `config.json` and safetensors. Not a language model;
-    /// no surface but `xwen image` opens it.
+    /// config that the pipeline's own module ([`crate::zimage`],
+    /// [`crate::qwen_image`]) opens straight from their diffusers-format
+    /// `config.json` and safetensors. Not a language model; no surface but
+    /// `xwen image` opens it.
     ///
     /// The internal layout — `transformer/`, `vae/`,
     /// `scheduler/scheduler_config.json` — is stated once, in
@@ -257,6 +285,28 @@ pub struct EncoderSpec {
     /// because layer 35's MLP is the corrupt plane and asking for a deeper
     /// hidden state would evaluate it.
     pub max_layer: usize,
+    /// What [`EncoderSpec::layer`] means when it is the whole stack: `true` is
+    /// transformers' numbering, where the last `hidden_states` entry is the
+    /// output of the final norm; `false` is the residual after the last layer
+    /// with the norm NOT applied. Below the last index no norm applies and this
+    /// says nothing.
+    ///
+    /// Qwen-Image 2.1 is the `false` case: its pipeline hooks the final norm
+    /// out of the encoder call, because the checkpoint was trained on the
+    /// un-normed state. The normed tensor has the same shape and a third of the
+    /// magnitude, so reading it renders a plausible image with broken text
+    /// rather than failing.
+    pub final_norm: bool,
+}
+
+impl EncoderSpec {
+    /// The hidden state this spec reads, in the stack's own terms.
+    pub const fn tap(self) -> crate::qwen3::HiddenTap {
+        crate::qwen3::HiddenTap {
+            depth: self.layer,
+            final_norm: self.final_norm,
+        }
+    }
 }
 
 /// One checkpoint's drafter sidecar.
@@ -592,6 +642,7 @@ const Z_IMAGE_TURBO_ENCODER: Checkpoint = Checkpoint {
             layer: 35,
             max_tokens: 512,
             max_layer: 35,
+            final_norm: true,
         }),
     },
 };
@@ -635,6 +686,88 @@ const Z_IMAGE_TURBO: Checkpoint = Checkpoint {
     },
 };
 
+/// The Qwen-Image 2.1 text encoder: the `text_encoder/` subdirectory of the
+/// pipeline repo, with its tokenizer under `processor/` — the `Qwen3VLProcessor`
+/// layout, where Z-Image's is `tokenizer/`. That `tokenizer.json` is the Qwen3
+/// family's file byte for byte, vision specials included.
+///
+/// The geometry is the 4B's because the KV shape is: 36 full-attention layers,
+/// 8 KV heads of 128. The residual is wider (4096 against 2560), which no cache
+/// row holds.
+///
+/// `max_tokens` is a ceiling of this runtime's, not a pipeline constant: the
+/// reference pipeline has no `max_sequence_length` and pads nothing, so there
+/// is no value to mirror. 4096 tokens is far past any prompt a person writes
+/// and keeps one encode within one prefill's working set; a longer prompt is
+/// refused rather than truncated ([`crate::qwen_image::conditioning`]).
+const QWEN_IMAGE_21_ENCODER: Checkpoint = Checkpoint {
+    repo: "Qwen/Qwen-Image-2.1",
+    files: &[
+        "text_encoder/config.json",
+        "text_encoder/model.safetensors.index.json",
+        "text_encoder/model-00001-of-00004.safetensors",
+        "text_encoder/model-00002-of-00004.safetensors",
+        "text_encoder/model-00003-of-00004.safetensors",
+        "text_encoder/model-00004-of-00004.safetensors",
+        "processor/tokenizer.json",
+    ],
+    full_name: "Qwen-Image-2.1-text-encoder",
+    arch: Arch::Qwen3,
+    // The hub's byte counts: 17,534,339,488 in the four shards, which hold the
+    // vision tower and the untied head as well as the planes this entry loads.
+    model_size: "17.5 GB",
+    drafter: None,
+    geometry: QWEN3_4B_GEOMETRY,
+    format: Format::SafeTensors {
+        config: "text_encoder/config.json",
+        index: "text_encoder/model.safetensors.index.json",
+        tokenizer: "processor/tokenizer.json",
+        allow_zero_runs: &[],
+        encoder: Some(EncoderSpec {
+            layer: 36,
+            max_tokens: 4096,
+            max_layer: 36,
+            final_norm: false,
+        }),
+    },
+};
+
+/// The whole Qwen-Image 2.1 pipeline, at the repo root, laid out as
+/// [`Z_IMAGE_TURBO`] is: `model_index.json` first so the resolved path's parent
+/// is the snapshot root, and the encoder entry's files repeated so one fetch
+/// leaves nothing to download.
+///
+/// The transformer ships bf16 (14.2 GB in two shards) and the VAE 1.35 GB.
+const QWEN_IMAGE_21: Checkpoint = Checkpoint {
+    repo: "Qwen/Qwen-Image-2.1",
+    files: &[
+        "model_index.json",
+        "text_encoder/config.json",
+        "text_encoder/model.safetensors.index.json",
+        "text_encoder/model-00001-of-00004.safetensors",
+        "text_encoder/model-00002-of-00004.safetensors",
+        "text_encoder/model-00003-of-00004.safetensors",
+        "text_encoder/model-00004-of-00004.safetensors",
+        "processor/tokenizer.json",
+        "transformer/config.json",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+        "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+        "vae/config.json",
+        "vae/diffusion_pytorch_model.safetensors",
+        "scheduler/scheduler_config.json",
+    ],
+    full_name: "Qwen-Image-2.1",
+    // As on Z-Image: the one piece of the pipeline `Arch` can name.
+    arch: Arch::Qwen3,
+    model_size: "33.1 GB",
+    drafter: None,
+    geometry: QWEN3_4B_GEOMETRY,
+    format: Format::Diffusion {
+        text_encoder: Model::QwenImage21Encoder,
+    },
+};
+
 impl Model {
     const fn checkpoint(self) -> &'static Checkpoint {
         match self {
@@ -647,6 +780,8 @@ impl Model {
             Model::Qwen34BInstruct2507 => &QWEN3_4B_INSTRUCT_2507,
             Model::ZImageTurboEncoder => &Z_IMAGE_TURBO_ENCODER,
             Model::ZImageTurbo => &Z_IMAGE_TURBO,
+            Model::QwenImage21Encoder => &QWEN_IMAGE_21_ENCODER,
+            Model::QwenImage21 => &QWEN_IMAGE_21,
         }
     }
 
@@ -724,7 +859,7 @@ impl Model {
     pub const fn safetensors_rope_theta(self) -> Option<f32> {
         match self {
             Model::Qwen34B | Model::ZImageTurboEncoder => Some(1e6),
-            Model::Qwen34BInstruct2507 => Some(5e6),
+            Model::Qwen34BInstruct2507 | Model::QwenImage21Encoder => Some(5e6),
             // The pipeline root carries no `config.json` of its own; its text
             // encoder's entry answers for the set it holds.
             Model::Qwen27B
@@ -732,14 +867,19 @@ impl Model {
             | Model::Qwen35BA3BUncensored
             | Model::Qwen3827B
             | Model::Qwen38FlashNext
-            | Model::ZImageTurbo => None,
+            | Model::ZImageTurbo
+            | Model::QwenImage21 => None,
         }
     }
 
     /// Which `qwen3` release a `rope_theta` names, for a directory that
     /// identifies as nothing else.
     ///
-    /// 5e6 is Instruct-2507's alone. 1e6 is shared by the base model and the
+    /// 5e6 is Instruct-2507's, and the Qwen-Image 2.1 encoder's too — which
+    /// never answers here: it is an 8B under another tensor layout that only
+    /// `xwen encode-text` can run, so a language-model surface assuming it
+    /// would assume something it must then refuse. It is reached by provenance
+    /// or by naming it. 1e6 is shared by the base model and the
     /// Z-Image text encoder, whose configs are byte-identical, and the tie goes
     /// to the base model: it is the language model, it is what an unpacked copy
     /// of these weights most likely is, and the encoder entry is reachable by
@@ -778,7 +918,9 @@ impl Model {
             | Model::Qwen35BA3BUncensored
             | Model::Qwen3827B
             | Model::Qwen38FlashNext
-            | Model::Qwen34BInstruct2507 => 262_144,
+            | Model::Qwen34BInstruct2507
+            | Model::QwenImage21Encoder
+            | Model::QwenImage21 => 262_144,
             Model::Qwen34B | Model::ZImageTurboEncoder | Model::ZImageTurbo => 40_960,
         }
     }
@@ -800,7 +942,9 @@ impl Model {
             Model::Qwen34B
             | Model::Qwen34BInstruct2507
             | Model::ZImageTurboEncoder
-            | Model::ZImageTurbo => VocabFamily::Qwen3,
+            | Model::ZImageTurbo
+            | Model::QwenImage21Encoder
+            | Model::QwenImage21 => VocabFamily::Qwen3,
         }
     }
 
@@ -867,7 +1011,14 @@ impl Model {
             Model::Qwen34B | Model::ZImageTurboEncoder | Model::ZImageTurbo => {
                 crate::chat::ChatDialect::Qwen3
             }
-            Model::Qwen34BInstruct2507 => crate::chat::ChatDialect::Qwen3Instruct,
+            // Never rendered through: the Qwen-Image pipeline hands its encoder
+            // a raw template string of its own
+            // ([`crate::qwen_image::conditioning`]), and no chat surface runs
+            // either entry. The dialect named is the one whose ChatML specials
+            // that string uses.
+            Model::Qwen34BInstruct2507 | Model::QwenImage21Encoder | Model::QwenImage21 => {
+                crate::chat::ChatDialect::Qwen3Instruct
+            }
         }
     }
 
@@ -904,7 +1055,9 @@ impl Model {
             Model::Qwen34B
             | Model::Qwen34BInstruct2507
             | Model::ZImageTurboEncoder
-            | Model::ZImageTurbo => 0.0,
+            | Model::ZImageTurbo
+            | Model::QwenImage21Encoder
+            | Model::QwenImage21 => 0.0,
         }
     }
 
@@ -951,6 +1104,8 @@ impl Model {
             Model::Qwen34B | Model::Qwen34BInstruct2507 | Model::ZImageTurboEncoder => false,
             // 32.9 GB, and nothing but `xwen image` can use it.
             Model::ZImageTurbo => false,
+            // 17.5 and 33.1 GB, for `xwen encode-text` and `xwen image` alone.
+            Model::QwenImage21Encoder | Model::QwenImage21 => false,
         }
     }
 
@@ -1011,6 +1166,15 @@ impl Model {
             Model::ZImageTurbo => Some(
                 "it is a text-to-image diffusion pipeline, not a language model; use \
                  `xwen image`",
+            ),
+            Model::QwenImage21Encoder => Some(
+                "it is an encode-only conditioning encoder: the language model of a \
+                 Qwen3-VL-8B whose LM head is untied, which this stack cannot generate \
+                 through; use `xwen encode-text`",
+            ),
+            Model::QwenImage21 => Some(
+                "it is an image generation and editing diffusion pipeline, not a language \
+                 model; use `xwen image`",
             ),
         }
     }
@@ -1079,7 +1243,9 @@ impl Model {
             Model::Qwen34B
             | Model::Qwen34BInstruct2507
             | Model::ZImageTurboEncoder
-            | Model::ZImageTurbo => false,
+            | Model::ZImageTurbo
+            | Model::QwenImage21Encoder
+            | Model::QwenImage21 => false,
         }
     }
 
@@ -1115,7 +1281,9 @@ impl Model {
             Model::Qwen34B
             | Model::Qwen34BInstruct2507
             | Model::ZImageTurboEncoder
-            | Model::ZImageTurbo => false,
+            | Model::ZImageTurbo
+            | Model::QwenImage21Encoder
+            | Model::QwenImage21 => false,
         }
     }
 
@@ -1337,7 +1505,7 @@ impl Model {
     /// reason: the rule is what matters and the environment variable it
     /// normally reads is not something a test may change out from under the
     /// threads it shares a process with.
-    fn identify_cached_dir_in(root: &Path, path: &Path) -> Option<Model> {
+    pub(crate) fn identify_cached_dir_in(root: &Path, path: &Path) -> Option<Model> {
         let dir = canonical_checkpoint_dir(path)?;
         MODELS
             .into_iter()
@@ -1572,6 +1740,8 @@ impl std::fmt::Display for Model {
             Model::Qwen34BInstruct2507 => "qwen3-4b-instruct-2507",
             Model::ZImageTurboEncoder => "zimage-turbo-encoder",
             Model::ZImageTurbo => "zimage-turbo",
+            Model::QwenImage21Encoder => "qwen-image-2.1-encoder",
+            Model::QwenImage21 => "qwen-image-2.1",
         })
     }
 }
@@ -1596,9 +1766,12 @@ impl std::str::FromStr for Model {
             "qwen3-4b-instruct-2507" | "4b-instruct" => Ok(Model::Qwen34BInstruct2507),
             "zimage-turbo-encoder" | "z-image-turbo-encoder" => Ok(Model::ZImageTurboEncoder),
             "zimage-turbo" | "z-image-turbo" => Ok(Model::ZImageTurbo),
+            "qwen-image-2.1-encoder" => Ok(Model::QwenImage21Encoder),
+            "qwen-image-2.1" => Ok(Model::QwenImage21),
             other => Err(format!(
                 "unknown model {other:?} (expected 27b, 35b, 35b-uncensored, 3.8-27b, flash-next, qwen3-4b, \
-                 qwen3-4b-instruct-2507, zimage-turbo-encoder or zimage-turbo)"
+                 qwen3-4b-instruct-2507, zimage-turbo-encoder, zimage-turbo, qwen-image-2.1-encoder \
+                 or qwen-image-2.1)"
             )),
         }
     }
@@ -2256,19 +2429,25 @@ mod tests {
 
     /// A safetensors checkpoint is a DIRECTORY, and what the registry lists is
     /// every file that has to be in it: the config the loader opens, the shard
-    /// index, the three shards and the tokenizer. `file()` is the config,
+    /// index, the shards (three on a 4B, four on the Qwen-Image 2.1 encoder's
+    /// 8B) and the tokenizer. `file()` is the config,
     /// deliberately — it is the entry `cached_model` and `ensure_model` hand
     /// back, and `CheckpointSource::open` resolves the directory from it.
     #[test]
     fn the_qwen3_entries_name_every_file_of_their_set() {
         for model in MODELS.into_iter().filter(|m| m.is_safetensors()) {
             let files = model.files();
-            assert_eq!(files.len(), 6, "{model:?}");
+            let shards = if model == Model::QwenImage21Encoder {
+                4
+            } else {
+                3
+            };
+            assert_eq!(files.len(), shards + 3, "{model:?}");
             assert!(files[0].ends_with("config.json"), "{model:?}: {}", files[0]);
             assert_eq!(model.file(), files[0], "{model:?}");
             assert_eq!(
                 files.iter().filter(|f| f.ends_with(".safetensors")).count(),
-                3,
+                shards,
                 "{model:?}"
             );
             assert!(
@@ -2681,6 +2860,88 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         assert_eq!(identify(&outside), None);
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The Qwen-Image 2.1 pair, as the registry states them: an encode-only
+    /// entry reading the un-normed residual after all 36 layers, and a pipeline
+    /// entry whose encoder it is.
+    #[test]
+    fn the_qwen_image_entries_are_an_encoder_and_its_pipeline() {
+        let encoder = Model::QwenImage21Encoder;
+        let pipeline = Model::QwenImage21;
+        assert!(encoder.is_safetensors() && !encoder.is_diffusion());
+        assert!(pipeline.is_diffusion() && !pipeline.is_safetensors());
+        assert_eq!(pipeline.text_encoder(), Some(encoder));
+        assert_eq!(pipeline.repo(), encoder.repo());
+        assert_eq!(pipeline.file(), "model_index.json");
+        assert_eq!(encoder.file(), "text_encoder/config.json");
+        assert_eq!(
+            encoder.safetensors_tokenizer(),
+            Some("processor/tokenizer.json")
+        );
+        // One fetch of the pipeline leaves the encoder nothing to download.
+        for file in encoder.files() {
+            assert!(pipeline.files().contains(file), "{file}");
+        }
+        let spec = encoder.encoder_spec().unwrap();
+        assert_eq!((spec.layer, spec.max_layer), (36, 36));
+        assert!(!spec.final_norm);
+        assert_eq!(
+            spec.tap(),
+            crate::qwen3::HiddenTap {
+                depth: 36,
+                final_norm: false
+            }
+        );
+        // Z-Image's reading is below the last index, where the norm question
+        // does not arise, and its spec keeps transformers' numbering.
+        assert!(Model::ZImageTurboEncoder.encoder_spec().unwrap().final_norm);
+        assert!(encoder.safetensors_allowed_zero_runs().is_empty());
+        for model in [encoder, pipeline] {
+            assert!(!model.servable(), "{model}");
+            assert!(!model.auto_fetch(), "{model}");
+            assert!(!crate::serve::checkpoint_selectable(model), "{model}");
+            assert_eq!(model.vocab_family(), VocabFamily::Qwen3, "{model}");
+            assert_eq!(model.trained_context(), 262_144, "{model}");
+            assert_eq!(model.to_string().parse::<Model>(), Ok(model));
+            assert_eq!(Model::from_api_name(model.full_name()), Some(model));
+        }
+        assert!(encoder.not_servable_message().contains("xwen encode-text"));
+        assert!(pipeline.not_servable_message().contains("xwen image"));
+    }
+
+    /// The encoder shares its `rope_theta` with Instruct-2507 and its
+    /// subdirectory name with the Z-Image encoder, and is confused with
+    /// neither: a directory that identifies as nothing is ASSUMED to be the
+    /// language model, never the 8B encoder, and provenance tells the two
+    /// `text_encoder/` directories apart by the repo they sit under.
+    #[test]
+    fn the_qwen_image_encoder_is_reached_by_provenance_or_by_name_only() {
+        assert_eq!(
+            Model::QwenImage21Encoder.safetensors_rope_theta(),
+            Model::Qwen34BInstruct2507.safetensors_rope_theta()
+        );
+        assert_eq!(
+            Model::by_safetensors_rope_theta(5e6),
+            Some(Model::Qwen34BInstruct2507)
+        );
+
+        let root = scratch("qwen-image-snapshots");
+        let identify = |dir: &Path| Model::identify_cached_dir_in(&root, dir);
+        let pipeline = install_set(&root, Model::QwenImage21, "fff666");
+        let zimage = install_set(&root, Model::ZImageTurbo, "eee555");
+        assert_eq!(identify(&pipeline), None);
+        assert_eq!(
+            identify(&pipeline.join("text_encoder")),
+            Some(Model::QwenImage21Encoder)
+        );
+        assert_eq!(
+            identify(&zimage.join("text_encoder")),
+            Some(Model::ZImageTurboEncoder)
+        );
+        // `processor/` holds a tokenizer and nothing this build can run.
+        assert_eq!(identify(&pipeline.join("processor")), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

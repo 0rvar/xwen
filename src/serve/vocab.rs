@@ -468,7 +468,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The three `qwen3` releases really do ship one `tokenizer.json`.
+    /// Every entry of the Qwen3 family really does ship one `tokenizer.json`:
+    /// the three `qwen3` releases, and the Qwen-Image 2.1 encoder, whose copy
+    /// sits under `processor/`.
     ///
     /// `tokenizer_source` leans on this: asked for the Qwen3 family it answers
     /// with whichever release is cached, on the grounds that they are the same
@@ -492,11 +494,12 @@ mod tests {
         }
         // One cached release proves nothing about the others, and saying so is
         // the point: this is an assumption about a SET of files.
-        if seen.len() < 2 {
-            eprintln!(
-                "SKIPPED every_qwen3_release_ships_the_same_tokenizer: fewer than two qwen3 \
-                 releases are cached, so there is nothing to compare"
-            );
+        if !crate::test_support::enough_or_skip(
+            seen.len(),
+            2,
+            "a second Qwen3-family tokenizer.json to compare against",
+            "xwen fetch --model-size qwen3-4b and --model-size qwen3-4b-instruct-2507",
+        ) {
             return;
         }
         let (first, bytes) = &seen[0];

@@ -274,22 +274,52 @@ fn check_norm(name: &str, t: &Tensor, len: usize) -> Result<()> {
     Ok(())
 }
 
+/// Which hidden state an encoder reads: the HF `hidden_states` index, and what
+/// that index means at the very end of the stack.
+///
+/// Below `n_layer` there is one answer, the raw residual after `depth` layers.
+/// AT `n_layer` there are two, and pipelines disagree about which they read:
+/// transformers ties that entry to `last_hidden_state`, the residual after the
+/// final norm, and Qwen-Image 2.1 reads the same residual BEFORE it, hooking
+/// the norm out of the call. The two differ by a whole RMSNorm, so which one is
+/// wanted is stated by the caller and never inferred from the depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HiddenTap {
+    /// Layers `[0, depth)` run; 0 is the embedding output.
+    pub depth: usize,
+    /// Whether the final norm applies when `depth` is the whole stack. Has no
+    /// effect below it, where no norm is ever applied.
+    pub final_norm: bool,
+}
+
+impl HiddenTap {
+    /// Transformers' numbering with `tie_last_hidden_states`: index `n_layer`
+    /// is the normed output.
+    pub const fn hf(depth: usize) -> Self {
+        Self {
+            depth,
+            final_norm: true,
+        }
+    }
+}
+
 /// How many layers a forward runs and whether the final norm applies, from
-/// the HF `hidden_states` index the caller asked for: `None` is a full forward
-/// (every layer, then the norm — what `forward` and `forward_all_logits`
-/// want); `Some(n)` runs layers `[0, n)` and applies the norm only when
-/// `n == n_layer`, which mirrors transformers' `tie_last_hidden_states`, so
-/// `Some(0)` is the embedding output and `Some(n_layer)` equals `None`.
-pub(crate) fn plan(stop_after: Option<usize>, n_layer: usize) -> Result<(usize, bool)> {
+/// the hidden state the caller asked for: `None` is a full forward (every
+/// layer, then the norm — what `forward` and `forward_all_logits` want);
+/// `Some(tap)` runs layers `[0, tap.depth)` and applies the norm only when
+/// `tap.depth == n_layer` and the tap asks for it, so `HiddenTap::hf(0)` is the
+/// embedding output and `HiddenTap::hf(n_layer)` equals `None`.
+pub(crate) fn plan(stop_after: Option<HiddenTap>, n_layer: usize) -> Result<(usize, bool)> {
     match stop_after {
         None => Ok((n_layer, true)),
-        Some(n) => {
+        Some(HiddenTap { depth, final_norm }) => {
             ensure!(
-                n <= n_layer,
-                "hidden-state index {n} is past the last one: this model has {n_layer} layers, \
-                 so its indices run 0 (the embeddings) through {n_layer} (after the final norm)"
+                depth <= n_layer,
+                "hidden-state index {depth} is past the last one: this model has {n_layer} \
+                 layers, so its indices run 0 (the embeddings) through {n_layer} (after the \
+                 last layer)"
             );
-            Ok((n, n == n_layer))
+            Ok((depth, depth == n_layer && final_norm))
         }
     }
 }
@@ -311,7 +341,7 @@ pub fn run_stack(
     model: &mut XwenModel,
     tokens: &Tensor,
     pos: usize,
-    stop_after: Option<usize>,
+    stop_after: Option<HiddenTap>,
 ) -> Result<StackOutput> {
     let seq = tokens.elem_count();
     ensure!(seq > 0, "qwen3 stack: a forward needs at least one token");
@@ -619,12 +649,26 @@ mod tests {
     #[test]
     fn the_hidden_state_index_selects_layers_and_the_norm() {
         assert_eq!(plan(None, 36).unwrap(), (36, true));
-        assert_eq!(plan(Some(36), 36).unwrap(), (36, true));
-        assert_eq!(plan(Some(35), 36).unwrap(), (35, false));
-        assert_eq!(plan(Some(1), 36).unwrap(), (1, false));
-        assert_eq!(plan(Some(0), 36).unwrap(), (0, false));
-        let err = plan(Some(37), 36).unwrap_err().to_string();
+        assert_eq!(plan(Some(HiddenTap::hf(36)), 36).unwrap(), (36, true));
+        assert_eq!(plan(Some(HiddenTap::hf(35)), 36).unwrap(), (35, false));
+        assert_eq!(plan(Some(HiddenTap::hf(1)), 36).unwrap(), (1, false));
+        assert_eq!(plan(Some(HiddenTap::hf(0)), 36).unwrap(), (0, false));
+        let err = plan(Some(HiddenTap::hf(37)), 36).unwrap_err().to_string();
         assert!(err.contains("37") && err.contains("36"), "{err}");
+    }
+
+    /// The pre-norm tap: the whole stack runs and the final norm does not, and
+    /// below the last index the flag changes nothing.
+    #[test]
+    fn a_pre_norm_tap_runs_every_layer_and_skips_the_norm() {
+        let pre = |depth| HiddenTap {
+            depth,
+            final_norm: false,
+        };
+        assert_eq!(plan(Some(pre(36)), 36).unwrap(), (36, false));
+        assert_eq!(plan(Some(pre(35)), 36).unwrap(), (35, false));
+        assert_eq!(plan(Some(pre(0)), 36).unwrap(), (0, false));
+        assert!(plan(Some(pre(37)), 36).is_err());
     }
 
     /// The load-time switch names its two arms and refuses anything else.
@@ -658,11 +702,13 @@ mod tests {
             vocab_size: 32,
             max_position_embeddings: 4096,
             tie_word_embeddings: true,
+            layout: crate::qwen3::TensorLayout::Qwen3,
             norm: NormVariant::Standard,
             rope: RopeSpec {
                 head_dim: 128,
                 rotary_dim: 128,
                 theta: 1e6,
+                mrope: None,
             },
             eog: crate::qwen3::QWEN3_EOG,
         }

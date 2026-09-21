@@ -22,6 +22,7 @@ pub mod ops;
 pub mod parity_schema;
 pub mod qwen3;
 pub mod qwen4exp;
+pub mod qwen_image;
 pub mod rope;
 pub mod sampler;
 pub mod serve;

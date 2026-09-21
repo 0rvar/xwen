@@ -507,7 +507,7 @@ impl Loaded {
         }
         self.encoder.device().synchronize()?;
         let encoding = Instant::now();
-        let encoded = self.encoder.encode(&rendered.ids, self.spec.layer);
+        let encoded = self.encoder.encode_spec(&rendered.ids, &self.spec);
         let drained = self.encoder.device().synchronize();
         trace.record.encode_secs += encoding.elapsed().as_secs_f64();
         drained?;
@@ -865,6 +865,20 @@ pub(crate) fn validate(
     }
 
     let full_name = Model::ZImageTurbo.full_name();
+    // Named on any path, the proxy one included, a registered image pipeline
+    // this route cannot run is refused rather than answered by another model.
+    if let Some(name) = request.model.as_deref().map(str::trim)
+        && name.eq_ignore_ascii_case(Model::QwenImage21.full_name())
+    {
+        return Err(bad_param(
+            "model",
+            format!(
+                "{} is not served yet: its image pipeline is not implemented; this route serves \
+                 {full_name}",
+                Model::QwenImage21.full_name()
+            ),
+        ));
+    }
     let model_note = match request.model.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(name) if name == full_name => None,

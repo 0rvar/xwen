@@ -18,8 +18,10 @@ pub mod config;
 pub mod safetensors;
 pub mod stack;
 
-pub use config::{HfQwen3Config, NormVariant, QWEN3_EOG, Qwen3Config, RopeSpec};
+pub use config::{
+    HfQwen3Config, MropeSections, NormVariant, QWEN3_EOG, Qwen3Config, RopeSpec, TensorLayout,
+};
 pub use safetensors::{
     Qwen3LayerWeights, Qwen3Set, Qwen3Weights, RangeScan, TensorSet, ZERO_RUN_LIMIT, ZeroRun,
 };
-pub use stack::{AttnImpl, Qwen3Parts};
+pub use stack::{AttnImpl, HiddenTap, Qwen3Parts};

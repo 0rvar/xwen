@@ -108,6 +108,22 @@ applies the final norm to the last one only. Z-Image's default is 35, derived in
 [zimage.md](zimage.md). The stack takes a `stop_after` so layers at or past the index
 never run.
 
+2026-09-21: index 36 has a second reading, and it is stated, never inferred. Qwen-Image
+2.1 conditions on the residual after `layers[35]` WITHOUT `output_norm`: its pipeline
+hooks the final norm out of the encoder call, because transformers 5 ties the last
+`hidden_states` entry to the normed output and the checkpoint was trained on the
+un-normed one. So the stack's `stop_after` is a `qwen3::HiddenTap { depth, final_norm }`,
+`EncoderSpec::final_norm` carries the registry's answer (false on the Qwen-Image 2.1
+encoder, true everywhere else), and `XwenModel::encode_tap` is the entry that takes it.
+`encode(ids, n)` keeps the table above and is `encode_tap` with `HiddenTap::hf(n)`. Below
+index 36 the flag changes nothing. The two tensors have one shape and the normed one a
+third of the magnitude, so the wrong one renders an image with broken text rather than
+failing, which is why `tests/qwen_image_encoder.rs` asserts the normed state falls
+OUTSIDE its bar. The same encoder is the first `qwen3_vl` set the loader opens: its
+language model under `model.language_model.`, the vision tower ignored, an untied head
+that only `load_encoder` accepts, and a three-axis MRoPE split that text-only ids reduce
+to the plain NEoX table bit for bit (`rope::mrope_interleaved_tables`).
+
 ## Weights, and why they are copied
 
 BF16 safetensors, read through the pinned candle's own `MmapedSafetensors`, one instance

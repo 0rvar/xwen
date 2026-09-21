@@ -69,7 +69,7 @@ struct ModelArgs {
     /// no release — on every surface alike.
     #[arg(
         long,
-        value_name = "27b|35b|35b-uncensored|3.8-27b|flash-next|qwen3-4b|qwen3-4b-instruct-2507|zimage-turbo-encoder|zimage-turbo"
+        value_name = "27b|35b|35b-uncensored|3.8-27b|flash-next|qwen3-4b|qwen3-4b-instruct-2507|zimage-turbo-encoder|zimage-turbo|qwen-image-2.1-encoder|qwen-image-2.1"
     )]
     model_size: Option<Model>,
 }
@@ -559,18 +559,22 @@ enum Cmd {
         model: Option<PathBuf>,
         /// Which Qwen3 checkpoint to encode with: zimage-turbo-encoder (the Z-Image
         /// text encoder; the default here, unlike every other command),
-        /// qwen3-4b or qwen3-4b-instruct-2507. `zimage-turbo`, the whole
-        /// diffusion pipeline, is accepted and encodes with its text encoder.
+        /// qwen-image-2.1-encoder (the Qwen-Image 2.1 text encoder), qwen3-4b or
+        /// qwen3-4b-instruct-2507. `zimage-turbo` and `qwen-image-2.1`, the whole
+        /// diffusion pipelines, are accepted and encode with their text encoder.
         /// A GGUF checkpoint has no hidden-state encoder.
         #[arg(
             long,
-            value_name = "zimage-turbo-encoder|zimage-turbo|qwen3-4b|qwen3-4b-instruct-2507"
+            value_name = "zimage-turbo-encoder|zimage-turbo|qwen-image-2.1-encoder|qwen-image-2.1|qwen3-4b|qwen3-4b-instruct-2507"
         )]
         model_size: Option<Model>,
         /// The HF `hidden_states` index to return: 0 is the embedding output,
-        /// N the residual after layer N-1 (before the final norm), 36 the
-        /// normed output. Default: what the checkpoint's pipeline reads (35 on
-        /// zimage-turbo-encoder), or the normed output on a plain language model.
+        /// N the residual after layer N-1 (before the final norm), and 36 the
+        /// output of the whole stack: normed, except on qwen-image-2.1-encoder,
+        /// whose pipeline reads it BEFORE the final norm. Default: what the
+        /// checkpoint's pipeline reads (35 on zimage-turbo-encoder, 36 on
+        /// qwen-image-2.1-encoder), or the normed output on a plain language
+        /// model.
         #[arg(long)]
         layer: Option<usize>,
         /// The prompt text.
@@ -2242,9 +2246,9 @@ fn run_encode_text(
         }
         (Some(_), Some(_)) => bail!("--prompt and --prompt-file are mutually exclusive"),
     };
-    // `--model-size zimage-turbo` names the whole diffusion pipeline, and the
-    // part of it that encodes is its text encoder entry — the same weights,
-    // the same repo, one subdirectory down. Both aliases therefore encode, and
+    // `--model-size zimage-turbo` (or `qwen-image-2.1`) names a whole diffusion
+    // pipeline, and the part of it that encodes is its text encoder entry — the
+    // same repo, one subdirectory down. Both aliases therefore encode, and
     // the remap happens here rather than being a second name for the encoder
     // entry, because `xwen image` wants the pipeline under that alias.
     let (model_size, model) = match model_size {
@@ -2294,7 +2298,8 @@ fn run_encode_text(
     ensure!(
         size.is_safetensors(),
         "{} is a GGUF checkpoint; the hidden-state encoder runs the Qwen3 dense safetensors \
-         checkpoints only (--model-size zimage-turbo-encoder, qwen3-4b or qwen3-4b-instruct-2507)",
+         checkpoints only (--model-size zimage-turbo-encoder, qwen-image-2.1-encoder, qwen3-4b \
+         or qwen3-4b-instruct-2507)",
         size.full_name()
     );
     let path = resolve_model(model, size)?;
@@ -2337,11 +2342,26 @@ fn run_encode_text(
         );
     }
 
-    let (text, ids) = encoder_prompt_ids(size, set.tokenizer_path(), prompt)?;
+    // What the last index means is the entry's to say: a pipeline that reads
+    // the un-normed residual there gets it, everything else gets transformers'
+    // numbering, in which the last entry is the normed output.
+    let read = spec.map(|s| xwen::hub::EncoderSpec { layer, ..s });
+    let pre_norm = read.is_some_and(|s| !s.final_norm);
+    let (text, ids, dropped) = encoder_prompt_ids(size, set.tokenizer_path(), prompt)?;
     if verbose {
         eprintln!("xwen: rendered prompt ({} bytes):\n{text}", text.len());
         eprintln!("xwen: {} token ids: {ids:?}", ids.len());
-        eprintln!("xwen: hidden-state index {layer} of 0..={n_layer}");
+        eprintln!(
+            "xwen: hidden-state index {layer} of 0..={n_layer}{}",
+            if layer == n_layer && pre_norm {
+                ", before the final norm"
+            } else {
+                ""
+            }
+        );
+        if dropped > 0 {
+            eprintln!("xwen: the first {dropped} rows are the system turn and are not written");
+        }
     }
 
     let load_start = std::time::Instant::now();
@@ -2351,11 +2371,19 @@ fn run_encode_text(
         load_start.elapsed().as_secs_f64()
     );
     let encode_start = std::time::Instant::now();
-    let (hidden, n_tokens) = model.encode(&ids, layer)?;
+    let (hidden, n_tokens) = match read {
+        Some(spec) => model.encode_spec(&ids, &spec)?,
+        None => model.encode(&ids, layer)?,
+    };
+    // The pipeline's own cut: the encoder reads the whole sequence, and the
+    // rows of the fixed system turn are not part of the conditioning.
+    let n_tokens = n_tokens - dropped;
+    let hidden = hidden.narrow(0, dropped, n_tokens)?.contiguous()?;
     let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
 
-    // `input_ids` as i64, the dtype a torch-side consumer expects for ids.
-    let input_ids: Vec<i64> = ids.iter().map(|&id| i64::from(id)).collect();
+    // `input_ids` as i64, the dtype a torch-side consumer expects for ids: the
+    // ids of the rows written, so the two tensors stay row for row.
+    let input_ids: Vec<i64> = ids[dropped..].iter().map(|&id| i64::from(id)).collect();
     let input_ids = candle_core::Tensor::new(input_ids.as_slice(), &candle_core::Device::Cpu)?;
     let tensors: std::collections::HashMap<&str, candle_core::Tensor> =
         [("hidden", hidden), ("input_ids", input_ids)]
@@ -2371,14 +2399,24 @@ fn run_encode_text(
     Ok(())
 }
 
-/// [`xwen::zimage::conditioning::prompt_ids`] with the truncation said out loud:
-/// the pipeline cuts a long prompt silently, and a CLI user should hear that
-/// the text past the limit was not encoded.
+/// The prompt as `size`'s pipeline renders it: the text, every id the encoder
+/// reads, and how many leading rows of its output the pipeline drops.
+///
+/// Z-Image's is [`xwen::zimage::conditioning::prompt_ids`] with the truncation
+/// said out loud: the pipeline cuts a long prompt silently, and a CLI user
+/// should hear that the text past the limit was not encoded. Qwen-Image's is
+/// its own raw template ([`xwen::qwen_image::conditioning`]), whose system turn
+/// is encoded and then dropped.
 fn encoder_prompt_ids(
     size: Model,
     tokenizer_path: &Path,
     prompt: String,
-) -> Result<(String, Vec<u32>)> {
+) -> Result<(String, Vec<u32>, usize)> {
+    if size == Model::QwenImage21Encoder {
+        let rendered =
+            xwen::qwen_image::conditioning::prompt_ids(size, tokenizer_path, &prompt, &[])?;
+        return Ok((rendered.text, rendered.ids, rendered.drop));
+    }
     let rendered = xwen::zimage::conditioning::prompt_ids(size, tokenizer_path, &prompt)?;
     if let Some(from) = rendered.truncated_from {
         eprintln!(
@@ -2388,7 +2426,7 @@ fn encoder_prompt_ids(
             rendered.ids.len()
         );
     }
-    Ok((rendered.text, rendered.ids))
+    Ok((rendered.text, rendered.ids, 0))
 }
 
 /// `xwen image`'s flags, gathered so the run function has a name per field.
@@ -2450,6 +2488,16 @@ fn run_image(args: ImageArgs) -> Result<()> {
     use xwen::zimage::pipeline::{ImageOptions, ZImagePipeline, write_png};
 
     let size = args.model_size.unwrap_or(Model::ZImageTurbo);
+    // Everything below is Z-Image's pipeline: its transformer, its scheduler,
+    // its VAE. Another pipeline's entry must not fall through into it, where it
+    // would fail deep inside a load, or worse, half succeed.
+    ensure!(
+        size != Model::QwenImage21,
+        "{} is registered and fetchable, but its image pipeline is not implemented yet: only \
+         its text encoder runs (`xwen encode-text --model-size {}`)",
+        size.full_name(),
+        Model::QwenImage21Encoder
+    );
     let encoder_entry = size.text_encoder().with_context(|| {
         format!(
             "{} is not a text-to-image checkpoint; `xwen image` runs {} (--model-size {})",
@@ -2655,7 +2703,7 @@ fn run_image(args: ImageArgs) -> Result<()> {
                     )
                 })?
                 .clone();
-            let (_text, ids) =
+            let (_text, ids, dropped) =
                 encoder_prompt_ids(encoder_entry, set.tokenizer_path(), args.prompt)?;
             let mut encoder = xwen::model::XwenModel::load_encoder(source, spec.max_tokens)?;
             eprintln!(
@@ -2663,7 +2711,11 @@ fn run_image(args: ImageArgs) -> Result<()> {
                 load_start.elapsed().as_secs_f64()
             );
             let encode_start = std::time::Instant::now();
-            let (cap_feats, n_tokens) = encoder.encode(&ids, spec.layer)?;
+            let (cap_feats, n_tokens) = encoder.encode_spec(&ids, &spec)?;
+            // The rows of a fixed system turn the pipeline encodes and does not
+            // condition on; none on a pipeline that renders no such turn.
+            let n_tokens = n_tokens - dropped;
+            let cap_feats = cap_feats.narrow(0, dropped, n_tokens)?.contiguous()?;
             eprintln!(
                 "xwen: {n_tokens} prompt tokens encoded in {:.0}ms",
                 encode_start.elapsed().as_secs_f64() * 1000.0

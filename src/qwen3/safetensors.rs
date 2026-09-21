@@ -161,21 +161,23 @@ struct Expected {
 }
 
 /// Every tensor a `qwen3` checkpoint of this config must contain, in a stable
-/// order. `lm_head.weight` is NOT here: it is optional, because the embedding is
-/// tied.
+/// order, under the prefix its layout names them with. `lm_head.weight` is NOT
+/// here: it is optional, because the embedding is tied — and where it is not,
+/// the head is no plane of this loader's at all.
 fn expected_tensors(cfg: &Qwen3Config) -> Vec<Expected> {
+    let prefix = cfg.layout.prefix();
     let hidden = cfg.hidden_size;
     let inter = cfg.intermediate_size;
     let head_dim = cfg.head_dim();
     let q = cfg.q_dim();
     let kv = cfg.kv_dim();
     let mut out = vec![Expected {
-        name: "model.embed_tokens.weight".to_string(),
+        name: format!("{prefix}embed_tokens.weight"),
         shape: vec![cfg.vocab_size, hidden],
         plane: Plane::Projection,
     }];
     for i in 0..cfg.n_layer {
-        let p = format!("model.layers.{i}");
+        let p = format!("{prefix}layers.{i}");
         for (suffix, shape, plane) in [
             ("input_layernorm.weight", vec![hidden], Plane::Norm),
             (
@@ -221,7 +223,7 @@ fn expected_tensors(cfg: &Qwen3Config) -> Vec<Expected> {
         }
     }
     out.push(Expected {
-        name: "model.norm.weight".to_string(),
+        name: format!("{prefix}norm.weight"),
         shape: vec![hidden],
         plane: Plane::Norm,
     });
@@ -430,6 +432,15 @@ impl Qwen3Set {
             }
         }
 
+        // Planes that are in the set and are not this loader's: a `qwen3_vl`
+        // vision tower, and the separate head of an untied checkpoint, which
+        // only the hidden-state encoder may load and which never projects to
+        // logits. The index and the shards have agreed about them above; past
+        // this point they are not validated, not scanned and not loadable.
+        let untied_head = !config.tie_word_embeddings;
+        routing
+            .retain(|name, _| !(config.layout.ignores(name) || (untied_head && name == LM_HEAD)));
+
         // Shapes, dtypes, and the exact name set the config implies.
         let expected = expected_tensors(&config);
         let mut allowed: BTreeSet<&str> = expected.iter().map(|e| e.name.as_str()).collect();
@@ -485,7 +496,8 @@ impl Qwen3Set {
         // Anything else means the file is not the tied checkpoint its config
         // claims, and silently preferring one of the two would be a coin flip.
         if has_lm_head {
-            let embed = "model.embed_tokens.weight";
+            let embed = format!("{}embed_tokens.weight", config.layout.prefix());
+            let embed = embed.as_str();
             let a = shards[routing[embed]]
                 .st
                 .get(embed)
@@ -698,11 +710,12 @@ impl Qwen3Set {
     /// Load every weight onto `device`.
     pub fn load_all(&self, device: &Device) -> Result<Qwen3Weights> {
         let cfg = &self.config;
+        let prefix = cfg.layout.prefix();
         let mut set = self.tensor_set(device);
-        let embed_tokens = set.take("model.embed_tokens.weight")?;
+        let embed_tokens = set.take(&format!("{prefix}embed_tokens.weight"))?;
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
-            let p = format!("model.layers.{i}");
+            let p = format!("{prefix}layers.{i}");
             layers.push(Qwen3LayerWeights {
                 input_layernorm: set.take_f32(&format!("{p}.input_layernorm.weight"))?,
                 q_proj: set.take(&format!("{p}.self_attn.q_proj.weight"))?,
@@ -718,7 +731,7 @@ impl Qwen3Set {
                 down_proj: set.take(&format!("{p}.mlp.down_proj.weight"))?,
             });
         }
-        let norm = set.take_f32("model.norm.weight")?;
+        let norm = set.take_f32(&format!("{prefix}norm.weight"))?;
         if self.has_lm_head {
             // `open` has already proven this plane byte-equal to the embedding,
             // so it is struck off the ledger without being read: loading it
@@ -726,10 +739,11 @@ impl Qwen3Set {
             // (742 MiB on the 4B) only to drop it.
             set.consume_alias(LM_HEAD)?;
         }
-        // Always tied on this architecture: the config check refuses
-        // `tie_word_embeddings: false`, so an untied head cannot reach here. The
-        // field is `Option` for the checkpoint that one day is untied, and that
-        // one will have to lift the config check first.
+        // Never a separate plane: a tied head is the embedding, and an untied
+        // one is not in the ledger at all (`open` sets it aside), because the
+        // only caller allowed to load an untied set is the hidden-state encoder,
+        // which has no use for a head. The field is `Option` for the language
+        // model that one day is untied.
         let lm_head = None;
         set.finish()?;
         Ok(Qwen3Weights {
@@ -1243,6 +1257,12 @@ pub(crate) mod fixture {
         pub stray_shard: bool,
         /// Write a `tokenizer.json` beside the weights.
         pub tokenizer: bool,
+        /// Write the set as a `qwen3_vl` checkpoint: the nested config with an
+        /// untied head and a three-axis rope split, the language-model planes
+        /// under `model.language_model.`, an `lm_head.weight` that is NOT the
+        /// embedding, and one vision-tower plane at a dtype and shape no
+        /// language-model plane could pass with.
+        pub vl: bool,
     }
 
     impl Tweaks {
@@ -1277,6 +1297,39 @@ pub(crate) mod fixture {
         })
         .to_string()
     }
+
+    /// The same geometry as [`config_json`], in the `qwen3_vl` form.
+    pub(crate) fn vl_config_json() -> String {
+        serde_json::json!({
+            "model_type": "qwen3_vl",
+            "tie_word_embeddings": false,
+            "text_config": {
+                "model_type": "qwen3_vl_text",
+                "hidden_size": HIDDEN,
+                "intermediate_size": INTERMEDIATE,
+                "num_hidden_layers": LAYERS,
+                "num_attention_heads": HEADS,
+                "num_key_value_heads": KV_HEADS,
+                "head_dim": HEAD_DIM,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 5000000,
+                "max_position_embeddings": 4096,
+                "vocab_size": VOCAB,
+                "attention_bias": false,
+                "rope_scaling": {
+                    "rope_type": "default",
+                    "mrope_interleaved": true,
+                    "mrope_section": [24, 20, 20],
+                },
+                "hidden_act": "silu",
+            },
+            "vision_config": {"depth": 1},
+        })
+        .to_string()
+    }
+
+    /// The vision-tower plane a `vl` fixture carries.
+    pub(crate) const VISUAL_PLANE: &str = "model.visual.patch_embed.proj.weight";
 
     /// Deterministic BF16 weights with magnitudes in `[0.5, 1)`: never zero,
     /// never near f16's subnormal floor, never past f16's max. An intact fixture
@@ -1314,8 +1367,13 @@ pub(crate) mod fixture {
     /// Write a two-shard set into `dir`, with `tweaks` applied.
     pub(crate) fn write_set(dir: &Path, tweaks: &Tweaks) -> Result<()> {
         std::fs::create_dir_all(dir)?;
-        let config = config_json();
+        let config = if tweaks.vl {
+            vl_config_json()
+        } else {
+            config_json()
+        };
         let cfg = Qwen3Config::from_json_bytes(config.as_bytes())?;
+        let embed_name = format!("{}embed_tokens.weight", cfg.layout.prefix());
         let expected = expected_tensors(&cfg);
         // Shard A takes the embedding and layer 0; shard B takes layer 1 and the
         // final norm, so both shards hold a mix of norm and projection planes.
@@ -1337,10 +1395,21 @@ pub(crate) mod fixture {
             })
             .collect();
 
-        if let Some(mode) = tweaks.lm_head {
+        if tweaks.vl {
+            entries.push(Entry {
+                name: VISUAL_PLANE.to_string(),
+                shape: vec![3, 5],
+                dtype: "F16".to_string(),
+                data: vec![0u8; 3 * 5 * 2],
+                shard: 0,
+                listed: true,
+            });
+        }
+        let lm_head = tweaks.lm_head.or(tweaks.vl.then_some(LmHead::Divergent));
+        if let Some(mode) = lm_head {
             let embed = entries
                 .iter()
-                .find(|e| e.name == "model.embed_tokens.weight")
+                .find(|e| e.name == embed_name)
                 .expect("the embedding is always written");
             let data = match mode {
                 LmHead::Tied => embed.data.clone(),
@@ -1949,6 +2018,63 @@ mod tests {
         assert!(err.contains("lm_head.weight"), "{err}");
         assert!(err.contains("contradicts itself"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `qwen3_vl` set is its language model to this loader: the planes are
+    /// found under their own prefix, the vision tower is neither validated nor
+    /// scanned (the fixture's is an all-zero F16 plane that would fail both),
+    /// and the untied head is set aside rather than compared or loaded.
+    #[test]
+    fn a_qwen3_vl_set_opens_as_its_language_model() {
+        let tweaks = Tweaks {
+            vl: true,
+            ..Tweaks::intact()
+        };
+        let (dir, set) = open_with("vl", &tweaks, &[]);
+        let set = set.unwrap();
+        assert!(!set.config().tie_word_embeddings);
+        assert!(!set.has_lm_head());
+        assert!(set.zero_runs().is_empty());
+        let w = set.load_all(&Device::Cpu).unwrap();
+        assert_eq!(w.layers.len(), fixture::LAYERS);
+        assert!(w.lm_head.is_none());
+        assert_eq!(w.embed_tokens.dims(), [fixture::VOCAB, fixture::HIDDEN]);
+        let mut ledger = set.tensor_set(&Device::Cpu);
+        assert!(ledger.take(fixture::VISUAL_PLANE).is_err());
+        assert!(ledger.take(LM_HEAD).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The vision tower is ignored by name, not by leniency: any other plane a
+    /// `qwen3_vl` config does not imply is still refused, and so is a
+    /// language-model plane under the flat `qwen3` prefix.
+    #[test]
+    fn a_qwen3_vl_set_still_refuses_names_outside_its_config() {
+        for extra in ["model.audio.proj.weight", "model.norm.weight"] {
+            let tweaks = Tweaks {
+                vl: true,
+                extra: Some(extra),
+                ..Tweaks::intact()
+            };
+            let (dir, set) = open_with("vl-extra", &tweaks, &[]);
+            let err = format!("{:#}", set.unwrap_err());
+            assert!(err.contains(extra), "{err}");
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// A flat `qwen3` set has no ignored planes: a vision-tower name in it is as
+    /// foreign as any other.
+    #[test]
+    fn a_qwen3_set_refuses_a_vision_plane() {
+        let tweaks = Tweaks {
+            extra: Some(fixture::VISUAL_PLANE),
+            ..Tweaks::intact()
+        };
+        let (dir, set) = open_with("flat-visual", &tweaks, &[]);
+        let err = format!("{:#}", set.unwrap_err());
+        assert!(err.contains(fixture::VISUAL_PLANE), "{err}");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

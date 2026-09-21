@@ -286,6 +286,9 @@ impl XwenModel {
                 Self::load_gguf(gguf, runner, max_ctx)
             }
             crate::checkpoint::CheckpointSource::SafeTensors(set, device) => {
+                set.config()
+                    .ensure_tied_head()
+                    .with_context(|| format!("in {}", set.dir().display()))?;
                 let zero_runs = set.zero_runs();
                 ensure!(
                     zero_runs.is_empty(),
@@ -308,7 +311,10 @@ impl XwenModel {
     /// Assemble a safetensors checkpoint for [`XwenModel::encode`]: the same
     /// graph as [`XwenModel::load`] builds, minus the refusal of zero-filled
     /// planes, because an encoder never runs the layers above the hidden
-    /// state it reads (the CLI refuses a `--layer` that would). A GGUF cannot
+    /// state it reads (the CLI refuses a `--layer` that would), and minus the
+    /// refusal of an untied head, because an encoder never projects to logits:
+    /// the model this returns holds the embedding where a head would be, and
+    /// only [`XwenModel::load`]'s check keeps that away from generation. A GGUF cannot
     /// be an encoder here — the hidden-state accessor is a qwen3 stack
     /// feature — and says so.
     pub fn load_encoder(
@@ -321,8 +327,8 @@ impl XwenModel {
             }
             crate::checkpoint::CheckpointSource::Gguf(gguf) => bail!(
                 "{} is a GGUF checkpoint; the hidden-state encoder runs the Qwen3 dense \
-                 safetensors checkpoints only (--model-size zimage-turbo-encoder, qwen3-4b or \
-                 qwen3-4b-instruct-2507)",
+                 safetensors checkpoints only (--model-size zimage-turbo-encoder, \
+                 qwen-image-2.1-encoder, qwen3-4b or qwen3-4b-instruct-2507)",
                 gguf.checkpoint_path().display()
             ),
         }
@@ -381,11 +387,11 @@ impl XwenModel {
             norm,
             lm_head,
         } = set.load_all(device)?;
-        // The loader never materializes a separate head (a tied one is proven
-        // byte-equal to the embedding and struck off without a read), and the
-        // config check refuses an untied checkpoint; so an explicit head here
-        // is a loader contract change this stack has not been taught, not a
-        // tensor to quietly prefer.
+        // The loader never materializes a separate head: a tied one is proven
+        // byte-equal to the embedding and struck off without a read, and an
+        // untied one is set aside at open, its set being loadable as an encoder
+        // alone. So an explicit head here is a loader contract change this
+        // stack has not been taught, not a tensor to quietly prefer.
         ensure!(
             lm_head.is_none(),
             "the qwen3 loader handed over a separate lm_head plane; this stack ties the head \
@@ -403,7 +409,10 @@ impl XwenModel {
             },
         ));
 
-        // One rope table over the full head, at the runtime context budget.
+        // One rope table over the full head, at the runtime context budget. A
+        // multimodal text tower's three-axis split (`qcfg.rope.mrope`) needs no
+        // other table while every token is text: its three ids are equal, and
+        // `rope::mrope_interleaved_tables` yields these rows bit for bit.
         let rope = Arc::new(Rope::new(cfg.rope(), max_ctx, device)?);
         let parts = crate::qwen3::Qwen3Parts::new(qcfg, layers, rope, attn)?;
         Self::assemble_qwen3(
@@ -1274,6 +1283,31 @@ impl XwenModel {
     /// Truncation is the caller's: this encodes exactly the ids it is given.
     /// Only a qwen3-backed model has a hidden-state encoder.
     pub fn encode(&mut self, ids: &[u32], n_layers: usize) -> Result<(Tensor, usize)> {
+        self.encode_tap(ids, crate::qwen3::HiddenTap::hf(n_layers))
+    }
+
+    /// The hidden state a registry entry's pipeline conditions on: its layer,
+    /// and its reading of the last index. Every call site that encodes FOR a
+    /// pipeline goes through here, so an entry whose spec says "before the
+    /// final norm" cannot be encoded with the norm applied by a caller that
+    /// passed the layer alone.
+    pub fn encode_spec(
+        &mut self,
+        ids: &[u32],
+        spec: &crate::hub::EncoderSpec,
+    ) -> Result<(Tensor, usize)> {
+        self.encode_tap(ids, spec.tap())
+    }
+
+    /// [`XwenModel::encode`] with the meaning of the last index stated rather
+    /// than assumed: a tap whose `final_norm` is false reads the residual after
+    /// every layer WITHOUT the final norm, which is what a pipeline that hooks
+    /// the norm out of its encoder call conditions on (Qwen-Image 2.1).
+    pub fn encode_tap(
+        &mut self,
+        ids: &[u32],
+        tap: crate::qwen3::HiddenTap,
+    ) -> Result<(Tensor, usize)> {
         ensure!(
             self.qwen3.is_some(),
             "encode: this model runs the {:?} graph, which has no hidden-state encoder; only \
@@ -1288,9 +1322,9 @@ impl XwenModel {
             self.max_ctx
         );
         // Validated up front so an out-of-range index fails before the reset.
-        crate::qwen3::stack::plan(Some(n_layers), self.cfg.n_layer)?;
+        crate::qwen3::stack::plan(Some(tap), self.cfg.n_layer)?;
         self.reset_cache()?;
-        let hidden = self.encode_chunks(ids, n_layers);
+        let hidden = self.encode_chunks(ids, tap);
         // Reset whatever the pass left, on success and on failure alike.
         self.reset_cache()?;
         // This call publishes nothing: the parity taps it would have collected
@@ -1306,14 +1340,14 @@ impl XwenModel {
 
     /// The prefill of `encode`, split out so its caller can reset the cache
     /// whether or not it returned.
-    fn encode_chunks(&mut self, ids: &[u32], n_layers: usize) -> Result<Tensor> {
+    fn encode_chunks(&mut self, ids: &[u32], tap: crate::qwen3::HiddenTap) -> Result<Tensor> {
         let chunk = self.prefill_chunk();
         let mut parts = Vec::with_capacity(ids.len().div_ceil(chunk));
         let mut pos = 0;
         for c in ids.chunks(chunk) {
             let tokens = Tensor::new(c, &self.device)?;
             let (hidden, _taps, _spec) =
-                crate::qwen3::stack::run_stack(self, &tokens, pos, Some(n_layers))?;
+                crate::qwen3::stack::run_stack(self, &tokens, pos, Some(tap))?;
             parts.push(hidden);
             pos += c.len();
         }

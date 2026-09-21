@@ -42,6 +42,57 @@ pub enum NormVariant {
     Standard,
 }
 
+/// How the rotary frequency slots of a multimodal (MRoPE) text tower are shared
+/// between its three position axes — `rope_scaling.mrope_section` of a
+/// `qwen3_vl` config, `[24, 20, 20]` over the 64 slots of Qwen3-VL-8B.
+///
+/// A token carries a temporal, a height and a width position. In the
+/// INTERLEAVED layout this architecture uses, slot `i` reads the height id when
+/// `i % 3 == 1` and `i < 3 * height`, the width id when `i % 3 == 2` and
+/// `i < 3 * width`, and the temporal id otherwise
+/// ([`crate::rope::mrope_interleaved_tables`]). A text token has the same id on
+/// all three axes, so for text-only input the layout is indistinguishable from
+/// plain NEoX rope over the whole head — which is the path text-only encoding
+/// runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MropeSections {
+    pub temporal: usize,
+    pub height: usize,
+    pub width: usize,
+}
+
+/// Which tensor naming a checkpoint's language-model planes go under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorLayout {
+    /// `model_type: qwen3` — `model.embed_tokens`, `model.layers.N`,
+    /// `model.norm`, and nothing beside them but an optional tied `lm_head`.
+    Qwen3,
+    /// `model_type: qwen3_vl` — the same planes under `model.language_model.`,
+    /// with a vision tower under `model.visual.` beside them and an untied
+    /// `lm_head`. Only the language-model planes are this loader's.
+    Qwen3Vl,
+}
+
+impl TensorLayout {
+    /// The prefix the language-model planes share, with its trailing dot.
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            TensorLayout::Qwen3 => "model.",
+            TensorLayout::Qwen3Vl => "model.language_model.",
+        }
+    }
+
+    /// Whether `name` is a plane this loader neither validates, scans nor
+    /// loads: the vision tower of a `qwen3_vl` set, which text-only encoding
+    /// never evaluates.
+    pub fn ignores(self, name: &str) -> bool {
+        match self {
+            TensorLayout::Qwen3 => false,
+            TensorLayout::Qwen3Vl => name.starts_with("model.visual."),
+        }
+    }
+}
+
 /// How rotary embeddings are applied on this architecture.
 ///
 /// `rotary_dim == head_dim` is Qwen3's full-width NEoX rope, which llama.cpp
@@ -57,8 +108,11 @@ pub struct RopeSpec {
     /// index pass through unrotated.
     pub rotary_dim: usize,
     /// Rope base frequency. 1e6 on `Qwen3-4B` and the Z-Image text encoder,
-    /// 5e6 on `Qwen3-4B-Instruct-2507`.
+    /// 5e6 on `Qwen3-4B-Instruct-2507` and on the Qwen3-VL-8B text tower.
     pub theta: f64,
+    /// The three-axis frequency split of a multimodal text tower, or `None` for
+    /// a plain language model, whose tokens have one position each.
+    pub mrope: Option<MropeSections>,
 }
 
 /// A Hugging Face `config.json` for a `qwen3` checkpoint, as written.
@@ -100,10 +154,84 @@ pub struct HfQwen3Config {
     pub hidden_act: String,
 }
 
+/// A `qwen3_vl` `config.json`, as far as its language model goes: the text
+/// tower's parameters nest under `text_config`, while `tie_word_embeddings`
+/// stays at the top level. `vision_config` and the multimodal token ids are not
+/// read; nothing here evaluates the vision tower.
+#[derive(Debug, Clone, Deserialize)]
+struct HfQwen3VlConfig {
+    tie_word_embeddings: bool,
+    text_config: HfQwen3VlTextConfig,
+}
+
+/// The `text_config` of a `qwen3_vl` checkpoint. The same keys as a flat
+/// `qwen3` config minus the two the multimodal format does not write there:
+/// `tie_word_embeddings` (top level) and `use_sliding_window` (the
+/// `qwen3_vl_text` model has no windowed path to switch on).
+#[derive(Debug, Clone, Deserialize)]
+struct HfQwen3VlTextConfig {
+    model_type: String,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    rms_norm_eps: f64,
+    rope_theta: f64,
+    max_position_embeddings: usize,
+    vocab_size: usize,
+    attention_bias: bool,
+    #[serde(default)]
+    rope_scaling: Option<serde_json::Value>,
+    hidden_act: String,
+}
+
+/// The `model_type` of a multimodal Qwen3-VL checkpoint, whose language model
+/// is the `qwen3` graph under another tensor prefix.
+const QWEN3_VL: &str = "qwen3_vl";
+
 impl HfQwen3Config {
-    /// Parse a `config.json`.
+    /// Parse a `config.json`: a flat `qwen3` one as written, or a `qwen3_vl`
+    /// one flattened — its `text_config` read into the same fields, with
+    /// `model_type` left saying `qwen3_vl` so the tensor layout follows from it.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).context("parsing the qwen3 config.json")
+        #[derive(Deserialize)]
+        struct Probe {
+            model_type: String,
+        }
+        let probe: Probe =
+            serde_json::from_slice(bytes).context("parsing the qwen3 config.json")?;
+        if probe.model_type != QWEN3_VL {
+            return serde_json::from_slice(bytes).context("parsing the qwen3 config.json");
+        }
+        let vl: HfQwen3VlConfig =
+            serde_json::from_slice(bytes).context("parsing the qwen3_vl config.json")?;
+        let text = vl.text_config;
+        ensure!(
+            text.model_type == "qwen3_vl_text",
+            "config.json declares text_config.model_type {:?}; a qwen3_vl checkpoint's language \
+             model is \"qwen3_vl_text\"",
+            text.model_type
+        );
+        Ok(Self {
+            model_type: probe.model_type,
+            hidden_size: text.hidden_size,
+            intermediate_size: text.intermediate_size,
+            num_hidden_layers: text.num_hidden_layers,
+            num_attention_heads: text.num_attention_heads,
+            num_key_value_heads: text.num_key_value_heads,
+            head_dim: text.head_dim,
+            rms_norm_eps: text.rms_norm_eps,
+            rope_theta: text.rope_theta,
+            max_position_embeddings: text.max_position_embeddings,
+            vocab_size: text.vocab_size,
+            tie_word_embeddings: vl.tie_word_embeddings,
+            attention_bias: text.attention_bias,
+            use_sliding_window: false,
+            rope_scaling: text.rope_scaling,
+            hidden_act: text.hidden_act,
+        })
     }
 }
 
@@ -121,8 +249,12 @@ pub struct Qwen3Config {
     /// Full vocabulary, unpadded on this architecture (151936).
     pub vocab_size: usize,
     pub max_position_embeddings: usize,
-    /// True on every shipped Qwen3-4B: `lm_head` reuses `embed_tokens`.
+    /// True on every shipped Qwen3-4B: `lm_head` reuses `embed_tokens`. False
+    /// on a `qwen3_vl` text tower, which ships a separate head — a set only the
+    /// hidden-state encoder may load, since it never projects to logits.
     pub tie_word_embeddings: bool,
+    /// Which names the planes go under. Follows `model_type`.
+    pub layout: TensorLayout,
     /// Which RMSNorm form the stored weights are in. Supplied by the
     /// architecture, not read from the file.
     pub norm: NormVariant,
@@ -140,11 +272,14 @@ impl Qwen3Config {
     /// offending value, because the whole point of the check is to say what the
     /// file wanted that we do not do.
     pub fn from_hf(hf: &HfQwen3Config) -> Result<Self> {
-        ensure!(
-            hf.model_type == "qwen3",
-            "config.json declares model_type {:?}; this loader implements \"qwen3\" only",
-            hf.model_type
-        );
+        let layout = match hf.model_type.as_str() {
+            "qwen3" => TensorLayout::Qwen3,
+            QWEN3_VL => TensorLayout::Qwen3Vl,
+            other => bail!(
+                "config.json declares model_type {other:?}; this loader implements \"qwen3\" \
+                 and the language model of \"qwen3_vl\" only"
+            ),
+        };
         ensure!(
             !hf.use_sliding_window,
             "config.json sets use_sliding_window true; the qwen3 stack is full attention on \
@@ -154,11 +289,6 @@ impl Qwen3Config {
             !hf.attention_bias,
             "config.json sets attention_bias true; the qwen3 q/k/v/o projections are \
              implemented without bias tensors"
-        );
-        ensure!(
-            hf.tie_word_embeddings,
-            "config.json sets tie_word_embeddings false; the qwen3 LM head is the embedding \
-             matrix and an untied checkpoint would need a separate output plane"
         );
         ensure!(
             hf.head_dim == 128,
@@ -191,13 +321,10 @@ impl Qwen3Config {
                 hf.head_dim
             );
         }
-        match &hf.rope_scaling {
-            Some(v) if !v.is_null() => bail!(
-                "config.json sets rope_scaling to {v}; this loader implements plain NEoX rope \
-                 with no scaling scheme"
-            ),
-            _ => {}
-        }
+        let mrope = match &hf.rope_scaling {
+            Some(v) if !v.is_null() => Some(mrope_sections(v, hf.head_dim)?),
+            _ => None,
+        };
         ensure!(
             hf.hidden_act == "silu",
             "config.json declares hidden_act {:?}; the qwen3 FFN is SwiGLU over silu",
@@ -237,15 +364,30 @@ impl Qwen3Config {
             vocab_size: hf.vocab_size,
             max_position_embeddings: hf.max_position_embeddings,
             tie_word_embeddings: hf.tie_word_embeddings,
+            layout,
             norm: NormVariant::Standard,
             rope: RopeSpec {
                 head_dim: hf.head_dim,
                 // Full-width NEoX: every dim of the head rotates.
                 rotary_dim: hf.head_dim,
                 theta: hf.rope_theta,
+                mrope,
             },
             eog: QWEN3_EOG,
         })
+    }
+
+    /// Refuse a checkpoint whose LM head is not its embedding, for every caller
+    /// that projects to logits. The stack holds ONE vocabulary plane and uses it
+    /// for both ends, so an untied set would generate from the wrong head and
+    /// return fluent text rather than an error.
+    pub fn ensure_tied_head(&self) -> Result<()> {
+        ensure!(
+            self.tie_word_embeddings,
+            "config.json sets tie_word_embeddings false; the qwen3 LM head is the embedding \
+             matrix and an untied checkpoint would need a separate output plane"
+        );
+        Ok(())
     }
 
     /// Parse and validate a `config.json` in one step.
@@ -272,6 +414,46 @@ impl Qwen3Config {
     pub fn kv_dim(&self) -> usize {
         self.n_kv_head * self.head_dim()
     }
+}
+
+/// Read a non-null `rope_scaling`. Exactly one shape is implemented — unscaled
+/// frequencies (`rope_type: default`) split over three position axes in the
+/// interleaved layout — and everything else is a scheme this loader does not
+/// run, refused with the value it asked for.
+fn mrope_sections(v: &serde_json::Value, head_dim: usize) -> Result<MropeSections> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Mrope {
+        rope_type: String,
+        mrope_interleaved: bool,
+        mrope_section: [usize; 3],
+    }
+    let refuse = || {
+        anyhow::anyhow!(
+            "config.json sets rope_scaling to {v}; this loader implements plain NEoX rope with \
+             no scaling scheme, and the interleaved three-axis split of unscaled frequencies \
+             (rope_type \"default\", mrope_interleaved true, mrope_section [t, h, w])"
+        )
+    };
+    let m: Mrope = serde_json::from_value(v.clone()).map_err(|_| refuse())?;
+    if m.rope_type != "default" || !m.mrope_interleaved {
+        return Err(refuse());
+    }
+    let [temporal, height, width] = m.mrope_section;
+    let slots = temporal.saturating_add(height).saturating_add(width);
+    ensure!(
+        slots == head_dim / 2,
+        "config.json declares mrope_section {:?}, which sums to {} where a {head_dim}-wide head \
+         has {} rotary frequency slots",
+        m.mrope_section,
+        slots,
+        head_dim / 2
+    );
+    Ok(MropeSections {
+        temporal,
+        height,
+        width,
+    })
 }
 
 #[cfg(test)]
@@ -337,6 +519,9 @@ mod tests {
             assert_eq!(cfg.norm, NormVariant::Standard, "{label}");
             assert_eq!(cfg.rope.rotary_dim, cfg.rope.head_dim, "{label}");
             assert_eq!(cfg.rope.theta, theta, "{label}");
+            assert_eq!(cfg.rope.mrope, None, "{label}");
+            assert_eq!(cfg.layout, TensorLayout::Qwen3, "{label}");
+            cfg.ensure_tied_head().unwrap();
             assert_eq!(cfg.max_position_embeddings, max_pos, "{label}");
             assert_eq!(cfg.eog, [151645, 151643], "{label}");
         }
@@ -371,12 +556,127 @@ mod tests {
         assert!(err.contains("attention_bias"), "{err}");
     }
 
+    /// An untied config parses, carrying the fact, and it is the language-model
+    /// callers that refuse it: the encoder never projects to logits and may
+    /// load such a set.
     #[test]
-    fn untied_embeddings_are_refused() {
+    fn untied_embeddings_are_carried_and_refused_by_the_lm_check() {
         let mut v = valid_json();
         v["tie_word_embeddings"] = false.into();
-        let err = parse(v).unwrap_err().to_string();
+        let cfg = parse(v).unwrap();
+        assert!(!cfg.tie_word_embeddings);
+        let err = cfg.ensure_tied_head().unwrap_err().to_string();
         assert!(err.contains("tie_word_embeddings"), "{err}");
+        parse(valid_json()).unwrap().ensure_tied_head().unwrap();
+    }
+
+    /// The Qwen3-VL-8B config as Qwen-Image 2.1 ships it under `text_encoder/`,
+    /// cut down to the keys that are read plus a few that are not.
+    fn valid_vl_json() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "image_token_id": 151655,
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "attention_bias": false,
+                "head_dim": 128,
+                "hidden_act": "silu",
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "max_position_embeddings": 262144,
+                "model_type": "qwen3_vl_text",
+                "num_attention_heads": 32,
+                "num_hidden_layers": 36,
+                "num_key_value_heads": 8,
+                "rms_norm_eps": 1e-6,
+                "rope_scaling": {
+                    "mrope_interleaved": true,
+                    "mrope_section": [24, 20, 20],
+                    "rope_type": "default",
+                },
+                "rope_theta": 5000000,
+                "vocab_size": 151936,
+            },
+            "tie_word_embeddings": false,
+            "vision_config": {"depth": 27, "hidden_size": 1152},
+        })
+    }
+
+    fn assert_is_the_qwen3_vl_8b_text_tower(cfg: &Qwen3Config) {
+        assert_eq!(cfg.hidden_size, 4096);
+        assert_eq!(cfg.intermediate_size, 12288);
+        assert_eq!(cfg.n_layer, 36);
+        assert_eq!(cfg.n_head, 32);
+        assert_eq!(cfg.n_kv_head, 8);
+        assert_eq!(cfg.vocab_size, 151936);
+        assert_eq!(cfg.head_dim(), 128);
+        assert_eq!(cfg.rms_norm_eps, 1e-6);
+        assert_eq!(cfg.max_position_embeddings, 262144);
+        assert!(!cfg.tie_word_embeddings);
+        assert_eq!(cfg.layout, TensorLayout::Qwen3Vl);
+        assert_eq!(cfg.rope.rotary_dim, 128);
+        assert_eq!(cfg.rope.theta, 5e6);
+        assert_eq!(
+            cfg.rope.mrope,
+            Some(MropeSections {
+                temporal: 24,
+                height: 20,
+                width: 20
+            })
+        );
+    }
+
+    #[test]
+    fn a_qwen3_vl_config_reads_its_text_tower() {
+        assert_is_the_qwen3_vl_8b_text_tower(&parse(valid_vl_json()).unwrap());
+    }
+
+    #[test]
+    fn the_shipped_qwen_image_encoder_config_parses() {
+        // The config alone: this asks nothing of the shards beside it.
+        let entry = Model::QwenImage21Encoder;
+        let Some(config) = test_support::cached_file_or_skip(entry, entry.file()) else {
+            return;
+        };
+        let cfg = Qwen3Config::from_json_bytes(&std::fs::read(&config).unwrap()).unwrap();
+        assert_is_the_qwen3_vl_8b_text_tower(&cfg);
+    }
+
+    #[test]
+    fn a_qwen3_vl_config_with_a_foreign_text_model_is_refused() {
+        let mut v = valid_vl_json();
+        v["text_config"]["model_type"] = "qwen3_vl_moe_text".into();
+        let err = format!("{:#}", parse(v).unwrap_err());
+        assert!(err.contains("qwen3_vl_moe_text"), "{err}");
+    }
+
+    #[test]
+    fn a_three_axis_split_in_any_other_form_is_refused() {
+        let broken = [
+            serde_json::json!({"rope_type": "default", "mrope_interleaved": false,
+                "mrope_section": [24, 20, 20]}),
+            serde_json::json!({"rope_type": "yarn", "mrope_interleaved": true,
+                "mrope_section": [24, 20, 20]}),
+            serde_json::json!({"rope_type": "default", "mrope_interleaved": true,
+                "mrope_section": [24, 20, 20], "factor": 4.0}),
+            serde_json::json!({"rope_type": "default", "mrope_interleaved": true,
+                "mrope_section": [16, 24, 24, 0]}),
+            serde_json::json!({"rope_type": "default", "mrope_interleaved": true}),
+        ];
+        for scaling in broken {
+            let mut v = valid_vl_json();
+            v["text_config"]["rope_scaling"] = scaling.clone();
+            let err = format!("{:#}", parse(v).unwrap_err());
+            assert!(err.contains("rope_scaling"), "{scaling}: {err}");
+        }
+    }
+
+    #[test]
+    fn sections_that_do_not_fill_the_head_are_refused() {
+        let mut v = valid_vl_json();
+        v["text_config"]["rope_scaling"]["mrope_section"] = serde_json::json!([24, 20, 19]);
+        let err = format!("{:#}", parse(v).unwrap_err());
+        assert!(err.contains("sums to 63"), "{err}");
     }
 
     #[test]

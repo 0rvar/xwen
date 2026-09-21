@@ -100,6 +100,29 @@ pub(crate) fn cached_file_or_skip(model: Model, file: &str) -> Option<PathBuf> {
     )
 }
 
+/// One file of a repo named directly, by its repo-relative path, or `None`
+/// with a visible skip naming `fetch`. For a file no registry entry lists, so
+/// there is no `Model` to ask.
+pub(crate) fn repo_file_or_skip(repo: &str, file: &str, fetch: &str) -> Option<PathBuf> {
+    or_skip(
+        hub::cached_file(repo, file),
+        &format!("{repo}/{file}"),
+        fetch,
+    )
+}
+
+/// The same rule for a test about a SET of cached files, which has something
+/// to assert only when at least `need` of them are here: `true` to go on,
+/// `false` with a visible skip, and a failure under [`REQUIRE_HF_CACHE`].
+pub(crate) fn enough_or_skip(have: usize, need: usize, what: &str, fetch: &str) -> bool {
+    or_skip(
+        (have >= need).then(PathBuf::new),
+        &format!("{what} (found {have}, need {need})"),
+        fetch,
+    )
+    .is_some()
+}
+
 /// This checkpoint's `tokenizer.json`, or `None` with a visible skip. `None`
 /// without a skip line for a GGUF checkpoint, which names no tokenizer file:
 /// that is a fact about the registry rather than about this machine, and a test

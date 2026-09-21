@@ -131,7 +131,9 @@ impl SamplerOptions {
                 top_p: if thinking { 0.95 } else { 0.80 },
                 ..Self::recommended(thinking)
             },
-            Model::Qwen34BInstruct2507 => Self {
+            // The Qwen-Image entries never sample; they take the card of the
+            // non-thinking release whose dialect they name.
+            Model::Qwen34BInstruct2507 | Model::QwenImage21Encoder | Model::QwenImage21 => Self {
                 temperature: 0.7,
                 top_p: 0.80,
                 ..Self::recommended(thinking)

@@ -172,8 +172,10 @@ impl Rope {
 
     /// The candle rope chain over already-selected `[seq, n_rot/2]` cos/sin
     /// rows: rotate the first `n_rot` dims of `x` `[heads, seq, head_dim]`,
-    /// pass the rest through, store as `out_dtype`.
-    fn rotate_with_tables(
+    /// pass the rest through, store as `out_dtype`. Also the entry for rows that
+    /// are not rows of this table at all: the three-axis ones
+    /// [`mrope_interleaved_tables`] builds.
+    pub(crate) fn rotate_with_tables(
         &self,
         x: &Tensor,
         cos: &Tensor,
@@ -203,6 +205,81 @@ impl Rope {
     }
 }
 
+/// One position per axis for every token of a multimodal sequence. A text
+/// token carries the same id on all three; an image token carries its frame,
+/// row and column.
+#[derive(Debug, Clone, Copy)]
+pub struct MropeIds<'a> {
+    pub temporal: &'a [u32],
+    pub height: &'a [u32],
+    pub width: &'a [u32],
+}
+
+/// Which axis frequency slot `slot` reads under interleaved MRoPE.
+///
+/// transformers' `Qwen3VLTextRotaryEmbedding` starts every slot on the temporal
+/// axis and then overwrites `slice(1, 3 * height, 3)` with the height axis and
+/// `slice(2, 3 * width, 3)` with the width axis. So with sections
+/// `[24, 20, 20]` over 64 slots, 1, 4, …, 58 read height, 2, 5, …, 59 read
+/// width, and 0, 3, …, 57 together with 60..63 read temporal.
+fn mrope_axis(sections: crate::qwen3::MropeSections, slot: usize) -> usize {
+    match slot % 3 {
+        1 if slot < 3 * sections.height => 1,
+        2 if slot < 3 * sections.width => 2,
+        _ => 0,
+    }
+}
+
+/// cos/sin rows `[seq, head_dim / 2]` f32 for interleaved three-axis MRoPE with
+/// unscaled frequencies: slot `j` is `id * theta^(-2j / head_dim)` with `id`
+/// taken from the axis [`mrope_axis`] assigns that slot. The rows go to
+/// [`Rope::rotate_with_tables`], whose NEoX pairing is the `cat(freqs, freqs)`
+/// plus `rotate_half` transformers applies.
+///
+/// The arithmetic is [`Rope::new`]'s, f64 rounded once to f32, so a token whose
+/// three ids are equal gets bit for bit the row the plain table holds at that
+/// position. That is what makes text-only encoding on the plain path exact
+/// rather than approximately right.
+pub fn mrope_interleaved_tables(
+    sections: crate::qwen3::MropeSections,
+    theta: f64,
+    ids: MropeIds<'_>,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let seq = ids.temporal.len();
+    anyhow::ensure!(
+        ids.height.len() == seq && ids.width.len() == seq,
+        "mrope: {seq} temporal ids against {} height and {} width ids",
+        ids.height.len(),
+        ids.width.len()
+    );
+    let half = sections.temporal + sections.height + sections.width;
+    // A split whose spatial sections reach past the slots that exist would
+    // leave some of their frequencies unassigned without saying so.
+    anyhow::ensure!(
+        3 * sections.height <= half + 2 && 3 * sections.width <= half + 2,
+        "mrope: sections {sections:?} do not interleave into {half} slots"
+    );
+    let n = (2 * half) as f64;
+    let inv_freq: Vec<f64> = (0..half)
+        .map(|j| theta.powf(-(2.0 * j as f64) / n))
+        .collect();
+    let axes = [ids.temporal, ids.height, ids.width];
+    let mut cos = vec![0f32; seq * half];
+    let mut sin = vec![0f32; seq * half];
+    for t in 0..seq {
+        for j in 0..half {
+            let angle = axes[mrope_axis(sections, j)][t] as f64 * inv_freq[j];
+            cos[t * half + j] = angle.cos() as f32;
+            sin[t * half + j] = angle.sin() as f32;
+        }
+    }
+    Ok((
+        Tensor::from_vec(cos, (seq, half), device)?,
+        Tensor::from_vec(sin, (seq, half), device)?,
+    ))
+}
+
 /// F32/F16 is the contract on every rope path (the fused kernel enforces it;
 /// the chain must not silently accept more just because to_dtype can).
 fn check_out_dtype(out_dtype: DType) -> Result<()> {
@@ -216,6 +293,132 @@ fn check_out_dtype(out_dtype: DType) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qwen3::MropeSections;
+
+    const QWEN3_VL_SECTIONS: MropeSections = MropeSections {
+        temporal: 24,
+        height: 20,
+        width: 20,
+    };
+
+    /// The slot-to-axis map, against the slices transformers writes.
+    #[test]
+    fn interleaved_mrope_assigns_slots_as_transformers_does() {
+        let mut want = [0usize; 64];
+        for slot in (1..60).step_by(3) {
+            want[slot] = 1;
+        }
+        for slot in (2..60).step_by(3) {
+            want[slot] = 2;
+        }
+        let got: Vec<usize> = (0..64).map(|s| mrope_axis(QWEN3_VL_SECTIONS, s)).collect();
+        assert_eq!(got, want);
+        for (axis, count) in [(0, 24), (1, 20), (2, 20)] {
+            assert_eq!(got.iter().filter(|a| **a == axis).count(), count);
+        }
+    }
+
+    /// Text tokens carry one id on all three axes, and their rows are the plain
+    /// NEoX table's rows to the bit — at every position, not just small ones.
+    #[test]
+    fn equal_ids_on_every_axis_reproduce_the_plain_table_bitwise() {
+        let device = Device::Cpu;
+        let theta = 5e6;
+        let plain = Rope::new(
+            &RopeKind::Plain {
+                freq_base: theta as f32,
+                n_rot: 128,
+            },
+            4096,
+            &device,
+        )
+        .unwrap();
+        let ids: Vec<u32> = vec![0, 1, 2, 3, 17, 511, 2048, 4095];
+        let (cos, sin) = mrope_interleaved_tables(
+            QWEN3_VL_SECTIONS,
+            theta,
+            MropeIds {
+                temporal: &ids,
+                height: &ids,
+                width: &ids,
+            },
+            &device,
+        )
+        .unwrap();
+        let positions = Tensor::new(ids.as_slice(), &device).unwrap();
+        for (got, table) in [(&cos, &plain.cos), (&sin, &plain.sin)] {
+            let want = table.index_select(&positions, 0).unwrap();
+            let got: Vec<u32> = got
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            let want: Vec<u32> = want
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    /// An image token's row mixes three positions: each slot is the plain row
+    /// of whichever axis owns it.
+    #[test]
+    fn distinct_ids_take_each_slot_from_its_own_axis() {
+        let device = Device::Cpu;
+        let theta = 5e6;
+        let plain = Rope::new(
+            &RopeKind::Plain {
+                freq_base: theta as f32,
+                n_rot: 128,
+            },
+            64,
+            &device,
+        )
+        .unwrap();
+        let (cos, _) = mrope_interleaved_tables(
+            QWEN3_VL_SECTIONS,
+            theta,
+            MropeIds {
+                temporal: &[7],
+                height: &[19],
+                width: &[42],
+            },
+            &device,
+        )
+        .unwrap();
+        let cos = cos.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let rows = [cos_row(&plain, 7), cos_row(&plain, 19), cos_row(&plain, 42)];
+        for (slot, got) in cos.iter().enumerate() {
+            let axis = mrope_axis(QWEN3_VL_SECTIONS, slot);
+            assert_eq!(got.to_bits(), rows[axis][slot].to_bits(), "slot {slot}");
+        }
+        assert_ne!(cos[1].to_bits(), rows[0][1].to_bits());
+    }
+
+    #[test]
+    fn mismatched_id_rows_are_refused() {
+        let err = mrope_interleaved_tables(
+            QWEN3_VL_SECTIONS,
+            5e6,
+            MropeIds {
+                temporal: &[0, 1],
+                height: &[0],
+                width: &[0, 1],
+            },
+            &Device::Cpu,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("2 temporal ids"), "{err}");
+    }
 
     fn cos_row(rope: &Rope, pos: usize) -> Vec<f32> {
         rope.cos

@@ -59,6 +59,8 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
     for (alias, expected, command) in [
         ("zimage-turbo-encoder", "encode-only", "xwen encode-text"),
         ("zimage-turbo", "text-to-image", "xwen image"),
+        ("qwen-image-2.1-encoder", "encode-only", "xwen encode-text"),
+        ("qwen-image-2.1", "diffusion pipeline", "xwen image"),
     ] {
         let out = xwen()
             .args(["serve", "--config"])
@@ -86,7 +88,7 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
     std::fs::remove_file(&config).unwrap();
 }
 
-/// The same two refusals on the one-shot CLI surfaces, which apply the gate at
+/// The same refusals on the one-shot CLI surfaces, which apply the gate at
 /// a different call site from serve's and could stop applying it on their own.
 ///
 /// `generate` and `chat` do not move cache state the way serve and batch do,
@@ -94,10 +96,12 @@ fn serve_refuses_an_unrunnable_checkpoint_before_it_fetches_anything() {
 /// the gate `generate --model-size zimage-turbo` would try to open a
 /// `model_index.json` as a checkpoint after a 32.9 GB download.
 #[test]
-fn the_one_shot_surfaces_refuse_both_z_image_entries() {
+fn the_one_shot_surfaces_refuse_every_image_entry() {
     for (alias, expected, command) in [
         ("zimage-turbo-encoder", "encode-only", "xwen encode-text"),
         ("zimage-turbo", "text-to-image", "xwen image"),
+        ("qwen-image-2.1-encoder", "encode-only", "xwen encode-text"),
+        ("qwen-image-2.1", "diffusion pipeline", "xwen image"),
     ] {
         // `chat` takes no `--prompt`; it reads a REPL it never gets to.
         for (subcommand, extra) in [("generate", vec!["--prompt", "hi"]), ("chat", Vec::new())] {
@@ -139,6 +143,12 @@ fn batch_refuses_an_unrunnable_checkpoint_named_in_its_payload() {
             "xwen encode-text",
         ),
         ("Z-Image-Turbo", "text-to-image", "xwen image"),
+        (
+            "Qwen-Image-2.1-text-encoder",
+            "encode-only",
+            "xwen encode-text",
+        ),
+        ("Qwen-Image-2.1", "diffusion pipeline", "xwen image"),
     ] {
         let mut child = xwen()
             .arg("batch")
@@ -514,4 +524,20 @@ fn encode_text_finds_the_encoder_by_either_spelling_of_a_snapshot() {
         );
     }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `xwen image` names a registered pipeline it cannot run yet, rather than
+/// loading it through another model's pipeline, and does so before any fetch.
+#[test]
+fn image_refuses_a_pipeline_it_does_not_implement() {
+    let out = xwen()
+        .args(["image", "--model-size", "qwen-image-2.1", "--prompt", "hi"])
+        .output()
+        .expect("running xwen image");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "it must refuse\n{stderr}");
+    assert!(stderr.contains("Qwen-Image-2.1"), "{stderr}");
+    assert!(stderr.contains("not implemented"), "{stderr}");
+    assert!(stderr.contains("xwen encode-text"), "{stderr}");
+    assert!(!stderr.contains("downloading"), "{stderr}");
 }
