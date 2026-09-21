@@ -993,6 +993,16 @@ impl QwenImageLoaded {
             .pipeline
             .as_ref()
             .context("the Qwen-Image 2.1 pipeline is not loaded")?;
+        // The request was admitted on the VAE arm the environment names. The
+        // loaded pipeline knows the arm it resolved to, and a render it prices
+        // above what was admitted is refused rather than run on a wrong number.
+        let admitted = Pipeline::QwenImage.peak(params.width, params.height, false, 0)?;
+        let loaded = pipeline.loaded_peak_bytes(params.width, params.height)?;
+        anyhow::ensure!(
+            loaded <= admitted,
+            "the loaded Qwen-Image 2.1 pipeline prices this render at {loaded} bytes, above the \
+             {admitted} it was admitted on: its VAE resolved to another arm than admission assumed"
+        );
         let first_seed = params.seed.unwrap_or_else(drawn_seed);
         let mut out = Vec::with_capacity(params.n as usize);
         for i in 0..params.n as u64 {
@@ -1993,12 +2003,16 @@ mod tests {
             peak - 14 * gib
         );
         assert!(Pipeline::QwenImage.resident_floor() < 15_700_000_000);
+        // The envelope is the taller of the two phases at every size. Which
+        // one that is depends on the VAE arm: the shipped decoder keeps the
+        // render under the encode phase up to the pixel cap.
         let large = Pipeline::QwenImage.peak(1024, 1024, false, 0).unwrap();
         assert_eq!(
             large,
-            crate::memory::qwen_image_peak(1024, 1024).unwrap(),
-            "at 1024x1024 the render's own peak is the taller phase"
+            crate::memory::qwen_image_serve_peak(1024, 1024).unwrap()
         );
+        assert!(large >= crate::memory::qwen_image_peak(1024, 1024).unwrap());
+        assert!(large >= crate::memory::QWEN_IMAGE_SERVE_ENCODE_PEAK);
     }
 
     fn fingerprint() -> crate::zimage::lora::Fingerprint {

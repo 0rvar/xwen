@@ -348,29 +348,54 @@ impl QwenImagePipeline {
         h * w
     }
 
-    /// The bytes one run holds at its peak, the encoder excluded (it is gone
-    /// before the transformer loads): `PEAK_BASE + PEAK_PER_MEGAPIXEL * pixels`,
-    /// a line through two measured runs with 15% on top.
+    /// The bytes one run will hold at its peak, the encoder excluded (it is
+    /// gone before the transformer loads), for admission BEFORE anything is
+    /// loaded. See [`Self::peak_bytes_for`].
     ///
-    /// Measured 2026-09-21 as the kernel's `phys_footprint_peak` of `xwen
-    /// image`, 40 steps, the VAE on the candle arm: 25 GiB at 512x512
-    /// ([`MEASURED_PEAK_512`]) and 56 GiB at 1024x1024
-    /// ([`MEASURED_PEAK_1024`]). Both peaks are the VAE DECODE, not the
-    /// denoising loop, which held 19 and 27 GiB: candle's convolution builds a
-    /// column buffer nine times its input, 10.9 GB for one 288-channel
-    /// 1024x1024 layer, and the buffer pool rounds that up. The decode already
-    /// returns its buffers between layers, so what is left is one layer's
-    /// worth, and it scales with pixels. A decoder that forms no column buffer
-    /// moves both constants, which is when they are measured again.
+    /// The arm is the one [`VAE_ENV`] names, resolved the way the loader
+    /// resolves it for a Metal device when this build has one and for the CPU
+    /// otherwise. Every surface that loads this pipeline creates a Metal
+    /// device, so that is the arm the load arrives at; a pipeline in hand
+    /// answers for itself through [`Self::loaded_peak_bytes`], which is what
+    /// to admit on if the two ever differ.
+    ///
+    /// [`VAE_ENV`]: super::vae::VAE_ENV
     pub fn peak_bytes(width: usize, height: usize) -> Result<u64> {
+        let arm = VaeImpl::from_env()?.resolve(candle_core::utils::metal_is_available());
+        Self::peak_bytes_for(width, height, arm)
+    }
+
+    /// [`Self::peak_bytes_for`] on the arm this pipeline's VAE resolved to on
+    /// the device it was loaded on.
+    pub fn loaded_peak_bytes(&self, width: usize, height: usize) -> Result<u64> {
+        Self::peak_bytes_for(width, height, self.vae.resolved_arm())
+    }
+
+    /// `base + per_megapixel * pixels` for the arm, a line through two measured
+    /// runs with 15% on top. Measured 2026-09-21 as the kernel's
+    /// `phys_footprint_peak` of `xwen image` at 512x512 and 1024x1024.
+    ///
+    /// On the xwen arm the peak is the DENOISING LOOP, 19 and 28 GiB
+    /// ([`MEASURED_PEAK_512`], [`MEASURED_PEAK_1024`]): the direct convolution
+    /// forms no column buffer and the decode stays under what the loop already
+    /// held. On the candle arm the peak is the VAE DECODE, 25 and 56 GiB
+    /// ([`MEASURED_CANDLE_PEAK_512`], [`MEASURED_CANDLE_PEAK_1024`]) over the
+    /// same 19 and 27 GiB loop: candle's convolution builds a column buffer
+    /// nine times its input, 10.9 GB for one 288-channel 1024x1024 layer, and
+    /// the buffer pool rounds that up.
+    pub fn peak_bytes_for(width: usize, height: usize, vae: VaeImpl) -> Result<u64> {
         Self::check_size(width, height)?;
+        let (base, per_megapixel) = match vae {
+            VaeImpl::Xwen => (PEAK_BASE, PEAK_PER_MEGAPIXEL),
+            VaeImpl::Candle => (CANDLE_PEAK_BASE, CANDLE_PEAK_PER_MEGAPIXEL),
+        };
         let pixels = (width as u64)
             .checked_mul(height as u64)
             .context("image pixel count overflow")?;
         pixels
-            .checked_mul(PEAK_PER_MEGAPIXEL)
+            .checked_mul(per_megapixel)
             .map(|scaled| scaled >> 20)
-            .and_then(|scaled| scaled.checked_add(PEAK_BASE))
+            .and_then(|scaled| scaled.checked_add(base))
             .context("image memory estimate overflow")
     }
 
@@ -597,14 +622,22 @@ impl QwenImagePipeline {
 
 const GIB: u64 = 1 << 30;
 
-/// The measured peaks [`QwenImagePipeline::peak_bytes`] is fitted to.
-pub const MEASURED_PEAK_512: u64 = 25 * GIB;
-pub const MEASURED_PEAK_1024: u64 = 56 * GIB;
+/// The measured peaks [`QwenImagePipeline::peak_bytes_for`] is fitted to on
+/// the xwen VAE arm.
+pub const MEASURED_PEAK_512: u64 = 19 * GIB;
+pub const MEASURED_PEAK_1024: u64 = 28 * GIB;
 
-/// The fit through those two points is 14.7 GiB plus 41.3 GiB per megapixel
+/// The fit through those two points is 16 GiB plus 12 GiB per megapixel
 /// (1,048,576 pixels); these are that line with 15% on top, rounded up.
-const PEAK_BASE: u64 = 17 * GIB;
-const PEAK_PER_MEGAPIXEL: u64 = 48 * GIB;
+const PEAK_BASE: u64 = 19 * GIB;
+const PEAK_PER_MEGAPIXEL: u64 = 14 * GIB;
+
+/// The same for the candle VAE arm: measured, then the fit (14.7 GiB plus
+/// 41.3 GiB per megapixel) with 15% on top.
+pub const MEASURED_CANDLE_PEAK_512: u64 = 25 * GIB;
+pub const MEASURED_CANDLE_PEAK_1024: u64 = 56 * GIB;
+const CANDLE_PEAK_BASE: u64 = 17 * GIB;
+const CANDLE_PEAK_PER_MEGAPIXEL: u64 = 48 * GIB;
 
 /// The latent channels and the caption width of the shipped checkpoint, which
 /// the file readers check against before any config is open. The loaded
@@ -784,8 +817,13 @@ mod tests {
         assert!(QwenImagePipeline::check_layout(0, 1024, 1024).is_err());
         assert!(QwenImagePipeline::check_layout(73, 1000, 1024).is_err());
         // The estimate covers both measured runs with its margin.
-        for (side, measured) in [(512, MEASURED_PEAK_512), (1024, MEASURED_PEAK_1024)] {
-            let estimate = QwenImagePipeline::peak_bytes(side, side).unwrap();
+        for (side, measured, arm) in [
+            (512, MEASURED_PEAK_512, VaeImpl::Xwen),
+            (1024, MEASURED_PEAK_1024, VaeImpl::Xwen),
+            (512, MEASURED_CANDLE_PEAK_512, VaeImpl::Candle),
+            (1024, MEASURED_CANDLE_PEAK_1024, VaeImpl::Candle),
+        ] {
+            let estimate = QwenImagePipeline::peak_bytes_for(side, side, arm).unwrap();
             assert!(
                 estimate as f64 >= measured as f64 * 1.15,
                 "{side}x{side}: {estimate} against a measured {measured}"

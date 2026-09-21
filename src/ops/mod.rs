@@ -1,6 +1,7 @@
 pub mod attn_glue;
 pub mod bandwidth;
 pub mod bf16;
+pub mod channel_l2_norm;
 pub mod combine;
 pub mod conv2d_direct;
 pub mod delta;
@@ -28,6 +29,7 @@ pub mod silu_mul;
 
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
 pub use bf16::matmul_bf16;
+pub use channel_l2_norm::channel_l2_norm;
 pub use combine::combine;
 pub use conv2d_direct::{
     Conv2dFusion, conv2d_direct, conv2d_direct_supported, permute_conv_weight,

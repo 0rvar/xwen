@@ -122,6 +122,9 @@ const ROPE_PAIR_SOURCE: &str = include_str!("rope_pair.metal");
 /// Gated residual add for the Z-Image transformer (gated_residual.metal). Own
 /// library, same pinning as above for the same reason.
 const GATED_RESIDUAL_SOURCE: &str = include_str!("gated_residual.metal");
+/// Per-pixel channel L2 norm for the Qwen-Image VAE (channel_l2_norm.metal).
+/// Own library, no Metal-4 dependency.
+const CHANNEL_L2_NORM_SOURCE: &str = include_str!("channel_l2_norm.metal");
 /// Direct 3x3 / 1x1 convolution for the Z-Image VAE decoder
 /// (conv2d_direct.metal). Own library, simdgroup matrix f32, fast math;
 /// no bitwise contract with candle.
@@ -372,6 +375,11 @@ pub(crate) fn rope_pair_pipeline(device: &Device, name: &str) -> Result<ComputeP
 /// Pipeline for the `gated_residual.metal` kernel (Z-Image gated residual add).
 pub(crate) fn gated_residual_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, GATED_RESIDUAL_SOURCE, "gated_residual", name)
+}
+
+/// Pipeline for the `channel_l2_norm.metal` kernel (Qwen-Image VAE norm).
+pub(crate) fn channel_l2_norm_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, CHANNEL_L2_NORM_SOURCE, "channel_l2_norm", name)
 }
 
 /// Pipeline for a `conv2d_direct.metal` kernel (Z-Image VAE direct convolution).

@@ -2792,6 +2792,12 @@ fn run_qwen_image(args: ImageArgs, root: Option<PathBuf>) -> Result<()> {
 
     let load_start = std::time::Instant::now();
     let pipeline = QwenImagePipeline::load(&root, &device)?;
+    // Admission ran on the arm the environment names; the pipeline knows the
+    // one it resolved to, and a taller estimate is admitted before it renders.
+    let loaded_peak = pipeline.loaded_peak_bytes(width, height)?;
+    if loaded_peak > peak {
+        xwen::memory::admit("cli image", loaded_peak)?;
+    }
     xwen::memory::log_event("cli Qwen-Image 2.1 loaded", Some(&device));
     device.synchronize()?;
     eprintln!(

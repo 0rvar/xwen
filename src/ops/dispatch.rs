@@ -3936,6 +3936,89 @@ pub(crate) fn run_gated_residual(h: &Tensor, y: &Tensor, gate: &Tensor) -> Resul
     Ok(output_tensor(dst, mdev, n, shape))
 }
 
+/// Matches the Metal `channel_l2_norm_args` struct (src/ops/channel_l2_norm.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ChannelL2NormArgs {
+    n: i32,
+    channels: i32,
+    plane: i32,
+    eps: f32,
+}
+
+/// Per-pixel channel L2 norm against `kernel_channel_l2_norm`
+/// (channel_l2_norm.metal): `x` `[B, C, H, W]` f32 contiguous, `gamma` `C` f32
+/// elements, out `x / max(|x|_2 over C, eps) * gamma[c]`. One thread per
+/// pixel, bounded on the pixel count in the args.
+pub(crate) fn run_channel_l2_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor> {
+    let cdev = x.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("channel_l2_norm requires x on a Metal device");
+    };
+    for (name, t) in [("x", x), ("gamma", gamma)] {
+        if t.dtype() != DType::F32 {
+            bail!("{name} must be f32, got {:?}", t.dtype());
+        }
+        if !t.is_contiguous() {
+            bail!("{name} must be contiguous");
+        }
+        if !x.device().same_device(t.device()) {
+            bail!("{name} must live on the same Metal device as x");
+        }
+    }
+    let (batch, channels, h, w) = x.dims4().map_err(|_| {
+        anyhow::anyhow!(
+            "channel_l2_norm: x must be [B, C, H, W], got {:?}",
+            x.dims()
+        )
+    })?;
+    if gamma.elem_count() != channels {
+        bail!(
+            "gamma has {} elements, expected one per channel of x ({channels})",
+            gamma.elem_count()
+        );
+    }
+    if !(eps > 0.0 && eps.is_finite()) {
+        bail!("channel_l2_norm: eps must be positive and finite, got {eps}");
+    }
+    let shape = x.shape().clone();
+    let total = checked_elems(shape.dims(), "channel_l2_norm")?;
+    if total == 0 {
+        bail!("channel_l2_norm: x is empty");
+    }
+    glue_index_fits_i32(total)?;
+    let plane = h * w;
+    let pixels = batch * plane;
+
+    let pipeline = pipelines::channel_l2_norm_pipeline(mdev.device(), "kernel_channel_l2_norm")?;
+    let dst = mdev.new_buffer(total, DType::F32, "channel_l2_norm")?;
+
+    let x_arg = metal_arg(x, "x")?;
+    let g_arg = metal_arg(gamma, "gamma")?;
+    let args = ChannelL2NormArgs {
+        n: pixels as i32,
+        channels: channels as i32,
+        plane: plane as i32,
+        eps,
+    };
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(x_arg.buffer()?), x_arg.offset);
+        encoder.set_input_buffer(2, Some(g_arg.buffer()?), g_arg.offset);
+        encoder.set_output_buffer(3, Some(&dst), 0);
+        dispatch_linear(encoder, &pipeline, pixels);
+    }
+    drop(x_arg);
+    drop(g_arg);
+
+    Ok(output_tensor(dst, mdev, total, shape))
+}
+
 /// Matches the Metal `delta_conv_args` struct (src/ops/delta.metal).
 #[repr(C)]
 #[derive(Clone, Copy)]

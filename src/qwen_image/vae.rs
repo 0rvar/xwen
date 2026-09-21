@@ -40,25 +40,42 @@
 use candle_core::{D, DType, Module, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, VarBuilder, conv2d};
 
-/// The environment switch that picks the VAE's convolution kernels, read when
-/// the VAE loads. `candle` (or unset) is candle's conv2d chain, the only arm
-/// there is; `xwen` / `direct` name the direct-convolution arm and are refused
-/// until it exists, rather than silently running candle under that label.
+use crate::ops::{self, Conv2dFusion};
+
+/// The environment switch that picks the VAE DECODER's convolution kernels,
+/// read when the VAE loads. `xwen` / `direct` is xwen's direct convolution,
+/// `candle` is candle's im2col conv2d chain, and unset means
+/// [`VaeImpl::SHIPPED`]. The encoder runs candle's chain under either: its
+/// `conv_in` (4 input channels) and its strided downsample convolutions are
+/// outside what the direct kernel accepts, and it runs once per reference image
+/// where the decoder runs once per render.
 pub const VAE_ENV: &str = "XWEN_QWEN_IMAGE_VAE";
 
-/// Which kernels the VAE runs.
+/// Which kernels the VAE decoder runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VaeImpl {
-    /// candle's conv2d for every convolution.
+    /// xwen's direct convolution (`ops::conv2d_direct`) for every decoder
+    /// convolution, with the silu after a norm folded into the convolution's
+    /// input read, the residual add into its store, and the upsampler's
+    /// nearest 2x into its read coordinates. It forms no column buffer. The
+    /// kernels are Metal-only, so off Metal every layer falls through to the
+    /// candle chain.
+    Xwen,
+    /// candle's conv2d for every convolution, with the device drained around
+    /// each one so its column buffers are returned as they are finished with.
     Candle,
 }
 
 impl VaeImpl {
-    /// Resolve from [`VAE_ENV`]: unset means `candle`, anything else must name
-    /// an arm.
+    /// The arm an unset [`VAE_ENV`] selects, named once so the loader, the
+    /// parser's message and the tests cannot drift.
+    pub const SHIPPED: Self = Self::Xwen;
+
+    /// Resolve from [`VAE_ENV`]: unset means [`Self::SHIPPED`], anything else
+    /// must name an arm.
     pub fn from_env() -> Result<Self> {
         match std::env::var(VAE_ENV) {
-            Err(std::env::VarError::NotPresent) => Ok(Self::Candle),
+            Err(std::env::VarError::NotPresent) => Ok(Self::SHIPPED),
             Err(std::env::VarError::NotUnicode(_)) => {
                 candle_core::bail!("{VAE_ENV} is not valid UTF-8")
             }
@@ -66,24 +83,40 @@ impl VaeImpl {
         }
     }
 
-    /// `candle` (or empty) selects candle's chain. `xwen` and `direct` are
-    /// refused by name; anything else is refused as unknown.
+    /// `xwen` / `direct` select the direct convolution, `candle` candle's
+    /// chain, empty the shipped arm; anything else is refused rather than
+    /// defaulted.
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "candle" => Ok(Self::Candle),
-            "xwen" | "direct" => candle_core::bail!(
-                "{VAE_ENV}={value:?}: the Qwen-Image VAE has no direct-convolution arm, \
-                 `candle` is the only one"
+            "" => Ok(Self::SHIPPED),
+            "xwen" | "direct" => Ok(Self::Xwen),
+            "candle" => Ok(Self::Candle),
+            other => candle_core::bail!(
+                "{VAE_ENV}={other:?}: expected `xwen` or `candle` (unset runs `{}`)",
+                Self::SHIPPED.label()
             ),
-            other => candle_core::bail!("{VAE_ENV}={other:?}: expected `candle`"),
+        }
+    }
+
+    /// The arm that actually runs on a device: the xwen kernels are
+    /// Metal-only, so anywhere else every layer is the candle chain.
+    pub fn resolve(self, metal: bool) -> Self {
+        match self {
+            Self::Xwen if metal => Self::Xwen,
+            _ => Self::Candle,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Xwen => "xwen",
             Self::Candle => "candle",
         }
     }
+}
+
+fn wrap(e: anyhow::Error) -> candle_core::Error {
+    candle_core::Error::Msg(format!("{e:#}"))
 }
 
 // ==================== Config ====================
@@ -314,31 +347,86 @@ pub fn dead_tensors(cfg: &VaeConfig) -> Vec<(String, Vec<usize>)> {
 
 // ==================== Layers ====================
 
-/// A square stride-1 convolution with `padding = kernel / 2`. The arm is a
-/// constructor argument so a second one lands here and nowhere else; note that
-/// the encoder's `conv_in` (4 input channels) and its strided downsample
-/// convolutions are outside what `ops::conv2d_direct` accepts (`c_in % 8 == 0`,
-/// stride 1) and stay on candle under any arm.
+/// A square stride-1 convolution with `padding = kernel / 2`: candle's
+/// `Conv2d` for the candle arm and for any shape the direct kernel declines
+/// (`c_in % 8 == 0`, kernel 1 or 3), plus, on the xwen arm on a Metal device,
+/// the weight permuted to the direct kernel's `[k*k, c_in, c_out]` plane and
+/// the bias it stores. `direct` being `Some` is what the blocks read as "the
+/// direct kernel runs here", so it carries the device condition and not just
+/// the arm.
 #[derive(Debug, Clone)]
 struct Conv {
     candle: Conv2d,
+    kernel: usize,
+    direct: Option<(Tensor, Tensor)>,
 }
 
 impl Conv {
     fn new(c_in: usize, c_out: usize, kernel: usize, arm: VaeImpl, vb: VarBuilder) -> Result<Self> {
-        let VaeImpl::Candle = arm;
         let cfg = Conv2dConfig {
             padding: kernel / 2,
             ..Default::default()
         };
+        let arm = arm.resolve(vb.device().is_metal());
+        let candle = conv2d(c_in, c_out, kernel, cfg, vb)?;
+        let direct = if arm == VaeImpl::Xwen && ops::conv2d_direct_supported(c_in, kernel) {
+            let w = ops::permute_conv_weight(candle.weight()).map_err(wrap)?;
+            let b = match candle.bias() {
+                Some(b) => b.clone(),
+                None => Tensor::zeros(c_out, w.dtype(), w.device())?,
+            };
+            Some((w, b))
+        } else {
+            None
+        };
         Ok(Self {
-            candle: conv2d(c_in, c_out, kernel, cfg, vb)?,
+            candle,
+            kernel,
+            direct,
         })
+    }
+
+    /// Whether this layer runs the direct kernel.
+    fn is_direct(&self) -> bool {
+        self.direct.is_some()
+    }
+
+    /// The convolution with `fusion` folded in: one dispatch of the direct
+    /// kernel, or the same steps as candle ops for a layer it does not run
+    /// (silu, the nearest 2x, conv2d, the residual add). This VAE's norm is
+    /// per pixel and has no per-channel affine form, so `fusion.norm` is never
+    /// set here and is refused.
+    fn forward_fused(&self, xs: &Tensor, fusion: Conv2dFusion<'_>) -> Result<Tensor> {
+        if fusion.norm.is_some() {
+            candle_core::bail!("qwen-image vae: the channel L2 norm does not fold into a conv");
+        }
+        if let Some((w, b)) = &self.direct {
+            let xs = xs.contiguous()?;
+            let residual = fusion.residual.map(Tensor::contiguous).transpose()?;
+            let fusion = Conv2dFusion {
+                residual: residual.as_ref(),
+                ..fusion
+            };
+            return ops::conv2d_direct(&xs, w, b, self.kernel, fusion).map_err(wrap);
+        }
+        let mut v = if fusion.silu { xs.silu()? } else { xs.clone() };
+        if fusion.upsample {
+            let (_, _, h, w) = v.dims4()?;
+            v = v.upsample_nearest2d(2 * h, 2 * w)?;
+        }
+        let out = self.candle.forward(&v)?;
+        match fusion.residual {
+            Some(r) => out + r,
+            None => Ok(out),
+        }
     }
 }
 
 impl Module for Conv {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if self.is_direct() {
+            return self.forward_fused(xs, Conv2dFusion::default());
+        }
         self.candle.forward(xs)
     }
 }
@@ -348,9 +436,15 @@ impl Module for Conv {
 /// `[C, 1, 1, 1]` in the residual blocks and the output norms and as
 /// `[C, 1, 1]` in the attention block, and is held here as `[1, C, 1, 1]`
 /// with `sqrt(C)` folded in. There is no bias.
+///
+/// On the xwen arm on a Metal device it is one dispatch of
+/// `ops::channel_l2_norm`; otherwise it is the six candle ops written out
+/// below. The two agree to rounding and not to the bit, the kernel summing the
+/// squares in channel order.
 #[derive(Debug, Clone)]
 struct ChannelL2Norm {
     gamma: Tensor,
+    fused: bool,
 }
 
 impl ChannelL2Norm {
@@ -359,8 +453,15 @@ impl ChannelL2Norm {
     fn new(dim: usize, stored: &[usize], vb: VarBuilder) -> Result<Self> {
         let gamma = vb.get(stored, "gamma")?.reshape((1, dim, 1, 1))?;
         Ok(Self {
-            gamma: (gamma * (dim as f64).sqrt())?,
+            gamma: (gamma * (dim as f64).sqrt())?.contiguous()?,
+            fused: false,
         })
+    }
+
+    /// Run the fused kernel where `arm` and the device allow it.
+    fn for_arm(mut self, arm: VaeImpl) -> Self {
+        self.fused = arm.resolve(self.gamma.device().is_metal()) == VaeImpl::Xwen;
+        self
     }
 
     fn residual(dim: usize, vb: VarBuilder) -> Result<Self> {
@@ -374,6 +475,10 @@ impl ChannelL2Norm {
 
 impl Module for ChannelL2Norm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        if self.fused {
+            return ops::channel_l2_norm(&xs.contiguous()?, &self.gamma, Self::EPS as f32)
+                .map_err(wrap);
+        }
         let norm = xs.sqr()?.sum_keepdim(1)?.sqrt()?.maximum(Self::EPS)?;
         xs.broadcast_div(&norm)?.broadcast_mul(&self.gamma)
     }
@@ -398,9 +503,9 @@ impl ResidualBlock {
             None
         };
         Ok(Self {
-            norm1: ChannelL2Norm::residual(c_in, vb.pp("norm1"))?,
+            norm1: ChannelL2Norm::residual(c_in, vb.pp("norm1"))?.for_arm(arm),
             conv1: Conv::new(c_in, c_out, 3, arm, vb.pp("conv1"))?,
-            norm2: ChannelL2Norm::residual(c_out, vb.pp("norm2"))?,
+            norm2: ChannelL2Norm::residual(c_out, vb.pp("norm2"))?.for_arm(arm),
             conv2: Conv::new(c_out, c_out, 3, arm, vb.pp("conv2"))?,
             conv_shortcut,
         })
@@ -413,6 +518,27 @@ impl Module for ResidualBlock {
             Some(conv) => conv.forward(xs)?,
             None => xs.clone(),
         };
+        if self.conv1.is_direct() && self.conv2.is_direct() {
+            // The silu after each norm is read inside the convolution and the
+            // shortcut is added in its store, so the block materialises the
+            // two normed tensors and the two convolution outputs and nothing
+            // else.
+            let x = self.conv1.forward_fused(
+                &self.norm1.forward(xs)?,
+                Conv2dFusion {
+                    silu: true,
+                    ..Default::default()
+                },
+            )?;
+            return self.conv2.forward_fused(
+                &self.norm2.forward(&x)?,
+                Conv2dFusion {
+                    silu: true,
+                    residual: Some(&h),
+                    ..Default::default()
+                },
+            );
+        }
         // Around each convolution, so the norm's full-size temporaries are
         // gone before a column buffer nine times an activation is made, and
         // the two column buffers are never both held.
@@ -440,7 +566,7 @@ struct AttentionBlock {
 impl AttentionBlock {
     fn new(dim: usize, arm: VaeImpl, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            norm: ChannelL2Norm::attention(dim, vb.pp("norm"))?,
+            norm: ChannelL2Norm::attention(dim, vb.pp("norm"))?.for_arm(arm),
             to_qkv: Conv::new(dim, dim * 3, 1, arm, vb.pp("to_qkv"))?,
             proj: Conv::new(dim, dim, 1, arm, vb.pp("proj"))?,
             dim,
@@ -462,7 +588,13 @@ impl Module for AttentionBlock {
         let scores = (q.matmul(&k.transpose(1, 2)?)? * (1.0 / (self.dim as f64).sqrt()))?;
         let attn = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
         let out = attn.transpose(1, 2)?.reshape((b, c, h, w))?;
-        self.proj.forward(&out)? + xs
+        self.proj.forward_fused(
+            &out,
+            Conv2dFusion {
+                residual: Some(xs),
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -697,7 +829,7 @@ impl Encoder {
             conv_in: Conv::new(cfg.in_channels, dims[0], 3, arm, vb.pp("conv_in"))?,
             down_blocks,
             mid_block: MidBlock::new(top, arm, vb.pp("mid_block"))?,
-            norm_out: ChannelL2Norm::residual(top, vb.pp("norm_out"))?,
+            norm_out: ChannelL2Norm::residual(top, vb.pp("norm_out"))?.for_arm(arm),
             conv_out: Conv::new(top, cfg.z_dim * 2, 3, arm, vb.pp("conv_out"))?,
         })
     }
@@ -723,10 +855,11 @@ impl Module for Encoder {
 /// only when the device is synchronized, so a pass that never synchronizes
 /// keeps every intermediate it ever made: a 1024x1024 decode held 57 GB of them
 /// at its end. The widest stages are where that matters, a single 288-channel
-/// activation at 1024x1024 being 1.2 GB and the convolution's column buffer
-/// nine times that, so the wait sits after every residual block of the decoder
-/// and after every stage of the encoder. It changes when memory is returned
-/// and nothing about what is computed. A no-op off Metal.
+/// activation at 1024x1024 being 1.2 GB and candle's column buffer nine times
+/// that, so on the candle arm the wait sits around every convolution of the
+/// decoder. The direct arm has no column buffer and waits once per decoder
+/// stage. The encoder waits after every stage. It changes when memory is
+/// returned and nothing about what is computed. A no-op off Metal.
 fn drain(x: &Tensor) -> Result<()> {
     x.device().synchronize()
 }
@@ -772,13 +905,32 @@ impl Module for UpBlock {
         let mut x = xs.clone();
         for resnet in &self.resnets {
             x = resnet.forward(&x)?;
-            drain(&x)?;
+            // The direct arm makes no column buffer, so it waits once per
+            // stage (below) and not once per block: at 1024x1024 that holds
+            // the decode at the step phase's 28 GiB, where no wait at all read
+            // 36, and costs 3% of the decode where a wait per block cost 7%.
+            if !resnet.conv1.is_direct() {
+                drain(&x)?;
+            }
         }
         match &self.upsampler {
+            // `nearest-exact` and `nearest` pick the same source pixel at an
+            // integer factor of 2, which is also what the direct kernel's
+            // half-coordinate read picks.
+            Some((conv, shortcut)) if conv.is_direct() => {
+                let x = conv.forward_fused(
+                    &x,
+                    Conv2dFusion {
+                        upsample: true,
+                        residual: Some(&shortcut.forward(xs)?),
+                        ..Default::default()
+                    },
+                )?;
+                drain(&x)?;
+                Ok(x)
+            }
             Some((conv, shortcut)) => {
                 let (_, _, h, w) = x.dims4()?;
-                // `nearest-exact` and `nearest` pick the same source pixel at
-                // an integer factor of 2.
                 let x = conv.forward(&x.upsample_nearest2d(2 * h, 2 * w)?)?;
                 let x = (x + shortcut.forward(xs)?)?;
                 drain(&x)?;
@@ -818,7 +970,7 @@ impl Decoder {
             conv_in: Conv::new(cfg.z_dim, dims[0], 3, arm, vb.pp("conv_in"))?,
             mid_block: MidBlock::new(dims[0], arm, vb.pp("mid_block"))?,
             up_blocks,
-            norm_out: ChannelL2Norm::residual(bottom, vb.pp("norm_out"))?,
+            norm_out: ChannelL2Norm::residual(bottom, vb.pp("norm_out"))?.for_arm(arm),
             conv_out: Conv::new(bottom, cfg.out_channels, 3, arm, vb.pp("conv_out"))?,
         })
     }
@@ -830,6 +982,15 @@ impl Module for Decoder {
         drain(&x)?;
         for block in &self.up_blocks {
             x = block.forward(&x)?;
+        }
+        if self.conv_out.is_direct() {
+            return self.conv_out.forward_fused(
+                &self.norm_out.forward(&x)?,
+                Conv2dFusion {
+                    silu: true,
+                    ..Default::default()
+                },
+            );
         }
         let x = self.norm_out.forward(&x)?.silu()?;
         drain(&x)?;
@@ -876,8 +1037,8 @@ impl QwenImageVae {
             Tensor::from_vec(values, (1, z, 1, 1), vb.device())
         };
         Ok(Self {
-            encoder: Encoder::new(cfg, arm, vb.pp("encoder"))?,
-            quant_conv: Conv::new(z * 2, z * 2, 1, arm, vb.pp("quant_conv"))?,
+            encoder: Encoder::new(cfg, VaeImpl::Candle, vb.pp("encoder"))?,
+            quant_conv: Conv::new(z * 2, z * 2, 1, VaeImpl::Candle, vb.pp("quant_conv"))?,
             post_quant_conv: Conv::new(z, z, 1, arm, vb.pp("post_quant_conv"))?,
             decoder: Decoder::new(cfg, arm, vb.pp("decoder"))?,
             latents_mean: constants(&cfg.latents_mean)?,
@@ -891,8 +1052,14 @@ impl QwenImageVae {
         &self.cfg
     }
 
+    /// The arm the VAE was asked for.
     pub fn arm(&self) -> VaeImpl {
         self.arm
+    }
+
+    /// The arm its decoder runs on the device it was loaded on.
+    pub fn resolved_arm(&self) -> VaeImpl {
+        self.arm.resolve(self.latents_mean.device().is_metal())
     }
 
     /// Decode the transformer's NORMALISED latent `[B, z_dim, h, w]` (f32) to
@@ -1004,18 +1171,33 @@ pub(crate) mod tests {
         Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
     }
 
+    /// The largest element difference, with both operands required finite
+    /// first: a fold with `max` drops a NaN and would read it as agreement.
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
         assert_eq!(a.dims(), b.dims());
-        (a - b)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .max(0)
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap()
+        let flat = |t: &Tensor| -> Vec<f32> {
+            let v = t
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(v.iter().all(|x| x.is_finite()), "non-finite operand");
+            v
+        };
+        let (a, b) = (flat(a), flat(b));
+        a.iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite operand")]
+    fn the_comparison_refuses_a_nan() {
+        let a = Tensor::new(&[1f32, f32::NAN, 2.0], &Device::Cpu).unwrap();
+        let b = Tensor::new(&[1f32, 5.0, 2.0], &Device::Cpu).unwrap();
+        max_abs_diff(&a, &b);
     }
 
     /// The reference's `AvgDown3D.forward` line by line on a `[B, C, 1, H, W]`
@@ -1172,6 +1354,7 @@ pub(crate) mod tests {
         let c = 5;
         let norm = ChannelL2Norm {
             gamma: Tensor::full((c as f32).sqrt(), (1, c, 1, 1), &Device::Cpu).unwrap(),
+            fused: false,
         };
         let x = ramp(&[1, c, 2, 3]);
         let x = Tensor::cat(&[&x, &x.zeros_like().unwrap()], 2).unwrap();
@@ -1232,11 +1415,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_arm_switch_refuses_the_arm_that_does_not_exist() {
-        assert_eq!(VaeImpl::parse("").unwrap(), VaeImpl::Candle);
+    fn the_arm_switch_names_two_arms_and_refuses_the_rest() {
+        assert_eq!(VaeImpl::parse("").unwrap(), VaeImpl::SHIPPED);
         assert_eq!(VaeImpl::parse(" Candle ").unwrap(), VaeImpl::Candle);
-        for value in ["xwen", "direct", "steel"] {
-            assert!(VaeImpl::parse(value).is_err(), "{value}");
+        for value in ["xwen", "XWEN", "direct"] {
+            assert_eq!(VaeImpl::parse(value).unwrap(), VaeImpl::Xwen, "{value}");
+        }
+        for value in ["steel", "im2col", "xwen,candle"] {
+            let err = VaeImpl::parse(value).unwrap_err().to_string();
+            assert!(err.contains(VaeImpl::SHIPPED.label()), "{err}");
         }
     }
 
@@ -1356,6 +1543,17 @@ pub(crate) mod tests {
     /// (of one, for a `gamma`). No two output channels share a filter, so the
     /// two halves of the posterior differ and every stage carries signal.
     pub(crate) fn patterned(cfg: &VaeConfig, amplitude: f32) -> QwenImageVae {
+        patterned_on(cfg, amplitude, VaeImpl::Candle, &Device::Cpu)
+    }
+
+    /// [`patterned`] on a chosen arm and device; the weights are the same
+    /// values whatever the two are.
+    fn patterned_on(
+        cfg: &VaeConfig,
+        amplitude: f32,
+        arm: VaeImpl,
+        device: &Device,
+    ) -> QwenImageVae {
         let tensors = live_tensors(cfg)
             .into_iter()
             .map(|(name, shape)| {
@@ -1372,12 +1570,221 @@ pub(crate) mod tests {
                         base + 2.0 * amplitude * unit
                     })
                     .collect();
-                let tensor = Tensor::from_vec(data, shape, &Device::Cpu).unwrap();
+                let tensor = Tensor::from_vec(data, shape, &Device::Cpu)
+                    .unwrap()
+                    .to_device(device)
+                    .unwrap();
                 (name, tensor)
             })
             .collect();
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
-        QwenImageVae::load_with_impl(vb, cfg, VaeImpl::Candle).unwrap()
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        QwenImageVae::load_with_impl(vb, cfg, arm).unwrap()
+    }
+
+    /// A decoder whose every convolution the direct kernel accepts: widths
+    /// 64, 64, 64, 32, 16, 8 over an 8-channel latent.
+    fn tiny_direct() -> VaeConfig {
+        VaeConfig {
+            base_dim: 4,
+            decoder_base_dim: Some(8),
+            z_dim: 8,
+            latents_mean: vec![0.25, -0.5, 1.0, 0.0, 0.5, -0.25, 0.75, -1.0],
+            latents_std: vec![2.0, 0.5, 1.5, 1.0, 0.75, 1.25, 0.5, 2.0],
+            ..shipped_shape()
+        }
+    }
+
+    /// The direct arm against the candle arm on one decoder and one latent.
+    /// They are different code, an implicit-gemm kernel with the silu, the
+    /// upsample and the residual folded in against im2col and separate ops, so
+    /// the difference is asserted NONZERO as well as small: an exact match
+    /// would mean both labels ran one path.
+    #[test]
+    fn the_direct_arm_matches_the_candle_arm_and_is_other_code() {
+        let device = crate::gguf::metal_device().unwrap();
+        let cfg = tiny_direct();
+        let direct = patterned_on(&cfg, 0.15, VaeImpl::Xwen, &device);
+        let candle = patterned_on(&cfg, 0.15, VaeImpl::Candle, &device);
+        assert!(direct.decoder.conv_in.is_direct() && direct.decoder.conv_out.is_direct());
+        assert!(direct.post_quant_conv.is_direct());
+        assert!(direct.decoder.norm_out.fused && !candle.decoder.norm_out.fused);
+        assert!(!candle.decoder.conv_in.is_direct());
+
+        // Odd latent sides, so the kernel's tiles are ragged at every stage.
+        let z = ramp(&[1, cfg.z_dim, 5, 7]).to_device(&device).unwrap();
+        let a = direct.decode_trunk(&z).unwrap();
+        let b = candle.decode_trunk(&z).unwrap();
+        assert_eq!(a.dims(), &[1, cfg.out_channels, 80, 112]);
+        let (a, b) = (
+            a.to_device(&Device::Cpu).unwrap(),
+            b.to_device(&Device::Cpu).unwrap(),
+        );
+        let scale = b
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let diff = max_abs_diff(&a, &b);
+        assert!(scale > 1e-3, "a decoder output of {scale} grades nothing");
+        assert!(
+            diff > 0.0,
+            "the two arms agree to the bit: one path under two labels"
+        );
+        assert!(
+            diff / scale < 1e-4,
+            "arms differ by {diff} on a scale of {scale}"
+        );
+    }
+
+    /// Every convolution and norm of one half of the VAE, by name.
+    struct Layers<'a> {
+        convs: Vec<(String, &'a Conv)>,
+        norms: Vec<(String, &'a ChannelL2Norm)>,
+    }
+
+    impl<'a> Layers<'a> {
+        fn resnet(&mut self, name: &str, r: &'a ResidualBlock) {
+            self.norms.push((format!("{name}.norm1"), &r.norm1));
+            self.convs.push((format!("{name}.conv1"), &r.conv1));
+            self.norms.push((format!("{name}.norm2"), &r.norm2));
+            self.convs.push((format!("{name}.conv2"), &r.conv2));
+            if let Some(c) = &r.conv_shortcut {
+                self.convs.push((format!("{name}.conv_shortcut"), c));
+            }
+        }
+
+        fn mid(&mut self, name: &str, m: &'a MidBlock) {
+            self.resnet(&format!("{name}.resnets.0"), &m.resnet0);
+            self.norms
+                .push((format!("{name}.attention.norm"), &m.attention.norm));
+            self.convs
+                .push((format!("{name}.attention.to_qkv"), &m.attention.to_qkv));
+            self.convs
+                .push((format!("{name}.attention.proj"), &m.attention.proj));
+            self.resnet(&format!("{name}.resnets.1"), &m.resnet1);
+        }
+
+        /// The decoder and `post_quant_conv`.
+        fn decode_side(vae: &'a QwenImageVae) -> Self {
+            let mut all = Self {
+                convs: vec![],
+                norms: vec![],
+            };
+            all.convs
+                .push(("post_quant_conv".into(), &vae.post_quant_conv));
+            let d = &vae.decoder;
+            all.convs.push(("decoder.conv_in".into(), &d.conv_in));
+            all.mid("decoder.mid_block", &d.mid_block);
+            for (i, block) in d.up_blocks.iter().enumerate() {
+                for (j, r) in block.resnets.iter().enumerate() {
+                    all.resnet(&format!("decoder.up_blocks.{i}.resnets.{j}"), r);
+                }
+                if let Some((conv, _)) = &block.upsampler {
+                    all.convs
+                        .push((format!("decoder.up_blocks.{i}.upsampler"), conv));
+                }
+            }
+            all.norms.push(("decoder.norm_out".into(), &d.norm_out));
+            all.convs.push(("decoder.conv_out".into(), &d.conv_out));
+            all
+        }
+
+        /// The encoder and `quant_conv`. The strided downsample convolutions
+        /// are candle `Conv2d`s by type and have no direct handle to check.
+        fn encode_side(vae: &'a QwenImageVae) -> Self {
+            let mut all = Self {
+                convs: vec![],
+                norms: vec![],
+            };
+            let e = &vae.encoder;
+            all.convs.push(("encoder.conv_in".into(), &e.conv_in));
+            for (i, block) in e.down_blocks.iter().enumerate() {
+                for (j, r) in block.resnets.iter().enumerate() {
+                    all.resnet(&format!("encoder.down_blocks.{i}.resnets.{j}"), r);
+                }
+            }
+            all.mid("encoder.mid_block", &e.mid_block);
+            all.norms.push(("encoder.norm_out".into(), &e.norm_out));
+            all.convs.push(("encoder.conv_out".into(), &e.conv_out));
+            all.convs.push(("quant_conv".into(), &vae.quant_conv));
+            all
+        }
+    }
+
+    /// Which layers take the xwen kernels, walked over the whole structure at
+    /// the SHIPPED widths (random weights, no file): on the xwen arm on Metal
+    /// every decoder convolution and norm does, so a width the direct kernel
+    /// declines cannot fall back to candle unnoticed, and nothing on the
+    /// encoder side does, whose convolutions would mostly qualify by shape.
+    #[test]
+    fn the_xwen_arm_covers_the_decoder_and_none_of_the_encoder() {
+        let device = crate::gguf::metal_device().unwrap();
+        let cfg = VaeConfig {
+            // The shipped decoder widths over a thin encoder, which keeps the
+            // random weights small; the encoder's layer list is the same.
+            base_dim: 8,
+            ..shipped_shape()
+        };
+        let xwen = patterned_on(&cfg, 0.01, VaeImpl::Xwen, &device);
+        assert_eq!(xwen.resolved_arm(), VaeImpl::Xwen);
+
+        let decode = Layers::decode_side(&xwen);
+        // post_quant and conv_in, the mid block's four and its attention's
+        // two, five stages of three blocks of two, the three narrowing 1x1
+        // shortcuts, four upsamplers, conv_out.
+        assert_eq!(decode.convs.len(), 2 + 4 + 2 + 5 * 3 * 2 + 3 + 4 + 1);
+        assert_eq!(decode.norms.len(), 4 + 1 + 5 * 3 * 2 + 1);
+        for (name, conv) in &decode.convs {
+            assert!(conv.is_direct(), "{name} fell back to candle");
+        }
+        for (name, norm) in &decode.norms {
+            assert!(norm.fused, "{name} runs the candle chain");
+        }
+
+        let encode = Layers::encode_side(&xwen);
+        assert!(encode.convs.len() > 20 && encode.norms.len() > 20);
+        let qualifying = encode
+            .convs
+            .iter()
+            .filter(|(_, c)| {
+                let (_, c_in, k, _) = c.candle.weight().dims4().unwrap();
+                ops::conv2d_direct_supported(c_in, k)
+            })
+            .count();
+        assert!(
+            qualifying > 10,
+            "the claim is only a claim if they would qualify"
+        );
+        for (name, conv) in &encode.convs {
+            assert!(!conv.is_direct(), "{name} took the direct kernel");
+        }
+        for (name, norm) in &encode.norms {
+            assert!(!norm.fused, "{name} took the fused norm");
+        }
+
+        let candle = patterned_on(&cfg, 0.01, VaeImpl::Candle, &device);
+        assert_eq!(candle.resolved_arm(), VaeImpl::Candle);
+        let side = Layers::decode_side(&candle);
+        assert!(side.convs.iter().all(|(_, c)| !c.is_direct()));
+        assert!(side.norms.iter().all(|(_, n)| !n.fused));
+    }
+
+    /// Off Metal the direct kernel does not exist, so the xwen arm resolves
+    /// every layer to candle's chain and equals the candle arm exactly.
+    #[test]
+    fn the_direct_arm_is_the_candle_chain_off_metal() {
+        let cfg = tiny_direct();
+        let xwen = patterned_on(&cfg, 0.15, VaeImpl::Xwen, &Device::Cpu);
+        let candle = patterned_on(&cfg, 0.15, VaeImpl::Candle, &Device::Cpu);
+        assert!(!xwen.decoder.conv_in.is_direct());
+        assert_eq!(xwen.arm(), VaeImpl::Xwen);
+        assert_eq!(xwen.resolved_arm(), VaeImpl::Candle);
+        let z = ramp(&[1, cfg.z_dim, 3, 4]);
+        let a = xwen.decode_trunk(&z).unwrap();
+        let b = candle.decode_trunk(&z).unwrap();
+        assert_eq!(max_abs_diff(&a, &b), 0.0);
     }
 
     fn per_channel(values: &[f64]) -> Tensor {
@@ -1535,6 +1942,56 @@ pub(crate) mod tests {
         want.latents_mean = cfg.latents_mean.clone();
         want.latents_std = cfg.latents_std.clone();
         assert_eq!(format!("{want:?}"), format!("{cfg:?}"));
+    }
+
+    /// The decoder alone at the native 2048x2048, on the shipped arm, with
+    /// the process's peak footprint read from the kernel afterwards: what a
+    /// native-size decode costs in seconds and bytes without the denoising loop
+    /// beside it. An instrument and not a gate; it asserts only that the image
+    /// is finite and the right shape.
+    #[test]
+    #[ignore = "loads the shipped VAE and decodes 2048x2048 on the GPU; run alone"]
+    fn the_shipped_decoder_runs_the_native_size() {
+        let (Some(cfg), Some(weights)) = (shipped_config(), shipped(WEIGHTS_FILE)) else {
+            return;
+        };
+        let device = crate::gguf::metal_device().unwrap();
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device).unwrap()
+        };
+        let vae = QwenImageVae::load_with_impl(vb, &cfg, VaeImpl::SHIPPED).unwrap();
+        for side in [1024usize, 2048] {
+            let l = side / cfg.spatial_factor();
+            let z = (ramp(&[1, cfg.z_dim, l, l]) * 0.2)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            device.synchronize().unwrap();
+            let t0 = std::time::Instant::now();
+            let image = vae.decode(&z).unwrap();
+            device.synchronize().unwrap();
+            let secs = t0.elapsed().as_secs_f64();
+            assert_eq!(image.dims(), [1, cfg.out_channels, side, side]);
+            let lo = image.min_all().unwrap().to_scalar::<f32>().unwrap();
+            let hi = image.max_all().unwrap().to_scalar::<f32>().unwrap();
+            assert!(lo.is_finite() && hi.is_finite() && lo >= -1.0 && hi <= 1.0);
+            drop(image);
+            let report = std::process::Command::new("footprint")
+                .args(["-p", &std::process::id().to_string()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let peak = report
+                .lines()
+                .find(|l| l.contains("phys_footprint_peak"))
+                .unwrap_or("phys_footprint_peak: unavailable")
+                .trim()
+                .to_string();
+            eprintln!(
+                "{side}x{side} decode on {}: {secs:.2}s, {peak}",
+                vae.arm().label()
+            );
+        }
     }
 
     /// Smoke, not a gate: the shipped weights decode a fixed random latent at
