@@ -57,6 +57,28 @@ impl RenderedPrompt {
     }
 }
 
+/// The one refusal of [`prompt_ids`] that is the prompt's own fault. Every
+/// other failure there is a tokenizer that did not open or did not behave, so
+/// a server tells the two apart by downcasting to this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptTooLong {
+    pub tokens: usize,
+    pub limit: usize,
+    pub model: &'static str,
+}
+
+impl std::fmt::Display for PromptTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the prompt renders to {} tokens and {} encodes at most {}; shorten it",
+            self.tokens, self.model, self.limit
+        )
+    }
+}
+
+impl std::error::Error for PromptTooLong {}
+
 /// The system turn on its own, exactly as it opens every rendered prompt.
 fn system_block() -> String {
     format!("<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n")
@@ -137,14 +159,14 @@ pub fn prompt_ids(
         ids.len() > system.len(),
         "the rendered prompt tokenized to nothing past its system turn"
     );
-    if let Some(spec) = entry.encoder_spec() {
-        ensure!(
-            ids.len() <= spec.max_tokens,
-            "the prompt renders to {} tokens and {} encodes at most {}; shorten it",
-            ids.len(),
-            entry.full_name(),
-            spec.max_tokens
-        );
+    if let Some(spec) = entry.encoder_spec()
+        && ids.len() > spec.max_tokens
+    {
+        return Err(anyhow::Error::new(PromptTooLong {
+            tokens: ids.len(),
+            limit: spec.max_tokens,
+            model: entry.full_name(),
+        }));
     }
     Ok(RenderedPrompt {
         text,

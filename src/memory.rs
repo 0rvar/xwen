@@ -690,6 +690,28 @@ pub fn qwen_image_peak(width: u32, height: u32) -> Result<u64> {
     crate::qwen_image::pipeline::QwenImagePipeline::peak_bytes(width as usize, height as usize)
 }
 
+/// The pixel cap both image envelopes above share, for a listing that tells a
+/// client the largest image it may ask for.
+pub const IMAGE_MAX_PIXELS: u64 = 1024 * 1024;
+
+/// What `xwen serve` holds at once while Qwen-Image 2.1's text encoder works:
+/// the resident transformer and VAE (15.7 GB) and the encoder loaded beside
+/// them for the request (15.7 GB), 29.3 GiB of weights, plus the encode's own
+/// transients. `xwen image` never sees this phase, its encoder having left
+/// before its pipeline loads. Sized from the two weight sets with 4.7 GiB on
+/// top, not from a measured peak: the phase lasts about two seconds, and a
+/// two-second footprint sampler read 27 GB inside it on 2026-09-21, a lower
+/// bound and no more.
+pub const QWEN_IMAGE_SERVE_ENCODE_PEAK: u64 = 34 * GIB;
+
+/// Qwen-Image 2.1's admission envelope on `xwen serve`: the larger of the
+/// render's own peak ([`qwen_image_peak`]) and the encode phase, which at small
+/// sizes is the taller of the two because the pipeline stays resident between
+/// requests and the encoder is loaded on top of it.
+pub fn qwen_image_serve_peak(width: u32, height: u32) -> Result<u64> {
+    Ok(qwen_image_peak(width, height)?.max(QWEN_IMAGE_SERVE_ENCODE_PEAK))
+}
+
 fn sysctl_value<T: Copy>(name: &CStr) -> Option<T> {
     let mut value = std::mem::MaybeUninit::<T>::uninit();
     let mut size = std::mem::size_of::<T>();

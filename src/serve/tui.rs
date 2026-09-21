@@ -108,6 +108,8 @@ pub struct Vitals {
     pub resident: Arc<ResidentModel>,
     /// The image worker's residency cell, polled with the language model cell.
     pub image_resident: Arc<AtomicBool>,
+    /// Which image pipeline that is: the cell `/health` reads for `image_model`.
+    pub(crate) image_model: Arc<super::images::ResidentModel>,
     pub context_length: usize,
     pub port: u16,
     /// Whether the resident checkpoint is speculating, driven by drafter events.
@@ -123,18 +125,20 @@ pub struct Vitals {
 }
 
 impl Vitals {
-    pub fn new(
+    pub(crate) fn new(
         model_id: String,
         settings: &ServeSettings,
         default_model: crate::hub::Model,
         resident: Arc<ResidentModel>,
         image_resident: Arc<AtomicBool>,
+        image_model: Arc<super::images::ResidentModel>,
     ) -> Self {
         let draft = settings.draft.is_on_for(default_model);
         Self {
             model_id,
             resident,
             image_resident,
+            image_model,
             context_length: settings.context_length,
             port: settings.port,
             draft,
@@ -801,12 +805,18 @@ fn draw(frame: &mut Frame, app: &mut Dashboard, now: Instant) {
 
 fn header_line(app: &Dashboard, now: Instant) -> Paragraph<'static> {
     let resident = app.vitals.resident_name();
-    let image_loaded = app.vitals.image_resident.load(Ordering::Acquire);
-    let model = match (&resident, image_loaded) {
-        (Some(name), true) => format!("loaded {name} · Z-Image-Turbo"),
-        (Some(name), false) => format!("loaded {name}"),
-        (None, true) => "loaded Z-Image-Turbo".to_string(),
-        (None, false) => "unloaded".to_string(),
+    // The name `/health` reports as `image_model`. The flag alone, with no
+    // name beside it, reads as the default pipeline.
+    let image = app
+        .vitals
+        .image_resident
+        .load(Ordering::Acquire)
+        .then(|| app.vitals.image_model.name());
+    let model = match (&resident, image) {
+        (Some(name), Some(image)) => format!("loaded {name} · {image}"),
+        (Some(name), None) => format!("loaded {name}"),
+        (None, Some(image)) => format!("loaded {image}"),
+        (None, None) => "unloaded".to_string(),
     };
     let context = if resident.is_none() {
         "ctx — · slot —".to_string()
@@ -1693,6 +1703,7 @@ mod tests {
             model_id: "laguna-s-2.1-Q4_K_M".to_string(),
             resident,
             image_resident: Arc::new(AtomicBool::new(false)),
+            image_model: Arc::default(),
             context_length: 262_144,
             port: 5241,
             draft: true,
@@ -3110,6 +3121,16 @@ mod tests {
         app.vitals.resident.clear();
         app.vitals.image_resident.store(true, Ordering::Release);
         assert!(header(&app, &mut terminal).contains("loaded Z-Image-Turbo"));
+        // The header names whichever pipeline is resident, as `/health` does.
+        app.vitals
+            .image_model
+            .set(Some(super::super::images::Pipeline::QwenImage));
+        let text = header(&app, &mut terminal);
+        assert!(
+            text.contains("loaded Qwen-Image-2.1") && !text.contains("Z-Image-Turbo"),
+            "{text}"
+        );
+        app.vitals.image_model.set(None);
         app.vitals.image_resident.store(false, Ordering::Release);
         app.vitals
             .resident

@@ -204,12 +204,12 @@ corruption.
 
 **One entry is not a language model at all** (2026-09-07): the Z-Image-Turbo diffusion
 pipeline, which is what `xwen image` runs. Qwen-Image 2.1 joined it on 2026-09-21, on the
-CLI only so far (its section is below).
+CLI and on the images routes (its section is below).
 
 | Full name | Repo | `--model` | Role |
 | --- | --- | --- | --- |
 | `Z-Image-Turbo` | `Tongyi-MAI/Z-Image-Turbo`, whole repo | `zimage-turbo` / `z-image-turbo` | text-to-image, `xwen image` and the images route |
-| `Qwen-Image-2.1` | `Qwen/Qwen-Image-2.1`, whole repo | `qwen-image-2.1` | text-to-image, `xwen image` only |
+| `Qwen-Image-2.1` | `Qwen/Qwen-Image-2.1`, whole repo | `qwen-image-2.1` | text-to-image, `xwen image` and the images routes |
 | `Qwen-Image-2.1-text-encoder` | `Qwen/Qwen-Image-2.1`, `text_encoder/` | `qwen-image-2.1-encoder` | encode-only, `xwen encode-text` |
 
 Fifteen files, **32.9 GB** in total: the transformer is 24.6 GB of fp32 safetensors in
@@ -285,7 +285,7 @@ transformer loads, so the two are never resident together. `--latents`, `--cap-f
 `--dump` work as they do for Z-Image, with a `[1, 64, H/16, W/16]` latent and `[T, 4096]`
 caption features. `--init`, `--mask`, `--control` and `--lora` are Z-Image mechanisms and
 are refused for this model before anything loads. Reference images and editing are not
-wired yet, and neither is the serve images route, which still answers Z-Image only.
+wired yet. `xwen serve` renders it when a request names it (below, under Serve).
 
 The decoder draws an alpha plane. The PNG is RGBA when at least 10 pixels are clear
 (alpha 8 or under), which is what the model card's transparency prompt produces ("This is
@@ -337,7 +337,10 @@ unreadable directory or a path that is not a directory returns an error. Listing
 file metadata, not adapter weights; compatibility is checked when rendering. It uses
 the image API's authentication policy and does not load models or wait for a render.
 
-`POST /v1/images/render` is the native JSON endpoint. Image strings accept local
+`POST /v1/images/render` is the native JSON endpoint. `model` is a pipeline's full name
+as on the OpenAI routes, and absent means Z-Image-Turbo; with `Qwen-Image-2.1` the
+request is a prompt, a size, `steps`, `seed` and `n`, and `init_image`, `strength`,
+`mask`, `mask_blur`, `control` and `loras` are each a 400 naming the field. Image strings accept local
 server paths, plain base64 or image data URLs. Unknown fields, including nested
 fields, return 400. The response has a `data` array with `b64_json`, `seed`,
 `start_step` and, for control requests, `control_map`. `n` can request up to four
@@ -379,7 +382,9 @@ The OpenAI compatibility surface also accepts multipart
 `POST /v1/images/edits` and `/v1/images/variations`. Its mask uses OpenAI's
 transparent-repaint convention; the native endpoint and CLI use white-repaint
 masks. Edits use strength 1.0 with a mask and 0.6 without one; variations use
-0.6. The GUI and CFG phase remain outside this implementation.
+0.6. Both routes are Z-Image's image-to-image, so `model: Qwen-Image-2.1` on either is
+a 400: editing from reference images is a separate path that is not wired yet. The GUI
+and CFG phase remain outside this implementation.
 
 **`--model` is the one flag that names a checkpoint (2026-09-21)**, on every
 subcommand: a registry alias or full name (`--model 27b`, `--model Qwen3.6-27B`), or a
@@ -661,13 +666,45 @@ beside the language engine, loads on the first request and unloads after `idle_u
 like a language model, one render at a time with four queued at most; `/health` reports
 it as `image_model_loaded`. Fields: `prompt`, `size` (`WxH` or `auto`, default 1024x1024),
 `n` (1 to 4), `seed`, `steps` (default 8), `response_format` (`b64_json` only); `model` is
-`Z-Image-Turbo` or absent, and anything the ComfyUI dropdown says on the proxy path. A
-negative prompt or a guidance scale is a 400, since Turbo runs without guidance and would
-ignore them silently. `--image-steps <N>` (config `image.steps`, 1 to 50) sets the step
+a pipeline's full name or absent (next paragraph), and anything the ComfyUI dropdown says
+on the proxy path. A negative prompt or a guidance scale is a 400, since Turbo runs without
+guidance and would ignore them silently. `--image-steps <N>` (config `image.steps`, 1 to 50) sets the step
 count for every request that names none, which is how a client with no step field of its
 own renders at 4 or 6. 1024x1024 measured 49 s warm and 80 s cold with load included,
 both taken before the four performance arcs of 2026-09-07 and 2026-09-08 cut the render
 from about 47 s to 15.5-17.5 s; the route has not been re-timed since.
+
+**Two image pipelines, one resident (2026-09-21).** `"model": "Qwen-Image-2.1"` on any of
+the three generations paths, or on `/v1/images/render`, renders with Qwen-Image 2.1;
+`Z-Image-Turbo` or no `model` renders with Z-Image-Turbo as before, and the response's
+`model` names whichever did. Its defaults are its own: 40 steps (`--image-steps` is
+Z-Image's eight-step figure and does not apply to it), both sides multiples of 32, the same
+1,048,576-pixel cap. A negative prompt or a guidance scale is a 400 here too, the route
+serving it without classifier-free guidance; a prompt past 4096 tokens is a 400; an
+uncached checkpoint is a 400 naming `xwen fetch --model qwen-image-2.1`. The PNG is RGBA
+when the render has a transparent region, by the same rule as `xwen image`. Only one
+pipeline is resident: a request for the other one unloads the resident one first, through
+the same drain the idle unload uses, and `/health` names it in `image_model` beside
+`image_model_loaded` (`null` when none is). Qwen-Image 2.1's text encoder is 15.7 GB
+beside a pipeline of the same size, so it is loaded for each request, run once and
+released, and only the transformer and VAE stay resident between requests.
+
+`GET /v1/images/models` (also `/images/models` and `/proxy/openai/images/models`) lists
+the image pipelines that are in the cache, which is every one a request can name without a
+400. `/v1/models` lists language models only and none of these. One entry:
+
+```json
+{"id": "Qwen-Image-2.1", "object": "model", "default": false,
+ "default_steps": 40, "max_steps": 50, "default_size": "1024x1024",
+ "size_multiple": 32, "size_rule": "both sides multiples of 32",
+ "max_pixels": 1048576, "max_references": 0,
+ "controls": {"init_image": false, "mask": false, "control": false, "loras": false}}
+```
+
+`default` marks what a request without a `model` runs, `default_steps` is what a request
+without a step count renders at (so Z-Image's follows `--image-steps`), `controls` says which inputs of
+`/v1/images/render` the pipeline has a path for, and `max_references` is how many
+reference images an edit may carry, zero until editing is wired.
 
 **Memory ownership (2026-09-09).** Language and image engines take turns holding
 models, including while idle. A waiting engine or another updated Xwen process

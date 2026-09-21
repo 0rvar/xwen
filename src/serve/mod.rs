@@ -212,6 +212,7 @@ pub fn run(settings: ServeSettings) -> Result<()> {
     // first request is what pays for it.
     let resident = Arc::new(types::ResidentModel::new());
     let image_resident = Arc::new(AtomicBool::new(false));
+    let image_model = Arc::<images::ResidentModel>::default();
     // The sink outlives everything that logs: it is started before the first
     // line the server can produce, and the handle's `Drop` stops and joins it on
     // every way out of this function, error paths included. Which sink is the
@@ -224,6 +225,7 @@ pub fn run(settings: ServeSettings) -> Result<()> {
                 default_target.model,
                 Arc::clone(&resident),
                 Arc::clone(&image_resident),
+                Arc::clone(&image_model),
             ),
             quit.clone(),
         )
@@ -305,6 +307,7 @@ pub fn run(settings: ServeSettings) -> Result<()> {
         Arc::clone(&shutdown),
         logger.clone(),
         image_resident,
+        image_model,
     );
 
     let address = format!("{}:{}", settings.host, settings.port);
@@ -644,7 +647,12 @@ fn router(state: AppState) -> Router {
             .route(
                 "/proxy/openai/images/generations",
                 post(images::generations),
-            );
+            )
+            // The image pipelines, which `/v1/models` does not list, on the
+            // same three prefixes the generations handler answers on.
+            .route("/v1/images/models", get(images::models))
+            .route("/images/models", get(images::models))
+            .route("/proxy/openai/images/models", get(images::models));
     }
     // The native surface is not a compatibility dialect and has no opt-out: it
     // is the only way to reach the engine capabilities the other two cannot
@@ -850,11 +858,14 @@ async fn health(State(state): State<AppState>) -> Response {
     // it is there it is the same string `/v1/models` lists and a request selects
     // the checkpoint by, which on a custom-GGUF server is the file's own id.
     let resident = state.resident.get();
+    // The same rule for the image engine: the flag is derived from the name.
+    let image_model = state.images.resident_model();
     axum::Json(json!({
         "status": "ok",
         "model_loaded": resident.is_some(),
         "model": resident.map(|target| model_id(&state.settings, &target)),
-        "image_model_loaded": state.images.is_loaded(),
+        "image_model_loaded": image_model.is_some(),
+        "image_model": image_model,
     }))
     .into_response()
 }

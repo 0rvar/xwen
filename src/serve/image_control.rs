@@ -60,6 +60,8 @@ pub(crate) struct ControlRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RenderRequest {
     pub prompt: String,
+    /// The pipeline's full name, as on the OpenAI routes; absent is the default.
+    pub model: Option<String>,
     pub width: Option<usize>,
     pub height: Option<usize>,
     pub steps: Option<usize>,
@@ -104,6 +106,21 @@ pub(crate) fn prepare(
             "a non-empty prompt is required",
         ));
     }
+    // Before any input is decoded: a pipeline with no path for an input says
+    // so by the field's name, rather than by whatever decoding it would fail on.
+    let (pipeline, _) = images::select_pipeline(request.model.as_deref(), false)?;
+    let given: Vec<&str> = [
+        ("init_image", request.init_image.is_some()),
+        ("strength", request.strength.is_some()),
+        ("mask", request.mask.is_some()),
+        ("mask_blur", request.mask_blur.is_some()),
+        ("control", request.control.is_some()),
+        ("loras", !request.loras.is_empty()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+    images::refuse_missing_controls(pipeline, &given)?;
     if request.init_image.is_none() && (request.mask.is_some() || request.strength.is_some()) {
         return Err(images::bad_param(
             "init_image",
@@ -158,7 +175,7 @@ pub(crate) fn prepare(
         None => size.unwrap_or((1024, 1024)),
     };
     let compatibility: images::ImagesRequest = serde_json::from_value(json!({
-        "prompt":request.prompt,"width":width,"height":height,"steps":request.steps,"seed":request.seed,"n":request.n
+        "prompt":request.prompt,"model":request.model,"width":width,"height":height,"steps":request.steps,"seed":request.seed,"n":request.n
     })).map_err(|e| bad_request(e.to_string()))?;
     let params = images::validate(compatibility, false, server_steps)?;
     let edit = match source {
@@ -299,6 +316,14 @@ fn prepare_multipart(
     variation: bool,
     server_steps: Option<usize>,
 ) -> Result<(ImageParams, ImageInputs), ApiError> {
+    // Editing from reference images is a separate path on Qwen-Image 2.1, and
+    // this route's image-to-image is Z-Image's: naming the other model here is
+    // refused before the image is decoded.
+    let model = fields
+        .get("model")
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    let (pipeline, _) = images::select_pipeline(model.as_deref(), false)?;
+    images::refuse_missing_controls(pipeline, &["image"])?;
     let bytes = fields
         .remove("image")
         .ok_or_else(|| images::bad_param("image", "image is required"))?;
@@ -511,6 +536,62 @@ mod tests {
             .unwrap()
             .to_owned()
     }
+    #[test]
+    fn native_render_takes_a_model_and_holds_it_to_its_own_rules() {
+        let (params, inputs) = prepare(
+            request(json!({"prompt":"x","model":"Qwen-Image-2.1"})),
+            Some(8),
+        )
+        .unwrap();
+        assert_eq!(params.pipeline, images::Pipeline::QwenImage);
+        assert_eq!(
+            (params.width, params.height, params.steps),
+            (1024, 1024, 40)
+        );
+        assert!(inputs.edit.is_none() && inputs.loras.is_empty() && inputs.control.is_none());
+        let (params, _) = prepare(request(json!({"prompt":"x"})), None).unwrap();
+        assert_eq!(params.pipeline, images::Pipeline::ZImage);
+        // An alias is refused here as it is on the OpenAI routes.
+        assert_eq!(
+            error_param(json!({"prompt":"x","model":"qwen-image-2.1"})),
+            "model"
+        );
+        // Each input Qwen-Image 2.1 has no path for is refused by its own name,
+        // before it is decoded: none of these strings is a readable image.
+        let image = "not an image";
+        for (field, value) in [
+            ("init_image", json!(image)),
+            ("strength", json!(0.5)),
+            ("mask", json!(image)),
+            ("mask_blur", json!(2.0)),
+            ("control", json!({"image": image})),
+            ("loras", json!([{"name":"x","weight":1.0}])),
+        ] {
+            let mut body = json!({"prompt":"x","model":"Qwen-Image-2.1"});
+            body[field] = value;
+            assert_eq!(error_param(body), field);
+        }
+        assert_eq!(
+            error_param(json!({"prompt":"x","model":"Qwen-Image-2.1","width":1000,"height":1000})),
+            "size"
+        );
+    }
+
+    #[test]
+    fn the_multipart_routes_refuse_qwen_image_before_decoding_the_image() {
+        for variation in [false, true] {
+            let fields = HashMap::from([
+                ("image".to_string(), b"not an image".to_vec()),
+                ("prompt".to_string(), b"x".to_vec()),
+                ("model".to_string(), b"Qwen-Image-2.1".to_vec()),
+            ]);
+            let err = prepare_multipart(fields, variation, None).err().unwrap();
+            assert_eq!(err.body["error"]["param"], "image");
+            let text = err.body["error"]["message"].as_str().unwrap();
+            assert!(text.contains("Qwen-Image-2.1"), "{text}");
+        }
+    }
+
     #[test]
     fn native_rejects_unknown_fields_and_dependent_controls() {
         for value in [
