@@ -1,0 +1,306 @@
+{
+  "note": "Reference for tests/qwen_image_encoder.rs. Dumps are NOT committed; point $XWEN_QWEN_IMAGE_REF_DIR at the output of scripts/qwen-image-ref-dump.py. Each prompt's arrays live in <XWEN_QWEN_IMAGE_REF_DIR>/<dir>/<file>. Rendered strings and ids are in tokens.json.",
+  "repo_id": "Qwen/Qwen-Image-2.1",
+  "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+  "hidden_index": 36,
+  "final_norm": false,
+  "drop": 14,
+  "hidden_size": 4096,
+  "check_prompt_idx": 1,
+  "versions": {
+    "torch": "2.14.0",
+    "transformers": "5.17.0",
+    "numpy": "2.5.3"
+  },
+  "stages": {
+    "fp32": {
+      "dtype": "torch.float32",
+      "attn_implementation": "eager",
+      "load_s": 10.1
+    },
+    "bf16": {
+      "dtype": "torch.bfloat16",
+      "attn_implementation": "sdpa",
+      "load_s": 0.3
+    }
+  },
+  "checks": {
+    "hidden_states_last_is_normed_without_the_hook": true,
+    "normed_vs_prenorm": {
+      "min_cosine": 0.6233393351082621,
+      "mean_cosine": 0.813172040327606,
+      "max_rel_error": 1.0000384997124754,
+      "mean_rel_error": 0.8349551502016409,
+      "rms_ratio": 0.26497846841812134
+    },
+    "mrope_text_ids": {
+      "prompt_idx": 1,
+      "tokens": 87,
+      "axes_equal": true,
+      "is_arange": true
+    },
+    "pipeline_check": {
+      "prompt_idx": 1,
+      "bitwise_equal": true,
+      "drop_idx": 14
+    }
+  },
+  "spread": {
+    "note": "Per-row cosine and max-abs relative error against the fp32 arm, over every prompt. `row0` is kept row 0 alone, `rest` every other kept row pooled. `bf16` is the reference's own bf16 arm (a CORRECT graph at lower precision), `normed` the wrong graph: the final norm applied.",
+    "rows_rest": 1805,
+    "row0": {
+      "bf16": {
+        "min_cosine": 0.9538515941682193,
+        "max_rel_error": 1.5774082882374887
+      },
+      "normed": {
+        "max_cosine": 0.9053349091418458,
+        "min_rel_error": 0.9999533114547451
+      }
+    },
+    "rest": {
+      "bf16": {
+        "min_cosine": 0.9928701822168559,
+        "p50_rel_error": 0.034064895688166966,
+        "p99_rel_error": 0.1566528395834976,
+        "max_rel_error": 0.23329142390769586
+      },
+      "normed": {
+        "max_cosine": 0.9588559504928582,
+        "min_rel_error": 0.4037827802624994
+      }
+    }
+  },
+  "prompts": [
+    {
+      "idx": 0,
+      "label": "short",
+      "dir": "00",
+      "T": 25,
+      "T_kept": 11,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "fdffb9141de663f71389bf1bc9dbcbd33656196a918245a3cee2995d4ffdc221",
+      "wall_s_fp32": 1.985,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "502f22c877c4025737e2f4617ebdc80136e8c523eda2a27beb2188ab7512a341",
+      "wall_s_bf16": 2.653,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9956073072375276,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.16564090141422055
+      }
+    },
+    {
+      "idx": 1,
+      "label": "portrait-golden-hour",
+      "dir": "01",
+      "T": 87,
+      "T_kept": 73,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "65a37c2d63f9f8537455511ee888cd30d25fa96b0956be2d98fec53677ce3b4e",
+      "wall_s_fp32": 1.846,
+      "hidden_normed_fp32": "hidden_normed_fp32.safetensors",
+      "hidden_normed_fp32_sha256": "79be1eace3aee64d8e158d62c790ac53b075187715f5d4dfe9b81449236a1482",
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "85ba084799ec9e5d35a9149d6536719c2efe0eacd0c6786bb2e85b82f37be06c",
+      "wall_s_bf16": 8.314,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.999161154722265,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.07755798163379757
+      }
+    },
+    {
+      "idx": 2,
+      "label": "product-studio",
+      "dir": "02",
+      "T": 74,
+      "T_kept": 60,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "a3703fcdd5d45dc0beb9fb0d424d7234c2822cd5620c8bfd6149bf77d73953e5",
+      "wall_s_fp32": 1.796,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "f588200150a748150d3efb963b3ee1fd65e5f4c1b50fe8fa5060e0bd07e39be4",
+      "wall_s_bf16": 9.156,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9990418548147919,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.07194973464841893
+      }
+    },
+    {
+      "idx": 3,
+      "label": "landscape-storm",
+      "dir": "03",
+      "T": 72,
+      "T_kept": 58,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "641d9268ba88dfbd981aef837ab614f2da800d66befca06f53fe2b8cb7a180aa",
+      "wall_s_fp32": 1.812,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "6fb81c41438e2e68168771ac7806fdf1ef5057d3977ea60a7f669b0eb243d483",
+      "wall_s_bf16": 6.558,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9990446395958849,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.06891993095891215
+      }
+    },
+    {
+      "idx": 4,
+      "label": "cjk",
+      "dir": "04",
+      "T": 62,
+      "T_kept": 48,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "068dcae82433ec70c2ac7160cd3bf9245bb909ab6fbc2dad74af0931fc14bbe4",
+      "wall_s_fp32": 1.442,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "9434a9772100aec5e06d528ba8f4b866811ff01a9977ecb19c6fa76541914d09",
+      "wall_s_bf16": 5.664,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9988510987033719,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.08853225975975754
+      }
+    },
+    {
+      "idx": 5,
+      "label": "emoji-punct",
+      "dir": "05",
+      "T": 69,
+      "T_kept": 55,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "772e24f5cff7a57f75fd96da728fc068e1d5dd6902c08995adab1c497876e634",
+      "wall_s_fp32": 1.802,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "57bef961455ef839fdb6cf16c9a72a1d24dc57f9ffe4585ccac3d034c40d379f",
+      "wall_s_bf16": 6.244,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9989500651849262,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.07439660825607082
+      }
+    },
+    {
+      "idx": 6,
+      "label": "multi-sentence",
+      "dir": "06",
+      "T": 206,
+      "T_kept": 192,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "7aa48af2447a62cf78bb4aab3a60da51cf46d5a65071796ccc0640089c5e3925",
+      "wall_s_fp32": 3.435,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "18323829ace3f5c6f1aac1113ff53409898f644a7bc94e767620d8e4a6ef83d2",
+      "wall_s_bf16": 19.882,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9995825821702112,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.0503246286070003
+      }
+    },
+    {
+      "idx": 7,
+      "label": "literal-think-tag",
+      "dir": "07",
+      "T": 68,
+      "T_kept": 54,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "8039fa65e50b690e33e8fc5dde6e8b6c13c64032c0ae8d5295f5cacb74e638d0",
+      "wall_s_fp32": 1.799,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "b5ee475527ddd12bbc95252d7f121193309e225e209183e18f823e575f8a4bbe",
+      "wall_s_bf16": 6.486,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9989538609033944,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.07285531883712658
+      }
+    },
+    {
+      "idx": 8,
+      "label": "watercolour-fox",
+      "dir": "08",
+      "T": 70,
+      "T_kept": 56,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "aa0f72ff1dc963e1d532fc2cc60665d445b297e4612ff7a6a2ac64907d2e3ee5",
+      "wall_s_fp32": 1.795,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "5a7b3a8c9763253f87cb38439567a48561754768b8fda8a2ceda991f82820b91",
+      "wall_s_bf16": 6.401,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9989887719212085,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.08363504585671995
+      }
+    },
+    {
+      "idx": 9,
+      "label": "scifi-station",
+      "dir": "09",
+      "T": 69,
+      "T_kept": 55,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "78a3793c59b9c42715083cf0119ac02f97837b173126c6f63691e78589817b1a",
+      "wall_s_fp32": 1.807,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "454c67b8382bd0104b2114a611f5deee3d0732be7123304e628f2b7bc01a1854",
+      "wall_s_bf16": 7.485,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9989927439788521,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.0756385848463718
+      }
+    },
+    {
+      "idx": 10,
+      "label": "exactly-512",
+      "dir": "10",
+      "T": 526,
+      "T_kept": 512,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "db10ac614844179578b09266def9a8ae7a73d37db9789a36eacae8bdbdf9a046",
+      "wall_s_fp32": 7.682,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "41e728ebcae88cd6716ee8f3b8b2f0175557f17a72fc80e68f3b3fe71a804b00",
+      "wall_s_bf16": 60.61,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9997423218914817,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.042464344042913736
+      }
+    },
+    {
+      "idx": 11,
+      "label": "over-512",
+      "dir": "11",
+      "T": 657,
+      "T_kept": 643,
+      "hidden_fp32": "hidden_fp32.safetensors",
+      "hidden_fp32_sha256": "fdeea03122ba5f044a01c1d962f486a6f938c8161730c16f6c46e9f652b0ce89",
+      "wall_s_fp32": 9.474,
+      "hidden_bf16": "hidden_bf16.safetensors",
+      "hidden_bf16_sha256": "0b5f079f1c43f633b709cc0b4e3cbdd981a034deb93edc1942c37085111f2807",
+      "wall_s_bf16": 96.572,
+      "bf16_vs_fp32": {
+        "min_cosine": 0.9538515941682193,
+        "mean_cosine": 0.9997419012599179,
+        "max_rel_error": 1.5774082882374887,
+        "mean_rel_error": 0.042880120614440145
+      }
+    }
+  ]
+}
