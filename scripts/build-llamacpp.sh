@@ -17,13 +17,16 @@
 # the real work.
 set -euo pipefail
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
-REPO="$SCRIPTS/../reference/llama.cpp"
+# An optional first argument names a different checkout: reference/llama.cpp-flint
+# is the Flint oracle, pinned apart from the main one so moving it never moves the
+# calibrated floors of the other checkpoints.
+REPO="${1:-$SCRIPTS/../reference/llama.cpp}"
 cd "$REPO"
 
 SDK="$(xcrun --show-sdk-path)"
 nix shell nixpkgs#cmake --command bash -c "
   cmake -B build -DGGML_METAL=ON -DGGML_BLAS=OFF -DCMAKE_BUILD_TYPE=Release \
-    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_UI_GZIP=OFF \
     -DCMAKE_OSX_SYSROOT='$SDK' \
     -DCMAKE_FRAMEWORK_PATH='$SDK/System/Library/Frameworks' &&
   cmake --build build -j

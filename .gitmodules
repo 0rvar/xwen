@@ -2,3 +2,7 @@
 	path = reference/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
 	shallow = true
+[submodule "reference/llama.cpp-flint"]
+	path = reference/llama.cpp-flint
+	url = https://github.com/ggml-org/llama.cpp.git
+	shallow = true
