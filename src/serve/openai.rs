@@ -29,7 +29,7 @@ use super::{
     ApiError, AppState, Completion, EngineFailure, JobRequest, SseEncoder, SseFrame, SubmitError,
     collect_completion, random_id, sse_response, submit, unix_now,
 };
-use crate::chat::{Message, ReasoningEffort, ToolCall};
+use crate::chat::{ChatDialect, Message, ReasoningEffort, ToolCall};
 use crate::constrain::Grammar;
 use crate::generate::feasible_think_budget;
 use crate::sampler::SamplerOptions;
@@ -309,7 +309,16 @@ fn join_into(previous: &mut String, text: &str) {
 /// template renders exactly one system block, ahead of the conversation, while
 /// harnesses (Claude Code's token-budget reminders) inject system messages
 /// mid-conversation that are addressed to the model like any user text.
-fn push_turn(messages: &mut Vec<Message>, turn: Message) {
+///
+/// Both rewrites are Qwen template behaviour. A dialect whose template renders
+/// every message in place (`ChatDialect::renders_turns_in_place`, Flint) gets
+/// the conversation exactly as sent: a late system message stays a system turn
+/// and consecutive same-role messages stay separate turns.
+fn push_turn(messages: &mut Vec<Message>, turn: Message, dialect: ChatDialect) {
+    if dialect.renders_turns_in_place() {
+        messages.push(turn);
+        return;
+    }
     let turn = match turn {
         Message::System(text) if !matches!(messages.last(), None | Some(Message::System(_))) => {
             Message::User(text)
@@ -446,7 +455,16 @@ fn tool_calls_of(specs: Option<&Vec<ToolCallSpec>>) -> Result<Vec<ToolCall>, Api
 /// existed — which they can only do for a conversation that contains none, and
 /// which means reasoning is dropped everywhere, exactly as it was before this
 /// server rendered tools at all.
-pub(crate) fn normalize(request: &ChatRequest, mode: ToolsMode) -> Result<Vec<Message>, ApiError> {
+///
+/// `dialect` is the target's: it decides whether a `developer` message keeps
+/// its own role (`ChatDialect::has_developer_role`) or is a system message,
+/// and whether turns are merged and a late system message demoted
+/// (`push_turn`).
+pub(crate) fn normalize(
+    request: &ChatRequest,
+    mode: ToolsMode,
+    dialect: ChatDialect,
+) -> Result<Vec<Message>, ApiError> {
     let native = matches!(mode, ToolsMode::Native);
     let mut messages = Vec::new();
     for index in result_order(&request.messages) {
@@ -456,6 +474,7 @@ pub(crate) fn normalize(request: &ChatRequest, mode: ToolsMode) -> Result<Vec<Me
             None => String::new(),
         };
         let turn = match message.role.as_str() {
+            "developer" if dialect.has_developer_role() => Message::Developer(text),
             "system" | "developer" => Message::System(text),
             "user" => Message::User(text),
             "assistant" => Message::Assistant {
@@ -483,7 +502,7 @@ pub(crate) fn normalize(request: &ChatRequest, mode: ToolsMode) -> Result<Vec<Me
                 )));
             }
         };
-        push_turn(&mut messages, turn);
+        push_turn(&mut messages, turn, dialect);
     }
     Ok(messages)
 }
@@ -822,7 +841,7 @@ pub(crate) fn prepare(
         return Err(bad_request("max_completion_tokens must be at least 1"));
     }
 
-    let messages = normalize(&request, settings.tools_mode)?;
+    let messages = normalize(&request, settings.tools_mode, target.model.chat_dialect())?;
     let kwargs = template_kwargs(request.chat_template_kwargs.as_ref())?;
     // The kwarg is the raw template parameter, and only the 3.8 template takes
     // one: honoring the request is impossible on every other target, and
@@ -1438,6 +1457,94 @@ mod tests {
             panic!("tools on a toolless dialect must be a request fault");
         };
         assert!(message.contains("tool"), "{message}");
+    }
+
+    /// Flint renders its tool format but serve cannot parse a call back out of
+    /// a reply, so tools on a Flint target are a request fault until it can.
+    #[test]
+    fn tools_on_a_flint_target_are_a_bad_request() {
+        let (state, _queue) = crate::serve::testutil::probe_state(4096);
+        let request = crate::serve::JobRequest {
+            tools: vec![serde_json::json!({
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            })],
+            ..crate::serve::testutil::plain_request(16)
+        };
+        let error = crate::serve::submit(
+            &state,
+            request,
+            crate::serve::Dialect::OpenAi,
+            false,
+            crate::serve::types::Target::official(crate::hub::Model::Flint),
+            crate::serve::ClientId::default(),
+        )
+        .err()
+        .expect("tools on Flint are refused");
+        let crate::serve::SubmitError::Invalid(message) = error else {
+            panic!("tools on Flint must be a request fault");
+        };
+        assert!(message.contains("tools"), "{message}");
+    }
+
+    /// Every Flint chat fixture, sent as an OpenAI request and run through this
+    /// module's normalizer for a Flint target, renders to the fixture's bytes,
+    /// which `scripts/verify_chat_template_flint.ts` holds to llama-server's
+    /// renderer of the template. That covers what the normalizer could change
+    /// on the way: a late system message stays in place, a developer message
+    /// keeps its role, and consecutive same-role messages stay separate turns.
+    #[test]
+    fn the_flint_fixtures_render_byte_exact_through_the_normalizer() {
+        let file: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/flint-chat.json")).unwrap();
+        for case in file["cases"].as_array().unwrap() {
+            let request: ChatRequest =
+                serde_json::from_value(serde_json::json!({ "messages": case["messages"] }))
+                    .unwrap();
+            let messages = normalize(&request, ToolsMode::Native, ChatDialect::Flint)
+                .unwrap_or_else(|e| panic!("{}: {}", case["name"], message(&e)));
+            let opts = crate::chat::ChatOptions {
+                tools: case["tools"].as_array().cloned().unwrap_or_default(),
+                ..crate::chat::ChatOptions::for_dialect(ChatDialect::Flint)
+            };
+            assert_eq!(
+                crate::chat::build_prompt(&messages, &opts).unwrap(),
+                case["expected"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    /// The Qwen normalization is unchanged: on a Qwen target a developer
+    /// message is a system message, a late one demotes to a user turn, and
+    /// consecutive same-role messages merge.
+    #[test]
+    fn the_qwen_normalization_still_merges_and_demotes() {
+        let request = parse(
+            r#"{"messages":[
+                {"role":"developer","content":"D"},
+                {"role":"user","content":"Q1"},
+                {"role":"user","content":"Q2"},
+                {"role":"system","content":"late"},
+                {"role":"developer","content":"later"}]}"#,
+        );
+        let messages = normalize(&request, ToolsMode::Native, ChatDialect::Qwen38).unwrap();
+        assert_eq!(
+            crate::serve::testutil::shape(&messages),
+            ["system:D", "user:Q1\nQ2\nlate\nlater"]
+        );
+        let flint = normalize(&request, ToolsMode::Native, ChatDialect::Flint).unwrap();
+        assert_eq!(
+            crate::serve::testutil::shape(&flint),
+            [
+                "developer:D",
+                "user:Q1",
+                "user:Q2",
+                "system:late",
+                "developer:later"
+            ]
+        );
     }
 
     fn target() -> crate::serve::types::Target {

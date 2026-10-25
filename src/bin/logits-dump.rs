@@ -541,10 +541,10 @@ fn provenance(model: &XwenModel, moe_impl: &str, seq_len: usize) -> Result<Value
 /// environment or splits across both paths (one dump carries one label; a mixed
 /// run has no honest one).
 fn observed_delta_path(cfg: &xwen::XwenConfig) -> Result<&'static str> {
-    // An all-attention checkpoint (the Qwen3 dense stack) has no DeltaNet
-    // layer to observe: the field says so rather than claiming a path, and
-    // the counters below stay zero by construction.
-    if !(0..cfg.n_layer).any(|il| !cfg.is_full_attn(il)) {
+    // An all-attention checkpoint (the Qwen3 dense stack, Flint) has no
+    // DeltaNet layer to observe: the field says so rather than claiming a
+    // path, and the counters below stay zero by construction.
+    if !(0..cfg.n_layer).any(|il| cfg.layer_kind(il) == xwen::config::LayerKind::Linear) {
         return Ok("n/a");
     }
     let (fused, classic) = xwen::linear_attn::delta_path_counts();
@@ -677,6 +677,9 @@ fn run_ppl(
     let tokenizer = match (cli.tokenizer.as_deref(), checkpoint_tokenizer) {
         (Some(path), _) | (None, Some(path)) => LagunaTokenizer::from_file(path)
             .with_context(|| format!("loading tokenizer {}", path.display()))?,
+        (None, None) if model.config().arch == xwen::config::Arch::Flint => {
+            LagunaTokenizer::embedded_flint()?
+        }
         (None, None) => LagunaTokenizer::embedded()?,
     };
     let text = std::fs::read_to_string(corpus)

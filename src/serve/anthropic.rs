@@ -26,7 +26,7 @@ use super::{
     ApiError, AppState, Completion, EngineFailure, JobRequest, SseEncoder, SseFrame, SubmitError,
     collect_completion, random_id, sse_response, submit,
 };
-use crate::chat::{Message, ToolCall};
+use crate::chat::{ChatDialect, Message, ToolCall};
 use crate::constrain::Grammar;
 use crate::generate::feasible_think_budget;
 use crate::sampler::SamplerOptions;
@@ -364,7 +364,16 @@ fn join_into(previous: &mut String, text: &str) {
 /// template renders exactly one system block, ahead of the conversation, while
 /// harnesses (Claude Code's token-budget reminders) inject system messages
 /// mid-conversation that are addressed to the model like any user text.
-fn push_turn(messages: &mut Vec<Message>, turn: Message) {
+///
+/// Both rewrites are Qwen template behaviour. A dialect whose template renders
+/// every message in place (`ChatDialect::renders_turns_in_place`, Flint) gets
+/// the conversation exactly as sent: a late system message stays a system turn
+/// and consecutive same-role messages stay separate turns.
+fn push_turn(messages: &mut Vec<Message>, turn: Message, dialect: ChatDialect) {
+    if dialect.renders_turns_in_place() {
+        messages.push(turn);
+        return;
+    }
     let turn = match turn {
         Message::System(text) if !matches!(messages.last(), None | Some(Message::System(_))) => {
             Message::User(text)
@@ -443,10 +452,13 @@ fn order_results_by_call(parts: &mut [Segment], calls: &[String]) {
     }
 }
 
-/// Normalize a request's conversation into the turns `chat.rs` renders.
+/// Normalize a request's conversation into the turns `chat.rs` renders, for
+/// the target's `dialect` (which decides whether `push_turn` merges and
+/// demotes).
 pub(crate) fn normalize(
     request: &MessagesRequest,
     mode: ToolsMode,
+    dialect: ChatDialect,
 ) -> Result<Vec<Message>, ApiError> {
     let mut messages = Vec::new();
     if let Some(system) = &request.system {
@@ -475,9 +487,9 @@ pub(crate) fn normalize(
                             // it, so the turns keep the client's ordering.
                             let before = join_text(std::mem::take(&mut pending));
                             if !before.is_empty() {
-                                push_turn(&mut messages, Message::User(before));
+                                push_turn(&mut messages, Message::User(before), dialect);
                             }
-                            push_turn(&mut messages, Message::ToolResponse(text));
+                            push_turn(&mut messages, Message::ToolResponse(text), dialect);
                         }
                         // Reasoning and calls are the assistant's; the template
                         // has nowhere to put either inside a user turn.
@@ -487,7 +499,7 @@ pub(crate) fn normalize(
                 }
                 let rest = join_text(pending);
                 if !rest.is_empty() {
-                    push_turn(&mut messages, Message::User(rest));
+                    push_turn(&mut messages, Message::User(rest), dialect);
                 }
             }
             "assistant" => {
@@ -524,12 +536,17 @@ pub(crate) fn normalize(
                         reasoning: keep_reasoning.then_some(reasoning),
                         tool_calls,
                     },
+                    dialect,
                 );
             }
             // Not a role the spec puts in `messages`, but harnesses send it.
             "system" => {
                 preceding_calls.clear();
-                push_turn(&mut messages, Message::System(text_of(content, mode)?));
+                push_turn(
+                    &mut messages,
+                    Message::System(text_of(content, mode)?),
+                    dialect,
+                );
             }
             role => {
                 return Err(bad_request(format!(
@@ -801,7 +818,7 @@ pub(crate) fn prepare(
     }
 
     check_thinking_supported(&request, target)?;
-    let messages = normalize(&request, settings.tools_mode)?;
+    let messages = normalize(&request, settings.tools_mode, target.model.chat_dialect())?;
     let (enable_thinking, max_think) =
         resolve_thinking(request.thinking.as_ref(), settings, Some(max_tokens))?;
 
@@ -1274,7 +1291,7 @@ fn counted_tokens(
         return Err(bad_request(EMPTY_MESSAGES));
     }
     check_thinking_supported(request, target)?;
-    let messages = normalize(request, settings.tools_mode)?;
+    let messages = normalize(request, settings.tools_mode, target.model.chat_dialect())?;
     // `max_tokens` is not required here, so the budget is left unclamped: it
     // caps the thinking span, which does not change the prompt being counted.
     let (enable_thinking, _) = resolve_thinking(request.thinking.as_ref(), settings, None)?;

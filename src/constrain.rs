@@ -55,7 +55,10 @@ use toktrie::{SimpleVob, TokEnv};
 use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 
 use crate::chat::ThinkingEntry;
-use crate::tokenizer::{EMBEDDED_TOKENIZER_JSON, LagunaTokenizer, Specials};
+use crate::hub::VocabFamily;
+use crate::tokenizer::{
+    EMBEDDED_FLINT_TOKENIZER_JSON, EMBEDDED_TOKENIZER_JSON, LagunaTokenizer, Specials,
+};
 
 /// Token trie + parser factory over the embedded vocabulary. Build once and
 /// share (`Arc`-clone is cheap; the factory itself is `Send + Sync`).
@@ -74,12 +77,32 @@ pub struct ConstraintFactory {
 /// vocabularies resolves through [`crate::serve::vocab::Vocabularies`], which
 /// is keyed by family for the same reason.
 pub fn shared() -> Result<Arc<ConstraintFactory>> {
-    static SHARED: OnceLock<std::result::Result<Arc<ConstraintFactory>, String>> = OnceLock::new();
-    match SHARED.get_or_init(|| {
-        ConstraintFactory::embedded()
-            .map(Arc::new)
-            .map_err(|e| format!("{e:#}"))
-    }) {
+    static SHARED: SharedFactory = OnceLock::new();
+    shared_in(&SHARED, ConstraintFactory::embedded)
+}
+
+/// The process-wide factory over the embedded FLINT vocabulary, built on first
+/// use and kept. Reached only through [`for_tokenizer`], for the reason
+/// [`shared`] is.
+fn shared_flint() -> Result<Arc<ConstraintFactory>> {
+    static SHARED: SharedFactory = OnceLock::new();
+    shared_in(&SHARED, || {
+        let tokenizer = LagunaTokenizer::embedded_flint()?;
+        ConstraintFactory::new(
+            EMBEDDED_FLINT_TOKENIZER_JSON,
+            tokenizer.specials().eog(),
+            VocabFamily::Flint.logit_width(),
+        )
+    })
+}
+
+type SharedFactory = OnceLock<std::result::Result<Arc<ConstraintFactory>, String>>;
+
+fn shared_in(
+    cell: &SharedFactory,
+    build: impl FnOnce() -> Result<ConstraintFactory>,
+) -> Result<Arc<ConstraintFactory>> {
+    match cell.get_or_init(|| build().map(Arc::new).map_err(|e| format!("{e:#}"))) {
         Ok(factory) => Ok(Arc::clone(factory)),
         Err(e) => Err(anyhow!(
             "constrain: the shared factory failed to build: {e}"
@@ -109,17 +132,29 @@ pub fn for_tokenizer(
     logit_width: usize,
 ) -> Result<Arc<ConstraintFactory>> {
     let Some(path) = tokenizer.source() else {
+        let embedded = tokenizer.embedded_json().ok_or_else(|| {
+            anyhow!("constrain: this tokenizer has neither a file nor embedded bytes")
+        })?;
+        let (width, factory): (usize, fn() -> Result<Arc<ConstraintFactory>>) =
+            if std::ptr::eq(embedded, EMBEDDED_TOKENIZER_JSON) {
+                (LagunaTokenizer::PADDED_VOCAB, shared)
+            } else if std::ptr::eq(embedded, EMBEDDED_FLINT_TOKENIZER_JSON) {
+                (VocabFamily::Flint.logit_width(), shared_flint)
+            } else {
+                bail!(
+                    "constrain: this tokenizer's embedded bytes are no vocabulary this build knows"
+                );
+            };
         ensure!(
-            logit_width == LagunaTokenizer::PADDED_VOCAB,
-            "constrain: this tokenizer is the embedded {}-wide vocabulary, but a \
-             {logit_width}-wide mask was asked for",
-            LagunaTokenizer::PADDED_VOCAB
+            logit_width == width,
+            "constrain: this tokenizer is an embedded {width}-wide vocabulary, but a \
+             {logit_width}-wide mask was asked for"
         );
-        return shared();
+        return factory();
     };
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading {} to build a grammar trie", path.display()))?;
-    let factory = ConstraintFactory::new(&bytes, &tokenizer.specials().eog(), logit_width)
+    let factory = ConstraintFactory::new(&bytes, tokenizer.specials().eog(), logit_width)
         .with_context(|| format!("building the grammar trie over {}", path.display()))?;
     Ok(Arc::new(factory))
 }
@@ -149,8 +184,8 @@ impl ConstraintFactory {
     pub fn new(tokenizer_json: &[u8], eos: &[u32], expected_vocab: usize) -> Result<Self> {
         let mut bt = ByteTokenizer::from_json_bytes(tokenizer_json)
             .map_err(|e| anyhow!("constrain: building the grammar token trie failed: {e}"))?;
-        // Chat ends on either EOG id, and llguidance's auto-detection settles
-        // on one stop token. Naming both keeps the grammar offering a stop the
+        // Chat ends on any EOG id, and llguidance's auto-detection settles
+        // on one stop token. Naming them all keeps the grammar offering a stop the
         // decode loop will actually act on; leaving it to the scan lets a
         // constrained run reach max_tokens with the value long since complete.
         bt.set_eos_tokens(eos);

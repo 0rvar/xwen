@@ -56,8 +56,9 @@ struct Cli {
 struct ModelArgs {
     /// The checkpoint: a registry name, or a path. Names are the aliases
     /// `flash-next` (Qwen3.8-Flash-Next, EXPERIMENTAL and without a drafter),
-    /// `27b`, `35b`, `35b-uncensored`, `3.8-27b`, `qwen3-4b` (hybrid thinking) and
-    /// `qwen3-4b-instruct-2507` (no thinking), plus `zimage-turbo-encoder` and
+    /// `27b`, `35b`, `35b-uncensored`, `3.8-27b`, `qwen3-4b` (hybrid thinking),
+    /// `qwen3-4b-instruct-2507` (no thinking) and `flint` (Recursive's Flint,
+    /// without a drafter), plus `zimage-turbo-encoder` and
     /// `qwen-image-2.1-encoder` (text encoders: `xwen encode-text` only) and
     /// `zimage-turbo` and `qwen-image-2.1` (diffusion pipelines: `xwen image`).
     /// Each checkpoint's full name works too. A named checkpoint is ensured in

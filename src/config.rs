@@ -26,13 +26,20 @@ pub enum RopeKind {
 
 /// Which attention a layer runs. Qwen 3.6 is a hybrid: full attention at layer
 /// indices where `(il + 1) % full_attention_interval == 0` — 3, 7, 11, … on both
-/// shipped checkpoints — and gated DeltaNet everywhere else.
+/// shipped checkpoints — and gated DeltaNet everywhere else. Flint mixes the
+/// first kind with the third: sliding-window attention on 35 of its 49 layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
     /// Softmax attention over a KV cache.
     Full,
     /// Gated DeltaNet (linear attention) over a recurrent state.
     Linear,
+    /// Softmax attention over the last `window` positions, the current one
+    /// included (llama.cpp's `LLAMA_SWA_TYPE_STANDARD`: a key is masked when
+    /// `q - k >= window`). Its cache is a ring of `window` slots, a fixed size
+    /// whatever the context, so it is state a snapshot copies rather than rows
+    /// that grow.
+    Swa { window: usize },
 }
 
 /// Which graph a checkpoint holds. `qwen35` and `qwen35moe` differ only in the
@@ -50,6 +57,13 @@ pub enum Arch {
     /// Qwen3.8-Flash-Next — 512 routed experts + one shared expert on every
     /// layer, hyper-connection residuals, QSA attention, PLE.
     Qwen4Exp,
+    /// Flint (`flint`) — Recursive's 40B-A2.5B MoE, trained from scratch on a
+    /// Qwen3-MoE skeleton. Plain softmax attention on every layer (35 sliding
+    /// at window 513 with NEoX rope over the whole 128-wide head, 14 full with
+    /// no positional encoding at all), learned per-head attention sinks, two
+    /// leading dense SwiGLU layers and 47 MoE layers routed by a SIGMOID with
+    /// an ungated shared expert. See [`FlintConfig`] and `src/flint/`.
+    Flint,
     /// Qwen3-4B dense (`qwen3`) — the one architecture here that is NOT a
     /// hybrid: full softmax attention on every layer, a dense SwiGLU FFN, no
     /// DeltaNet, no experts, and full NEoX rope over the whole 128-wide head.
@@ -150,6 +164,7 @@ impl Arch {
             // what a GGUF of it would carry, and `from_gguf` names it when it
             // refuses one.
             Arch::Qwen3 => "qwen3",
+            Arch::Flint => "flint",
         }
     }
 
@@ -169,7 +184,9 @@ impl Arch {
     pub fn prefill_chunk_default(&self) -> usize {
         match self {
             Arch::Dense | Arch::Qwen3 => 512,
-            Arch::Moe | Arch::Qwen4Exp => 2048,
+            // Flint takes the MoE arm unmeasured, for the reason the two MoE
+            // checkpoints won at 2048: the chunk is the expert batch.
+            Arch::Moe | Arch::Qwen4Exp | Arch::Flint => 2048,
         }
     }
 
@@ -249,6 +266,7 @@ impl Arch {
             // `qwen35`. [`XwenConfig::assumed_model`] reads `rope_theta` to at
             // least tell the Instruct release apart before falling back here.
             Arch::Qwen3 => Some(crate::hub::Model::Qwen34B),
+            Arch::Flint => Some(crate::hub::Model::Flint),
         }
     }
 
@@ -259,7 +277,7 @@ impl Arch {
     /// architecture is a DeltaNet layer, so there is no z-gate to activate.
     pub fn z_gate(&self) -> ZGate {
         match self {
-            Arch::Dense | Arch::Moe | Arch::Qwen3 => ZGate::Silu,
+            Arch::Dense | Arch::Moe | Arch::Qwen3 | Arch::Flint => ZGate::Silu,
             Arch::Qwen4Exp => ZGate::Sigmoid,
         }
     }
@@ -273,7 +291,10 @@ impl Arch {
     /// architecture has no router and no experts to renormalize.
     pub fn moe_sum_floor(&self) -> f32 {
         match self {
-            Arch::Dense | Arch::Moe | Arch::Qwen3 => MOE_SUM_FLOOR,
+            // Flint's renormalization runs over sigmoid scores and llama.cpp
+            // clamps it at the same floor (build_moe_ffn), where it is a no-op:
+            // six sigmoids never sum below 2^-14 in practice.
+            Arch::Dense | Arch::Moe | Arch::Qwen3 | Arch::Flint => MOE_SUM_FLOOR,
             Arch::Qwen4Exp => 0.0,
         }
     }
@@ -329,6 +350,23 @@ pub struct XwenConfig {
     /// The `qwen4exp` subsystems (hyper-connections, QSA indexer, PLE);
     /// `None` on the qwen35/qwen35moe arms.
     pub qwen4exp: Option<Qwen4ExpConfig>,
+    /// What the `flint` graph carries beyond the shared geometry; `None` on
+    /// every other architecture.
+    pub flint: Option<FlintConfig>,
+}
+
+/// Config the `flint` architecture carries beyond the shared geometry. The
+/// sliding window itself lives in [`LayerKind::Swa`], per layer.
+#[derive(Debug, Clone)]
+pub struct FlintConfig {
+    /// `flint.attention.rope_pattern`, per layer: whether the layer rotates
+    /// q and k at all. True exactly on the sliding layers of the shipped file;
+    /// the 14 full-attention layers are NoPE. Read rather than derived from the
+    /// window pattern because llama.cpp reads the two as separate keys.
+    pub roped: Vec<bool>,
+    /// `flint.leading_dense_block_count`: layers `0..n_dense_lead` run a dense
+    /// SwiGLU of width `dense_ff`, every later one the MoE block.
+    pub n_dense_lead: usize,
 }
 
 /// Config the `qwen4exp` architecture carries beyond the shared geometry.
@@ -538,6 +576,7 @@ impl XwenConfig {
             "qwen35" => Arch::Dense,
             "qwen35moe" => Arch::Moe,
             "qwen4exp" => Arch::Qwen4Exp,
+            "flint" => Arch::Flint,
             // A real architecture here, just not one this build reads from a
             // GGUF: Qwen3-4B is loaded from its Hugging Face BF16 safetensors
             // directory. Named explicitly rather than falling into the generic
@@ -549,8 +588,8 @@ impl XwenConfig {
                  --model qwen3-4b / qwen3-4b-instruct-2507 / zimage-turbo-encoder)"
             ),
             other => bail!(
-                "expected a Qwen GGUF (architecture \"qwen35\", \"qwen35moe\" or \"qwen4exp\"), \
-                 got {other:?}"
+                "expected a Qwen or Flint GGUF (architecture \"qwen35\", \"qwen35moe\", \
+                 \"qwen4exp\" or \"flint\"), got {other:?}"
             ),
         };
         let a = arch.key();
@@ -566,6 +605,9 @@ impl XwenConfig {
             "{a}.attention.value_length is {value_length} but key_length is {head_dim}; this \
              build assumes one attention head dim"
         );
+        if arch == Arch::Flint {
+            return Self::flint_from_gguf(&md, content, n_layer, hidden, head_dim);
+        }
 
         // Partial NEoX rope over the first n_rot dims at theta 1e7. The GGUF
         // declares IMROPE sections; text-only positions make that identical to
@@ -606,7 +648,9 @@ impl XwenConfig {
             Arch::Dense | Arch::Qwen3 => {
                 (md.usize(&format!("{a}.feed_forward_length"))?, 0, 0, 0, 0)
             }
-            Arch::Moe | Arch::Qwen4Exp => (
+            // `Arch::Flint` never reaches here either: it returned through
+            // `flint_from_gguf` above. Its FFN keys have the MoE spelling.
+            Arch::Moe | Arch::Qwen4Exp | Arch::Flint => (
                 0,
                 md.usize(&format!("{a}.expert_count"))?,
                 md.usize(&format!("{a}.expert_used_count"))?,
@@ -648,7 +692,7 @@ impl XwenConfig {
 
         let qwen4exp = match arch {
             Arch::Qwen4Exp => Some(Qwen4ExpConfig::from_gguf(&md, a, &layer_kind)?),
-            Arch::Dense | Arch::Moe | Arch::Qwen3 => None,
+            Arch::Dense | Arch::Moe | Arch::Qwen3 | Arch::Flint => None,
         };
 
         Ok(Self {
@@ -675,6 +719,139 @@ impl XwenConfig {
             rope,
             eog_tokens,
             qwen4exp,
+            flint: None,
+        })
+    }
+
+    /// The `flint` arm of [`XwenConfig::from_gguf`], from the point where the
+    /// two stop sharing keys: no DeltaNet (`ssm.*` is absent and nothing reads
+    /// it), a per-layer window and rope pattern instead of an interval, a
+    /// leading-dense count, and stop tokens that are this vocabulary's own.
+    ///
+    /// The graph is llama.cpp's `src/models/flint.cpp` at a37cc4610, and the
+    /// routing keys it hands `build_moe_ffn` are checked rather than assumed:
+    /// `expert_gating_func` 2 (sigmoid), `expert_weights_norm` true and
+    /// `expert_weights_scale` 1.0 are what `src/flint/` implements, so a file
+    /// declaring anything else is refused instead of routed wrongly.
+    fn flint_from_gguf(
+        md: &Meta,
+        content: &Content,
+        n_layer: usize,
+        hidden: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let a = Arch::Flint.key();
+        let window = md.usize(&format!("{a}.attention.sliding_window"))?;
+        ensure!(window > 0, "{a}.attention.sliding_window is 0");
+        let sliding = md.bool_array(&format!("{a}.attention.sliding_window_pattern"), n_layer)?;
+        let roped = md.bool_array(&format!("{a}.attention.rope_pattern"), n_layer)?;
+        let layer_kind = sliding
+            .iter()
+            .map(|&s| {
+                if s {
+                    LayerKind::Swa { window }
+                } else {
+                    LayerKind::Full
+                }
+            })
+            .collect();
+
+        let gating = md.usize(&format!("{a}.expert_gating_func"))?;
+        ensure!(
+            gating == 2,
+            "{a}.expert_gating_func is {gating}; this build implements Flint's sigmoid router \
+             (2) only"
+        );
+        let norm = md.get(&format!("{a}.expert_weights_norm"))?.to_bool()?;
+        ensure!(
+            norm,
+            "{a}.expert_weights_norm is false; Flint renormalizes its top-k weights"
+        );
+        let scale = md.f32_or(&format!("{a}.expert_weights_scale"), 1.0);
+        ensure!(
+            scale == 1.0,
+            "{a}.expert_weights_scale is {scale}; this build applies no routed-weight scale"
+        );
+        let n_dense_lead = md.usize(&format!("{a}.leading_dense_block_count"))?;
+        ensure!(
+            n_dense_lead <= n_layer,
+            "{a}.leading_dense_block_count {n_dense_lead} exceeds the {n_layer} layers"
+        );
+        // An expert-selection bias would rank experts differently from what
+        // the sigmoid scores alone say; the shipped file has none, and the
+        // router here applies none.
+        ensure!(
+            !content
+                .tensor_infos
+                .keys()
+                .any(|name| name.ends_with(".exp_probs_b.bias")),
+            "this Flint file carries an expert-selection bias (exp_probs_b), which this \
+             build does not apply"
+        );
+
+        // The rope is full NEoX over the whole head: llama.cpp asserts
+        // `n_rot == n_embd_head` for this graph, and the file writes no
+        // dimension_count, so the head dim is the rotated width.
+        let n_rot = md.usize_or(&format!("{a}.rope.dimension_count"), head_dim);
+        ensure!(
+            n_rot == head_dim,
+            "{a}.rope.dimension_count is {n_rot} but the head dim is {head_dim}; Flint rotates \
+             the whole head"
+        );
+        let rope = RopeKind::Plain {
+            freq_base: md.f32(&format!("{a}.rope.freq_base"))?,
+            n_rot,
+        };
+
+        let vocab = content
+            .tensor_infos
+            .get("token_embd.weight")
+            .and_then(|info| info.shape.dims().first().copied())
+            .context("no token_embd.weight to read the vocabulary width from")?;
+
+        // The file advertises one eos (`<|end_of_text|>`). The checkpoint's
+        // `generation_config.json` stops on four ids: that one plus the three
+        // role markers that open the NEXT turn (`<|user|>`, `<|observation|>`,
+        // `<|developer|>`), since this template closes a turn by starting
+        // another rather than with an end-of-turn token. llama.cpp marks two of
+        // those EOG by text at vocab load. They are resolved here by text from
+        // the file's own token list, not hardcoded, and a file missing any of
+        // them is refused: a loop that did not stop on `<|user|>` would write
+        // the user's next turn itself.
+        let eog_tokens = flint_stop_ids(md)?;
+        ensure!(
+            eog_tokens[0] == md.u32("tokenizer.ggml.eos_token_id")?,
+            "tokenizer.ggml.eos_token_id is not <|end_of_text|> in this Flint file"
+        );
+
+        Ok(Self {
+            arch: Arch::Flint,
+            general_name: md.str("general.name").ok().map(str::to_string),
+            n_layer,
+            hidden,
+            vocab,
+            n_head: md.usize_per_layer(&format!("{a}.attention.head_count"), n_layer)?,
+            n_kv_head: md.usize(&format!("{a}.attention.head_count_kv"))?,
+            head_dim,
+            layer_kind,
+            linear_k_heads: 0,
+            linear_v_heads: 0,
+            linear_head_dim: 0,
+            conv_kernel: 0,
+            dense_ff: md.usize(&format!("{a}.feed_forward_length"))?,
+            n_expert: md.usize(&format!("{a}.expert_count"))?,
+            n_expert_used: md.usize(&format!("{a}.expert_used_count"))?,
+            expert_ff: md.usize(&format!("{a}.expert_feed_forward_length"))?,
+            shared_expert_ff: md.usize(&format!("{a}.expert_shared_feed_forward_length"))?,
+            rms_eps: md.f32_or(&format!("{a}.attention.layer_norm_rms_epsilon"), 1e-6) as f64,
+            n_ctx_train: md.usize(&format!("{a}.context_length"))?,
+            rope,
+            eog_tokens,
+            qwen4exp: None,
+            flint: Some(FlintConfig {
+                roped,
+                n_dense_lead,
+            }),
         })
     }
 
@@ -732,6 +909,7 @@ impl XwenConfig {
             },
             eog_tokens: cfg.eog.to_vec(),
             qwen4exp: None,
+            flint: None,
         }
     }
 }
@@ -887,6 +1065,8 @@ fn indexer_compress_ratio(md: &Meta, arch: &str, layer_kind: &[LayerKind]) -> Re
                 r == 0,
                 "GGUF key {key} is {r} at layer {il}, a DeltaNet layer that runs no indexer"
             ),
+            // `layer_kinds` builds no sliding layer for qwen4exp.
+            LayerKind::Swa { .. } => bail!("qwen4exp has no sliding-window layers (layer {il})"),
         }
     }
     ratio.with_context(|| format!("GGUF key {key} covers no full-attention layer"))
@@ -940,6 +1120,32 @@ fn layer_kinds(md: &Meta, arch: &str, n_layer: usize) -> Result<Vec<LayerKind>> 
             }
         })
         .collect())
+}
+
+/// The texts of Flint's four stop tokens, `<|end_of_text|>` first.
+pub const FLINT_STOP_TEXTS: [&str; 4] = [
+    "<|end_of_text|>",
+    "<|user|>",
+    "<|observation|>",
+    "<|developer|>",
+];
+
+/// Flint's stop ids, resolved by text from `tokenizer.ggml.tokens` in
+/// [`FLINT_STOP_TEXTS`] order.
+fn flint_stop_ids(md: &Meta) -> Result<Vec<u32>> {
+    let Value::Array(tokens) = md.get("tokenizer.ggml.tokens")? else {
+        bail!("tokenizer.ggml.tokens is not an array");
+    };
+    FLINT_STOP_TEXTS
+        .iter()
+        .map(|text| {
+            tokens
+                .iter()
+                .position(|t| t.to_string().is_ok_and(|s| s == text))
+                .map(|id| id as u32)
+                .with_context(|| format!("this Flint file's vocabulary has no {text} token"))
+        })
+        .collect()
 }
 
 /// Tolerant typed accessors over GGUF metadata.
@@ -1031,6 +1237,26 @@ impl Meta<'_> {
                 .with_context(|| format!("GGUF key {key} has non-integer entries")),
             _ => bail!("GGUF key {key} is not an array"),
         }
+    }
+
+    /// A per-layer boolean array of exactly `n_layer` entries (integers are
+    /// read as nonzero-is-true, as llama.cpp's `get_arr` does).
+    fn bool_array(&self, key: &str, n_layer: usize) -> Result<Vec<bool>> {
+        let Value::Array(vals) = self.get(key)? else {
+            bail!("GGUF key {key} is not an array");
+        };
+        ensure!(
+            vals.len() == n_layer,
+            "GGUF key {key} has {} entries, expected {n_layer}",
+            vals.len()
+        );
+        vals.iter()
+            .map(|v| {
+                v.to_bool()
+                    .or_else(|_| value_as_usize(v).map(|n| n != 0))
+                    .with_context(|| format!("GGUF key {key} has a non-boolean entry"))
+            })
+            .collect()
     }
 
     /// A per-layer array key, expanding a scalar to a uniform vec.
@@ -1241,6 +1467,7 @@ mod tests {
             },
             eog_tokens: vec![248046, 248044],
             qwen4exp: None,
+            flint: None,
         };
         assert_eq!(cfg.conv_dim(), (2 * 16 + 32) * 128);
         assert_eq!(cfg.conv_dim(), 8192);
@@ -1278,6 +1505,7 @@ mod tests {
             },
             eog_tokens: vec![248046, 248044],
             qwen4exp: None,
+            flint: None,
         }
     }
 

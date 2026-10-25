@@ -169,18 +169,22 @@ impl Vocabularies {
     /// after it, forever.
     ///
     /// Every OTHER family is best-effort, and warming them is what keeps the
-    /// ~150 ms build off the request path entirely. A family whose tokenizer is
-    /// not on this machine simply has none to build, which is not a reason to
-    /// refuse to start: nothing on that family is selectable either
-    /// (`checkpoint_selectable` wants the weights cached too), so the operator
-    /// has lost nothing they had.
+    /// ~150 ms build off the request path entirely. Only a family some
+    /// checkpoint of which is selectable right now is warmed
+    /// (`checkpoint_selectable`): a family with no cached and no fetchable
+    /// checkpoint has no request to serve, so a server never asked for it does
+    /// not pay for it. One that becomes selectable later (a `xwen fetch` while
+    /// the server runs) builds on its first request, through [`Self::for_family`].
     pub fn warm(&self, served: Target) -> Result<()> {
         let family = served.model.vocab_family();
         self.for_family(family).with_context(|| {
             format!("loading the vocabulary {} speaks", served.model.full_name())
         })?;
-        for other in [VocabFamily::Qwen36, VocabFamily::Qwen3] {
-            if other != family {
+        for other in [VocabFamily::Qwen36, VocabFamily::Qwen3, VocabFamily::Flint] {
+            let reachable = hub::MODELS
+                .into_iter()
+                .any(|model| model.vocab_family() == other && super::checkpoint_selectable(model));
+            if other != family && reachable {
                 let _ = self.for_family(other);
             }
         }
@@ -210,14 +214,19 @@ impl Vocabularies {
     }
 
     fn build(&self, family: VocabFamily) -> Result<Vocabulary> {
-        // The embedded copy IS the Qwen 3.6 family's vocabulary — the same
-        // bytes its GGUFs carry — so that family needs no file, no search and
-        // no second 12 MB parse. Every other family is read from disk, and a
-        // family with nothing to read from is an error rather than a silent
-        // fall back to the embedded one, which is the single worst outcome
-        // available here: it would run and return nonsense.
-        if family == VocabFamily::Qwen36 {
-            let tokenizer = LagunaTokenizer::embedded()?;
+        // The two embedded copies ARE their families' vocabularies — Qwen
+        // 3.6's the same bytes its GGUFs carry, Flint's the file its GGUF was
+        // converted from — so those families need no file and no search.
+        // Every other family is read from disk, and a family with nothing to
+        // read from is an error rather than a silent fall back to an embedded
+        // one, which is the single worst outcome available here: it would run
+        // and return nonsense.
+        let embedded = match family {
+            VocabFamily::Qwen36 => Some(LagunaTokenizer::embedded()?),
+            VocabFamily::Flint => Some(LagunaTokenizer::embedded_flint()?),
+            VocabFamily::Qwen3 => None,
+        };
+        if let Some(tokenizer) = embedded {
             let grammars = crate::constrain::for_tokenizer(&tokenizer, family.logit_width())?;
             return Ok(Vocabulary {
                 family,
@@ -245,8 +254,8 @@ impl Vocabularies {
 
     /// Where this family's `tokenizer.json` is, or `None` when this machine
     /// holds no copy of it. Only asked for a family that has a file at all —
-    /// [`Vocabularies::build`] answers Qwen 3.6 from the embedded bytes before
-    /// it gets here.
+    /// [`Vocabularies::build`] answers Qwen 3.6 and Flint from the embedded
+    /// bytes before it gets here.
     ///
     /// Two places, in order. The SERVED file's own, when the server was
     /// started on a checkpoint of this family — that file is the one running,
@@ -275,7 +284,7 @@ impl std::fmt::Debug for Vocabularies {
             .field("served", &self.served)
             .field(
                 "built",
-                &[VocabFamily::Qwen36, VocabFamily::Qwen3]
+                &[VocabFamily::Qwen36, VocabFamily::Qwen3, VocabFamily::Flint]
                     .into_iter()
                     .filter(|family| self.is_built(*family))
                     .collect::<Vec<VocabFamily>>(),
@@ -427,8 +436,8 @@ mod tests {
         for (text, id) in SYNTHETIC_MARKERS {
             let resolved = match text {
                 "<|endoftext|>" => specials.endoftext,
-                "<|im_start|>" => specials.im_start,
-                "<|im_end|>" => specials.im_end,
+                "<|im_start|>" => specials.im_start.unwrap(),
+                "<|im_end|>" => specials.im_end.unwrap(),
                 "<think>" => specials.think_open,
                 "</think>" => specials.think_close,
                 "<tool_call>" => specials.tool_call_open,
@@ -588,6 +597,39 @@ mod tests {
             mask_width(&qwen3) < VocabFamily::Qwen36.logit_width(),
             "the Qwen3 mask must not be wide enough to be the other family's"
         );
+    }
+
+    /// Flint's vocabulary is embedded, so its ids, stops and mask width are
+    /// checked on every machine, against both Qwen families.
+    #[test]
+    fn the_flint_family_gets_its_own_ids_stops_and_mask_width() {
+        let vocabs = Vocabularies::hub_only();
+        let flint = vocabs.for_family(VocabFamily::Flint).unwrap();
+        let qwen36 = vocabs.for_family(VocabFamily::Qwen36).unwrap();
+        assert!(
+            flint.source().is_none(),
+            "Flint's vocabulary is the embedded one"
+        );
+
+        let text = "The quick brown fox jumps over the lazy dog.";
+        let a = flint.tokenizer().encode(text).unwrap();
+        let b = qwen36.tokenizer().encode(text).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(flint.tokenizer().decode(&a).unwrap(), text);
+
+        let specials = flint.tokenizer().specials();
+        assert_eq!(specials.eog(), [150_001, 150_003, 150_005, 150_018]);
+        assert_eq!(specials.im_start, None);
+        assert_eq!(specials.think_close, 150_007);
+
+        let width = mask_width(&flint);
+        assert!(width >= VocabFamily::Flint.logit_width());
+        assert!(width < VocabFamily::Flint.logit_width() + 64);
+        // Built once, like every family.
+        assert!(Arc::ptr_eq(
+            &flint,
+            &vocabs.for_family(VocabFamily::Flint).unwrap()
+        ));
     }
 
     /// The width of the allow-mask this vocabulary's grammars produce, measured

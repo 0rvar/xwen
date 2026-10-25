@@ -463,4 +463,34 @@ mod tests {
             }
         }
     }
+
+    /// The activation operand is consumed at f32, not staged to half: a column
+    /// of values far past the f16 range (65504) comes out finite and inside the
+    /// kernel's ordinary precision class. Flint's dense lead layers and its
+    /// shared expert prefill on this gemm with down-projection inputs measured
+    /// near 7e3, and its routed experts' reach 3e5, so the margin here is the
+    /// largest of those and then some.
+    #[test]
+    fn activations_past_the_f16_range_stay_finite() {
+        let device = metal_device().unwrap();
+        let (n_out, k, seq) = (256usize, 1024usize, 64usize);
+        for dt in [GgmlDType::Q8_0, GgmlDType::Q4K] {
+            let (plane, qt) = build_plane(&device, dt, n_out, k, 7);
+            let mut xs = pseudo_random(seq * k, 9, -1.0, 1.0);
+            for v in xs.iter_mut().step_by(97) {
+                *v *= 1.0e6;
+            }
+            let x = Tensor::from_vec(xs, (seq, k), &Device::Cpu)
+                .unwrap()
+                .to_device(&device)
+                .unwrap();
+            let got = flat(&matmul_dense_q(&plane, &x).unwrap());
+            assert!(
+                got.iter().all(|v| v.is_finite()),
+                "{dt:?}: a non-finite output"
+            );
+            let err = rel_l2(&got, &classic(&qt, &x));
+            assert!(err < 1e-3, "{dt:?}: rel_l2 {err:.3e} against QMatMul");
+        }
+    }
 }

@@ -7712,6 +7712,7 @@ mod tests {
             },
             eog_tokens: vec![248046, 248044],
             qwen4exp: None,
+            flint: None,
         }
     }
 

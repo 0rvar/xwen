@@ -163,7 +163,7 @@ const relErr = (a: number, b: number) => Math.abs(a - b) / (Math.abs(b) + 1e-6);
  * cbs the norm's MUL). Mapping them would compare two different tensors. The
  * post-norm value is compared as `result_norm` instead.
  */
-const ARCHES = ["qwen35", "qwen3"] as const;
+const ARCHES = ["qwen35", "qwen3", "flint"] as const;
 type Arch = (typeof ARCHES)[number];
 
 // Per-arch translation from OUR tap name to the llama.cpp graph node name(s) it
@@ -197,6 +197,11 @@ const TAP_TABLES: Record<Arch, (base: string, il: string) => string[]> = {
   // nothing to be compared to. `kqv_out` is the pair for the pre-o_proj tap of
   // the same name.
   qwen3: (base, il) => (base === "attn_o_proj" ? [] : [`${base}-${il}`]),
+  // Flint, against llama.cpp's src/models/flint.cpp (a37cc4610): it cbs
+  // attn_norm, ffn_inp, ffn_norm, ffn_out (dense and MoE layers alike) and
+  // l_out under our names, and its attention goes through the same build_attn
+  // as qwen3, so it is the same table for the same reason.
+  flint: (base, il) => (base === "attn_o_proj" ? [] : [`${base}-${il}`]),
 };
 
 function refTapNames(arch: Arch, ourName: string): string[] {

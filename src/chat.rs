@@ -28,6 +28,11 @@
 //! `reasoning_effort`, renders conversations the 3.6 one refuses, and writes
 //! tool calls as JSON — a format this renderer does not produce, so tools on
 //! those dialects are [`ChatError::ToolsUnsupported`]. See [`ChatDialect`].
+//!
+//! Flint's template (reference/flint/chat_template.jinja) is not ChatML at all:
+//! GLM-style role markers open each turn and nothing closes one. It has its own
+//! builder, [`build_flint_parts`], behind the same entry points and the same
+//! client-content bookkeeping; see [`ChatDialect::Flint`].
 use std::fmt;
 use std::ops::Range;
 
@@ -186,6 +191,11 @@ pub struct ToolCall {
 #[derive(Debug, Clone)]
 pub enum Message {
     System(String),
+    /// A `developer` turn. Flint's template renders it under its own role
+    /// marker, `<|developer|>`; every Qwen template has no such role and renders
+    /// it exactly as a system turn, which is what the serve normalizers hand
+    /// those dialects instead (`ChatDialect::has_developer_role`).
+    Developer(String),
     User(String),
     Assistant {
         content: String,
@@ -240,6 +250,33 @@ pub enum ChatDialect {
     /// assistant turn renders its content verbatim with no `<think>` block and
     /// no inline parsing, and `enable_thinking` has nothing to act on.
     Qwen3Instruct,
+    /// reference/flint/chat_template.jinja — Flint. A lineage of its own and
+    /// not ChatML at all: GLM-style role markers (`<|system|>`, `<|user|>`,
+    /// `<|assistant|>`, `<|observation|>`) open each turn and nothing closes
+    /// one, the next marker being the boundary. Rendered by its own builder
+    /// ([`build_flint_parts`]), which shares nothing with the ChatML one but
+    /// the client-content bookkeeping. Against the others:
+    ///
+    /// - the generation prompt is `<|assistant|>` alone and the model opens
+    ///   its own `<think>` ([`ChatDialect::model_opens_thinking`]). Thinking
+    ///   cannot be turned off: the template has no `enable_thinking` switch and
+    ///   the reference servers (SGLang's Flint parser among them) ignore the
+    ///   flag, so a thinking-off request renders exactly like a thinking-on one
+    ///   rather than as a prompt the model was never trained on. It is a no-op
+    ///   and not an error, which is why [`ChatDialect::supports_thinking`]
+    ///   stays true here.
+    /// - every assistant turn replays its reasoning, superseded or not, so
+    ///   `preserve_thinking` is inert. No body is stripped and no inline
+    ///   `<think>` is split out of content.
+    /// - system, user and tool-result text is sanitized before it is written:
+    ///   NUL and the think markers are removed and every role marker is
+    ///   HTML-escaped. Assistant content, reasoning and call arguments are not.
+    /// - the tools preamble is a `<|system|>` block of its own, placed after
+    ///   the leading run of system messages, and calls are written as
+    ///   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`.
+    /// - nothing is refused: a later system message, a conversation with no
+    ///   query and one opened by a tool result all render.
+    Flint,
 }
 
 /// Which family of templates a dialect belongs to. Most of what separates the
@@ -254,6 +291,8 @@ enum Lineage {
     Qwen36,
     /// reference/chat_template-qwen3.jinja and its Instruct-2507 revision.
     Qwen3,
+    /// reference/flint/chat_template.jinja.
+    Flint,
 }
 
 impl ChatDialect {
@@ -261,6 +300,7 @@ impl ChatDialect {
         match self {
             Self::Qwen36 | Self::Qwen38 => Lineage::Qwen36,
             Self::Qwen3 | Self::Qwen3Instruct => Lineage::Qwen3,
+            Self::Flint => Lineage::Flint,
         }
     }
 
@@ -293,7 +333,7 @@ impl ChatDialect {
     /// thing that decides, which is what [`ThinkingEntry::ModelOpens`] carries
     /// into the decode loop.
     pub fn model_opens_thinking(self) -> bool {
-        matches!(self, Self::Qwen3)
+        matches!(self, Self::Qwen3 | Self::Flint)
     }
 
     /// Whether the template takes a `reasoning_effort` parameter. Only 3.8's
@@ -309,8 +349,29 @@ impl ChatDialect {
     /// prose; neither is implemented, and the serve-side parser reads the 3.6
     /// `<function=…>` form only, so a half-rendered tool round trip would come
     /// back unparseable.
+    ///
+    /// Flint's format is rendered. Parsing a reply written in it is a separate
+    /// question this module does not answer.
     pub fn supports_tools(self) -> bool {
-        self.lineage() == Lineage::Qwen36
+        matches!(self.lineage(), Lineage::Qwen36 | Lineage::Flint)
+    }
+
+    /// Whether the template has a `developer` role of its own. Flint's does
+    /// (`<|developer|>`, which is also one of its stop tokens); on every other
+    /// dialect a developer message is a system message.
+    pub fn has_developer_role(self) -> bool {
+        self.lineage() == Lineage::Flint
+    }
+
+    /// Whether the template renders every message as its own turn, in order,
+    /// a system message included wherever it sits. Flint's does: it loops over
+    /// the messages and writes one role marker each, with no merging and no
+    /// system-first rule. The serve normalizers therefore leave such a
+    /// conversation as the client sent it, where for the Qwen templates they
+    /// merge consecutive same-role turns and demote a late system message to a
+    /// user turn.
+    pub fn renders_turns_in_place(self) -> bool {
+        self.lineage() == Lineage::Flint
     }
 
     /// The vendored template this dialect renders, for the tests that check the
@@ -324,6 +385,7 @@ impl ChatDialect {
             Self::Qwen3Instruct => {
                 include_str!("../reference/chat_template-qwen3-instruct-2507.jinja")
             }
+            Self::Flint => include_str!("../reference/flint/chat_template.jinja"),
         }
     }
 }
@@ -818,6 +880,24 @@ pub fn build_prompt_parts_with_spans_continued(
     if messages.is_empty() {
         return Err(ChatError::NoMessages.into());
     }
+    if opts.dialect == ChatDialect::Flint {
+        return build_flint_parts(messages, opts, continuation);
+    }
+    // No Qwen template has a developer role: a developer turn is a system turn
+    // here, so everything below reads one shape.
+    let as_system: Vec<Message>;
+    let messages = if messages.iter().any(|m| matches!(m, Message::Developer(_))) {
+        as_system = messages
+            .iter()
+            .map(|m| match m {
+                Message::Developer(text) => Message::System(text.clone()),
+                other => other.clone(),
+            })
+            .collect();
+        &as_system[..]
+    } else {
+        messages
+    };
     // The refusals are ordered as the template orders them, so a conversation
     // that is wrong in more than one way is refused for the same reason the
     // reference renderer would give: the missing query is found while scanning
@@ -954,8 +1034,8 @@ pub fn build_prompt_parts_with_spans_continued(
             // over it. A later one is refused before rendering starts under the
             // 3.6 family and renders as an ordinary turn under the Qwen3 one
             // (its jinja line 29, which admits `system` past `loop.first`).
-            Message::System(_) if index == 0 => {}
-            Message::System(text) => {
+            Message::System(_) | Message::Developer(_) if index == 0 => {}
+            Message::System(text) | Message::Developer(text) => {
                 out.push_str("<|im_start|>system\n");
                 content(&mut out, &mut ranges, body_of(text, dialect));
                 out.push_str("<|im_end|>\n");
@@ -1009,6 +1089,7 @@ pub fn build_prompt_parts_with_spans_continued(
                         Lineage::Qwen3 => {
                             current && (index + 1 == messages.len() || !reasoning.is_empty())
                         }
+                        Lineage::Flint => unreachable!("rendered by build_flint_parts"),
                     };
                 let mut body = body;
                 if writes_block {
@@ -1016,6 +1097,7 @@ pub fn build_prompt_parts_with_spans_continued(
                     let reasoning = match dialect.lineage() {
                         Lineage::Qwen36 => trim(reasoning),
                         Lineage::Qwen3 => reasoning.trim_matches('\n'),
+                        Lineage::Flint => unreachable!("rendered by build_flint_parts"),
                     };
                     content(&mut out, &mut ranges, reasoning);
                     out.push_str("\n</think>\n\n");
@@ -1137,6 +1219,8 @@ pub fn build_prompt_parts_with_spans_continued(
         ChatDialect::Qwen36 | ChatDialect::Qwen38 => true,
         ChatDialect::Qwen3 => closes_thinking || !injected.is_empty(),
         ChatDialect::Qwen3Instruct => false,
+        // Rendered by `build_flint_parts`, which returned above.
+        ChatDialect::Flint => false,
     };
     let mut gen_header = String::from("<|im_start|>assistant\n");
     let mut header_ranges: Vec<Range<usize>> = Vec::new();
@@ -1176,6 +1260,198 @@ pub fn build_prompt_parts_with_spans_continued(
             ThinkingEntry::ModelOpens
         } else {
             ThinkingEntry::Answer
+        },
+        system_end,
+    })
+}
+
+/// The call-format prose of Flint's tools preamble, verbatim from
+/// reference/flint/chat_template.jinja, from `</tools>` through the newline
+/// that ends the block. Template text: the example call's markers encode to
+/// their control ids, as the model was trained on them.
+///
+/// The schemas sit directly between `<tools>` and `</tools>`, with no newline
+/// on either side of any of them, although the template source puts each on a
+/// line of its own: it is rendered with `trim_blocks` (HF's
+/// `apply_chat_template` sets it, llama.cpp's engine follows), which eats the
+/// newline after `{%- set fn … %}` and the one after `{%- endfor %}`.
+const FLINT_TOOLS_FORMAT: &str = "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n";
+
+/// The opening of Flint's tools preamble, up to and including `<tools>`.
+const FLINT_TOOLS_HEADER: &str = "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+
+/// Flint's `flint_text` macro: what system, user and tool-result text is put
+/// through before the template writes it. NUL and both think markers are
+/// removed, then every role marker is HTML-escaped, one `replace` at a time in
+/// the template's order — so a marker the removals assemble (`<thi<think>nk>`)
+/// survives, exactly as it does there.
+fn flint_text(text: &str) -> String {
+    let mut text = text
+        .replace('\0', "")
+        .replace("<think>", "")
+        .replace("</think>", "");
+    for marker in [
+        "begin_of_text",
+        "end_of_text",
+        "system",
+        "developer",
+        "user",
+        "assistant",
+        "observation",
+    ] {
+        text = text.replace(&format!("<|{marker}|>"), &format!("&lt;|{marker}|&gt;"));
+    }
+    text
+}
+
+/// [`build_prompt_parts_with_spans_continued`] under [`ChatDialect::Flint`].
+///
+/// The template refuses nothing, so neither does this: every message renders
+/// in order under its own role marker. The tools preamble, when there are
+/// tools, goes in front of the first message that is not a system message, or
+/// at the end when there is none. `system_end` is the offset past the leading
+/// system messages and that preamble, a token boundary because a role marker
+/// always follows it.
+///
+/// The generation header is `<|assistant|>`, and the reply decides whether it
+/// opens a reasoning block ([`ThinkingEntry::ModelOpens`]). `enable_thinking`
+/// is not read (see [`ChatDialect::Flint`]). A continuation's reasoning and an
+/// explicitly closed span are written into the header as `<think>…</think>`
+/// with no newlines, the form the template gives a replayed turn's reasoning,
+/// and a response prefix with neither starts the reply in its answer.
+fn build_flint_parts(
+    messages: &[Message],
+    opts: &ChatOptions,
+    continuation: Option<&Continuation>,
+) -> Result<PromptParts> {
+    fn content(out: &mut String, ranges: &mut Vec<Range<usize>>, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let start = out.len();
+        out.push_str(text);
+        ranges.push(start..out.len());
+    }
+    fn preamble(
+        out: &mut String,
+        ranges: &mut Vec<Range<usize>>,
+        tools: &[serde_json::Value],
+    ) -> Result<()> {
+        if tools.is_empty() {
+            return Ok(());
+        }
+        out.push_str(FLINT_TOOLS_HEADER);
+        for tool in tools {
+            // `tool.function if tool.function is defined else tool`.
+            let function = tool.get("function").unwrap_or(tool);
+            content(out, ranges, &tojson_text(function)?);
+        }
+        out.push_str(FLINT_TOOLS_FORMAT);
+        Ok(())
+    }
+
+    let mut out = String::new();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut system_end = None;
+    let mut tools_pending = true;
+    for message in messages {
+        if tools_pending && !matches!(message, Message::System(_)) {
+            preamble(&mut out, &mut ranges, &opts.tools)?;
+            tools_pending = false;
+            system_end = (!out.is_empty()).then_some(out.len());
+        }
+        match message {
+            Message::System(text) => {
+                out.push_str("<|system|>");
+                content(&mut out, &mut ranges, &flint_text(text));
+            }
+            Message::Developer(text) => {
+                out.push_str("<|developer|>");
+                content(&mut out, &mut ranges, &flint_text(text));
+            }
+            Message::User(text) => {
+                out.push_str("<|user|>");
+                content(&mut out, &mut ranges, &flint_text(text));
+            }
+            Message::Assistant {
+                content: text,
+                reasoning,
+                tool_calls,
+            } => {
+                out.push_str("<|assistant|>");
+                if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.is_empty()) {
+                    out.push_str("<think>");
+                    content(&mut out, &mut ranges, reasoning);
+                    out.push_str("</think>");
+                }
+                content(&mut out, &mut ranges, text);
+                for call in tool_calls {
+                    out.push_str("<tool_call>");
+                    content(&mut out, &mut ranges, &call.name);
+                    for (key, value) in &call.arguments {
+                        out.push_str("<arg_key>");
+                        content(&mut out, &mut ranges, key);
+                        out.push_str("</arg_key><arg_value>");
+                        match value {
+                            serde_json::Value::String(text) => content(&mut out, &mut ranges, text),
+                            other => content(&mut out, &mut ranges, &tojson_text(other)?),
+                        }
+                        out.push_str("</arg_value>");
+                    }
+                    out.push_str("</tool_call>");
+                }
+            }
+            Message::ToolResponse(text) => {
+                out.push_str("<|observation|><tool_response>");
+                content(&mut out, &mut ranges, &flint_text(text));
+                out.push_str("</tool_response>");
+            }
+        }
+    }
+    if tools_pending {
+        preamble(&mut out, &mut ranges, &opts.tools)?;
+        system_end = (!out.is_empty()).then_some(out.len());
+    }
+
+    let injected = continuation
+        .and_then(|c| c.thinking.as_deref())
+        .unwrap_or("");
+    let prefix = continuation.and_then(|c| c.prefix.as_deref()).unwrap_or("");
+    let closes_thinking = continuation.is_some_and(|c| c.close_thinking);
+    if !prefix.is_empty() && !injected.is_empty() && !closes_thinking {
+        return Err(ChatError::UnrenderableContinuation {
+            reason: "a response prefix was injected while the thinking span is open; set close_thinking",
+        }
+        .into());
+    }
+
+    let mut header = String::from("<|assistant|>");
+    let mut header_ranges: Vec<Range<usize>> = Vec::new();
+    let opens_think_block = closes_thinking || !injected.is_empty();
+    if opens_think_block {
+        header.push_str("<think>");
+        content(&mut header, &mut header_ranges, injected);
+        if closes_thinking {
+            header.push_str("</think>");
+        }
+    }
+    let header_prefix_start = (!prefix.is_empty()).then(|| {
+        let start = header.len();
+        content(&mut header, &mut header_ranges, prefix);
+        start
+    });
+
+    Ok(PromptParts {
+        context: out,
+        header,
+        content_ranges: ranges,
+        header_content_ranges: header_ranges,
+        header_prefix_start,
+        thinking_entry: match (opens_think_block, closes_thinking) {
+            (true, true) => ThinkingEntry::Answer,
+            (true, false) => ThinkingEntry::Seeded,
+            (false, _) if !prefix.is_empty() => ThinkingEntry::Answer,
+            (false, _) => ThinkingEntry::ModelOpens,
         },
         system_end,
     })
@@ -3098,5 +3374,293 @@ mod tests {
             format!("{}{}", parts.context, parts.header),
             format!("{head}The answer is")
         );
+    }
+}
+
+#[cfg(test)]
+mod flint_tests {
+    /// No Qwen template has a developer role, so a developer turn renders
+    /// byte-identically to a system turn on every Qwen dialect, leading or not.
+    #[test]
+    fn a_developer_turn_is_a_system_turn_on_the_qwen_dialects() {
+        for dialect in [
+            ChatDialect::Qwen36,
+            ChatDialect::Qwen38,
+            ChatDialect::Qwen3,
+            ChatDialect::Qwen3Instruct,
+        ] {
+            let opts = ChatOptions::for_dialect(dialect);
+            let as_dev = [
+                Message::Developer("Be brief.".into()),
+                Message::User("Hi".into()),
+            ];
+            let as_sys = [
+                Message::System("Be brief.".into()),
+                Message::User("Hi".into()),
+            ];
+            assert_eq!(
+                build_prompt(&as_dev, &opts).unwrap(),
+                build_prompt(&as_sys, &opts).unwrap(),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    use super::*;
+    use crate::tokenizer::LagunaTokenizer;
+    use serde_json::{Value, json};
+
+    fn flint(on: bool) -> ChatOptions {
+        ChatOptions {
+            enable_thinking: on,
+            ..ChatOptions::for_dialect(ChatDialect::Flint)
+        }
+    }
+
+    /// One fixture message in the OpenAI shape the fixture file uses, as the
+    /// renderer's own [`Message`]. Call arguments arrive as an object.
+    fn message(m: &Value) -> Message {
+        let text = |key: &str| m[key].as_str().unwrap_or("").to_string();
+        match m["role"].as_str().unwrap() {
+            "system" => Message::System(text("content")),
+            "developer" => Message::Developer(text("content")),
+            "user" => Message::User(text("content")),
+            "tool" => Message::ToolResponse(text("content")),
+            "assistant" => Message::Assistant {
+                content: text("content"),
+                reasoning: m["reasoning_content"].as_str().map(str::to_string),
+                tool_calls: m["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|call| ToolCall {
+                        name: call["function"]["name"].as_str().unwrap().to_string(),
+                        arguments: call["function"]["arguments"]
+                            .as_object()
+                            .unwrap()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    })
+                    .collect(),
+            },
+            other => panic!("fixture role {other}"),
+        }
+    }
+
+    fn fixtures() -> Vec<Value> {
+        let file: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/flint-chat.json")).unwrap();
+        file["cases"].as_array().unwrap().clone()
+    }
+
+    fn render(case: &Value, thinking: bool) -> PromptParts {
+        let messages: Vec<Message> = case["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(message)
+            .collect();
+        let opts = ChatOptions {
+            tools: case["tools"].as_array().cloned().unwrap_or_default(),
+            ..flint(thinking)
+        };
+        build_prompt_parts_with_spans(&messages, &opts).unwrap()
+    }
+
+    /// Every fixture renders to its expected bytes. The same file is checked
+    /// against llama-server's renderer of the vendored template by
+    /// `scripts/verify_chat_template_flint.ts`, which is what makes these
+    /// literals the template's output and not this renderer's opinion of it.
+    /// A thinking-off request renders the same bytes ([`ChatDialect::Flint`]).
+    #[test]
+    fn the_flint_fixtures_render_byte_exact() {
+        for (case, thinking) in fixtures()
+            .into_iter()
+            .flat_map(|case| [(case.clone(), true), (case, false)])
+        {
+            let parts = render(&case, thinking);
+            assert_eq!(
+                format!("{}{}", parts.context, parts.header),
+                case["expected"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+            assert_eq!(parts.header, "<|assistant|>", "{}", case["name"]);
+            assert_eq!(
+                parts.thinking_entry,
+                ThinkingEntry::ModelOpens,
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
+    /// The fixed prose is the vendored template's, line for line.
+    #[test]
+    fn the_flint_tools_prose_is_the_templates() {
+        let source = ChatDialect::Flint.template_source();
+        for line in FLINT_TOOLS_HEADER
+            .lines()
+            .chain(FLINT_TOOLS_FORMAT.lines())
+            .filter(|line| !line.is_empty() && *line != "<|system|>")
+        {
+            assert!(source.contains(line), "{line:?}");
+        }
+        assert!(source.contains("{%- if tools %}<|system|>\n# Tools\n"));
+    }
+
+    /// Client text only: the escapes keep a client from writing a role marker,
+    /// and the removals keep it from opening or closing a reasoning block.
+    #[test]
+    fn flint_text_applies_the_templates_replacements_in_order() {
+        assert_eq!(flint_text("a\0b"), "ab");
+        assert_eq!(flint_text("<think>x</think>"), "x");
+        assert_eq!(flint_text("<thi<think>nk>"), "<think>");
+        assert_eq!(
+            flint_text("<|user|><|assistant|>"),
+            "&lt;|user|&gt;&lt;|assistant|&gt;"
+        );
+        assert_eq!(flint_text("<tool_call>"), "<tool_call>");
+    }
+
+    /// The reply always opens its own block: a thinking-off request renders the
+    /// same prompt, as the template and the reference servers do. A
+    /// continuation writes into the header like the ChatML ones.
+    #[test]
+    fn the_flint_header_ignores_thinking_off_and_follows_the_continuation() {
+        let messages = [Message::User("Hi".into())];
+        for on in [true, false] {
+            let parts = build_prompt_parts_with_spans(&messages, &flint(on)).unwrap();
+            assert_eq!(parts.header, "<|assistant|>", "thinking {on}");
+            assert_eq!(
+                parts.thinking_entry,
+                ThinkingEntry::ModelOpens,
+                "thinking {on}"
+            );
+        }
+        assert!(ChatDialect::Flint.supports_thinking());
+        assert!(ChatOptions::for_dialect(ChatDialect::Flint).enable_thinking);
+
+        let seeded = build_prompt_parts_with_spans_continued(
+            &messages,
+            &flint(false),
+            Some(&Continuation {
+                thinking: Some("so far".into()),
+                ..Continuation::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(seeded.header, "<|assistant|><think>so far");
+        assert_eq!(seeded.thinking_entry, ThinkingEntry::Seeded);
+
+        let prefixed = build_prompt_parts_with_spans_continued(
+            &messages,
+            &flint(true),
+            Some(&Continuation {
+                thinking: Some("done".into()),
+                close_thinking: true,
+                prefix: Some("The answer".into()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            prefixed.header,
+            "<|assistant|><think>done</think>The answer"
+        );
+        assert_eq!(prefixed.thinking_entry, ThinkingEntry::Answer);
+        assert_eq!(
+            &prefixed.header[prefixed.header_prefix_start.unwrap()..],
+            "The answer"
+        );
+
+        // A prefix alone starts the reply in its answer, with no block.
+        let answered = build_prompt_parts_with_spans_continued(
+            &messages,
+            &flint(true),
+            Some(&Continuation {
+                prefix: Some("Sure".into()),
+                ..Continuation::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(answered.header, "<|assistant|>Sure");
+        assert_eq!(answered.thinking_entry, ThinkingEntry::Answer);
+
+        // A prefix inside a block that is still open would be read as reasoning.
+        let open = build_prompt_parts_with_spans_continued(
+            &messages,
+            &flint(true),
+            Some(&Continuation {
+                thinking: Some("hmm".into()),
+                prefix: Some("x".into()),
+                ..Continuation::default()
+            }),
+        );
+        assert!(open.is_err());
+    }
+
+    /// The template refuses nothing the ChatML lineages refuse.
+    #[test]
+    fn flint_renders_what_chatml_refuses() {
+        for messages in [
+            vec![Message::ToolResponse("r".into())],
+            vec![Message::Assistant {
+                content: "a".into(),
+                reasoning: None,
+                tool_calls: vec![],
+            }],
+            vec![Message::User("<tool_response>x</tool_response>".into())],
+        ] {
+            build_prompt(&messages, &flint(true)).unwrap();
+        }
+        assert!(ChatDialect::Flint.supports_tools());
+        assert!(ChatDialect::Flint.model_opens_thinking());
+        assert!(!ChatDialect::Flint.supports_reasoning_effort());
+    }
+
+    /// `system_end` falls past the leading system messages and the tools
+    /// preamble, and both it and the context/header seam are token boundaries:
+    /// a role marker follows each.
+    #[test]
+    fn the_flint_seams_are_token_boundaries() {
+        let tokenizer = LagunaTokenizer::embedded_flint().unwrap();
+        let tool = json!({"type": "function", "function": {"name": "f", "parameters": {}}});
+        let messages = [
+            Message::System("Be brief.".into()),
+            Message::User("Hi there".into()),
+            Message::Assistant {
+                content: "Hello".into(),
+                reasoning: Some("greet".into()),
+                tool_calls: vec![],
+            },
+            Message::User("Again".into()),
+        ];
+        let opts = ChatOptions {
+            tools: vec![tool],
+            ..flint(true)
+        };
+        let parts = build_prompt_parts_with_spans(&messages, &opts).unwrap();
+        let system_end = parts.system_end.unwrap();
+        assert!(parts.context[system_end..].starts_with("<|user|>"));
+        assert!(parts.context[..system_end].ends_with("</tool_call>\n"));
+
+        let whole = tokenizer
+            .encode_prompt(
+                &format!("{}{}", parts.context, parts.header),
+                &parts.content_ranges,
+            )
+            .unwrap();
+        let context = tokenizer
+            .encode_prompt(&parts.context, &parts.content_ranges)
+            .unwrap();
+        let head = tokenizer.encode(&parts.context[..system_end]).unwrap();
+        assert!(whole.starts_with(&context));
+        assert!(context.starts_with(&head));
+        assert_eq!(whole[context.len()..], [150_004]);
+
+        // Without tools or a system message there is no system block.
+        let bare = build_prompt_parts_with_spans(&messages[1..], &flint(true)).unwrap();
+        assert_eq!(bare.system_end, None);
     }
 }

@@ -614,6 +614,7 @@ mod tests {
             },
             eog_tokens: vec![0],
             qwen4exp: None,
+            flint: None,
         }
     }
 

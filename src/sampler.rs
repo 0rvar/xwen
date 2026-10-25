@@ -138,6 +138,14 @@ impl SamplerOptions {
                 top_p: 0.80,
                 ..Self::recommended(thinking)
             },
+            // Flint's `generation_config.json` (and the GGUF's
+            // `general.sampling.*`): 1.0 / 0.95 / 20, with no thinking switch
+            // to key a second set on.
+            Model::Flint => Self {
+                temperature: 1.0,
+                top_p: 0.95,
+                ..Self::recommended(thinking)
+            },
         };
         Self {
             presence_penalty: model.recommended_presence_penalty(thinking),

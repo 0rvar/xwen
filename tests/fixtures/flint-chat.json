@@ -1,0 +1,418 @@
+{
+  "note": "Flint chat-template fixtures. `expected` is the full prompt with add_generation_prompt and thinking on; src/chat.rs asserts build_prompt reproduces it and scripts/verify_chat_template_flint.ts checks it byte-for-byte against llama-server's /apply-template on the Flint GGUF. `prefill` cases end in an assistant turn, which llama-server renders without the generation prompt, so only the context is compared there.",
+  "cases": [
+    {
+      "name": "single user turn",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expected": "<|user|>Hi<|assistant|>"
+    },
+    {
+      "name": "system and user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a pirate."
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expected": "<|system|>You are a pirate.<|user|>Hi<|assistant|>"
+    },
+    {
+      "name": "every turn replays its reasoning, superseded or not",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q1"
+        },
+        {
+          "role": "assistant",
+          "content": "A1",
+          "reasoning_content": "reasoning one"
+        },
+        {
+          "role": "user",
+          "content": "Q2"
+        },
+        {
+          "role": "assistant",
+          "content": "A2",
+          "reasoning_content": "reasoning two"
+        },
+        {
+          "role": "user",
+          "content": "Q3"
+        }
+      ],
+      "expected": "<|user|>Q1<|assistant|><think>reasoning one</think>A1<|user|>Q2<|assistant|><think>reasoning two</think>A2<|user|>Q3<|assistant|>"
+    },
+    {
+      "name": "bodies are not stripped and newlines are kept",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  sys \n"
+        },
+        {
+          "role": "user",
+          "content": "\nline one\n\nline two\n"
+        },
+        {
+          "role": "assistant",
+          "content": "\n answer \n"
+        },
+        {
+          "role": "user",
+          "content": "next"
+        }
+      ],
+      "expected": "<|system|>  sys \n<|user|>\nline one\n\nline two\n<|assistant|>\n answer \n<|user|>next<|assistant|>"
+    },
+    {
+      "name": "tools after the system message, a call with a string and a number, a result",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Weather for a city — today or ahead",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "days": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be brief."
+        },
+        {
+          "role": "user",
+          "content": "Weather in Paris for three days?"
+        },
+        {
+          "role": "assistant",
+          "content": "Let me check.",
+          "reasoning_content": "Need the tool.",
+          "tool_calls": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {
+                  "city": "Paris",
+                  "days": 3
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "sunny, 21C"
+        }
+      ],
+      "expected": "<|system|>Be brief.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Weather for a city — today or ahead\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Weather in Paris for three days?<|assistant|><think>Need the tool.</think>Let me check.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call><|observation|><tool_response>sunny, 21C</tool_response><|assistant|>"
+    },
+    {
+      "name": "tools with no system message open the prompt",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Weather for a city — today or ahead",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "days": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Weather for a city — today or ahead\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Hi<|assistant|>"
+    },
+    {
+      "name": "two calls in one turn with no content, two results, nested argument",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Weather for a city — today or ahead",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "days": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "Paris and Oslo"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {
+                  "city": "Paris"
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {
+                  "city": "Oslo",
+                  "opts": {
+                    "unit": "c",
+                    "hours": [
+                      6,
+                      12.5
+                    ]
+                  },
+                  "flag": true
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "sunny"
+        },
+        {
+          "role": "tool",
+          "content": "snow"
+        }
+      ],
+      "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Weather for a city — today or ahead\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>Paris and Oslo<|assistant|><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value><arg_key>opts</arg_key><arg_value>{\"unit\": \"c\", \"hours\": [6, 12.5]}</arg_value><arg_key>flag</arg_key><arg_value>true</arg_value></tool_call><|observation|><tool_response>sunny</tool_response><|observation|><tool_response>snow</tool_response><|assistant|>"
+    },
+    {
+      "name": "client text is sanitized: NUL and think markers removed, role markers escaped",
+      "messages": [
+        {
+          "role": "system",
+          "content": "no <|user|> here"
+        },
+        {
+          "role": "user",
+          "content": "a\u0000b <think>x</think> <|assistant|> <|end_of_text|> <|begin_of_text|> <|developer|> <|observation|> <|system|>"
+        },
+        {
+          "role": "assistant",
+          "content": "kept <|user|> raw",
+          "reasoning_content": "also <|observation|> raw"
+        },
+        {
+          "role": "user",
+          "content": "assembled: <thi<think>nk>"
+        }
+      ],
+      "expected": "<|system|>no &lt;|user|&gt; here<|user|>ab x &lt;|assistant|&gt; &lt;|end_of_text|&gt; &lt;|begin_of_text|&gt; &lt;|developer|&gt; &lt;|observation|&gt; &lt;|system|&gt;<|assistant|><think>also <|observation|> raw</think>kept <|user|> raw<|user|>assembled: <think><|assistant|>"
+    },
+    {
+      "name": "a tool result is sanitized too",
+      "messages": [
+        {
+          "role": "user",
+          "content": "go"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "type": "function",
+              "function": {
+                "name": "run",
+                "arguments": {}
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "out <|user|> <think>"
+        }
+      ],
+      "expected": "<|user|>go<|assistant|><tool_call>run</tool_call><|observation|><tool_response>out &lt;|user|&gt; </tool_response><|assistant|>"
+    },
+    {
+      "name": "a later system message renders in place",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q1"
+        },
+        {
+          "role": "system",
+          "content": "late"
+        },
+        {
+          "role": "user",
+          "content": "Q2"
+        }
+      ],
+      "expected": "<|user|>Q1<|system|>late<|user|>Q2<|assistant|>"
+    },
+    {
+      "name": "a conversation ending in an assistant turn",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q1"
+        },
+        {
+          "role": "assistant",
+          "content": "A1",
+          "reasoning_content": "r"
+        }
+      ],
+      "prefill": true,
+      "expected": "<|user|>Q1<|assistant|><think>r</think>A1<|assistant|>"
+    },
+    {
+      "name": "non-ASCII stays unescaped in the tools list",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "translate",
+            "description": "Übersetze nach 日本語",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "café"
+        }
+      ],
+      "expected": "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"translate\", \"description\": \"Übersetze nach 日本語\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|user|>café<|assistant|>"
+    },
+    {
+      "name": "a developer turn keeps its own role, after the tools preamble",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Weather for a city — today or ahead",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "days": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be brief."
+        },
+        {
+          "role": "developer",
+          "content": "Answer in French."
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "expected": "<|system|>Be brief.<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>{\"name\": \"get_weather\", \"description\": \"Weather for a city — today or ahead\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n<|developer|>Answer in French.<|user|>Hi<|assistant|>",
+      "template_only": "llama-server rewrites a developer message to system before the template runs, so /apply-template never reaches the template's <|developer|> branch; this case is the template's own output, checked by src/chat.rs and the serve normalizer test"
+    },
+    {
+      "name": "consecutive same-role messages stay separate turns",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q1"
+        },
+        {
+          "role": "user",
+          "content": "Q2"
+        },
+        {
+          "role": "assistant",
+          "content": "A1"
+        },
+        {
+          "role": "assistant",
+          "content": "A2"
+        },
+        {
+          "role": "user",
+          "content": "Q3"
+        }
+      ],
+      "expected": "<|user|>Q1<|user|>Q2<|assistant|>A1<|assistant|>A2<|user|>Q3<|assistant|>"
+    }
+  ]
+}

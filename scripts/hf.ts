@@ -46,6 +46,13 @@ export const CHECKPOINTS = {
     ],
     drafter: null,
   },
+  // Flint (`flint`), ggml-org's Q4_K_M conversion. Its own vocabulary and
+  // architecture, no drafter.
+  "flint": {
+    repo: "ggml-org/Flint-GGUF",
+    model: "Flint-Q4_K_M.gguf",
+    drafter: null,
+  },
   // The three SAFETENSORS checkpoints. `model` is `config.json` rather than a
   // weight file, because that is what the Rust registry lists first and what
   // `CheckpointSource` resolves the checkpoint DIRECTORY from — a safetensors
@@ -162,6 +169,7 @@ export const SPELLINGS: Record<string, string> = {
   "qwen-image-2.1-encoder": "qwen-image-2.1-encoder",
   "qwen-image-2.1-text-encoder": "qwen-image-2.1-encoder",
   "qwen-image-2.1": "qwen-image-2.1",
+  "flint": "flint",
 };
 
 /** What `--model` and `$XWEN_MODEL` name, read the way the binary reads its

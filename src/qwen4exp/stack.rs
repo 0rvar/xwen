@@ -153,6 +153,7 @@ impl Qwen4ExpParts {
                     (Some(idx), Some(cache))
                 }
                 LayerKind::Linear => (None, None),
+                LayerKind::Swa { .. } => bail!("qwen4exp has no sliding-window layers"),
             };
             // The PLE layer list is 0-based in the GGUF (the converter shifts
             // config.json's one-indexed ids) and is treated as data: this
@@ -642,6 +643,10 @@ pub fn run_stack_hc(
                 )
             }
             Mixer::Linear(block) => stage!(Stage::MixerDelta, block.forward(&x, cache)?),
+            Mixer::Flint(_) => bail!(
+                "layer {il} carries Flint attention, but this is the qwen4exp graph; this model \
+                 was assembled from the wrong architecture arm"
+            ),
         };
         tap!("attn_o_proj", il, out);
         stream = stage!(Stage::ResidualAttn, hc_write(&stream, &out, &inject)?);

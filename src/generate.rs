@@ -1484,7 +1484,12 @@ impl Generator {
             Some(path) => LagunaTokenizer::from_file(path).with_context(|| {
                 format!("reading this checkpoint's own tokenizer {}", path.display())
             }),
-            None => LagunaTokenizer::embedded(),
+            // A GGUF carries no tokenizer.json; the binary embeds one per GGUF
+            // vocabulary, chosen by the file's architecture.
+            None => match source.config()?.arch {
+                crate::config::Arch::Flint => LagunaTokenizer::embedded_flint(),
+                _ => LagunaTokenizer::embedded(),
+            },
         }
     }
 
@@ -4547,8 +4552,8 @@ mod tests {
 
         let tok = Generator::load_tokenizer(&source, None).expect("the checkpoint's tokenizer");
         let specials = tok.specials();
-        assert_eq!(specials.im_start, 151644);
-        assert_eq!(specials.im_end, 151645);
+        assert_eq!(specials.im_start, Some(151644));
+        assert_eq!(specials.im_end, Some(151645));
         assert_eq!(specials.endoftext, 151643);
         assert_eq!(specials.think_open, 151667);
         assert_eq!(specials.think_close, 151668);
@@ -4566,7 +4571,7 @@ mod tests {
         let override_path = dir.join("tokenizer.json");
         let overridden = Generator::load_tokenizer(&source, Some(&override_path))
             .expect("an explicit tokenizer path");
-        assert_eq!(overridden.specials().im_end, 151645);
+        assert_eq!(overridden.specials().im_end, Some(151645));
     }
 
     /// Drive `accept_drafts` with a fixed list of "target samples", tracking how

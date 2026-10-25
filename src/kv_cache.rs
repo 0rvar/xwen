@@ -25,10 +25,8 @@ pub enum LayerCache {
     Full { k: Tensor, v: Tensor, len: usize },
     /// Sliding-window attention: a ring of `window` slots keyed by `pos % window`.
     ///
-    /// No Qwen 3.6 layer is of this kind — nothing in the model path constructs
-    /// one. The variant and its ring machinery are retained because the SWA
-    /// rollback/snapshot semantics are the non-obvious half of this module and
-    /// deleting them would take their tests with them.
+    /// Flint's 35 sliding layers are of this kind (`LayerKind::Swa`); no Qwen
+    /// layer is.
     Swa {
         k: Tensor,
         v: Tensor,
@@ -61,7 +59,7 @@ pub enum LayerCache {
 /// the window for SWA. Nothing else in a `LayerCache` affects the mask, so a
 /// mask built from a `MaskKind` is identical across every layer of that kind
 /// and can be hoisted out of the per-layer loop.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaskKind {
     Full,
     Swa { window: usize },
@@ -158,8 +156,9 @@ impl LayerCache {
     /// `slots` is the INITIAL allocation of a full-attention layer, not its
     /// ceiling: `ensure_full_capacity` grows the buffers on demand, so a caller
     /// with a large context budget starts small and pays for positions only as
-    /// a sequence actually reaches them. A DeltaNet layer's state is fixed-size
-    /// whatever the context, so `slots` does not apply to it.
+    /// a sequence actually reaches them. A DeltaNet layer's state and a sliding
+    /// layer's ring are fixed-size whatever the context, so `slots` does not
+    /// apply to them.
     pub fn new(cfg: &XwenConfig, il: usize, slots: usize, device: &Device) -> Result<Self> {
         match cfg.layer_kind(il) {
             LayerKind::Full => {
@@ -170,6 +169,16 @@ impl LayerCache {
                     k: alloc(slots)?,
                     v: alloc(slots)?,
                     len: 0,
+                })
+            }
+            LayerKind::Swa { window } => {
+                let alloc =
+                    || Tensor::zeros((cfg.n_kv_head, window, cfg.head_dim), DType::F16, device);
+                Ok(LayerCache::Swa {
+                    k: alloc()?,
+                    v: alloc()?,
+                    len: 0,
+                    window,
                 })
             }
             LayerKind::Linear => Ok(LayerCache::Linear {

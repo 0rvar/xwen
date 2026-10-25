@@ -6,6 +6,7 @@ pub mod config;
 pub mod constrain;
 pub mod dflash;
 pub mod drafter;
+pub mod flint;
 pub mod gdn_profile;
 pub mod generate;
 pub mod gguf;

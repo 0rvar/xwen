@@ -665,6 +665,7 @@ mod tests {
             },
             eog_tokens: vec![248_046, 248_044],
             qwen4exp: None,
+            flint: None,
         }
     }
 
@@ -785,6 +786,7 @@ mod tests {
             },
             eog_tokens: vec![0],
             qwen4exp: None,
+            flint: None,
         }
     }
 

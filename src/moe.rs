@@ -37,6 +37,27 @@ pub trait ExpertFfn: Send {
     }
 }
 
+/// How a router turns its logits into expert scores before the top-k.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gating {
+    /// Softmax over every expert (qwen35moe, qwen4exp).
+    Softmax,
+    /// An independent sigmoid per expert (Flint, llama.cpp
+    /// `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`). The selected scores are then
+    /// renormalized to sum to 1 exactly as the softmax ones are.
+    Sigmoid,
+}
+
+impl Gating {
+    /// The gating an architecture's routers use.
+    pub fn for_arch(arch: crate::config::Arch) -> Self {
+        match arch {
+            crate::config::Arch::Flint => Gating::Sigmoid,
+            _ => Gating::Softmax,
+        }
+    }
+}
+
 /// One MoE FFN block — every layer of `qwen35moe`. Routing math: a SOFTMAX over
 /// all 256 experts in f32, then top-k by that probability, then a sum
 /// renormalization of the selected weights with the f16 floor. There is no
@@ -69,6 +90,11 @@ pub struct MoeBlock {
     shared: SharedExpert,
     n_expert: usize,
     n_expert_used: usize,
+    /// Softmax or sigmoid scoring. The fused router kernel implements the
+    /// softmax router only and the fused block epilogue the GATED shared expert
+    /// only, so a block with either a sigmoid router or an ungated shared expert
+    /// (Flint has both) runs the candle chains; see [`MoeBlock::glue_fused`].
+    gating: Gating,
     /// The floor the renormalized top-k weight sum is clamped to, from
     /// `Arch::moe_sum_floor`: llama.cpp's [`crate::config::MOE_SUM_FLOOR`] on
     /// qwen35moe, 0.0 (no clamp) on qwen4exp, whose HF math has none.
@@ -85,6 +111,7 @@ impl MoeBlock {
             ExpertRunner::Reference => Box::new(ReferenceExperts::new(w)?),
             ExpertRunner::Fused => Box::new(FusedExperts::new(w)?),
         };
+        let gating = Gating::for_arch(cfg.arch);
         let shared = SharedExpert::new(w)?;
         Ok(Self {
             router,
@@ -93,6 +120,7 @@ impl MoeBlock {
             shared,
             n_expert,
             n_expert_used: cfg.n_expert_used,
+            gating,
             sum_floor: cfg.arch.moe_sum_floor(),
         })
     }
@@ -104,7 +132,9 @@ impl MoeBlock {
     /// bounds are the kernel's, so a checkpoint outside them falls back rather
     /// than failing.
     fn glue_fused(&self, x: &Tensor) -> bool {
-        !crate::ops::moe_glue_classic()
+        self.gating == Gating::Softmax
+            && self.shared.is_gated()
+            && !crate::ops::moe_glue_classic()
             && x.device().is_metal()
             && crate::ops::moe_router_supported(self.n_expert, self.n_expert_used)
     }
@@ -165,7 +195,12 @@ impl MoeBlock {
                 crate::ops::moe_router(&logits, self.n_expert_used, self.sum_floor)
             });
         }
-        route_from_logits(&logits, self.n_expert_used, self.sum_floor)
+        match self.gating {
+            Gating::Softmax => route_from_logits(&logits, self.n_expert_used, self.sum_floor),
+            Gating::Sigmoid => {
+                route_sigmoid_from_logits(&logits, self.n_expert_used, self.sum_floor)
+            }
+        }
     }
 
     pub fn forward(&self, x_normed: &Tensor) -> Result<Tensor> {
@@ -355,6 +390,25 @@ fn route_from_logits(
     let ids = order.narrow(1, 0, n_expert_used)?.contiguous()?; // [seq, top_k] u32
 
     let weights = probs.gather(&ids, 1)?;
+    let sum = weights.sum_keepdim(1)?.clamp(sum_floor, f32::INFINITY)?;
+    Ok((ids, weights.broadcast_div(&sum)?))
+}
+
+/// The sigmoid router's decision from its logits (llama.cpp `build_moe_ffn`
+/// with `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID` and `norm_w`): each expert is
+/// scored by its own sigmoid, the top-k scores are selected, and the selected
+/// scores are renormalized to sum to 1 with the same floored denominator as the
+/// softmax router. No selection bias: the shipped Flint file has none
+/// (`XwenConfig::from_gguf` refuses one).
+fn route_sigmoid_from_logits(
+    logits: &Tensor,
+    n_expert_used: usize,
+    sum_floor: f32,
+) -> Result<(Tensor, Tensor)> {
+    let scores = sigmoid(&logits.to_dtype(DType::F32)?)?.contiguous()?; // [seq, n_expert]
+    let order = scores.arg_sort_last_dim(false)?;
+    let ids = order.narrow(1, 0, n_expert_used)?.contiguous()?;
+    let weights = scores.gather(&ids, 1)?;
     let sum = weights.sum_keepdim(1)?.clamp(sum_floor, f32::INFINITY)?;
     Ok((ids, weights.broadcast_div(&sum)?))
 }
@@ -662,24 +716,33 @@ impl ExpertFfn for FusedExperts {
 }
 
 /// The always-on shared expert: a plain SwiGLU with intermediate
-/// `shared_expert_ff`, scaled by ONE scalar per token —
-/// `sigmoid(ffn_gate_inp_shexp . x)`, a `[hidden]` vector, not a per-channel
-/// gate. Its output is added to the routed output unscaled otherwise.
+/// `shared_expert_ff`, scaled on the Qwen MoE checkpoints by ONE scalar per
+/// token — `sigmoid(ffn_gate_inp_shexp . x)`, a `[hidden]` vector, not a
+/// per-channel gate — and on Flint by nothing at all. Its output is added to the
+/// routed output unscaled otherwise.
 pub struct SharedExpert {
     gate: QLinear,
     up: QLinear,
     down: QLinear,
     /// `[hidden, 1]` f32: the shared-expert router, pre-transposed so the
-    /// per-token scalar is one matmul.
-    router_t: Tensor,
+    /// per-token scalar is one matmul. `None` on an ungated shared expert.
+    router_t: Option<Tensor>,
 }
 
 impl SharedExpert {
+    /// Gated exactly when the file carries `ffn_gate_inp_shexp` (every Qwen MoE
+    /// checkpoint does, Flint does not): the tensor is the gate, so its presence
+    /// is the property, whatever the routed experts' router looks like.
     pub fn new(w: &Weights) -> Result<Self> {
-        let router = w.dense_f32("ffn_gate_inp_shexp")?;
         // Stored as a bare `[hidden]` vector on both checkpoints; a `[1, hidden]`
         // conversion means the same thing.
-        let hidden = router.elem_count();
+        let router_t = if w.has("ffn_gate_inp_shexp") {
+            let router = w.dense_f32("ffn_gate_inp_shexp")?;
+            let hidden = router.elem_count();
+            Some(router.reshape((hidden, 1))?)
+        } else {
+            None
+        };
         // Loaded through the buffer-retaining path so each projection carries a
         // plane and `QLinear::forward` can take the small-batch window (these
         // are q8_0 on both shipped files). Same single upload either way — the
@@ -690,12 +753,20 @@ impl SharedExpert {
             gate: planed("ffn_gate_shexp")?,
             up: planed("ffn_up_shexp")?,
             down: planed("ffn_down_shexp")?,
-            router_t: router.reshape((hidden, 1))?,
+            router_t,
         })
+    }
+
+    /// Whether a sigmoid gate scales this shared expert's output.
+    pub fn is_gated(&self) -> bool {
+        self.router_t.is_some()
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = self.swiglu_out(x)?;
+        if !self.is_gated() {
+            return Ok(out);
+        }
         let gate = sigmoid(&self.gate_logits(x)?)?; // [seq, 1]
         Ok(out.broadcast_mul(&gate)?)
     }
@@ -721,8 +792,13 @@ impl SharedExpert {
     /// The `ffn_gate_inp_shexp` row as the `[hidden, 1]` f32 tensor
     /// `gate_logits` matmuls against. The fused kernel reads the same buffer as
     /// a flat `[hidden]` vector.
+    ///
+    /// Only the gated paths read it, and `MoeBlock::glue_fused` closes the
+    /// fused one to an ungated shared expert, so asking an ungated one is a bug.
     pub(crate) fn gate_row(&self) -> &Tensor {
-        &self.router_t
+        self.router_t
+            .as_ref()
+            .expect("the fused shared-expert path runs only on a gated shared expert")
     }
 
     /// The SwiGLU output BEFORE the scalar gate — what the fused block epilogue
@@ -761,7 +837,7 @@ impl SharedExpert {
     /// itself lives with whoever applies the gate — the fused epilogue folds it
     /// into its own pass.
     pub fn gate_logits(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(x.to_dtype(DType::F32)?.matmul(&self.router_t)?)
+        Ok(x.to_dtype(DType::F32)?.matmul(self.gate_row())?)
     }
 }
 
@@ -877,6 +953,29 @@ mod tests {
 
     fn assert_close(a: f64, b: f64, tol: f64) {
         assert!((a - b).abs() <= tol, "expected {b}, got {a} (tol {tol})");
+    }
+
+    /// Flint's router scores each expert by its own sigmoid, takes the top-k of
+    /// those scores and renormalizes them over the selected set alone. Unlike
+    /// the softmax router the unselected experts do not enter the weights at
+    /// all, so the result is NOT a softmax restricted to the selected logits.
+    #[test]
+    fn sigmoid_routing_renormalizes_the_selected_scores() {
+        let (ids, weights) =
+            route_sigmoid_from_logits(&logits_row(), 3, WEIGHTS_SUM_FLOOR as f32).unwrap();
+        let ids_v: Vec<u32> = ids.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(ids_v, vec![5, 0, 3], "the three largest logits, in order");
+        let sig = |l: f64| 1.0 / (1.0 + (-l).exp());
+        let sel: Vec<f64> = [3.0_f64, 2.0, 1.0].iter().map(|&l| sig(l)).collect();
+        let total: f64 = sel.iter().sum();
+        let got: Vec<f32> = weights.flatten_all().unwrap().to_vec1().unwrap();
+        for (g, s) in got.iter().zip(&sel) {
+            assert_close(*g as f64, s / total, 1e-6);
+        }
+        // The softmax router on the same logits weights them differently.
+        let (_, soft) = route_from_logits(&logits_row(), 3, WEIGHTS_SUM_FLOOR as f32).unwrap();
+        let soft: Vec<f32> = soft.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((soft[0] - got[0]).abs() > 0.1);
     }
 
     /// Softmax over the FULL expert set, then top-k, then renormalize. The
@@ -1139,6 +1238,7 @@ mod tests {
                 n_expert,
                 n_expert_used: cfg.n_expert_used,
                 sum_floor: cfg.arch.moe_sum_floor(),
+                gating: Gating::Softmax,
             },
             dir,
         )
@@ -1678,7 +1778,7 @@ mod tests {
             gate,
             up,
             down,
-            router_t: router.reshape((hidden, 1)).unwrap(),
+            router_t: Some(router.reshape((hidden, 1)).unwrap()),
         };
 
         let got = ffn.forward(&x).unwrap();
@@ -1753,9 +1853,11 @@ mod tests {
             gate: ql(&det_tensor(&[expert_ff, hidden], 0x20, 0.5)),
             up: ql(&det_tensor(&[expert_ff, hidden], 0x21, 0.5)),
             down: ql(&det_tensor(&[hidden, expert_ff], 0x22, 0.5)),
-            router_t: det_tensor(&[hidden, 1], 0x23, 0.4)
-                .to_device(&device)
-                .unwrap(),
+            router_t: Some(
+                det_tensor(&[hidden, 1], 0x23, 0.4)
+                    .to_device(&device)
+                    .unwrap(),
+            ),
         };
         let router = det_tensor(&[n_expert, hidden], 0x10, 0.4)
             .to_device(&device)
@@ -1772,6 +1874,7 @@ mod tests {
             n_expert,
             n_expert_used: top_k,
             sum_floor: WEIGHTS_SUM_FLOOR as f32,
+            gating: Gating::Softmax,
         };
         assert!(
             crate::ops::moe_router_supported(n_expert, top_k),
@@ -1800,7 +1903,7 @@ mod tests {
         let u = block.shared.up.forward(&x).unwrap();
         let h = (silu(&g).unwrap() * u).unwrap();
         let sh = block.shared.down.forward(&h).unwrap();
-        let gate = sigmoid(&x.matmul(&block.shared.router_t).unwrap()).unwrap();
+        let gate = sigmoid(&x.matmul(&block.shared.gate_row()).unwrap()).unwrap();
         let want = (routed + sh.broadcast_mul(&gate).unwrap()).unwrap();
 
         let gv: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
@@ -2164,9 +2267,11 @@ mod tests {
                 gate: ql(&det_tensor(&[SHARED_FF, HIDDEN], s + 20, 0.5)),
                 up: ql(&det_tensor(&[SHARED_FF, HIDDEN], s + 21, 0.5)),
                 down: ql(&det_tensor(&[HIDDEN, SHARED_FF], s + 22, 0.5)),
-                router_t: det_tensor(&[HIDDEN, 1], s + 23, 0.02)
-                    .to_device(dev)
-                    .unwrap(),
+                router_t: Some(
+                    det_tensor(&[HIDDEN, 1], s + 23, 0.02)
+                        .to_device(dev)
+                        .unwrap(),
+                ),
             };
             let block = MoeBlock {
                 router,
@@ -2176,6 +2281,7 @@ mod tests {
                 n_expert: N_EXPERT,
                 n_expert_used: TOP_K,
                 sum_floor: WEIGHTS_SUM_FLOOR as f32,
+                gating: Gating::Softmax,
             };
             (norm(HIDDEN, s + 30, dev), block)
         }

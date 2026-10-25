@@ -65,7 +65,8 @@ pub(crate) type StackOutput = (Tensor, Vec<(String, Tensor)>, Vec<(usize, Tensor
 
 /// The per-layer FFN: a plain SwiGLU MLP on the dense checkpoint, the
 /// softmax-routed MoE block (routed experts + gated shared expert) on both MoE
-/// ones. Whole-model, not per-layer — no checkpoint mixes the two.
+/// ones. Flint mixes the two per layer: dense on its leading layers, a
+/// sigmoid-routed MoE block with an ungated shared expert on the rest.
 ///
 /// `pub(crate)` because `qwen4exp::stack` runs the same blocks through a
 /// different residual (D14) and therefore has to match on this.
@@ -80,6 +81,9 @@ pub(crate) enum Ffn {
 pub(crate) enum Mixer {
     Full(AttnBlock),
     Linear(LinearAttnBlock),
+    /// Flint's attention (full or sliding, roped or not, with sinks), which
+    /// owns its own mask: [`crate::flint::FlintAttn`].
+    Flint(crate::flint::FlintAttn),
 }
 
 /// The output projection `[seq, hidden] -> [seq, vocab]`, in whichever form
@@ -247,6 +251,14 @@ impl XwenModel {
     fn check_arch(cfg: &XwenConfig) -> Result<()> {
         match cfg.arch {
             Arch::Dense | Arch::Moe => Ok(()),
+            Arch::Flint => {
+                ensure!(
+                    cfg.flint.is_some(),
+                    "this file declares architecture flint but its config carries no flint \
+                     section"
+                );
+                Ok(())
+            }
             // Every precondition of the qwen3 graph is already a `Qwen3Config`
             // validation (head_dim 128, no bias, no sliding window, tied head).
             Arch::Qwen3 => Ok(()),
@@ -283,7 +295,7 @@ impl XwenModel {
     ) -> Result<Self> {
         match source {
             crate::checkpoint::CheckpointSource::Gguf(gguf) => {
-                Self::load_gguf(gguf, runner, max_ctx)
+                Self::load_gguf(gguf, runner, max_ctx, None)
             }
             crate::checkpoint::CheckpointSource::SafeTensors(set, device) => {
                 set.config()
@@ -497,9 +509,45 @@ impl XwenModel {
         })
     }
 
-    fn load_gguf(gguf: Arc<GgufFile>, runner: ExpertRunner, max_ctx: usize) -> Result<Self> {
-        let cfg = XwenConfig::from_gguf(&gguf.content)?;
+    /// A Flint model built as a deliberately WRONG graph, for the parity gate's
+    /// brackets (tests/flint_parity.rs) and nothing else: the bars have to fail
+    /// it, or they cannot tell this model from a broken one. A load option
+    /// rather than an environment switch, so no surface can build one by
+    /// accident.
+    #[doc(hidden)]
+    pub fn load_flint_wrong_graph(
+        source: crate::checkpoint::CheckpointSource,
+        runner: ExpertRunner,
+        max_ctx: usize,
+        wrong: crate::flint::attention::WrongGraph,
+    ) -> Result<Self> {
+        let crate::checkpoint::CheckpointSource::Gguf(gguf) = source else {
+            bail!("a wrong Flint graph is built from the Flint GGUF");
+        };
+        let model = Self::load_gguf(gguf, runner, max_ctx, Some(wrong))?;
+        ensure!(
+            model.cfg.arch == Arch::Flint,
+            "a wrong Flint graph needs a Flint checkpoint"
+        );
+        Ok(model)
+    }
+
+    fn load_gguf(
+        gguf: Arc<GgufFile>,
+        runner: ExpertRunner,
+        max_ctx: usize,
+        wrong: Option<crate::flint::attention::WrongGraph>,
+    ) -> Result<Self> {
+        let mut cfg = XwenConfig::from_gguf(&gguf.content)?;
         Self::check_arch(&cfg)?;
+        if wrong == Some(crate::flint::attention::WrongGraph::Window512) {
+            for kind in &mut cfg.layer_kind {
+                if let LayerKind::Swa { window } = kind {
+                    *window -= 1;
+                }
+            }
+        }
+        let cfg = cfg;
         let max_ctx = clamp_context_length(max_ctx, cfg.n_ctx_train)?;
         let device = gguf.device.clone();
         let _drain = crate::memory::DeviceDrain(device.clone());
@@ -569,16 +617,46 @@ impl XwenModel {
         // gates/indexers/PLE are loaded alongside afterwards.
         let hc = cfg.arch == Arch::Qwen4Exp;
 
+        // Flint's attention arm, resolved once for every layer of this load.
+        let flint_attn = if cfg.arch == Arch::Flint {
+            let arm = crate::flint::attention::AttnImpl::from_env()?;
+            if arm != crate::flint::attention::AttnImpl::SHIPPED {
+                crate::host_log::host_line(format!(
+                    "flint: attention arm {arm:?} ({})",
+                    crate::flint::attention::ATTN_ENV
+                ));
+            }
+            arm
+        } else {
+            crate::flint::attention::AttnImpl::SHIPPED
+        };
+
         let kv_slots = max_ctx.min(KV_INITIAL_CTX);
         let mut layers = Vec::with_capacity(cfg.n_layer);
         let mut caches = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {
             let lw = w.pp(format!("blk.{il}"));
-            let mixer = match cfg.layer_kind(il) {
-                LayerKind::Full => {
+            let mixer = match (cfg.arch, cfg.layer_kind(il)) {
+                (Arch::Flint, LayerKind::Full | LayerKind::Swa { .. }) => {
+                    Mixer::Flint(crate::flint::FlintAttn::new(
+                        &lw,
+                        &cfg,
+                        il,
+                        rope.clone(),
+                        attn_weights,
+                        flint_attn,
+                        wrong,
+                    )?)
+                }
+                (_, LayerKind::Full) => {
                     Mixer::Full(AttnBlock::new(&lw, &cfg, il, rope.clone(), attn_weights)?)
                 }
-                LayerKind::Linear => Mixer::Linear(LinearAttnBlock::new(&lw, &cfg, attn_weights)?),
+                (_, LayerKind::Linear) => {
+                    Mixer::Linear(LinearAttnBlock::new(&lw, &cfg, attn_weights)?)
+                }
+                (_, LayerKind::Swa { .. }) => {
+                    bail!("layer {il}: only Flint has sliding-window layers")
+                }
             };
             let ffn = match cfg.arch {
                 // `Arch::Qwen3` is unreachable here — this is the GGUF layer
@@ -587,6 +665,21 @@ impl XwenModel {
                 // there is no other arm it could take.
                 Arch::Dense | Arch::Qwen3 => Ffn::Dense(DenseMlp::new(&lw)?),
                 Arch::Moe | Arch::Qwen4Exp => Ffn::Moe(MoeBlock::new(&lw, &cfg, runner)?),
+                Arch::Flint => {
+                    let lead = cfg.flint.as_ref().map_or(0, |f| f.n_dense_lead);
+                    if il < lead {
+                        Ffn::Dense(DenseMlp::new(&lw)?)
+                    } else {
+                        Ffn::Moe(MoeBlock::new(&lw, &cfg, runner)?)
+                    }
+                }
+            };
+            // The pre-MLP norm: `post_attention_norm` on the Qwen files,
+            // `ffn_norm` on Flint's (llama.cpp's own name for it).
+            let ffn_norm_name = if cfg.arch == Arch::Flint {
+                "ffn_norm"
+            } else {
+                "post_attention_norm"
             };
             layers.push(Layer {
                 attn_norm: if hc {
@@ -600,7 +693,7 @@ impl XwenModel {
                 ffn_norm: if hc {
                     None
                 } else {
-                    Some(lw.rms_norm("post_attention_norm", cfg.rms_eps)?)
+                    Some(lw.rms_norm(ffn_norm_name, cfg.rms_eps)?)
                 },
                 ffn,
             });
@@ -629,6 +722,7 @@ impl XwenModel {
         } else if !crate::ops::attn_dequant()
             && layers.iter().any(|l| match &l.mixer {
                 Mixer::Full(attn) => attn.uses_q8_decode(),
+                Mixer::Flint(attn) => attn.uses_q8_decode(),
                 Mixer::Linear(_) => false,
             })
         {
@@ -860,9 +954,11 @@ impl XwenModel {
         // None. The vendored flash kernel, which would compute the mask
         // in-kernel and skip this allocation entirely, is compiled at head dim
         // 128 and cannot serve this architecture's 256.
+        // Flint's layers take the mask of their own cache kind (full or
+        // sliding), built at most once per kind per forward below.
         let full_mask = if seq > 1 {
             let n_head = (0..self.cfg.n_layer)
-                .find(|&il| self.cfg.is_full_attn(il))
+                .find(|&il| matches!(self.layers[il].mixer, Mixer::Full(_)))
                 .map(|il| self.cfg.n_head(il));
             match n_head {
                 Some(n) => self.build_prefill_mask(n, seq, pos)?,
@@ -871,6 +967,8 @@ impl XwenModel {
         } else {
             None
         };
+
+        let mut flint_masks: Vec<(MaskKind, Option<Tensor>)> = Vec::new();
 
         for il in 0..self.layers.len() {
             let layer = &self.layers[il];
@@ -891,6 +989,23 @@ impl XwenModel {
                 ),
                 Mixer::Linear(block) => {
                     stage!(Stage::MixerDelta, block.forward(&normed, cache)?)
+                }
+                Mixer::Flint(block) => {
+                    let kind = cache.mask_kind();
+                    let at = match flint_masks.iter().position(|(k, _)| *k == kind) {
+                        Some(at) => at,
+                        None => {
+                            flint_masks.push((
+                                kind,
+                                crate::kv_cache::attn_mask_for(kind, seq, pos, x.device())?,
+                            ));
+                            flint_masks.len() - 1
+                        }
+                    };
+                    stage!(
+                        Stage::MixerFullAttn,
+                        block.forward(&normed, cache, pos, flint_masks[at].1.as_ref())?
+                    )
                 }
             };
             tap!("attn_o_proj", il, attn);
@@ -1645,7 +1760,12 @@ impl XwenModel {
         if crate::memory::is_managed() {
             let capacity = kv_growth_capacity(self.kv_slots, needed, self.max_ctx);
             // The new planes coexist with the old ones until the copy completes.
-            crate::memory::admit_additional("KV growth", kv_bytes(&self.cfg, capacity))?;
+            crate::memory::admit_additional(
+                "KV growth",
+                kv_bytes(&self.cfg, capacity)
+                    + flint_scratch_bytes(self.cfg.arch, capacity)
+                        .saturating_sub(flint_scratch_bytes(self.cfg.arch, self.kv_slots)),
+            )?;
         }
         let mut grown = self.kv_slots;
         for cache in &mut self.caches {
@@ -1709,6 +1829,19 @@ fn order_spec_taps(config: &[usize], captured: Vec<(usize, Tensor)>) -> Vec<Tens
 fn kv_bytes(cfg: &XwenConfig, slots: usize) -> u64 {
     let n_full = (0..cfg.n_layer).filter(|&il| cfg.is_full_attn(il)).count() as u64;
     n_full * 2 * cfg.n_kv_head as u64 * slots as u64 * cfg.head_dim as u64 * 2
+}
+
+/// Bytes of the sliding layers' K/V rings: f16, `[n_kv_head, window,
+/// head_dim]` twice per layer, allocated whole at load whatever the context.
+fn swa_ring_bytes(cfg: &XwenConfig) -> u64 {
+    (0..cfg.n_layer)
+        .map(|il| match cfg.layer_kind(il) {
+            LayerKind::Swa { window } => {
+                2 * cfg.n_kv_head as u64 * window as u64 * cfg.head_dim as u64 * 2
+            }
+            LayerKind::Full | LayerKind::Linear => 0,
+        })
+        .sum()
 }
 
 fn kv_growth_capacity(slots: usize, needed: usize, cap: usize) -> usize {
@@ -1787,17 +1920,42 @@ fn language_peak_bytes(
         * 4
         * ((cfg.conv_kernel as u64).saturating_sub(1) * cfg.conv_dim() as u64
             + cfg.linear_v_heads as u64 * hd * hd)
-        + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx);
+        + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx)
+        + swa_ring_bytes(cfg);
     let scratch = if cfg.arch.tapers_prefill_chunk() {
         peak_prefill_transient_bytes(cfg.arch, max_ctx).max(8 * GIB)
     } else {
-        8 * GIB
+        flint_scratch_bytes(cfg.arch, slots).max(8 * GIB)
     };
     weights
         .saturating_add(ple.min(4 * GIB))
         .saturating_add(kv_bytes(cfg, slots))
         .saturating_add(state)
         .saturating_add(scratch)
+}
+
+/// What a Flint prefill holds beyond its file-backed weights once its cache
+/// reaches `n_kv` positions: the dequantized planes, the KV, and the attention's
+/// transients, which grow faster than the context. Zero on every other
+/// architecture, whose scratch is the flat 8 GiB.
+///
+/// A quadratic fitted to `xwen generate --model flint` peak footprints
+/// (`/usr/bin/time -l`, which leaves out the mapped weights) at the default 2048
+/// chunk on the production attention arm, 2026-10-25: 10.97 GB at 9,895
+/// tokens, 16.28 GB at 28,717 and 31.89 GB at 56,883, plus 5%. The load prices
+/// it at the KV capacity it allocates and every KV growth prices the step to
+/// the new capacity (`grow_kv_capacity`), so a prompt too long for the
+/// machine is refused where its cache grows rather than failing in a GPU
+/// out-of-memory mid-prefill. It extrapolates to about 115 GB at 131,072
+/// positions: past what this machine holds, which is the kernel arc's problem
+/// to lift, not this estimate's to hide.
+fn flint_scratch_bytes(arch: Arch, n_kv: usize) -> u64 {
+    if arch != Arch::Flint {
+        return 0;
+    }
+    let n = n_kv as f64;
+    let fitted = 9.153_629_3 * (1u64 << 30) as f64 + 58_581.8 * n + 5.787_623 * n * n;
+    (fitted * 1.05) as u64
 }
 
 /// The largest transient a prefill forward on this config can take, over a walk
@@ -1847,7 +2005,9 @@ fn report_footprint(
             + cfg.linear_v_heads as u64 * hd * hd)
         // qwen4exp only: the QSA raw-key planes (allocated at max_ctx, not
         // grown) and the PLE conv window. Zero on the other checkpoints.
-        + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx);
+        + crate::qwen4exp::stack::extra_state_bytes(cfg, max_ctx)
+        // Flint only: the sliding layers' rings.
+        + swa_ring_bytes(cfg);
 
     let total = weight_bytes + kv_bytes(cfg, kv_slots) + state_bytes;
     let ceiling = weight_bytes + kv_bytes(cfg, max_ctx) + state_bytes;
@@ -1879,6 +2039,26 @@ fn report_footprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Flint scratch estimate sits above every footprint it was fitted to,
+    /// and grows with the cache, so a KV growth always admits a positive step.
+    #[test]
+    fn the_flint_scratch_estimate_covers_its_measurements() {
+        assert_eq!(flint_scratch_bytes(Arch::Moe, 100_000), 0, "not Flint");
+        for (n_kv, measured) in [
+            (9_895usize, 10_974_973_392u64),
+            (28_717, 16_283_783_856),
+            (56_883, 31_887_812_384),
+        ] {
+            let estimate = flint_scratch_bytes(Arch::Flint, n_kv);
+            assert!(
+                estimate > measured,
+                "{n_kv} positions: estimate {estimate} under the measured {measured}"
+            );
+        }
+        assert!(flint_scratch_bytes(Arch::Flint, 16_384) > flint_scratch_bytes(Arch::Flint, 8_192));
+    }
+
     #[test]
     fn memory_admission_reserves_every_doubling_needed_by_a_long_prefill() {
         assert_eq!(kv_growth_capacity(8192, 20000, 131072), 32768);
@@ -1936,6 +2116,7 @@ mod tests {
             },
             eog_tokens: vec![248046, 248044],
             qwen4exp: None,
+            flint: None,
         };
         let err = XwenModel::check_arch(&cfg(Arch::Qwen4Exp))
             .unwrap_err()

@@ -122,6 +122,13 @@ pub enum Model {
     /// Released under the Qwen Research License (non-commercial), which binds
     /// the weights and not the images made with them.
     QwenImage21,
+    /// Flint (`flint`), Recursive's 40B-A2.5B coding-agent MoE, as ggml-org's
+    /// Q4_K_M conversion. Trained from scratch: no Qwen weights, its own
+    /// 150144-token vocabulary ([`VocabFamily::Flint`]) and a GLM-style chat
+    /// format ([`crate::chat::ChatDialect::Flint`]). Every layer is softmax
+    /// attention, 35 of them sliding at window 513, so a conversation's state
+    /// is its 14 full layers' KV rows plus 35 fixed-size rings. Ships no drafter.
+    Flint,
 }
 
 /// Which tokenizer vocabulary a checkpoint speaks — see
@@ -144,6 +151,13 @@ pub enum VocabFamily {
     /// `serve::vocab::tests::every_qwen3_release_ships_the_same_tokenizer`
     /// compares the bytes rather than leaving that believed.
     Qwen3,
+    /// Flint — 150144 ids, every one of them a real token (150000 byte-level
+    /// BPE entries plus 144 added ones, 150019 onward reserved). Its own
+    /// vocabulary, its own pre-tokenizer and GLM-style role markers in place
+    /// of ChatML; nothing is shared with either Qwen family. The tokenizer is
+    /// compiled into the binary (reference/flint/tokenizer.json), because the
+    /// checkpoint ships as a GGUF and a GGUF carries no `tokenizer.json`.
+    Flint,
 }
 
 impl VocabFamily {
@@ -167,13 +181,16 @@ impl VocabFamily {
             // `vocab_size` in every Qwen3-4B `config.json`, and the first
             // dimension of `model.embed_tokens.weight` in every shard set.
             VocabFamily::Qwen3 => 151_936,
+            // `vocab_size` in Flint's `config.json` and the row count of its
+            // `output.weight`: unpadded, so the mask and the tokenizer agree.
+            VocabFamily::Flint => 150_144,
         }
     }
 }
 
 /// Every checkpoint this build knows, in the order surfaces that enumerate them
 /// (`/v1/models`, an unknown-model error's list of valid names) print them.
-pub const MODELS: [Model; 11] = [
+pub const MODELS: [Model; 12] = [
     Model::Qwen27B,
     Model::Qwen35BA3B,
     Model::Qwen35BA3BUncensored,
@@ -185,6 +202,7 @@ pub const MODELS: [Model; 11] = [
     Model::ZImageTurbo,
     Model::QwenImage21Encoder,
     Model::QwenImage21,
+    Model::Flint,
 ];
 
 /// The hub coordinates of one checkpoint: the repo, the Q4_K_M target (the
@@ -349,6 +367,12 @@ struct CacheGeometry {
     conv_kernel: usize,
     /// The caches only the qwen4exp trunk carries, `None` on the qwen35 pair.
     extras: Option<Qwen4ExpCaches>,
+    /// Sliding-window attention layers and their window (Flint's 35 at 513).
+    /// Each holds a ring of `swa_window` K/V rows at `n_kv_head` x `head_dim`
+    /// f16: fixed-size state, so it is in [`Model::snapshot_bytes`] and not in
+    /// [`Model::kv_bytes_per_token`]. Zero on every Qwen checkpoint.
+    swa_layers: usize,
+    swa_window: usize,
 }
 
 /// The two extra caches a qwen4exp checkpoint carries beyond the KV rows and
@@ -394,6 +418,8 @@ const DENSE_27B_GEOMETRY: CacheGeometry = CacheGeometry {
     linear_v_heads: 48,
     linear_head_dim: 128,
     conv_kernel: 4,
+    swa_layers: 0,
+    swa_window: 0,
     extras: None,
 };
 
@@ -437,6 +463,8 @@ const QWEN_35B_A3B: Checkpoint = Checkpoint {
         linear_v_heads: 32,
         linear_head_dim: 128,
         conv_kernel: 4,
+        swa_layers: 0,
+        swa_window: 0,
         extras: None,
     },
     format: Format::Gguf,
@@ -518,6 +546,8 @@ const QWEN_38_FLASH_NEXT: Checkpoint = Checkpoint {
         linear_v_heads: 48,
         linear_head_dim: 128,
         conv_kernel: 4,
+        swa_layers: 0,
+        swa_window: 0,
         extras: Some(Qwen4ExpCaches {
             indexer_head_dim: 128,
             indexer_compress_ratio: 4,
@@ -545,6 +575,8 @@ const QWEN3_4B_GEOMETRY: CacheGeometry = CacheGeometry {
     linear_v_heads: 0,
     linear_head_dim: 0,
     conv_kernel: 0,
+    swa_layers: 0,
+    swa_window: 0,
     extras: None,
 };
 
@@ -768,6 +800,34 @@ const QWEN_IMAGE_21: Checkpoint = Checkpoint {
     },
 };
 
+/// ggml-org's conversion of `RecursiveSI/flint` at 2a247be (its `.src_sha`),
+/// Q4_K_M: Q8_0 attention, shared expert, embedding and head; Q4_K routed
+/// experts and dense FFN; F32 norms, router and sinks.
+const FLINT: Checkpoint = Checkpoint {
+    repo: "ggml-org/Flint-GGUF",
+    files: &["Flint-Q4_K_M.gguf"],
+    full_name: "Flint",
+    arch: Arch::Flint,
+    model_size: "23.4 GB",
+    drafter: None,
+    // 49 layers: 14 full attention (0, 1, 5, 9, ..., 45, 48) whose KV grows
+    // with context, 35 sliding at window 513 whose rings do not.
+    geometry: CacheGeometry {
+        full_attn_layers: 14,
+        linear_layers: 0,
+        n_kv_head: 4,
+        head_dim: 128,
+        linear_k_heads: 0,
+        linear_v_heads: 0,
+        linear_head_dim: 0,
+        conv_kernel: 0,
+        extras: None,
+        swa_layers: 35,
+        swa_window: 513,
+    },
+    format: Format::Gguf,
+};
+
 impl Model {
     const fn checkpoint(self) -> &'static Checkpoint {
         match self {
@@ -782,6 +842,7 @@ impl Model {
             Model::ZImageTurbo => &Z_IMAGE_TURBO,
             Model::QwenImage21Encoder => &QWEN_IMAGE_21_ENCODER,
             Model::QwenImage21 => &QWEN_IMAGE_21,
+            Model::Flint => &FLINT,
         }
     }
 
@@ -868,7 +929,8 @@ impl Model {
             | Model::Qwen3827B
             | Model::Qwen38FlashNext
             | Model::ZImageTurbo
-            | Model::QwenImage21 => None,
+            | Model::QwenImage21
+            | Model::Flint => None,
         }
     }
 
@@ -920,7 +982,8 @@ impl Model {
             | Model::Qwen38FlashNext
             | Model::Qwen34BInstruct2507
             | Model::QwenImage21Encoder
-            | Model::QwenImage21 => 262_144,
+            | Model::QwenImage21
+            | Model::Flint => 262_144,
             Model::Qwen34B | Model::ZImageTurboEncoder | Model::ZImageTurbo => 40_960,
         }
     }
@@ -945,6 +1008,7 @@ impl Model {
             | Model::ZImageTurbo
             | Model::QwenImage21Encoder
             | Model::QwenImage21 => VocabFamily::Qwen3,
+            Model::Flint => VocabFamily::Flint,
         }
     }
 
@@ -1019,6 +1083,7 @@ impl Model {
             Model::Qwen34BInstruct2507 | Model::QwenImage21Encoder | Model::QwenImage21 => {
                 crate::chat::ChatDialect::Qwen3Instruct
             }
+            Model::Flint => crate::chat::ChatDialect::Flint,
         }
     }
 
@@ -1058,6 +1123,8 @@ impl Model {
             | Model::ZImageTurbo
             | Model::QwenImage21Encoder
             | Model::QwenImage21 => 0.0,
+            // The card recommends temperature, top-p and top-k only.
+            Model::Flint => 0.0,
         }
     }
 
@@ -1106,6 +1173,8 @@ impl Model {
             Model::ZImageTurbo => false,
             // 17.5 and 33.1 GB, for `xwen encode-text` and `xwen image` alone.
             Model::QwenImage21Encoder | Model::QwenImage21 => false,
+            // 23.4 GB, and a new architecture: fetched when an operator names it.
+            Model::Flint => false,
         }
     }
 
@@ -1150,6 +1219,10 @@ impl Model {
             | Model::Qwen35BA3BUncensored
             | Model::Qwen3827B
             | Model::Qwen38FlashNext => None,
+            // Every layer is softmax attention, and both kinds of cache it
+            // holds (the full layers' rows, the sliding layers' rings) already
+            // had snapshot, rewind, page-out and disk images.
+            Model::Flint => None,
             // Servable since the qwen3 layer stack landed: every layer is full
             // attention, so a conversation's whole state is its KV rows and the
             // snapshot, rewind, page-out and disk-tier paths carry it with the
@@ -1245,7 +1318,8 @@ impl Model {
             | Model::ZImageTurboEncoder
             | Model::ZImageTurbo
             | Model::QwenImage21Encoder
-            | Model::QwenImage21 => false,
+            | Model::QwenImage21
+            | Model::Flint => false,
         }
     }
 
@@ -1283,7 +1357,8 @@ impl Model {
             | Model::ZImageTurboEncoder
             | Model::ZImageTurbo
             | Model::QwenImage21Encoder
-            | Model::QwenImage21 => false,
+            | Model::QwenImage21
+            | Model::Flint => false,
         }
     }
 
@@ -1721,7 +1796,9 @@ impl Model {
             Some(extras) => extras.ple_layers * extras.ple_conv_cols * extras.ple_conv_width * 4,
             None => 0,
         };
-        g.linear_layers * (conv + delta) + ple
+        // A sliding layer's ring is copied whole whatever position it covers.
+        let rings = g.swa_layers * g.swa_window * g.n_kv_head * g.head_dim * 2 * 2;
+        g.linear_layers * (conv + delta) + ple + rings
     }
 }
 
@@ -1741,6 +1818,7 @@ impl std::fmt::Display for Model {
             Model::ZImageTurbo => "zimage-turbo",
             Model::QwenImage21Encoder => "qwen-image-2.1-encoder",
             Model::QwenImage21 => "qwen-image-2.1",
+            Model::Flint => "flint",
         })
     }
 }
@@ -1790,6 +1868,7 @@ pub const ALIASES: &[(&str, Model)] = &[
     ("z-image-turbo", Model::ZImageTurbo),
     ("qwen-image-2.1-encoder", Model::QwenImage21Encoder),
     ("qwen-image-2.1", Model::QwenImage21),
+    ("flint", Model::Flint),
 ];
 
 /// The aliases [`Model`]'s `FromStr` answers to, one per checkpoint, in
@@ -2315,6 +2394,12 @@ mod tests {
         // read against.
         assert!(Model::Qwen27B.kv_bytes_per_token() > Model::Qwen35BA3B.kv_bytes_per_token());
         assert!(Model::Qwen27B.snapshot_bytes() > Model::Qwen35BA3B.snapshot_bytes());
+
+        // Flint: only its 14 full layers grow, 4 KV heads x 128 x 2 x 2 each;
+        // its 35 sliding layers are 513-slot rings at the same width, copied
+        // whole into every snapshot.
+        assert_eq!(Model::Flint.kv_bytes_per_token(), 14 * 4 * 128 * 2 * 2);
+        assert_eq!(Model::Flint.snapshot_bytes(), 35 * 513 * 4 * 128 * 2 * 2);
     }
 
     /// The qwen4exp checkpoint's figures, which carry two terms no other
@@ -2556,7 +2641,14 @@ mod tests {
     /// only sampling default that has to be resolved with a checkpoint in hand.
     #[test]
     fn the_presence_penalty_is_per_checkpoint_and_per_mode() {
-        let qwen36 = || MODELS.into_iter().filter(|m| m.is_gguf());
+        let qwen36 = || {
+            MODELS
+                .into_iter()
+                .filter(|m| m.is_gguf() && m.vocab_family() == VocabFamily::Qwen36)
+        };
+        // Flint's card recommends temperature, top-p and top-k only.
+        assert_eq!(Model::Flint.recommended_presence_penalty(false), 0.0);
+        assert_eq!(Model::Flint.recommended_presence_penalty(true), 0.0);
         // Every Qwen 3.6/3.8 card asks for 1.5 in non-thinking mode.
         for model in qwen36() {
             assert_eq!(model.recommended_presence_penalty(false), 1.5, "{model:?}");
@@ -2713,11 +2805,17 @@ mod tests {
         assert!(!crate::serve::checkpoint_selectable(
             Model::ZImageTurboEncoder
         ));
-        // Nothing else moved family: the four GGUF checkpoints still speak the
+        // Nothing else moved family: the Qwen GGUF checkpoints still speak the
         // 3.6 vocabulary, which is what makes this a checkpoint property worth
-        // keying a tokenizer on rather than a constant.
+        // keying a tokenizer on rather than a constant. Flint is a GGUF with a
+        // vocabulary of its own.
         for model in MODELS.into_iter().filter(|m| m.is_gguf()) {
-            assert_eq!(model.vocab_family(), VocabFamily::Qwen36, "{model:?}");
+            let want = if model.arch() == Arch::Flint {
+                VocabFamily::Flint
+            } else {
+                VocabFamily::Qwen36
+            };
+            assert_eq!(model.vocab_family(), want, "{model:?}");
         }
 
         // The encoder is the entry with an encode spec, and its ceiling is its

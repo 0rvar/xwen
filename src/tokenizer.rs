@@ -1,4 +1,7 @@
-//! Wrapper around the HF `tokenizers` runtime for the Qwen BPE vocab.
+//! Wrapper around the HF `tokenizers` runtime for the byte-level BPE
+//! vocabularies: the Qwen ones and Flint's. What follows describes the Qwen
+//! (ChatML) layout; Flint's differs in its markers and stops, which
+//! [`Specials`] resolves per vocabulary.
 //!
 //! There is no BOS token and nothing is ever prepended to a prompt: the
 //! conversation begins with the chat template's first `<|im_start|>`. A turn
@@ -35,6 +38,14 @@ use anyhow::{Result, anyhow, bail};
 /// once.
 pub(crate) static EMBEDDED_TOKENIZER_JSON: &[u8] = include_bytes!("../reference/tokenizer.json");
 
+/// Flint's `tokenizer.json`, embedded verbatim for the same reasons as the
+/// Qwen 3.6 one: its checkpoint ships as a GGUF, which carries no
+/// `tokenizer.json`, and the vocabulary is a compile-time input. Byte-identical
+/// to the file in `RecursiveSI/flint`; its tokens match the GGUF's own
+/// `tokenizer.ggml.tokens` one for one (`tests::the_embedded_flint_vocabulary_is_the_gguf_one`).
+pub(crate) static EMBEDDED_FLINT_TOKENIZER_JSON: &[u8] =
+    include_bytes!("../reference/flint/tokenizer.json");
+
 /// The byte-level BPE alphabet, inverted: each of the 256 printable stand-in
 /// characters a BPE vocab entry spells a byte with, mapped back to that byte.
 /// This is GPT-2's `bytes_to_unicode` reversed — the three printable Latin-1
@@ -59,24 +70,31 @@ fn byte_level_inverse() -> std::collections::HashMap<char, u8> {
     inverse
 }
 
-/// The ids of the structural markers a ChatML vocabulary is built around,
-/// resolved from the tokenizer's own added vocabulary by token TEXT.
+/// The ids of the structural markers a vocabulary is built around, resolved
+/// from the tokenizer's own added vocabulary by token TEXT.
 ///
-/// Every marker is a single added token in every Qwen vocabulary, but the ids
-/// differ between checkpoint families (Qwen 3.6/3.8 number them in the 248k
-/// range, Qwen3 in the 151k one), so code that recognizes a marker by id must
-/// read it from the tokenizer it is running against rather than from a
-/// compile-time constant. The struct is `Copy`, so a caller that needs the ids
-/// past the tokenizer's borrow takes a copy and carries it.
+/// Two layouts exist. The Qwen vocabularies are ChatML: `<|im_start|>` and
+/// `<|im_end|>` bracket every turn and `<|endoftext|>` ends the document, and
+/// the ids differ between families (Qwen 3.6/3.8 number them in the 248k range,
+/// Qwen3 in the 151k one). Flint's is GLM-style: a role marker opens each turn,
+/// nothing closes one, and a reply ends on `<|end_of_text|>` or on any marker
+/// that would hand the turn to someone else. The reasoning and tool markers are
+/// spelled the same in both. Code that recognizes a marker by id therefore reads
+/// it from the tokenizer it is running against rather than from a compile-time
+/// constant. The struct is `Copy`, so a caller that needs the ids past the
+/// tokenizer's borrow takes a copy and carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Specials {
-    /// `<|endoftext|>` — the document terminator, and the id used wherever a
-    /// slot must be filled with something inert. One of the two EOG ids.
+    /// The document terminator — `<|endoftext|>` in ChatML, `<|end_of_text|>`
+    /// in Flint's vocabulary — and the id used wherever a slot must be filled
+    /// with something inert. Always an EOG id.
     pub endoftext: u32,
-    /// `<|im_start|>` — opens a ChatML turn header.
-    pub im_start: u32,
-    /// `<|im_end|>` — closes a ChatML turn. The other EOG id.
-    pub im_end: u32,
+    /// `<|im_start|>` — opens a ChatML turn header. `None` in a vocabulary
+    /// without ChatML.
+    pub im_start: Option<u32>,
+    /// `<|im_end|>` — closes a ChatML turn, and an EOG id. `None` in a
+    /// vocabulary without ChatML.
+    pub im_end: Option<u32>,
     /// `<think>` — opens the reasoning block.
     pub think_open: u32,
     /// `</think>` — closes it. Generation code gates on this by id (the think
@@ -84,86 +102,127 @@ pub struct Specials {
     /// split), which is why it must be the running vocabulary's own.
     pub think_close: u32,
     /// `<tool_call>` / `</tool_call>` — bracket one function call the assistant
-    /// wrote. The call's body is ordinary text, not vocabulary entries.
+    /// wrote. The call's body is ordinary text in ChatML; in Flint's vocabulary
+    /// its `<arg_key>` / `<arg_value>` delimiters are added tokens of their own.
     pub tool_call_open: u32,
     pub tool_call_close: u32,
-    /// `<tool_response>` / `</tool_response>` — bracket one tool result inside
-    /// the user turn that carries results back to the model.
+    /// `<tool_response>` / `</tool_response>` — bracket one tool result.
     pub tool_response_open: u32,
     pub tool_response_close: u32,
+    /// The end-of-generation ids, in [`Specials::eog`]'s order; the first
+    /// `eog_len` entries are live.
+    eog: [u32; Specials::MAX_EOG],
+    eog_len: usize,
 }
 
 impl Specials {
-    /// End-of-generation tokens: `<|im_end|>` ends the assistant's turn,
-    /// `<|endoftext|>` ends the document. Generation stops on EITHER; watching
-    /// only one lets decoding run past the turn boundary and continue the
-    /// conversation on its own. The order matches
-    /// [`LagunaTokenizer::EOG`], which callers that compare the two rely on.
-    pub fn eog(&self) -> [u32; 2] {
-        [self.im_end, self.endoftext]
+    const MAX_EOG: usize = 4;
+
+    /// The markers a ChatML vocabulary must carry. `<|im_end|>` ends the
+    /// assistant's turn and `<|endoftext|>` ends the document; generation stops
+    /// on EITHER, and watching only one lets decoding run past the turn boundary
+    /// and continue the conversation on its own. That order is
+    /// [`LagunaTokenizer::EOG`]'s, which callers that compare the two rely on.
+    const CHATML_EOG: [&'static str; 2] = ["<|im_end|>", "<|endoftext|>"];
+
+    /// Flint's stop markers, in `generation_config.json`'s order: the document
+    /// end and the three role markers that hand the turn to someone other than
+    /// the assistant. The vocabulary has no end-of-turn token, so a reply that
+    /// is done writes the next turn's opener; stopping on only the first of
+    /// these runs straight on into a user turn the model invented.
+    const FLINT_EOG: [&'static str; 4] = [
+        "<|end_of_text|>",
+        "<|user|>",
+        "<|observation|>",
+        "<|developer|>",
+    ];
+
+    /// The markers both layouts share, by text.
+    const SHARED: [&'static str; 6] = [
+        "<think>",
+        "</think>",
+        "<tool_call>",
+        "</tool_call>",
+        "<tool_response>",
+        "</tool_response>",
+    ];
+
+    /// End-of-generation ids. Generation stops on any of them.
+    pub fn eog(&self) -> &[u32] {
+        &self.eog[..self.eog_len]
     }
 
-    /// Padding / fallback id. No Qwen vocabulary has a dedicated pad entry, so
-    /// `<|endoftext|>` serves.
+    /// Padding / fallback id. No vocabulary here has a dedicated pad entry, so
+    /// the document terminator serves (Flint's `pad_token_id` is that id too).
     pub fn pad(&self) -> u32 {
         self.endoftext
     }
 
-    /// Every marker, in the order the struct declares them, paired with the id
-    /// each resolved to. The one list both `resolve` and its collision check
-    /// walk, so neither can cover a marker the other misses.
-    fn entries(&self) -> [(&'static str, u32); 9] {
-        [
-            ("<|endoftext|>", self.endoftext),
-            ("<|im_start|>", self.im_start),
-            ("<|im_end|>", self.im_end),
-            ("<think>", self.think_open),
-            ("</think>", self.think_close),
-            ("<tool_call>", self.tool_call_open),
-            ("</tool_call>", self.tool_call_close),
-            ("<tool_response>", self.tool_response_open),
-            ("</tool_response>", self.tool_response_close),
-        ]
-    }
-
     /// Resolve every marker through an added-vocabulary lookup.
     ///
-    /// Two ways a vocabulary is refused rather than run with, both by name. A
-    /// missing marker has no rendering for the chat template at all. Two
-    /// markers sharing one id is worse than useless: the decode loop tells
-    /// sections apart BY id, so a vocabulary where (say) `<think>` and
-    /// `</think>` collide would close a reasoning block the moment it opened,
-    /// and one where `<|im_end|>` collides with anything would stop generation
-    /// on ordinary output. Neither failure is visible in the token stream.
+    /// The layout is read off the vocabulary: `<|im_start|>` makes it ChatML,
+    /// otherwise `<|assistant|>` makes it Flint's. Two ways a vocabulary is
+    /// refused rather than run with, both by name. A missing marker has no
+    /// rendering for the chat template at all. Two markers sharing one id is
+    /// worse than useless: the decode loop tells sections apart BY id, so a
+    /// vocabulary where (say) `<think>` and `</think>` collide would close a
+    /// reasoning block the moment it opened, and one where an EOG id collides
+    /// with anything would stop generation on ordinary output. Neither failure
+    /// is visible in the token stream.
     ///
     /// A single text mapping to two ids cannot happen — the lookup is a map
     /// keyed by text — so the check that remains is the other direction.
     fn resolve(lookup: impl Fn(&str) -> Option<u32>) -> Result<Self> {
+        let chatml = lookup("<|im_start|>").is_some() || lookup("<|assistant|>").is_none();
         let id = |text: &str| -> Result<u32> {
             lookup(text)
                 .ok_or_else(|| anyhow!("the tokenizer's added vocabulary has no {text:?} token"))
         };
-        let specials = Self {
-            endoftext: id("<|endoftext|>")?,
-            im_start: id("<|im_start|>")?,
-            im_end: id("<|im_end|>")?,
-            think_open: id("<think>")?,
-            think_close: id("</think>")?,
-            tool_call_open: id("<tool_call>")?,
-            tool_call_close: id("</tool_call>")?,
-            tool_response_open: id("<tool_response>")?,
-            tool_response_close: id("</tool_response>")?,
+        let (eog_texts, extra): (&[&str], &[&str]) = if chatml {
+            (&Self::CHATML_EOG, &["<|im_start|>"])
+        } else {
+            (&Self::FLINT_EOG, &["<|assistant|>"])
         };
-        let entries = specials.entries();
-        for (i, (text, id)) in entries.iter().enumerate() {
-            if let Some((other, _)) = entries[..i].iter().find(|(_, seen)| seen == id) {
+        let mut checked: Vec<(&str, u32)> = Vec::new();
+        for text in eog_texts.iter().chain(extra).chain(&Self::SHARED) {
+            checked.push((text, id(text)?));
+        }
+        for (i, (text, id)) in checked.iter().enumerate() {
+            if let Some((other, _)) = checked[..i].iter().find(|(_, seen)| seen == id) {
                 bail!(
                     "the tokenizer's added vocabulary maps {other:?} and {text:?} to the same id \
                      {id}; the structural markers have to be distinct tokens"
                 );
             }
         }
-        Ok(specials)
+        let of = |text: &str| {
+            checked
+                .iter()
+                .find(|(seen, _)| *seen == text)
+                .map(|&(_, id)| id)
+                .expect("every checked text was resolved above")
+        };
+        let mut eog = [0; Self::MAX_EOG];
+        for (slot, text) in eog.iter_mut().zip(eog_texts) {
+            *slot = of(text);
+        }
+        Ok(Self {
+            endoftext: of(if chatml {
+                "<|endoftext|>"
+            } else {
+                "<|end_of_text|>"
+            }),
+            im_start: chatml.then(|| of("<|im_start|>")),
+            im_end: chatml.then(|| of("<|im_end|>")),
+            think_open: of("<think>"),
+            think_close: of("</think>"),
+            tool_call_open: of("<tool_call>"),
+            tool_call_close: of("</tool_call>"),
+            tool_response_open: of("<tool_response>"),
+            tool_response_close: of("</tool_response>"),
+            eog,
+            eog_len: eog_texts.len(),
+        })
     }
 }
 
@@ -198,6 +257,9 @@ pub struct LagunaTokenizer {
     /// [`crate::constrain::for_tokenizer`] rather than being handed a path
     /// separately and hoping it matches.
     source: Option<PathBuf>,
+    /// The compiled-in bytes this was parsed from, or `None` for a file. The
+    /// embedded counterpart of `source`, for the same reason.
+    embedded: Option<&'static [u8]>,
 }
 
 impl LagunaTokenizer {
@@ -250,9 +312,21 @@ impl LagunaTokenizer {
     /// is a compile-time input, not a runtime download. Changing the embedded
     /// file changes the token stream: bump `chat::TOKENIZATION_RULES_VERSION`.
     pub fn embedded() -> Result<Self> {
-        let inner = tokenizers::Tokenizer::from_bytes(EMBEDDED_TOKENIZER_JSON)
+        Self::from_embedded(EMBEDDED_TOKENIZER_JSON)
+    }
+
+    /// Flint's tokenizer, compiled into the binary from
+    /// `reference/flint/tokenizer.json` (see [`EMBEDDED_FLINT_TOKENIZER_JSON`]).
+    pub fn embedded_flint() -> Result<Self> {
+        Self::from_embedded(EMBEDDED_FLINT_TOKENIZER_JSON)
+    }
+
+    fn from_embedded(bytes: &'static [u8]) -> Result<Self> {
+        let inner = tokenizers::Tokenizer::from_bytes(bytes)
             .map_err(|e| anyhow!("failed to parse the embedded tokenizer: {e}"))?;
-        Self::from_inner(inner)
+        let mut tokenizer = Self::from_inner_at(inner, None)?;
+        tokenizer.embedded = Some(bytes);
+        Ok(tokenizer)
     }
 
     /// Any checkpoint's `tokenizer.json`. Nothing here is specific to one
@@ -265,10 +339,6 @@ impl LagunaTokenizer {
             .map_err(|e| anyhow!("failed to load tokenizer from {:?}: {e}", path.as_ref()))?;
         Self::from_inner_at(inner, Some(path.as_ref().to_path_buf()))
             .map_err(|e| e.context(format!("tokenizer {:?}", path.as_ref().display())))
-    }
-
-    fn from_inner(inner: tokenizers::Tokenizer) -> Result<Self> {
-        Self::from_inner_at(inner, None)
     }
 
     fn from_inner_at(inner: tokenizers::Tokenizer, source: Option<PathBuf>) -> Result<Self> {
@@ -293,6 +363,7 @@ impl LagunaTokenizer {
             plain: OnceLock::new(),
             decoded: OnceLock::new(),
             source,
+            embedded: None,
         })
     }
 
@@ -300,6 +371,12 @@ impl LagunaTokenizer {
     /// embedded one. See the field.
     pub fn source(&self) -> Option<&Path> {
         self.source.as_deref()
+    }
+
+    /// The compiled-in `tokenizer.json` bytes this vocabulary was parsed from,
+    /// or `None` when it came from a file.
+    pub(crate) fn embedded_json(&self) -> Option<&'static [u8]> {
+        self.embedded
     }
 
     /// This vocabulary's structural marker ids. Anything that recognizes a
@@ -367,7 +444,10 @@ impl LagunaTokenizer {
     /// The template never emits a proper prefix of an added token immediately
     /// before client content — content follows a newline, `<function=`,
     /// `<parameter=` or `<tools>`, and no vocabulary entry begins with any of
-    /// those — so the structural case cannot absorb client bytes either.
+    /// those — so the structural case cannot absorb client bytes either. Flint's
+    /// template puts client content right after whole added tokens (a role
+    /// marker, `<think>`, `<tool_call>`, `<arg_key>`, `<arg_value>`,
+    /// `<tool_response>`) or a newline, which holds the same.
     pub fn encode_prompt(&self, text: &str, content_ranges: &[Range<usize>]) -> Result<Vec<u32>> {
         if content_ranges.is_empty() {
             return self.encode(text);
@@ -627,8 +707,8 @@ mod tests {
         let t = tokenizer();
         let s = *t.specials();
         assert_eq!(s.endoftext, LagunaTokenizer::ENDOFTEXT);
-        assert_eq!(s.im_start, LagunaTokenizer::IM_START);
-        assert_eq!(s.im_end, LagunaTokenizer::IM_END);
+        assert_eq!(s.im_start, Some(LagunaTokenizer::IM_START));
+        assert_eq!(s.im_end, Some(LagunaTokenizer::IM_END));
         assert_eq!(s.think_open, LagunaTokenizer::THINK_OPEN);
         assert_eq!(s.think_close, LagunaTokenizer::THINK_CLOSE);
         assert_eq!(s.tool_call_open, LagunaTokenizer::TOOL_CALL_OPEN);
@@ -650,8 +730,8 @@ mod tests {
         let t = LagunaTokenizer::from_file(&path).expect("load the Qwen3 tokenizer");
         let s = *t.specials();
         assert_eq!(s.endoftext, 151_643);
-        assert_eq!(s.im_start, 151_644);
-        assert_eq!(s.im_end, 151_645);
+        assert_eq!(s.im_start, Some(151_644));
+        assert_eq!(s.im_end, Some(151_645));
         assert_eq!(s.tool_call_open, 151_657);
         assert_eq!(s.tool_call_close, 151_658);
         assert_eq!(s.tool_response_open, 151_665);
@@ -659,6 +739,113 @@ mod tests {
         assert_eq!(s.think_open, 151_667);
         assert_eq!(s.think_close, 151_668);
         assert_eq!(s.eog(), [151_645, 151_643]);
+    }
+
+    /// Flint's vocabulary resolves to the GLM-style layout: no ChatML markers,
+    /// the document end as the pad, and four stops in `generation_config.json`'s
+    /// order. These are the ids `RecursiveSI/flint`'s `tokenizer.json` declares.
+    #[test]
+    fn the_flint_vocabulary_resolves_to_its_own_ids() {
+        let t = LagunaTokenizer::embedded_flint().expect("the embedded Flint tokenizer");
+        let s = *t.specials();
+        assert_eq!(s.endoftext, 150_001);
+        assert_eq!(s.pad(), 150_001);
+        assert_eq!(s.im_start, None);
+        assert_eq!(s.im_end, None);
+        assert_eq!(s.think_open, 150_006);
+        assert_eq!(s.think_close, 150_007);
+        assert_eq!(s.tool_call_open, 150_010);
+        assert_eq!(s.tool_call_close, 150_011);
+        assert_eq!(s.tool_response_open, 150_016);
+        assert_eq!(s.tool_response_close, 150_017);
+        assert_eq!(s.eog(), [150_001, 150_003, 150_005, 150_018]);
+        assert_eq!(t.vocab_size(), crate::hub::VocabFamily::Flint.logit_width());
+        assert!(t.embedded_json().is_some() && t.source().is_none());
+        // The role markers are single tokens.
+        assert_eq!(t.encode("<|user|>hi<|assistant|>").unwrap()[0], 150_003);
+        assert_eq!(
+            *t.encode("<|user|>hi<|assistant|>").unwrap().last().unwrap(),
+            150_004
+        );
+    }
+
+    /// The embedded Flint tokenizer is the GGUF's vocabulary, token for token.
+    /// The GGUF carries no `tokenizer.json`, so this is what licenses running
+    /// it with the embedded one: every id spells the same byte-level string in
+    /// both, the added tokens included.
+    #[test]
+    fn the_embedded_flint_vocabulary_is_the_gguf_one() {
+        let Some(path) = crate::test_support::repo_file_or_skip(
+            "ggml-org/Flint-GGUF",
+            "Flint-Q4_K_M.gguf",
+            "xwen fetch --model flint",
+        ) else {
+            return;
+        };
+        let mut file = std::fs::File::open(&path).unwrap();
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
+        let tokens = content.metadata["tokenizer.ggml.tokens"]
+            .to_vec()
+            .expect("the GGUF lists its tokens");
+        let t = LagunaTokenizer::embedded_flint().unwrap();
+        assert_eq!(tokens.len(), t.vocab_size());
+        for (id, token) in tokens.iter().enumerate() {
+            let token = token.to_string().expect("a token is a string");
+            assert_eq!(
+                t.id_to_token(id as u32).as_deref(),
+                Some(token.as_str()),
+                "id {id}"
+            );
+        }
+        let pre = content.metadata["tokenizer.ggml.pre"].to_string().unwrap();
+        assert_eq!(pre.as_str(), "flint");
+    }
+
+    /// The Flint fixture prompts encode to exactly the ids llama.cpp's own
+    /// tokenizer assigns them (`scripts/flint-fixtures.ts` regenerates the
+    /// file), and decode back to their text. The vocabulary declares no
+    /// normalizer, so a decomposed spelling is in the corpus too: unlike the
+    /// Qwen vocabularies, the two pipelines agree on it.
+    #[test]
+    fn the_flint_fixture_prompts_round_trip_against_the_oracles_ids() {
+        let t = LagunaTokenizer::embedded_flint().unwrap();
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/flint-prompts.json"))
+                .expect("the fixture file is JSON");
+        let prompts = fixtures["prompts"].as_array().unwrap();
+        assert!(prompts.len() >= 24, "the fixture corpus shrank");
+        let mut longest = 0;
+        for prompt in prompts {
+            let id = prompt["id"].as_str().unwrap();
+            let text = prompt["text"].as_str().unwrap();
+            let expected: Vec<u32> = prompt["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            longest = longest.max(expected.len());
+            assert_eq!(t.encode(text).unwrap(), expected, "encode differs on {id}");
+            assert_eq!(t.decode(&expected).unwrap(), text, "decode differs on {id}");
+        }
+        assert!(longest > 1000, "longest is {longest} tokens");
+    }
+
+    /// The grammar crate parses the same file through its own (older)
+    /// `tokenizers`, Flint's pre-tokenizer sequence included, and its trie
+    /// agrees with this tokenizer on what a token's bytes are.
+    #[test]
+    fn the_grammar_trie_reads_the_flint_tokenizer() {
+        let t = LagunaTokenizer::embedded_flint().unwrap();
+        let factory =
+            crate::constrain::for_tokenizer(&t, crate::hub::VocabFamily::Flint.logit_width())
+                .expect("the trie builds over the Flint vocabulary");
+        // The second call is the process-shared one.
+        let again =
+            crate::constrain::for_tokenizer(&t, crate::hub::VocabFamily::Flint.logit_width())
+                .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&factory, &again));
+        assert!(crate::constrain::for_tokenizer(&t, LagunaTokenizer::PADDED_VOCAB).is_err());
     }
 
     /// A vocabulary that maps two markers to one id is refused by name.

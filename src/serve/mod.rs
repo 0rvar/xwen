@@ -1278,6 +1278,17 @@ pub(crate) fn submit(
             "max_tokens must be at least 1".to_string(),
         ));
     }
+    // Flint's tool-call format renders (`chat::ChatDialect::supports_tools`),
+    // but the engine's call parser reads the Qwen 3.6 `<function=…>` form only,
+    // so a call the model writes would come back as text. Refused until the
+    // GLM-style `<arg_key>`/`<arg_value>` parser exists.
+    if !request.tools.is_empty() && model.model.chat_dialect() == crate::chat::ChatDialect::Flint {
+        return Err(SubmitError::Invalid(format!(
+            "{} cannot take tools on this server yet: its tool-call format is rendered but \
+             not parsed back out of a reply; send the request without tools",
+            model.model.full_name()
+        )));
+    }
     // The vocabulary follows the TARGET, never the process: a request naming
     // the other family is encoded with that family's ids, and one naming a
     // family this machine holds no tokenizer for is refused here rather than
@@ -1734,6 +1745,7 @@ pub(crate) mod testutil {
             .iter()
             .map(|message| match message {
                 Message::System(text) => format!("system:{text}"),
+                Message::Developer(text) => format!("developer:{text}"),
                 Message::User(text) => format!("user:{text}"),
                 Message::Assistant {
                     content, reasoning, ..
@@ -2021,7 +2033,8 @@ mod tests {
                 "Z-Image-Turbo-text-encoder",
                 "Z-Image-Turbo",
                 "Qwen-Image-2.1-text-encoder",
-                "Qwen-Image-2.1"
+                "Qwen-Image-2.1",
+                "Flint"
             ],
             "the served checkpoint leads and appears once"
         );

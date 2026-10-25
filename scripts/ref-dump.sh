@@ -44,7 +44,6 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
-bin="$root/reference/llama.cpp/build/bin"
 
 model=""
 prompt=""
@@ -72,8 +71,16 @@ done
 case "$arch" in
   qwen35) fixtures="$root/tests/fixtures/parity-prompts.json";;
   qwen3)  fixtures="$root/tests/fixtures/qwen3-prompts.json";;
-  *) echo "error: --arch must be qwen35 or qwen3, got: $arch" >&2; exit 2;;
+  flint)  fixtures="$root/tests/fixtures/flint-prompts.json";;
+  *) echo "error: --arch must be qwen35, qwen3 or flint, got: $arch" >&2; exit 2;;
 esac
+# Flint is graded against its own pinned checkout, reference/llama.cpp-flint (the
+# main pin predates it). XWEN_LLAMACPP_BIN overrides either default.
+if [[ "$arch" == flint ]]; then
+  bin="${XWEN_LLAMACPP_BIN:-$root/reference/llama.cpp-flint/build/bin}"
+else
+  bin="${XWEN_LLAMACPP_BIN:-$root/reference/llama.cpp/build/bin}"
+fi
 
 [[ -n "$model"  ]] || { echo "error: -m/--model is required" >&2; exit 2; }
 [[ -n "$outdir" ]] || { echo "error: -o/--out is required" >&2; exit 2; }
