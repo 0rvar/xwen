@@ -4,6 +4,25 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-10-25 — Flint runs and passes parity against llama.cpp Metal
+
+Flint (`ggml-org/Flint-GGUF`, Q4_K_M, 23.4 GB, alias `flint`) is a design target as of
+today. It is servable on every language surface and `xwen generate` was run on it end to
+end; serve and batch are covered by unit tests only. It is a 40B-A2.5B MoE
+trained from scratch, with sliding-window and NoPE attention, learned sinks, sigmoid
+routing and its own vocabulary. The attention is a new `Mixer::Flint` on an f32 path,
+everything else is the trunk's, and the laguna-era ring cache is finally built. Against
+llama.cpp Metal at a37cc461, pinned as a second checkout (b767234; code ca415f8), xwen reads argmax
+0.970, top-5 0.949 and mean |Δ| 0.210 over 2562 positions. llama.cpp's own CPU backend
+reads 0.907 / 0.863 / 0.613 against the same fixture, so that is the bar; dropping the
+sinks reads 0.047. The tokenizer matches `llama-tokenize` on 25 prompts and the template
+llama-server on 14 conversations. Two limits were found and left for the kernel arc:
+prefill computes each layer 2-4% off exact where decode is at 2e-7, from f16 weight tiles,
+and the f32 attention's memory grows to 31.9 GB at 57k tokens, so long prompts are
+refused. Tools are a 400 on serve until a call parser exists. No figures: low power mode,
+unpinned. [Record](records/flint-correctness.md),
+[decisions](decisions/flint.md).
+
 ## 2026-09-21 — Qwen-Image 2.1 is served, and its VAE decodes on the direct conv
 
 Two units the same evening. The images routes serve the model by full name (3ccb17b): one

@@ -15,7 +15,8 @@ verified by forced replay against llama.cpp (`docs/qwen4exp-port.md`). Decode ra
 in Speculative decoding below and, in full, in `docs/perf-state.md`. See `TODO.md` for
 the open ledger and `docs/log.md` for the timeline. A fifth architecture, dense Qwen3-4B
 in HF safetensors, runs on every surface too (Models, below); its encoder path passes
-its own reference gate at cosine 0.99999449.
+its own reference gate at cosine 0.99999449. Flint, a non-Qwen MoE GGUF, joined on
+2026-10-25 and passes its own parity gate against llama.cpp (Models, below).
 
 **And since 2026-09-07 one thing here is not a language model.** `xwen image` renders a
 prompt to a PNG through the Z-Image-Turbo diffusion pipeline, conditioned on that same
@@ -201,6 +202,28 @@ corrupt plane. The library entry point is `XwenModel::encode`, which is what the
 diffusion pipelines call in process. `docs/qwen3-dense.md` has the architecture and
 the measured verification numbers, `docs/zimage.md` has the encoder role and the
 corruption.
+
+**Flint** (2026-10-25) is a sixth GGUF checkpoint and the first language model here that
+is not Qwen: Recursive's 40B-A2.5B coding-agent MoE, with its own vocabulary and chat
+template.
+
+| Full name | Repo | `--model` | Drafter |
+| --- | --- | --- | --- |
+| `Flint` | `ggml-org/Flint-GGUF`, Q4_K_M, 23.4 GB | `flint` | none |
+
+```bash
+xwen fetch --model flint
+xwen chat --model flint
+```
+
+It is not auto-fetched, so `xwen fetch` puts it in the cache, and serve lists it and
+selects it by full name only while it is cached. It passes a parity gate against
+llama.cpp (`docs/parity.md`, "The Flint track"). This first version runs its attention
+on an unoptimized f32 path, so it is slower than it will be, and prompts past roughly 60k
+tokens are refused for memory. On serve a request with `tools` is a 400 until a parser
+for Flint's tool-call format lands; the CLI renders tools in the prompt. The model always
+decides for itself whether to think, so `--no-think` and `enable_thinking: false` do
+nothing on it, and a `developer` message renders as Flint's own developer turn.
 
 **One entry is not a language model at all** (2026-09-07): the Z-Image-Turbo diffusion
 pipeline, which is what `xwen image` runs. Qwen-Image 2.1 joined it on 2026-09-21, on the

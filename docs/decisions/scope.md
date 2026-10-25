@@ -48,3 +48,10 @@ called for one hidden state; the reason it is not a tok/s target is that a denoi
 is prefill-shaped compute where none of the shipped checkpoints' decode levers apply, so
 a lever found here would not transfer and a lever found there is not owed to it. The
 pipeline's own decisions are in [zimage.md](zimage.md) (2026-09-07).
+
+**Flint is a tok/s target beside the Qwen checkpoints, by the owner's decision of
+2026-10-25.** Unlike the dense 4B and the image pipelines this is a target amendment: Flint
+is held to the same rule as the 35B-A3B, maximum tok/s on this machine at batch 1, and an
+arc of it may argue for a hot-path change on its own behalf. It is the first target that is
+not a Qwen model, with its own vocabulary and chat template. What was decided about it is
+in [flint.md](flint.md) (2026-10-25).

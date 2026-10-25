@@ -1097,6 +1097,85 @@ would pass it. Decision paragraph in
 [decisions/ground-truth-and-parity.md](decisions/ground-truth-and-parity.md), the
 argument in [records/qwen3-dense.md](records/qwen3-dense.md).
 
+## The Flint track
+
+Flint is GGUF like the Qwen checkpoints, but the main oracle pin predates it, so its oracle
+is a second checkout, `reference/llama.cpp-flint` at a37cc461 (the Flint merge), and its
+gate grades per-position logits the way the Qwen3 track's Stage 1 does. Decisions and the
+argument for the bars: [decisions/flint.md](decisions/flint.md); the numbers and the
+brackets: [records/flint-correctness.md](records/flint-correctness.md).
+
+**The oracle build.** `just init` fetches both submodules. This llama.cpp revision only
+builds the server and cli with `LLAMA_UI_GZIP=OFF`, which the script passes:
+
+```
+bash scripts/build-llamacpp.sh reference/llama.cpp-flint
+```
+
+Every Flint script defaults to `reference/llama.cpp-flint/build/bin` and
+`XWEN_LLAMACPP_BIN` overrides it. `scripts/ref-dump.sh --arch flint` runs eval-callback
+against it for per-layer taps; the `flint` tap table in `scripts/parity.ts` maps every
+tap by name except `attn_o_proj`, which has no match.
+
+**Tokenizer and template.** `bun scripts/flint-fixtures.ts` regenerates
+`tests/fixtures/flint-prompts.json` (25 prompts) from `llama-tokenize`, and
+`src/tokenizer.rs` asserts the embedded tokenizer reproduces every id. Flint's tokenizer
+has no normalizer, so the fixtures are valid for any input. `bun
+scripts/verify_chat_template_flint.ts` checks `tests/fixtures/flint-chat.json` (14
+conversations) byte for byte through llama-server's `/apply-template`, on the GGUF's own
+template and on the vendored copy. The developer-turn case is marked `template_only` and
+skipped there, because llama-server rewrites `developer` to `system` before the template
+runs; `src/chat.rs` grades it against the jinja.
+
+**The logits gate.** The fixture `tests/fixtures/flint-parity.json` holds llama.cpp
+Metal's top-10 ids and logits at every position of seven prompts, 2562 positions, and
+records its backend; the test refuses a fixture not made on Metal. Regenerate with:
+
+```
+bun scripts/flint-ref-logits.ts --out-dir /tmp/flint-ref-metal
+XWEN_REQUIRE_HF_CACHE=1 cargo test --release --test flint_parity -- --ignored --nocapture
+```
+
+The script defaults to `--n-gpu-layers 99`. The gate prefills every prompt at chunk 512
+and at the shipped 2048, then prefills one prompt to 300 and decodes it one token at a
+time to 602, across the 513-slot ring. Pooled bars, argmax / top-5 / mean |Δlogit|:
+
+| bar | argmax | top-5 | mean | measured 2026-10-25 |
+| --- | --- | --- | --- | --- |
+| acceptance | ≥ 0.88 | ≥ 0.85 | ≤ 0.65 | |
+| regression, prefill | ≥ 0.955 | ≥ 0.93 | ≤ 0.26 | 0.970 / 0.949 / 0.210 at 512, 0.972 / 0.947 / 0.203 at 2048 |
+| regression, decode | ≥ 0.92 | ≥ 0.90 | ≤ 0.30 | 0.940 / 0.921 / 0.238 |
+| worst 64-position window | ≥ 0.82 | ≥ 0.82 | ≤ 0.75 | 0.922 / 0.894 / 0.638 prefill, 0.891 / 0.866 / 0.445 decode |
+
+The acceptance bar is llama.cpp CPU against Metal on the same fixture (0.907 / 0.863 /
+0.613): a bar tighter than the oracle's own backends would grade the backend. Three wrong
+graphs run over every prompt through `XwenModel::load_flint_wrong_graph`. Sinks dropped
+and rope on every layer must fail every bar, and do by a wide margin. A window one short
+(512) is reported and not asserted, because it reads 0.969 / 0.945 / 0.214, inside the
+noise. The window is held exactly by
+`flint::attention::tests::the_sliding_ring_attends_exactly_the_window`, which drives the
+ring, the mask and both attention arms against the definition at 1e-5 and asserts it sees
+512. Per-prompt lines that print `regress FAIL` on short prompts are informational; only
+the pooled lines gate. `XWEN_FLINT_PARITY_QUICK=<n>` scores the first `n` prompts for
+bisecting and never passes.
+
+**Chunk invariance.** `tests/flint_chunks.rs` runs a 2200-token prompt once in one chunk
+and again under single rows, 7, 512, 513, 514 and 2048, and one-token decode from 400,
+grading the hidden states from `attn_norm-0` to `ffn_norm-2` by worst per-position
+relative L2. Multi-row schedules are held to 4e-3 (worst measured 1.7e-3). Single-row
+schedules get 3e-3 through `ffn_norm-0` and 0.35 after it: a single row runs the exact
+gemv where the one-shot run's matmul stages weights as f16, a 2-4% per-layer gap on this
+model. Past the first router nothing is chunk-invariant even on the f32 path, so the test
+stops there.
+
+```
+XWEN_REQUIRE_HF_CACHE=1 cargo test --release --test flint_chunks -- --ignored --nocapture
+```
+
+**The kernel arc's oracle.** `XWEN_FLINT_ATTN=reference` runs the frozen f32 attention
+with the sink column; the production arm is what a kernel replaces, and a kernel is graded
+against the reference on captured activations before it is graded end to end here.
+
 ## Limitations
 
 - The gate compares against llama.cpp's implementation, not against HF transformers;

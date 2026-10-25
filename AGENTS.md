@@ -93,6 +93,10 @@ Rules for keeping it that way:
   behalf. A denoising step is prefill-shaped compute, so the decode levers here do not
   transfer either way (decisions.md "Diffusion image transformers are in scope, held to
   correctness bars first").
+  **Amended 2026-10-25, by the owner:** Flint (`ggml-org/Flint-GGUF`, Q4_K_M) is a tok/s
+  target beside the Qwen checkpoints, on their terms and not the 4B's: a target
+  amendment, so an arc of it may argue for a hot-path change on its own behalf. It is the
+  first target that is not a Qwen model (decisions.md "Flint is a design target").
 - TODO.md is the deferred-work ledger. Scope is never silently dropped: it ships, it
   becomes a ledger item with context, or it is retired with a dated reason and a reopen
   condition (retired means not planned, not forbidden). Ledger text is never deleted:
@@ -693,6 +697,85 @@ mean relative error 0.04) with two wrong graphs asserted outside, and the VAE al
 60 dB. It reads cosine 1.000000 and 0.0006, brackets 0.9825 and 0.9874, VAE 91.07 dB and
 a 40-step image at 57.30 dB. The dump commands are in docs/qwen-image.md. **There is no
 time-per-image figure**: every timing so far was unpinned and in low power mode.
+
+## Flint (`flint`, ggml-org GGUF)
+
+A design target since 2026-10-25, and the first language model here that is not Qwen:
+Recursive's 40B-A2.5B coding-agent MoE, trained from scratch, `ggml-org/Flint-GGUF`
+Q4_K_M (23.4 GB, one file), alias `flint`, full name `Flint`.
+[decisions/flint.md](docs/decisions/flint.md) is the decisions,
+[records/flint-correctness.md](docs/records/flint-correctness.md) the arc. Ground truth is
+llama.cpp `src/models/flint.cpp` at a37cc461 and the GGUF's own metadata, in that order;
+transformers' `modular_flint.py` is for intent.
+
+Shape: 49 layers, hidden 2048, 32 Q / 4 KV heads of 128 (KV head `h / 8`), separate
+q/k/v, QK-RMSNorm [128] before rope, scale 1/√128, no output gate, untied head, vocab
+150144. 35 layers are sliding (window 513) with NEoX rope over all 128 dims at theta 1e4;
+14 are full attention with NO rope, at 0, 1, 5, 9, ..., 45, 48. The GGUF says which in two
+identical bool[49] arrays, `sliding_window_pattern` and `rope_pattern`, `true` meaning
+sliding and roped. Layers 0-1 are dense SwiGLU 6144, the other 47 MoE: 256 experts of 512,
+sigmoid over all of them, top-6, renormalized (same 6.1e-5 clamp), plus an UNGATED shared
+expert of 1024. The pre-FFN norm tensor is `ffn_norm`, not `post_attention_norm`. Stops
+are 150001, 150003, 150005 and 150018, resolved by text from the vocabulary; the GGUF
+advertises only 150001, and the Qwen stop ids are never folded in.
+
+The seams, so a change lands in one place:
+
+- **`Mixer::Flint(FlintAttn)`, `src/flint/attention.rs`**, is the only new block; the
+  residual, norms, `DenseMlp`, `MoeBlock`, taps and head are the trunk's, and the FFN is
+  chosen per layer. Two arms behind `XWEN_FLINT_ATTN`: `production` (the default,
+  `AttnImpl::SHIPPED`) and `reference`, the frozen f32 oracle with an explicit sink column
+  that the kernel arc is graded against. Never optimize `reference_attention`; a kernel
+  replaces `production_attention`. Both are f32 today, and production caps its score tile
+  at 256 MiB.
+- **`LayerCache::Swa` is reachable now**, built from `LayerKind::Swa { window }`. Its
+  rollback, snapshot and disk framing predate Flint; `CacheGeometry` counts only the 14
+  full layers for KV and adds the rings to a snapshot.
+- **`Gating::Sigmoid`** runs the candle chain. The fused router kernel and the fused
+  epilogue need softmax gating AND a gated shared expert, and whether a shared expert is
+  gated is read from the file (`ffn_gate_inp_shexp` present), never from the gating kind.
+- **The vocabulary is `VocabFamily::Flint`**, its `tokenizer.json` embedded
+  (`LagunaTokenizer::embedded_flint()`); `Specials` reads the layout off the vocabulary, so
+  `im_start`/`im_end` are `Option` and `eog()` is a slice. A test holds the embedded
+  tokenizer token-for-token equal to the GGUF's. A server builds it only when Flint is
+  selectable.
+- **`ChatDialect::Flint`** is its own builder (`build_flint_parts`): GLM-like role
+  markers, no turn terminator, client text sanitized the way the template does it, every
+  assistant turn replays its reasoning, generation prompt `<|assistant|>`, thinking
+  MODEL-opened. Thinking off is a no-op, not an error and not an empty block. `developer`
+  is its own role (`Message::Developer`), rendered as a system turn on every Qwen dialect,
+  and on Flint serve's `push_turn` neither merges same-role turns nor demotes a late
+  system message (`renders_turns_in_place`). Tools render on the CLI and are a 400 on serve
+  until a parser for `<arg_key>`/`<arg_value>` exists.
+- **The oracle is `reference/llama.cpp-flint` at a37cc461**, a second submodule so the
+  main pin's floors never move; `bash scripts/build-llamacpp.sh reference/llama.cpp-flint`
+  builds it, and this revision needs `LLAMA_UI_GZIP=OFF`, which the script passes. Every
+  Flint script defaults to its bin dir. The gate is `tests/flint_parity.rs`, the chunk
+  test `tests/flint_chunks.rs` (docs/parity.md "The Flint track").
+
+Traps that are silent:
+
+- **Sinks** are raw, unscaled logits in the softmax denominator with no value. Dropping
+  them still produces text; it reads argmax 0.047 against the oracle.
+- **The full layers have no rope**, and the window counts the current position: 513 keys,
+  512 back.
+- **The routed down-projection input reaches 297,857**, 4.5x f16. The default prefill
+  `mm_id` stages it as half and the per-column rescale (`needs_rescale`) is what keeps it
+  finite; a new prefill path for the experts must keep that guard or read f32.
+- **Prefill is 2-4% off exact per layer and decode is at 2e-7.** The prefill matmuls stage
+  the weight tile as f16, and Flint's down projections cancel hard enough to amplify it.
+  llama.cpp Metal does the same, so the parity gate cannot see it. Measured, not fixed.
+- **Nothing past the first router is chunk-invariant**, even all-f32: a near-tie sigmoid
+  router flips on last-place rounding and attention spreads it. Grade chunking on hidden
+  states up to `ffn_norm-2`, never on logits.
+- **No logits bar can see a window off by one** (512 reads inside the oracle's own
+  noise). The ring test in `flint::attention` holds the window exactly; keep it.
+- **The oracle's own backends disagree**: llama.cpp CPU against Metal reads argmax 0.907.
+  That is the acceptance bar, and a CPU-made fixture is refused, its distance from Metal
+  being the bar's whole width.
+- **Memory grows superlinearly with context** on the f32 attention, 31.9 GB beyond the
+  weights at 57k tokens, so admission prices it at KV growth (`flint_scratch_bytes`) and a
+  prompt past roughly 60k is refused. The kernel arc is expected to lift it.
 
 ## The candle situation
 

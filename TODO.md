@@ -149,17 +149,44 @@ the Z-Image load transient, a measured admission gap of about 8 GB that has not 
 a run. Editing (plan Phase 5) is the owner's next feature and is an arc to open, not a
 lever to rank.]
 
+[Amended 2026-10-25, after the Flint correctness arc
+(log.md "Flint runs and passes parity against llama.cpp Metal"): Flint is a design target
+as of today and its kernel arc takes the empty tenth place, ranked second. Nothing is demoted. It ranks below the drafting
+retune, which is a measured loss on a shipped default, and above every other lever,
+because Flint's decode runs at roughly a third of the 35B-A3B's class on an f32 attention
+the arc built as an oracle, and the owner has just admitted it as a target. Three Flint
+items enter the area sections and not the Front: the prefill precision gap and the
+long-context memory, which the kernel arc is expected to move and should be re-priced
+after it, and the serve tool-call parser.]
+
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
-2. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
-3. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
-4. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
-5. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
-6. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
-7. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
-8. **Joules per byte and per FLOP on this machine, read under the power script** (Image generation, measured, an instrument): a 1024x1024 step is 65 J at the 35 W plateau and the split between its ~59 TFLOP and ~110-120 GB of traffic is the one number that prices every remaining image row; an hour, and it decides whether the q/k/v chain fusion is worth 4% or 10%
-9. **A time-per-image figure for Qwen-Image 2.1** (Image generation, small): perf-state.md has the section and no figure, every timing so far being low power mode on an unpinned build; the owner is rendering with the model, the direct-conv arm it waited on landed in 1e028be, and an hour with a pinned binary settles how much of the 5.3-6.1 s a step at 1024x1024 is the power mode
+2. **Flint's attention and MoE glue run on reference paths: sinks in the flash kernel, a decode kernel with sinks, the sigmoid router arm** (Decode performance, measured): Flint decodes 47.7 tok/s short and 23.7 at 3.6k on the f32 attention, against an estimated bytes-only ceiling in the 35B-A3B's range (~2.3 GB/token) where the 35B reads 127.0; the same kernel retires the superlinear memory that refuses prompts past ~60k
+3. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
+4. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
+5. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
+6. **Hyper-connection activation traffic: ~8% of wall estimated** (Prefill performance, measured): 0.39 s of 3.4 s prefill wall (11.3%) by the probe, and the whole-gate fusion is the kernel work the decode gate already shipped
+7. **Reduce candle's CPU-side locking per dispatch** (Research candidates, measured): 1740 dispatches x 2.4 us is ~4.2 ms of a 19-21 ms token and it attacks the floor every fusion here buys against; the first step is a cheap CPU-vs-wall read
+8. **Prefill runs candle sdpa with a materialized mask, not the vendored flash kernel** (Prefill performance, measured): attention is 77-81% of the 35B's 128k prefill (156-161 s of 200) and roughly a third of Flash-Next's after the sparse tiles, the largest measured prefill bounty on the ledger; a flash kernel at head dim 256 is the lever on both
+9. **Joules per byte and per FLOP on this machine, read under the power script** (Image generation, measured, an instrument): a 1024x1024 step is 65 J at the 35 W plateau and the split between its ~59 TFLOP and ~110-120 GB of traffic is the one number that prices every remaining image row; an hour, and it decides whether the q/k/v chain fusion is worth 4% or 10%
+10. **A time-per-image figure for Qwen-Image 2.1** (Image generation, small): perf-state.md has the section and no figure, every timing so far being low power mode on an unpinned build; the owner is rendering with the model, the direct-conv arm it waited on landed in 1e028be, and an hour with a pinned binary settles how much of the 5.3-6.1 s a step at 1024x1024 is the power mode
 
 ## Decode performance
+
+- [ ] [measured] **Flint's attention and MoE glue run on reference paths: sinks in the flash kernel,
+  a decode kernel with sinks, the sigmoid router arm.** Flint decodes 47.7 tok/s on a short
+  prompt and 23.7 at 3.6k, prefill 292 at 3654 (observations: `lowpowermode 1`, unpinned),
+  because both phases run an f32 attention that widens the full layers' f16 cache to f32
+  every step, and the fused MoE glue is off for sigmoid routing. The ceiling is an estimate:
+  ~2.3 GB of active weights per token, the 35B-A3B's range, where the 35B decodes 127.0.
+  Steps: add the sink term to `flash.metal` (prefill, head dim 128, window in-kernel
+  already; `exp2(sink·log2e − max)` into the sum before the divide), a vendored decode
+  kernel with a sink (candle's `sdpa_vector` cannot take one), each graded against
+  `FlintAttn::reference_attention` on captured activations (a NoPE layer at 32k+ keys, a
+  sliding layer across a wrap, a decode row, real sink values up to ~10) and then by
+  `tests/flint_parity.rs`; then a sigmoid arm of `ops::moe_router` and an ungated
+  epilogue; then a pinned bench for perf-state.md. Re-measure the memory item after.
+  [Record](docs/records/flint-correctness.md).
+  From: Deferred from the Flint correctness arc (2026-10-25).
 
 - [ ] [measured] **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest
    population.** 7 per gate (norm, inject head — separate on the decode split arm —,
@@ -315,6 +342,16 @@ lever to rank.]
   Promoted from the item «Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the 2048-token QSA budget, then slopes gently» on 2026-09-06; dated 2026-08-30 there.
 
 ## Prefill performance
+
+- [ ] [measured] **Flint's prefill projections are 2-4% off exact per layer, where decode is at 2e-7.**
+  Layer 0's dense SwiGLU reads 3.7e-2 mean per-row relative L2 against an f64 recompute of
+  its own input, layer 2's MoE 2.4e-2; the single-row gemv reads ~2e-7, and forcing the
+  routed experts to it takes layer 2 to 7.7e-4. The weight tile is staged as f16 and the
+  down projections cancel hard. llama.cpp Metal does the same, so the gate cannot see it.
+  The candidates are an f32 weight tile or a per-row path for Flint, priced against prefill
+  time. The probe is outside the tree, `/tmp/flint-fix-probes/flint_mlp_probe.rs`.
+  [Record](docs/records/flint-correctness.md), "The prefill precision gap".
+  From: Deferred from the Flint correctness arc (2026-10-25).
 
 - [ ] [small] **Flash-Next's >49k prefill rows are stale, and the replay fixtures never
    cross a tier boundary.** Its chunk halves past 49,152 positions (2026-09-17); a hand-run
@@ -586,6 +623,16 @@ lever to rank.]
 
 ## Serve, batch and CLI
 
+- [ ] [unpriced] **A tool-call parser for Flint, so serve stops refusing `tools` on it.**
+  Flint is a coding-agent model and the owner admitted it as a target on 2026-10-25; a tools
+  request on a Flint target is a 400 today, because serve's parser reads the Qwen
+  `<function=` form. Flint's `<tool_call>`, `<arg_key>` and `<arg_value>` (and their
+  closers) are single tokens, 150010-150015, so the parser can track them by id; strings
+  arrive raw and other values as JSON. Serve-level snapshot and rewind on a Flint
+  conversation can be exercised in the same arc. If agentic use on serve is not wanted,
+  retire this.
+  From: Deferred from the Flint correctness arc (2026-10-25).
+
 - [ ] [measured] **serve at 32k decodes 4-7% under `generate` and the cause is unconfirmed — run a
   `--ctx 8192` / `--ctx 65536` serve arm to test the state-allocation hypothesis.** At
   2k and 7.6k the two paths are at parity; only 32k separates them, and the difference
@@ -612,6 +659,15 @@ lever to rank.]
   From: Deferred from the metrics arc (2026-09-05).
 
 ## Cache images, memory and context
+
+- [ ] [measured] **Flint's memory grows superlinearly with context, so prompts past ~60k are refused.**
+  Peak beyond the weights reads 10.97 GB at 9,895 tokens, 16.28 at 28,717 and 31.89 at
+  56,883, and the fit extrapolates to ~115 GB at 131k. Draining between chunks barely moves
+  it, so something that scales with keys is retained per forward, most likely the f32 K/V
+  copies and the mask. The kernel arc on the Front is expected to retire the f32 copies;
+  re-measure after it, and refit `flint_scratch_bytes` from the new points.
+  [Record](docs/records/flint-correctness.md), "Memory".
+  From: Deferred from the Flint correctness arc (2026-10-25).
 
 - [ ] [measured] **The router gemv holds `ffn_gate_inp` twice, ~251 MB resident f32 on Flash-Next.**
   **2026-09-06.** `MoeBlock` keeps the
