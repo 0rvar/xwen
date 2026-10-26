@@ -137,6 +137,10 @@ const GROUP_NORM_SOURCE: &str = include_str!("group_norm.metal");
 /// masking). Own library (no Metal-4 dependency), compiled fast-math like
 /// candle's metallib with no contract pragmas — see flash.metal's header.
 const FLASH_SOURCE: &str = include_str!("flash.metal");
+/// Single-row (decode) attention with GQA grouping, head-strided f16 K/V,
+/// split-K and per-head sinks (`src/ops/attn_decode.metal`, derived from
+/// candle's `sdpa_vector`). Own library, no Metal-4 dependency.
+const ATTN_DECODE_SOURCE: &str = include_str!("attn_decode.metal");
 
 /// Bidirectional flash attention on the Metal-4 cooperative-tensor ops
 /// (`src/ops/flash_t.metal`, the `tensor` arm of `XWEN_ZIMAGE_ATTN`). Own
@@ -395,6 +399,11 @@ pub(crate) fn group_norm_pipeline(device: &Device, name: &str) -> Result<Compute
 /// Pipeline for a `flash.metal` kernel (vendored flash-attention prefill).
 pub(crate) fn flash_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
     compiled_pipeline(device, FLASH_SOURCE, "flash", name)
+}
+
+/// Pipeline for an `attn_decode.metal` kernel (single-row attention).
+pub(crate) fn attn_decode_pipeline(device: &Device, name: &str) -> Result<ComputePipeline> {
+    compiled_pipeline(device, ATTN_DECODE_SOURCE, "attn_decode", name)
 }
 
 /// Pipeline for a `flash_t.metal` kernel (bidirectional flash attention on the

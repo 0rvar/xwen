@@ -3,24 +3,31 @@ use candle_core::Tensor;
 use candle_core::quantized::GgmlDType;
 
 use crate::gguf::QuantPlane;
+use crate::moe::Gating;
 use crate::ops::dispatch;
 
 /// Fused MoE routing decision against the vendored `moe_glue.metal` router — the
-/// seven candle dispatches that follow the router matmul in `MoeBlock::route`
-/// (softmax over all experts, descending arg-sort, narrow, gather, sum, clamp,
-/// renormalize) collapsed into one threadgroup per token. `logits` is
-/// `[seq, n_expert]` f32 contiguous, the router matmul's output; `sum_floor` is
-/// the renormalization denominator floor. Returns
-/// `(ids [seq, top_k] u32, weights [seq, top_k] f32)`.
+/// candle dispatches that follow the router matmul in `MoeBlock::route`
+/// (softmax over all experts or a sigmoid per expert, descending arg-sort,
+/// narrow, gather, sum, clamp, renormalize) collapsed into one threadgroup per
+/// token. `logits` is `[seq, n_expert]` f32 contiguous, the router matmul's
+/// output; `sum_floor` is the renormalization denominator floor; `gating` picks
+/// the scoring, and the sort always runs on the scores, never the logits.
+/// Returns `(ids [seq, top_k] u32, weights [seq, top_k] f32)`.
 ///
 /// Bit-identical to the candle chain it replaces (`router_matches_candle_bitwise`
-/// proves it), so the fused path is safe under every parity tier — which matters
+/// and `sigmoid_router_matches_candle_bitwise` prove it), so the fused path is safe under every parity tier — which matters
 /// more here than anywhere else in the MoE block: the arg-sort's tie order
 /// decides WHICH experts run, so a single differing bit is a whole expert's
 /// contribution, not a rounding. Metal only; the caller's kill-switch is the
 /// candle chain (`XWEN_MOE_GLUE_CLASSIC`).
-pub fn moe_router(logits: &Tensor, top_k: usize, sum_floor: f32) -> Result<(Tensor, Tensor)> {
-    dispatch::run_moe_router(logits, top_k, sum_floor)
+pub fn moe_router(
+    logits: &Tensor,
+    top_k: usize,
+    sum_floor: f32,
+    gating: Gating,
+) -> Result<(Tensor, Tensor)> {
+    dispatch::run_moe_router(logits, top_k, sum_floor, gating)
 }
 
 /// Whether `moe_router` covers this routing geometry. The router kernel sizes
@@ -42,15 +49,17 @@ pub fn moe_router_supported(n_expert: usize, top_k: usize) -> bool {
 /// `dst[s,c] = Σ_k down[s,k,c] * w[s,k] + shexp[s,c] * sigmoid(gate[s])`.
 /// `down` is `[seq, top_k, n_out]` f32 contiguous, `w` `[seq, top_k]` f32,
 /// `shexp` `[seq, n_out]` f32 (the shared expert's SwiGLU output, ungated), and
-/// `gate` `[seq, 1]` f32 the RAW pre-sigmoid shared-expert gate logit. Returns
-/// `[seq, n_out]` f32. Bit-identical to the candle chain it replaces
-/// (`epilogue_matches_candle_bitwise` proves it). Metal only; the caller's
-/// kill-switch is the candle chain (`XWEN_MOE_GLUE_CLASSIC`).
+/// `gate` `[seq, 1]` f32 the RAW pre-sigmoid shared-expert gate logit, or
+/// `None` for an UNGATED shared expert, where `dst = Σ_k down * w + shexp`.
+/// Returns `[seq, n_out]` f32. Bit-identical to the candle chain it replaces
+/// (`epilogue_matches_candle_bitwise` and
+/// `ungated_epilogue_matches_candle_bitwise` prove it). Metal only; the
+/// caller's kill-switch is the candle chain (`XWEN_MOE_GLUE_CLASSIC`).
 pub fn moe_epilogue(
     down: &Tensor,
     weights: &Tensor,
     shexp: &Tensor,
-    gate: &Tensor,
+    gate: Option<&Tensor>,
 ) -> Result<Tensor> {
     dispatch::run_moe_epilogue(down, weights, shexp, gate)
 }
@@ -103,16 +112,18 @@ pub fn moe_shexp_plane_bindable(plane: &QuantPlane) -> bool {
 /// `ffn_gate_inp_shexp` row as the `[hidden, 1]` f32 tensor `SharedExpert`
 /// already holds. Returns `(h [n, inner], logit [n, 1])` — the UNGATED SwiGLU
 /// bottleneck and the RAW pre-sigmoid gate logit, both of which
-/// [`moe_epilogue_shexp`] consumes. Metal only; the caller's kill switches are
-/// `XWEN_MOE_SHEXP_CLASSIC` and `XWEN_MOE_GLUE_CLASSIC`.
+/// [`moe_epilogue_shexp`] consumes. A `None` `gate_inp` is an UNGATED shared
+/// expert: no logit is computed and the second element is `None`. Metal only;
+/// the caller's kill switches are `XWEN_MOE_SHEXP_CLASSIC` and
+/// `XWEN_MOE_GLUE_CLASSIC`.
 pub fn moe_shexp_gate_up(
     x: &Tensor,
     gate: &QuantPlane,
     up: &QuantPlane,
-    gate_inp: &Tensor,
+    gate_inp: Option<&Tensor>,
     hidden: usize,
     inner: usize,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<(Tensor, Option<Tensor>)> {
     dispatch::run_moe_shexp_gate_up(x, gate, up, gate_inp, hidden, inner)
 }
 
@@ -121,7 +132,8 @@ pub fn moe_shexp_gate_up(
 /// `dst[s,c] = Σ_k down[s,k,c] * w[s,k] + (Σ_j down_shexp[c,j] * h[s,j]) *
 /// sigmoid(gate[s])`. `h` is [`moe_shexp_gate_up`]'s bottleneck `[seq, inner]`
 /// and `down_shexp` the `[n_out, inner]` projection's raw bytes; the materialized
-/// `shexp` tensor [`moe_epilogue`] takes is never built.
+/// `shexp` tensor [`moe_epilogue`] takes is never built. A `None` gate is an
+/// UNGATED shared expert, added unscaled.
 ///
 /// BOUNDED, not bitwise, against [`moe_epilogue`]: this kernel's routed combine
 /// folds over a full simdgroup where that one folds over
@@ -132,7 +144,7 @@ pub fn moe_epilogue_shexp(
     weights: &Tensor,
     h: &Tensor,
     down_shexp: &QuantPlane,
-    gate: &Tensor,
+    gate: Option<&Tensor>,
     inner: usize,
 ) -> Result<Tensor> {
     dispatch::run_moe_epilogue_shexp(down, weights, h, down_shexp, gate, inner)
@@ -220,6 +232,34 @@ mod tests {
         (routed + shared).unwrap()
     }
 
+    /// The exact candle chain `MoeBlock::route` runs for a SIGMOID router
+    /// (`route_sigmoid_from_logits`), transcribed for the same reason as
+    /// [`candle_route`]: an independent sigmoid per expert, the descending
+    /// arg-sort on those scores, the top-k gather and the floored renormalize.
+    fn candle_route_sigmoid(logits: &Tensor, top_k: usize, floor: f32) -> (Tensor, Tensor) {
+        let scores = sigmoid(&logits.to_dtype(DType::F32).unwrap())
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let order = scores.arg_sort_last_dim(false).unwrap();
+        let ids = order.narrow(1, 0, top_k).unwrap().contiguous().unwrap();
+        let weights = scores.gather(&ids, 1).unwrap();
+        let sum = weights
+            .sum_keepdim(1)
+            .unwrap()
+            .clamp(floor, f32::INFINITY)
+            .unwrap();
+        (ids, weights.broadcast_div(&sum).unwrap())
+    }
+
+    /// The chain an UNGATED shared expert's block tail runs on the classic path:
+    /// `FusedExperts::forward`'s fused combine (`ops::combine`, itself
+    /// bit-identical to candle's broadcast/sum chain) then `routed + shared`.
+    fn candle_epilogue_ungated(down: &Tensor, w: &Tensor, shexp: &Tensor) -> Tensor {
+        let routed = crate::ops::combine(down, None, w).unwrap();
+        (routed + shexp).unwrap()
+    }
+
     fn assert_f32_bits_eq(got: &Tensor, want: &Tensor, what: &str) {
         let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
         let w: Vec<f32> = want.flatten_all().unwrap().to_vec1().unwrap();
@@ -277,7 +317,8 @@ mod tests {
                 scale,
             );
             let logits = on_device(v, (seq, n_expert), &device);
-            let (ids, weights) = moe_router(&logits, top_k, WEIGHTS_SUM_FLOOR as f32).unwrap();
+            let (ids, weights) =
+                moe_router(&logits, top_k, WEIGHTS_SUM_FLOOR as f32, Gating::Softmax).unwrap();
             assert_eq!(ids.dims(), &[seq, top_k]);
             assert_eq!(ids.dtype(), DType::U32);
             assert_eq!(weights.dims(), &[seq, top_k]);
@@ -330,7 +371,8 @@ mod tests {
             ("one-winner", one_winner),
         ] {
             let logits = on_device(row, (1, n_expert), &device);
-            let (ids, weights) = moe_router(&logits, top_k, WEIGHTS_SUM_FLOOR as f32).unwrap();
+            let (ids, weights) =
+                moe_router(&logits, top_k, WEIGHTS_SUM_FLOOR as f32, Gating::Softmax).unwrap();
             let (want_ids, want_w) = candle_route(&logits, top_k);
             assert_u32_eq(&ids, &want_ids, &format!("router ties {label}"));
             assert_f32_bits_eq(&weights, &want_w, &format!("router ties {label}"));
@@ -351,7 +393,8 @@ mod tests {
         );
         let view = big.narrow(0, skip, seq).unwrap();
         assert!(view.is_contiguous());
-        let (ids, weights) = moe_router(&view, top_k, WEIGHTS_SUM_FLOOR as f32).unwrap();
+        let (ids, weights) =
+            moe_router(&view, top_k, WEIGHTS_SUM_FLOOR as f32, Gating::Softmax).unwrap();
         let (want_ids, want_w) = candle_route(&view, top_k);
         assert_u32_eq(&ids, &want_ids, "router offset view");
         assert_f32_bits_eq(&weights, &want_w, "router offset view");
@@ -382,7 +425,7 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-5, "renormalized weights sum to one");
 
         for floor in [1.0f32, 0.5, WEIGHTS_SUM_FLOOR as f32] {
-            let (ids, weights) = moe_router(&logits, top_k, floor).unwrap();
+            let (ids, weights) = moe_router(&logits, top_k, floor, Gating::Softmax).unwrap();
             // The candle side has to clamp with the same floor to be a fair
             // comparison, so re-run its tail here.
             let probs = softmax_last_dim(&logits).unwrap();
@@ -402,6 +445,124 @@ mod tests {
             assert_u32_eq(&ids, &want_ids, &format!("router floor={floor}"));
             assert_f32_bits_eq(&weights, &want_w, &format!("router floor={floor}"));
         }
+    }
+
+    /// The SIGMOID router (Flint's: 256 experts, top-6) must reproduce
+    /// `route_sigmoid_from_logits`'s candle chain bit-for-bit, ids and weights,
+    /// on ordinary logits at every token count the block sees, plus the padded
+    /// and the small expert counts the softmax test also covers.
+    #[test]
+    fn sigmoid_router_matches_candle_bitwise() {
+        let device = metal_device().unwrap();
+        let floor = WEIGHTS_SUM_FLOOR as f32;
+
+        let cases: [(usize, usize, usize, f32); 9] = [
+            // (seq, n_expert, top_k, logit scale)
+            (1, 256, 6, 1.0), // Flint decode
+            (1, 256, 6, 4.0),
+            (1, 256, 6, 0.001), // near-uniform: every score crowds 0.5
+            (2, 256, 6, 2.0),
+            (7, 256, 6, 1.0),
+            (64, 256, 6, 3.0), // a prefill chunk
+            (1, 250, 6, 1.0),  // padded bitonic network
+            (3, 64, 16, 2.0),
+            (1, 8, 3, 1.0),
+        ];
+        for (seq, n_expert, top_k, scale) in cases {
+            let v = uniform(
+                0x5160 + seq as u64 * 131 + n_expert as u64 * 7 + top_k as u64,
+                seq * n_expert,
+                -scale,
+                scale,
+            );
+            let logits = on_device(v, (seq, n_expert), &device);
+            let (ids, weights) = moe_router(&logits, top_k, floor, Gating::Sigmoid).unwrap();
+            assert_eq!(ids.dims(), &[seq, top_k]);
+            assert_eq!(weights.dims(), &[seq, top_k]);
+            let (want_ids, want_w) = candle_route_sigmoid(&logits, top_k, floor);
+            let what =
+                format!("sigmoid router seq={seq} n_expert={n_expert} top_k={top_k} scale={scale}");
+            assert_u32_eq(&ids, &want_ids, &what);
+            assert_f32_bits_eq(&weights, &want_w, &what);
+        }
+    }
+
+    /// Saturation is where a sigmoid router ties: distinct logits past ~17 all
+    /// score exactly 1.0 and logits far enough below zero all score +0.0, so
+    /// WHICH of the tied experts are selected is decided by the bitonic
+    /// network's comparator order over the scores. Sorting the logits instead
+    /// would rank a plateau by logit, which is not the chain's order, so the
+    /// plateau's winners carry distinct logits. Every row runs at one token and inside a
+    /// multi-token batch, the rows being independent threadgroups.
+    #[test]
+    fn sigmoid_router_saturated_ties_match_candle_bitwise() {
+        let device = metal_device().unwrap();
+        let (n_expert, top_k) = (256usize, 6usize);
+        let floor = WEIGHTS_SUM_FLOOR as f32;
+
+        // Ten saturated winners with distinct logits among losers deep in the
+        // negative tail: six of the ten are selected, all at weight 1/6.
+        let mut plateau = vec![-40.0f32; n_expert];
+        for (i, l) in [
+            (3usize, 30.0f32),
+            (9, 30.0),
+            (17, 30.0001),
+            (40, 35.0),
+            (55, 89.0),
+            (77, 30.0),
+            (90, 50.0),
+            (101, 31.5),
+            (200, 40.0),
+            (250, 30.0001),
+        ] {
+            plateau[i] = l;
+        }
+        // Every expert saturated high: a six-way pick out of 256 exact ties.
+        let all_high: Vec<f32> = uniform(0x5A7, n_expert, 30.0, 90.0);
+        // Every score underflows to +0.0: the denominator floor binds and the
+        // pick is again pure comparator order.
+        let all_zero = vec![-200.0f32; n_expert];
+        // Two saturated winners, then a tie among the rest at a moderate value.
+        let mut two_then_tie = vec![0.25f32; n_expert];
+        two_then_tie[11] = 30.0;
+        two_then_tie[200] = 30.0001;
+        // Ordinary logits interleaved with saturated ones.
+        let mut mixed = uniform(0x3141, n_expert, -3.0, 3.0);
+        for i in (0..n_expert).step_by(37) {
+            mixed[i] = 30.0 + i as f32;
+        }
+
+        let rows = [
+            ("plateau", plateau),
+            ("all-high", all_high),
+            ("all-zero", all_zero),
+            ("two-then-tie", two_then_tie),
+            ("mixed", mixed),
+        ];
+        for (label, row) in &rows {
+            let logits = on_device(row.clone(), (1, n_expert), &device);
+            let (ids, weights) = moe_router(&logits, top_k, floor, Gating::Sigmoid).unwrap();
+            let (want_ids, want_w) = candle_route_sigmoid(&logits, top_k, floor);
+            assert_u32_eq(&ids, &want_ids, &format!("sigmoid ties {label}"));
+            assert_f32_bits_eq(&weights, &want_w, &format!("sigmoid ties {label}"));
+        }
+
+        // The plateau row really is a tie on the device: all six selected
+        // scores are the same float, or this test would grade nothing.
+        let logits = on_device(rows[0].1.clone(), (1, n_expert), &device);
+        let (_, w) = candle_route_sigmoid(&logits, top_k, floor);
+        let w: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            w.iter().all(|v| v.to_bits() == w[0].to_bits()),
+            "saturated scores must tie exactly, got {w:?}"
+        );
+
+        let batch: Vec<f32> = rows.iter().flat_map(|(_, r)| r.iter().copied()).collect();
+        let logits = on_device(batch, (rows.len(), n_expert), &device);
+        let (ids, weights) = moe_router(&logits, top_k, floor, Gating::Sigmoid).unwrap();
+        let (want_ids, want_w) = candle_route_sigmoid(&logits, top_k, floor);
+        assert_u32_eq(&ids, &want_ids, "sigmoid ties batched");
+        assert_f32_bits_eq(&weights, &want_w, "sigmoid ties batched");
     }
 
     /// The fused epilogue must reproduce the live candle chain (weighted
@@ -435,7 +596,7 @@ mod tests {
                 let shexp = on_device(shexp_v, (seq, n_out), &device);
                 let gate = on_device(gate_v, (seq, 1), &device);
 
-                let fused = moe_epilogue(&down, &w, &shexp, &gate).unwrap();
+                let fused = moe_epilogue(&down, &w, &shexp, Some(&gate)).unwrap();
                 assert_eq!(fused.dims(), &[seq, n_out]);
                 assert_eq!(fused.dtype(), DType::F32);
                 let want = candle_epilogue(&down, &w, &shexp, &gate);
@@ -485,9 +646,80 @@ mod tests {
             assert!(t.is_contiguous(), "narrowed views must stay contiguous");
         }
 
-        let fused = moe_epilogue(&down, &w, &shexp, &gate).unwrap();
+        let fused = moe_epilogue(&down, &w, &shexp, Some(&gate)).unwrap();
         let want = candle_epilogue(&down, &w, &shexp, &gate);
         assert_f32_bits_eq(&fused, &want, "epilogue offset views");
+    }
+
+    /// The UNGATED epilogue (Flint's shared expert has no gate) must reproduce
+    /// the chain that block tail runs on the classic path — the fused combine
+    /// and `routed + shared` — BIT-FOR-BIT, at Flint's top-6 and the Qwen top-8,
+    /// across decode and prefill widths and over offset views. It must also
+    /// equal the GATED kernel handed a saturated gate, whose sigmoid is exactly
+    /// 1.0: the two share their reduction, so anything else is a slot or a
+    /// branch gone wrong.
+    #[test]
+    fn ungated_epilogue_matches_candle_bitwise() {
+        let device = metal_device().unwrap();
+        for &top_k in &[6usize, 8] {
+            for &seq in &[1usize, 5, 31] {
+                for &n_out in &[2048usize, 1000] {
+                    let seed = 0x1100 + (top_k * 1000 + seq * 31 + n_out) as u64;
+                    let down = Tensor::from_vec(
+                        wide(seed, seq * top_k * n_out, true),
+                        (seq, top_k, n_out),
+                        &Device::Cpu,
+                    )
+                    .unwrap()
+                    .to_device(&device)
+                    .unwrap();
+                    let w = on_device(wide(seed + 1, seq * top_k, true), (seq, top_k), &device);
+                    let shexp = on_device(wide(seed + 2, seq * n_out, true), (seq, n_out), &device);
+
+                    let what = format!("ungated epilogue top_k={top_k} seq={seq} n_out={n_out}");
+                    let fused = moe_epilogue(&down, &w, &shexp, None).unwrap();
+                    assert_eq!(fused.dims(), &[seq, n_out]);
+                    assert_f32_bits_eq(&fused, &candle_epilogue_ungated(&down, &w, &shexp), &what);
+                    // candle's own broadcast/sum chain, which ops::combine is
+                    // bitwise with, plus the add.
+                    let wb = w.reshape((seq, top_k, 1)).unwrap();
+                    let chain =
+                        (down.broadcast_mul(&wb).unwrap().sum(1).unwrap() + &shexp).unwrap();
+                    assert_f32_bits_eq(&fused, &chain, &format!("{what} (candle sum)"));
+                    let saturated = Tensor::full(90.0f32, (seq, 1), &device).unwrap();
+                    let gated = moe_epilogue(&down, &w, &shexp, Some(&saturated)).unwrap();
+                    assert_f32_bits_eq(&fused, &gated, &format!("{what} (saturated gate)"));
+                }
+            }
+        }
+
+        let (seq, top_k, n_out, skip) = (3usize, 6usize, 512usize, 2usize);
+        let view = |v: Vec<f32>, dims: &[usize]| -> Tensor {
+            let mut wide_dims = dims.to_vec();
+            wide_dims[0] += skip;
+            Tensor::from_vec(v, wide_dims, &Device::Cpu)
+                .unwrap()
+                .to_device(&device)
+                .unwrap()
+                .narrow(0, skip, dims[0])
+                .unwrap()
+        };
+        let down = view(
+            wide(0x9101, (seq + skip) * top_k * n_out, true),
+            &[seq, top_k, n_out],
+        );
+        let w = view(wide(0x9102, (seq + skip) * top_k, true), &[seq, top_k]);
+        let shexp = view(wide(0x9103, (seq + skip) * n_out, true), &[seq, n_out]);
+        for t in [&down, &w, &shexp] {
+            assert!(t.is_contiguous());
+            assert_ne!(t.layout().start_offset(), 0);
+        }
+        let fused = moe_epilogue(&down, &w, &shexp, None).unwrap();
+        assert_f32_bits_eq(
+            &fused,
+            &candle_epilogue_ungated(&down, &w, &shexp),
+            "ungated epilogue offset views",
+        );
     }
 
     /// The router kernel's threadgroup-array bounds are spelled out twice: as
@@ -530,6 +762,16 @@ mod tests {
             dispatch::MOE_ROUTER_MAX_TOP_K,
             "moe_glue.metal and dispatch.rs disagree on the selection bound"
         );
+        assert_eq!(
+            define("MOE_GATING_SOFTMAX") as i32,
+            dispatch::MOE_GATING_SOFTMAX,
+            "moe_glue.metal and dispatch.rs disagree on the softmax gating value"
+        );
+        assert_eq!(
+            define("MOE_GATING_SIGMOID") as i32,
+            dispatch::MOE_GATING_SIGMOID,
+            "moe_glue.metal and dispatch.rs disagree on the sigmoid gating value"
+        );
         // The softmax phase reuses the low lanes of the bitonic network's
         // threadgroup, so its bound can never be the binding one; and the sum
         // folds a single simdgroup, so the selection bound cannot exceed 32.
@@ -550,44 +792,44 @@ mod tests {
 
         // Router: rank, dtype, and selection-size contracts.
         let logits = Tensor::zeros((2, 256), DType::F32, &device).unwrap();
-        assert!(moe_router(&logits, 0, floor).is_err());
-        assert!(moe_router(&logits, 257, floor).is_err());
+        assert!(moe_router(&logits, 0, floor, Gating::Softmax).is_err());
+        assert!(moe_router(&logits, 257, floor, Gating::Softmax).is_err());
         assert!(
-            moe_router(&logits, 33, floor).is_err(),
+            moe_router(&logits, 33, floor, Gating::Softmax).is_err(),
             "top_k over one simdgroup"
         );
         let logits_f16 = Tensor::zeros((2, 256), DType::F16, &device).unwrap();
-        assert!(moe_router(&logits_f16, 8, floor).is_err());
+        assert!(moe_router(&logits_f16, 8, floor, Gating::Softmax).is_err());
         let logits_r3 = Tensor::zeros((2, 4, 256), DType::F32, &device).unwrap();
-        assert!(moe_router(&logits_r3, 8, floor).is_err());
+        assert!(moe_router(&logits_r3, 8, floor, Gating::Softmax).is_err());
         // An expert count whose padding overruns the kernel's shared arrays.
         let too_wide = Tensor::zeros((1, 1024), DType::F32, &device).unwrap();
-        assert!(moe_router(&too_wide, 8, floor).is_err());
+        assert!(moe_router(&too_wide, 8, floor, Gating::Softmax).is_err());
         // Empty rows dispatch a zero-dimension grid, which writes nothing and
         // hands the caller a shape it did not ask for.
         let empty = Tensor::zeros((0, 256), DType::F32, &device).unwrap();
-        assert!(moe_router(&empty, 8, floor).is_err());
+        assert!(moe_router(&empty, 8, floor, Gating::Softmax).is_err());
 
         // Epilogue: shape agreement across the four operands.
         let down = Tensor::zeros((4, 8, 16), DType::F32, &device).unwrap();
         let w = Tensor::zeros((4, 8), DType::F32, &device).unwrap();
         let shexp = Tensor::zeros((4, 16), DType::F32, &device).unwrap();
         let gate = Tensor::zeros((4, 1), DType::F32, &device).unwrap();
-        assert!(moe_epilogue(&down, &w, &shexp, &gate).is_ok());
+        assert!(moe_epilogue(&down, &w, &shexp, Some(&gate)).is_ok());
         let bad_w = Tensor::zeros((4, 7), DType::F32, &device).unwrap();
-        assert!(moe_epilogue(&down, &bad_w, &shexp, &gate).is_err());
+        assert!(moe_epilogue(&down, &bad_w, &shexp, Some(&gate)).is_err());
         let bad_shexp = Tensor::zeros((4, 15), DType::F32, &device).unwrap();
-        assert!(moe_epilogue(&down, &w, &bad_shexp, &gate).is_err());
+        assert!(moe_epilogue(&down, &w, &bad_shexp, Some(&gate)).is_err());
         let bad_gate = Tensor::zeros((4, 2), DType::F32, &device).unwrap();
-        assert!(moe_epilogue(&down, &w, &shexp, &bad_gate).is_err());
+        assert!(moe_epilogue(&down, &w, &shexp, Some(&bad_gate)).is_err());
         let down_f16 = Tensor::zeros((4, 8, 16), DType::F16, &device).unwrap();
-        assert!(moe_epilogue(&down_f16, &w, &shexp, &gate).is_err());
+        assert!(moe_epilogue(&down_f16, &w, &shexp, Some(&gate)).is_err());
         // A top_k whose candle reduction width would exceed one simdgroup.
         let wide_down = Tensor::zeros((1, 66, 4), DType::F32, &device).unwrap();
         let wide_w = Tensor::zeros((1, 66), DType::F32, &device).unwrap();
         let one_shexp = Tensor::zeros((1, 4), DType::F32, &device).unwrap();
         let one_gate = Tensor::zeros((1, 1), DType::F32, &device).unwrap();
-        let err = moe_epilogue(&wide_down, &wide_w, &one_shexp, &one_gate)
+        let err = moe_epilogue(&wide_down, &wide_w, &one_shexp, Some(&one_gate))
             .unwrap_err()
             .to_string();
         assert!(err.contains("> 32"), "unexpected error: {err}");
@@ -799,6 +1041,7 @@ mod tests {
     /// and the epilogue's `routed + (down_shexp . h) * sigmoid(logit)`. Every
     /// dot is a sequential f32 sum, which is a different association from every
     /// path under test — that is the point: the bound holds all of them.
+    /// `gated` false is an ungated shared expert: `routed + down_shexp . h`.
     #[allow(clippy::too_many_arguments)]
     fn host_shexp(
         w: &ShexpWeights,
@@ -809,6 +1052,7 @@ mod tests {
         hidden: usize,
         inner: usize,
         top_k: usize,
+        gated: bool,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut h = vec![0f32; n * inner];
         let mut logit = vec![0f32; n];
@@ -842,7 +1086,11 @@ mod tests {
                 for j in 0..inner {
                     shared += w.down_deq[c * inner + j] * h[s * inner + j];
                 }
-                dst[s * hidden + c] = combined + shared * sig;
+                dst[s * hidden + c] = if gated {
+                    combined + shared * sig
+                } else {
+                    combined + shared
+                };
             }
         }
         (h, logit, dst)
@@ -862,6 +1110,7 @@ mod tests {
         x: &Tensor,
         routed: &Tensor,
         weights: &Tensor,
+        gated: bool,
     ) -> Tensor {
         let proj = |lin: &crate::gguf::QLinear, x: &Tensor| {
             if crate::ops::shexp_qmatmul() {
@@ -874,8 +1123,11 @@ mod tests {
         let u = proj(&w.up_lin, x);
         let h = crate::ops::silu_mul(&g, &u).unwrap();
         let shexp = proj(&w.down_lin, &h);
+        if !gated {
+            return moe_epilogue(routed, weights, &shexp, None).unwrap();
+        }
         let logit = x.matmul(&w.gate_inp).unwrap();
-        moe_epilogue(routed, weights, &shexp, &logit).unwrap()
+        moe_epilogue(routed, weights, &shexp, Some(&logit)).unwrap()
     }
 
     fn assert_rel_l2(got: &Tensor, want: &[f32], tol: f32, what: &str) {
@@ -974,15 +1226,18 @@ mod tests {
                 let rw = on_device(rw_v.clone(), (n, top_k), &device);
 
                 let (h, logit) =
-                    moe_shexp_gate_up(&x, &w.gate, &w.up, &w.gate_inp, hidden, inner).unwrap();
+                    moe_shexp_gate_up(&x, &w.gate, &w.up, Some(&w.gate_inp), hidden, inner)
+                        .unwrap();
+                let logit = logit.expect("a gated shared expert has a gate logit");
                 assert_eq!(h.dims(), &[n, inner]);
                 assert_eq!(logit.dims(), &[n, 1]);
-                let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, inner).unwrap();
+                let dst =
+                    moe_epilogue_shexp(&routed, &rw, &h, &w.down, Some(&logit), inner).unwrap();
                 assert_eq!(dst.dims(), &[n, hidden]);
                 assert_eq!(dst.dtype(), DType::F32);
 
                 let (want_h, want_logit, want_dst) =
-                    host_shexp(&w, &x_v, &routed_v, &rw_v, n, hidden, inner, top_k);
+                    host_shexp(&w, &x_v, &routed_v, &rw_v, n, hidden, inner, top_k, true);
                 assert_rel_l2(&h, &want_h, 1e-5, &format!("fused shexp h {case}"));
                 assert_rel_l2(
                     &logit,
@@ -992,7 +1247,7 @@ mod tests {
                 );
                 assert_rel_l2(&dst, &want_dst, 1e-5, &format!("fused shexp dst {case}"));
 
-                let classic = classic_shexp_chain(&w, &x, &routed, &rw);
+                let classic = classic_shexp_chain(&w, &x, &routed, &rw, true);
                 let classic_v: Vec<f32> = classic.flatten_all().unwrap().to_vec1().unwrap();
                 // The classic side runs `QMatMul`'s gemv at one token and the
                 // small-batch mv_ext kernel above it, so the gap has two
@@ -1026,6 +1281,74 @@ mod tests {
                          chain it replaces, not fall behind it"
                     );
                 }
+            }
+        }
+    }
+
+    /// The UNGATED fused shared expert, at Flint's geometry (hidden 2048, inner
+    /// 1024, top-6) and a Qwen one, across the token window. Graded the way the
+    /// gated pair is — bounded against the f32 host oracle and against the
+    /// four-dispatch chain it replaces, never bitwise, the dots being
+    /// reassociated — plus two bitwise identities with the GATED pair: the
+    /// bottleneck `h` is the same code in both kernels, and the gated epilogue
+    /// handed a saturated logit scales by exactly 1.0, so its output must be the
+    /// ungated one bit for bit. Those two are what catch a slot or a branch gone
+    /// wrong in the ungated entry points.
+    #[test]
+    fn ungated_shexp_fused_matches_reference() {
+        use crate::ops::dispatch::testutil::pseudo_random;
+        let device = metal_device().unwrap();
+
+        for (hidden, inner, top_k) in [(2048usize, 1024usize, 6usize), SHEXP_CASES[1]] {
+            let w = shexp_weights(&device, 0, hidden, inner);
+            for &n in &[1usize, 3, 8] {
+                let case = format!("ungated hidden={hidden} inner={inner} top_k={top_k} n={n}");
+                let x_v = pseudo_random(n * hidden, 0xF1 + n as u64, -2.0, 2.0);
+                let routed_v = pseudo_random(n * top_k * hidden, 0xF2 + n as u64, -1.0, 1.0);
+                let rw_v = pseudo_random(n * top_k, 0xF3 + n as u64, 0.0, 1.0);
+                let x = on_device(x_v.clone(), (n, hidden), &device);
+                let routed = Tensor::from_vec(routed_v.clone(), (n, top_k, hidden), &Device::Cpu)
+                    .unwrap()
+                    .to_device(&device)
+                    .unwrap();
+                let rw = on_device(rw_v.clone(), (n, top_k), &device);
+
+                let (h, logit) =
+                    moe_shexp_gate_up(&x, &w.gate, &w.up, None, hidden, inner).unwrap();
+                assert!(
+                    logit.is_none(),
+                    "{case}: an ungated shared expert has no logit"
+                );
+                assert_eq!(h.dims(), &[n, inner]);
+                let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, None, inner).unwrap();
+                assert_eq!(dst.dims(), &[n, hidden]);
+
+                let (want_h, _, want_dst) =
+                    host_shexp(&w, &x_v, &routed_v, &rw_v, n, hidden, inner, top_k, false);
+                assert_rel_l2(&h, &want_h, 1e-5, &format!("{case}: h"));
+                assert_rel_l2(&dst, &want_dst, 1e-5, &format!("{case}: dst"));
+                let classic = classic_shexp_chain(&w, &x, &routed, &rw, false);
+                let classic_v: Vec<f32> = classic.flatten_all().unwrap().to_vec1().unwrap();
+                let tol = if n == 1 { 1e-6 } else { 2e-6 };
+                assert_rel_l2(
+                    &dst,
+                    &classic_v,
+                    tol,
+                    &format!("{case}: vs the classic chain"),
+                );
+
+                let (gated_h, _) =
+                    moe_shexp_gate_up(&x, &w.gate, &w.up, Some(&w.gate_inp), hidden, inner)
+                        .unwrap();
+                assert_f32_bits_eq(&h, &gated_h, &format!("{case}: h against the gated kernel"));
+                let saturated = Tensor::full(90.0f32, (n, 1), &device).unwrap();
+                let gated_dst =
+                    moe_epilogue_shexp(&routed, &rw, &h, &w.down, Some(&saturated), inner).unwrap();
+                assert_f32_bits_eq(
+                    &dst,
+                    &gated_dst,
+                    &format!("{case}: dst against the gated epilogue at a saturated gate"),
+                );
             }
         }
     }
@@ -1074,12 +1397,15 @@ mod tests {
                 let rw = on_device(rw_v.clone(), (n, top_k), &device);
 
                 let (h, logit) =
-                    moe_shexp_gate_up(&x, &w.gate, &w.up, &w.gate_inp, hidden, inner).unwrap();
-                let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, inner).unwrap();
+                    moe_shexp_gate_up(&x, &w.gate, &w.up, Some(&w.gate_inp), hidden, inner)
+                        .unwrap();
+                let logit = logit.expect("a gated shared expert has a gate logit");
+                let dst =
+                    moe_epilogue_shexp(&routed, &rw, &h, &w.down, Some(&logit), inner).unwrap();
                 assert_eq!(dst.dims(), &[n, hidden], "{case}");
 
                 let (want_h, want_logit, want_dst) =
-                    host_shexp(&w, &x_v, &routed_v, &rw_v, n, hidden, inner, top_k);
+                    host_shexp(&w, &x_v, &routed_v, &rw_v, n, hidden, inner, top_k, true);
                 assert_rel_l2(&h, &want_h, 1e-5, &format!("{case}: h"));
                 assert_rel_l2(&dst, &want_dst, 1e-5, &format!("{case}: dst"));
 
@@ -1199,13 +1525,14 @@ mod tests {
                 )
             };
             let (h, logit) =
-                moe_shexp_gate_up(&x, &w.gate, &w.up, &gate_inp, hidden, inner).unwrap();
+                moe_shexp_gate_up(&x, &w.gate, &w.up, Some(&gate_inp), hidden, inner).unwrap();
+            let logit = logit.expect("a gated shared expert has a gate logit");
             let (h, logit) = if offsets {
                 (repad(&h), repad(&logit))
             } else {
                 (h, logit)
             };
-            let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, inner).unwrap();
+            let dst = moe_epilogue_shexp(&routed, &rw, &h, &w.down, Some(&logit), inner).unwrap();
             (dst, logit)
         };
 
@@ -1300,24 +1627,26 @@ mod tests {
             &device,
         );
         assert!(
-            moe_shexp_gate_up(&x, &w.gate, &w.up, &w.gate_inp, h_small + 16, i_small).is_err(),
+            moe_shexp_gate_up(&x, &w.gate, &w.up, Some(&w.gate_inp), h_small + 16, i_small)
+                .is_err(),
             "a hidden that is not a whole number of blocks"
         );
         assert!(
-            moe_shexp_gate_up(&x, &w.down, &w.up, &w.gate_inp, h_small, i_small).is_err(),
+            moe_shexp_gate_up(&x, &w.down, &w.up, Some(&w.gate_inp), h_small, i_small).is_err(),
             "a plane whose shape contradicts the geometry"
         );
         let (h, logit) =
-            moe_shexp_gate_up(&x, &w.gate, &w.up, &w.gate_inp, h_small, i_small).unwrap();
+            moe_shexp_gate_up(&x, &w.gate, &w.up, Some(&w.gate_inp), h_small, i_small).unwrap();
+        let logit = logit.expect("a gated shared expert has a gate logit");
         let routed = Tensor::zeros((1, k_small, h_small), DType::F32, &device).unwrap();
         let rw = Tensor::zeros((1, k_small), DType::F32, &device).unwrap();
-        assert!(moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, i_small).is_ok());
+        assert!(moe_epilogue_shexp(&routed, &rw, &h, &w.down, Some(&logit), i_small).is_ok());
         assert!(
-            moe_epilogue_shexp(&routed, &rw, &h, &w.down, &logit, i_small + 16).is_err(),
+            moe_epilogue_shexp(&routed, &rw, &h, &w.down, Some(&logit), i_small + 16).is_err(),
             "an inner that is not a whole number of blocks"
         );
         assert!(
-            moe_epilogue_shexp(&routed, &rw, &h, &w.gate, &logit, i_small).is_err(),
+            moe_epilogue_shexp(&routed, &rw, &h, &w.gate, Some(&logit), i_small).is_err(),
             "a down plane whose shape contradicts the geometry"
         );
 
@@ -1330,14 +1659,24 @@ mod tests {
             ..w.gate.clone()
         };
         assert!(
-            moe_shexp_gate_up(&x, &lying_gate, &w.up, &w.gate_inp, h_small, i_small * 4).is_err()
+            moe_shexp_gate_up(
+                &x,
+                &lying_gate,
+                &w.up,
+                Some(&w.gate_inp),
+                h_small,
+                i_small * 4
+            )
+            .is_err()
         );
         let lying_down = QuantPlane {
             out_dim: h_small * 4,
             ..w.down.clone()
         };
         let wide_routed = Tensor::zeros((1, k_small, h_small * 4), DType::F32, &device).unwrap();
-        assert!(moe_epilogue_shexp(&wide_routed, &rw, &h, &lying_down, &logit, i_small).is_err());
+        assert!(
+            moe_epilogue_shexp(&wide_routed, &rw, &h, &lying_down, Some(&logit), i_small).is_err()
+        );
     }
 
     /// The fused pair's launch geometry is spelled out in BOTH languages — a

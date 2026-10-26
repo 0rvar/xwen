@@ -954,8 +954,9 @@ impl XwenModel {
         // None. The vendored flash kernel, which would compute the mask
         // in-kernel and skip this allocation entirely, is compiled at head dim
         // 128 and cannot serve this architecture's 256.
-        // Flint's layers take the mask of their own cache kind (full or
-        // sliding), built at most once per kind per forward below.
+        // Flint's production arm computes visibility in-kernel and takes no
+        // mask; its reference arm takes the mask of the layer's cache kind
+        // (full or sliding), built at most once per kind per forward below.
         let full_mask = if seq > 1 {
             let n_head = (0..self.cfg.n_layer)
                 .find(|&il| matches!(self.layers[il].mixer, Mixer::Full(_)))
@@ -990,6 +991,10 @@ impl XwenModel {
                 Mixer::Linear(block) => {
                     stage!(Stage::MixerDelta, block.forward(&normed, cache)?)
                 }
+                Mixer::Flint(block) if !block.needs_mask() => stage!(
+                    Stage::MixerFullAttn,
+                    block.forward(&normed, cache, pos, None)?
+                ),
                 Mixer::Flint(block) => {
                     let kind = cache.mask_kind();
                     let at = match flint_masks.iter().position(|(k, _)| *k == kind) {

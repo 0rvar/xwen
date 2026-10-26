@@ -2732,7 +2732,13 @@ struct MoeRouterArgs {
     softmax_width: i32,
     sum_width: i32,
     sum_floor: f32,
+    gating: i32,
 }
+
+/// `moe_router_args.gating`'s two values, the `MOE_GATING_*` `#define`s in
+/// moe_glue.metal (the geometry test holds them equal).
+pub(crate) const MOE_GATING_SOFTMAX: i32 = 0;
+pub(crate) const MOE_GATING_SIGMOID: i32 = 1;
 
 /// Matches the Metal `moe_epilogue_args` struct (src/ops/moe_glue.metal).
 /// `#[repr(C)]` pins the layout byte-for-byte.
@@ -2765,7 +2771,8 @@ fn candle_reduction_width(work: usize) -> usize {
 }
 
 /// Fused MoE routing decision against `kernel_moe_router` (moe_glue.metal):
-/// softmax over the full expert set, descending bitonic arg-sort, top-k gather,
+/// softmax over the full expert set (or, under `Gating::Sigmoid`, candle's
+/// elementwise sigmoid per expert), descending bitonic arg-sort, top-k gather,
 /// floor-clamped sum, renormalize — one threadgroup per token, replacing seven
 /// candle dispatches. `logits` is `[seq, n_expert]` f32 contiguous (the router
 /// matmul output, which stays a candle dispatch). Returns
@@ -2776,6 +2783,7 @@ pub(crate) fn run_moe_router(
     logits: &Tensor,
     top_k: usize,
     sum_floor: f32,
+    gating: crate::moe::Gating,
 ) -> Result<(Tensor, Tensor)> {
     let cdev = logits.device().clone();
     let Device::Metal(mdev) = &cdev else {
@@ -2847,6 +2855,10 @@ pub(crate) fn run_moe_router(
         softmax_width: softmax_width as i32,
         sum_width: candle_reduction_width(top_k) as i32,
         sum_floor,
+        gating: match gating {
+            crate::moe::Gating::Softmax => MOE_GATING_SOFTMAX,
+            crate::moe::Gating::Sigmoid => MOE_GATING_SIGMOID,
+        },
     };
     {
         let cmd = mdev.command_encoder()?;
@@ -2877,14 +2889,16 @@ pub(crate) fn run_moe_router(
 /// sigmoid, its broadcast multiply and the routed+shared add. `down` is
 /// `[seq, top_k, n_out]` f32 contiguous, `w` `[seq, top_k]` f32, `shexp`
 /// `[seq, n_out]` f32, `gate` `[seq, 1]` f32 (the RAW pre-sigmoid gate logit).
+/// A `None` gate is an UNGATED shared expert and takes
+/// `kernel_moe_epilogue_ungated`: `dst = Σ_k down * w + shexp`.
 /// Bit-identical to the candle chain it replaces (moe_glue.rs
-/// `epilogue_matches_candle_bitwise` proves it); the caller's kill-switch is
-/// that chain (`XWEN_MOE_GLUE_CLASSIC`).
+/// `epilogue_matches_candle_bitwise` and `ungated_epilogue_matches_candle_bitwise`
+/// prove it); the caller's kill-switch is that chain (`XWEN_MOE_GLUE_CLASSIC`).
 pub(crate) fn run_moe_epilogue(
     down: &Tensor,
     weights: &Tensor,
     shexp: &Tensor,
-    gate: &Tensor,
+    gate: Option<&Tensor>,
 ) -> Result<Tensor> {
     let cdev = down.device().clone();
     let Device::Metal(mdev) = &cdev else {
@@ -2897,9 +2911,17 @@ pub(crate) fn run_moe_epilogue(
     check_f32(down, &[seq, top_k, n_out], "down")?;
     check_f32(weights, &[seq, top_k], "weights")?;
     check_f32(shexp, &[seq, n_out], "shexp")?;
-    check_f32(gate, &[seq, 1], "gate")?;
-    for (name, t) in [("weights", weights), ("shexp", shexp), ("gate", gate)] {
-        if !down.device().same_device(t.device()) {
+    if let Some(gate) = gate {
+        check_f32(gate, &[seq, 1], "gate")?;
+    }
+    for (name, t) in [
+        ("weights", Some(weights)),
+        ("shexp", Some(shexp)),
+        ("gate", gate),
+    ] {
+        if let Some(t) = t
+            && !down.device().same_device(t.device())
+        {
             bail!("{name} must live on the same Metal device as down");
         }
     }
@@ -2925,7 +2947,12 @@ pub(crate) fn run_moe_epilogue(
         );
     }
 
-    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), "kernel_moe_epilogue")?;
+    let kernel = if gate.is_some() {
+        "kernel_moe_epilogue"
+    } else {
+        "kernel_moe_epilogue_ungated"
+    };
+    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), kernel)?;
     let out_length = seq * n_out;
     let dst = mdev.new_buffer(out_length, DType::F32, "moe_epilogue")?;
 
@@ -2941,9 +2968,15 @@ pub(crate) fn run_moe_epilogue(
     let Storage::Metal(sh_storage) = &*sh_guard else {
         bail!("shexp is not on a Metal device");
     };
-    let (g_guard, g_layout) = gate.storage_and_layout();
-    let Storage::Metal(g_storage) = &*g_guard else {
-        bail!("gate is not on a Metal device");
+    let g_guard = gate.map(|g| g.storage_and_layout());
+    let g_bind = match &g_guard {
+        Some((guard, layout)) => {
+            let Storage::Metal(storage) = &**guard else {
+                bail!("gate is not on a Metal device");
+            };
+            Some((storage.buffer(), f32_off(layout)))
+        }
+        None => None,
     };
 
     let args = MoeEpilogueArgs {
@@ -2964,8 +2997,15 @@ pub(crate) fn run_moe_epilogue(
         encoder.set_input_buffer(1, Some(down_storage.buffer()), f32_off(down_layout));
         encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
         encoder.set_input_buffer(3, Some(sh_storage.buffer()), f32_off(sh_layout));
-        encoder.set_input_buffer(4, Some(g_storage.buffer()), f32_off(g_layout));
-        encoder.set_output_buffer(5, Some(&dst), 0);
+        // The ungated kernel has no gate binding, so its output moves up a slot.
+        let dst_slot = match g_bind {
+            Some((buffer, off)) => {
+                encoder.set_input_buffer(4, Some(buffer), off);
+                5
+            }
+            None => 4,
+        };
+        encoder.set_output_buffer(dst_slot, Some(&dst), 0);
         encoder.dispatch_thread_groups(mtl_size(out_length, 1, 1), mtl_size(width, 1, 1));
     }
     drop(down_guard);
@@ -3086,7 +3126,8 @@ struct MoeEpilogueShexpArgs {
 /// already holds pre-transposed. Returns `(h [n, inner], logit [n, 1])` — the
 /// ungated bottleneck and the RAW pre-sigmoid gate logit, which is what
 /// [`run_moe_epilogue_shexp`] takes (the sigmoid stays in the epilogue, where it
-/// was before this path existed).
+/// was before this path existed). A `None` gate row is an UNGATED shared expert:
+/// `kernel_moe_shexp_gate_up_ungated`, no logit threadgroup, and a `None` logit.
 ///
 /// Geometry outside [`moe_shexp_fused_supported`] is an error here: the caller
 /// asks that predicate first and keeps the classic chain when it says no.
@@ -3094,10 +3135,10 @@ pub(crate) fn run_moe_shexp_gate_up(
     x: &Tensor,
     gate: &QuantPlane,
     up: &QuantPlane,
-    gate_inp: &Tensor,
+    gate_inp: Option<&Tensor>,
     hidden: usize,
     inner: usize,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<(Tensor, Option<Tensor>)> {
     let cdev = x.device().clone();
     let Device::Metal(mdev) = &cdev else {
         bail!("moe_shexp_gate_up requires the activation on a Metal device");
@@ -3138,34 +3179,51 @@ pub(crate) fn run_moe_shexp_gate_up(
         check_plane_fits(plane, &format!("shared expert {what} projection"))?;
     }
     check_f32(x, &[n, hidden], "shared expert activation")?;
-    check_f32(gate_inp, &[hidden, 1], "shared expert gate row")?;
-    if !x.device().same_device(gate_inp.device()) {
-        bail!("the shared expert gate row must live on the same Metal device as the activation");
+    if let Some(gate_inp) = gate_inp {
+        check_f32(gate_inp, &[hidden, 1], "shared expert gate row")?;
+        if !x.device().same_device(gate_inp.device()) {
+            bail!(
+                "the shared expert gate row must live on the same Metal device as the activation"
+            );
+        }
     }
     let n_h = checked_elems(&[n, inner], "moe_shexp bottleneck")?;
     glue_index_fits_i32(checked_elems(&[n, hidden], "moe_shexp activation")?)?;
     glue_index_fits_i32(n_h)?;
 
-    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), "kernel_moe_shexp_gate_up")?;
+    let kernel = if gate_inp.is_some() {
+        "kernel_moe_shexp_gate_up"
+    } else {
+        "kernel_moe_shexp_gate_up_ungated"
+    };
+    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), kernel)?;
     if pipeline.max_total_threads_per_threadgroup() < MOE_SHEXP_THREADS {
         bail!(
-            "kernel_moe_shexp_gate_up needs {MOE_SHEXP_THREADS} threads per threadgroup, the \
-             pipeline allows {}",
+            "{kernel} needs {MOE_SHEXP_THREADS} threads per threadgroup, the pipeline allows {}",
             pipeline.max_total_threads_per_threadgroup()
         );
     }
-    check_delta_simd_width(&pipeline, "kernel_moe_shexp_gate_up")?;
+    check_delta_simd_width(&pipeline, kernel)?;
 
     let h = mdev.new_buffer(n_h, DType::F32, "moe_shexp_h")?;
-    let logit = mdev.new_buffer(n, DType::F32, "moe_shexp_logit")?;
+    let logit = match gate_inp {
+        Some(_) => Some(mdev.new_buffer(n, DType::F32, "moe_shexp_logit")?),
+        None => None,
+    };
 
     let (x_guard, x_layout) = x.storage_and_layout();
     let Storage::Metal(x_storage) = &*x_guard else {
         bail!("the shared expert activation is not on a Metal device");
     };
-    let (r_guard, r_layout) = gate_inp.storage_and_layout();
-    let Storage::Metal(r_storage) = &*r_guard else {
-        bail!("the shared expert gate row is not on a Metal device");
+    let r_guard = gate_inp.map(|r| r.storage_and_layout());
+    let r_bind = match &r_guard {
+        Some((guard, layout)) => {
+            let Storage::Metal(storage) = &**guard else {
+                bail!("the shared expert gate row is not on a Metal device");
+            };
+            Some((storage.buffer(), f32_off(layout)))
+        }
+        None => None,
     };
 
     let n_row_tg = inner.div_ceil(MOE_SHEXP_ROWS_PER_TG);
@@ -3185,21 +3243,28 @@ pub(crate) fn run_moe_shexp_gate_up(
         encoder.set_input_buffer(1, Some(x_storage.buffer()), f32_off(x_layout));
         encoder.set_input_buffer(2, Some(&gate.buffer), gate.base_off);
         encoder.set_input_buffer(3, Some(&up.buffer), up.base_off);
-        encoder.set_input_buffer(4, Some(r_storage.buffer()), f32_off(r_layout));
-        encoder.set_output_buffer(5, Some(&h), 0);
-        encoder.set_output_buffer(6, Some(&logit), 0);
         // One threadgroup per (row tile of the two projections, token), plus one
-        // for the gate logit.
-        encoder.dispatch_thread_groups(
-            mtl_size(n_row_tg + 1, n, 1),
-            mtl_size(MOE_SHEXP_THREADS, 1, 1),
-        );
+        // for the gate logit when there is a gate. The ungated kernel has no gate
+        // row or logit binding, so its output moves up a slot.
+        let row_tgs = match (r_bind, &logit) {
+            (Some((buffer, off)), Some(logit)) => {
+                encoder.set_input_buffer(4, Some(buffer), off);
+                encoder.set_output_buffer(5, Some(&h), 0);
+                encoder.set_output_buffer(6, Some(logit), 0);
+                n_row_tg + 1
+            }
+            _ => {
+                encoder.set_output_buffer(4, Some(&h), 0);
+                n_row_tg
+            }
+        };
+        encoder.dispatch_thread_groups(mtl_size(row_tgs, n, 1), mtl_size(MOE_SHEXP_THREADS, 1, 1));
     }
     drop(x_guard);
     drop(r_guard);
 
     let h = output_tensor(h, mdev, n_h, (n, inner));
-    let logit = output_tensor(logit, mdev, n, (n, 1));
+    let logit = logit.map(|logit| output_tensor(logit, mdev, n, (n, 1)));
     Ok((h, logit))
 }
 
@@ -3211,7 +3276,9 @@ pub(crate) fn run_moe_shexp_gate_up(
 /// `down` is the uncombined routed projection `[seq, top_k, n_out]` f32, `w` the
 /// routing weights `[seq, top_k]`, `h` [`run_moe_shexp_gate_up`]'s bottleneck
 /// `[seq, inner]`, `down_shexp` the `[n_out, inner]` q8_0 projection's raw bytes
-/// and `gate` the RAW `[seq, 1]` gate logit. Returns `[seq, n_out]`.
+/// and `gate` the RAW `[seq, 1]` gate logit, `None` for an ungated shared
+/// expert (`kernel_moe_epilogue_shexp_ungated`, no sigmoid and no scale).
+/// Returns `[seq, n_out]`.
 ///
 /// BOUNDED, not bitwise, against `run_moe_epilogue` — the routed combine folds
 /// over 32 lanes here where that kernel folds over `next_pow2(top_k/2)` — which
@@ -3222,7 +3289,7 @@ pub(crate) fn run_moe_epilogue_shexp(
     weights: &Tensor,
     h: &Tensor,
     down_shexp: &QuantPlane,
-    gate: &Tensor,
+    gate: Option<&Tensor>,
     inner: usize,
 ) -> Result<Tensor> {
     let cdev = down.device().clone();
@@ -3259,9 +3326,17 @@ pub(crate) fn run_moe_epilogue_shexp(
     check_f32(down, &[seq, top_k, n_out], "down")?;
     check_f32(weights, &[seq, top_k], "weights")?;
     check_f32(h, &[seq, inner], "shared expert bottleneck")?;
-    check_f32(gate, &[seq, 1], "gate")?;
-    for (name, t) in [("weights", weights), ("bottleneck", h), ("gate", gate)] {
-        if !down.device().same_device(t.device()) {
+    if let Some(gate) = gate {
+        check_f32(gate, &[seq, 1], "gate")?;
+    }
+    for (name, t) in [
+        ("weights", Some(weights)),
+        ("bottleneck", Some(h)),
+        ("gate", gate),
+    ] {
+        if let Some(t) = t
+            && !down.device().same_device(t.device())
+        {
             bail!("{name} must live on the same Metal device as down");
         }
     }
@@ -3274,15 +3349,20 @@ pub(crate) fn run_moe_epilogue_shexp(
     }
     glue_index_fits_i32(checked_elems(&[seq, inner], "moe_shexp bottleneck")?)?;
 
-    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), "kernel_moe_epilogue_shexp")?;
+    let kernel = if gate.is_some() {
+        "kernel_moe_epilogue_shexp"
+    } else {
+        "kernel_moe_epilogue_shexp_ungated"
+    };
+    let pipeline = pipelines::moe_glue_pipeline(mdev.device(), kernel)?;
     if pipeline.max_total_threads_per_threadgroup() < MOE_SHEXP_EPILOGUE_THREADS {
         bail!(
-            "kernel_moe_epilogue_shexp needs {MOE_SHEXP_EPILOGUE_THREADS} threads per \
-             threadgroup, the pipeline allows {}",
+            "{kernel} needs {MOE_SHEXP_EPILOGUE_THREADS} threads per threadgroup, the pipeline \
+             allows {}",
             pipeline.max_total_threads_per_threadgroup()
         );
     }
-    check_delta_simd_width(&pipeline, "kernel_moe_epilogue_shexp")?;
+    check_delta_simd_width(&pipeline, kernel)?;
 
     let out_length = checked_elems(&[seq, n_out], "moe_epilogue_shexp output")?;
     let dst = mdev.new_buffer(out_length, DType::F32, "moe_epilogue_shexp")?;
@@ -3299,9 +3379,15 @@ pub(crate) fn run_moe_epilogue_shexp(
     let Storage::Metal(h_storage) = &*h_guard else {
         bail!("the shared expert bottleneck is not on a Metal device");
     };
-    let (g_guard, g_layout) = gate.storage_and_layout();
-    let Storage::Metal(g_storage) = &*g_guard else {
-        bail!("gate is not on a Metal device");
+    let g_guard = gate.map(|g| g.storage_and_layout());
+    let g_bind = match &g_guard {
+        Some((guard, layout)) => {
+            let Storage::Metal(storage) = &**guard else {
+                bail!("gate is not on a Metal device");
+            };
+            Some((storage.buffer(), f32_off(layout)))
+        }
+        None => None,
     };
 
     let args = MoeEpilogueShexpArgs {
@@ -3321,8 +3407,15 @@ pub(crate) fn run_moe_epilogue_shexp(
         encoder.set_input_buffer(2, Some(w_storage.buffer()), f32_off(w_layout));
         encoder.set_input_buffer(3, Some(h_storage.buffer()), f32_off(h_layout));
         encoder.set_input_buffer(4, Some(&down_shexp.buffer), down_shexp.base_off);
-        encoder.set_input_buffer(5, Some(g_storage.buffer()), f32_off(g_layout));
-        encoder.set_output_buffer(6, Some(&dst), 0);
+        // The ungated kernel has no gate binding, so its output moves up a slot.
+        let dst_slot = match g_bind {
+            Some((buffer, off)) => {
+                encoder.set_input_buffer(5, Some(buffer), off);
+                6
+            }
+            None => 5,
+        };
+        encoder.set_output_buffer(dst_slot, Some(&dst), 0);
         // kernel_moe_epilogue's grid, unchanged: one threadgroup per output
         // element, now a full simdgroup wide.
         encoder.dispatch_thread_groups(
@@ -3387,9 +3480,9 @@ struct GatedResidualArgs {
 }
 
 /// Matches the Metal `flash_attn_params` struct (src/ops/flash.metal).
-/// `#[repr(C)]` pins the layout byte-for-byte: twelve 4-byte fields (48 bytes,
-/// a multiple of 8) followed by eight `i64` element strides — no implicit
-/// padding on either side.
+/// `#[repr(C)]` pins the layout byte-for-byte: fourteen 4-byte fields (56
+/// bytes, a multiple of 8) followed by eight `i64` element strides — no
+/// implicit padding on either side.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlashAttnArgs {
@@ -3405,6 +3498,8 @@ struct FlashAttnArgs {
     k_off: i32,
     window: i32,
     disable_skip: i32,
+    has_sinks: i32,
+    pad0: i32,
     q_stride_h: i64,
     q_stride_r: i64,
     k_stride_h: i64,
@@ -5173,6 +5268,34 @@ pub(crate) fn run_flash_attn(
         k,
         v,
         FlashMask::Causal { pos, k_off, window },
+        None,
+        scale,
+        disable_skip,
+    )
+}
+
+/// [`run_flash_attn`] with a learned sink per query head: `sinks` is
+/// `[n_head]` f32, raw logits (not scaled by `scale`) that join every row's
+/// softmax denominator and attend to nothing. A sink of -1e30 vanishes from
+/// the denominator exactly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_flash_attn_sinks(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    sinks: &Tensor,
+    pos: usize,
+    k_off: usize,
+    window: Option<usize>,
+    scale: f32,
+    disable_skip: bool,
+) -> Result<Tensor> {
+    run_flash_attn_impl(
+        q,
+        k,
+        v,
+        FlashMask::Causal { pos, k_off, window },
+        Some(sinks),
         scale,
         disable_skip,
     )
@@ -5192,7 +5315,7 @@ pub(crate) fn run_flash_attn_bidirectional(
     v: &Tensor,
     scale: f32,
 ) -> Result<Tensor> {
-    run_flash_attn_impl(q, k, v, FlashMask::Bidirectional, scale, false)
+    run_flash_attn_impl(q, k, v, FlashMask::Bidirectional, None, scale, false)
 }
 
 /// Which visibility rule a flash dispatch runs. Both are expressed to the
@@ -5215,6 +5338,7 @@ fn run_flash_attn_impl(
     k: &Tensor,
     v: &Tensor,
     mask: FlashMask,
+    sinks: Option<&Tensor>,
     scale: f32,
     disable_skip: bool,
 ) -> Result<Tensor> {
@@ -5297,9 +5421,14 @@ fn run_flash_attn_impl(
         }
     };
 
+    if let Some(s) = sinks {
+        check_sinks(s, n_head, &cdev)?;
+    }
+
     let out_count = checked_elems(&[n_head, seq, head_dim], "flash_attn")?;
     let dst = mdev.new_buffer(out_count, DType::F32, "flash_attn")?;
 
+    let sinks_guard = sinks.map(|s| s.storage_and_layout());
     let (q_guard, q_layout) = q.storage_and_layout();
     let Storage::Metal(q_storage) = &*q_guard else {
         bail!("q is not on a Metal device");
@@ -5341,6 +5470,8 @@ fn run_flash_attn_impl(
         k_off: k_off as i32,
         window,
         disable_skip: disable_skip as i32,
+        has_sinks: sinks.is_some() as i32,
+        pad0: 0,
         q_stride_h: i64_stride(q_layout.stride()[0], "q head")?,
         q_stride_r: i64_stride(q_layout.stride()[1], "q row")?,
         k_stride_h: i64_stride(k_layout.stride()[0], "k head")?,
@@ -5374,6 +5505,21 @@ fn run_flash_attn_impl(
             v_layout.start_offset() * DType::F16.size_in_bytes(),
         );
         encoder.set_output_buffer(4, Some(&dst), 0);
+        // Without sinks the kernel never reads buffer 5; q's buffer stands in
+        // so the slot is bound.
+        match &sinks_guard {
+            Some((guard, layout)) => {
+                let Storage::Metal(s) = &**guard else {
+                    bail!("sinks are not on a Metal device");
+                };
+                encoder.set_input_buffer(
+                    5,
+                    Some(s.buffer()),
+                    layout.start_offset() * DType::F32.size_in_bytes(),
+                );
+            }
+            None => encoder.set_input_buffer(5, Some(q_storage.buffer()), 0),
+        }
         // One threadgroup per (query block, query head); 4 simdgroups.
         let grid = mtl_size(nq, n_head, 1);
         encoder.dispatch_thread_groups(grid, mtl_size(32, 4, 1));
@@ -5420,6 +5566,240 @@ fn check_flash_kv(
         bail!("{what} must live on the same Metal device as q");
     }
     Ok((n_kv, len, stride[0]))
+}
+
+/// Validate a per-query-head sink vector: `[n_head]` f32, contiguous, on q's
+/// device.
+fn check_sinks(sinks: &Tensor, n_head: usize, q_device: &Device) -> Result<()> {
+    if sinks.dims() != [n_head] {
+        bail!("sinks are {:?}, expected [{n_head}]", sinks.dims());
+    }
+    if sinks.dtype() != DType::F32 {
+        bail!("sinks must be f32, got {:?}", sinks.dtype());
+    }
+    if !sinks.is_contiguous() {
+        bail!("sinks must be contiguous");
+    }
+    if !sinks.device().same_device(q_device) {
+        bail!("sinks must live on the same Metal device as q");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Single-row (decode) attention, see src/ops/attn_decode.metal.
+
+/// Matches the Metal `attn_decode_args` struct (src/ops/attn_decode.metal).
+/// `#[repr(C)]` pins the layout: six 4-byte fields (24 bytes) then two `i64`
+/// element strides.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttnDecodeArgs {
+    n_keys: i32,
+    n_split: i32,
+    chunk: i32,
+    has_sinks: i32,
+    scale_log2: f32,
+    pad: i32,
+    k_stride_h: i64,
+    v_stride_h: i64,
+}
+
+/// Simdgroups per `attn_decode` threadgroup (`NSG` in the kernel).
+const ATTN_DECODE_NSG: usize = 4;
+/// The most splits `attn_decode` runs: the combine reads every split's max and
+/// sum per head dim, and past this the per-split work is too small to pay for
+/// its partial row.
+pub(crate) const ATTN_DECODE_MAX_SPLIT: usize = 128;
+/// The fewest keys a split covers: eight per simdgroup.
+const ATTN_DECODE_MIN_KEYS_PER_SPLIT: usize = 32;
+/// The threadgroups a decode dispatch aims for across all KV heads.
+const ATTN_DECODE_TARGET_GROUPS: usize = 128;
+
+/// The split count `run_attn_decode` picks for `n_keys` keys over `n_kv` KV
+/// heads: enough splits for [`ATTN_DECODE_TARGET_GROUPS`] threadgroups, but
+/// none with fewer than [`ATTN_DECODE_MIN_KEYS_PER_SPLIT`] keys. Fitted on
+/// Flint's 4 KV heads (`attn_decode_microbench`): 32 splits is fastest at 4k
+/// and 32k keys and 16 at the 513-key ring, where each extra split costs more
+/// in its partial row than its keys save.
+pub(crate) fn attn_decode_splits(n_keys: usize, n_kv: usize) -> usize {
+    let by_groups = (ATTN_DECODE_TARGET_GROUPS / n_kv.max(1)).max(1);
+    n_keys
+        .div_ceil(ATTN_DECODE_MIN_KEYS_PER_SPLIT)
+        .min(by_groups)
+        .clamp(1, ATTN_DECODE_MAX_SPLIT)
+}
+
+/// Single-row attention over every key of a cache view: `q` `[n_head, 1, 128]`
+/// f32 contiguous, `k`/`v` `[n_kv, K, 128]` f16 with contiguous rows (the head
+/// stride is free, so a cache capacity view or a sliding ring is read in
+/// place), `sinks` `[n_head]` f32 raw logits when given. No mask: the row sees
+/// every key, in any order. Query head `h` reads KV head `h / (n_head / n_kv)`.
+/// `n_split` overrides [`attn_decode_splits`] (tests and the microbench).
+/// Returns `[n_head, 1, 128]` f32.
+pub(crate) fn run_attn_decode(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    sinks: Option<&Tensor>,
+    scale: f32,
+    n_split: Option<usize>,
+) -> Result<Tensor> {
+    let cdev = q.device().clone();
+    let Device::Metal(mdev) = &cdev else {
+        bail!("attn_decode requires q on a Metal device");
+    };
+    let (n_head, seq, head_dim) = q
+        .dims3()
+        .map_err(|e| anyhow::anyhow!("q must be rank-3 [n_head, 1, head_dim]: {e}"))?;
+    if seq != 1 {
+        bail!("attn_decode takes one query row, got {seq}");
+    }
+    if q.dtype() != DType::F32 {
+        bail!("q must be f32, got {:?}", q.dtype());
+    }
+    if !q.is_contiguous() {
+        bail!("q must be contiguous");
+    }
+    if head_dim != FLASH_BD {
+        bail!("attn_decode is compiled for head_dim {FLASH_BD}, got {head_dim}");
+    }
+    let (n_kv, n_keys, k_stride_h) = check_flash_kv(k, "k", head_dim, &cdev)?;
+    let (n_kv_v, v_len, v_stride_h) = check_flash_kv(v, "v", head_dim, &cdev)?;
+    if (n_kv_v, v_len) != (n_kv, n_keys) {
+        bail!("k [{n_kv}, {n_keys}] and v [{n_kv_v}, {v_len}] disagree on shape");
+    }
+    if n_kv == 0 || !n_head.is_multiple_of(n_kv) {
+        bail!("n_head ({n_head}) must be a positive multiple of n_kv ({n_kv})");
+    }
+    let name = match n_head / n_kv {
+        1 => "kernel_attn_decode_g1",
+        2 => "kernel_attn_decode_g2",
+        4 => "kernel_attn_decode_g4",
+        8 => "kernel_attn_decode_g8",
+        g => bail!("attn_decode has no kernel for {g} query heads per KV head"),
+    };
+    if let Some(s) = sinks {
+        check_sinks(s, n_head, &cdev)?;
+    }
+    if i32::try_from(n_keys).is_err() {
+        bail!("attn_decode key count {n_keys} overflows the kernel's i32 index math");
+    }
+    let n_split = n_split.unwrap_or_else(|| attn_decode_splits(n_keys, n_kv));
+    if !(1..=ATTN_DECODE_MAX_SPLIT).contains(&n_split) {
+        bail!("attn_decode split count {n_split} outside 1..={ATTN_DECODE_MAX_SPLIT}");
+    }
+    let chunk = n_keys.div_ceil(n_split);
+
+    let out_count = checked_elems(&[n_head, head_dim], "attn_decode")?;
+    // With more than one split, the partial rows and their (max, sum) pairs
+    // live at the tail of the output allocation, so the returned tensor keeps
+    // them resident until the combine has read them.
+    let partial_count = if n_split > 1 {
+        checked_elems(&[n_head, n_split, head_dim + 2], "attn_decode partials")?
+    } else {
+        0
+    };
+    let dst = mdev.new_buffer(out_count + partial_count, DType::F32, "attn_decode")?;
+    let f32_bytes = DType::F32.size_in_bytes();
+    let partials_off = out_count * f32_bytes;
+    let ml_off = partials_off + n_head * n_split * head_dim * f32_bytes;
+
+    let args = AttnDecodeArgs {
+        n_keys: n_keys as i32,
+        n_split: n_split as i32,
+        chunk: chunk as i32,
+        has_sinks: sinks.is_some() as i32,
+        scale_log2: scale * std::f32::consts::LOG2_E,
+        pad: 0,
+        k_stride_h: i64::try_from(k_stride_h)?,
+        v_stride_h: i64::try_from(v_stride_h)?,
+    };
+
+    let pipeline = pipelines::attn_decode_pipeline(mdev.device(), name)?;
+    let sinks_guard = sinks.map(|s| s.storage_and_layout());
+    let (q_guard, q_layout) = q.storage_and_layout();
+    let Storage::Metal(q_storage) = &*q_guard else {
+        bail!("q is not on a Metal device");
+    };
+    let (k_guard, k_layout) = k.storage_and_layout();
+    let Storage::Metal(k_storage) = &*k_guard else {
+        bail!("k is not on a Metal device");
+    };
+    let (v_guard, v_layout) = v.storage_and_layout();
+    let Storage::Metal(v_storage) = &*v_guard else {
+        bail!("v is not on a Metal device");
+    };
+    // Without sinks the kernels never read the sink slot; q's buffer stands in
+    // so it is bound.
+    let (sink_buf, sink_off) = match &sinks_guard {
+        Some((guard, layout)) => {
+            let Storage::Metal(s) = &**guard else {
+                bail!("sinks are not on a Metal device");
+            };
+            (
+                s.buffer(),
+                layout.start_offset() * DType::F32.size_in_bytes(),
+            )
+        }
+        None => (q_storage.buffer(), 0),
+    };
+
+    {
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(
+            1,
+            Some(q_storage.buffer()),
+            q_layout.start_offset() * DType::F32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(k_storage.buffer()),
+            k_layout.start_offset() * DType::F16.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            3,
+            Some(v_storage.buffer()),
+            v_layout.start_offset() * DType::F16.size_in_bytes(),
+        );
+        encoder.set_input_buffer(4, Some(sink_buf), sink_off);
+        if n_split > 1 {
+            encoder.set_output_buffer(5, Some(&dst), partials_off);
+            encoder.set_output_buffer(6, Some(&dst), ml_off);
+        } else {
+            encoder.set_output_buffer(5, Some(&dst), 0);
+            encoder.set_output_buffer(6, Some(&dst), 0);
+        }
+        // One threadgroup per (split, KV head).
+        encoder.dispatch_thread_groups(
+            mtl_size(n_split, n_kv, 1),
+            mtl_size(32 * ATTN_DECODE_NSG, 1, 1),
+        );
+    }
+    if n_split > 1 {
+        let combine = pipelines::attn_decode_pipeline(mdev.device(), "attn_decode_combine")?;
+        let cmd = mdev.command_encoder()?;
+        let ep = &cmd;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&combine);
+        encoder.set_bytes(0, &args);
+        encoder.set_input_buffer(1, Some(&dst), partials_off);
+        encoder.set_input_buffer(2, Some(&dst), ml_off);
+        encoder.set_input_buffer(3, Some(sink_buf), sink_off);
+        encoder.set_output_buffer(4, Some(&dst), 0);
+        encoder.dispatch_thread_groups(mtl_size(n_head, 1, 1), mtl_size(head_dim, 1, 1));
+    }
+    drop(q_guard);
+    drop(k_guard);
+    drop(v_guard);
+
+    Ok(output_tensor(dst, mdev, out_count, (n_head, 1, head_dim)))
 }
 
 // ---------------------------------------------------------------------------

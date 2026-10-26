@@ -6,9 +6,13 @@
 //! The attention itself runs on one of two arms, picked once per load by
 //! [`ATTN_ENV`] ([`AttnImpl`]): [`reference_attention`], an explicit f32 candle
 //! chain that is the frozen correctness oracle and is never optimised, and
-//! `production_attention`, the shipped arm, which is the one a faster kernel
-//! replaces. The two compute the same math today, in separate functions, so the
-//! kernel work edits one and the oracle it is graded against stays put.
+//! `production_attention`, the shipped arm, which runs the same math on two
+//! Metal kernels: the flash prefill kernel with a sink per head
+//! ([`crate::ops::flash_attn_sinks`]) for a chunk, computing the causal and
+//! sliding visibility in-kernel, and the GQA-grouped split-K decode kernel
+//! ([`crate::ops::attn_decode`]) for a single row. Neither widens the f16
+//! cache or materializes a score tile, and only the reference arm takes a
+//! mask.
 
 use std::sync::Arc;
 
@@ -18,7 +22,7 @@ use candle_core::{D, DType, Module, Tensor};
 use crate::attention::{AttnWeights, Proj};
 use crate::config::{LayerKind, XwenConfig};
 use crate::gguf::Weights;
-use crate::kv_cache::LayerCache;
+use crate::kv_cache::{LayerCache, MaskKind};
 use crate::rope::Rope;
 
 /// The environment switch naming the attention arm: `production` (the default)
@@ -28,8 +32,8 @@ pub const ATTN_ENV: &str = "XWEN_FLINT_ATTN";
 /// Which function computes Flint's attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttnImpl {
-    /// The shipped arm, `production_attention`: the one a fused kernel
-    /// replaces.
+    /// The shipped arm, `production_attention`: the flash and decode
+    /// kernels.
     Production,
     /// [`reference_attention`], the frozen f32 oracle the production arm is
     /// graded against. Never optimised.
@@ -84,13 +88,6 @@ pub enum WrongGraph {
 /// `n_head x rows x keys` f32, so an unblocked 2048-token chunk at 32k keys
 /// would be 8.6 GB; 256 rows hold it to 1.1 GB there.
 const QUERY_BLOCK: usize = 256;
-
-/// The production arm's score-tile ceiling. A tile is `n_head x rows x keys`
-/// f32 and the arm lowers `rows` below [`QUERY_BLOCK`] to stay under this, so
-/// a forward's attention transients stop growing with the context: at 256
-/// rows the tile is 32 KiB per key, and the pool candle keeps of past tiles
-/// measured 41 GB of footprint at 57k tokens (2026-10-25).
-const TILE_BYTES: usize = 256 << 20;
 
 /// One Flint attention layer. Projections run on the trunk's [`Proj`] (Q8_0 on
 /// the shipped file: the dense f16 plane at prefill, the q8_0 gemv at decode);
@@ -187,7 +184,9 @@ impl FlintAttn {
     ///
     /// `mask` is `attn_mask_for(cache.mask_kind(), seq, pos)`, which the stack
     /// builds once per forward per kind and shares across the layers of that
-    /// kind; `None` for a single decode row.
+    /// kind, and only for the reference arm ([`Self::needs_mask`]); `None`
+    /// for a single decode row and on the production arm, which computes
+    /// visibility in-kernel from `pos` and the cache's geometry.
     pub fn forward(
         &self,
         x_normed: &Tensor,
@@ -200,31 +199,72 @@ impl FlintAttn {
         let q = self.q_proj.forward(x_normed)?.reshape((seq, nh, hd))?;
         let k = self.k_proj.forward(x_normed)?.reshape((seq, nkv, hd))?;
         let v = self.v_proj.forward(x_normed)?.reshape((seq, nkv, hd))?;
-        let q = self.q_norm.forward(&q)?.transpose(0, 1)?.contiguous()?; // [nh, seq, hd]
-        let k = self.k_norm.forward(&k)?.transpose(0, 1)?.contiguous()?; // [nkv, seq, hd]
-        let v = v.transpose(0, 1)?.contiguous()?;
-        let (q, k) = match &self.rope {
-            Some(rope) => rope.apply(&q, &k, pos)?,
-            None => (q, k),
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+        // To [head, seq, hd]. At one row the [1, head, hd] and [head, 1, hd]
+        // layouts share byte order, so a reshape is the transpose.
+        let (q, k, v) = if seq == 1 {
+            (
+                q.reshape((nh, 1, hd))?,
+                k.reshape((nkv, 1, hd))?,
+                v.reshape((nkv, 1, hd))?,
+            )
+        } else {
+            (
+                q.transpose(0, 1)?.contiguous()?,
+                k.transpose(0, 1)?.contiguous()?,
+                v.transpose(0, 1)?.contiguous()?,
+            )
         };
-        // The cache holds f16, as llama.cpp's does; the reference reads it back
-        // as f32 and does everything else at f32.
-        let (k_all, v_all) = cache.append(&k.to_dtype(DType::F16)?, &v.to_dtype(DType::F16)?)?;
+        // The cache holds f16, as llama.cpp's does; the rope stores k as f16
+        // directly (one rounding of the f32 result, the same as a cast after
+        // it). The reference reads the cache back as f32 and does everything
+        // else at f32.
+        let (q, k) = match &self.rope {
+            Some(rope) => rope.apply_dt(&q, &k, pos, DType::F32, DType::F16)?,
+            None => (q, k.to_dtype(DType::F16)?),
+        };
+        // Where this chunk's keys start: a full layer's view is every position
+        // from 0, a sliding layer's prefill view the ring's survivors (at most
+        // `window` of them, oldest first) and then the chunk. Read before the
+        // append, which advances the cache.
+        let (k_off, window) = match cache.mask_kind() {
+            MaskKind::Full => (0, None),
+            MaskKind::Swa { window } => (pos - pos.min(window), Some(window)),
+        };
+        let (k_all, v_all) = cache.append(&k, &v.to_dtype(DType::F16)?)?;
         let out = match self.attn_impl {
-            AttnImpl::Production => {
-                production_attention(&q, &k_all, &v_all, mask, &self.sinks, self.head_dim)?
-            }
+            AttnImpl::Production => production_attention(
+                &q,
+                &k_all,
+                &v_all,
+                &self.sinks,
+                self.head_dim,
+                pos,
+                k_off,
+                window,
+            )?,
             AttnImpl::Reference => {
                 reference_attention(&q, &k_all, &v_all, mask, &self.sinks, self.head_dim)?
             }
         }; // [nh, seq, hd]
-        let out = out.transpose(0, 1)?.contiguous()?.reshape((seq, nh * hd))?;
+        let out = if seq == 1 {
+            out.reshape((1, nh * hd))?
+        } else {
+            out.transpose(0, 1)?.contiguous()?.reshape((seq, nh * hd))?
+        };
         self.o_proj.forward(&out)
     }
 
     /// The arm this layer runs.
     pub fn attn_impl(&self) -> AttnImpl {
         self.attn_impl
+    }
+
+    /// Whether [`Self::forward`] reads a prefill mask: only the reference arm
+    /// does, so the stack builds none for the production one.
+    pub fn needs_mask(&self) -> bool {
+        self.attn_impl == AttnImpl::Reference
     }
 }
 
@@ -283,57 +323,33 @@ pub fn reference_attention(
     Ok(Tensor::cat(&blocks, 1)?)
 }
 
-/// The shipped attention arm, same operands and contract as
-/// [`reference_attention`]. It computes the same math today; it is the function
-/// a fused kernel replaces, with the reference left as the oracle.
+/// The shipped attention arm: [`reference_attention`]'s math and output on
+/// the Metal kernels, with visibility computed from positions instead of a
+/// mask. `q` is `[n_head, seq, 128]` f32 contiguous; `k`/`v` are the cache's
+/// f16 view `[n_kv, keys, 128]` exactly as `LayerCache::append` returns it,
+/// head-strided or not. Query row `i` sits at absolute position `pos + i` and
+/// key column `j` at `k_off + j`, and a row sees a key that is not in its
+/// future and, under `window`, fewer than `window` positions behind it. A
+/// single row sees every key of its view whatever the geometry: a sliding
+/// layer's decode view is the whole ring in ring order, which holds exactly
+/// the visible window.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn production_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    mask: Option<&Tensor>,
     sinks: &Tensor,
     head_dim: usize,
+    pos: usize,
+    k_off: usize,
+    window: Option<usize>,
 ) -> Result<Tensor> {
-    let (nh, seq, hd) = q.dims3()?;
-    let (nkv, keys, _) = k.dims3()?;
-    let group = nh / nkv;
-    let scale = 1.0 / (head_dim as f64).sqrt();
-    let k = k.to_dtype(DType::F32)?;
-    let v = v.to_dtype(DType::F32)?;
-    let kt = k.transpose(1, 2)?.contiguous()?; // [nkv, hd, keys]
-    let sinks = sinks.to_dtype(DType::F32)?.reshape((nkv, group, 1, 1))?;
-    // Rows are independent, so the block height changes no value: it bounds
-    // the score tile, `n_head x rows x keys` f32, to [`TILE_BYTES`] whatever
-    // the context, where a fixed height makes it grow with every key.
-    let block =
-        (TILE_BYTES / (nh * keys.max(1) * DType::F32.size_in_bytes())).clamp(1, QUERY_BLOCK);
-    let mut blocks = Vec::new();
-    let mut r0 = 0;
-    while r0 < seq {
-        let rows = block.min(seq - r0);
-        // [nh, rows, hd] -> [nkv, group * rows, hd]: head h = j * group + i.
-        let qb = q
-            .narrow(1, r0, rows)?
-            .contiguous()?
-            .reshape((nkv, group * rows, hd))?;
-        let scores = (qb.matmul(&kt)? * scale)?.reshape((nkv, group, rows, keys))?;
-        let scores = match mask {
-            Some(m) => {
-                scores.broadcast_add(&m.narrow(0, r0, rows)?.reshape((1, 1, rows, keys))?)?
-            }
-            None => scores,
-        };
-        let sink_col = sinks.broadcast_as((nkv, group, rows, 1))?.contiguous()?;
-        let logits = Tensor::cat(&[&scores, &sink_col], D::Minus1)?;
-        let probs = candle_nn::ops::softmax_last_dim(&logits)?
-            .narrow(D::Minus1, 0, keys)?
-            .contiguous()?
-            .reshape((nkv, group * rows, keys))?;
-        let out = probs.matmul(&v)?.reshape((nh, rows, hd))?;
-        blocks.push(out);
-        r0 += rows;
+    let scale = (1.0 / (head_dim as f64).sqrt()) as f32;
+    if q.dim(1)? == 1 {
+        crate::ops::attn_decode(q, k, v, Some(sinks), scale)
+    } else {
+        crate::ops::flash_attn_sinks(q, k, v, sinks, pos, k_off, window, scale)
     }
-    Ok(Tensor::cat(&blocks, 1)?)
 }
 
 #[cfg(test)]
@@ -453,19 +469,35 @@ mod tests {
         assert!(moved > 1e-2, "sinks moved the output by only {moved}");
     }
 
-    /// The sliding layers' ring and mask against the definition, through the
-    /// path a forward takes (`LayerCache::append`, `attn_mask_for`, both
-    /// attention arms), at every chunking a forward can see: single rows, a
-    /// small odd chunk, chunks one under, at and one over the window, and one
-    /// wider than it. Query position `p` sees key position `j` exactly when
-    /// `j <= p` and `p - j < 513`, the current position included; a window
-    /// one short (512) is far outside the tolerance here, which is the
-    /// off-by-one the logits gate cannot see (tests/flint_parity.rs).
+    /// The sliding layers' ring against the definition, through the path a
+    /// forward takes (`LayerCache::append`, then the reference arm on
+    /// `attn_mask_for`'s mask, or the production arm on the geometry
+    /// `FlintAttn::forward` derives), at every chunking a forward can see:
+    /// single rows, a small odd chunk, chunks one under, at and one over the
+    /// window, and one wider than it. Query position `p` sees key position
+    /// `j` exactly when `j <= p` and `p - j < 513`, the current position
+    /// included; a window one short (512) is far outside the tolerance here,
+    /// which is the off-by-one the logits gate cannot see
+    /// (tests/flint_parity.rs). The reference arm runs on the CPU; the
+    /// production arm's kernels need Metal, where both arms run.
     #[test]
     fn the_sliding_ring_attends_exactly_the_window() {
+        sliding_ring_case(&Device::Cpu, &[AttnImpl::Reference], 16);
+    }
+
+    /// [`the_sliding_ring_attends_exactly_the_window`] on Metal, at Flint's
+    /// head width (the kernels are compiled for 128) and GQA ratio, through
+    /// both arms.
+    #[test]
+    fn the_sliding_ring_attends_exactly_the_window_on_metal() {
+        let dev = crate::gguf::metal_device().unwrap();
+        sliding_ring_case(&dev, &[AttnImpl::Reference, AttnImpl::Production], 128);
+    }
+
+    fn sliding_ring_case(dev: &Device, arms: &[AttnImpl], hd: usize) {
         use crate::kv_cache::{LayerCache, attn_mask_for};
-        let dev = Device::Cpu;
-        let (nh, nkv, hd, window) = (4usize, 2usize, 16usize, 513usize);
+        let dev = dev.clone();
+        let (nh, nkv, window) = (16usize, 2usize, 513usize);
         let total = 1400usize;
         const TOL: f32 = 1e-5;
         let round = |v: Vec<f32>| -> Vec<f32> {
@@ -527,7 +559,18 @@ mod tests {
             ("514", &|_| 514),
             ("1x40 then 700", &|p| if p < 40 { 1 } else { 700 }),
         ];
-        let mut short_window_gap = 0f32;
+        // Every schedule and arm grades the same positions, so the definition
+        // is evaluated once per position.
+        let wants: Vec<Vec<f32>> = (0..total).map(|p| definition(p, window)).collect();
+        let short_window_gap = (window..total)
+            .map(|p| {
+                let short = definition(p, window - 1);
+                (0..nh * hd)
+                    .map(|i| (wants[p][i] - short[i]).abs())
+                    .fold(0f32, f32::max)
+            })
+            .fold(0f32, f32::max);
+        let mut worst_by_arm = vec![0f32; arms.len()];
         for (name, size) in schedules {
             let mut cache = LayerCache::Swa {
                 k: Tensor::zeros((nkv, window, hd), DType::F16, &dev).unwrap(),
@@ -540,28 +583,31 @@ mod tests {
                 let seq = size(pos).min(total - pos);
                 let kc = head_rows(&k, nkv, pos, seq).to_dtype(DType::F16).unwrap();
                 let vc = head_rows(&v, nkv, pos, seq).to_dtype(DType::F16).unwrap();
+                let k_off = pos - pos.min(window);
                 let (k_all, v_all) = cache.append(&kc, &vc).unwrap();
                 let mask = attn_mask_for(cache.mask_kind(), seq, pos, &dev).unwrap();
                 let qc = head_rows(&q, nh, pos, seq);
-                type Arm = fn(
-                    &Tensor,
-                    &Tensor,
-                    &Tensor,
-                    Option<&Tensor>,
-                    &Tensor,
-                    usize,
-                ) -> Result<Tensor>;
-                let arms: [(&str, Arm); 2] = [
-                    ("reference", reference_attention),
-                    ("production", production_attention),
-                ];
-                for (arm, f) in arms {
-                    let out = f(&qc, &k_all, &v_all, mask.as_ref(), &sink_t, hd)
-                        .unwrap()
-                        .to_vec3::<f32>()
-                        .unwrap(); // [nh, seq, hd]
+                for (ai, &arm) in arms.iter().enumerate() {
+                    let out = match arm {
+                        AttnImpl::Reference => {
+                            reference_attention(&qc, &k_all, &v_all, mask.as_ref(), &sink_t, hd)
+                        }
+                        AttnImpl::Production => production_attention(
+                            &qc,
+                            &k_all,
+                            &v_all,
+                            &sink_t,
+                            hd,
+                            pos,
+                            k_off,
+                            Some(window),
+                        ),
+                    }
+                    .unwrap()
+                    .to_vec3::<f32>()
+                    .unwrap(); // [nh, seq, hd]
                     for r in 0..seq {
-                        let want = definition(pos + r, window);
+                        let want = &wants[pos + r];
                         let mut worst = 0f32;
                         for h in 0..nh {
                             for d in 0..hd {
@@ -570,20 +616,17 @@ mod tests {
                         }
                         assert!(
                             worst < TOL,
-                            "schedule {name}, {arm}: position {} off the definition by {worst}",
+                            "schedule {name}, {arm:?}: position {} off the definition by {worst}",
                             pos + r
                         );
-                        if arm == "reference" && pos + r >= window {
-                            let short = definition(pos + r, window - 1);
-                            let gap = (0..nh * hd)
-                                .map(|i| (want[i] - short[i]).abs())
-                                .fold(0f32, f32::max);
-                            short_window_gap = short_window_gap.max(gap);
-                        }
+                        worst_by_arm[ai] = worst_by_arm[ai].max(worst);
                     }
                 }
                 pos += seq;
             }
+        }
+        for (arm, worst) in arms.iter().zip(&worst_by_arm) {
+            println!("{arm:?}: worst {worst:.2e} off the definition");
         }
         // Dropping the oldest of 513 keys moves a row by about one key's share
         // of the softmax, ~6e-4 on these operands: tens of tolerances.

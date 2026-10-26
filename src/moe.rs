@@ -90,10 +90,8 @@ pub struct MoeBlock {
     shared: SharedExpert,
     n_expert: usize,
     n_expert_used: usize,
-    /// Softmax or sigmoid scoring. The fused router kernel implements the
-    /// softmax router only and the fused block epilogue the GATED shared expert
-    /// only, so a block with either a sigmoid router or an ungated shared expert
-    /// (Flint has both) runs the candle chains; see [`MoeBlock::glue_fused`].
+    /// Softmax or sigmoid scoring. Both run on the fused router kernel, which
+    /// is told which (`ops::moe_router`).
     gating: Gating,
     /// The floor the renormalized top-k weight sum is clamped to, from
     /// `Arch::moe_sum_floor`: llama.cpp's [`crate::config::MOE_SUM_FLOOR`] on
@@ -130,11 +128,10 @@ impl MoeBlock {
     /// the candle chains. Needs a Metal device, the kill-switch unset, and a
     /// routing geometry the router kernel's threadgroup arrays cover — the
     /// bounds are the kernel's, so a checkpoint outside them falls back rather
-    /// than failing.
+    /// than failing. Either gating and a gated or ungated shared expert: every
+    /// kernel on the path has both forms.
     fn glue_fused(&self, x: &Tensor) -> bool {
-        self.gating == Gating::Softmax
-            && self.shared.is_gated()
-            && !crate::ops::moe_glue_classic()
+        !crate::ops::moe_glue_classic()
             && x.device().is_metal()
             && crate::ops::moe_router_supported(self.n_expert, self.n_expert_used)
     }
@@ -189,10 +186,11 @@ impl MoeBlock {
             route_logits(&self.router, &self.router_t, x_normed, mv)
         })?;
         if self.glue_fused(x_normed) {
-            // One kernel for softmax + arg-sort + gather + sum + clamp + divide,
-            // bit-identical to the candle chain below (ops::moe_glue).
+            // One kernel for softmax (or sigmoid) + arg-sort + gather + sum +
+            // clamp + divide, bit-identical to the candle chains below
+            // (ops::moe_glue).
             return crate::ops::dup(crate::ops::DupStage::MoeGlue, x_normed.dim(0)?, || {
-                crate::ops::moe_router(&logits, self.n_expert_used, self.sum_floor)
+                crate::ops::moe_router(&logits, self.n_expert_used, self.sum_floor, self.gating)
             });
         }
         match self.gating {
@@ -207,8 +205,8 @@ impl MoeBlock {
         let (ids, weights) = self.route(x_normed)?;
 
         // Fused tail: the routed weighted combine, the shared expert's sigmoid
-        // gate, its multiply and the routed+shared add in one pass over the
-        // uncombined down projection. Only when the expert runner can hand that
+        // gate and its multiply when it has one, and the routed+shared add in
+        // one pass over the uncombined down projection. Only when the expert runner can hand that
         // projection over — the reference oracle never materializes one, and the
         // f16-tile prefill variants carry an L2 rescale this epilogue does not
         // undo — otherwise the classic chain below runs unchanged.
@@ -241,13 +239,14 @@ impl MoeBlock {
             // Bounded, not bit-identical, unlike everything else on this path
             // (moe_glue.metal): kept behind its own switch and its own ceiling,
             // and `ops::moe_epilogue` below is the untouched bitwise anchor.
+            let gate_row = self.shared.is_gated().then(|| self.shared.gate_row());
             if fused && let Some((gate_p, up_p, down_p)) = self.shared.fused_planes() {
                 let (h, gate) = crate::ops::dup(crate::ops::DupStage::Shexp, seq, || {
                     crate::ops::moe_shexp_gate_up(
                         x_normed,
                         gate_p,
                         up_p,
-                        self.shared.gate_row(),
+                        gate_row,
                         gate_p.in_dim,
                         gate_p.out_dim,
                     )
@@ -258,7 +257,7 @@ impl MoeBlock {
                         &weights,
                         &h,
                         down_p,
-                        &gate,
+                        gate.as_ref(),
                         gate_p.out_dim,
                     )
                 });
@@ -267,11 +266,14 @@ impl MoeBlock {
             let shexp = crate::ops::dup(crate::ops::DupStage::Shexp, seq, || {
                 self.shared.swiglu_out(x_normed)
             })?;
-            let gate = crate::ops::dup(crate::ops::DupStage::Shexp, seq, || {
-                self.shared.gate_logits(x_normed)
-            })?;
+            let gate = match gate_row {
+                Some(_) => Some(crate::ops::dup(crate::ops::DupStage::Shexp, seq, || {
+                    self.shared.gate_logits(x_normed)
+                })?),
+                None => None,
+            };
             return crate::ops::dup(crate::ops::DupStage::MoeGlue, seq, || {
-                crate::ops::moe_epilogue(&down, &weights, &shexp, &gate)
+                crate::ops::moe_epilogue(&down, &weights, &shexp, gate.as_ref())
             });
         }
 
@@ -283,8 +285,9 @@ impl MoeBlock {
     /// Whether this block's shared expert takes the FUSED PAIR
     /// (`ops::moe_shexp_gate_up` + `ops::moe_epilogue_shexp`) rather than its
     /// five-dispatch chain: neither kill switch set, a token count at or below
-    /// the ceiling, a Metal device, an activation the kernels can bind, and
-    /// three q8_0 planes of a geometry they cover.
+    /// the ceiling, a Metal device, an activation the kernels can bind, three
+    /// q8_0 planes of a geometry they cover, and, on a gated shared expert, a
+    /// gate row the first kernel can bind (an ungated one has none to ask about).
     ///
     /// The bounds are the kernels', so a block outside them keeps the chain
     /// rather than failing — which means every condition the launchers
@@ -317,7 +320,13 @@ impl MoeBlock {
             return false;
         };
         let (hidden, inner) = (gate.in_dim, gate.out_dim);
-        let row = self.shared.gate_row();
+        let row_ok = !self.shared.is_gated() || {
+            let row = self.shared.gate_row();
+            row.dtype() == DType::F32
+                && row.is_contiguous()
+                && row.dims() == [hidden, 1]
+                && x.device().same_device(row.device())
+        };
         // The epilogue writes `n_out` channels per token from the routed
         // projection and reads `down.out_dim` of them out of the shared expert;
         // a file where those differ is one the launcher refuses.
@@ -330,10 +339,7 @@ impl MoeBlock {
             && down.out_dim == hidden
             && down.in_dim == inner
             && n_out == down.out_dim
-            && row.dtype() == DType::F32
-            && row.is_contiguous()
-            && row.dims() == [hidden, 1]
-            && x.device().same_device(row.device())
+            && row_ok
             // Not implied by the geometry: a plane's bytes are its own claim.
             && [gate, up, down]
                 .into_iter()
@@ -793,8 +799,8 @@ impl SharedExpert {
     /// `gate_logits` matmuls against. The fused kernel reads the same buffer as
     /// a flat `[hidden]` vector.
     ///
-    /// Only the gated paths read it, and `MoeBlock::glue_fused` closes the
-    /// fused one to an ungated shared expert, so asking an ungated one is a bug.
+    /// Only the gated paths read it, and every caller asks [`Self::is_gated`]
+    /// first, so asking an ungated one is a bug.
     pub(crate) fn gate_row(&self) -> &Tensor {
         self.router_t
             .as_ref()
@@ -1254,8 +1260,21 @@ mod tests {
             .collect()
     }
 
+    /// [`shexp_block`] turned into Flint's shape of block: a SIGMOID router
+    /// and an UNGATED shared expert (the gate row dropped, as a file without
+    /// `ffn_gate_inp_shexp` loads it). Every other weight is the same.
+    fn ungated_sigmoid_block(tag: &str, device: &Device) -> (MoeBlock, FixtureDir) {
+        let (mut block, dir) = shexp_block(tag, device);
+        block.shared.router_t = None;
+        block.gating = Gating::Sigmoid;
+        assert!(!block.shared.is_gated());
+        (block, dir)
+    }
+
     fn shexp_input(block: &MoeBlock, n: usize, seed: u64, device: &Device) -> Tensor {
-        let hidden = block.shared.gate_row().dim(0).unwrap();
+        // The router plane is `[n_expert, hidden]` on gated and ungated blocks
+        // alike.
+        let hidden = block.router.dim(1).unwrap();
         det_tensor(&[n, hidden], seed, 2.0)
             .to_device(device)
             .unwrap()
@@ -1275,6 +1294,10 @@ mod tests {
         let device = crate::gguf::metal_device().expect("the fused shared expert needs Metal");
         let (block, _dir) = shexp_block("fused_shexp_decode", &device);
         let x = shexp_input(&block, 1, 0x1001, &device);
+        assert!(
+            block.glue_fused(&x),
+            "a softmax block with a gated shared expert"
+        );
 
         // Spelled out condition by condition: `fused_shexp` is a conjunction, and
         // a bare false says nothing about which of its clauses moved.
@@ -1313,14 +1336,20 @@ mod tests {
             &x,
             gate_p,
             up_p,
-            block.shared.gate_row(),
+            Some(block.shared.gate_row()),
             gate_p.in_dim,
             gate_p.out_dim,
         )
         .unwrap();
-        let want =
-            crate::ops::moe_epilogue_shexp(&down, &weights, &h, down_p, &gate, gate_p.out_dim)
-                .unwrap();
+        let want = crate::ops::moe_epilogue_shexp(
+            &down,
+            &weights,
+            &h,
+            down_p,
+            gate.as_ref(),
+            gate_p.out_dim,
+        )
+        .unwrap();
         assert_eq!(
             bits(&got),
             bits(&want),
@@ -1349,14 +1378,20 @@ mod tests {
             &x,
             gate_p,
             up_p,
-            block.shared.gate_row(),
+            Some(block.shared.gate_row()),
             gate_p.in_dim,
             gate_p.out_dim,
         )
         .unwrap();
-        let want =
-            crate::ops::moe_epilogue_shexp(&down, &weights, &h, down_p, &gate, gate_p.out_dim)
-                .unwrap();
+        let want = crate::ops::moe_epilogue_shexp(
+            &down,
+            &weights,
+            &h,
+            down_p,
+            gate.as_ref(),
+            gate_p.out_dim,
+        )
+        .unwrap();
         assert_eq!(
             bits(&got),
             bits(&want),
@@ -1372,12 +1407,92 @@ mod tests {
         let got = block.forward(&x).unwrap();
         let shexp = block.shared.swiglu_out(&x).unwrap();
         let gate = block.shared.gate_logits(&x).unwrap();
-        let want = crate::ops::moe_epilogue(&down, &weights, &shexp, &gate).unwrap();
+        let want = crate::ops::moe_epilogue(&down, &weights, &shexp, Some(&gate)).unwrap();
         assert_eq!(
             bits(&got),
             bits(&want),
             "at n = {n} the block must run the classic shared-expert chain, bit for bit"
         );
+    }
+
+    /// Flint's block shape — a sigmoid router and an UNGATED shared expert —
+    /// takes the fused glue: the fused router, and at decode the ungated fused
+    /// shared-expert pair, pinned BITWISE against those kernels called directly
+    /// (the same reachability argument as `forward_fuses_the_shexp_at_decode`).
+    /// One token past the pair's ceiling the tail is the ungated plain epilogue
+    /// over the four-dispatch shared expert, pinned the same way.
+    #[test]
+    fn an_ungated_sigmoid_block_takes_the_fused_glue() {
+        let device = crate::gguf::metal_device().expect("the fused glue needs Metal");
+        let (block, _dir) = ungated_sigmoid_block("ungated_sigmoid_glue", &device);
+        let x = shexp_input(&block, 1, 0x6006, &device);
+        assert!(
+            block.glue_fused(&x),
+            "neither the sigmoid router nor the ungated shared expert closes the fused glue"
+        );
+
+        // The routing decision is the fused router's, under sigmoid gating, and
+        // equal to the candle chain it replaced.
+        let (ids, weights) = block.route(&x).unwrap();
+        let logits = route_logits(&block.router, &block.router_t, &x, block.router_mv(&x)).unwrap();
+        let (want_ids, want_w) = crate::ops::moe_router(
+            &logits,
+            block.n_expert_used,
+            block.sum_floor,
+            Gating::Sigmoid,
+        )
+        .unwrap();
+        assert_eq!(
+            ids.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+            want_ids.flatten_all().unwrap().to_vec1::<u32>().unwrap()
+        );
+        assert_eq!(bits(&weights), bits(&want_w));
+        let (chain_ids, chain_w) =
+            route_sigmoid_from_logits(&logits, block.n_expert_used, block.sum_floor).unwrap();
+        assert_eq!(
+            ids.flatten_all().unwrap().to_vec1::<u32>().unwrap(),
+            chain_ids.flatten_all().unwrap().to_vec1::<u32>().unwrap()
+        );
+        assert_eq!(bits(&weights), bits(&chain_w));
+
+        let down = block.experts.project(&x, &ids).unwrap().unwrap();
+        assert!(
+            block.fused_shexp(&x, &down),
+            "an ungated q8_0 shared expert is inside every bound the pair has"
+        );
+        let got = block.forward(&x).unwrap();
+        let (gate_p, up_p, down_p) = block.shared.fused_planes().unwrap();
+        let (h, logit) =
+            crate::ops::moe_shexp_gate_up(&x, gate_p, up_p, None, gate_p.in_dim, gate_p.out_dim)
+                .unwrap();
+        assert!(logit.is_none());
+        let want =
+            crate::ops::moe_epilogue_shexp(&down, &weights, &h, down_p, None, gate_p.out_dim)
+                .unwrap();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "at one token the ungated block must run the ungated fused pair, bit for bit"
+        );
+
+        let n = crate::ops::MOE_SHEXP_FUSED_MAX_N + 1;
+        let x = shexp_input(&block, n, 0x7007, &device);
+        let (ids, weights) = block.route(&x).unwrap();
+        let down = block.experts.project(&x, &ids).unwrap().unwrap();
+        assert!(!block.fused_shexp(&x, &down), "n = {n} is past the ceiling");
+        let got = block.forward(&x).unwrap();
+        let shexp = block.shared.swiglu_out(&x).unwrap();
+        let want = crate::ops::moe_epilogue(&down, &weights, &shexp, None).unwrap();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "at n = {n} the ungated block must run the ungated plain epilogue, bit for bit"
+        );
+        // And that tail is the chain the block ran before the fused glue took
+        // it: the routed combine plus the shared expert's own forward.
+        let routed = crate::ops::combine(&down, None, &weights).unwrap();
+        let chain = (routed + block.shared.forward(&x).unwrap()).unwrap();
+        assert_eq!(bits(&got), bits(&chain));
     }
 
     /// A plane whose declared shape outruns the allocation it views takes the

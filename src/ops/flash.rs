@@ -35,6 +35,27 @@ pub fn flash_attn(
     dispatch::run_flash_attn(q, k, v, pos, k_off, window, scale, false)
 }
 
+/// [`flash_attn`] with a learned sink per query head: `sinks` is `[n_head]`
+/// f32, raw logits (NOT multiplied by `scale`) that join every row's softmax
+/// denominator and attend to nothing, so row i of head h is
+/// `Σ e^{s_j} v_j / (e^{sink_h} + Σ e^{s_j})` over its visible keys. A sink of
+/// -1e30 drops out of the denominator exactly. Same operand contract and
+/// visibility rule as [`flash_attn`]; without sinks that entry runs the
+/// kernel's values bit for bit as before sinks existed. Metal only.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_sinks(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    sinks: &Tensor,
+    pos: usize,
+    k_off: usize,
+    window: Option<usize>,
+    scale: f32,
+) -> Result<Tensor> {
+    dispatch::run_flash_attn_sinks(q, k, v, sinks, pos, k_off, window, scale, false)
+}
+
 /// Bidirectional flash attention, `softmax(q·kᵀ·scale)·v` with every query
 /// seeing every key: the diffusion transformer's attention, where the image
 /// and caption tokens form one unordered set. Same operand contract as
@@ -372,6 +393,170 @@ mod tests {
                 "head {h}: the first row must differ once future keys are visible"
             );
         }
+    }
+
+    /// Worst error of `got` against `want` relative to each output row's
+    /// largest magnitude, so rows a large sink shrinks are graded at their own
+    /// scale. Returns (worst row-relative, worst absolute).
+    fn row_relative_error(got: &Tensor, want: &Tensor) -> (f32, f32) {
+        assert_eq!(got.dims(), want.dims());
+        let g: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+        let w: Vec<f32> = want.flatten_all().unwrap().to_vec1().unwrap();
+        let (mut rel, mut abs) = (0f32, 0f32);
+        for (gr, wr) in g.chunks(128).zip(w.chunks(128)) {
+            let scale = wr.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-30);
+            for (a, b) in gr.iter().zip(wr) {
+                assert!(a.is_finite(), "non-finite output {a}");
+                abs = abs.max((a - b).abs());
+                rel = rel.max((a - b).abs() / scale);
+            }
+        }
+        (rel, abs)
+    }
+
+    /// Sinks spanning the shipped file's range, one head nearly switched off.
+    fn sinks_t(n_head: usize, seed: u64, dev: &Device) -> Tensor {
+        let mut s = rand(seed, n_head, -4.0, 8.0);
+        s[0] = 10.0;
+        Tensor::from_vec(s, n_head, dev).unwrap()
+    }
+
+    /// With sinks, the kernel matches Flint's frozen f32 oracle
+    /// (`flint::attention::reference_attention`) on identical operands at
+    /// Flint's geometry (32 query heads over 4 KV heads): a NoPE full layer's
+    /// chunk past 32k keys through a head-strided capacity view, an unaligned
+    /// chunk early in a full layer, a sliding chunk whose keys are the 513 ring
+    /// survivors plus its own (the view `LayerCache::append` returns once the
+    /// ring has wrapped), and a sliding chunk from position 0 wider than the
+    /// window. Each with realistic sinks and with sinks of -1e30.
+    #[test]
+    fn flash_attn_sinks_match_the_flint_oracle() {
+        use crate::flint::attention::reference_attention;
+        let dev = metal_device().unwrap();
+        let (n_head, n_kv, hd) = (32usize, 4usize, 128usize);
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        // Row-relative bar: both sides accumulate in f32 from the same f16
+        // K/V, in different orders and with exp2 against exp. Against an f64
+        // evaluation of the chunk past 32k keys each side is off by up to
+        // ~1e-5 of the row, in independent directions, so their gap reaches
+        // ~1.8e-5 there and ~4e-6 at a few hundred keys. Measured worst is
+        // printed per case.
+        const TOL: f32 = 4e-5;
+        // (label, seq, pos, window)
+        let cases: &[(&str, usize, usize, Option<usize>)] = &[
+            ("full NoPE chunk past 32k", 64, 32 * 1024 + 5, None),
+            ("full unaligned chunk", 37, 100, None),
+            ("sliding chunk across the wrap", 70, 1200, Some(513)),
+            ("sliding chunk wider than the window", 600, 0, Some(513)),
+        ];
+        let mut worst = 0f32;
+        for &(label, seq, pos, window) in cases {
+            let (kind, k_off, k_len) = match window {
+                None => (MaskKind::Full, 0usize, pos + seq),
+                Some(w) => {
+                    let m = pos.min(w);
+                    (MaskKind::Swa { window: w }, pos - m, m + seq)
+                }
+            };
+            let seed = (seq * 7 + pos) as u64;
+            let q = rand_t(seed, (n_head, seq, hd), &dev);
+            // Full layers read a narrowed capacity view, as the cache hands
+            // them out; the sliding view is a fresh contiguous tensor.
+            let (k16, v16) = match window {
+                None => (
+                    rand_kv(seed + 1, (n_kv, k_len + 100, hd), &dev)
+                        .narrow(1, 0, k_len)
+                        .unwrap(),
+                    rand_kv(seed + 2, (n_kv, k_len + 100, hd), &dev)
+                        .narrow(1, 0, k_len)
+                        .unwrap(),
+                ),
+                Some(_) => (
+                    rand_kv(seed + 1, (n_kv, k_len, hd), &dev),
+                    rand_kv(seed + 2, (n_kv, k_len, hd), &dev),
+                ),
+            };
+            let mask = attn_mask_for(kind, seq, pos, &dev).unwrap();
+            for (sl, sinks) in [
+                ("sinks", sinks_t(n_head, seed + 3, &dev)),
+                (
+                    "sinks -1e30",
+                    Tensor::from_vec(vec![-1e30f32; n_head], n_head, &dev).unwrap(),
+                ),
+            ] {
+                let got =
+                    flash_attn_sinks(&q, &k16, &v16, &sinks, pos, k_off, window, scale).unwrap();
+                let want = reference_attention(&q, &k16, &v16, mask.as_ref(), &sinks, hd).unwrap();
+                let (rel, abs) = row_relative_error(&got, &want);
+                println!("{label}, {sl}: row-rel {rel:.2e}, abs {abs:.2e}");
+                assert!(rel < TOL, "{label}, {sl}: row-rel {rel:.2e}");
+                worst = worst.max(rel);
+            }
+        }
+        println!("worst row-relative error {worst:.2e}");
+    }
+
+    /// A sink of -1e30 contributes exactly nothing: the sink path reproduces
+    /// the sinkless kernel bit for bit, on a sliding case whose early key
+    /// blocks are fully masked for some rows (where the sink, not -inf, seeds
+    /// the running max). And the sink path reads head-strided views exactly
+    /// as their packed copies.
+    #[test]
+    fn flash_attn_sinks_vanish_exactly_and_read_strided_views() {
+        let dev = metal_device().unwrap();
+        let (n_head, n_kv, hd) = (32usize, 4usize, 128usize);
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let (seq, pos, w) = (90usize, 0usize, 40usize);
+        let q = rand_t(400, (n_head, seq, hd), &dev);
+        let k16 = rand_kv(401, (n_kv, seq, hd), &dev);
+        let v16 = rand_kv(402, (n_kv, seq, hd), &dev);
+        let none = flash_attn(&q, &k16, &v16, pos, 0, Some(w), scale).unwrap();
+        let vanishing = Tensor::from_vec(vec![-1e30f32; n_head], n_head, &dev).unwrap();
+        let sunk = flash_attn_sinks(&q, &k16, &v16, &vanishing, pos, 0, Some(w), scale).unwrap();
+        assert_bits_eq(&sunk, &none, "sinks -1e30 vs no sinks");
+        let skip_off = dispatch::run_flash_attn_sinks(
+            &q,
+            &k16,
+            &v16,
+            &vanishing,
+            pos,
+            0,
+            Some(w),
+            scale,
+            true,
+        )
+        .unwrap();
+        assert_bits_eq(&skip_off, &none, "sinks -1e30 without the block skip");
+
+        let (k_len, cap) = (pos + seq, 300usize);
+        let sinks = sinks_t(n_head, 403, &dev);
+        let k_view = rand_kv(404, (n_kv, cap, hd), &dev)
+            .narrow(1, 9, k_len)
+            .unwrap();
+        let v_view = rand_kv(405, (n_kv, cap, hd), &dev)
+            .narrow(1, 9, k_len)
+            .unwrap();
+        let strided = flash_attn_sinks(&q, &k_view, &v_view, &sinks, pos, 0, None, scale).unwrap();
+        let packed = flash_attn_sinks(
+            &q,
+            &k_view.contiguous().unwrap(),
+            &v_view.contiguous().unwrap(),
+            &sinks,
+            pos,
+            0,
+            None,
+            scale,
+        )
+        .unwrap();
+        assert_bits_eq(&strided, &packed, "sinks: head-strided vs packed");
+
+        // Sinks of the wrong length, dtype or device are refused.
+        let short = sinks.narrow(0, 0, 8).unwrap();
+        assert!(flash_attn_sinks(&q, &k16, &v16, &short, pos, 0, None, scale).is_err());
+        let s16 = sinks.to_dtype(DType::F16).unwrap();
+        assert!(flash_attn_sinks(&q, &k16, &v16, &s16, pos, 0, None, scale).is_err());
+        let cpu = sinks.to_device(&Device::Cpu).unwrap();
+        assert!(flash_attn_sinks(&q, &k16, &v16, &cpu, pos, 0, None, scale).is_err());
     }
 
     /// Rejection paths: shape/dtype/stride/position preconditions fail cleanly.

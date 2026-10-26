@@ -1,3 +1,4 @@
+pub mod attn_decode;
 pub mod attn_glue;
 pub mod bandwidth;
 pub mod bf16;
@@ -27,6 +28,7 @@ pub mod qsa_tiles;
 pub mod rope_pair;
 pub mod silu_mul;
 
+pub use attn_decode::attn_decode;
 pub use attn_glue::{attn_gate, cast_f16, cast_f32, permute_01, permute_01_f16, rope_neox};
 pub use bf16::matmul_bf16;
 pub use channel_l2_norm::channel_l2_norm;
@@ -43,7 +45,7 @@ pub use dispatch::mv_vendored_supported;
 pub(crate) use dispatch::view_offset_aligned_16;
 pub use f16::matmul_f16;
 pub use f32_mv::{matmul_f32, matmul_f32_supported};
-pub use flash::{flash_attn, flash_attn_bidirectional};
+pub use flash::{flash_attn, flash_attn_bidirectional, flash_attn_sinks};
 pub use flash_t::{FlashTGeometry, flash_attn_tensor, flash_attn_tensor_with};
 pub use gated_residual::gated_residual;
 pub use group_norm::{group_norm, group_norm_apply, group_norm_fold};

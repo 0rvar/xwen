@@ -43,6 +43,13 @@
 //      `simd_sum`. Lanes beyond that width hold +0.0 here where candle simply
 //      has no such thread; softmax probabilities are non-negative, so those
 //      lanes are an exact additive identity.
+// A SIGMOID router (Flint) replaces step 1 with candle's elementwise
+// `usigmoid` (unary.metal), `recip(1 + exp(-x))` per logit, and keeps steps 2
+// and 3 unchanged. The sort runs on the sigmoid scores and never on the logits:
+// distinct large logits saturate to the same 1.0f, and which of those tied
+// experts wins is the network's comparator order over the scores, exactly as it
+// is in candle's chain. Scores are non-negative here too, so the +0.0 lanes of
+// step 3 stay an exact identity.
 // The tail then mirrors candle's `clamp` (a `maximum` then a `minimum`, both
 // ternary selects — `MAX(x,y)` is `x > y ? x : y`, NOT `fmax`, so their NaN
 // behavior differs) and its `bdiv` (a true per-element divide, no reciprocal
@@ -108,7 +115,13 @@ typedef struct {
     int32_t softmax_width; // candle's softmax threadgroup width for n_expert
     int32_t sum_width;     // candle's fast_sum threadgroup width for top_k
     float   sum_floor;     // renormalization denominator floor
+    int32_t gating;        // MOE_GATING_SOFTMAX or MOE_GATING_SIGMOID
 } moe_router_args;
+
+// moe_router_args.gating. Mirrored by dispatch.rs MOE_GATING_SOFTMAX /
+// MOE_GATING_SIGMOID.
+#define MOE_GATING_SOFTMAX 0
+#define MOE_GATING_SIGMOID 1
 
 // candle's `MD<float>`: the running (max, denominator) pair of the online
 // softmax. `d` is always float on candle's side too.
@@ -137,8 +150,9 @@ static inline moe_md moe_md_shuffle_down(moe_md v, ushort delta) {
     return r;
 }
 
-// One token's routing decision: softmax over `n_expert` logits, descending
-// bitonic arg-sort, top_k gather, sum, floor-clamp, renormalize.
+// One token's routing decision: softmax (or a per-expert sigmoid) over
+// `n_expert` logits, descending bitonic arg-sort, top_k gather, sum,
+// floor-clamp, renormalize.
 // `logits` is [seq, n_expert] f32 contiguous; `ids` [seq, top_k] u32 and
 // `weights` [seq, top_k] f32 are the outputs. One threadgroup per token, with
 // `n_expert_pad` threads (the bitonic network's width, which is always >= the
@@ -165,53 +179,63 @@ kernel void kernel_moe_router(
 
     device const float * row_logits = logits + (int) row * n_expert;
 
-    // --- 1. candle softmax_f32, online form (see file header) --------------
-    moe_md value = moe_md{ numeric_limits<float>::lowest(), 0.0f };
-    if (col < sw) {
-        for (int i = col; i < n_expert; i += sw) {
-            value = moe_md_merge(value, moe_md{ row_logits[i], 1.0f });
+    if (args.gating == MOE_GATING_SIGMOID) {
+        // --- 1'. candle usigmoid, elementwise: `recip(1 + exp(-x))`, a true
+        // divide, the expression kernel_moe_epilogue applies to its gate. Every
+        // padded column's thread takes a strided share; the partition cannot
+        // matter, each probability being a function of its own logit alone.
+        for (int i = col; i < n_expert; i += pad) {
+            probs[i] = 1.0f / (1.0f + exp(-row_logits[i]));
         }
-    }
-    // candle's block_reducer, with its compile-time BLOCKSIZE switch expressed
-    // over the runtime width. `sw` is threadgroup-uniform, so every barrier
-    // below is reached by every thread.
-    if (sw >= 64) {
+    } else {
+        // --- 1. candle softmax_f32, online form (see file header) ----------
+        moe_md value = moe_md{ numeric_limits<float>::lowest(), 0.0f };
         if (col < sw) {
-            md_shared[col] = value;
+            for (int i = col; i < n_expert; i += sw) {
+                value = moe_md_merge(value, moe_md{ row_logits[i], 1.0f });
+            }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int s = sw / 2; s >= 64; s >>= 1) {
-            if (col < s) {
-                md_shared[col] = moe_md_merge(md_shared[col], md_shared[col + s]);
+        // candle's block_reducer, with its compile-time BLOCKSIZE switch
+        // expressed over the runtime width. `sw` and `gating` are
+        // threadgroup-uniform, so every barrier below is reached by every thread.
+        if (sw >= 64) {
+            if (col < sw) {
+                md_shared[col] = value;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int s = sw / 2; s >= 64; s >>= 1) {
+                if (col < s) {
+                    md_shared[col] = moe_md_merge(md_shared[col], md_shared[col + s]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
-    }
-    if (col < 32) {
-        if (sw >= 64) {
-            value = moe_md_merge(md_shared[col], md_shared[col + 32]);
-            simdgroup_barrier(mem_flags::mem_none);
+        if (col < 32) {
+            if (sw >= 64) {
+                value = moe_md_merge(md_shared[col], md_shared[col + 32]);
+                simdgroup_barrier(mem_flags::mem_none);
+            }
+            // Lanes past `sw` (which candle simply does not have, its
+            // threadgroup being `sw` wide) still hold the {lowest, 0} identity,
+            // which merges away exactly.
+            if (sw >= 32) value = moe_md_merge(value, moe_md_shuffle_down(value, 16));
+            if (sw >= 16) value = moe_md_merge(value, moe_md_shuffle_down(value, 8));
+            if (sw >= 8) value = moe_md_merge(value, moe_md_shuffle_down(value, 4));
+            if (sw >= 4) value = moe_md_merge(value, moe_md_shuffle_down(value, 2));
+            if (sw >= 2) value = moe_md_merge(value, moe_md_shuffle_down(value, 1));
         }
-        // Lanes past `sw` (which candle simply does not have, its threadgroup
-        // being `sw` wide) still hold the {lowest, 0} identity, which merges
-        // away exactly.
-        if (sw >= 32) value = moe_md_merge(value, moe_md_shuffle_down(value, 16));
-        if (sw >= 16) value = moe_md_merge(value, moe_md_shuffle_down(value, 8));
-        if (sw >= 8) value = moe_md_merge(value, moe_md_shuffle_down(value, 4));
-        if (sw >= 4) value = moe_md_merge(value, moe_md_shuffle_down(value, 2));
-        if (sw >= 2) value = moe_md_merge(value, moe_md_shuffle_down(value, 1));
-    }
-    if (col == 0) {
-        md_total = value;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (col == 0) {
+            md_total = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // candle's finalize_softmax: one reciprocal per thread, then the same
-    // ascending strided partition over the row.
-    if (col < sw) {
-        const float d_total_inverse = fast::divide(1.0f, md_total.d);
-        for (int i = col; i < n_expert; i += sw) {
-            probs[i] = fast::exp(row_logits[i] - md_total.m) * d_total_inverse;
+        // candle's finalize_softmax: one reciprocal per thread, then the same
+        // ascending strided partition over the row.
+        if (col < sw) {
+            const float d_total_inverse = fast::divide(1.0f, md_total.d);
+            for (int i = col; i < n_expert; i += sw) {
+                probs[i] = fast::exp(row_logits[i] - md_total.m) * d_total_inverse;
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -292,16 +316,21 @@ typedef struct {
 // `simd_sum` folding exactly one 32-lane simdgroup, so a candle width above 32
 // would leave lanes 32.. unfolded. `run_moe_epilogue` refuses such a top_k
 // host-side.
-kernel void kernel_moe_epilogue(
-        constant moe_epilogue_args & args [[buffer(0)]],
-        device const float * down  [[buffer(1)]],
-        device const float * w     [[buffer(2)]],
-        device const float * shexp [[buffer(3)]],
-        device const float * gate  [[buffer(4)]],
-        device       float * dst   [[buffer(5)]],
-        uint tid       [[thread_index_in_threadgroup]],
-        uint dst_id    [[threadgroup_position_in_grid]],
-        uint block_dim [[threads_per_threadgroup]]) {
+//
+// GATED is false for an UNGATED shared expert (Flint, no ffn_gate_inp_shexp):
+// `dst = routed + shexp`, the chain's `ops::combine` then candle's `badd`,
+// with `gate` never read. The reduction is the same code in both.
+template <bool GATED>
+static inline void moe_epilogue_impl(
+        constant moe_epilogue_args & args,
+        device const float * down,
+        device const float * w,
+        device const float * shexp,
+        device const float * gate,
+        device       float * dst,
+        uint tid,
+        uint dst_id,
+        uint block_dim) {
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
     const int top_k = args.top_k;
@@ -321,13 +350,44 @@ kernel void kernel_moe_epilogue(
     }
     value = simd_sum(value);
     if (tid == 0) {
-        // candle's usigmoid: recip(1 + exp(-x)) — a true divide, no fma.
-        const float g = gate[s];
-        const float sig = 1.0f / (1.0f + exp(-g));
-        // candle's bmul, then badd in the block's order: routed + shared.
-        const float shared = shexp[did] * sig;
-        dst[did] = value + shared;
+        if (GATED) {
+            // candle's usigmoid: recip(1 + exp(-x)) — a true divide, no fma.
+            const float g = gate[s];
+            const float sig = 1.0f / (1.0f + exp(-g));
+            // candle's bmul, then badd in the block's order: routed + shared.
+            const float shared = shexp[did] * sig;
+            dst[did] = value + shared;
+        } else {
+            // candle's badd in the block's order: routed + shared.
+            dst[did] = value + shexp[did];
+        }
     }
+}
+
+kernel void kernel_moe_epilogue(
+        constant moe_epilogue_args & args [[buffer(0)]],
+        device const float * down  [[buffer(1)]],
+        device const float * w     [[buffer(2)]],
+        device const float * shexp [[buffer(3)]],
+        device const float * gate  [[buffer(4)]],
+        device       float * dst   [[buffer(5)]],
+        uint tid       [[thread_index_in_threadgroup]],
+        uint dst_id    [[threadgroup_position_in_grid]],
+        uint block_dim [[threads_per_threadgroup]]) {
+    moe_epilogue_impl<true>(args, down, w, shexp, gate, dst, tid, dst_id, block_dim);
+}
+
+// kernel_moe_epilogue for an ungated shared expert: no gate operand.
+kernel void kernel_moe_epilogue_ungated(
+        constant moe_epilogue_args & args [[buffer(0)]],
+        device const float * down  [[buffer(1)]],
+        device const float * w     [[buffer(2)]],
+        device const float * shexp [[buffer(3)]],
+        device       float * dst   [[buffer(4)]],
+        uint tid       [[thread_index_in_threadgroup]],
+        uint dst_id    [[threadgroup_position_in_grid]],
+        uint block_dim [[threads_per_threadgroup]]) {
+    moe_epilogue_impl<false>(args, down, w, shexp, nullptr, dst, tid, dst_id, block_dim);
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +407,11 @@ kernel void kernel_moe_epilogue(
 // glue — the sigmoid, the broadcast multiply and the routed+shared add were
 // already inside `kernel_moe_epilogue`, and the down projection now joins them.
 // Four launches per MoE layer disappear.
+//
+// An UNGATED shared expert (Flint) has four dispatches to swallow, not five,
+// and takes the `_ungated` entry points of both kernels: the same bodies with
+// the gate-logit threadgroup and the sigmoid compiled out, and the shared
+// output added to the routed one unscaled.
 //
 // ROUNDING: BOUNDED, not bitwise, unlike everything above it in this file. All
 // three dot products are reassociated — the gate/up rows fold per-thread
@@ -447,28 +512,29 @@ typedef struct {
 // Outputs: `h[t, inner]`, the ungated SwiGLU bottleneck, and `logit[t, 1]`, the
 // RAW pre-sigmoid gate logit — the sigmoid stays in the epilogue, where it
 // already was.
-kernel void kernel_moe_shexp_gate_up(
-        constant moe_shexp_gate_up_args & args [[buffer(0)]],
-        device const float * x                 [[buffer(1)]],
-        device const moe_block_q8_0 * gate_w   [[buffer(2)]],
-        device const moe_block_q8_0 * up_w     [[buffer(3)]],
-        device const float * gate_inp          [[buffer(4)]],
-        device       float * h                 [[buffer(5)]],
-        device       float * logit             [[buffer(6)]],
-        uint2 tgid    [[threadgroup_position_in_grid]],
-        uint2 tpos    [[thread_position_in_threadgroup]],
-        uint  sgid    [[simdgroup_index_in_threadgroup]],
-        uint  lane    [[thread_index_in_simdgroup]],
-        uint  sgcount [[simdgroups_per_threadgroup]]) {
-    // The launch is `MOE_SHEXP_THREADS x 1`, so the row component is the whole
-    // partition (the vector arity has to match tgid's).
-    const uint tid = tpos.x;
-    // One slot per (row of this tile, simdgroup), for each of the two
-    // projections. The gate-logit threadgroup reduces one value and uses the
-    // first MOE_SHEXP_SIMDGROUPS slots of the first array.
-    threadgroup float partial_g[MOE_SHEXP_ROWS_PER_TG * MOE_SHEXP_SIMDGROUPS];
-    threadgroup float partial_u[MOE_SHEXP_ROWS_PER_TG * MOE_SHEXP_SIMDGROUPS];
-
+//
+// GATED is false for an ungated shared expert: the grid is `(n_row_tg, n)`,
+// with no gate-logit threadgroup, and `gate_inp` / `logit` are never read.
+// `partial_g` / `partial_u` are the kernel's threadgroup arrays, one slot per
+// (row of this tile, simdgroup) for each of the two projections; the
+// gate-logit threadgroup reduces one value and uses the first
+// MOE_SHEXP_SIMDGROUPS slots of the first.
+template <bool GATED>
+static inline void moe_shexp_gate_up_impl(
+        constant moe_shexp_gate_up_args & args,
+        device const float * x,
+        device const moe_block_q8_0 * gate_w,
+        device const moe_block_q8_0 * up_w,
+        device const float * gate_inp,
+        device       float * h,
+        device       float * logit,
+        threadgroup float * partial_g,
+        threadgroup float * partial_u,
+        uint2 tgid,
+        uint  tid,
+        uint  sgid,
+        uint  lane,
+        uint  sgcount) {
     const size_t row = (size_t) tgid.y * (size_t) args.hidden;
 
     // This thread's slice of the token's activation, staged once. The loop bound
@@ -573,6 +639,9 @@ kernel void kernel_moe_shexp_gate_up(
         }
         return;
     }
+    if (!GATED) {
+        return;
+    }
 
     // The gate logit, `<x[t], ffn_gate_inp_shexp>`. Accumulated per thread while
     // the activation is still in registers, over the same block partition the
@@ -599,6 +668,46 @@ kernel void kernel_moe_shexp_gate_up(
         }
         logit[tgid.y] = total;
     }
+}
+
+kernel void kernel_moe_shexp_gate_up(
+        constant moe_shexp_gate_up_args & args [[buffer(0)]],
+        device const float * x                 [[buffer(1)]],
+        device const moe_block_q8_0 * gate_w   [[buffer(2)]],
+        device const moe_block_q8_0 * up_w     [[buffer(3)]],
+        device const float * gate_inp          [[buffer(4)]],
+        device       float * h                 [[buffer(5)]],
+        device       float * logit             [[buffer(6)]],
+        uint2 tgid    [[threadgroup_position_in_grid]],
+        uint2 tpos    [[thread_position_in_threadgroup]],
+        uint  sgid    [[simdgroup_index_in_threadgroup]],
+        uint  lane    [[thread_index_in_simdgroup]],
+        uint  sgcount [[simdgroups_per_threadgroup]]) {
+    threadgroup float partial_g[MOE_SHEXP_ROWS_PER_TG * MOE_SHEXP_SIMDGROUPS];
+    threadgroup float partial_u[MOE_SHEXP_ROWS_PER_TG * MOE_SHEXP_SIMDGROUPS];
+    // The launch is `MOE_SHEXP_THREADS x 1`, so the row component is the whole
+    // partition (the vector arity has to match tgid's).
+    moe_shexp_gate_up_impl<true>(args, x, gate_w, up_w, gate_inp, h, logit, partial_g,
+                                 partial_u, tgid, tpos.x, sgid, lane, sgcount);
+}
+
+// kernel_moe_shexp_gate_up for an ungated shared expert: the projections and
+// their activation only, no gate row and no logit.
+kernel void kernel_moe_shexp_gate_up_ungated(
+        constant moe_shexp_gate_up_args & args [[buffer(0)]],
+        device const float * x                 [[buffer(1)]],
+        device const moe_block_q8_0 * gate_w   [[buffer(2)]],
+        device const moe_block_q8_0 * up_w     [[buffer(3)]],
+        device       float * h                 [[buffer(4)]],
+        uint2 tgid    [[threadgroup_position_in_grid]],
+        uint2 tpos    [[thread_position_in_threadgroup]],
+        uint  sgid    [[simdgroup_index_in_threadgroup]],
+        uint  lane    [[thread_index_in_simdgroup]],
+        uint  sgcount [[simdgroups_per_threadgroup]]) {
+    threadgroup float partial_g[MOE_SHEXP_ROWS_PER_TG * MOE_SHEXP_SIMDGROUPS];
+    threadgroup float partial_u[MOE_SHEXP_ROWS_PER_TG * MOE_SHEXP_SIMDGROUPS];
+    moe_shexp_gate_up_impl<false>(args, x, gate_w, up_w, nullptr, h, nullptr, partial_g,
+                                  partial_u, tgid, tpos.x, sgid, lane, sgcount);
 }
 
 // Threads per threadgroup in kernel_moe_epilogue_shexp: ONE simdgroup, so both
@@ -631,16 +740,20 @@ typedef struct {
 // each in its own accumulator. That widening is why this kernel is bounded and
 // not bitwise against kernel_moe_epilogue, which is left untouched as the
 // strict tier's anchor.
-kernel void kernel_moe_epilogue_shexp(
-        constant moe_epilogue_shexp_args & args  [[buffer(0)]],
-        device const float * down                [[buffer(1)]],
-        device const float * w                   [[buffer(2)]],
-        device const float * h                   [[buffer(3)]],
-        device const moe_block_q8_0 * down_shexp [[buffer(4)]],
-        device const float * gate                [[buffer(5)]],
-        device       float * dst                 [[buffer(6)]],
-        uint lane   [[thread_index_in_threadgroup]],
-        uint dst_id [[threadgroup_position_in_grid]]) {
+//
+// GATED is false for an ungated shared expert: `dst = routed + shexp`, with
+// `gate` never read.
+template <bool GATED>
+static inline void moe_epilogue_shexp_impl(
+        constant moe_epilogue_shexp_args & args,
+        device const float * down,
+        device const float * w,
+        device const float * h,
+        device const moe_block_q8_0 * down_shexp,
+        device const float * gate,
+        device       float * dst,
+        uint lane,
+        uint dst_id) {
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
     const int top_k = args.top_k;
@@ -691,12 +804,43 @@ kernel void kernel_moe_epilogue_shexp(
     routed = simd_sum(routed);
     shexp = simd_sum(shexp);
     if (lane == 0) {
-        // candle's usigmoid: recip(1 + exp(-x)) — a true divide, no fma. The
-        // same expression kernel_moe_epilogue applies to the same raw logit.
-        const float g = gate[s];
-        const float sig = 1.0f / (1.0f + exp(-g));
-        // candle's bmul, then badd in the block's order: routed + shared.
-        const float shared = shexp * sig;
-        dst[did] = routed + shared;
+        if (GATED) {
+            // candle's usigmoid: recip(1 + exp(-x)) — a true divide, no fma.
+            // The same expression kernel_moe_epilogue applies to the same raw
+            // logit.
+            const float g = gate[s];
+            const float sig = 1.0f / (1.0f + exp(-g));
+            // candle's bmul, then badd in the block's order: routed + shared.
+            const float shared = shexp * sig;
+            dst[did] = routed + shared;
+        } else {
+            dst[did] = routed + shexp;
+        }
     }
+}
+
+kernel void kernel_moe_epilogue_shexp(
+        constant moe_epilogue_shexp_args & args  [[buffer(0)]],
+        device const float * down                [[buffer(1)]],
+        device const float * w                   [[buffer(2)]],
+        device const float * h                   [[buffer(3)]],
+        device const moe_block_q8_0 * down_shexp [[buffer(4)]],
+        device const float * gate                [[buffer(5)]],
+        device       float * dst                 [[buffer(6)]],
+        uint lane   [[thread_index_in_threadgroup]],
+        uint dst_id [[threadgroup_position_in_grid]]) {
+    moe_epilogue_shexp_impl<true>(args, down, w, h, down_shexp, gate, dst, lane, dst_id);
+}
+
+// kernel_moe_epilogue_shexp for an ungated shared expert: no gate operand.
+kernel void kernel_moe_epilogue_shexp_ungated(
+        constant moe_epilogue_shexp_args & args  [[buffer(0)]],
+        device const float * down                [[buffer(1)]],
+        device const float * w                   [[buffer(2)]],
+        device const float * h                   [[buffer(3)]],
+        device const moe_block_q8_0 * down_shexp [[buffer(4)]],
+        device       float * dst                 [[buffer(5)]],
+        uint lane   [[thread_index_in_threadgroup]],
+        uint dst_id [[threadgroup_position_in_grid]]) {
+    moe_epilogue_shexp_impl<false>(args, down, w, h, down_shexp, nullptr, dst, lane, dst_id);
 }

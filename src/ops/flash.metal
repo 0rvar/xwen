@@ -598,6 +598,12 @@ struct DivOp {
 // attention); `disable_skip` forces the block-skip bounds open (test-only —
 // production always passes 0; a "skipped" block processed under it is all -inf
 // and contributes exactly nothing, which is what the block-skip test proves).
+// `has_sinks` adds a learned sink per query head (buffer 5): a raw logit, not
+// scaled by 1/√d, that joins every row's softmax denominator and attends to
+// nothing. It seeds each row's running max with the sink (×log2 e, the kernel
+// working in log2) and its running sum with exp2(0) = 1, which is the sink's
+// term rescaled like every other as the max moves. Without sinks the seeds are
+// -inf and 0, exactly the kernel's values before sinks existed.
 typedef struct {
     int gqa_factor;
     float scale;
@@ -611,6 +617,8 @@ typedef struct {
     int k_off;      // absolute position of key column 0
     int window;     // sliding window (0x7fffffff = full attention)
     int disable_skip;
+    int has_sinks;  // 1: buffer 5 holds one sink logit per query head
+    int pad0;
     int64_t q_stride_h;
     int64_t q_stride_r;
     int64_t k_stride_h;
@@ -630,6 +638,7 @@ template <bool ALIGN_Q, bool ALIGN_K>
     const device half* K [[buffer(2)]],
     const device half* V [[buffer(3)]],
     device float* O [[buffer(4)]],
+    const device float* sinks [[buffer(5)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) {
@@ -801,10 +810,15 @@ template <bool ALIGN_Q, bool ALIGN_K>
   float max_score[kRowsPT];
   float sum_score[kRowsPT] = {0};
 
-  // Init to -Inf
+  // Init to -Inf, or to the sink.
+  const float max_init = params->has_sinks
+      ? sinks[tid.y] * 1.44269504089f
+      : -metal::numeric_limits<float>::infinity();
+  const float sum_init = params->has_sinks ? 1.0f : 0.0f;
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
-    max_score[i] = -metal::numeric_limits<float>::infinity();
+    max_score[i] = max_init;
+    sum_score[i] = sum_init;
   }
 
   // Loop over KV seq length
