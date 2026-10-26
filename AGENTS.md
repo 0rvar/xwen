@@ -725,15 +725,19 @@ The seams, so a change lands in one place:
   residual, norms, `DenseMlp`, `MoeBlock`, taps and head are the trunk's, and the FFN is
   chosen per layer. Two arms behind `XWEN_FLINT_ATTN`: `production` (the default,
   `AttnImpl::SHIPPED`) and `reference`, the frozen f32 oracle with an explicit sink column
-  that the kernel arc is graded against. Never optimize `reference_attention`; a kernel
-  replaces `production_attention`. Both are f32 today, and production caps its score tile
-  at 256 MiB.
+  that the kernels are graded against. Never optimize `reference_attention`. Production
+  takes geometry, not a mask: `visibility()` gives `(k_off, window)` to
+  `ops::flash_attn_sinks` at prefill and `ops::attn_decode` (GQA-grouped split-K,
+  `src/ops/attn_decode.metal`) at one row, and masks are built only for the reference
+  arm. `forward` refuses a position that disagrees with the cache length.
 - **`LayerCache::Swa` is reachable now**, built from `LayerKind::Swa { window }`. Its
   rollback, snapshot and disk framing predate Flint; `CacheGeometry` counts only the 14
   full layers for KV and adds the rings to a snapshot.
-- **`Gating::Sigmoid`** runs the candle chain. The fused router kernel and the fused
-  epilogue need softmax gating AND a gated shared expert, and whether a shared expert is
-  gated is read from the file (`ffn_gate_inp_shexp` present), never from the gating kind.
+- **`Gating::Sigmoid`** takes the fused glue: a sigmoid branch in the router kernel,
+  bitwise against `route_sigmoid_from_logits`, and ungated variants of the epilogue and
+  the fused shared-expert pair (the pair to the gated pair's tolerance, not bitwise).
+  `XWEN_MOE_GLUE_CLASSIC` closes it. Whether a shared expert is gated is read from the
+  file (`ffn_gate_inp_shexp` present), never from the gating kind.
 - **The vocabulary is `VocabFamily::Flint`**, its `tokenizer.json` embedded
   (`LagunaTokenizer::embedded_flint()`); `Specials` reads the layout off the vocabulary, so
   `im_start`/`im_end` are `Option` and `eog()` is a slice. A test holds the embedded
@@ -756,12 +760,13 @@ The seams, so a change lands in one place:
 Traps that are silent:
 
 - **Sinks** are raw, unscaled logits in the softmax denominator with no value. Dropping
-  them still produces text; it reads argmax 0.047 against the oracle.
+  them still produces text; it reads argmax 0.029 against the oracle.
 - **The full layers have no rope**, and the window counts the current position: 513 keys,
   512 back.
 - **The routed down-projection input reaches 297,857**, 4.5x f16. The default prefill
   `mm_id` stages it as half and the per-column rescale (`needs_rescale`) is what keeps it
-  finite; a new prefill path for the experts must keep that guard or read f32.
+  finite, and the fused glue steps aside there (`FusedExperts::project` returns none); a
+  new prefill path for the experts must keep that guard or read f32.
 - **Prefill is 2-4% off exact per layer and decode is at 2e-7.** The prefill matmuls stage
   the weight tile as f16, and Flint's down projections cancel hard enough to amplify it.
   llama.cpp Metal does the same, so the parity gate cannot see it. Measured, not fixed.
@@ -769,13 +774,15 @@ Traps that are silent:
   router flips on last-place rounding and attention spreads it. Grade chunking on hidden
   states up to `ffn_norm-2`, never on logits.
 - **No logits bar can see a window off by one** (512 reads inside the oracle's own
-  noise). The ring test in `flint::attention` holds the window exactly; keep it.
+  noise). The ring test in `flint::attention` holds the window exactly, through the
+  same `visibility()` the forward calls; keep both.
 - **The oracle's own backends disagree**: llama.cpp CPU against Metal reads argmax 0.907.
   That is the acceptance bar, and a CPU-made fixture is refused, its distance from Metal
   being the bar's whole width.
-- **Memory grows superlinearly with context** on the f32 attention, 31.9 GB beyond the
-  weights at 57k tokens, so admission prices it at KV growth (`flint_scratch_bytes`) and a
-  prompt past roughly 60k is refused. The kernel arc is expected to lift it.
+- **Memory is flat, then follows the KV capacity**: 7.3-7.9 GB beyond the weights up to
+  ~60k tokens, 16.3 GB at 198k. `flint_scratch_bytes` is `(7 GiB + 48 KiB per KV slot)
+  x 1.05`, priced at KV growth, so `--max-ctx` is the limit. The reference arm's
+  uncapped score tiles (~1.9 GB at 57k) are not in the fit.
 
 ## The candle situation
 

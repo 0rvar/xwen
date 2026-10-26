@@ -3222,6 +3222,35 @@ blocks use of the feature; item (a) is the one with a known trigger.
 
 [Opened 2026-10-25 by the arc that brought Flint up on an f32 attention and graded it against llama.cpp Metal (log.md "Flint runs and passes parity against llama.cpp Metal"; records/flint-correctness.md). Nothing has closed under it yet; its open items are the kernel arc in TODO.md "Decode performance", the prefill precision gap in "Prefill performance", the long-context memory in "Cache images, memory and context" and the tool-call parser in "Serve, batch and CLI".]
 
+[Closed parts of the item «Flint's attention and MoE glue run on reference paths: sinks in the flash kernel, a decode kernel with sinks, the sigmoid router arm», moved verbatim on 2026-10-26: every step but the last shipped in 3063e0e and 18e1294 (log.md "Flint's attention and MoE glue run on Metal kernels, and long prompts fit"; records/flint-kernels.md). The sink is in `flash.metal`, the decode kernel is `attn_decode.metal`, both graded against `reference_attention` and then by `tests/flint_parity.rs`, and the router has its sigmoid arm with ungated epilogue and shared-expert kernels beside it. Observations in low power, unpinned: decode 59.4 tok/s short and 50.7 at 3654 tokens, prefill 1149. Its open remainder, the pinned bench, is in TODO.md under "Decode performance". Text as it stood in TODO.md.]
+
+- [x] [measured] **Flint's attention and MoE glue run on reference paths: sinks in the flash kernel,
+  a decode kernel with sinks, the sigmoid router arm.** Flint decodes 47.7 tok/s on a short
+  prompt and 23.7 at 3.6k, prefill 292 at 3654 (observations: `lowpowermode 1`, unpinned),
+  because both phases run an f32 attention that widens the full layers' f16 cache to f32
+  every step, and the fused MoE glue is off for sigmoid routing. The ceiling is an estimate:
+  ~2.3 GB of active weights per token, the 35B-A3B's range, where the 35B decodes 127.0.
+  Steps: add the sink term to `flash.metal` (prefill, head dim 128, window in-kernel
+  already; `exp2(sink·log2e − max)` into the sum before the divide), a vendored decode
+  kernel with a sink (candle's `sdpa_vector` cannot take one), each graded against
+  `FlintAttn::reference_attention` on captured activations (a NoPE layer at 32k+ keys, a
+  sliding layer across a wrap, a decode row, real sink values up to ~10) and then by
+  `tests/flint_parity.rs`; then a sigmoid arm of `ops::moe_router` and an ungated
+  epilogue; then a pinned bench for perf-state.md. Re-measure the memory item after.
+  [Record](records/flint-correctness.md).
+  From: Deferred from the Flint correctness arc (2026-10-25).
+
+[Shipped 2026-10-26 (23fcd68), with the kernel arc: on the kernel attention the peak beyond the weights is 7.3-7.9 GB up to ~60k tokens and 16.3 GB at 198k, and `flint_scratch_bytes` is refitted to six measured points as `(7 GiB + 48 KiB per KV slot) x 1.05`, so the ~60k refusal is gone and `--max-ctx` is the limit (records/flint-kernels.md "Memory"). Text as it stood in TODO.md.]
+
+- [x] [measured] **Flint's memory grows superlinearly with context, so prompts past ~60k are refused.**
+  Peak beyond the weights reads 10.97 GB at 9,895 tokens, 16.28 at 28,717 and 31.89 at
+  56,883, and the fit extrapolates to ~115 GB at 131k. Draining between chunks barely moves
+  it, so something that scales with keys is retained per forward, most likely the f32 K/V
+  copies and the mask. The kernel arc on the Front is expected to retire the f32 copies;
+  re-measure after it, and refit `flint_scratch_bytes` from the new points.
+  [Record](records/flint-correctness.md), "Memory".
+  From: Deferred from the Flint correctness arc (2026-10-25).
+
 ## Retired: Image generation
 
 [Retired 2026-09-08: its basis was the profiler's buffer-pool eviction and not the f32 store. The bf16 store was built on the branch `zimage-ffn` (5e7a6ea), is bit-exact, and measured parity within 5% with an unstable sign; the f32-store gemm runs 37-45 TFLOP/s isolated, w2's own class, and bandwidth caps the lever at ~0.2 s per image (decisions.md "The bf16 SwiGLU store is REFUTED"). A half intermediate for w2 is disqualified by a measured activation max of 284,507 against f16's 65,504. Reopen if a future MPP release adds a converting cooperative-tensor store or documents the tile lane layout so a vectorized epilogue can skip the index math, or with a per-row scaled activation folded into w2's gemm, which is a different arc.]

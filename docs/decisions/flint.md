@@ -48,7 +48,9 @@ layers. The cost is that every `XwenConfig` literal carries a `flint: None` fiel
 math today. The reference is the oracle the kernel arc will be graded against and is never
 optimized; the production function is the one a kernel replaces. Production already caps
 its score tile at 256 MiB, which leaves the parity numbers unchanged and took the peak
-footprint at 57k tokens from 41.3 to 31.9 GB (2026-10-25).
+footprint at 57k tokens from 41.3 to 31.9 GB (2026-10-25). Amended 2026-10-26: the
+production arm is the kernels now, `flash.metal` with a sink at prefill and `attn_decode`
+at one row, and the tile cap went with the chain. The reference arm is unchanged.
 
 **The routing is its own kind, sigmoid then top-6 then renormalize, and the fused glue is
 off for it.** `Gating::Sigmoid` runs the candle chain. The fused router kernel computes a
@@ -56,7 +58,9 @@ softmax and the fused epilogue applies the shared-expert sigmoid, so both are ga
 softmax routing AND a gated shared expert, two separate conditions. Whether a shared
 expert is gated is read from the file (`ffn_gate_inp_shexp` present or not), not inferred
 from the routing kind. The sigmoid arm of the fused router is kernel-arc work
-(2026-10-25).
+(2026-10-25). Amended 2026-10-26: the fused glue is on for Flint now, through a sigmoid
+branch in the router and ungated epilogue kernels ("The fused MoE glue takes sigmoid
+routing" below).
 
 **The parity bars admit anything at least as close to llama.cpp Metal as llama.cpp CPU
 is, and two wrong graphs fall far outside them.** llama.cpp's own CPU and Metal backends
@@ -101,3 +105,52 @@ family is the embedded copy with no file search. The stops are the four ids the 
 resolves by text (150001, 150003, 150005, 150018); the GGUF advertises only 150001, and
 the Qwen stop ids are never folded in. A server builds Flint's vocabulary and grammar trie
 only when a Flint checkpoint is selectable (2026-10-25).
+
+**Flint's decode attention is a vendored kernel, GQA-grouped, not candle's `sdpa_vector`.**
+candle's one-row kernels take no sink, assume K/V rows packed at the head dim so a cache
+capacity view or the ring would need a copy, and run one threadgroup per query head, so
+at Flint's GQA of 8 every KV row is read 8 times. `attn_decode.metal` is derived from them
+and differs in all three: one threadgroup per (split, KV head) holds the group's 8 query
+heads and reads each K/V row once through explicit head strides, and the sink is folded
+into the merge. Keys are split at a floor of 32 per split, capped at 128 threadgroups in
+all, which the microbench fitted as 16 splits at the 513-key ring and 32 at 4k and 32k. At
+32k keys it reads 188-250 µs a call against 3.7-5.6 ms for the f32 chain, ~1.5x the read
+floor (low power, unpinned). A simdgroup-MMA variant that could close the rest is a
+record line (records/flint-kernels.md "Not taken now") (3063e0e, 18e1294, 2026-10-26).
+
+**Flint's prefill attention is `flash.metal` with a `has_sinks` flag, and callers without
+sinks are bit-identical.** The kernel already computed the causal edge and the window from
+`pos`, `k_off` and `window`, so the sliding layers needed no mask, only the sink. With the
+flag set, a row's running max starts at `sink * log2(e)` and its sum at 1; without it the
+seeds are `-inf` and 0 as before, chosen at runtime, so the Qwen3 dense and Z-Image
+callers run the same arithmetic and every existing flash test is still bitwise. A second
+kernel would have meant a second copy of the block skip and the window rule. Sinks at
+-1e30 are bitwise against the sinkless kernel, which is what keeps the `NoSinks` bracket
+meaningful on the production arm (3063e0e, 2026-10-26).
+
+**The production attention takes geometry, not a mask.** `flint::attention::visibility`
+turns the cache's kind and the position into `(k_off, window)`, the kernels apply it, and
+`forward` refuses a position that disagrees with the cache length. Masks are built only
+when the reference arm is selected. This removes the per-forward host mask (268 MB at a
+2048 chunk into 32k). The cost is that a window off by one now lives in a helper and not
+in `attn_mask_for`, and no logits bar can see it, so the ring test calls the same helper
+the forward does (18e1294, 2026-10-26).
+
+**The fused MoE glue takes sigmoid routing and an ungated shared expert; the router is
+bitwise, the ungated shared-expert pair is held to the gated pair's tolerance.** The
+router's sigmoid branch replaces only the softmax step and is bitwise against
+`route_sigmoid_from_logits`, saturated ties included, because a sigmoid router on near
+ties is exactly where a last-place difference flips an expert. The ungated epilogue is
+bitwise against `ops::combine` plus the add. The fused shared-expert pair cannot be: the
+gated pair reassociates its dot products and has always been graded by tolerance, and the
+ungated variant runs the same templated body, so it gets the same bars (rel L2 1e-5 against
+an f32 host oracle) plus bitwise identities against the gated kernels at a gate of exactly
+1.0. Gatedness is still read from the file. A Flint MoE layer goes from 19 dispatches to 8
+at decode (3063e0e, 2026-10-26).
+
+**Flint's memory admission is a flat scratch plus a term in the KV capacity, refitted to
+the kernel arm.** With no score tile and no f32 copy of the cache the peak beyond the
+weights is 7.3-7.9 GB to ~60k tokens and then follows the KV capacity, 16.3 GB at 198k.
+`flint_scratch_bytes` is `(7 GiB + 48 KiB per KV slot) x 1.05`, 11-40% above six measured
+points, priced at the KV capacity. The ~60k refusal is gone and `--max-ctx` is the limit.
+The reference arm is not in the fit; it is a bisect arm (23fcd68, 2026-10-26).

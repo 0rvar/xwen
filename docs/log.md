@@ -4,6 +4,23 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-10-26 — Flint's attention and MoE glue run on Metal kernels, and long prompts fit
+
+Flint's prefill attention runs `flash.metal` with a per-head sink, its one-row attention a
+new GQA-grouped split-K kernel (`attn_decode.metal`) that reads the f16 cache in place,
+and its MoE layers the fused glue, with a sigmoid router bitwise against the candle chain
+and ungated epilogue and shared-expert kernels. Parity against llama.cpp Metal holds:
+prefill 0.9696 / 0.9461 / 0.2163 at chunk 512, decode 0.9485 / 0.9219 / 0.2366, with
+dropped sinks still at argmax 0.029. In low power on an unpinned build, so observations:
+decode 59.4 tok/s short and 50.7 at a 3654-token prompt (was 47.7 and 23.7), prefill 1149
+at 3654 (was 292). Peak memory beyond the weights is flat at 7.3-7.9 GB to ~60k tokens and
+16.3 GB at 198k (was 31.9 GB at 57k), so the ~60k refusal is gone and `--max-ctx` is the
+limit. The pinned figure is still owed.
+[3063e0e](https://github.com/0rvar/xwen/commit/3063e0e),
+[18e1294](https://github.com/0rvar/xwen/commit/18e1294),
+[23fcd68](https://github.com/0rvar/xwen/commit/23fcd68).
+[Record](records/flint-kernels.md), [decisions](decisions/flint.md).
+
 ## 2026-10-25 — Flint runs and passes parity against llama.cpp Metal
 
 Flint (`ggml-org/Flint-GGUF`, Q4_K_M, 23.4 GB, alias `flint`) is a design target as of

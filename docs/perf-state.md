@@ -481,13 +481,13 @@ now the direct conv (1e028be), so the figure is owed on that arm, at 512x512 and
 ## Flint, a design target with no figure yet
 
 Flint is a tok/s target as of 2026-10-25 (decisions.md "Flint is a design target"), and
-**no figure is measured yet**. The arc that brought it up ran its attention on an f32
-path that the kernel arc replaces, on an unpinned dev build in `lowpowermode 1`, so its
-timings are observations in
-[records/flint-correctness.md](records/flint-correctness.md) and not figures. The first
-figures are owed by the kernel arc on the [TODO.md](../TODO.md) Front: plain decode short
-and at ~4k context, and prefill at ~3.6k, on a pinned binary with the `pmset -g` line
-verbatim. There is no drafter for it. The decode ceiling is unmeasured too; the tensor
+**no figure is measured yet**. The correctness arc and the kernel arc (2026-10-26) both
+timed it on unpinned builds in `lowpowermode 1`, so their timings are observations in
+[records/flint-correctness.md](records/flint-correctness.md) and
+[records/flint-kernels.md](records/flint-kernels.md) and not figures. The first figures
+are owed by the pinned-bench item on the [TODO.md](../TODO.md) Front: plain decode short
+and at ~4k context, and prefill at ~3.6k, on a pinned binary in high power mode with the
+`pmset -g` line verbatim. There is no drafter for it. The decode ceiling is unmeasured too; the tensor
 table puts active weights at ~2.3 GB per token, in the 35B-A3B's range, which is an
 estimate.
 

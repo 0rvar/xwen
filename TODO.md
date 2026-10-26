@@ -159,8 +159,17 @@ items enter the area sections and not the Front: the prefill precision gap and t
 long-context memory, which the kernel arc is expected to move and should be re-priced
 after it, and the serve tool-call parser.]
 
+[Amended 2026-10-26, after the Flint kernel arc (log.md "Flint's attention and MoE glue run
+on Metal kernels, and long prompts fit"): the item at 2 shipped everything but its last
+step, so its closed part moved to the archive and the remainder, the pinned bench, holds
+place 2 as its own `[small]` item. It keeps the rank because Flint is a target with no
+figure and the bench is what ranks every next Flint lever; it waits on high power mode,
+which the machine was not in that day. The long-context memory item shipped with the arc
+(23fcd68) and moved to the archive. Recursive's Q4_1 file enters "Parity, provenance and
+tooling" because the owner asked about it. The Front is ten.]
+
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
-2. **Flint's attention and MoE glue run on reference paths: sinks in the flash kernel, a decode kernel with sinks, the sigmoid router arm** (Decode performance, measured): Flint decodes 47.7 tok/s short and 23.7 at 3.6k on the f32 attention, against an estimated bytes-only ceiling in the 35B-A3B's range (~2.3 GB/token) where the 35B reads 127.0; the same kernel retires the superlinear memory that refuses prompts past ~60k
+2. **A pinned bench for Flint, so perf-state.md has its first figures** (Decode performance, small): Flint is a target with no figure; in low power on an unpinned build the kernel arc read decode 59.4 tok/s short and 50.7 at 3654 tokens, prefill 1149, against an estimated ~2.3 GB/token bytes-only ceiling where the 35B reads 127.0; an hour in high power mode with a pinned binary prices that gap and picks the next Flint lever
 3. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
 4. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
 5. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
@@ -172,20 +181,16 @@ after it, and the serve tool-call parser.]
 
 ## Decode performance
 
-- [ ] [measured] **Flint's attention and MoE glue run on reference paths: sinks in the flash kernel,
-  a decode kernel with sinks, the sigmoid router arm.** Flint decodes 47.7 tok/s on a short
-  prompt and 23.7 at 3.6k, prefill 292 at 3654 (observations: `lowpowermode 1`, unpinned),
-  because both phases run an f32 attention that widens the full layers' f16 cache to f32
-  every step, and the fused MoE glue is off for sigmoid routing. The ceiling is an estimate:
-  ~2.3 GB of active weights per token, the 35B-A3B's range, where the 35B decodes 127.0.
-  Steps: add the sink term to `flash.metal` (prefill, head dim 128, window in-kernel
-  already; `exp2(sink·log2e − max)` into the sum before the divide), a vendored decode
-  kernel with a sink (candle's `sdpa_vector` cannot take one), each graded against
-  `FlintAttn::reference_attention` on captured activations (a NoPE layer at 32k+ keys, a
-  sliding layer across a wrap, a decode row, real sink values up to ~10) and then by
-  `tests/flint_parity.rs`; then a sigmoid arm of `ops::moe_router` and an ungated
-  epilogue; then a pinned bench for perf-state.md. Re-measure the memory item after.
-  [Record](docs/records/flint-correctness.md).
+- [ ] [small] **A pinned bench for Flint, so perf-state.md has its first figures.**
+  What is left of the kernel item after 3063e0e, 18e1294 and 23fcd68 shipped the rest
+  (2026-10-26). Plain decode short and at ~4k context, and prefill at ~3.6k, on a pinned
+  binary with the `pmset -g` line verbatim, per docs/benching.md. It needs high power
+  mode, which the machine was not in on 2026-10-26. The observations it replaces, in
+  `lowpowermode 1` on an unpinned build: decode 59.4 tok/s on a 13-token prompt and 50.7
+  at 3654, prefill 1149 at 3654. The ceiling is still an estimate, ~2.3 GB of active
+  weights per token; the bench says how far Flint sits from it and so which Flint lever is
+  next, the simdgroup-MMA decode kernel being one candidate.
+  [Record](docs/records/flint-kernels.md).
   From: Deferred from the Flint correctness arc (2026-10-25).
 
 - [ ] [measured] **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest
@@ -350,6 +355,8 @@ after it, and the serve tool-call parser.]
   down projections cancel hard. llama.cpp Metal does the same, so the gate cannot see it.
   The candidates are an f32 weight tile or a per-row path for Flint, priced against prefill
   time. The probe is outside the tree, `/tmp/flint-fix-probes/flint_mlp_probe.rs`.
+  2026-10-26: unchanged by the kernel arc, which touched attention and the MoE glue and not
+  the projection matmuls; still the one known per-layer error on Flint's default path.
   [Record](docs/records/flint-correctness.md), "The prefill precision gap".
   From: Deferred from the Flint correctness arc (2026-10-25).
 
@@ -630,7 +637,8 @@ after it, and the serve tool-call parser.]
   closers) are single tokens, 150010-150015, so the parser can track them by id; strings
   arrive raw and other values as JSON. Serve-level snapshot and rewind on a Flint
   conversation can be exercised in the same arc. If agentic use on serve is not wanted,
-  retire this.
+  retire this. 2026-10-26: kept; the kernel arc did not touch serve, and tools are still a
+  400 on a coding-agent model.
   From: Deferred from the Flint correctness arc (2026-10-25).
 
 - [ ] [measured] **serve at 32k decodes 4-7% under `generate` and the cause is unconfirmed — run a
@@ -659,15 +667,6 @@ after it, and the serve tool-call parser.]
   From: Deferred from the metrics arc (2026-09-05).
 
 ## Cache images, memory and context
-
-- [ ] [measured] **Flint's memory grows superlinearly with context, so prompts past ~60k are refused.**
-  Peak beyond the weights reads 10.97 GB at 9,895 tokens, 16.28 at 28,717 and 31.89 at
-  56,883, and the fit extrapolates to ~115 GB at 131k. Draining between chunks barely moves
-  it, so something that scales with keys is retained per forward, most likely the f32 K/V
-  copies and the mask. The kernel arc on the Front is expected to retire the f32 copies;
-  re-measure after it, and refit `flint_scratch_bytes` from the new points.
-  [Record](docs/records/flint-correctness.md), "Memory".
-  From: Deferred from the Flint correctness arc (2026-10-25).
 
 - [ ] [measured] **The router gemv holds `ffn_gate_inp` twice, ~251 MB resident f32 on Flash-Next.**
   **2026-09-06.** `MoeBlock` keeps the
@@ -749,6 +748,17 @@ after it, and the serve tool-call parser.]
   From: Deferred from the qwen4exp cache-image arc (2026-08-30, P4).
 
 ## Parity, provenance and tooling
+
+- [ ] [unpriced] **Run Recursive's Q4_1 Flint, `flint-int4-q4_1.gguf`.**
+  The owner asked about it on 2026-10-26. Recursive ships it as "trained INT4 codes" (26 GB)
+  beside ggml-org's Q4_K_M, which is the checkpoint xwen runs. First step: a quality
+  comparison of the two in llama.cpp, a perplexity A/B, which decides whether the rest is
+  worth doing. Then a Q4_1 dequant case in
+  xwen's own kernels, `dense_mm`, `mm_id`, `mm_id_t_hp` and `mv_ext`; candle's
+  `mul_mv_id` already has q4_1, so decode's expert gemv would dispatch today. The parity
+  gate needs a fixture made from the Q4_1 file.
+  [Record](docs/records/flint-correctness.md), "Not taken now".
+  From: Deferred from the Flint correctness arc (2026-10-25).
 
 - [ ] [small] **The 27B's interactive generate/chat smoke run was never done, and its
     numbers carry a ±10% spread.** Bring-up itself finished 2026-07-28 via P7: the parity

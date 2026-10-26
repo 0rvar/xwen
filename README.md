@@ -218,9 +218,8 @@ xwen chat --model flint
 
 It is not auto-fetched, so `xwen fetch` puts it in the cache, and serve lists it and
 selects it by full name only while it is cached. It passes a parity gate against
-llama.cpp (`docs/parity.md`, "The Flint track"). This first version runs its attention
-on an unoptimized f32 path, so it is slower than it will be, and prompts past roughly 60k
-tokens are refused for memory. On serve a request with `tools` is a 400 until a parser
+llama.cpp (`docs/parity.md`, "The Flint track"). Its attention and MoE glue run on Metal
+kernels as of 2026-10-26, and a prompt is limited by `--max-ctx`, not memory. On serve a request with `tools` is a 400 until a parser
 for Flint's tool-call format lands; the CLI renders tools in the prompt. The model always
 decides for itself whether to think, so `--no-think` and `enable_thinking: false` do
 nothing on it, and a `developer` message renders as Flint's own developer turn.

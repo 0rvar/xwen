@@ -1140,22 +1140,24 @@ The script defaults to `--n-gpu-layers 99`. The gate prefills every prompt at ch
 and at the shipped 2048, then prefills one prompt to 300 and decodes it one token at a
 time to 602, across the 513-slot ring. Pooled bars, argmax / top-5 / mean |Δlogit|:
 
-| bar | argmax | top-5 | mean | measured 2026-10-25 |
+| bar | argmax | top-5 | mean | measured |
 | --- | --- | --- | --- | --- |
 | acceptance | ≥ 0.88 | ≥ 0.85 | ≤ 0.65 | |
-| regression, prefill | ≥ 0.955 | ≥ 0.93 | ≤ 0.26 | 0.970 / 0.949 / 0.210 at 512, 0.972 / 0.947 / 0.203 at 2048 |
-| regression, decode | ≥ 0.92 | ≥ 0.90 | ≤ 0.30 | 0.940 / 0.921 / 0.238 |
-| worst 64-position window | ≥ 0.82 | ≥ 0.82 | ≤ 0.75 | 0.922 / 0.894 / 0.638 prefill, 0.891 / 0.866 / 0.445 decode |
+| regression, prefill | ≥ 0.955 | ≥ 0.93 | ≤ 0.26 | 0.9696 / 0.9461 / 0.2163 at 512, 0.9711 / 0.9461 / 0.2140 at 2048 (2026-10-26) |
+| regression, decode | ≥ 0.92 | ≥ 0.90 | ≤ 0.30 | 0.9485 / 0.9219 / 0.2366 (2026-10-26) |
+| worst 64-position window | ≥ 0.82 | ≥ 0.82 | ≤ 0.75 | 0.922 / 0.894 / 0.638 prefill, 0.891 / 0.866 / 0.445 decode (2026-10-25) |
 
 The acceptance bar is llama.cpp CPU against Metal on the same fixture (0.907 / 0.863 /
 0.613): a bar tighter than the oracle's own backends would grade the backend. Three wrong
 graphs run over every prompt through `XwenModel::load_flint_wrong_graph`. Sinks dropped
 and rope on every layer must fail every bar, and do by a wide margin. A window one short
-(512) is reported and not asserted, because it reads 0.969 / 0.945 / 0.214, inside the
-noise. The window is held exactly by
-`flint::attention::tests::the_sliding_ring_attends_exactly_the_window`, which drives the
-ring, the mask and both attention arms against the definition at 1e-5 and asserts it sees
-512. Per-prompt lines that print `regress FAIL` on short prompts are informational; only
+(512) is reported and not asserted, because it reads argmax 0.97, inside the noise. Since
+the kernel arc (2026-10-26) the brackets read argmax 0.029 with sinks dropped and 0.42
+with rope everywhere. The window is held exactly by
+`flint::attention::tests::the_sliding_ring_attends_exactly_the_window` (the reference arm
+on the CPU) and its `_on_metal` twin (both arms), which drive the ring, the mask and the
+shipped `visibility()` helper against the definition at 1e-5 and assert they see 512.
+The production arm takes no mask, so the helper is the only place the window lives. Per-prompt lines that print `regress FAIL` on short prompts are informational; only
 the pooled lines gate. `XWEN_FLINT_PARITY_QUICK=<n>` scores the first `n` prompts for
 bisecting and never passes.
 
