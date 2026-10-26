@@ -209,29 +209,8 @@ impl FlintAttn {
         let v = self.v_proj.forward(x_normed)?.reshape((seq, nkv, hd))?;
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
-        // To [head, seq, hd]. At one row the [1, head, hd] and [head, 1, hd]
-        // layouts share byte order, so a reshape is the transpose.
-        let (q, k, v) = if seq == 1 {
-            (
-                q.reshape((nh, 1, hd))?,
-                k.reshape((nkv, 1, hd))?,
-                v.reshape((nkv, 1, hd))?,
-            )
-        } else {
-            (
-                q.transpose(0, 1)?.contiguous()?,
-                k.transpose(0, 1)?.contiguous()?,
-                v.transpose(0, 1)?.contiguous()?,
-            )
-        };
-        // The cache holds f16, as llama.cpp's does; the rope stores k as f16
-        // directly (one rounding of the f32 result, the same as a cast after
-        // it). The reference reads the cache back as f32 and does everything
-        // else at f32.
-        let (q, k) = match &self.rope {
-            Some(rope) => rope.apply_dt(&q, &k, pos, DType::F32, DType::F16)?,
-            None => (q, k.to_dtype(DType::F16)?),
-        };
+        let fused = fused_glue(x_normed);
+        let (q, k, v) = heads_first(&q, &k, &v, self.rope.as_deref(), pos, fused)?;
         // The production arm sees keys by position alone, so a cache holding
         // other than `pos` positions would hide keys or attend to stale ones
         // without an error. Read before the append, which advances the cache.
@@ -241,7 +220,7 @@ impl FlintAttn {
             cache.len()
         );
         let (k_off, window) = visibility(cache.mask_kind(), pos);
-        let (k_all, v_all) = cache.append(&k, &v.to_dtype(DType::F16)?)?;
+        let (k_all, v_all) = cache.append(&k, &v)?;
         let out = match self.attn_impl {
             AttnImpl::Production => production_attention(
                 &q,
@@ -257,12 +236,7 @@ impl FlintAttn {
                 reference_attention(&q, &k_all, &v_all, mask, &self.sinks, self.head_dim)?
             }
         }; // [nh, seq, hd]
-        let out = if seq == 1 {
-            out.reshape((1, nh * hd))?
-        } else {
-            out.transpose(0, 1)?.contiguous()?.reshape((seq, nh * hd))?
-        };
-        self.o_proj.forward(&out)
+        self.o_proj.forward(&rows_first(&out, fused)?)
     }
 
     /// The arm this layer runs.
@@ -275,6 +249,75 @@ impl FlintAttn {
     pub fn needs_mask(&self) -> bool {
         self.attn_impl == AttnImpl::Reference
     }
+}
+
+/// Whether the attention glue runs on the fused permute/cast kernels: Metal,
+/// unless `XWEN_ATTN_GLUE_CLASSIC` asks for the candle chain. Both are
+/// bit-identical (`the_fused_glue_matches_the_candle_chain_bitwise`).
+fn fused_glue(x: &Tensor) -> bool {
+    x.device().is_metal() && !crate::ops::attn_glue_classic()
+}
+
+/// q, k, v `[seq, heads, hd]` f32 to `[heads, seq, hd]`: q f32 for the
+/// attention, k (roped when `rope` is given) and v f16 for the cache, which
+/// holds f16 as llama.cpp's does. Every f16 here is one rounding of the final
+/// f32 value, so where the cast is folded into a copy changes no bit. At one
+/// row the `[1, head, hd]` and `[head, 1, hd]` layouts share byte order, so a
+/// reshape is the transpose. A prefill permutes in one pass per tensor on the
+/// fused path: k stays f32 for the rope, which stores f16 itself, and on an
+/// unroped layer k takes the cast in its permute, as v always does.
+fn heads_first(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    rope: Option<&Rope>,
+    pos: usize,
+    fused: bool,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (seq, nh, hd) = q.dims3()?;
+    let nkv = k.dim(1)?;
+    let (q, k, v) = if seq == 1 {
+        (
+            q.reshape((nh, 1, hd))?,
+            k.reshape((nkv, 1, hd))?,
+            v.reshape((nkv, 1, hd))?.to_dtype(DType::F16)?,
+        )
+    } else if fused {
+        let k = match rope {
+            Some(_) => crate::ops::permute_01(k)?,
+            None => crate::ops::permute_01_f16(k)?,
+        };
+        (
+            crate::ops::permute_01(q)?,
+            k,
+            crate::ops::permute_01_f16(v)?,
+        )
+    } else {
+        (
+            q.transpose(0, 1)?.contiguous()?,
+            k.transpose(0, 1)?.contiguous()?,
+            v.transpose(0, 1)?.contiguous()?.to_dtype(DType::F16)?,
+        )
+    };
+    let (q, k) = match rope {
+        Some(rope) => rope.apply_dt(&q, &k, pos, DType::F32, DType::F16)?,
+        None => (q, k.to_dtype(DType::F16)?),
+    };
+    Ok((q, k, v))
+}
+
+/// The attention's `[heads, seq, hd]` back to `[seq, heads * hd]` rows for
+/// `attn_output`, with the same one-row reshape and one-pass permute as
+/// [`heads_first`].
+fn rows_first(out: &Tensor, fused: bool) -> Result<Tensor> {
+    let (nh, seq, hd) = out.dims3()?;
+    Ok(if seq == 1 {
+        out.reshape((1, nh * hd))?
+    } else if fused {
+        crate::ops::permute_01(out)?.reshape((seq, nh * hd))?
+    } else {
+        out.transpose(0, 1)?.contiguous()?.reshape((seq, nh * hd))?
+    })
 }
 
 /// Where a chunk's keys start and how far back a row sees, for a chunk at
@@ -649,5 +692,77 @@ mod tests {
             short_window_gap > 10.0 * TOL,
             "a 512 window lands within {short_window_gap} of the 513 one, so this test could not see it"
         );
+    }
+
+    /// The fused permute/cast glue of [`heads_first`] and [`rows_first`]
+    /// stores the same bits as the candle chain, on a roped and an unroped
+    /// layer, at a decode row and at prefill chunks. The two arms share no
+    /// copy code: the fused one is `kernel_permute_cast_*`, the chain is
+    /// candle's strided copy and cast.
+    #[test]
+    fn the_fused_glue_matches_the_candle_chain_bitwise() {
+        use crate::config::RopeKind;
+        let dev = crate::gguf::metal_device().unwrap();
+        let (nh, nkv, hd) = (32usize, 4usize, 128usize);
+        let rope = Rope::new(
+            &RopeKind::Plain {
+                freq_base: 1e4,
+                n_rot: hd,
+            },
+            1024,
+            &dev,
+        )
+        .unwrap();
+        let bits = |t: &Tensor| -> Vec<u32> {
+            let t = t.flatten_all().unwrap();
+            match t.dtype() {
+                DType::F32 => t
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect(),
+                DType::F16 => t
+                    .to_vec1::<half::f16>()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.to_bits() as u32)
+                    .collect(),
+                other => panic!("unexpected dtype {other:?}"),
+            }
+        };
+        let same = |a: &Tensor, b: &Tensor, what: &str| {
+            assert_eq!(a.dims(), b.dims(), "{what}: shape");
+            assert_eq!(a.dtype(), b.dtype(), "{what}: dtype");
+            assert!(
+                bits(a) == bits(b),
+                "{what}: the fused glue differs from the chain"
+            );
+        };
+        for (seq, pos) in [(1usize, 0usize), (1, 517), (7, 3), (300, 600)] {
+            let t = |heads: usize, seed: u64| {
+                Tensor::from_vec(seeded(seq * heads * hd, seed), (seq, heads, hd), &dev)
+                    .unwrap()
+                    .affine(16.0, 0.0)
+                    .unwrap()
+            };
+            let (q, k, v) = (t(nh, 21), t(nkv, 22), t(nkv, 23));
+            for roped in [Some(&rope), None] {
+                let what = format!("seq {seq} pos {pos} roped {}", roped.is_some());
+                let fused = heads_first(&q, &k, &v, roped, pos, true).unwrap();
+                let chain = heads_first(&q, &k, &v, roped, pos, false).unwrap();
+                assert_eq!(fused.1.dtype(), DType::F16, "{what}: k is cache-ready");
+                assert_eq!(fused.2.dtype(), DType::F16, "{what}: v is cache-ready");
+                same(&fused.0, &chain.0, &format!("{what} q"));
+                same(&fused.1, &chain.1, &format!("{what} k"));
+                same(&fused.2, &chain.2, &format!("{what} v"));
+            }
+            let out = Tensor::from_vec(seeded(nh * seq * hd, 24), (nh, seq, hd), &dev).unwrap();
+            same(
+                &rows_first(&out, true).unwrap(),
+                &rows_first(&out, false).unwrap(),
+                &format!("seq {seq} output rows"),
+            );
+        }
     }
 }
