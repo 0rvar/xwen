@@ -508,6 +508,15 @@ short-prompt anchor drifted 2.1% between the start and the end (131.4 to 134.1).
 coming down from ~8. The prompts: a one-sentence story prompt, `prefill-4k.txt` (3654
 Flint tokens) and the first 140,000 bytes of the concatenated records at 91ef40a.
 
+The owner reran it the same evening on a quiet machine at
+[940f502](https://github.com/0rvar/xwen/commit/940f502) (docs only since 91ef40a), pinned,
+through `bun scripts/bench.ts --model flint --expect-mode full`, `pmset -g` reading
+` powermode            2` at the start and the end: decode 128.0 tok/s over 256 tokens at
+554, prefill 2708.8 at 822 and 2783.3 at 3654, and two 38,024-token runs at prefill
+1355.7 / 1391.9 and decode 93.2 / 94.2. Every number falls inside or within 1.2% of the
+rows above, and the 38k pair sits at the top of their ranges, which reads the shared-machine
+low end as load rather than the model.
+
 Decode holds with context: -5% at 3654 tokens against the short prompt, about -30% at
 38k, which is the KV read (14 full layers at 2 KiB per position, ~1.09 GB per token at 38k
 beside the weights). These rows supersede the `lowpowermode 1` observations in
