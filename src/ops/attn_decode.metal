@@ -30,10 +30,18 @@
 //    M >= x and both >= EMPTY, so it is finite and <= 0, and a split or
 //    simdgroup that saw no key carries l = 0 and o = 0 into the merge.
 //
-// Compiled math_mode(fast), like candle's metallib.
+// Compiled math_mode(fast), like candle's metallib: the library compiles with
+// nil options, whose documented default is Fast, and the pragma below pins
+// that at the source so an OS changing the default cannot move it (clang
+// rejects unknown `METAL fp` options, so a successful compile proves it is
+// honored). No contraction pragmas: there is no bitwise contract to keep.
+// Fast math assumes no infinities, which is why EMPTY is finite and Flint's
+// loader refuses non-finite sinks (a sink of -1e30 is finite).
 
 #include <metal_stdlib>
 using namespace metal;
+
+#pragma METAL fp math_mode(fast)
 
 constant constexpr int D = 128;     // head dim
 constant constexpr int EPT = 4;     // head dims per lane, D / 32

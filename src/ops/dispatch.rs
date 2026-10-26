@@ -5611,21 +5611,22 @@ const ATTN_DECODE_NSG: usize = 4;
 /// sum per head dim, and past this the per-split work is too small to pay for
 /// its partial row.
 pub(crate) const ATTN_DECODE_MAX_SPLIT: usize = 128;
-/// The fewest keys a split covers: eight per simdgroup.
+/// The fewest keys an automatically chosen split covers: eight per
+/// simdgroup. A key count under it runs as one split.
 const ATTN_DECODE_MIN_KEYS_PER_SPLIT: usize = 32;
 /// The threadgroups a decode dispatch aims for across all KV heads.
 const ATTN_DECODE_TARGET_GROUPS: usize = 128;
 
 /// The split count `run_attn_decode` picks for `n_keys` keys over `n_kv` KV
 /// heads: enough splits for [`ATTN_DECODE_TARGET_GROUPS`] threadgroups, but
-/// none with fewer than [`ATTN_DECODE_MIN_KEYS_PER_SPLIT`] keys. Fitted on
+/// none with fewer than [`ATTN_DECODE_MIN_KEYS_PER_SPLIT`] keys (the split
+/// count rounds down, so every split holds at least that many). Fitted on
 /// Flint's 4 KV heads (`attn_decode_microbench`): 32 splits is fastest at 4k
-/// and 32k keys and 16 at the 513-key ring, where each extra split costs more
-/// in its partial row than its keys save.
+/// and 32k keys and 16 at the 513-key ring, which is what this picks there,
+/// each extra split costing more in its partial row than its keys save.
 pub(crate) fn attn_decode_splits(n_keys: usize, n_kv: usize) -> usize {
     let by_groups = (ATTN_DECODE_TARGET_GROUPS / n_kv.max(1)).max(1);
-    n_keys
-        .div_ceil(ATTN_DECODE_MIN_KEYS_PER_SPLIT)
+    (n_keys / ATTN_DECODE_MIN_KEYS_PER_SPLIT)
         .min(by_groups)
         .clamp(1, ATTN_DECODE_MAX_SPLIT)
 }
@@ -5690,6 +5691,13 @@ pub(crate) fn run_attn_decode(
         bail!("attn_decode split count {n_split} outside 1..={ATTN_DECODE_MAX_SPLIT}");
     }
     let chunk = n_keys.div_ceil(n_split);
+    // The kernel bounds split s by `(s + 1) * chunk` in i32.
+    if n_split
+        .checked_mul(chunk)
+        .is_none_or(|end| i32::try_from(end).is_err())
+    {
+        bail!("attn_decode {n_split} splits of {chunk} keys overflow the kernel's i32 index math");
+    }
 
     let out_count = checked_elems(&[n_head, head_dim], "attn_decode")?;
     // With more than one split, the partial rows and their (max, sum) pairs
@@ -5730,6 +5738,25 @@ pub(crate) fn run_attn_decode(
     let Storage::Metal(v_storage) = &*v_guard else {
         bail!("v is not on a Metal device");
     };
+    // The kernel reads q as float4 and K/V as half4, so every head row must
+    // start on a 16-byte (q) or 8-byte (K/V) boundary.
+    let f16_bytes = DType::F16.size_in_bytes();
+    if !(q_layout.start_offset() * f32_bytes).is_multiple_of(16) {
+        bail!(
+            "attn_decode q starts at element {}, not on a 16-byte boundary",
+            q_layout.start_offset()
+        );
+    }
+    for (what, layout, stride_h) in [("k", k_layout, k_stride_h), ("v", v_layout, v_stride_h)] {
+        if !(layout.start_offset() * f16_bytes).is_multiple_of(8)
+            || !(stride_h * f16_bytes).is_multiple_of(8)
+        {
+            bail!(
+                "attn_decode {what} (start element {}, head stride {stride_h}) is not 8-byte aligned",
+                layout.start_offset()
+            );
+        }
+    }
     // Without sinks the kernels never read the sink slot; q's buffer stands in
     // so it is bound.
     let (sink_buf, sink_off) = match &sinks_guard {

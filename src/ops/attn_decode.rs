@@ -195,10 +195,14 @@ mod tests {
         let k = k_big.narrow(1, 17, keys).unwrap();
         let v = v_big.narrow(1, 17, keys).unwrap();
         let want = reference_attention(&q, &k, &v, None, &vanishing_sinks(nh, &dev), HD).unwrap();
-        let got = attn_decode(&q, &k, &v, None, scale).unwrap();
-        let (rel, _) = row_relative_error(&got, &want);
-        println!("no sinks: row-rel {rel:.2e}");
-        assert!(rel < TOL, "no sinks: row-rel {rel:.2e}");
+        // Both the one-dispatch form, which folds the (absent) sink into its
+        // threadgroup merge, and the split form, which folds it in the combine.
+        for split in [Some(1), None] {
+            let got = dispatch::run_attn_decode(&q, &k, &v, None, scale, split).unwrap();
+            let (rel, _) = row_relative_error(&got, &want);
+            println!("no sinks, split {split:?}: row-rel {rel:.2e}");
+            assert!(rel < TOL, "no sinks, split {split:?}: row-rel {rel:.2e}");
+        }
 
         let sinks = sinks_t(nh, 53, &dev);
         for split in [Some(1), None] {
@@ -217,7 +221,8 @@ mod tests {
         }
     }
 
-    /// Every GQA ratio the kernel instantiates matches the oracle.
+    /// Every GQA ratio the kernel instantiates matches the oracle, in one
+    /// dispatch, at the default split count and at an odd forced one.
     #[test]
     fn attn_decode_covers_each_group_size() {
         let dev = metal_device().unwrap();
@@ -229,9 +234,26 @@ mod tests {
             let v = rand_kv(62, (nkv, keys, HD), &dev);
             let sinks = sinks_t(nh, 63, &dev);
             let want = reference_attention(&q, &k, &v, None, &sinks, HD).unwrap();
-            let got = attn_decode(&q, &k, &v, Some(&sinks), scale).unwrap();
-            let (rel, _) = row_relative_error(&got, &want);
-            assert!(rel < TOL, "{nh}/{nkv}: row-rel {rel:.2e}");
+            for split in [Some(1), None, Some(5)] {
+                let got =
+                    dispatch::run_attn_decode(&q, &k, &v, Some(&sinks), scale, split).unwrap();
+                let (rel, _) = row_relative_error(&got, &want);
+                assert!(rel < TOL, "{nh}/{nkv} split {split:?}: row-rel {rel:.2e}");
+            }
+        }
+    }
+
+    /// The automatic split count never leaves a split under its floor of 32
+    /// keys, and lands on the fitted counts at Flint's shapes.
+    #[test]
+    fn attn_decode_splits_keep_their_floor() {
+        assert_eq!(dispatch::attn_decode_splits(513, 4), 16);
+        assert_eq!(dispatch::attn_decode_splits(4096, 4), 32);
+        assert_eq!(dispatch::attn_decode_splits(32768, 4), 32);
+        assert_eq!(dispatch::attn_decode_splits(31, 4), 1);
+        for keys in 1..3000 {
+            let n = dispatch::attn_decode_splits(keys, 4);
+            assert!(n == 1 || keys / n >= 32, "{keys} keys over {n} splits");
         }
     }
 
@@ -286,6 +308,28 @@ mod tests {
             )
             .is_err()
         );
+        // Views starting mid-row, off the float4 / half4 boundary the kernel
+        // loads on.
+        let q_off = rand_t(82, (1, 1, 8 * HD + 1), &dev)
+            .narrow(2, 1, 8 * HD)
+            .unwrap()
+            .reshape((8, 1, HD))
+            .unwrap();
+        assert!(attn_decode(&q_off, &k, &v, None, scale).is_err());
+        let k_off = rand_kv(83, (1, 1, 2 * 9 * HD + 2), &dev)
+            .narrow(2, 2, 2 * 9 * HD)
+            .unwrap()
+            .reshape((2, 9, HD))
+            .unwrap();
+        assert!(attn_decode(&q, &k_off, &v, None, scale).is_err());
+        assert!(attn_decode(&q, &k, &k_off, None, scale).is_err());
+        // The same views at an aligned start are accepted.
+        let k_on = rand_kv(84, (1, 1, 2 * 9 * HD + 4), &dev)
+            .narrow(2, 4, 2 * 9 * HD)
+            .unwrap()
+            .reshape((2, 9, HD))
+            .unwrap();
+        attn_decode(&q, &k_on, &v, None, scale).unwrap();
         // CPU operands.
         let cq = rand_t(80, (8, 1, HD), &Device::Cpu);
         let ck = rand_kv(81, (2, 9, HD), &Device::Cpu);

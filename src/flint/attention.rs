@@ -143,6 +143,14 @@ impl FlintAttn {
             "layer {il}: attn_sinks is {:?}, expected [{n_head}]",
             sinks.dims()
         );
+        // A non-finite sink has no meaning in the softmax, and the kernels
+        // compile under fast math, which assumes there are none. The wrong
+        // graph's -1e30 below is finite.
+        let sink_values = sinks.to_vec1::<f32>()?;
+        ensure!(
+            sink_values.iter().all(|s| s.is_finite()),
+            "layer {il}: attn_sinks holds a non-finite value: {sink_values:?}"
+        );
         let (sinks, roped) = match wrong {
             None | Some(WrongGraph::Window512) => (sinks, flint.roped[il]),
             // exp(-1e30) underflows to an exact zero in the denominator.
@@ -224,14 +232,15 @@ impl FlintAttn {
             Some(rope) => rope.apply_dt(&q, &k, pos, DType::F32, DType::F16)?,
             None => (q, k.to_dtype(DType::F16)?),
         };
-        // Where this chunk's keys start: a full layer's view is every position
-        // from 0, a sliding layer's prefill view the ring's survivors (at most
-        // `window` of them, oldest first) and then the chunk. Read before the
-        // append, which advances the cache.
-        let (k_off, window) = match cache.mask_kind() {
-            MaskKind::Full => (0, None),
-            MaskKind::Swa { window } => (pos - pos.min(window), Some(window)),
-        };
+        // The production arm sees keys by position alone, so a cache holding
+        // other than `pos` positions would hide keys or attend to stale ones
+        // without an error. Read before the append, which advances the cache.
+        ensure!(
+            cache.len() == pos,
+            "flint attention at position {pos} over a cache holding {} positions",
+            cache.len()
+        );
+        let (k_off, window) = visibility(cache.mask_kind(), pos);
         let (k_all, v_all) = cache.append(&k, &v.to_dtype(DType::F16)?)?;
         let out = match self.attn_impl {
             AttnImpl::Production => production_attention(
@@ -265,6 +274,18 @@ impl FlintAttn {
     /// does, so the stack builds none for the production one.
     pub fn needs_mask(&self) -> bool {
         self.attn_impl == AttnImpl::Reference
+    }
+}
+
+/// Where a chunk's keys start and how far back a row sees, for a chunk at
+/// absolute position `pos` over a cache of kind `kind` holding `pos`
+/// positions: `(k_off, window)` for [`production_attention`]. A full layer's
+/// view is every position from 0; a sliding layer's prefill view is the ring's
+/// survivors (at most `window` of them, oldest first) and then the chunk.
+pub(crate) fn visibility(kind: MaskKind, pos: usize) -> (usize, Option<usize>) {
+    match kind {
+        MaskKind::Full => (0, None),
+        MaskKind::Swa { window } => (pos - pos.min(window), Some(window)),
     }
 }
 
@@ -583,7 +604,8 @@ mod tests {
                 let seq = size(pos).min(total - pos);
                 let kc = head_rows(&k, nkv, pos, seq).to_dtype(DType::F16).unwrap();
                 let vc = head_rows(&v, nkv, pos, seq).to_dtype(DType::F16).unwrap();
-                let k_off = pos - pos.min(window);
+                let (k_off, visible) = visibility(cache.mask_kind(), pos);
+                assert_eq!(visible, Some(window));
                 let (k_all, v_all) = cache.append(&kc, &vc).unwrap();
                 let mask = attn_mask_for(cache.mask_kind(), seq, pos, &dev).unwrap();
                 let qc = head_rows(&q, nh, pos, seq);
@@ -593,14 +615,7 @@ mod tests {
                             reference_attention(&qc, &k_all, &v_all, mask.as_ref(), &sink_t, hd)
                         }
                         AttnImpl::Production => production_attention(
-                            &qc,
-                            &k_all,
-                            &v_all,
-                            &sink_t,
-                            hd,
-                            pos,
-                            k_off,
-                            Some(window),
+                            &qc, &k_all, &v_all, &sink_t, hd, pos, k_off, visible,
                         ),
                     }
                     .unwrap()
