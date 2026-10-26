@@ -1941,26 +1941,25 @@ fn language_peak_bytes(
 
 /// What a Flint prefill holds beyond its file-backed weights once its cache
 /// reaches `n_kv` positions: the dequantized planes, the KV, and the attention's
-/// transients, which grow faster than the context. Zero on every other
-/// architecture, whose scratch is the flat 8 GiB.
+/// transients. Zero on every other architecture, whose scratch is the flat 8 GiB.
 ///
-/// A quadratic fitted to `xwen generate --model flint` peak footprints
-/// (`/usr/bin/time -l`, which leaves out the mapped weights) at the default 2048
-/// chunk on the production attention arm, 2026-10-25: 10.97 GB at 9,895
-/// tokens, 16.28 GB at 28,717 and 31.89 GB at 56,883, plus 5%. The load prices
-/// it at the KV capacity it allocates and every KV growth prices the step to
-/// the new capacity (`grow_kv_capacity`), so a prompt too long for the
-/// machine is refused where its cache grows rather than failing in a GPU
-/// out-of-memory mid-prefill. It extrapolates to about 115 GB at 131,072
-/// positions: past what this machine holds, which is the kernel arc's problem
-/// to lift, not this estimate's to hide.
+/// Linear in the cache: a fixed base for the dequantized planes and the chunk's
+/// transients, plus a per-position term that covers the KV planes, old and new
+/// coexisting while a growth copies (1.5x the cache at the grown capacity). Fitted
+/// to `xwen generate --model flint` peak footprints (`/usr/bin/time -l`, which
+/// leaves out the mapped weights) at the default 2048 chunk on the kernel
+/// attention, 2026-10-26: 7.26 GB at 544 tokens, 7.93 at 56,028, 10.43 at 98,617
+/// and 16.33 at 198,401; then 5% on top. The load prices it at the KV capacity it
+/// allocates and every KV growth prices the step to the new capacity
+/// (`grow_kv_capacity`), so a prompt too long for the machine is refused where
+/// its cache grows rather than failing in a GPU out-of-memory mid-prefill. At
+/// the trained 262,144 positions it reads 21.4 GB.
 fn flint_scratch_bytes(arch: Arch, n_kv: usize) -> u64 {
     if arch != Arch::Flint {
         return 0;
     }
-    let n = n_kv as f64;
-    let fitted = 9.153_629_3 * (1u64 << 30) as f64 + 58_581.8 * n + 5.787_623 * n * n;
-    (fitted * 1.05) as u64
+    let fitted = 7 * (1u64 << 30) + 48 * 1024 * n_kv as u64;
+    fitted + fitted / 20
 }
 
 /// The largest transient a prefill forward on this config can take, over a walk
@@ -2046,14 +2045,19 @@ mod tests {
     use super::*;
 
     /// The Flint scratch estimate sits above every footprint it was fitted to,
-    /// and grows with the cache, so a KV growth always admits a positive step.
+    /// priced at the prompt length rather than the larger capacity admission
+    /// asks for, and grows with the cache, so a KV growth always admits a
+    /// positive step.
     #[test]
     fn the_flint_scratch_estimate_covers_its_measurements() {
         assert_eq!(flint_scratch_bytes(Arch::Moe, 100_000), 0, "not Flint");
         for (n_kv, measured) in [
-            (9_895usize, 10_974_973_392u64),
-            (28_717, 16_283_783_856),
-            (56_883, 31_887_812_384),
+            (544usize, 7_257_870_304u64),
+            (10_043, 7_481_429_120),
+            (28_392, 7_921_470_952),
+            (56_028, 7_930_990_080),
+            (98_617, 10_426_648_984),
+            (198_401, 16_328_411_520),
         ] {
             let estimate = flint_scratch_bytes(Arch::Flint, n_kv);
             assert!(
@@ -2062,6 +2066,7 @@ mod tests {
             );
         }
         assert!(flint_scratch_bytes(Arch::Flint, 16_384) > flint_scratch_bytes(Arch::Flint, 8_192));
+        assert_eq!(flint_scratch_bytes(Arch::Flint, 262_144), 21_421_149_388);
     }
 
     #[test]
