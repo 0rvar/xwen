@@ -5,24 +5,28 @@
 // construction (compared bitwise in the combine.rs ops test), so the fused path
 // is safe under every parity tier including strict.
 //
-// The identity rests on reproducing candle's `sum(1)` launch geometry and
-// instruction structure EXACTLY. candle dispatches `fast_sum_f32_strided` with
-// out_length = seq*n_out threadgroups, each `block_dim` threads wide where
-// block_dim = min(pipeline_max, next_power_of_two(top_k/2)); the reduced axis is
-// top_k. Its per-thread loader accumulates `value = value + src[strided_idx(i)]`
-// for i = tid, tid+block_dim, ... < top_k (candle reduce.metal loader), then the
+// The identity rests on reproducing candle's `sum(1)` reduction order EXACTLY.
+// candle dispatches `fast_sum_f32_strided` with out_length = seq*n_out
+// threadgroups, each `block_dim` threads wide where block_dim =
+// min(pipeline_max, next_power_of_two(top_k/2)); the reduced axis is top_k. Its
+// per-thread loader accumulates `value = value + src[strided_idx(i)]` for i =
+// tid, tid+block_dim, ... < top_k (candle reduce.metal loader), then the
 // BLOCKSIZE<=32 path reduces the lane partials with the hardware `simd_sum`, and
-// lane 0 stores. We mirror that: the same launch geometry, the same ascending
-// per-lane loader partition, the same hardware `simd_sum`, lane-0 store — but we
-// compute each loaded element in-register with candle's per-op rounding
-// boundaries instead of reading a pre-materialized product:
+// lane 0 stores. We mirror that per output: `block_dim` lanes, the same
+// ascending per-lane loader partition, a shuffle-xor butterfly over strides 1, 2,
+// ..., block_dim/2 (the order `simd_sum` folds those lanes in; the bitwise test
+// fails on the reversed strides), lane-0 store — but we compute each loaded
+// element in-register with candle's per-op rounding boundaries instead of reading
+// a pre-materialized product. What we do NOT mirror is the launch: one
+// threadgroup of block_dim (4 or 8) threads per output left the GPU idling on
+// threadgroup dispatch, 2.6-3 ms for a 2048-token chunk that moves 0.1 GB, so
+// each 256-thread threadgroup packs 256/block_dim outputs instead.
 //
-// SINGLE-SIMDGROUP CONSTRAINT: these kernels implement ONLY the block_dim <= 32
-// path — a lone `simd_sum` folds exactly one 32-lane simdgroup, so a wider
-// threadgroup would leave lanes 32.. in a second simdgroup whose partials are
-// never added (silent lane drop). candle's >32 threadgroup-reduction tree is
-// deliberately NOT reproduced (production top_k is 10, so candle's width
-// next_pow2(top_k/2) is 8). `run_combine` (combine.rs dispatch) refuses
+// SINGLE-SIMDGROUP CONSTRAINT: an output's lanes must sit inside one 32-lane
+// simdgroup for the shuffles to reach them, so these kernels implement ONLY the
+// block_dim <= 32 path. candle's >32 threadgroup-reduction tree is deliberately
+// NOT reproduced (production top_k is 6 to 10, so candle's width
+// next_pow2(top_k/2) is 4 or 8). `run_combine` (combine.rs dispatch) refuses
 // host-side any top_k whose candle width would exceed 32, so a reduction wider
 // than one simdgroup can never reach these kernels.
 //   rescale-free : r3 = down * w                                (one f32 mul)
@@ -64,7 +68,61 @@ using namespace metal;
 typedef struct {
     int32_t top_k;
     int32_t n_out;
+    int32_t width;
+    int32_t n;
 } combine_args;
+
+// One output per `width` adjacent lanes, `width` being candle's block_dim: lane
+// t of an output's group loads k = t, t+width, ... < top_k (candle's loader
+// partition), and the group folds its partials with a shuffle-xor butterfly over
+// strides 1, 2, ..., width/2, the pairing `simd_sum` uses (the bitwise test
+// holds it). `width` divides 32 and the threadgroup is a whole number of
+// simdgroups, so a group never straddles a simdgroup. Bounded on the explicit
+// `args.n` (seq * n_out), never on the grid; lanes past it still join the
+// shuffles with a zero partial.
+template <bool RESCALE>
+inline void moe_combine(
+        constant combine_args & args,
+        device const float * down,
+        device const float * col_l2,
+        device const float * w,
+        device       float * dst,
+        uint gid) {
+    const int top_k = args.top_k;
+    const int n_out = args.n_out;
+    const int width = args.width;
+    const int did = (int) (gid / (uint) width);
+    const int tid = (int) (gid % (uint) width);
+    const bool live = did < args.n;
+
+    float value = 0.0f;
+    if (live) {
+        const int s = did / n_out;
+        const int c = did % n_out;
+        const int down_base = s * top_k * n_out + c;
+        const int sk_base   = s * top_k;
+        for (int k = tid; k < top_k; k += width) {
+            float d  = down[down_base + k * n_out];
+            float ww = w[sk_base + k];
+            float r3;
+            if (RESCALE) {
+                float l  = col_l2[sk_base + k];
+                float r1 = d * l;
+                float r2 = r1 * 0x1p-15f;
+                r3 = r2 * ww;
+            } else {
+                r3 = d * ww;
+            }
+            value = value + r3;
+        }
+    }
+    for (ushort m = 1; m < (ushort) width; m <<= 1) {
+        value = value + simd_shuffle_xor(value, m);
+    }
+    if (live && tid == 0) {
+        dst[did] = value;
+    }
+}
 
 // Rescale-free combine: dst[s, c] = Σ_k down[s, k, c] * w[s, k].
 kernel void kernel_moe_combine(
@@ -72,28 +130,8 @@ kernel void kernel_moe_combine(
         device const float * down    [[buffer(1)]],
         device const float * w       [[buffer(2)]],
         device       float * dst     [[buffer(3)]],
-        uint tid       [[thread_index_in_threadgroup]],
-        uint dst_id    [[threadgroup_position_in_grid]],
-        uint block_dim [[threads_per_threadgroup]]) {
-    const int top_k = args.top_k;
-    const int n_out = args.n_out;
-    const int did = (int) dst_id;
-    const int s = did / n_out;
-    const int c = did % n_out;
-    const int down_base = s * top_k * n_out + c;
-    const int sk_base   = s * top_k;
-
-    float value = 0.0f;
-    for (int k = (int) tid; k < top_k; k += (int) block_dim) {
-        float d  = down[down_base + k * n_out];
-        float ww = w[sk_base + k];
-        float r3 = d * ww;
-        value = value + r3;
-    }
-    value = simd_sum(value);
-    if (tid == 0) {
-        dst[did] = value;
-    }
+        uint gid [[thread_position_in_grid]]) {
+    moe_combine<false>(args, down, nullptr, w, dst, gid);
 }
 
 // Rescale combine: dst[s, c] = Σ_k (down[s, k, c] * col_l2[s, k]) * 2^-15 * w[s, k],
@@ -105,29 +143,6 @@ kernel void kernel_moe_combine_rescale(
         device const float * col_l2  [[buffer(2)]],
         device const float * w       [[buffer(3)]],
         device       float * dst     [[buffer(4)]],
-        uint tid       [[thread_index_in_threadgroup]],
-        uint dst_id    [[threadgroup_position_in_grid]],
-        uint block_dim [[threads_per_threadgroup]]) {
-    const int top_k = args.top_k;
-    const int n_out = args.n_out;
-    const int did = (int) dst_id;
-    const int s = did / n_out;
-    const int c = did % n_out;
-    const int down_base = s * top_k * n_out + c;
-    const int sk_base   = s * top_k;
-
-    float value = 0.0f;
-    for (int k = (int) tid; k < top_k; k += (int) block_dim) {
-        float d  = down[down_base + k * n_out];
-        float l  = col_l2[sk_base + k];
-        float ww = w[sk_base + k];
-        float r1 = d * l;
-        float r2 = r1 * 0x1p-15f;
-        float r3 = r2 * ww;
-        value = value + r3;
-    }
-    value = simd_sum(value);
-    if (tid == 0) {
-        dst[did] = value;
-    }
+        uint gid [[thread_position_in_grid]]) {
+    moe_combine<true>(args, down, col_l2, w, dst, gid);
 }

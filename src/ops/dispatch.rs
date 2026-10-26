@@ -328,6 +328,8 @@ struct MvIdArgs {
 struct CombineArgs {
     top_k: i32,
     n_out: i32,
+    width: i32,
+    n: i32,
 }
 
 /// Matches the Metal `silu_mul_args` struct (src/ops/silu_mul.metal).
@@ -355,11 +357,16 @@ struct SiluMulL2Args {
 pub(crate) const SILU_MUL_L2_THREADS: usize = 256;
 pub(crate) const SILU_MUL_L2_MAX_FF: usize = 1024;
 
+/// The combine kernels' threadgroup: whole simdgroups, each holding
+/// `32 / combine_reduction_width(top_k)` outputs.
+const COMBINE_THREADS: usize = 256;
+
 /// candle's `fast_sum` threadgroup width for a `top_k`-wide reduction:
-/// `min(pipeline_max, next_pow2(top_k/2))`. The combine kernels reproduce it so
-/// the simd_sum lane partition matches candle's reduction order bit-for-bit, but
-/// they fold only ONE 32-lane simdgroup (see combine.metal), so a width above 32
-/// would silently drop lanes 32.. — `run_combine` bails when this exceeds 32.
+/// `min(pipeline_max, next_pow2(top_k/2))`. The combine kernels give each output
+/// this many lanes so the lane partition matches candle's reduction order
+/// bit-for-bit, but an output's lanes must share one 32-lane simdgroup (see
+/// combine.metal), so a width above 32 would silently drop lanes 32.. —
+/// `run_combine` bails when this exceeds 32.
 fn combine_reduction_width(top_k: usize) -> usize {
     (top_k / 2).next_power_of_two()
 }
@@ -2385,8 +2392,9 @@ pub(crate) fn run_matmul_dense_q_mm(
 ///   - `col_l2` = `None`  (rescale-free): `dst[s,c] = Σ_k down[s,k,c] * w[s,k]`
 ///   - `col_l2` = `Some`  (`[seq, top_k, 1]` f32): the per-column L2 rescale is
 ///     undone in the same pass — `dst[s,c] = Σ_k down[s,k,c]*col_l2[s,k]*2^-15*w[s,k]`.
-/// `weights` is `[seq, top_k]` f32. The launch geometry and per-op rounding
-/// mirror candle's strided `sum(1)` exactly, so the result is bit-identical to
+/// `weights` is `[seq, top_k]` f32. The per-output lane partition, reduction
+/// order and per-op rounding mirror candle's strided `sum(1)` exactly, so the
+/// result is bit-identical to
 /// the candle broadcast/affine/sum chain (see combine.metal / the combine.rs test).
 pub(crate) fn run_combine(
     down: &Tensor,
@@ -2442,11 +2450,11 @@ pub(crate) fn run_combine(
         }
     }
 
-    // The reduction is a single simd_sum over one 32-lane simdgroup, so the
-    // candle-matching threadgroup width must not exceed 32 (see combine.metal);
-    // a wider width would leave lanes 32.. in a second simdgroup whose partials
-    // are never folded in. This is an error, not a fallback — production top_k is
-    // 10 (width 8); a top_k needing width > 32 (i.e. >= 66) is out of contract.
+    // Each output reduces inside one 32-lane simdgroup, so the candle-matching
+    // width must not exceed 32 (see combine.metal); a wider width would leave
+    // lanes 32.. in a second simdgroup whose partials are never folded in. This
+    // is an error, not a fallback — production top_k is 6 to 10 (width 4 or 8); a
+    // top_k needing width > 32 (i.e. >= 66) is out of contract.
     let width_hint = combine_reduction_width(top_k);
     if width_hint > 32 {
         bail!(
@@ -2499,19 +2507,22 @@ pub(crate) fn run_combine(
         None => None,
     };
 
-    let args = CombineArgs {
-        top_k: top_k as i32,
-        n_out: n_out as i32,
-    };
-    // candle's `fast_sum_f32_strided` launch: out_length threadgroups, block_dim
-    // = min(pipeline max, next_pow2(top_k/2)); reproduced so the simd_sum lane
-    // partition (and thus the reduction order) is identical. The width guard
-    // above pins `combine_reduction_width(top_k)` <= 32, so this stays within one
-    // simdgroup.
+    // candle's `fast_sum_f32_strided` gives each output block_dim =
+    // min(pipeline max, next_pow2(top_k/2)) lanes; the kernel keeps that lane
+    // partition (and so the reduction order) but packs COMBINE_THREADS / width
+    // outputs into each threadgroup instead of launching one per output. The
+    // width guard above pins it <= 32, so it divides a simdgroup.
     let width = std::cmp::min(
         pipeline.max_total_threads_per_threadgroup(),
         combine_reduction_width(top_k),
     );
+    let args = CombineArgs {
+        top_k: top_k as i32,
+        n_out: n_out as i32,
+        width: width as i32,
+        n: out_length as i32,
+    };
+    let groups = (out_length * width).div_ceil(COMBINE_THREADS);
     {
         let cmd = mdev.command_encoder()?;
         let ep = &cmd;
@@ -2531,7 +2542,7 @@ pub(crate) fn run_combine(
             encoder.set_input_buffer(2, Some(w_buf), w_off);
             encoder.set_output_buffer(3, Some(&dst), 0);
         }
-        encoder.dispatch_thread_groups(mtl_size(out_length, 1, 1), mtl_size(width, 1, 1));
+        encoder.dispatch_thread_groups(mtl_size(groups, 1, 1), mtl_size(COMBINE_THREADS, 1, 1));
     }
     drop(down_guard);
     drop(w_guard);
