@@ -4,6 +4,19 @@ Reverse-chronological. Heading convention: `## YYYY-MM-DD — headline stating w
 shipped, ideally with the number`. Same-day entries disambiguate in the heading text.
 Superseded entries are marked in the headline, never deleted.
 
+## 2026-10-26 — Flint's first figures: 122.7-134.1 tok/s decode, 2817-2891 prefill at 3654
+
+A pinned build of [91ef40a](https://github.com/0rvar/xwen/commit/91ef40a), `pmset -g`
+reading ` lowpowermode         2`, on a machine shared with other agents. Flint decodes
+122.7-134.1 tok/s on a short prompt, 121.0-127.0 at 3654 tokens and 77.6-94.4 at 38,024,
+and prefills 2817-2891 at 3654 and 1067-1415 at 38,024. In the same rounds it decodes
+1.32-1.40x faster than the cached `35b-uncensored`, which is the 35B-A3B graph on a
+different quant mix and not the official file. A token reads 2.26 GB of weights, a
+~190-230 tok/s bytes-only ceiling; the rest of a 7.4 ms token is ~1161 dispatches at a
+measured ~2.3-3.0 µs each. The profile put two glue kernels at a third of the 3654-token
+prefill and ranked five levers into the ledger, the prefill pair on the Front.
+[Figures](perf-state.md), [record](records/flint-profile.md).
+
 ## 2026-10-26 — Flint's attention and MoE glue run on Metal kernels, and long prompts fit
 
 Flint's prefill attention runs `flash.metal` with a per-head sink, its one-row attention a

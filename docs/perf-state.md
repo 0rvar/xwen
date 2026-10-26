@@ -41,6 +41,8 @@ reasoning behind the choice that produced it lives in [decisions](decisions.md).
 | Qwen3.8-27B | drafted decode, code | 34.4-35.7 tok/s (+44-45%), acceptance 80.0% | fitted 2026-08-15 at p_min 0.7, depth 4 | `lowpowermode 0` |
 | Qwen3.8-27B | drafted decode, chat | 33.1-34.0 tok/s (+37-38%), acceptance 77.8% | fitted 2026-08-15 at p_min 0.7, depth 4 | `lowpowermode 0` |
 | Qwen3.8-27B | prefill | no figure of its own; it runs the dense 27B graph | | |
+| Flint | plain decode, short / @3654 / @38,024 | 122.7-134.1 / 121.0-127.0 / 77.6-94.4 tok/s; detail below, "Flint, a design target with no figure yet" | 2026-10-26, 91ef40a, shared machine | `lowpowermode         2` |
+| Flint | prefill @3654 / @38,024 | 2817-2891 / 1067-1415 tok/s (chunk 2048) | 2026-10-26, 91ef40a, shared machine | `lowpowermode         2` |
 | Qwen3.8-Flash-Next | plain decode @596 | 52.9 tok/s | 2026-09-06, 24c4069; its `XWEN_ROUTER_MV_CLASSIC` arm read 50.5 in the same rounds, so +4.8%, ahead in all three | not recorded |
 | Qwen3.8-Flash-Next | plain decode by context | 46 tok/s below the 2048 indexer budget, 44-45 at 3.8k-32k | 2026-08-30, after the QSA block-key cache, fused gather and device-side selection | `powermode 0` |
 | Qwen3.8-Flash-Next | plain decode, 2..8-token forwards | 149.7 tok/s at chunk 8, 108.9 at 4, 68.1 at 2; the `XWEN_HC_GATE_CLASSIC` arm read 93.2 / 69.5 / 38.6, so +57-76% | 2026-09-06, every forward forced to n tokens with `XWEN_PREFILL_CHUNK` | not recorded |
@@ -480,16 +482,56 @@ now the direct conv (1e028be), so the figure is owed on that arm, at 512x512 and
 
 ## Flint, a design target with no figure yet
 
-Flint is a tok/s target as of 2026-10-25 (decisions.md "Flint is a design target"), and
-**no figure is measured yet**. The correctness arc and the kernel arc (2026-10-26) both
-timed it on unpinned builds in `lowpowermode 1`, so their timings are observations in
-[records/flint-correctness.md](records/flint-correctness.md) and
-[records/flint-kernels.md](records/flint-kernels.md) and not figures. The first figures
-are owed by the pinned-bench item on the [TODO.md](../TODO.md) Front: plain decode short
-and at ~4k context, and prefill at ~3.6k, on a pinned binary in high power mode with the
-`pmset -g` line verbatim. There is no drafter for it. The decode ceiling is unmeasured too; the tensor
-table puts active weights at ~2.3 GB per token, in the 35B-A3B's range, which is an
-estimate.
+The heading is older than the figures and stays as written, since headings are never
+renamed. Flint is a tok/s target as of 2026-10-25 (decisions.md "Flint is a design
+target"), and its first figures were measured on 2026-10-26. There is no drafter for it,
+so every row is plain decode. Method, raw reps and the profile are in
+[records/flint-profile.md](records/flint-profile.md).
+
+| Figure | Value, range over reps | Reps |
+| --- | --- | --- |
+| plain decode, 16-token prompt, 256 tokens | 122.7-134.1 tok/s | 3 plus an anchor at each end |
+| plain decode at 3654 tokens, 128 tokens | 121.0-127.0 tok/s | 3 |
+| plain decode at 38,024 tokens, 64 tokens | 77.6-94.4 tok/s (91.2-94.4 without the outlier rep) | 3 |
+| prefill @3654, chunk 2048 | 2817-2891 tok/s | 3 |
+| prefill @38,024 | 1067-1415 tok/s (1336-1415 without the outlier rep) | 3 |
+
+The binary is a release build of an unmodified detached worktree at
+[91ef40a](https://github.com/0rvar/xwen/commit/91ef40a), sha256
+`935771c2...afab5` (full in the record). `pmset -g` read ` lowpowermode         2` at the
+start and the end of every sweep, after the owner switched the machine out of power saver;
+nothing beyond that line is claimed. The machine was shared with other agents, its load
+average 8.2 at the start and 1.3 at the end, with one model process at a time under the
+GPU lock. Three interleaved rounds, a fresh process per run with `XWEN_BENCH=1`. The
+short-prompt anchor drifted 2.1% between the start and the end (131.4 to 134.1). The first
+38k rep is the low outlier on both decode and prefill; it ran while the load was still
+coming down from ~8. The prompts: a one-sentence story prompt, `prefill-4k.txt` (3654
+Flint tokens) and the first 140,000 bytes of the concatenated records at 91ef40a.
+
+Decode holds with context: -5% at 3654 tokens against the short prompt, about -30% at
+38k, which is the KV read (14 full layers at 2 KiB per position, ~1.09 GB per token at 38k
+beside the weights). These rows supersede the `lowpowermode 1` observations in
+[records/flint-kernels.md](records/flint-kernels.md) and
+[records/flint-correctness.md](records/flint-correctness.md).
+
+The same-session reference is the cached `35b-uncensored` (HauhauCS Qwen3.5-35B-A3B
+Q4_K_M, the same `qwen35moe` graph), because the official 35B-A3B file was not cached.
+It read 87.7-95.6 tok/s short, 89.3-92.2 at 3851 tokens and prefill 2967-3045 at 3851, so
+Flint decodes 1.32-1.40x faster than it and prefills at 0.94-0.96x. It is not the official
+35B-A3B: its attention and shared expert are Q4_K/Q5_K/Q6_K rather than Q8_0 and its
+`down_exps` is Q6_K, so it is a class reference and its rates are not comparable to the
+35B-A3B's 127.0 above.
+
+**Ceiling.** A token reads **2.26 GB of active weights** by the tensor table (attn_q 437 MB,
+attn_output 437, lm_head 327, routed experts 499, shexp 314, router 99, attn_k plus attn_v
+109, dense FFN 43). The ggml-org file keeps attention, the shexp and lm_head in Q8_0,
+1.62 GB of it. At the 438-517 GB/s the lm_head gemv ran at, the bytes-only ceiling is
+**~190-230 tok/s** (4.4-5.2 ms). The measured ~7.4 ms short-prompt token sits ~3 ms above
+it, and that is the dispatch chain: **~1161 dispatches per token** (1210 at 3654, 23.7-24.7
+per layer) at **~2.3-3.0 µs each, measured** by a removal A/B of 517 dispatches. About 560
+of them are one-threadgroup glue. So the decode lever is dispatch count, as on the Qwen
+MoE, and the prefill levers are two glue kernels that cost a third of the 3654-token
+wall; both are ranked in the record and ledgered in [TODO.md](../TODO.md).
 
 ## History
 

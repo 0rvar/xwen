@@ -168,8 +168,18 @@ which the machine was not in that day. The long-context memory item shipped with
 (23fcd68) and moved to the archive. Recursive's Q4_1 file enters "Parity, provenance and
 tooling" because the owner asked about it. The Front is ten.]
 
+[Amended 2026-10-26, later, after the Flint bench and profile (log.md "Flint's first
+figures: 122.7-134.1 tok/s decode, 2817-2891 prefill at 3654"): the pinned bench at 2
+shipped and moved to the archive. The profile that followed it priced five levers, and
+they enter the area sections: two prefill glue fixes as one item under "Prefill
+performance" and three decode fusions under "Decode performance". The prefill item takes
+the free place at 2, because it is two small kernels for ~1.5x on a target's 3.6k prefill
+and one of them is worth ~15% on every MoE checkpoint. The decode fusions stay in the area
+section: the largest is +10-13% and medium work, below the audit and the 35B retune. The
+Front is ten.]
+
 1. **Drafting reads below plain on the 35B-A3B after the router gemv** (Drafting, measured): the default path of the 35B loses 8% at 1k tokens deepening to 37% at 16k, and 4% on a 256-token code prompt, in two independent measurements; the retune sweep either refits `p_min`/depth or flips the default off, and either way is worth more than any entry below
-2. **A pinned bench for Flint, so perf-state.md has its first figures** (Decode performance, small): Flint is a target with no figure; in low power on an unpinned build the kernel arc read decode 59.4 tok/s short and 50.7 at 3654 tokens, prefill 1149, against an estimated ~2.3 GB/token bytes-only ceiling where the 35B reads 127.0; an hour in high power mode with a pinned binary prices that gap and picks the next Flint lever
+2. **Flint prefill's two glue fixes** (Prefill performance, measured): the MoE combine's one-output-per-threadgroup geometry is 18.8% of the 3654-token prefill and the attention's strided transposes 17.4%; fixing both takes ~1.28 s to ~0.85 s (2817-2891 tok/s now), and the combine fix is ~15% on every MoE checkpoint
 3. **Threadgroup-count-against-bytes audit of every decode dispatch** (Decode performance, unpriced): the instrument that would have found the router gemv (+10.3% on the 35B, +4.8% on Flash-Next); occupancy is the third decode cost class and nothing else names the next lever
 4. **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest population** (Decode performance, measured): (e) the 8-token decode tail after a ragged prefill read 47.9-52.1 tok/s fused against 55.4-57.6 split, all nine pairs, no valid recheck: a possible ~10% regression on the default path; (a) is a further -96 dispatches, +2%
 5. **Expert gemm efficiency: 14-43% of wall, bracketed by two in-situ A/Bs** (Prefill performance, measured): prefill runs at ~45% of its ~2500 tok/s gemm-only ceiling and 38% of its wall is unpriced; pricing it is an hour and decides the second prefill lever
@@ -181,17 +191,33 @@ tooling" because the owner asked about it. The Front is ten.]
 
 ## Decode performance
 
-- [ ] [small] **A pinned bench for Flint, so perf-state.md has its first figures.**
-  What is left of the kernel item after 3063e0e, 18e1294 and 23fcd68 shipped the rest
-  (2026-10-26). Plain decode short and at ~4k context, and prefill at ~3.6k, on a pinned
-  binary with the `pmset -g` line verbatim, per docs/benching.md. It needs high power
-  mode, which the machine was not in on 2026-10-26. The observations it replaces, in
-  `lowpowermode 1` on an unpinned build: decode 59.4 tok/s on a 13-token prompt and 50.7
-  at 3654, prefill 1149 at 3654. The ceiling is still an estimate, ~2.3 GB of active
-  weights per token; the bench says how far Flint sits from it and so which Flint lever is
-  next, the simdgroup-MMA decode kernel being one candidate.
-  [Record](docs/records/flint-kernels.md).
-  From: Deferred from the Flint correctness arc (2026-10-25).
+- [ ] [measured] **One Flint decode kernel for the q/k norms, rope, the casts and the K/V cache write.**
+  Today each attention layer runs 7 small dispatches between the projections and the
+  attention (6 on the NoPE layers): q_norm, k_norm, rope q, rope k or the k cast, the v
+  cast, and two `copy2d_f16` slot writes, most of them one threadgroup. One kernel for all
+  of it, which is Kapitsa's `flint_attn_d2` without the attention, removes ~294 dispatches
+  of the 1161 per token. Extend `rope.metal`'s f16-store rope with a per-head RMS pre-norm
+  and give it the slot offset of the capacity or ring view. Estimated +10-13% decode
+  (-0.7 to -0.9 ms of a 7.4 ms token), +6-8% without the cache write. The dispatch count
+  and the 2.3-3.0 µs per dispatch are measured; the gain is the product, an estimate.
+  [Record](docs/records/flint-profile.md), "Ranked fruit".
+  From: Flint profile (2026-10-26).
+
+- [ ] [measured] **A fused QKV q8 gemv for Flint with the input RMSNorm folded in.**
+  Flint's q, k and v are three q8 gemvs after a one-threadgroup attn_norm, 147 dispatches
+  per token. One multi-plane gemv that normalizes its input, generalizing
+  `kernel_moe_shexp_gate_up_ungated`, is Kapitsa's first step. Estimated +5-6% decode
+  (-0.35 to -0.45 ms), from the measured count and per-dispatch cost.
+  [Record](docs/records/flint-profile.md), "Ranked fruit".
+  From: Flint profile (2026-10-26).
+
+- [ ] [measured] **Fold Flint's residual adds into the o-proj and MoE epilogue stores, and ffn_norm into the router input.**
+  98 `badd_f32` and 98 outer `rmsnorm_f32` per token, one threadgroup each. Folding the add
+  into the stores (Kapitsa steps 3-4) is medium work; a fused add-plus-RMSNorm kernel is
+  the small version, and it applies to the Qwen graphs too. Estimated +3-6% decode (-0.2 to
+  -0.45 ms), from the measured count and per-dispatch cost.
+  [Record](docs/records/flint-profile.md), "Ranked fruit".
+  From: Flint profile (2026-10-26).
 
 - [ ] [measured] **Hyper-connection carrier: 672 dispatches/token (35% of all launches), the largest
    population.** 7 per gate (norm, inject head — separate on the decode split arm —,
@@ -257,6 +283,9 @@ tooling" because the owner asked about it. The Front is ten.]
   mechanical way to find the rest of it is to list each decode dispatch's threadgroup
   count next to the bytes it moves, then flag any plane over ~1 MB running under ~32
   threadgroups. Nothing is named or priced until that list exists.
+  2026-10-26: built in scratch for Flint's decode only (records/flint-profile.md "Method");
+  its one-threadgroup rows are the norms, adds, casts, slot writes and `kernel_moe_router`.
+  The Qwen checkpoints are still unaudited, and the counter was not kept in the tree.
   From: Flash-Next perf ledger, re-ranked from the measured budgets (2026-09-05, step 4).
   Promoted from the item «MoE FFN: 576 dispatches/token (30%)» on 2026-09-06; dated 2026-09-06 there.
 
@@ -347,6 +376,23 @@ tooling" because the owner asked about it. The Front is ten.]
   Promoted from the item «Decode on Flash-Next steps down ~11 ms/token the moment the context crosses the 2048-token QSA budget, then slopes gently» on 2026-09-06; dated 2026-08-30 there.
 
 ## Prefill performance
+
+- [ ] [measured] **Flint prefill's two glue fixes: the MoE combine's geometry and the attention transposes.**
+  At 3654 tokens the prefill is 1.28 s, and the serialized prices (which match the wall at
+  prefill) put two glue kernels at a third of it. (a) `kernel_moe_combine_rescale` takes
+  247 ms, 18.8%: to mirror candle's `sum(1)` bitwise it launches one threadgroup of 4
+  threads per output element, 3.74 M of them, and takes 2.6 ms a call to move ~0.25 ms of
+  traffic. Many outputs per threadgroup (say 64 by 4 lanes, quad reduce), graded on
+  tolerance since the `needs_rescale` branch is already off the strict tier; estimated
+  -17% wall at 3.7k and -9% at 38k, and the 35B-class file pays the same 16% of its 4k
+  prefill. `src/ops/combine.metal`, `run_combine` in `src/ops/dispatch.rs`. (b) The
+  `transpose(0,1).contiguous()` copies of q, k, v and the output in `FlintAttn::forward`
+  take 227 ms, 17.4%; Qwen's `ops::permute_01` and `ops::permute_01_f16` (which folds the
+  v cast) replace them as-is, bitwise per the attention glue tests, for an estimated -15%
+  at 3.7k and -8% at 38k. Together ~1.28 s to ~0.85 s. The kernel prices are measured,
+  the gains estimates from them.
+  [Record](docs/records/flint-profile.md), "Prefill anatomy".
+  From: Flint profile (2026-10-26).
 
 - [ ] [measured] **Flint's prefill projections are 2-4% off exact per layer, where decode is at 2e-7.**
   Layer 0's dense SwiGLU reads 3.7e-2 mean per-row relative L2 against an f64 recompute of

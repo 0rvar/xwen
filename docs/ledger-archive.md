@@ -3251,6 +3251,24 @@ blocks use of the feature; item (a) is the one with a known trigger.
   [Record](records/flint-correctness.md), "Memory".
   From: Deferred from the Flint correctness arc (2026-10-25).
 
+[Shipped 2026-10-26 on a pinned build of 91ef40a, in `lowpowermode 2` on a shared machine: Flint decodes 122.7-134.1 tok/s short, 121.0-127.0 at 3654 tokens and 77.6-94.4 at 38,024, and prefills 2817-2891 at 3654 and 1067-1415 at 38,024 (perf-state.md "Flint, a design target with no figure yet"; log.md "Flint's first figures: 122.7-134.1 tok/s decode, 2817-2891 prefill at 3654"; records/flint-profile.md). The profile that followed it put the next Flint levers in TODO.md under "Prefill performance" and "Decode performance", From: "Flint profile (2026-10-26)". Text as it stood in TODO.md, the record link rebased to this directory.]
+
+- [x] [small] **A pinned bench for Flint, so perf-state.md has its first figures.**
+  What is left of the kernel item after 3063e0e, 18e1294 and 23fcd68 shipped the rest
+  (2026-10-26). Plain decode short and at ~4k context, and prefill at ~3.6k, on a pinned
+  binary with the `pmset -g` line verbatim, per docs/benching.md. It needs high power
+  mode, which the machine was not in on 2026-10-26. The observations it replaces, in
+  `lowpowermode 1` on an unpinned build: decode 59.4 tok/s on a 13-token prompt and 50.7
+  at 3654, prefill 1149 at 3654. The ceiling is still an estimate, ~2.3 GB of active
+  weights per token; the bench says how far Flint sits from it and so which Flint lever is
+  next, the simdgroup-MMA decode kernel being one candidate.
+  [Record](records/flint-kernels.md).
+  From: Deferred from the Flint correctness arc (2026-10-25).
+
+## Flint profile (2026-10-26)
+
+[Opened 2026-10-26 by the profile of Flint's decode and prefill on the pinned bench binary (records/flint-profile.md). Nothing has closed under it yet; its open items are the prefill glue fixes in TODO.md "Prefill performance" and three decode fusions in "Decode performance".]
+
 ## Retired: Image generation
 
 [Retired 2026-09-08: its basis was the profiler's buffer-pool eviction and not the f32 store. The bf16 store was built on the branch `zimage-ffn` (5e7a6ea), is bit-exact, and measured parity within 5% with an unstable sign; the f32-store gemm runs 37-45 TFLOP/s isolated, w2's own class, and bandwidth caps the lever at ~0.2 s per image (decisions.md "The bf16 SwiGLU store is REFUTED"). A half intermediate for w2 is disqualified by a measured activation max of 284,507 against f16's 65,504. Reopen if a future MPP release adds a converting cooperative-tensor store or documents the tile lane layout so a vectorized epilogue can skip the index math, or with a per-row scaled activation folded into w2's gemm, which is a different arc.]
